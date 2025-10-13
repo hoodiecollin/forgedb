@@ -18,6 +18,7 @@ sinkdb-storage = { path = "crates/storage" }
 sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
+ordered-float = "4.2"
 
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
@@ -59,3 +60,8 @@ path = "examples/sprint2_persistence/test_persistence.rs"
 [[example]]
 name = "sprint3_indexing_queries"
 path = "examples/sprint3_indexing_queries.rs"
+
+# Sprint 5: Advanced Indexing
+[[example]]
+name = "sprint5_advanced_indexing"
+path = "examples/sprint5_advanced_indexing.rs"

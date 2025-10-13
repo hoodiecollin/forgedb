@@ -36,6 +36,10 @@ pub enum Token {
     RBracket,    // ]
     Asterisk,    // *
     Question,    // ?
+    At,          // @
+    Comma,       // ,
+    LParen,      // (
+    RParen,      // )
 
     // Whitespace and EOF
     Newline,
@@ -171,6 +175,22 @@ impl Lexer {
             Some('?') => {
                 self.advance();
                 Ok(Token::Question)
+            }
+            Some('@') => {
+                self.advance();
+                Ok(Token::At)
+            }
+            Some(',') => {
+                self.advance();
+                Ok(Token::Comma)
+            }
+            Some('(') => {
+                self.advance();
+                Ok(Token::LParen)
+            }
+            Some(')') => {
+                self.advance();
+                Ok(Token::RParen)
             }
             Some(ch) if ch.is_alphabetic() || ch == '_' => {
                 let ident = self.read_identifier();
@@ -330,10 +350,10 @@ mod tests {
 
     #[test]
     fn test_invalid_character() {
-        let mut lexer = Lexer::new("User { id: @u64 }");
+        let mut lexer = Lexer::new("User { id: $u64 }");
         let result = lexer.tokenize();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unexpected character '@'"));
+        assert!(result.unwrap_err().contains("Unexpected character '$'"));
     }
 
     #[test]

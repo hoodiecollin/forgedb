@@ -1,6 +1,17 @@
 /// Abstract Syntax Tree representation
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum IndexType {
+    Hash,   // Default for exact matches, unordered types
+    BTree,  // For range queries on ordered types
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeIndex {
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     U32,
     U64,
@@ -32,12 +43,14 @@ pub struct Field {
     pub auto_generate: bool, // + symbol
     pub unique: bool,        // & symbol
     pub indexed: bool,       // ^ symbol
+    pub index_type: IndexType, // Hash or BTree
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub name: String,
     pub fields: Vec<Field>,
+    pub composite_indexes: Vec<CompositeIndex>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +154,25 @@ impl FieldType {
 
     pub fn is_relation(&self) -> bool {
         matches!(self, FieldType::Relation(_))
+    }
+
+    /// Determine if this type supports range queries (ordered)
+    pub fn supports_range_queries(&self) -> bool {
+        matches!(
+            self,
+            FieldType::U32 | FieldType::U64
+            | FieldType::I32 | FieldType::I64
+            | FieldType::F64 | FieldType::Timestamp
+        )
+    }
+
+    /// Get the default index type for this field type
+    pub fn default_index_type(&self) -> IndexType {
+        if self.supports_range_queries() {
+            IndexType::BTree
+        } else {
+            IndexType::Hash
+        }
     }
 }
 
