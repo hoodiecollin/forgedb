@@ -7,7 +7,13 @@ pub enum Token {
     // Types
     TypeU32,
     TypeU64,
+    TypeI32,
+    TypeI64,
+    TypeF64,
+    TypeBool,
     TypeString,
+    TypeUuid,
+    TypeTimestamp,
 
     // Symbols
     Plus,        // +
@@ -136,7 +142,13 @@ impl Lexer {
                 let token = match ident.as_str() {
                     "u32" => Token::TypeU32,
                     "u64" => Token::TypeU64,
+                    "i32" => Token::TypeI32,
+                    "i64" => Token::TypeI64,
+                    "f64" => Token::TypeF64,
+                    "bool" => Token::TypeBool,
                     "string" => Token::TypeString,
+                    "uuid" => Token::TypeUuid,
+                    "timestamp" => Token::TypeTimestamp,
                     _ => Token::Ident(ident),
                 };
                 Ok(token)
@@ -179,12 +191,18 @@ mod tests {
 
     #[test]
     fn test_types() {
-        let mut lexer = Lexer::new("u32 u64 string");
+        let mut lexer = Lexer::new("u32 u64 i32 i64 f64 bool string uuid timestamp");
         let tokens = lexer.tokenize().unwrap();
         assert_eq!(tokens, vec![
             Token::TypeU32,
             Token::TypeU64,
+            Token::TypeI32,
+            Token::TypeI64,
+            Token::TypeF64,
+            Token::TypeBool,
             Token::TypeString,
+            Token::TypeUuid,
+            Token::TypeTimestamp,
             Token::Eof,
         ]);
     }

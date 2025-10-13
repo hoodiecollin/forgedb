@@ -83,8 +83,7 @@ impl CodeGenerator {
     }
 
     fn generate_insert_method(&self, code: &mut String, model: &Model) {
-        // Find auto-generate field (assumed to be u64 id)
-        let auto_gen_field = model.fields.iter().find(|f| f.auto_generate);
+        use crate::ast::FieldType;
 
         // Find unique fields
         let unique_fields: Vec<&Field> = model.fields.iter().filter(|f| f.unique).collect();
@@ -107,10 +106,23 @@ impl CodeGenerator {
             code.push_str("        }\n");
         }
 
-        // Generate auto-increment ID if needed
-        if let Some(id_field) = auto_gen_field {
-            code.push_str(&format!("        let {} = self.next_id;\n", id_field.name));
-            code.push_str("        self.next_id += 1;\n");
+        // Generate auto-generated fields
+        for field in &model.fields {
+            if field.auto_generate {
+                match field.field_type {
+                    FieldType::U32 | FieldType::U64 => {
+                        code.push_str(&format!("        let {} = self.next_id;\n", field.name));
+                        code.push_str("        self.next_id += 1;\n");
+                    }
+                    FieldType::Uuid => {
+                        code.push_str(&format!("        let {} = Uuid::new_v4();\n", field.name));
+                    }
+                    FieldType::Timestamp => {
+                        code.push_str(&format!("        let {} = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;\n", field.name));
+                    }
+                    _ => {}
+                }
+            }
         }
 
         // Create record
@@ -153,7 +165,9 @@ impl CodeGenerator {
 
         // Add standard imports
         code.push_str("// Generated code - do not edit manually\n\n");
-        code.push_str("use std::collections::HashMap;\n\n");
+        code.push_str("use std::collections::HashMap;\n");
+        code.push_str("use std::time::{SystemTime, UNIX_EPOCH};\n");
+        code.push_str("use uuid::Uuid;\n\n");
 
         // Generate code for each model
         for model in &schema.models {
@@ -300,7 +314,11 @@ User {
 Model {
   field1: u32
   field2: u64
-  field3: string
+  field3: i32
+  field4: i64
+  field5: f64
+  field6: bool
+  field7: string
 }
 "#;
         let mut parser = Parser::new(input).unwrap();
@@ -311,6 +329,95 @@ Model {
 
         assert!(code.contains("pub field1: u32"));
         assert!(code.contains("pub field2: u64"));
-        assert!(code.contains("pub field3: String"));
+        assert!(code.contains("pub field3: i32"));
+        assert!(code.contains("pub field4: i64"));
+        assert!(code.contains("pub field5: f64"));
+        assert!(code.contains("pub field6: bool"));
+        assert!(code.contains("pub field7: String"));
+    }
+
+    #[test]
+    fn test_generate_uuid_type() {
+        let input = r#"
+User {
+  id: +uuid
+  email: &string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check UUID type is used
+        assert!(code.contains("pub id: uuid::Uuid"));
+
+        // Check UUID generation
+        assert!(code.contains("let id = Uuid::new_v4()"));
+
+        // Check uuid import
+        assert!(code.contains("use uuid::Uuid"));
+    }
+
+    #[test]
+    fn test_generate_timestamp_type() {
+        let input = r#"
+User {
+  id: +u64
+  created_at: +timestamp
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check timestamp type (stored as i64)
+        assert!(code.contains("pub created_at: i64"));
+
+        // Check timestamp generation
+        assert!(code.contains("let created_at = SystemTime::now()"));
+        assert!(code.contains("UNIX_EPOCH"));
+
+        // Check imports
+        assert!(code.contains("use std::time::{SystemTime, UNIX_EPOCH}"));
+    }
+
+    #[test]
+    fn test_generate_full_type_schema() {
+        let input = r#"
+User {
+  id: +uuid
+  email: &string
+  age: u32
+  balance: f64
+  active: bool
+  score: i32
+  created_at: +timestamp
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check all types are present
+        assert!(code.contains("pub id: uuid::Uuid"));
+        assert!(code.contains("pub email: String"));
+        assert!(code.contains("pub age: u32"));
+        assert!(code.contains("pub balance: f64"));
+        assert!(code.contains("pub active: bool"));
+        assert!(code.contains("pub score: i32"));
+        assert!(code.contains("pub created_at: i64"));
+
+        // Check auto-generation
+        assert!(code.contains("let id = Uuid::new_v4()"));
+        assert!(code.contains("let created_at = SystemTime::now()"));
+
+        // Check email is a parameter (not auto-generated)
+        assert!(code.contains("email: String"));
     }
 }

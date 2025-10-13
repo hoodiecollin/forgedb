@@ -46,7 +46,13 @@ impl Parser {
         let field_type = match self.current_token() {
             Token::TypeU32 => FieldType::U32,
             Token::TypeU64 => FieldType::U64,
+            Token::TypeI32 => FieldType::I32,
+            Token::TypeI64 => FieldType::I64,
+            Token::TypeF64 => FieldType::F64,
+            Token::TypeBool => FieldType::Bool,
             Token::TypeString => FieldType::String,
+            Token::TypeUuid => FieldType::Uuid,
+            Token::TypeTimestamp => FieldType::Timestamp,
             _ => return Err(format!("Expected type, found {:?}", self.current_token())),
         };
         self.advance();
@@ -86,6 +92,14 @@ impl Parser {
 
         // Parse type
         let field_type = self.parse_type()?;
+
+        // Validate auto-generate is compatible with type
+        if auto_generate && !field_type.is_auto_generatable() {
+            return Err(format!(
+                "Auto-generate symbol '+' cannot be used with type {:?}. Only u32, u64, uuid, and timestamp support auto-generation",
+                field_type
+            ));
+        }
 
         Ok(Field {
             name,
@@ -310,7 +324,13 @@ Post {
 Model {
   field1: u32
   field2: u64
-  field3: string
+  field3: i32
+  field4: i64
+  field5: f64
+  field6: bool
+  field7: string
+  field8: uuid
+  field9: timestamp
 }
 "#;
         let mut parser = Parser::new(input).unwrap();
@@ -319,7 +339,13 @@ Model {
         let model = &schema.models[0];
         assert_eq!(model.fields[0].field_type, FieldType::U32);
         assert_eq!(model.fields[1].field_type, FieldType::U64);
-        assert_eq!(model.fields[2].field_type, FieldType::String);
+        assert_eq!(model.fields[2].field_type, FieldType::I32);
+        assert_eq!(model.fields[3].field_type, FieldType::I64);
+        assert_eq!(model.fields[4].field_type, FieldType::F64);
+        assert_eq!(model.fields[5].field_type, FieldType::Bool);
+        assert_eq!(model.fields[6].field_type, FieldType::String);
+        assert_eq!(model.fields[7].field_type, FieldType::Uuid);
+        assert_eq!(model.fields[8].field_type, FieldType::Timestamp);
     }
 
     #[test]
@@ -355,5 +381,80 @@ User {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.contains("Duplicate model name 'User'"));
+    }
+
+    #[test]
+    fn test_parse_uuid_with_auto_generate() {
+        let input = r#"
+User {
+  id: +uuid
+  email: &string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        let id_field = &model.fields[0];
+        assert_eq!(id_field.field_type, FieldType::Uuid);
+        assert!(id_field.auto_generate);
+    }
+
+    #[test]
+    fn test_parse_timestamp_with_auto_generate() {
+        let input = r#"
+User {
+  created_at: +timestamp
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        let field = &model.fields[0];
+        assert_eq!(field.field_type, FieldType::Timestamp);
+        assert!(field.auto_generate);
+    }
+
+    #[test]
+    fn test_parse_invalid_auto_generate_with_string() {
+        let input = r#"
+User {
+  name: +string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Auto-generate symbol '+' cannot be used"));
+    }
+
+    #[test]
+    fn test_parse_invalid_auto_generate_with_i32() {
+        let input = r#"
+User {
+  count: +i32
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Auto-generate symbol '+' cannot be used"));
+    }
+
+    #[test]
+    fn test_parse_invalid_auto_generate_with_bool() {
+        let input = r#"
+User {
+  active: +bool
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("Auto-generate symbol '+' cannot be used"));
     }
 }
