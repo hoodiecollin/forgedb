@@ -1,22 +1,5 @@
 // Test example demonstrating all Sprint 2 types
-//
-// This example requires generating code from a specific schema first:
-// Run: cargo run -- examples/test_all_types_schema.sink && mv generated/database.rs examples/test_all_types_generated.rs
-//
-// For now, this example is disabled since it requires a different schema than the main one.
 
-fn main() {
-    println!("=== Sprint 2: All Types Example ===\n");
-    println!("This example requires a specific schema with all types.");
-    println!("To run this example:");
-    println!("  1. Generate code: cargo run -- examples/test_all_types_schema.sink");
-    println!("  2. Move generated code: mv generated/database.rs examples/test_all_types_generated.rs");
-    println!("  3. Uncomment the code in this file");
-    println!("\nFor now, please use the sprint3_indexing_queries example instead.");
-}
-
-/*
-// Uncomment this section after generating the schema
 mod generated {
     include!("test_all_types_generated.rs");
 }
@@ -105,4 +88,3 @@ fn main() {
     println!("  ✓ Timestamp type with auto-set");
     println!("  ✓ Total types supported: 9");
 }
-*/

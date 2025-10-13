@@ -12,20 +12,30 @@ use std::fs;
 use std::path::Path;
 
 fn main() {
-    // Example usage: parse schema and generate code
-    let schema_path = "schema.sink";
+    // Get schema path from command line or use default
+    let args: Vec<String> = std::env::args().collect();
+    let schema_path = if args.len() > 1 {
+        &args[1]
+    } else {
+        "schema.sink"
+    };
 
     if !Path::new(schema_path).exists() {
         eprintln!("Error: {} not found", schema_path);
-        eprintln!("Creating example schema...");
 
-        let example_schema = r#"User {
+        // Only create default schema if using the default path
+        if schema_path == "schema.sink" {
+            eprintln!("Creating example schema...");
+            let example_schema = r#"User {
   id: +u64
   email: &string
 }
 "#;
-        fs::write(schema_path, example_schema).expect("Failed to write example schema");
-        println!("Created example schema at {}", schema_path);
+            fs::write(schema_path, example_schema).expect("Failed to write example schema");
+            println!("Created example schema at {}", schema_path);
+        } else {
+            std::process::exit(1);
+        }
     }
 
     // Read schema file

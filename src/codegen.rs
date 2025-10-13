@@ -380,7 +380,11 @@ impl CodeGenerator {
                     continue;
                 }
 
-                if !field.auto_generate {
+                if field.auto_generate && field.name != id_field.name {
+                    // Preserve auto-generated fields (except ID which is already handled)
+                    code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", field.name, field.name));
+                } else if !field.auto_generate {
+                    // Use parameter values for non-auto-generated fields
                     let param_name = self.get_field_param_name(field);
                     code.push_str(&format!("            {},\n", param_name));
                 }
