@@ -10,3 +10,4 @@ bun.lockb
 schema.sink
 !examples/**/schema.sink
 Cargo.lock
+generated/
