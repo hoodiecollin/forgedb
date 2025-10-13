@@ -104,9 +104,10 @@ impl Parser {
         // Expect colon
         self.expect(Token::Colon)?;
 
-        // Check for symbols (+ and &)
+        // Check for symbols (+, &, and ^)
         let mut auto_generate = false;
         let mut unique = false;
+        let mut indexed = false;
 
         loop {
             match self.current_token() {
@@ -116,6 +117,10 @@ impl Parser {
                 }
                 Token::Ampersand => {
                     unique = true;
+                    self.advance();
+                }
+                Token::Caret => {
+                    indexed = true;
                     self.advance();
                 }
                 _ => break,
@@ -138,6 +143,7 @@ impl Parser {
             field_type,
             auto_generate,
             unique,
+            indexed,
         })
     }
 
@@ -661,5 +667,91 @@ User {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.contains("snake_case"));
+    }
+
+    // Sprint 3: Indexing tests
+    #[test]
+    fn test_parse_indexed_field() {
+        let input = r#"
+User {
+  id: +u64
+  username: ^string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        let username_field = &model.fields[1];
+        assert_eq!(username_field.name, "username");
+        assert!(username_field.indexed);
+        assert!(!username_field.unique);
+        assert!(!username_field.auto_generate);
+    }
+
+    #[test]
+    fn test_parse_indexed_and_unique_field() {
+        let input = r#"
+User {
+  id: +u64
+  email: ^&string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        let email_field = &model.fields[1];
+        assert_eq!(email_field.name, "email");
+        assert!(email_field.indexed);
+        assert!(email_field.unique);
+    }
+
+    #[test]
+    fn test_parse_indexed_symbol_order() {
+        let input = r#"
+User {
+  email1: ^&string
+  email2: &^string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        // Both orderings should work
+        assert!(model.fields[0].indexed);
+        assert!(model.fields[0].unique);
+        assert!(model.fields[1].indexed);
+        assert!(model.fields[1].unique);
+    }
+
+    #[test]
+    fn test_parse_multiple_indexed_fields() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string
+  username: ^string
+  age: u32
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        assert_eq!(model.fields.len(), 4);
+
+        assert!(model.fields[0].auto_generate);
+        assert!(!model.fields[0].indexed);
+
+        assert!(model.fields[1].indexed);
+        assert!(model.fields[1].unique);
+
+        assert!(model.fields[2].indexed);
+        assert!(!model.fields[2].unique);
+
+        assert!(!model.fields[3].indexed);
+        assert!(!model.fields[3].unique);
     }
 }

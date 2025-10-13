@@ -1,0 +1,6 @@
+User {
+  id: +uuid
+  email: ^&string
+  username: ^string
+  age: u32
+}

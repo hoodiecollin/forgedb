@@ -37,10 +37,15 @@ impl CodeGenerator {
         code.push_str("    next_id: u64,\n");
         code.push_str("    tombstones: Vec<bool>,\n");
 
-        // Add unique index maps for fields with & symbol
+        // Add index maps for fields with ^ or & symbols
         for field in &model.fields {
             if field.unique {
+                // Unique index (& symbol) - maps value to single row index
                 code.push_str(&format!("    {}_index: std::collections::HashMap<{}, usize>,\n",
+                    field.name, field.field_type.to_rust_type()));
+            } else if field.indexed {
+                // Non-unique index (^ symbol) - maps value to multiple row indices
+                code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
                     field.name, field.field_type.to_rust_type()));
             }
         }
@@ -63,7 +68,7 @@ impl CodeGenerator {
         code.push_str("            tombstones: Vec::new(),\n");
 
         for field in &model.fields {
-            if field.unique {
+            if field.unique || field.indexed {
                 code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field.name));
             }
         }
@@ -76,6 +81,18 @@ impl CodeGenerator {
 
         // Generate get() method
         self.generate_get_method(&mut code, model);
+
+        // Generate find_by_X methods for indexed fields
+        self.generate_find_by_methods(&mut code, model);
+
+        // Generate list() method
+        self.generate_list_method(&mut code, model);
+
+        // Generate update() method
+        self.generate_update_method(&mut code, model);
+
+        // Generate delete() method
+        self.generate_delete_method(&mut code, model);
 
         code.push_str("}\n\n");
 
@@ -132,10 +149,18 @@ impl CodeGenerator {
         }
         code.push_str("        };\n\n");
 
-        // Add to unique indexes
-        for field in &unique_fields {
-            code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), self.records.len());\n",
-                field.name, field.name));
+        // Add to indexes
+        code.push_str("        let row_index = self.records.len();\n");
+        for field in &model.fields {
+            if field.unique {
+                // Unique index: map value to single row index
+                code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), row_index);\n",
+                    field.name, field.name));
+            } else if field.indexed {
+                // Non-unique index: append row index to list of indices
+                code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
+                    field.name, field.name));
+            }
         }
 
         // Add record
@@ -156,7 +181,148 @@ impl CodeGenerator {
             code.push_str("            .find(|(i, r)| !self.tombstones[*i] && r.");
             code.push_str(&format!("{} == {})\n", id_field.name, id_field.name));
             code.push_str("            .map(|(_, r)| r.clone())\n");
-            code.push_str("    }\n");
+            code.push_str("    }\n\n");
+        }
+    }
+
+    fn generate_find_by_methods(&self, code: &mut String, model: &Model) {
+        // Generate find_by_X for indexed or unique fields
+        for field in &model.fields {
+            if field.indexed || field.unique {
+                let method_name = format!("find_by_{}", field.name);
+                code.push_str(&format!("    pub fn {}(&self, {}: {}) -> Vec<{}> {{\n",
+                    method_name, field.name, field.field_type.to_rust_type(), model.name));
+
+                if field.unique {
+                    // Unique index: O(1) lookup, returns 0 or 1 results
+                    code.push_str(&format!("        if let Some(&idx) = self.{}_index.get(&{}) {{\n", field.name, field.name));
+                    code.push_str("            if !self.tombstones[idx] {\n");
+                    code.push_str("                return vec![self.records[idx].clone()];\n");
+                    code.push_str("            }\n");
+                    code.push_str("        }\n");
+                    code.push_str("        Vec::new()\n");
+                } else {
+                    // Non-unique index: O(1) lookup, may return multiple results
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", field.name, field.name));
+                    code.push_str("            return indices.iter()\n");
+                    code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+                    code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                    code.push_str("                .collect();\n");
+                    code.push_str("        }\n");
+                    code.push_str("        Vec::new()\n");
+                }
+
+                code.push_str("    }\n\n");
+            }
+        }
+    }
+
+    fn generate_list_method(&self, code: &mut String, model: &Model) {
+        code.push_str(&format!("    pub fn list(&self) -> Vec<{}> {{\n", model.name));
+        code.push_str("        self.records.iter().enumerate()\n");
+        code.push_str("            .filter(|(i, _)| !self.tombstones[*i])\n");
+        code.push_str("            .map(|(_, r)| r.clone())\n");
+        code.push_str("            .collect()\n");
+        code.push_str("    }\n\n");
+    }
+
+    fn generate_update_method(&self, code: &mut String, model: &Model) {
+        // Find the ID field
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+
+        if let Some(id_field) = id_field {
+            code.push_str(&format!("    pub fn update(&mut self, {}: {}", id_field.name, id_field.field_type.to_rust_type()));
+
+            // Parameters: all non-auto-generated fields
+            for field in &model.fields {
+                if !field.auto_generate {
+                    code.push_str(&format!(", {}: {}", field.name, field.field_type.to_rust_type()));
+                }
+            }
+
+            code.push_str(&format!(") -> Result<{}, String> {{\n", model.name));
+
+            // Find the record
+            code.push_str("        let idx = self.records.iter().enumerate()\n");
+            code.push_str(&format!("            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n", id_field.name, id_field.name));
+            code.push_str("            .map(|(i, _)| i)\n");
+            code.push_str("            .ok_or_else(|| \"Record not found\".to_string())?;\n\n");
+
+            // Remove old values from indexes
+            for field in &model.fields {
+                if field.unique {
+                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", field.name, field.name));
+                } else if field.indexed {
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", field.name, field.name));
+                    code.push_str("            indices.retain(|&i| i != idx);\n");
+                    code.push_str("        }\n");
+                }
+            }
+
+            // Check unique constraints for new values
+            for field in &model.fields {
+                if field.unique && !field.auto_generate {
+                    code.push_str(&format!("        if self.{}_index.contains_key(&{}) && self.records[idx].{} != {} {{\n",
+                        field.name, field.name, field.name, field.name));
+                    code.push_str(&format!("            return Err(\"Unique constraint violation: {} already exists\".to_string());\n", field.name));
+                    code.push_str("        }\n");
+                }
+            }
+
+            // Update record
+            code.push_str(&format!("        self.records[idx] = {} {{\n", model.name));
+            code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", id_field.name, id_field.name));
+            for field in &model.fields {
+                if !field.auto_generate {
+                    code.push_str(&format!("            {},\n", field.name));
+                }
+            }
+            code.push_str("        };\n\n");
+
+            // Add new values to indexes
+            for field in &model.fields {
+                if field.unique {
+                    code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", field.name, field.name));
+                } else if field.indexed {
+                    code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
+                        field.name, field.name));
+                }
+            }
+
+            code.push_str("        Ok(self.records[idx].clone())\n");
+            code.push_str("    }\n\n");
+        }
+    }
+
+    fn generate_delete_method(&self, code: &mut String, model: &Model) {
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+
+        if let Some(id_field) = id_field {
+            code.push_str(&format!("    pub fn delete(&mut self, {}: {}) -> Result<(), String> {{\n",
+                id_field.name, id_field.field_type.to_rust_type()));
+
+            // Find the record
+            code.push_str("        let idx = self.records.iter().enumerate()\n");
+            code.push_str(&format!("            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n", id_field.name, id_field.name));
+            code.push_str("            .map(|(i, _)| i)\n");
+            code.push_str("            .ok_or_else(|| \"Record not found\".to_string())?;\n\n");
+
+            // Mark as deleted (tombstone)
+            code.push_str("        self.tombstones[idx] = true;\n\n");
+
+            // Remove from indexes (optional optimization to free memory)
+            for field in &model.fields {
+                if field.unique {
+                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", field.name, field.name));
+                } else if field.indexed {
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", field.name, field.name));
+                    code.push_str("            indices.retain(|&i| i != idx);\n");
+                    code.push_str("        }\n");
+                }
+            }
+
+            code.push_str("        Ok(())\n");
+            code.push_str("    }\n\n");
         }
     }
 
@@ -419,5 +585,149 @@ User {
 
         // Check email is a parameter (not auto-generated)
         assert!(code.contains("email: String"));
+    }
+
+    // Sprint 3: Indexing and Query Operations tests
+    #[test]
+    fn test_generate_indexed_field() {
+        let input = r#"
+User {
+  id: +u64
+  username: ^string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check non-unique index is generated (Vec<usize>)
+        assert!(code.contains("username_index: std::collections::HashMap<String, Vec<usize>>"));
+
+        // Check index is initialized
+        assert!(code.contains("username_index: std::collections::HashMap::new()"));
+
+        // Check index is maintained in insert
+        assert!(code.contains("self.username_index.entry(record.username.clone()).or_insert_with(Vec::new).push(row_index)"));
+
+        // Check find_by method is generated
+        assert!(code.contains("pub fn find_by_username"));
+    }
+
+    #[test]
+    fn test_generate_unique_indexed_field() {
+        let input = r#"
+User {
+  id: +u64
+  email: ^&string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check unique index is generated (usize, not Vec<usize>)
+        assert!(code.contains("email_index: std::collections::HashMap<String, usize>"));
+
+        // Check find_by method is generated
+        assert!(code.contains("pub fn find_by_email"));
+    }
+
+    #[test]
+    fn test_generate_list_method() {
+        let input = r#"
+User {
+  id: +u64
+  email: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check list method is generated
+        assert!(code.contains("pub fn list(&self) -> Vec<User>"));
+
+        // Check tombstone filtering
+        assert!(code.contains("filter(|(i, _)| !self.tombstones[*i])"));
+    }
+
+    #[test]
+    fn test_generate_update_method() {
+        let input = r#"
+User {
+  id: +uuid
+  email: string
+  age: u32
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check update method is generated
+        assert!(code.contains("pub fn update(&mut self, id: uuid::Uuid, email: String, age: u32)"));
+        assert!(code.contains("-> Result<User, String>"));
+
+        // Check record not found error
+        assert!(code.contains("Record not found"));
+    }
+
+    #[test]
+    fn test_generate_delete_method() {
+        let input = r#"
+User {
+  id: +u64
+  email: &string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check delete method is generated
+        assert!(code.contains("pub fn delete(&mut self, id: u64) -> Result<(), String>"));
+
+        // Check tombstone marking
+        assert!(code.contains("self.tombstones[idx] = true"));
+
+        // Check index cleanup
+        assert!(code.contains("self.email_index.remove(&self.records[idx].email)"));
+    }
+
+    #[test]
+    fn test_generate_update_with_indexes() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string
+  username: ^string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check update removes old values from indexes
+        assert!(code.contains("self.email_index.remove(&self.records[idx].email)"));
+        assert!(code.contains("self.username_index.get_mut(&self.records[idx].username)"));
+
+        // Check update adds new values to indexes
+        assert!(code.contains("self.email_index.insert(self.records[idx].email.clone(), idx)"));
+        assert!(code.contains("self.username_index.entry(self.records[idx].username.clone()).or_insert_with(Vec::new).push(idx)"));
+
+        // Check unique constraint validation on update
+        assert!(code.contains("if self.email_index.contains_key(&email) && self.records[idx].email != email"));
     }
 }

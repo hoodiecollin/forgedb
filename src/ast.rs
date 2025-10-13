@@ -19,6 +19,7 @@ pub struct Field {
     pub field_type: FieldType,
     pub auto_generate: bool, // + symbol
     pub unique: bool,        // & symbol
+    pub indexed: bool,       // ^ symbol
 }
 
 #[derive(Debug, Clone, PartialEq)]

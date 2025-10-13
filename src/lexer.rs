@@ -28,6 +28,7 @@ pub enum Token {
     // Symbols
     Plus,        // +
     Ampersand,   // &
+    Caret,       // ^
     Colon,       // :
     LBrace,      // {
     RBrace,      // }
@@ -134,6 +135,10 @@ impl Lexer {
             Some('&') => {
                 self.advance();
                 Ok(Token::Ampersand)
+            }
+            Some('^') => {
+                self.advance();
+                Ok(Token::Caret)
             }
             Some(':') => {
                 self.advance();

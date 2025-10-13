@@ -54,3 +54,8 @@ path = "examples/test_validation.rs"
 [[example]]
 name = "sprint2_persistence"
 path = "examples/sprint2_persistence/test_persistence.rs"
+
+# Sprint 3: Indexing & Query Operations
+[[example]]
+name = "sprint3_indexing_queries"
+path = "examples/sprint3_indexing_queries.rs"
