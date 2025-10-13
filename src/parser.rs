@@ -1,4 +1,4 @@
-use crate::ast::{Field, FieldType, Model, RelationType, Schema};
+use crate::ast::{Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema};
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
@@ -64,6 +64,55 @@ impl Parser {
         } else {
             Err(format!("Expected {:?}, found {:?}", expected, self.current_token()))
         }
+    }
+
+    fn parse_constraint(&mut self) -> Result<Constraint, String> {
+        // Expect @
+        self.expect(Token::At)?;
+
+        // Parse constraint name
+        let name = match self.current_token() {
+            Token::Ident(s) => s.clone(),
+            _ => return Err(format!("Expected constraint name after '@', found {:?}", self.current_token())),
+        };
+        self.advance();
+
+        let mut constraint = Constraint::new(name);
+
+        // Check for parameters
+        if matches!(self.current_token(), Token::LParen) {
+            self.advance();
+
+            // Parse parameters
+            loop {
+                match self.current_token() {
+                    Token::Number(n) => {
+                        constraint = constraint.with_param(ConstraintParam::Number(*n));
+                        self.advance();
+                    }
+                    Token::Ident(s) => {
+                        constraint = constraint.with_param(ConstraintParam::String(s.clone()));
+                        self.advance();
+                    }
+                    _ => return Err(format!("Expected constraint parameter, found {:?}", self.current_token())),
+                }
+
+                // Check for comma (more params) or closing paren
+                match self.current_token() {
+                    Token::Comma => {
+                        self.advance();
+                        continue;
+                    }
+                    Token::RParen => {
+                        self.advance();
+                        break;
+                    }
+                    _ => return Err(format!("Expected ',' or ')' in constraint parameters, found {:?}", self.current_token())),
+                }
+            }
+        }
+
+        Ok(constraint)
     }
 
     fn parse_type(&mut self) -> Result<FieldType, String> {
@@ -175,12 +224,20 @@ impl Parser {
             ));
         }
 
+        // Parse constraints (@directives)
+        let mut constraints = Vec::new();
+        while matches!(self.current_token(), Token::At) {
+            let constraint = self.parse_constraint()?;
+            constraints.push(constraint);
+        }
+
         Ok(Field {
             name,
             field_type,
             auto_generate,
             unique,
             indexed,
+            constraints,
         })
     }
 
@@ -950,5 +1007,216 @@ User {
         let result = parser.parse();
         // This should succeed - Post references User which exists
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_constraint_simple() {
+        let input = r#"
+User {
+  email: string @email
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.constraints.len(), 1);
+        assert_eq!(field.constraints[0].name, "email");
+        assert_eq!(field.constraints[0].params.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_constraint_with_number_param() {
+        let input = r#"
+User {
+  age: u32 @min(0) @max(150)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.constraints.len(), 2);
+
+        assert_eq!(field.constraints[0].name, "min");
+        assert_eq!(field.constraints[0].params.len(), 1);
+        assert_eq!(field.constraints[0].params[0], ConstraintParam::Number(0));
+
+        assert_eq!(field.constraints[1].name, "max");
+        assert_eq!(field.constraints[1].params.len(), 1);
+        assert_eq!(field.constraints[1].params[0], ConstraintParam::Number(150));
+    }
+
+    #[test]
+    fn test_parse_constraint_multiple() {
+        let input = r#"
+User {
+  password: string @min(8) @private
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.constraints.len(), 2);
+        assert_eq!(field.constraints[0].name, "min");
+        assert_eq!(field.constraints[1].name, "private");
+    }
+
+    #[test]
+    fn test_parse_constraint_with_symbols() {
+        let input = r#"
+User {
+  email: ^&string @email @unique
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert!(field.indexed);
+        assert!(field.unique);
+        assert_eq!(field.constraints.len(), 2);
+        assert_eq!(field.constraints[0].name, "email");
+        assert_eq!(field.constraints[1].name, "unique");
+    }
+
+    #[test]
+    fn test_parse_constraint_complex() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string @email
+  website: string @url
+  age: u32 @min(0) @max(150)
+  password: string @min(8) @private
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        assert_eq!(schema.models[0].fields.len(), 5);
+
+        // id has no constraints
+        assert_eq!(schema.models[0].fields[0].constraints.len(), 0);
+
+        // email has @email
+        assert_eq!(schema.models[0].fields[1].constraints.len(), 1);
+        assert_eq!(schema.models[0].fields[1].constraints[0].name, "email");
+
+        // website has @url
+        assert_eq!(schema.models[0].fields[2].constraints.len(), 1);
+        assert_eq!(schema.models[0].fields[2].constraints[0].name, "url");
+
+        // age has @min and @max
+        assert_eq!(schema.models[0].fields[3].constraints.len(), 2);
+
+        // password has @min and @private
+        assert_eq!(schema.models[0].fields[4].constraints.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_constraint_empty_params() {
+        let input = r#"
+User {
+  email: string @email()
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+
+        // Should fail - empty params not allowed for parameterized directive
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_constraint_with_pattern() {
+        // Test pattern constraint with identifier (not full regex yet)
+        let input = r#"
+User {
+  phone: string @pattern(phone_regex)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.constraints.len(), 1);
+        assert_eq!(field.constraints[0].name, "pattern");
+        assert_eq!(field.constraints[0].params.len(), 1);
+
+        // Check pattern parameter (currently supports identifier, not full regex string)
+        match &field.constraints[0].params[0] {
+            ConstraintParam::String(s) => {
+                assert_eq!(s, "phone_regex");
+            }
+            _ => panic!("Expected string parameter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_constraint_negative_number() {
+        // Test that negative numbers in constraints fail gracefully
+        // Current implementation doesn't support negative numbers in lexer
+        let input = r#"
+Temperature {
+  celsius: i32 @min(-273)
+}
+"#;
+        let result = Parser::new(input);
+
+        // Lexer should fail on the '-' character (not a valid token)
+        // This test documents the current limitation
+        assert!(result.is_err());
+        if let Err(e) = result {
+            // Should fail during lexing, not parsing
+            assert!(e.contains("Unexpected character") || e.contains("Expected"));
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_constraints_same_type() {
+        let input = r#"
+User {
+  name: string @min(2) @max(50)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let field = &schema.models[0].fields[0];
+        assert_eq!(field.constraints.len(), 2);
+
+        // Verify both min and max are present
+        assert!(field.constraints.iter().any(|c| c.name == "min"));
+        assert!(field.constraints.iter().any(|c| c.name == "max"));
+    }
+
+    #[test]
+    fn test_constraint_helper_methods() {
+        let input = r#"
+User {
+  email: string @email
+  age: u32 @min(0) @max(150)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let email_field = &schema.models[0].fields[0];
+        let age_field = &schema.models[0].fields[1];
+
+        // Test has_constraint
+        assert!(email_field.has_constraint("email"));
+        assert!(!email_field.has_constraint("url"));
+        assert!(age_field.has_constraint("min"));
+        assert!(age_field.has_constraint("max"));
+
+        // Test get_constraint
+        assert!(email_field.get_constraint("email").is_some());
+        assert!(email_field.get_constraint("url").is_none());
+
+        let min_constraint = age_field.get_constraint("min").unwrap();
+        assert_eq!(min_constraint.params.len(), 1);
     }
 }

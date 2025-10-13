@@ -1,5 +1,33 @@
 /// Abstract Syntax Tree representation
 
+/// Constraint parameter value
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstraintParam {
+    Number(i64),
+    String(String),
+}
+
+/// Constraint directive (e.g., @min(10), @email)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Constraint {
+    pub name: String,
+    pub params: Vec<ConstraintParam>,
+}
+
+impl Constraint {
+    pub fn new(name: String) -> Self {
+        Constraint {
+            name,
+            params: Vec::new(),
+        }
+    }
+
+    pub fn with_param(mut self, param: ConstraintParam) -> Self {
+        self.params.push(param);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     U32,
@@ -32,6 +60,7 @@ pub struct Field {
     pub auto_generate: bool, // + symbol
     pub unique: bool,        // & symbol
     pub indexed: bool,       // ^ symbol
+    pub constraints: Vec<Constraint>, // @ directives
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,6 +170,24 @@ impl FieldType {
 
     pub fn is_relation(&self) -> bool {
         matches!(self, FieldType::Relation(_))
+    }
+}
+
+impl Field {
+    /// Check if field has a specific constraint
+    pub fn has_constraint(&self, name: &str) -> bool {
+        self.constraints.iter().any(|c| c.name == name)
+    }
+
+    /// Get a constraint by name
+    pub fn get_constraint(&self, name: &str) -> Option<&Constraint> {
+        self.constraints.iter().find(|c| c.name == name)
+    }
+
+    /// Check if field is nullable (no constraint yet, but useful for future)
+    pub fn is_nullable(&self) -> bool {
+        // For now, only optional references are nullable
+        matches!(&self.field_type, FieldType::Relation(RelationType::OptionalReference(_)))
     }
 }
 

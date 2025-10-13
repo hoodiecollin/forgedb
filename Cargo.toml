@@ -18,6 +18,7 @@ sinkdb-storage = { path = "crates/storage" }
 sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
+regex = "1.10"
 
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
@@ -59,3 +60,18 @@ path = "examples/sprint2_persistence/test_persistence.rs"
 [[example]]
 name = "sprint3_indexing_queries"
 path = "examples/sprint3_indexing_queries.rs"
+
+# Sprint 4: Relations (One-to-Many)
+[[example]]
+name = "sprint4_relations"
+path = "examples/sprint4_relations.rs"
+
+# Sprint 5: Constraints & Validation
+[[example]]
+name = "sprint5_constraints"
+path = "examples/sprint5_constraints.rs"
+
+# Sprint 5: Constraint Validation Integration Test
+[[example]]
+name = "test_constraint_validation"
+path = "examples/test_constraint_validation.rs"
