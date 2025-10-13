@@ -49,3 +49,8 @@ path = "examples/test_all_types.rs"
 [[example]]
 name = "test_validation"
 path = "examples/test_validation.rs"
+
+# Sprint 2 Persistence Example
+[[example]]
+name = "sprint2_persistence"
+path = "examples/sprint2_persistence/test_persistence.rs"

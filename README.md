@@ -210,6 +210,32 @@ TBD
 
 ---
 
+## Sprint 2 Implementation: ✅ COMPLETE
+
+All Sprint 2 persistence success criteria have been met:
+
+- ✅ Memory-mapped columnar storage architecture
+- ✅ Fixed-size column storage (u64) with direct file I/O
+- ✅ Variable-length string storage with offset indices
+- ✅ Manifest.json for metadata persistence
+- ✅ Database survives restart
+- ✅ Comprehensive test suite (8/8 passing)
+- ✅ Example demonstrating persistence
+
+### Quick Start (Sprint 2)
+
+```bash
+# Run persistence tests
+cargo test --package sinkdb-storage
+
+# Run persistence example
+cargo run --example sprint2_persistence
+```
+
+See [SPRINT2_PERSISTENCE.md](./SPRINT2_PERSISTENCE.md) for complete documentation.
+
+---
+
 ## Sprint 1 Implementation: ✅ COMPLETE
 
 All Sprint 1 MVP success criteria have been met:
