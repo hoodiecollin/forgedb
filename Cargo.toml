@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    ".",
+    "crates/storage",
+    "crates/types",
+    "crates/validation",
+    "crates/tests",
+]
+resolver = "2"
+
+[package]
+name = "sinkdb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sinkdb-storage = { path = "crates/storage" }
+sinkdb-types = { path = "crates/types" }
+sinkdb-validation = { path = "crates/validation" }
+uuid = { version = "1.6", features = ["v4"] }
+
+[dev-dependencies]
+sinkdb-validation = { path = "crates/validation" }
+
+[lib]
+name = "sinkdb"
+path = "src/main.rs"
+
+# Sprint 1 MVP Examples
+[[example]]
+name = "sprint1_mvp_app"
+path = "examples/sprint1_mvp/app.rs"
+
+[[example]]
+name = "sprint1_mvp_client"
+path = "examples/sprint1_mvp/client.rs"
+
+# Original basic example
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+
+# Sprint 2: Test all types
+[[example]]
+name = "test_all_types"
+path = "examples/test_all_types.rs"
+
+# Validation demo
+[[example]]
+name = "test_validation"
+path = "examples/test_validation.rs"
+
+# Sprint 2 Persistence Example
+[[example]]
+name = "sprint2_persistence"
+path = "examples/sprint2_persistence/test_persistence.rs"

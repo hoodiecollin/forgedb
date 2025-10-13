@@ -1,0 +1,9 @@
+// Sprint 1 MVP Schema
+// A simple User model demonstrating:
+// - Auto-increment ID (+u64)
+// - Unique constraint (&string)
+
+User {
+  id: +u64
+  email: &string
+}
