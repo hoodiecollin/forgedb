@@ -1,4 +1,4 @@
-use crate::ast::{Field, FieldType, Model, Schema};
+use crate::ast::{Field, FieldType, Model, RelationType, Schema};
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
@@ -67,6 +67,43 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<FieldType, String> {
+        // Check for relation types first
+        match self.current_token() {
+            // One-to-many: [Post]
+            Token::LBracket => {
+                self.advance();
+                let model_name = match self.current_token() {
+                    Token::Ident(name) => name.clone(),
+                    _ => return Err(format!("Expected model name after '[', found {:?}", self.current_token())),
+                };
+                self.advance();
+                self.expect(Token::RBracket)?;
+                return Ok(FieldType::Relation(RelationType::OneToMany(model_name)));
+            }
+            // Required reference: *User
+            Token::Asterisk => {
+                self.advance();
+                let model_name = match self.current_token() {
+                    Token::Ident(name) => name.clone(),
+                    _ => return Err(format!("Expected model name after '*', found {:?}", self.current_token())),
+                };
+                self.advance();
+                return Ok(FieldType::Relation(RelationType::RequiredReference(model_name)));
+            }
+            // Optional reference: ?User
+            Token::Question => {
+                self.advance();
+                let model_name = match self.current_token() {
+                    Token::Ident(name) => name.clone(),
+                    _ => return Err(format!("Expected model name after '?', found {:?}", self.current_token())),
+                };
+                self.advance();
+                return Ok(FieldType::Relation(RelationType::OptionalReference(model_name)));
+            }
+            _ => {}
+        }
+
+        // Primitive types
         let field_type = match self.current_token() {
             Token::TypeU32 => FieldType::U32,
             Token::TypeU64 => FieldType::U64,
@@ -219,7 +256,12 @@ impl Parser {
             return Err("Schema is empty".to_string());
         }
 
-        Ok(Schema { models })
+        let schema = Schema { models };
+
+        // Validate relations
+        schema.validate_relations()?;
+
+        Ok(schema)
     }
 }
 
@@ -753,5 +795,160 @@ User {
 
         assert!(!model.fields[3].indexed);
         assert!(!model.fields[3].unique);
+    }
+
+    // Sprint 4: Relation tests
+    #[test]
+    fn test_parse_one_to_many_relation() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        let posts_field = &model.fields[1];
+        assert_eq!(posts_field.name, "posts");
+        assert!(posts_field.field_type.is_relation());
+        match &posts_field.field_type {
+            FieldType::Relation(RelationType::OneToMany(target)) => {
+                assert_eq!(target, "Post");
+            }
+            _ => panic!("Expected OneToMany relation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_required_reference() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[1];
+        let author_field = &model.fields[1];
+        assert_eq!(author_field.name, "author");
+        assert!(author_field.field_type.is_relation());
+        match &author_field.field_type {
+            FieldType::Relation(RelationType::RequiredReference(target)) => {
+                assert_eq!(target, "User");
+            }
+            _ => panic!("Expected RequiredReference relation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_optional_reference() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+  reviewer: ?User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[1];
+        let reviewer_field = &model.fields[1];
+        assert_eq!(reviewer_field.name, "reviewer");
+        assert!(reviewer_field.field_type.is_relation());
+        match &reviewer_field.field_type {
+            FieldType::Relation(RelationType::OptionalReference(target)) => {
+                assert_eq!(target, "User");
+            }
+            _ => panic!("Expected OptionalReference relation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_full_relation_schema() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        assert_eq!(schema.models.len(), 2);
+
+        let user = &schema.models[0];
+        assert_eq!(user.name, "User");
+        assert_eq!(user.fields.len(), 3);
+
+        let post = &schema.models[1];
+        assert_eq!(post.name, "Post");
+        assert_eq!(post.fields.len(), 3);
+
+        // Test relation detection
+        let relations = schema.detect_relations();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].parent_model, "User");
+        assert_eq!(relations[0].parent_field, "posts");
+        assert_eq!(relations[0].child_model, "Post");
+        assert_eq!(relations[0].child_field, "author");
+        assert!(relations[0].is_required);
+    }
+
+    #[test]
+    fn test_parse_invalid_relation_undefined_model() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [NonExistentModel]
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("references undefined model"));
+        assert!(error.contains("NonExistentModel"));
+    }
+
+    #[test]
+    fn test_parse_relation_validation() {
+        let input = r#"
+Post {
+  id: +uuid
+  author: *User
+}
+
+User {
+  id: +uuid
+  email: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        // This should succeed - Post references User which exists
+        assert!(result.is_ok());
     }
 }

@@ -1,4 +1,4 @@
-use crate::ast::{Field, Model, Schema};
+use crate::ast::{Field, FieldType, Model, RelationType, Schema};
 
 pub struct CodeGenerator;
 
@@ -8,8 +8,23 @@ impl CodeGenerator {
     }
 
     fn generate_field_declaration(&self, field: &Field) -> String {
-        let rust_type = field.field_type.to_rust_type();
-        format!("    pub {}: {},", field.name, rust_type)
+        // Skip OneToMany fields - they are virtual and don't store data
+        if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            return String::new();
+        }
+
+        // For reference fields, generate the FK field name
+        let (field_name, rust_type) = match &field.field_type {
+            FieldType::Relation(RelationType::RequiredReference(_)) => {
+                (format!("{}_id", field.name), "uuid::Uuid".to_string())
+            }
+            FieldType::Relation(RelationType::OptionalReference(_)) => {
+                (format!("{}_id", field.name), "Option<uuid::Uuid>".to_string())
+            }
+            _ => (field.name.clone(), field.field_type.to_rust_type()),
+        };
+
+        format!("    pub {}: {},", field_name, rust_type)
     }
 
     fn generate_struct(&self, model: &Model) -> String {
@@ -20,8 +35,11 @@ impl CodeGenerator {
         code.push_str(&format!("pub struct {} {{\n", model.name));
 
         for field in &model.fields {
-            code.push_str(&self.generate_field_declaration(field));
-            code.push('\n');
+            let field_decl = self.generate_field_declaration(field);
+            if !field_decl.is_empty() {
+                code.push_str(&field_decl);
+                code.push('\n');
+            }
         }
 
         code.push_str("}\n\n");
@@ -37,16 +55,35 @@ impl CodeGenerator {
         code.push_str("    next_id: u64,\n");
         code.push_str("    tombstones: Vec<bool>,\n");
 
-        // Add index maps for fields with ^ or & symbols
+        // Add index maps for fields with ^ or & symbols, and for FK fields
         for field in &model.fields {
+            // Skip OneToMany fields
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+
+            // Get the actual field name and type for storage
+            let (field_name, field_type) = match &field.field_type {
+                FieldType::Relation(RelationType::RequiredReference(_)) => {
+                    (format!("{}_id", field.name), "uuid::Uuid".to_string())
+                }
+                FieldType::Relation(RelationType::OptionalReference(_)) => {
+                    (format!("{}_id", field.name), "Option<uuid::Uuid>".to_string())
+                }
+                _ => (field.name.clone(), field.field_type.to_rust_type()),
+            };
+
+            // FK fields are automatically indexed (non-unique)
+            let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
             if field.unique {
                 // Unique index (& symbol) - maps value to single row index
                 code.push_str(&format!("    {}_index: std::collections::HashMap<{}, usize>,\n",
-                    field.name, field.field_type.to_rust_type()));
-            } else if field.indexed {
-                // Non-unique index (^ symbol) - maps value to multiple row indices
+                    field_name, field_type));
+            } else if field.indexed || is_fk {
+                // Non-unique index (^ symbol or FK) - maps value to multiple row indices
                 code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
-                    field.name, field.field_type.to_rust_type()));
+                    field_name, field_type));
             }
         }
 
@@ -68,8 +105,20 @@ impl CodeGenerator {
         code.push_str("            tombstones: Vec::new(),\n");
 
         for field in &model.fields {
-            if field.unique || field.indexed {
-                code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field.name));
+            // Skip OneToMany fields
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+
+            let field_name = match &field.field_type {
+                FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
+                _ => field.name.clone(),
+            };
+
+            let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
+            if field.unique || field.indexed || is_fk {
+                code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
             }
         }
 
@@ -99,18 +148,37 @@ impl CodeGenerator {
         code
     }
 
-    fn generate_insert_method(&self, code: &mut String, model: &Model) {
-        use crate::ast::FieldType;
+    fn get_field_param_name(&self, field: &Field) -> String {
+        match &field.field_type {
+            FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
+            _ => field.name.clone(),
+        }
+    }
 
+    fn get_field_param_type(&self, field: &Field) -> String {
+        match &field.field_type {
+            FieldType::Relation(RelationType::RequiredReference(_)) => "uuid::Uuid".to_string(),
+            FieldType::Relation(RelationType::OptionalReference(_)) => "Option<uuid::Uuid>".to_string(),
+            _ => field.field_type.to_rust_type(),
+        }
+    }
+
+    fn generate_insert_method(&self, code: &mut String, model: &Model) {
         // Find unique fields
         let unique_fields: Vec<&Field> = model.fields.iter().filter(|f| f.unique).collect();
 
         code.push_str("    pub fn insert(&mut self");
 
-        // Parameters: all fields except auto-generated ones
+        // Parameters: all fields except auto-generated and OneToMany ones
         for field in &model.fields {
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue; // Skip virtual fields
+            }
+
             if !field.auto_generate {
-                code.push_str(&format!(", {}: {}", field.name, field.field_type.to_rust_type()));
+                let param_name = self.get_field_param_name(field);
+                let param_type = self.get_field_param_type(field);
+                code.push_str(&format!(", {}: {}", param_name, param_type));
             }
         }
 
@@ -145,21 +213,33 @@ impl CodeGenerator {
         // Create record
         code.push_str(&format!("        let record = {} {{\n", model.name));
         for field in &model.fields {
-            code.push_str(&format!("            {},\n", field.name));
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue; // Skip virtual fields
+            }
+
+            let field_name = self.get_field_param_name(field);
+            code.push_str(&format!("            {},\n", field_name));
         }
         code.push_str("        };\n\n");
 
         // Add to indexes
         code.push_str("        let row_index = self.records.len();\n");
         for field in &model.fields {
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+
+            let field_name = self.get_field_param_name(field);
+            let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
             if field.unique {
                 // Unique index: map value to single row index
                 code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), row_index);\n",
-                    field.name, field.name));
-            } else if field.indexed {
+                    field_name, field_name));
+            } else if field.indexed || is_fk {
                 // Non-unique index: append row index to list of indices
                 code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
-                    field.name, field.name));
+                    field_name, field_name));
             }
         }
 
@@ -186,16 +266,25 @@ impl CodeGenerator {
     }
 
     fn generate_find_by_methods(&self, code: &mut String, model: &Model) {
-        // Generate find_by_X for indexed or unique fields
+        // Generate find_by_X for indexed or unique fields, and FK fields
         for field in &model.fields {
-            if field.indexed || field.unique {
-                let method_name = format!("find_by_{}", field.name);
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+
+            let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
+            if field.indexed || field.unique || is_fk {
+                let param_name = self.get_field_param_name(field);
+                let param_type = self.get_field_param_type(field);
+                let method_name = format!("find_by_{}", param_name);
+
                 code.push_str(&format!("    pub fn {}(&self, {}: {}) -> Vec<{}> {{\n",
-                    method_name, field.name, field.field_type.to_rust_type(), model.name));
+                    method_name, param_name, param_type, model.name));
 
                 if field.unique {
                     // Unique index: O(1) lookup, returns 0 or 1 results
-                    code.push_str(&format!("        if let Some(&idx) = self.{}_index.get(&{}) {{\n", field.name, field.name));
+                    code.push_str(&format!("        if let Some(&idx) = self.{}_index.get(&{}) {{\n", param_name, param_name));
                     code.push_str("            if !self.tombstones[idx] {\n");
                     code.push_str("                return vec![self.records[idx].clone()];\n");
                     code.push_str("            }\n");
@@ -203,7 +292,7 @@ impl CodeGenerator {
                     code.push_str("        Vec::new()\n");
                 } else {
                     // Non-unique index: O(1) lookup, may return multiple results
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", field.name, field.name));
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
                     code.push_str("            return indices.iter()\n");
                     code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
                     code.push_str("                .map(|&idx| self.records[idx].clone())\n");
@@ -233,10 +322,16 @@ impl CodeGenerator {
         if let Some(id_field) = id_field {
             code.push_str(&format!("    pub fn update(&mut self, {}: {}", id_field.name, id_field.field_type.to_rust_type()));
 
-            // Parameters: all non-auto-generated fields
+            // Parameters: all non-auto-generated, non-OneToMany fields
             for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                    continue;
+                }
+
                 if !field.auto_generate {
-                    code.push_str(&format!(", {}: {}", field.name, field.field_type.to_rust_type()));
+                    let param_name = self.get_field_param_name(field);
+                    let param_type = self.get_field_param_type(field);
+                    code.push_str(&format!(", {}: {}", param_name, param_type));
                 }
             }
 
@@ -250,10 +345,17 @@ impl CodeGenerator {
 
             // Remove old values from indexes
             for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                    continue;
+                }
+
+                let param_name = self.get_field_param_name(field);
+                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", field.name, field.name));
-                } else if field.indexed {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", field.name, field.name));
+                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
+                } else if field.indexed || is_fk {
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
                     code.push_str("            indices.retain(|&i| i != idx);\n");
                     code.push_str("        }\n");
                 }
@@ -262,9 +364,10 @@ impl CodeGenerator {
             // Check unique constraints for new values
             for field in &model.fields {
                 if field.unique && !field.auto_generate {
+                    let param_name = self.get_field_param_name(field);
                     code.push_str(&format!("        if self.{}_index.contains_key(&{}) && self.records[idx].{} != {} {{\n",
-                        field.name, field.name, field.name, field.name));
-                    code.push_str(&format!("            return Err(\"Unique constraint violation: {} already exists\".to_string());\n", field.name));
+                        param_name, param_name, param_name, param_name));
+                    code.push_str(&format!("            return Err(\"Unique constraint violation: {} already exists\".to_string());\n", param_name));
                     code.push_str("        }\n");
                 }
             }
@@ -273,19 +376,31 @@ impl CodeGenerator {
             code.push_str(&format!("        self.records[idx] = {} {{\n", model.name));
             code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", id_field.name, id_field.name));
             for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                    continue;
+                }
+
                 if !field.auto_generate {
-                    code.push_str(&format!("            {},\n", field.name));
+                    let param_name = self.get_field_param_name(field);
+                    code.push_str(&format!("            {},\n", param_name));
                 }
             }
             code.push_str("        };\n\n");
 
             // Add new values to indexes
             for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                    continue;
+                }
+
+                let param_name = self.get_field_param_name(field);
+                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", field.name, field.name));
-                } else if field.indexed {
+                    code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", param_name, param_name));
+                } else if field.indexed || is_fk {
                     code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
-                        field.name, field.name));
+                        param_name, param_name));
                 }
             }
 
@@ -312,10 +427,17 @@ impl CodeGenerator {
 
             // Remove from indexes (optional optimization to free memory)
             for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                    continue;
+                }
+
+                let param_name = self.get_field_param_name(field);
+                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", field.name, field.name));
-                } else if field.indexed {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", field.name, field.name));
+                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
+                } else if field.indexed || is_fk {
+                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
                     code.push_str("            indices.retain(|&i| i != idx);\n");
                     code.push_str("        }\n");
                 }
@@ -729,5 +851,158 @@ User {
 
         // Check unique constraint validation on update
         assert!(code.contains("if self.email_index.contains_key(&email) && self.records[idx].email != email"));
+    }
+
+    // Sprint 4: Relation tests
+    #[test]
+    fn test_generate_relation_one_to_many() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // User struct should NOT have posts field (virtual)
+        assert!(code.contains("pub struct User"));
+        assert!(!code.contains("pub posts:"));
+        assert!(code.contains("pub id: uuid::Uuid"));
+    }
+
+    #[test]
+    fn test_generate_relation_required_reference() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Post struct should have author_id field (FK)
+        assert!(code.contains("pub struct Post"));
+        assert!(code.contains("pub author_id: uuid::Uuid"));
+
+        // PostStorage should have author_id_index
+        assert!(code.contains("pub struct PostStorage"));
+        assert!(code.contains("author_id_index: std::collections::HashMap<uuid::Uuid, Vec<usize>>"));
+
+        // Insert should take author_id parameter
+        assert!(code.contains("pub fn insert(&mut self, author_id: uuid::Uuid)"));
+
+        // Should generate find_by_author_id method
+        assert!(code.contains("pub fn find_by_author_id(&self, author_id: uuid::Uuid)"));
+
+        // author_id should be indexed
+        assert!(code.contains("self.author_id_index.entry(record.author_id.clone()).or_insert_with(Vec::new).push(row_index)"));
+    }
+
+    #[test]
+    fn test_generate_relation_optional_reference() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+  reviewer: ?User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Post struct should have optional reviewer_id field
+        assert!(code.contains("pub struct Post"));
+        assert!(code.contains("pub reviewer_id: Option<uuid::Uuid>"));
+
+        // Should generate find_by_reviewer_id method
+        assert!(code.contains("pub fn find_by_reviewer_id(&self, reviewer_id: Option<uuid::Uuid>)"));
+    }
+
+    #[test]
+    fn test_generate_full_relation_schema() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // User struct
+        assert!(code.contains("pub struct User"));
+        assert!(code.contains("pub id: uuid::Uuid"));
+        assert!(code.contains("pub email: String"));
+        assert!(!code.contains("pub posts:"));
+
+        // Post struct with FK
+        assert!(code.contains("pub struct Post"));
+        assert!(code.contains("pub title: String"));
+        assert!(code.contains("pub author_id: uuid::Uuid"));
+
+        // Indexes
+        assert!(code.contains("email_index: std::collections::HashMap<String, usize>"));
+        assert!(code.contains("author_id_index: std::collections::HashMap<uuid::Uuid, Vec<usize>>"));
+
+        // Methods
+        assert!(code.contains("pub fn find_by_email(&self, email: String)"));
+        assert!(code.contains("pub fn find_by_author_id(&self, author_id: uuid::Uuid)"));
+    }
+
+    #[test]
+    fn test_detect_relations() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let relations = schema.detect_relations();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].parent_model, "User");
+        assert_eq!(relations[0].parent_field, "posts");
+        assert_eq!(relations[0].child_model, "Post");
+        assert_eq!(relations[0].child_field, "author");
+        assert!(relations[0].is_required);
     }
 }

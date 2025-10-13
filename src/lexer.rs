@@ -32,6 +32,10 @@ pub enum Token {
     Colon,       // :
     LBrace,      // {
     RBrace,      // }
+    LBracket,    // [
+    RBracket,    // ]
+    Asterisk,    // *
+    Question,    // ?
 
     // Whitespace and EOF
     Newline,
@@ -151,6 +155,22 @@ impl Lexer {
             Some('}') => {
                 self.advance();
                 Ok(Token::RBrace)
+            }
+            Some('[') => {
+                self.advance();
+                Ok(Token::LBracket)
+            }
+            Some(']') => {
+                self.advance();
+                Ok(Token::RBracket)
+            }
+            Some('*') => {
+                self.advance();
+                Ok(Token::Asterisk)
+            }
+            Some('?') => {
+                self.advance();
+                Ok(Token::Question)
             }
             Some(ch) if ch.is_alphabetic() || ch == '_' => {
                 let ident = self.read_identifier();
