@@ -1,4 +1,4 @@
-use crate::ast::{Field, FieldType, Model, RelationType, Schema};
+use crate::ast::{ConstraintParam, Field, FieldType, IndexType, Model, RelationType, Schema};
 
 pub struct CodeGenerator;
 
@@ -81,10 +81,50 @@ impl CodeGenerator {
                 code.push_str(&format!("    {}_index: std::collections::HashMap<{}, usize>,\n",
                     field_name, field_type));
             } else if field.indexed || is_fk {
-                // Non-unique index (^ symbol or FK) - maps value to multiple row indices
-                code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
-                    field_name, field_type));
+                // Indexed fields use either Hash or BTree based on field type
+                match field.index_type {
+                    IndexType::Hash => {
+                        // Hash index for unordered types
+                        code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                            field_name, field_type));
+                    }
+                    IndexType::BTree => {
+                        // B-tree index for ordered types (supports range queries)
+                        let btree_key_type = if matches!(field.field_type, FieldType::F64) {
+                            "ordered_float::OrderedFloat<f64>".to_string()
+                        } else {
+                            field_type.clone()
+                        };
+                        code.push_str(&format!("    {}_btree: std::collections::BTreeMap<{}, Vec<usize>>,\n",
+                            field_name, btree_key_type));
+                    }
+                }
             }
+        }
+
+        // Add composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            let field_types: Vec<String> = comp_idx.fields.iter()
+                .filter_map(|fname| {
+                    model.fields.iter()
+                        .find(|f| &f.name == fname)
+                        .map(|f| {
+                            match &f.field_type {
+                                FieldType::Relation(RelationType::RequiredReference(_)) => {
+                                    "uuid::Uuid".to_string()
+                                }
+                                FieldType::Relation(RelationType::OptionalReference(_)) => {
+                                    "Option<uuid::Uuid>".to_string()
+                                }
+                                _ => f.field_type.to_rust_type(),
+                            }
+                        })
+                })
+                .collect();
+            let tuple_type = format!("({})", field_types.join(", "));
+            code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                index_name, tuple_type));
         }
 
         code.push_str("}\n\n");
@@ -117,9 +157,24 @@ impl CodeGenerator {
 
             let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
-            if field.unique || field.indexed || is_fk {
+            if field.unique {
                 code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+            } else if field.indexed || is_fk {
+                match field.index_type {
+                    IndexType::Hash => {
+                        code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+                    }
+                    IndexType::BTree => {
+                        code.push_str(&format!("            {}_btree: std::collections::BTreeMap::new(),\n", field_name));
+                    }
+                }
             }
+        }
+
+        // Initialize composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", index_name));
         }
 
         code.push_str("        }\n");
@@ -163,6 +218,116 @@ impl CodeGenerator {
         }
     }
 
+    fn generate_validation_functions(&self) -> String {
+        let mut code = String::new();
+
+        // Email validation function
+        code.push_str(r#"fn validate_email(value: &str) -> Result<(), String> {
+    let email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
+    if !regex::Regex::new(email_regex).unwrap().is_match(value) {
+        return Err(format!("'{}' is not a valid email address", value));
+    }
+    Ok(())
+}
+
+"#);
+
+        // URL validation function
+        code.push_str(r#"fn validate_url(value: &str) -> Result<(), String> {
+    let url_regex = r"^https?://[^\s/$.?#].[^\s]*$";
+    if !regex::Regex::new(url_regex).unwrap().is_match(value) {
+        return Err(format!("'{}' is not a valid URL", value));
+    }
+    Ok(())
+}
+
+"#);
+
+        // Pattern validation function (generic)
+        code.push_str(r#"fn validate_pattern(value: &str, pattern: &str) -> Result<(), String> {
+    if !regex::Regex::new(pattern).unwrap().is_match(value) {
+        return Err(format!("'{}' does not match required pattern", value));
+    }
+    Ok(())
+}
+
+"#);
+
+        code
+    }
+
+    fn generate_field_validation(&self, field: &Field) -> String {
+        let mut code = String::new();
+
+        // Skip validation for relations
+        if matches!(&field.field_type, FieldType::Relation(_)) {
+            return code;
+        }
+
+        for constraint in &field.constraints {
+            match constraint.name.as_str() {
+                "email" => {
+                    if matches!(field.field_type, FieldType::String) {
+                        code.push_str(&format!("        validate_email(&{})?;\n", field.name));
+                    }
+                }
+                "url" => {
+                    if matches!(field.field_type, FieldType::String) {
+                        code.push_str(&format!("        validate_url(&{})?;\n", field.name));
+                    }
+                }
+                "min" => {
+                    if let Some(ConstraintParam::Number(min_val)) = constraint.params.first() {
+                        match field.field_type {
+                            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => {
+                                code.push_str(&format!("        if {} < {} {{\n", field.name, min_val));
+                                code.push_str(&format!("            return Err(\"Validation error: {} must be at least {}\".to_string());\n", field.name, min_val));
+                                code.push_str("        }\n");
+                            }
+                            FieldType::String => {
+                                // For strings, min means minimum length
+                                code.push_str(&format!("        if {}.len() < {} {{\n", field.name, min_val));
+                                code.push_str(&format!("            return Err(\"Validation error: {} must be at least {} characters\".to_string());\n", field.name, min_val));
+                                code.push_str("        }\n");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "max" => {
+                    if let Some(ConstraintParam::Number(max_val)) = constraint.params.first() {
+                        match field.field_type {
+                            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => {
+                                code.push_str(&format!("        if {} > {} {{\n", field.name, max_val));
+                                code.push_str(&format!("            return Err(\"Validation error: {} must be at most {}\".to_string());\n", field.name, max_val));
+                                code.push_str("        }\n");
+                            }
+                            FieldType::String => {
+                                // For strings, max means maximum length
+                                code.push_str(&format!("        if {}.len() > {} {{\n", field.name, max_val));
+                                code.push_str(&format!("            return Err(\"Validation error: {} must be at most {} characters\".to_string());\n", field.name, max_val));
+                                code.push_str("        }\n");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "pattern" => {
+                    if let Some(ConstraintParam::String(pattern)) = constraint.params.first() {
+                        if matches!(field.field_type, FieldType::String) {
+                            code.push_str(&format!("        validate_pattern(&{}, \"{}\")?;\n", field.name, pattern));
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown constraints are ignored for now
+                }
+            }
+        }
+
+        code
+    }
+
     fn generate_insert_method(&self, code: &mut String, model: &Model) {
         // Find unique fields
         let unique_fields: Vec<&Field> = model.fields.iter().filter(|f| f.unique).collect();
@@ -183,6 +348,16 @@ impl CodeGenerator {
         }
 
         code.push_str(&format!(") -> Result<{}, String> {{\n", model.name));
+
+        // Validate field constraints
+        for field in &model.fields {
+            if !field.auto_generate && !field.constraints.is_empty() {
+                let validation = self.generate_field_validation(field);
+                if !validation.is_empty() {
+                    code.push_str(&validation);
+                }
+            }
+        }
 
         // Check unique constraints
         for field in &unique_fields {
@@ -237,10 +412,39 @@ impl CodeGenerator {
                 code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), row_index);\n",
                     field_name, field_name));
             } else if field.indexed || is_fk {
-                // Non-unique index: append row index to list of indices
-                code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
-                    field_name, field_name));
+                match field.index_type {
+                    IndexType::Hash => {
+                        // Hash index: append row index to list of indices
+                        code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
+                            field_name, field_name));
+                    }
+                    IndexType::BTree => {
+                        // B-tree index: append row index to list of indices
+                        if matches!(field.field_type, FieldType::F64) {
+                            code.push_str(&format!("        self.{}_btree.entry(ordered_float::OrderedFloat(record.{})).or_insert_with(Vec::new).push(row_index);\n",
+                                field_name, field_name));
+                        } else {
+                            code.push_str(&format!("        self.{}_btree.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
+                                field_name, field_name));
+                        }
+                    }
+                }
             }
+        }
+
+        // Add to composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            let field_values: Vec<String> = comp_idx.fields.iter()
+                .map(|fname| {
+                    let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                    let field_name = self.get_field_param_name(field);
+                    format!("record.{}.clone()", field_name)
+                })
+                .collect();
+            let tuple_value = format!("({})", field_values.join(", "));
+            code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(row_index);\n",
+                index_name, tuple_value));
         }
 
         // Add record
@@ -291,19 +495,178 @@ impl CodeGenerator {
                     code.push_str("        }\n");
                     code.push_str("        Vec::new()\n");
                 } else {
-                    // Non-unique index: O(1) lookup, may return multiple results
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
-                    code.push_str("            return indices.iter()\n");
-                    code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
-                    code.push_str("                .map(|&idx| self.records[idx].clone())\n");
-                    code.push_str("                .collect();\n");
-                    code.push_str("        }\n");
-                    code.push_str("        Vec::new()\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            // Hash index: O(1) lookup, may return multiple results
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
+                            code.push_str("            return indices.iter()\n");
+                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str("                .collect();\n");
+                            code.push_str("        }\n");
+                            code.push_str("        Vec::new()\n");
+                        }
+                        IndexType::BTree => {
+                            // B-tree index: O(log n) lookup
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&ordered_float::OrderedFloat({})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            return indices.iter()\n");
+                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str("                .collect();\n");
+                            code.push_str("        }\n");
+                            code.push_str("        Vec::new()\n");
+                        }
+                    }
                 }
 
                 code.push_str("    }\n\n");
+
+                // Generate range query methods for B-tree indexed fields
+                if !field.unique && matches!(field.index_type, IndexType::BTree) {
+                    self.generate_range_query_methods(code, field, model);
+                }
             }
         }
+
+        // Generate find_by methods for composite indexes
+        for comp_idx in &model.composite_indexes {
+            self.generate_composite_find_by_method(code, comp_idx, model);
+        }
+    }
+
+    fn generate_range_query_methods(&self, code: &mut String, field: &Field, model: &Model) {
+        let param_name = self.get_field_param_name(field);
+        let param_type = self.get_field_param_type(field);
+
+        // find_by_X_range(min, max)
+        code.push_str(&format!("    pub fn find_by_{}_range(&self, min: {}, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..=ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..=max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_gt(min) - greater than
+        code.push_str(&format!("    pub fn find_by_{}_gt(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range((std::ops::Bound::Excluded(ordered_float::OrderedFloat(min)), std::ops::Bound::Unbounded)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range((std::ops::Bound::Excluded(min), std::ops::Bound::Unbounded)) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_gte(min) - greater than or equal
+        code.push_str(&format!("    pub fn find_by_{}_gte(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_lt(max) - less than
+        code.push_str(&format!("    pub fn find_by_{}_lt(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_lte(max) - less than or equal
+        code.push_str(&format!("    pub fn find_by_{}_lte(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+    }
+
+    fn generate_composite_find_by_method(&self, code: &mut String, comp_idx: &crate::ast::CompositeIndex, model: &Model) {
+        let method_name = format!("find_by_{}", comp_idx.fields.iter().map(|f| format!("{}", f)).collect::<Vec<_>>().join("_and_"));
+        let index_name = comp_idx.fields.join("_");
+
+        // Generate parameters
+        let params: Vec<String> = comp_idx.fields.iter()
+            .map(|fname| {
+                let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                let param_name = self.get_field_param_name(field);
+                let param_type = self.get_field_param_type(field);
+                format!("{}: {}", param_name, param_type)
+            })
+            .collect();
+
+        code.push_str(&format!("    pub fn {}(&self, {}) -> Vec<{}> {{\n",
+            method_name, params.join(", "), model.name));
+
+        // Generate tuple key
+        let tuple_values: Vec<String> = comp_idx.fields.iter()
+            .map(|fname| {
+                let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                self.get_field_param_name(field)
+            })
+            .collect();
+        let tuple_key = format!("({})", tuple_values.join(", "));
+
+        code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", index_name, tuple_key));
+        code.push_str("            return indices.iter()\n");
+        code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+        code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+        code.push_str("                .collect();\n");
+        code.push_str("        }\n");
+        code.push_str("        Vec::new()\n");
+        code.push_str("    }\n\n");
     }
 
     fn generate_list_method(&self, code: &mut String, model: &Model) {
@@ -355,10 +718,39 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
-                    code.push_str("            indices.retain(|&i| i != idx);\n");
-                    code.push_str("        }\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&ordered_float::OrderedFloat(self.records[idx].{})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                    }
                 }
+            }
+
+            // Remove old values from composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let old_tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let old_tuple = format!("({})", old_tuple_values.join(", "));
+                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, old_tuple));
+                code.push_str("            indices.retain(|&i| i != idx);\n");
+                code.push_str("        }\n");
             }
 
             // Check unique constraints for new values
@@ -403,9 +795,37 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
-                        param_name, param_name));
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
+                                param_name, param_name));
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        self.{}_btree.entry(ordered_float::OrderedFloat(self.records[idx].{})).or_insert_with(Vec::new).push(idx);\n",
+                                    param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        self.{}_btree.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
+                                    param_name, param_name));
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Add new values to composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let new_tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let new_tuple = format!("({})", new_tuple_values.join(", "));
+                code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(idx);\n",
+                    index_name, new_tuple));
             }
 
             code.push_str("        Ok(self.records[idx].clone())\n");
@@ -441,10 +861,39 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
-                    code.push_str("            indices.retain(|&i| i != idx);\n");
-                    code.push_str("        }\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&ordered_float::OrderedFloat(self.records[idx].{})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                    }
                 }
+            }
+
+            // Remove from composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let tuple = format!("({})", tuple_values.join(", "));
+                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, tuple));
+                code.push_str("            indices.retain(|&i| i != idx);\n");
+                code.push_str("        }\n");
             }
 
             code.push_str("        Ok(())\n");
@@ -489,7 +938,7 @@ impl CodeGenerator {
         code
     }
 
-    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, schema: &Schema) {
+    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, _schema: &Schema) {
         // Find FK fields in this model
         let fk_fields: Vec<&Field> = model.fields.iter()
             .filter(|f| matches!(&f.field_type, FieldType::Relation(rel) if rel.is_reference()))
@@ -631,7 +1080,22 @@ impl CodeGenerator {
         code.push_str("// Generated code - do not edit manually\n\n");
         code.push_str("use std::collections::HashMap;\n");
         code.push_str("use std::time::{SystemTime, UNIX_EPOCH};\n");
-        code.push_str("use uuid::Uuid;\n\n");
+        code.push_str("use uuid::Uuid;\n");
+
+        // Check if any model uses constraints - if so, add regex import
+        let has_constraints = schema.models.iter()
+            .any(|m| m.fields.iter().any(|f| !f.constraints.is_empty()));
+
+        if has_constraints {
+            code.push_str("use regex;\n");
+        }
+
+        code.push_str("\n");
+
+        // Generate validation functions if any constraints exist
+        if has_constraints {
+            code.push_str(&self.generate_validation_functions());
+        }
 
         // Generate code for each model
         for model in &schema.models {
@@ -1286,5 +1750,269 @@ Post {
         assert!(code.contains("pub fn post_author(&self, post_id: uuid::Uuid) -> Option<User>"));
         assert!(code.contains("if let Some(child) = self.post.get(post_id)"));
         assert!(code.contains("self.user.get(child.author_id)"));
+    }
+
+    #[test]
+    fn test_generate_constraint_email() {
+        let input = r#"
+User {
+  id: +uuid
+  email: string @email
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check that regex is imported
+        assert!(code.contains("use regex;"));
+
+        // Check that validation function is generated
+        assert!(code.contains("fn validate_email(value: &str) -> Result<(), String>"));
+        assert!(code.contains("email_regex"));
+
+        // Check that validation is called in insert
+        assert!(code.contains("validate_email(&email)?"));
+    }
+
+    #[test]
+    fn test_generate_constraint_min_max() {
+        let input = r#"
+User {
+  id: +uuid
+  age: u32 @min(0) @max(150)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check that min validation is generated
+        assert!(code.contains("if age < 0"));
+        assert!(code.contains("age must be at least 0"));
+
+        // Check that max validation is generated
+        assert!(code.contains("if age > 150"));
+        assert!(code.contains("age must be at most 150"));
+    }
+
+    #[test]
+    fn test_generate_constraint_string_length() {
+        let input = r#"
+User {
+  id: +uuid
+  password: string @min(8) @max(100)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check that string length validation is generated
+        assert!(code.contains("if password.len() < 8"));
+        assert!(code.contains("password must be at least 8 characters"));
+
+        assert!(code.contains("if password.len() > 100"));
+        assert!(code.contains("password must be at most 100 characters"));
+    }
+
+    #[test]
+    fn test_generate_constraint_url() {
+        let input = r#"
+User {
+  id: +uuid
+  website: string @url
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check that URL validation function is generated
+        assert!(code.contains("fn validate_url(value: &str) -> Result<(), String>"));
+
+        // Check that validation is called
+        assert!(code.contains("validate_url(&website)?"));
+    }
+
+    #[test]
+    fn test_generate_multiple_constraints() {
+        let input = r#"
+User {
+  id: +uuid
+  email: string @email
+  age: u32 @min(0) @max(150)
+  website: string @url
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check all validations are present
+        assert!(code.contains("validate_email(&email)?"));
+        assert!(code.contains("if age < 0"));
+        assert!(code.contains("if age > 150"));
+        assert!(code.contains("validate_url(&website)?"));
+    }
+
+    #[test]
+    fn test_generate_no_regex_import_without_constraints() {
+        let input = r#"
+User {
+  id: +uuid
+  name: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Should NOT include regex import when no constraints
+        assert!(!code.contains("use regex;"));
+    }
+
+    #[test]
+    fn test_generate_constraint_validation_order() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string @email
+  age: u32 @min(13) @max(120)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Validation should happen BEFORE unique constraint checks
+        let validation_pos = code.find("validate_email(&email)?").unwrap();
+        let unique_check_pos = code.find("if self.email_index.contains_key").unwrap();
+
+        assert!(validation_pos < unique_check_pos,
+            "Validation should come before unique constraint checks");
+    }
+
+    #[test]
+    fn test_generate_constraint_only_on_non_autogen_fields() {
+        let input = r#"
+User {
+  id: +uuid @email
+  email: string @email
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Auto-generated fields should not have validation (uuid doesn't need email validation)
+        // Only the email field should have validation
+        let email_validation_count = code.matches("validate_email").count();
+
+        // Should only validate the non-auto-generated email field
+        assert_eq!(email_validation_count, 2); // 1 function definition + 1 call
+    }
+
+    #[test]
+    fn test_generate_constraint_boundary_values() {
+        let input = r#"
+User {
+  id: +uuid
+  age: u32 @min(0) @max(255)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check exact boundary values are preserved
+        assert!(code.contains("if age < 0"));
+        assert!(code.contains("if age > 255"));
+        assert!(code.contains("age must be at least 0"));
+        assert!(code.contains("age must be at most 255"));
+    }
+
+    #[test]
+    fn test_generate_validation_error_messages() {
+        let input = r#"
+User {
+  id: +uuid
+  username: string @min(3)
+  age: u32 @min(13)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check descriptive error messages are generated
+        assert!(code.contains("username must be at least 3 characters"));
+        assert!(code.contains("age must be at least 13"));
+    }
+
+    #[test]
+    fn test_generate_constraints_skip_relations() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Relations should not have validation code generated
+        // Verify the code compiles without constraint-related errors for relations
+        assert!(code.contains("pub struct User"));
+        assert!(code.contains("pub struct Post"));
+    }
+
+    #[test]
+    fn test_generate_mixed_constraints_and_symbols() {
+        // Test that constraints work with other field modifiers
+        let input = r#"
+User {
+  id: +uuid
+  email: ^&string @email
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Should handle field with indexed, unique, AND constraint
+        assert!(code.contains("pub email: String"));
+        assert!(code.contains("email_index"));
+        assert!(code.contains("validate_email(&email)?"));
     }
 }

@@ -36,6 +36,11 @@ pub enum Token {
     RBracket,    // ]
     Asterisk,    // *
     Question,    // ?
+    At,          // @
+    LParen,      // (
+    RParen,      // )
+    Comma,       // ,
+    Number(i64), // Numeric literal
 
     // Whitespace and EOF
     Newline,
@@ -112,6 +117,19 @@ impl Lexer {
         ident
     }
 
+    fn read_number(&mut self) -> i64 {
+        let mut num_str = String::new();
+        while let Some(ch) = self.current_char() {
+            if ch.is_numeric() {
+                num_str.push(ch);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        num_str.parse().unwrap_or(0)
+    }
+
     pub fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
 
@@ -171,6 +189,26 @@ impl Lexer {
             Some('?') => {
                 self.advance();
                 Ok(Token::Question)
+            }
+            Some('@') => {
+                self.advance();
+                Ok(Token::At)
+            }
+            Some('(') => {
+                self.advance();
+                Ok(Token::LParen)
+            }
+            Some(')') => {
+                self.advance();
+                Ok(Token::RParen)
+            }
+            Some(',') => {
+                self.advance();
+                Ok(Token::Comma)
+            }
+            Some(ch) if ch.is_numeric() => {
+                let num = self.read_number();
+                Ok(Token::Number(num))
             }
             Some(ch) if ch.is_alphabetic() || ch == '_' => {
                 let ident = self.read_identifier();
@@ -329,11 +367,58 @@ mod tests {
     }
 
     #[test]
+    fn test_directive_tokens() {
+        let mut lexer = Lexer::new("@email @min(10) @max(100)");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens, vec![
+            Token::At,
+            Token::Ident("email".to_string()),
+            Token::At,
+            Token::Ident("min".to_string()),
+            Token::LParen,
+            Token::Number(10),
+            Token::RParen,
+            Token::At,
+            Token::Ident("max".to_string()),
+            Token::LParen,
+            Token::Number(100),
+            Token::RParen,
+            Token::Eof,
+        ]);
+    }
+
+    #[test]
+    fn test_numeric_literals() {
+        let mut lexer = Lexer::new("0 42 1000");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens, vec![
+            Token::Number(0),
+            Token::Number(42),
+            Token::Number(1000),
+            Token::Eof,
+        ]);
+    }
+
+    #[test]
+    fn test_parentheses_and_comma() {
+        let mut lexer = Lexer::new("(10, 20)");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens, vec![
+            Token::LParen,
+            Token::Number(10),
+            Token::Comma,
+            Token::Number(20),
+            Token::RParen,
+            Token::Eof,
+        ]);
+    }
+
+    #[test]
     fn test_invalid_character() {
-        let mut lexer = Lexer::new("User { id: @u64 }");
+        let mut lexer = Lexer::new("User { id: $u64 }");
         let result = lexer.tokenize();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unexpected character '@'"));
+        assert!(result.unwrap_err().contains("Unexpected character '$'"));
     }
 
     #[test]
