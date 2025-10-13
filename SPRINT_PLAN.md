@@ -6,13 +6,27 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 
 ## Development Orchestration
 
-This project uses git worktrees and automated orchestration to enable parallel development across sprints and within individual sprints.
+This project uses git worktrees, Turborepo, and shell scripts to enable parallel development across sprints and within individual sprints.
+
+**Full documentation**: See [ORCHESTRATOR.md](./ORCHESTRATOR.md) for complete setup and usage guide.
 
 ### Technology Stack
 - **Package Manager**: `bun` (TypeScript runtime and package manager)
-- **Task Runner**: Turborepo (parallel task execution with caching)
-- **Source of Truth**: Cargo workspace structure (npm workspaces align with Cargo workspace members)
+- **Task Runner**: Turborepo (parallel task execution with dependency management)
+- **Source of Truth**: Cargo workspace structure (defines parallelizable tasks)
 - **CLI**: `claude-code -p --permission-mode=bypassPermissions` for non-interactive parallel execution
+
+### Quick Start Pattern
+```bash
+# Setup sprint (creates all orchestration assets)
+bun install
+
+# Run entire sprint in parallel
+bun sprint-N
+
+# Example for Sprint 2:
+bun sprint-2
+```
 
 ### Branch Naming Convention
 

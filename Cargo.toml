@@ -1,9 +1,22 @@
+[workspace]
+members = [
+    ".",
+    "crates/storage",
+    "crates/types",
+    "crates/validation",
+    "crates/tests",
+]
+resolver = "2"
+
 [package]
 name = "sinkdb"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sinkdb-storage = { path = "crates/storage" }
+sinkdb-types = { path = "crates/types" }
+sinkdb-validation = { path = "crates/validation" }
 
 [lib]
 name = "sinkdb"

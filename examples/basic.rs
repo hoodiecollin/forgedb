@@ -5,7 +5,7 @@
 
 // Include the generated code
 // Note: You need to run `cargo run` first to generate this file
-#[path = "../generated/database.rs"]
+#[path = "sprint1_mvp/generated/database.rs"]
 mod database;
 
 use database::{User, UserStorage};
@@ -19,11 +19,13 @@ fn main() {
 
     // Test 1: Insert users with auto-increment ID
     println!("Test 1: Insert users with auto-increment ID");
-    let user1 = storage.insert("alice@example.com".to_string())
+    let user1 = storage
+        .insert("alice@example.com".to_string())
         .expect("Failed to insert user1");
     println!("  Inserted: {:?}", user1);
 
-    let user2 = storage.insert("bob@example.com".to_string())
+    let user2 = storage
+        .insert("bob@example.com".to_string())
         .expect("Failed to insert user2");
     println!("  Inserted: {:?}", user2);
 
