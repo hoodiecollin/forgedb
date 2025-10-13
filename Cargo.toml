@@ -19,6 +19,7 @@ sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
 regex = "1.10"
+ordered-float = "4.2"
 
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
@@ -75,3 +76,8 @@ path = "examples/sprint5_constraints.rs"
 [[example]]
 name = "test_constraint_validation"
 path = "examples/test_constraint_validation.rs"
+
+# Sprint 5: Advanced Indexing
+[[example]]
+name = "sprint5_advanced_indexing"
+path = "examples/sprint5_advanced_indexing.rs"

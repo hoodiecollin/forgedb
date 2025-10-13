@@ -414,6 +414,14 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_character() {
+        let mut lexer = Lexer::new("User { id: $u64 }");
+        let result = lexer.tokenize();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unexpected character '$'"));
+    }
+
+    #[test]
     fn test_consecutive_symbols_with_space() {
         let mut lexer = Lexer::new("+ & u64");
         let tokens = lexer.tokenize().unwrap();

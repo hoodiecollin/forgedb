@@ -1,4 +1,4 @@
-use crate::ast::{Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema};
+use crate::ast::{ConstraintParam, Field, FieldType, IndexType, Model, RelationType, Schema};
 
 pub struct CodeGenerator;
 
@@ -81,10 +81,50 @@ impl CodeGenerator {
                 code.push_str(&format!("    {}_index: std::collections::HashMap<{}, usize>,\n",
                     field_name, field_type));
             } else if field.indexed || is_fk {
-                // Non-unique index (^ symbol or FK) - maps value to multiple row indices
-                code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
-                    field_name, field_type));
+                // Indexed fields use either Hash or BTree based on field type
+                match field.index_type {
+                    IndexType::Hash => {
+                        // Hash index for unordered types
+                        code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                            field_name, field_type));
+                    }
+                    IndexType::BTree => {
+                        // B-tree index for ordered types (supports range queries)
+                        let btree_key_type = if matches!(field.field_type, FieldType::F64) {
+                            "ordered_float::OrderedFloat<f64>".to_string()
+                        } else {
+                            field_type.clone()
+                        };
+                        code.push_str(&format!("    {}_btree: std::collections::BTreeMap<{}, Vec<usize>>,\n",
+                            field_name, btree_key_type));
+                    }
+                }
             }
+        }
+
+        // Add composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            let field_types: Vec<String> = comp_idx.fields.iter()
+                .filter_map(|fname| {
+                    model.fields.iter()
+                        .find(|f| &f.name == fname)
+                        .map(|f| {
+                            match &f.field_type {
+                                FieldType::Relation(RelationType::RequiredReference(_)) => {
+                                    "uuid::Uuid".to_string()
+                                }
+                                FieldType::Relation(RelationType::OptionalReference(_)) => {
+                                    "Option<uuid::Uuid>".to_string()
+                                }
+                                _ => f.field_type.to_rust_type(),
+                            }
+                        })
+                })
+                .collect();
+            let tuple_type = format!("({})", field_types.join(", "));
+            code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                index_name, tuple_type));
         }
 
         code.push_str("}\n\n");
@@ -117,9 +157,24 @@ impl CodeGenerator {
 
             let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
-            if field.unique || field.indexed || is_fk {
+            if field.unique {
                 code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+            } else if field.indexed || is_fk {
+                match field.index_type {
+                    IndexType::Hash => {
+                        code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+                    }
+                    IndexType::BTree => {
+                        code.push_str(&format!("            {}_btree: std::collections::BTreeMap::new(),\n", field_name));
+                    }
+                }
             }
+        }
+
+        // Initialize composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", index_name));
         }
 
         code.push_str("        }\n");
@@ -357,10 +412,39 @@ impl CodeGenerator {
                 code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), row_index);\n",
                     field_name, field_name));
             } else if field.indexed || is_fk {
-                // Non-unique index: append row index to list of indices
-                code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
-                    field_name, field_name));
+                match field.index_type {
+                    IndexType::Hash => {
+                        // Hash index: append row index to list of indices
+                        code.push_str(&format!("        self.{}_index.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
+                            field_name, field_name));
+                    }
+                    IndexType::BTree => {
+                        // B-tree index: append row index to list of indices
+                        if matches!(field.field_type, FieldType::F64) {
+                            code.push_str(&format!("        self.{}_btree.entry(ordered_float::OrderedFloat(record.{})).or_insert_with(Vec::new).push(row_index);\n",
+                                field_name, field_name));
+                        } else {
+                            code.push_str(&format!("        self.{}_btree.entry(record.{}.clone()).or_insert_with(Vec::new).push(row_index);\n",
+                                field_name, field_name));
+                        }
+                    }
+                }
             }
+        }
+
+        // Add to composite indexes
+        for comp_idx in &model.composite_indexes {
+            let index_name = comp_idx.fields.join("_");
+            let field_values: Vec<String> = comp_idx.fields.iter()
+                .map(|fname| {
+                    let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                    let field_name = self.get_field_param_name(field);
+                    format!("record.{}.clone()", field_name)
+                })
+                .collect();
+            let tuple_value = format!("({})", field_values.join(", "));
+            code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(row_index);\n",
+                index_name, tuple_value));
         }
 
         // Add record
@@ -411,19 +495,178 @@ impl CodeGenerator {
                     code.push_str("        }\n");
                     code.push_str("        Vec::new()\n");
                 } else {
-                    // Non-unique index: O(1) lookup, may return multiple results
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
-                    code.push_str("            return indices.iter()\n");
-                    code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
-                    code.push_str("                .map(|&idx| self.records[idx].clone())\n");
-                    code.push_str("                .collect();\n");
-                    code.push_str("        }\n");
-                    code.push_str("        Vec::new()\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            // Hash index: O(1) lookup, may return multiple results
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
+                            code.push_str("            return indices.iter()\n");
+                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str("                .collect();\n");
+                            code.push_str("        }\n");
+                            code.push_str("        Vec::new()\n");
+                        }
+                        IndexType::BTree => {
+                            // B-tree index: O(log n) lookup
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&ordered_float::OrderedFloat({})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            return indices.iter()\n");
+                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str("                .collect();\n");
+                            code.push_str("        }\n");
+                            code.push_str("        Vec::new()\n");
+                        }
+                    }
                 }
 
                 code.push_str("    }\n\n");
+
+                // Generate range query methods for B-tree indexed fields
+                if !field.unique && matches!(field.index_type, IndexType::BTree) {
+                    self.generate_range_query_methods(code, field, model);
+                }
             }
         }
+
+        // Generate find_by methods for composite indexes
+        for comp_idx in &model.composite_indexes {
+            self.generate_composite_find_by_method(code, comp_idx, model);
+        }
+    }
+
+    fn generate_range_query_methods(&self, code: &mut String, field: &Field, model: &Model) {
+        let param_name = self.get_field_param_name(field);
+        let param_type = self.get_field_param_type(field);
+
+        // find_by_X_range(min, max)
+        code.push_str(&format!("    pub fn find_by_{}_range(&self, min: {}, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..=ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..=max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_gt(min) - greater than
+        code.push_str(&format!("    pub fn find_by_{}_gt(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range((std::ops::Bound::Excluded(ordered_float::OrderedFloat(min)), std::ops::Bound::Unbounded)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range((std::ops::Bound::Excluded(min), std::ops::Bound::Unbounded)) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_gte(min) - greater than or equal
+        code.push_str(&format!("    pub fn find_by_{}_gte(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_lt(max) - less than
+        code.push_str(&format!("    pub fn find_by_{}_lt(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+
+        // find_by_X_lte(max) - less than or equal
+        code.push_str(&format!("    pub fn find_by_{}_lte(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name));
+        code.push_str("        let mut results = Vec::new();\n");
+        if matches!(field.field_type, FieldType::F64) {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=ordered_float::OrderedFloat(max)) {{\n", param_name));
+        } else {
+            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=max) {{\n", param_name));
+        }
+        code.push_str("            for &idx in indices {\n");
+        code.push_str("                if !self.tombstones[idx] {\n");
+        code.push_str("                    results.push(self.records[idx].clone());\n");
+        code.push_str("                }\n");
+        code.push_str("            }\n");
+        code.push_str("        }\n");
+        code.push_str("        results\n");
+        code.push_str("    }\n\n");
+    }
+
+    fn generate_composite_find_by_method(&self, code: &mut String, comp_idx: &crate::ast::CompositeIndex, model: &Model) {
+        let method_name = format!("find_by_{}", comp_idx.fields.iter().map(|f| format!("{}", f)).collect::<Vec<_>>().join("_and_"));
+        let index_name = comp_idx.fields.join("_");
+
+        // Generate parameters
+        let params: Vec<String> = comp_idx.fields.iter()
+            .map(|fname| {
+                let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                let param_name = self.get_field_param_name(field);
+                let param_type = self.get_field_param_type(field);
+                format!("{}: {}", param_name, param_type)
+            })
+            .collect();
+
+        code.push_str(&format!("    pub fn {}(&self, {}) -> Vec<{}> {{\n",
+            method_name, params.join(", "), model.name));
+
+        // Generate tuple key
+        let tuple_values: Vec<String> = comp_idx.fields.iter()
+            .map(|fname| {
+                let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                self.get_field_param_name(field)
+            })
+            .collect();
+        let tuple_key = format!("({})", tuple_values.join(", "));
+
+        code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", index_name, tuple_key));
+        code.push_str("            return indices.iter()\n");
+        code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
+        code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+        code.push_str("                .collect();\n");
+        code.push_str("        }\n");
+        code.push_str("        Vec::new()\n");
+        code.push_str("    }\n\n");
     }
 
     fn generate_list_method(&self, code: &mut String, model: &Model) {
@@ -475,10 +718,39 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
-                    code.push_str("            indices.retain(|&i| i != idx);\n");
-                    code.push_str("        }\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&ordered_float::OrderedFloat(self.records[idx].{})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                    }
                 }
+            }
+
+            // Remove old values from composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let old_tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let old_tuple = format!("({})", old_tuple_values.join(", "));
+                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, old_tuple));
+                code.push_str("            indices.retain(|&i| i != idx);\n");
+                code.push_str("        }\n");
             }
 
             // Check unique constraints for new values
@@ -523,9 +795,37 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
-                        param_name, param_name));
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        self.{}_index.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
+                                param_name, param_name));
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        self.{}_btree.entry(ordered_float::OrderedFloat(self.records[idx].{})).or_insert_with(Vec::new).push(idx);\n",
+                                    param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        self.{}_btree.entry(self.records[idx].{}.clone()).or_insert_with(Vec::new).push(idx);\n",
+                                    param_name, param_name));
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Add new values to composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let new_tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let new_tuple = format!("({})", new_tuple_values.join(", "));
+                code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(idx);\n",
+                    index_name, new_tuple));
             }
 
             code.push_str("        Ok(self.records[idx].clone())\n");
@@ -561,10 +861,39 @@ impl CodeGenerator {
                 if field.unique {
                     code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
                 } else if field.indexed || is_fk {
-                    code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
-                    code.push_str("            indices.retain(|&i| i != idx);\n");
-                    code.push_str("        }\n");
+                    match field.index_type {
+                        IndexType::Hash => {
+                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                        IndexType::BTree => {
+                            if matches!(field.field_type, FieldType::F64) {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&ordered_float::OrderedFloat(self.records[idx].{})) {{\n", param_name, param_name));
+                            } else {
+                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get_mut(&self.records[idx].{}) {{\n", param_name, param_name));
+                            }
+                            code.push_str("            indices.retain(|&i| i != idx);\n");
+                            code.push_str("        }\n");
+                        }
+                    }
                 }
+            }
+
+            // Remove from composite indexes
+            for comp_idx in &model.composite_indexes {
+                let index_name = comp_idx.fields.join("_");
+                let tuple_values: Vec<String> = comp_idx.fields.iter()
+                    .map(|fname| {
+                        let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
+                        let field_name = self.get_field_param_name(field);
+                        format!("self.records[idx].{}.clone()", field_name)
+                    })
+                    .collect();
+                let tuple = format!("({})", tuple_values.join(", "));
+                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, tuple));
+                code.push_str("            indices.retain(|&i| i != idx);\n");
+                code.push_str("        }\n");
             }
 
             code.push_str("        Ok(())\n");
@@ -609,7 +938,7 @@ impl CodeGenerator {
         code
     }
 
-    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, schema: &Schema) {
+    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, _schema: &Schema) {
         // Find FK fields in this model
         let fk_fields: Vec<&Field> = model.fields.iter()
             .filter(|f| matches!(&f.field_type, FieldType::Relation(rel) if rel.is_reference()))

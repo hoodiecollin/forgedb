@@ -1,4 +1,4 @@
-use crate::ast::{Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema};
+use crate::ast::{CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema};
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
@@ -169,6 +169,59 @@ impl Parser {
         Ok(field_type)
     }
 
+    fn parse_directive(&mut self) -> Result<CompositeIndex, String> {
+        // Expect @
+        self.expect(Token::At)?;
+
+        // Get directive name
+        let directive_name = match self.current_token() {
+            Token::Ident(s) => s.clone(),
+            _ => return Err(format!("Expected directive name after '@', found {:?}", self.current_token())),
+        };
+        self.advance();
+
+        match directive_name.as_str() {
+            "index" => self.parse_index_directive(),
+            _ => Err(format!("Unknown directive: @{}", directive_name)),
+        }
+    }
+
+    fn parse_index_directive(&mut self) -> Result<CompositeIndex, String> {
+        // Expect (
+        self.expect(Token::LParen)?;
+
+        // Parse field list
+        let mut fields = Vec::new();
+        loop {
+            // Parse field name
+            let field_name = match self.current_token() {
+                Token::Ident(s) => s.clone(),
+                _ => return Err(format!("Expected field name in @index directive, found {:?}", self.current_token())),
+            };
+            self.advance();
+            fields.push(field_name);
+
+            // Check for comma or closing paren
+            match self.current_token() {
+                Token::Comma => {
+                    self.advance();
+                    // Continue loop to parse next field
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                _ => return Err(format!("Expected ',' or ')' in @index directive, found {:?}", self.current_token())),
+            }
+        }
+
+        if fields.len() < 2 {
+            return Err("Composite index must include at least 2 fields".to_string());
+        }
+
+        Ok(CompositeIndex { fields })
+    }
+
     fn parse_field(&mut self) -> Result<Field, String> {
         self.skip_newlines();
 
@@ -231,6 +284,9 @@ impl Parser {
             constraints.push(constraint);
         }
 
+        // Determine index type based on field type
+        let index_type = field_type.default_index_type();
+
         Ok(Field {
             name,
             field_type,
@@ -238,6 +294,7 @@ impl Parser {
             unique,
             indexed,
             constraints,
+            index_type,
         })
     }
 
@@ -263,22 +320,30 @@ impl Parser {
         self.skip_newlines();
         self.expect(Token::LBrace)?;
 
-        // Parse fields
+        // Parse fields and directives
         let mut fields = Vec::new();
         let mut field_names = std::collections::HashSet::new();
+        let mut composite_indexes = Vec::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
-            let field = self.parse_field()?;
+            // Check for directive
+            if matches!(self.current_token(), Token::At) {
+                let composite_index = self.parse_directive()?;
+                composite_indexes.push(composite_index);
+                self.skip_newlines();
+            } else {
+                let field = self.parse_field()?;
 
-            // Check for duplicate field name
-            if field_names.contains(&field.name) {
-                return Err(format!("Duplicate field name '{}' in model '{}'", field.name, name));
+                // Check for duplicate field name
+                if field_names.contains(&field.name) {
+                    return Err(format!("Duplicate field name '{}' in model '{}'", field.name, name));
+                }
+                field_names.insert(field.name.clone());
+
+                fields.push(field);
+                self.skip_newlines();
             }
-            field_names.insert(field.name.clone());
-
-            fields.push(field);
-            self.skip_newlines();
         }
 
         // Expect closing brace
@@ -288,7 +353,19 @@ impl Parser {
             return Err(format!("Model '{}' has no fields", name));
         }
 
-        Ok(Model { name, fields })
+        // Validate composite indexes reference existing fields
+        for comp_idx in &composite_indexes {
+            for field_name in &comp_idx.fields {
+                if !field_names.contains(field_name) {
+                    return Err(format!(
+                        "Composite index in model '{}' references undefined field '{}'",
+                        name, field_name
+                    ));
+                }
+            }
+        }
+
+        Ok(Model { name, fields, composite_indexes })
     }
 
     pub fn parse(&mut self) -> Result<Schema, String> {
@@ -1129,6 +1206,68 @@ User {
         assert!(result.is_err());
     }
 
+    // Sprint 5: Composite Index Tests
+
+    #[test]
+    fn test_parse_composite_index() {
+        let input = r#"
+User {
+  id: +uuid
+  first_name: string
+  last_name: string
+
+  @index(first_name, last_name)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        assert_eq!(model.composite_indexes.len(), 1);
+        assert_eq!(model.composite_indexes[0].fields.len(), 2);
+        assert_eq!(model.composite_indexes[0].fields[0], "first_name");
+        assert_eq!(model.composite_indexes[0].fields[1], "last_name");
+    }
+
+    #[test]
+    fn test_parse_multiple_composite_indexes() {
+        let input = r#"
+User {
+  id: +uuid
+  first_name: string
+  last_name: string
+  city: string
+  state: string
+
+  @index(first_name, last_name)
+  @index(city, state)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        assert_eq!(model.composite_indexes.len(), 2);
+        assert_eq!(model.composite_indexes[0].fields, vec!["first_name", "last_name"]);
+        assert_eq!(model.composite_indexes[1].fields, vec!["city", "state"]);
+    }
+
+    #[test]
+    fn test_parse_composite_index_undefined_field() {
+        let input = r#"
+User {
+  id: +uuid
+  name: string
+
+  @index(name, email)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("undefined field"));
+    }
+
     #[test]
     fn test_parse_constraint_with_pattern() {
         // Test pattern constraint with identifier (not full regex yet)
@@ -1190,6 +1329,62 @@ User {
         // Verify both min and max are present
         assert!(field.constraints.iter().any(|c| c.name == "min"));
         assert!(field.constraints.iter().any(|c| c.name == "max"));
+    }
+
+    #[test]
+    fn test_parse_composite_index_too_few_fields() {
+        let input = r#"
+User {
+  id: +uuid
+  name: string
+
+  @index(name)
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("at least 2 fields"));
+    }
+
+    #[test]
+    fn test_parse_btree_index_type_for_ordered_types() {
+        let input = r#"
+Product {
+  id: +uuid
+  price: ^f64
+  stock: ^u32
+  created_at: ^timestamp
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        // Check that ordered types get BTree index type
+        use crate::ast::IndexType;
+        assert_eq!(model.fields[1].index_type, IndexType::BTree); // price: f64
+        assert_eq!(model.fields[2].index_type, IndexType::BTree); // stock: u32
+        assert_eq!(model.fields[3].index_type, IndexType::BTree); // created_at: timestamp
+    }
+
+    #[test]
+    fn test_parse_hash_index_type_for_unordered_types() {
+        let input = r#"
+User {
+  id: +uuid
+  email: ^string
+  active: ^bool
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let model = &schema.models[0];
+        // Check that unordered types get Hash index type
+        use crate::ast::IndexType;
+        assert_eq!(model.fields[1].index_type, IndexType::Hash); // email: string
+        assert_eq!(model.fields[2].index_type, IndexType::Hash); // active: bool
     }
 
     #[test]
