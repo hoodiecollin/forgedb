@@ -1,4 +1,4 @@
-# TypeDB Advanced Features Addendum
+# SinkDB Advanced Features Addendum
 
 ## Version 0.2.0 - Extended Feature Set
 
@@ -323,7 +323,7 @@ Child {
 
 ### Concept
 
-Use blockchain consensus for distributed transactions across nodes in a TypeDB cluster.
+Use blockchain consensus for distributed transactions across nodes in a SinkDB cluster.
 
 ### Architecture
 
@@ -612,7 +612,7 @@ merge_strategy = "deep"   # Field-level merge
 
 ```javascript
 // Browser WASM instance works offline
-const db = await TypeDB.init({
+const db = await SinkDB.init({
   online: false,  // Start offline
   syncWhenOnline: true
 })
@@ -780,7 +780,7 @@ let primary_author = db.users().get(post.authors.primary)?;
 
 ```javascript
 // Initialize WASM with live sync
-const db = await TypeDB.init({
+const db = await SinkDB.init({
   url: 'wss://api.example.com',
   liveSync: true,
   models: ['Post', 'User'],
@@ -853,7 +853,7 @@ TypeScript-based macro system for compile-time code generation and runtime metap
 ### Macro Types
 
 **1. Compile-Time Macros**
-- Execute during `typedb generate`
+- Execute during `sinkdb generate`
 - Can modify generated code
 - Access to AST and schema
 - Useful for: code generation, embedding metadata, optimization
@@ -940,7 +940,7 @@ export async function createUser(data: UserCreate) {
 ```typescript
 // macros/git-info.ts
 
-import { CompileTimeMacro, MacroContext } from 'typedb/macros'
+import { CompileTimeMacro, MacroContext } from 'sinkdb/macros'
 import { execSync } from 'child_process'
 
 export const git_hash: CompileTimeMacro = {
@@ -1007,7 +1007,7 @@ export const BUILD_INFO: BuildInfo = {
 ```typescript
 // macros/validation.ts
 
-import { RuntimeMacro, MacroContext } from 'typedb/macros'
+import { RuntimeMacro, MacroContext } from 'sinkdb/macros'
 
 export const validate: RuntimeMacro = {
   name: 'validate',
@@ -1094,7 +1094,7 @@ user.email = "invalid"  // Throws: does not match pattern
 ```typescript
 // macros/performance.ts
 
-import { RuntimeMacro } from 'typedb/macros'
+import { RuntimeMacro } from 'sinkdb/macros'
 
 export const memoize: RuntimeMacro = {
   name: 'memoize',
@@ -1162,7 +1162,7 @@ export const log_performance: RuntimeMacro = {
 ```typescript
 // macros/crud-generator.ts
 
-import { CompileTimeMacro, MacroContext } from 'typedb/macros'
+import { CompileTimeMacro, MacroContext } from 'sinkdb/macros'
 
 export const generate_crud: CompileTimeMacro = {
   name: 'generate_crud',
@@ -1199,7 +1199,7 @@ export const generate_crud: CompileTimeMacro = {
 ```typescript
 // macros/optimize.ts
 
-import { CompileTimeMacro, MacroContext } from 'typedb/macros'
+import { CompileTimeMacro, MacroContext } from 'sinkdb/macros'
 import * as ts from 'typescript'
 
 export const inline_constants: CompileTimeMacro = {
@@ -1249,9 +1249,9 @@ export const inline_constants: CompileTimeMacro = {
 ### Macro Registry
 
 ```typescript
-// typedb.macros.ts (in your project)
+// sinkdb.macros.ts (in your project)
 
-import { MacroRegistry } from 'typedb/macros'
+import { MacroRegistry } from 'sinkdb/macros'
 import * as gitInfo from './macros/git-info'
 import * as validation from './macros/validation'
 import * as performance from './macros/performance'
@@ -1278,11 +1278,11 @@ export default MacroRegistry.create({
 ### Configuration
 
 ```toml
-# typedb.toml
+# sinkdb.toml
 
 [macros]
 enabled = true
-registry = "./typedb.macros.ts"
+registry = "./sinkdb.macros.ts"
 
 [macros.compile_time]
 execute_on = "generate"
@@ -1297,7 +1297,7 @@ tree_shake = true
 
 ```bash
 # List available macros
-typedb macro list
+sinkdb macro list
 
 # Compile-time macros:
 #   git_hash            - Embed git commit hash
@@ -1310,12 +1310,12 @@ typedb macro list
 #   log_performance     - Log execution time
 
 # Test macro
-typedb macro test git_hash
+sinkdb macro test git_hash
 
 # Output: a3f5c8d9e2b1f4c7a6d8e9f0a1b2c3d4e5f6a7b8
 
 # Generate with specific macro
-typedb generate --macro-only git_hash,build_timestamp
+sinkdb generate --macro-only git_hash,build_timestamp
 ```
 
 ### Real-World Example: Release Signature
@@ -1368,7 +1368,7 @@ struct BuilderInfo {
 ```typescript
 // macros/release-signature.ts
 
-import { CompileTimeMacro } from 'typedb/macros'
+import { CompileTimeMacro } from 'sinkdb/macros'
 import { execSync } from 'child_process'
 import os from 'os'
 
@@ -1472,7 +1472,7 @@ export function Footer() {
 ### Macro Context API
 
 ```typescript
-// typedb/macros.d.ts
+// sinkdb/macros.d.ts
 
 export interface MacroContext {
   // Schema information
@@ -1554,7 +1554,7 @@ max_execution_time = 5000         # 5s timeout
 // macros/git-info.test.ts
 
 import { git_hash } from './git-info'
-import { createMockContext } from 'typedb/testing'
+import { createMockContext } from 'sinkdb/testing'
 
 describe('git_hash macro', () => {
   test('returns valid git hash', () => {

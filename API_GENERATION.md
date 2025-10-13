@@ -1,8 +1,8 @@
-# TypeDB API Generation Specification
+# SinkDB API Generation Specification
 
 ## Overview
 
-TypeDB automatically generates a complete REST API from the schema, including CRUD operations, relationship traversal, query parameters, validation, and OpenAPI documentation.
+SinkDB automatically generates a complete REST API from the schema, including CRUD operations, relationship traversal, query parameters, validation, and OpenAPI documentation.
 
 ## Design Principles
 
@@ -629,7 +629,7 @@ ws.onmessage = (event) => {
 
 ## Authentication & Authorization (Plugin)
 
-TypeDB doesn't enforce auth by default, but provides hooks:
+SinkDB doesn't enforce auth by default, but provides hooks:
 
 ```rust
 // Custom middleware
@@ -654,7 +654,7 @@ fn get_users(req: Request) -> Response {
 
 ## Rate Limiting
 
-Configured in `typedb.toml`:
+Configured in `sinkdb.toml`:
 
 ```toml
 [api]
@@ -676,7 +676,7 @@ X-RateLimit-Reset: 1697123456
 
 ## CORS
 
-Configured in `typedb.toml`:
+Configured in `sinkdb.toml`:
 
 ```toml
 [api]
@@ -726,7 +726,7 @@ openapi: 3.0.0
 info:
   title: My App API
   version: 1.0.0
-  description: Auto-generated API from TypeDB schema
+  description: Auto-generated API from SinkDB schema
 
 servers:
   - url: http://localhost:3000/api
@@ -891,7 +891,7 @@ For operations not covered by generated CRUD:
 
 ```rust
 // In your application code
-use typedb::api::Server;
+use sinkdb::api::Server;
 
 let mut server = Server::from_schema()?;
 

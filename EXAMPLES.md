@@ -1,28 +1,28 @@
-# TypeDB Examples & Getting Started
+# SinkDB Examples & Getting Started
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-# Install TypeDB CLI
-cargo install typedb-cli
+# Install SinkDB CLI
+cargo install sinkdb-cli
 
 # Verify installation
-typedb --version
+sinkdb --version
 ```
 
 ### Create Your First App
 
 ```bash
 # Initialize a new blog project
-typedb init my-blog --template blog
+sinkdb init my-blog --template blog
 
 # Navigate to project
 cd my-blog
 
 # Start development server
-typedb dev
+sinkdb dev
 ```
 
 Open your browser to `http://localhost:3000` and you'll see:
@@ -142,7 +142,7 @@ Comment {
 ### Step 2: Generate Code
 
 ```bash
-typedb generate
+sinkdb generate
 ```
 
 This creates:
@@ -200,7 +200,7 @@ export default function PostPreview({ data, computed }) {
 ### Step 5: Start Dev Server
 
 ```bash
-typedb dev
+sinkdb dev
 ```
 
 ### Step 6: Use the API
@@ -812,9 +812,9 @@ describe('Blog API', () => {
 
 ```bash
 # Build optimized binary
-typedb build --release
+sinkdb build --release
 
-# Output: dist/typedb-api
+# Output: dist/sinkdb-api
 ```
 
 ### Docker
@@ -823,16 +823,16 @@ typedb build --release
 FROM rust:1.75 AS builder
 WORKDIR /app
 COPY . .
-RUN cargo install typedb-cli
-RUN typedb build --release
+RUN cargo install sinkdb-cli
+RUN sinkdb build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder /app/dist/typedb-api /usr/local/bin/
+COPY --from=builder /app/dist/sinkdb-api /usr/local/bin/
 COPY schema.lang /app/
 COPY data/ /app/data/
 
 EXPOSE 3000
-CMD ["typedb-api", "--config", "/app/typedb.toml"]
+CMD ["sinkdb-api", "--config", "/app/sinkdb.toml"]
 ```
 
 ### Environment Variables
@@ -876,7 +876,7 @@ RUST_LOG=info
 ### Development Workflow
 
 1. **Edit schema** in `schema.lang`
-2. **Run `typedb dev`** to see changes immediately
+2. **Run `sinkdb dev`** to see changes immediately
 3. **Implement stubs** for new computed fields/components
 4. **Test thoroughly** before deployment
 5. **Create migrations** for schema changes
@@ -888,48 +888,48 @@ RUST_LOG=info
 ### Schema Validation Errors
 
 ```bash
-$ typedb validate
+$ sinkdb validate
 
 ❌ Error at line 15:
    Field 'email' has invalid type 'string!'
    Did you mean 'string' (nullable) or just 'string' (required)?
 ```
 
-**Fix**: Remove the `!` suffix. In TypeDB, fields are required by default.
+**Fix**: Remove the `!` suffix. In SinkDB, fields are required by default.
 
 ### Missing Implementations
 
 ```bash
-$ typedb validate --strict
+$ sinkdb validate --strict
 
 ❌ Missing implementations:
    - User.fullName (src/computed/User.ts)
 ```
 
-**Fix**: Run `typedb generate stubs` to create the file, then implement.
+**Fix**: Run `sinkdb generate stubs` to create the file, then implement.
 
 ### Hot Reload Not Working
 
 ```bash
 # Check file watcher
-typedb dev --verbose
+sinkdb dev --verbose
 
 # Manual regeneration
-typedb generate --force
+sinkdb generate --force
 ```
 
 ### Database Corruption
 
 ```bash
 # Verify database
-typedb inspect stats
+sinkdb inspect stats
 
 # Restore from WAL
-typedb recover
+sinkdb recover
 
 # Rebuild from migrations
-typedb migrate down --all
-typedb migrate up
+sinkdb migrate down --all
+sinkdb migrate up
 ```
 
 ---
@@ -938,7 +938,7 @@ typedb migrate up
 
 - **Documentation**: Full docs at `/docs` when running dev server
 - **Examples**: See `/examples` directory in repo
-- **Templates**: Use `typedb init --template <n>` for starter projects
+- **Templates**: Use `sinkdb init --template <n>` for starter projects
 - **Community**: (TBD - Discord, GitHub Discussions)
 
 ---

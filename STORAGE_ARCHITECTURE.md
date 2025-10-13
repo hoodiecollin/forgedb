@@ -1,8 +1,8 @@
-# TypeDB Storage Architecture
+# SinkDB Storage Architecture
 
 ## Overview
 
-TypeDB uses a hybrid columnar storage architecture optimized for different data types. The core principle is: **fixed-size data gets memory-mapped pages for zero-copy access, variable-length data gets append-only storage with offset indices**.
+SinkDB uses a hybrid columnar storage architecture optimized for different data types. The core principle is: **fixed-size data gets memory-mapped pages for zero-copy access, variable-length data gets append-only storage with offset indices**.
 
 ## Storage Layout
 

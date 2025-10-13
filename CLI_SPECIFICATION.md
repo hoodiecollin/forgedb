@@ -1,20 +1,20 @@
-# TypeDB CLI Specification
+# SinkDB CLI Specification
 
 ## Overview
 
-The `typedb` CLI is the primary developer interface for TypeDB. It handles project initialization, code generation, schema validation, development server, migrations, and more.
+The `sinkdb` CLI is the primary developer interface for SinkDB. It handles project initialization, code generation, schema validation, development server, migrations, and more.
 
 ## Installation
 
 ```bash
 # Via cargo
-cargo install typedb-cli
+cargo install sinkdb-cli
 
 # Via homebrew (future)
-brew install typedb
+brew install sinkdb
 
 # Via npm (wrapper, future)
-npm install -g typedb-cli
+npm install -g sinkdb-cli
 ```
 
 ## Project Structure
@@ -24,7 +24,7 @@ When you initialize a project, the CLI creates the following structure:
 ```
 my-app/
 ├── schema.lang              # Your schema definition
-├── typedb.toml             # Project configuration
+├── sinkdb.toml             # Project configuration
 │
 ├── generated/              # Auto-generated (never edit)
 │   ├── db.rs              # Rust database implementation
@@ -63,21 +63,21 @@ my-app/
 ```bash
 --verbose, -v         # Verbose output
 --quiet, -q          # Suppress output
---config, -c <path>  # Path to typedb.toml (default: ./typedb.toml)
+--config, -c <path>  # Path to sinkdb.toml (default: ./sinkdb.toml)
 --help, -h           # Show help
 --version, -V        # Show version
 ```
 
 ---
 
-## `typedb init`
+## `sinkdb init`
 
-Initialize a new TypeDB project.
+Initialize a new SinkDB project.
 
 ### Usage
 
 ```bash
-typedb init <project-name> [options]
+sinkdb init <project-name> [options]
 ```
 
 ### Options
@@ -94,23 +94,23 @@ typedb init <project-name> [options]
 
 ```bash
 # Interactive mode
-typedb init my-app
+sinkdb init my-app
 
 # With template
-typedb init my-blog --template blog
+sinkdb init my-blog --template blog
 
 # API only
-typedb init my-api --api-only
+sinkdb init my-api --api-only
 
 # Rust backend only
-typedb init my-service --rust --no-typescript
+sinkdb init my-service --rust --no-typescript
 ```
 
 ### What It Does
 
 1. Creates project directory
 2. Generates initial schema from template or blank
-3. Creates config file (`typedb.toml`)
+3. Creates config file (`sinkdb.toml`)
 4. Runs initial code generation
 5. Installs dependencies (if applicable)
 6. Initializes git repository
@@ -120,26 +120,26 @@ typedb init my-service --rust --no-typescript
 ```
 ✨ Creating project: my-app
 📄 Created schema.lang
-⚙️  Created typedb.toml
+⚙️  Created sinkdb.toml
 🔨 Generating code...
   ✓ Generated db.rs
   ✓ Generated types.ts
   ✓ Generated api.rs
   ✓ Generated openapi.yaml
 📦 Installing dependencies...
-✓ Done! Run 'cd my-app && typedb dev' to start
+✓ Done! Run 'cd my-app && sinkdb dev' to start
 ```
 
 ---
 
-## `typedb dev`
+## `sinkdb dev`
 
 Start development server with hot reload.
 
 ### Usage
 
 ```bash
-typedb dev [options]
+sinkdb dev [options]
 ```
 
 ### Options
@@ -158,16 +158,16 @@ typedb dev [options]
 
 ```bash
 # Basic dev mode
-typedb dev
+sinkdb dev
 
 # Custom port
-typedb dev --port 8080
+sinkdb dev --port 8080
 
 # Watch additional directories
-typedb dev --watch ./lib
+sinkdb dev --watch ./lib
 
 # API only (no UI)
-typedb dev --api-only
+sinkdb dev --api-only
 ```
 
 ### What It Does
@@ -185,7 +185,7 @@ typedb dev --api-only
 ### Output
 
 ```
-🚀 TypeDB Dev Server
+🚀 SinkDB Dev Server
 
 Watching: schema.lang
 API Server: http://localhost:3000
@@ -210,14 +210,14 @@ Ready! Edit schema.lang to see changes.
 
 ---
 
-## `typedb generate`
+## `sinkdb generate`
 
 Generate code from schema without starting dev server.
 
 ### Usage
 
 ```bash
-typedb generate [targets] [options]
+sinkdb generate [targets] [options]
 ```
 
 ### Targets
@@ -244,16 +244,16 @@ stubs        # Generate missing computed/component stubs
 
 ```bash
 # Generate everything
-typedb generate
+sinkdb generate
 
 # TypeScript types only
-typedb generate typescript
+sinkdb generate typescript
 
 # Check if generation is needed (CI)
-typedb generate --check
+sinkdb generate --check
 
 # Force regeneration
-typedb generate --force
+sinkdb generate --force
 ```
 
 ### What It Does
@@ -279,21 +279,21 @@ typedb generate --force
    - src/computed/User.ts: fullName
    - src/views/Dashboard.jsx
 
-Run 'typedb generate stubs' to create them.
+Run 'sinkdb generate stubs' to create them.
 
 ✓ Done in 1.2s
 ```
 
 ---
 
-## `typedb validate`
+## `sinkdb validate`
 
 Validate schema and check for missing implementations.
 
 ### Usage
 
 ```bash
-typedb validate [options]
+sinkdb validate [options]
 ```
 
 ### Options
@@ -309,13 +309,13 @@ typedb validate [options]
 
 ```bash
 # Validate everything
-typedb validate
+sinkdb validate
 
 # Schema only
-typedb validate --schema-only
+sinkdb validate --schema-only
 
 # Strict mode (fail on missing impls)
-typedb validate --strict
+sinkdb validate --strict
 ```
 
 ### What It Does
@@ -351,21 +351,21 @@ typedb validate --strict
    - src/views/OldComponent.jsx
    - src/computed/DeletedModel.ts
 
-Run 'typedb generate stubs' to create missing files.
+Run 'sinkdb generate stubs' to create missing files.
 
 Validation failed with 4 errors.
 ```
 
 ---
 
-## `typedb migrate`
+## `sinkdb migrate`
 
 Manage schema migrations.
 
 ### Usage
 
 ```bash
-typedb migrate <command> [options]
+sinkdb migrate <command> [options]
 ```
 
 ### Subcommands
@@ -379,10 +379,10 @@ history             # Show migration history
 rollback <version>  # Rollback to specific version
 ```
 
-### `typedb migrate create`
+### `sinkdb migrate create`
 
 ```bash
-typedb migrate create "add user profiles" [options]
+sinkdb migrate create "add user profiles" [options]
 
 Options:
   --auto              # Auto-generate migration (if safe)
@@ -402,13 +402,13 @@ Options:
 ✓ Generated migration: migrations/003_add_user_profiles.sql
 ✓ Generated rollback: migrations/003_add_user_profiles.down.sql
 
-⚠  Review migration before running 'typedb migrate up'
+⚠  Review migration before running 'sinkdb migrate up'
 ```
 
-### `typedb migrate up`
+### `sinkdb migrate up`
 
 ```bash
-typedb migrate up [options]
+sinkdb migrate up [options]
 
 Options:
   --to <version>      # Migrate to specific version
@@ -434,10 +434,10 @@ Apply these migrations? (y/N): y
 ✓ Applied 3 migrations in 446ms
 ```
 
-### `typedb migrate down`
+### `sinkdb migrate down`
 
 ```bash
-typedb migrate down [n] [options]
+sinkdb migrate down [n] [options]
 
 Options:
   --force            # Skip confirmation
@@ -457,7 +457,7 @@ Continue? (y/N): y
 Current version: 002
 ```
 
-### `typedb migrate status`
+### `sinkdb migrate status`
 
 **Output:**
 ```
@@ -473,19 +473,19 @@ Applied:
 Pending:
   - 003_add_user_profiles.sql
 
-Run 'typedb migrate up' to apply pending migrations.
+Run 'sinkdb migrate up' to apply pending migrations.
 ```
 
 ---
 
-## `typedb build`
+## `sinkdb build`
 
 Build production-ready artifacts.
 
 ### Usage
 
 ```bash
-typedb build [options]
+sinkdb build [options]
 ```
 
 ### Options
@@ -502,13 +502,13 @@ typedb build [options]
 
 ```bash
 # Production build
-typedb build --release
+sinkdb build --release
 
 # WASM target
-typedb build --target wasm
+sinkdb build --target wasm
 
 # API server only
-typedb build --no-db
+sinkdb build --no-db
 ```
 
 ### What It Does
@@ -532,23 +532,23 @@ typedb build --no-db
 
 📦 Output:
   dist/
-  ├── typedb-api (binary)
-  ├── libtypedb.a (static library)
-  └── typedb.wasm (if --target wasm)
+  ├── sinkdb-api (binary)
+  ├── libsinkdb.a (static library)
+  └── sinkdb.wasm (if --target wasm)
 
 ✓ Build complete in 45.2s
 ```
 
 ---
 
-## `typedb inspect`
+## `sinkdb inspect`
 
 Inspect and introspect the project.
 
 ### Usage
 
 ```bash
-typedb inspect <target> [options]
+sinkdb inspect <target> [options]
 ```
 
 ### Targets
@@ -566,18 +566,18 @@ stats           # Show project statistics
 
 ```bash
 # Show schema
-typedb inspect schema
+sinkdb inspect schema
 
 # Show API routes
-typedb inspect routes
+sinkdb inspect routes
 
 # Show statistics
-typedb inspect stats
+sinkdb inspect stats
 ```
 
 ### Output Examples
 
-**`typedb inspect routes`**
+**`sinkdb inspect routes`**
 
 ```
 🔍 Generated API Routes
@@ -603,7 +603,7 @@ Posts:
 Total: 11 routes
 ```
 
-**`typedb inspect stats`**
+**`sinkdb inspect stats`**
 
 ```
 📊 Project Statistics
@@ -633,14 +633,14 @@ Implementations:
 
 ---
 
-## `typedb test`
+## `sinkdb test`
 
 Run tests for generated code and implementations.
 
 ### Usage
 
 ```bash
-typedb test [pattern] [options]
+sinkdb test [pattern] [options]
 ```
 
 ### Options
@@ -656,28 +656,28 @@ typedb test [pattern] [options]
 
 ```bash
 # Run all tests
-typedb test
+sinkdb test
 
 # Run unit tests only
-typedb test --unit
+sinkdb test --unit
 
 # Run specific test file
-typedb test user_test
+sinkdb test user_test
 
 # With coverage
-typedb test --coverage
+sinkdb test --coverage
 ```
 
 ---
 
-## `typedb plugin`
+## `sinkdb plugin`
 
 Manage computed field plugins (WASM, Lua, etc.).
 
 ### Usage
 
 ```bash
-typedb plugin <command> [options]
+sinkdb plugin <command> [options]
 ```
 
 ### Subcommands
@@ -693,25 +693,25 @@ info <name>         # Show plugin info
 
 ```bash
 # Add WASM plugin
-typedb plugin add ./credit_score.wasm
+sinkdb plugin add ./credit_score.wasm
 
 # List plugins
-typedb plugin list
+sinkdb plugin list
 
 # Remove plugin
-typedb plugin remove credit_score
+sinkdb plugin remove credit_score
 ```
 
 ---
 
-## `typedb benchmark`
+## `sinkdb benchmark`
 
 Run performance benchmarks.
 
 ### Usage
 
 ```bash
-typedb benchmark [options]
+sinkdb benchmark [options]
 ```
 
 ### Options
@@ -728,13 +728,13 @@ typedb benchmark [options]
 
 ```bash
 # Run all benchmarks
-typedb benchmark
+sinkdb benchmark
 
 # Compare with SQLite
-typedb benchmark --compare sqlite
+sinkdb benchmark --compare sqlite
 
 # Specific suite
-typedb benchmark --suite insert
+sinkdb benchmark --suite insert
 ```
 
 ### Output
@@ -743,26 +743,26 @@ typedb benchmark --suite insert
 🏃 Running Benchmarks...
 
 Insert (1M rows):
-  TypeDB:    2.3s  ████████████████████ (baseline)
+  SinkDB:    2.3s  ████████████████████ (baseline)
   SQLite:    3.8s  █████████████████████████████████ (+65%)
 
 Query (scan 1M rows, filter):
-  TypeDB:    89ms  █████ (baseline)
+  SinkDB:    89ms  █████ (baseline)
   DuckDB:    67ms  ████ (-25%)
   SQLite:   234ms  ████████████ (+163%)
 
 Join (10k users × 100k posts):
-  TypeDB:    42ms  ████████████████ (baseline)
+  SinkDB:    42ms  ████████████████ (baseline)
   PostgreSQL: 38ms  ██████████████ (-10%)
 
 Memory (1M rows):
-  TypeDB:    85 MB
+  SinkDB:    85 MB
   SQLite:   142 MB (+67%)
 ```
 
 ---
 
-## Configuration File: `typedb.toml`
+## Configuration File: `sinkdb.toml`
 
 ```toml
 [project]
@@ -808,8 +808,8 @@ enable_simd = true          # Use SIMD instructions
 ## Environment Variables
 
 ```bash
-TYPEDB_HOME          # TypeDB installation directory
-TYPEDB_CONFIG        # Path to typedb.toml (overrides --config)
+TYPEDB_HOME          # SinkDB installation directory
+TYPEDB_CONFIG        # Path to sinkdb.toml (overrides --config)
 TYPEDB_LOG           # Log level (error, warn, info, debug, trace)
 TYPEDB_NO_COLOR     # Disable colored output
 RUST_LOG            # Rust logging (for internal debugging)
@@ -838,7 +838,7 @@ RUST_LOG            # Rust logging (for internal debugging)
 ### GitHub Actions Example
 
 ```yaml
-name: TypeDB CI
+name: SinkDB CI
 
 on: [push, pull_request]
 
@@ -848,20 +848,20 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Install TypeDB CLI
-        run: cargo install typedb-cli
+      - name: Install SinkDB CLI
+        run: cargo install sinkdb-cli
       
       - name: Validate Schema
-        run: typedb validate --strict
+        run: sinkdb validate --strict
       
       - name: Generate Code
-        run: typedb generate --check
+        run: sinkdb generate --check
       
       - name: Run Tests
-        run: typedb test --coverage
+        run: sinkdb test --coverage
       
       - name: Build
-        run: typedb build --release
+        run: sinkdb build --release
 ```
 
 ---
@@ -873,39 +873,39 @@ jobs:
 **Schema changes not reloading:**
 ```bash
 # Force regeneration
-typedb generate --force
+sinkdb generate --force
 
 # Restart dev server
-typedb dev
+sinkdb dev
 ```
 
 **Port already in use:**
 ```bash
 # Use different port
-typedb dev --port 8080
+sinkdb dev --port 8080
 ```
 
 **Generated code doesn't compile:**
 ```bash
 # Check for schema errors
-typedb validate
+sinkdb validate
 
 # Clean and regenerate
 rm -rf generated/
-typedb generate
+sinkdb generate
 ```
 
 **Database corruption:**
 ```bash
 # Verify database
-typedb inspect stats
+sinkdb inspect stats
 
 # Restore from WAL
-typedb recover
+sinkdb recover
 
 # Last resort: rebuild from migrations
-typedb migrate down --all
-typedb migrate up
+sinkdb migrate down --all
+sinkdb migrate up
 ```
 
 ---
@@ -913,12 +913,12 @@ typedb migrate up
 ## Future Commands (v2+)
 
 ```bash
-typedb export        # Export data (JSON, CSV, SQL)
-typedb import        # Import data
-typedb backup        # Create backup
-typedb restore       # Restore from backup
-typedb replicate     # Setup replication
-typedb ai            # AI assistant (v3)
+sinkdb export        # Export data (JSON, CSV, SQL)
+sinkdb import        # Import data
+sinkdb backup        # Create backup
+sinkdb restore       # Restore from backup
+sinkdb replicate     # Setup replication
+sinkdb ai            # AI assistant (v3)
 ```
 
 ---

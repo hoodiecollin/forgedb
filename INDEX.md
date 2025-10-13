@@ -1,8 +1,8 @@
-# TypeDB - Complete Documentation Index
+# SinkDB - Complete Documentation Index
 
 ## Overview
 
-This directory contains comprehensive documentation for **TypeDB**, a revolutionary schema-first database system that transpiles declarative schemas into highly optimized columnar storage with full-stack code generation.
+This directory contains comprehensive documentation for **SinkDB**, a revolutionary schema-first database system that transpiles declarative schemas into highly optimized columnar storage with full-stack code generation.
 
 **Version**: 0.1.0 (Design Phase)  
 **Last Updated**: October 11, 2025  
@@ -41,7 +41,7 @@ This directory contains comprehensive documentation for **TypeDB**, a revolution
 - Philosophy and design principles
 - Related projects and differentiators
 
-**Read this if:** You want a high-level understanding of TypeDB and its value proposition.
+**Read this if:** You want a high-level understanding of SinkDB and its value proposition.
 
 ---
 
@@ -100,7 +100,7 @@ This directory contains comprehensive documentation for **TypeDB**, a revolution
 **What it covers:**
 - All CLI commands (`init`, `dev`, `generate`, `validate`, `migrate`, `build`, etc.)
 - Project structure
-- Configuration file (`typedb.toml`)
+- Configuration file (`sinkdb.toml`)
 - Development workflow
 - Watch mode and hot reload
 - Migration management
@@ -108,7 +108,7 @@ This directory contains comprehensive documentation for **TypeDB**, a revolution
 - Deployment
 - Troubleshooting
 
-**Read this if:** You'll be using the TypeDB CLI for development.
+**Read this if:** You'll be using the SinkDB CLI for development.
 
 ---
 
@@ -194,14 +194,14 @@ User {
 ### The Workflow
 
 1. **Define schema** in `schema.lang`
-2. **Run `typedb dev`** - generates code, starts server
+2. **Run `sinkdb dev`** - generates code, starts server
 3. **Implement stubs** - computed fields, UI components
 4. **Build your app** - use type-safe APIs
 5. **Deploy** - production-optimized binary
 
 ### The Generated Output
 
-From one schema file, TypeDB generates:
+From one schema file, SinkDB generates:
 - Rust database implementation (columnar storage)
 - TypeScript types
 - REST API server
@@ -423,24 +423,24 @@ Comment {
 ## Comparisons
 
 ### vs SQLite
-- **TypeDB**: Columnar, optimized for analytics + OLTP hybrid
+- **SinkDB**: Columnar, optimized for analytics + OLTP hybrid
 - **SQLite**: Row-based, pure OLTP
-- **Trade-off**: TypeDB requires schema at compile-time
+- **Trade-off**: SinkDB requires schema at compile-time
 
 ### vs PostgreSQL
-- **TypeDB**: Embedded, single-node, schema-first
+- **SinkDB**: Embedded, single-node, schema-first
 - **PostgreSQL**: Client-server, distributed-ready, schema-flexible
-- **Trade-off**: TypeDB sacrifices flexibility for performance
+- **Trade-off**: SinkDB sacrifices flexibility for performance
 
 ### vs Prisma (ORM)
-- **TypeDB**: Database + ORM + API in one
+- **SinkDB**: Database + ORM + API in one
 - **Prisma**: ORM layer over existing databases
-- **Trade-off**: TypeDB is more opinionated but more integrated
+- **Trade-off**: SinkDB is more opinionated but more integrated
 
 ### vs PostgREST
-- **TypeDB**: Generates optimized database + API
+- **SinkDB**: Generates optimized database + API
 - **PostgREST**: Generates API over PostgreSQL
-- **Trade-off**: TypeDB owns the storage layer
+- **Trade-off**: SinkDB owns the storage layer
 
 ---
 
@@ -452,7 +452,7 @@ Comment {
 - Join discussions (Discord - future)
 
 ### Once Released
-- CLI: `typedb --help`
+- CLI: `sinkdb --help`
 - Dev server docs: `http://localhost:3000/docs`
 - API docs: OpenAPI spec at `/api/docs`
 
@@ -504,12 +504,12 @@ TBD (likely MIT or Apache 2.0)
 
 ### Common Commands
 ```bash
-typedb init my-app          # Create new project
-typedb dev                  # Start dev server
-typedb generate             # Generate code
-typedb validate             # Check schema
-typedb migrate up           # Run migrations
-typedb build --release      # Production build
+sinkdb init my-app          # Create new project
+sinkdb dev                  # Start dev server
+sinkdb generate             # Generate code
+sinkdb validate             # Check schema
+sinkdb migrate up           # Run migrations
+sinkdb build --release      # Production build
 ```
 
 ### Common Patterns

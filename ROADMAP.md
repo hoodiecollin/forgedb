@@ -1,8 +1,8 @@
-# TypeDB Development Roadmap
+# SinkDB Development Roadmap
 
 ## Overview
 
-This document outlines the development phases for TypeDB, from initial prototype through production-ready system and advanced features.
+This document outlines the development phases for SinkDB, from initial prototype through production-ready system and advanced features.
 
 ## Development Philosophy
 
@@ -28,7 +28,7 @@ This document outlines the development phases for TypeDB, from initial prototype
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── schema-lang/
 │   ├── lexer.rs         # Tokenization
 │   ├── parser.rs        # Parsing logic
@@ -60,7 +60,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── transpiler/
 │   ├── codegen/
 │   │   ├── mod.rs
@@ -95,7 +95,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── storage/
 │   │   ├── mod.rs
@@ -129,7 +129,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── storage/
 │   │   ├── variable.rs   # Variable-length storage
@@ -160,7 +160,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── query/
 │   │   ├── mod.rs
@@ -193,7 +193,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── query/
 │   │   ├── join.rs       # Join algorithms
@@ -223,7 +223,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── wal/
 │   │   ├── mod.rs
@@ -255,7 +255,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── storage/
 │   │   └── structs.rs    # Inline struct storage
@@ -306,7 +306,7 @@ typedb/
 ### Milestone 2.1: CLI Tool (Weeks 31-34)
 
 **Deliverables:**
-- [ ] `typedb` CLI binary
+- [ ] `sinkdb` CLI binary
 - [ ] Project initialization
 - [ ] Schema validation
 - [ ] Code generation commands
@@ -314,16 +314,16 @@ typedb/
 
 **Commands:**
 ```bash
-typedb init <project>
-typedb dev
-typedb generate
-typedb validate
-typedb build
+sinkdb init <project>
+sinkdb dev
+sinkdb generate
+sinkdb validate
+sinkdb build
 ```
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── cli/
 │   ├── main.rs
 │   ├── commands/
@@ -370,7 +370,7 @@ GET    /api/users/{id}/posts
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── api/
 │   │   ├── mod.rs
@@ -404,7 +404,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── runtime/
 │   ├── computed/
 │   │   ├── mod.rs
@@ -437,7 +437,7 @@ typedb/
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── cli/
 │   ├── scaffold.rs       # Stub generation
 │   └── ssr.rs           # Server-side rendering
@@ -472,15 +472,15 @@ typedb/
 
 **Commands:**
 ```bash
-typedb migrate create "add users"
-typedb migrate up
-typedb migrate down
-typedb migrate status
+sinkdb migrate create "add users"
+sinkdb migrate up
+sinkdb migrate down
+sinkdb migrate status
 ```
 
 **Files to Create:**
 ```
-typedb/
+sinkdb/
 ├── cli/
 │   └── migrate.rs
 ├── transpiler/
@@ -614,7 +614,7 @@ User {
 ```
 
 ```bash
-$ typedb dev --ai
+$ sinkdb dev --ai
 🤖 AI analyzing schema...
 📝 Generating Profile.jsx...
 ✓ Created component with tests

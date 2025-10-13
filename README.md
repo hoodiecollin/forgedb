@@ -1,8 +1,8 @@
-# TypeDB - Type-Safe, Schema-First Full-Stack Database Framework
+# SinkDB - Type-Safe, Schema-First Full-Stack Database Framework
 
 ## Executive Summary
 
-TypeDB is a revolutionary database system that uses a declarative schema language to generate a complete full-stack application: database, type-safe APIs, UI components, and developer tooling. The system transpiles schema definitions into highly optimized Rust code with columnar storage, providing exceptional performance through compile-time optimization while maintaining perfect type safety across the entire stack.
+SinkDB is a revolutionary database system that uses a declarative schema language to generate a complete full-stack application: database, type-safe APIs, UI components, and developer tooling. The system transpiles schema definitions into highly optimized Rust code with columnar storage, providing exceptional performance through compile-time optimization while maintaining perfect type safety across the entire stack.
 
 ## Core Innovation
 
@@ -131,7 +131,7 @@ Timeline: TBD (experimental)
 ## Project Structure
 
 ```
-typedb/
+sinkdb/
 ├── schema-lang/          # DSL parser and AST
 ├── transpiler/           # Code generation engine
 ├── runtime/              # Rust runtime library
@@ -147,10 +147,10 @@ typedb/
 
 ```bash
 # Install CLI
-cargo install typedb-cli
+cargo install sinkdb-cli
 
 # Create new project
-typedb init my-app
+sinkdb init my-app
 cd my-app
 
 # Define schema
@@ -163,7 +163,7 @@ User {
 EOF
 
 # Generate and run
-typedb dev
+sinkdb dev
 # Server running at http://localhost:3000
 # API docs at http://localhost:3000/docs
 ```
