@@ -3,6 +3,9 @@ pub mod lexer;
 pub mod parser;
 pub mod codegen;
 
+#[cfg(test)]
+mod edge_case_tests;
+
 use parser::Parser;
 use codegen::CodeGenerator;
 use std::fs;
