@@ -1,0 +1,24 @@
+[package]
+name = "sinkdb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[lib]
+name = "sinkdb"
+path = "src/main.rs"
+
+# Sprint 1 MVP Examples
+[[example]]
+name = "sprint1_mvp_app"
+path = "examples/sprint1_mvp/app.rs"
+
+[[example]]
+name = "sprint1_mvp_client"
+path = "examples/sprint1_mvp/client.rs"
+
+# Original basic example
+[[example]]
+name = "basic"
+path = "examples/basic.rs"

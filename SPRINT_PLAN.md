@@ -4,11 +4,159 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 
 ---
 
+## Development Orchestration
+
+This project uses git worktrees and automated orchestration to enable parallel development across sprints and within individual sprints.
+
+### Technology Stack
+- **Package Manager**: `bun` (TypeScript runtime and package manager)
+- **Task Runner**: Turborepo (parallel task execution with caching)
+- **Source of Truth**: Cargo workspace structure (npm workspaces align with Cargo workspace members)
+- **CLI**: `claude-code -p --permission-mode=bypassPermissions` for non-interactive parallel execution
+
+### Branch Naming Convention
+
+**All work must be done in conventionally named branches**, even for sequential (non-parallel) work:
+
+- Sprint branches: `sprint-N` (e.g., `sprint-1`, `sprint-2`)
+- Feature branches: `sprint-N/feature-name` (e.g., `sprint-2/persistence`, `sprint-5/cli`)
+- Never work directly on `main` branch
+
+This ensures:
+- Clean git history with atomic, reviewable PRs
+- Ability to parallelize work later if needed
+- Consistent workflow across all sprints
+- Easy rollback of individual features
+
+### Between Sprints
+
+Create separate worktrees for each sprint to work on multiple features simultaneously:
+
+```bash
+# From main repository
+git worktree add -b sprint-2 ../kitchen-sink-sprint-2
+git worktree add -b sprint-3 ../kitchen-sink-sprint-3
+git worktree add -b sprint-4 ../kitchen-sink-sprint-4
+```
+
+**Benefits:**
+- Work on multiple sprints in parallel without context switching
+- Each sprint becomes an independent PR
+- Easy to test different features in isolation
+- Keep main branch stable while developing
+
+### Within Sprints
+
+For sprints with 3+ independent tasks, create sub-worktrees:
+
+```bash
+# From sprint-2 branch
+git worktree add -b sprint-2/persistence ../kitchen-sink-sprint-2-persistence
+git worktree add -b sprint-2/types ../kitchen-sink-sprint-2-types
+git worktree add -b sprint-2/validation ../kitchen-sink-sprint-2-validation
+```
+
+**Recommended workflow:**
+1. Create base sprint branch (e.g., `sprint-2`)
+2. Create feature branches for independent tasks
+3. Submit separate PRs for each feature into the sprint branch
+4. Merge sprint branch to main when complete
+
+**Example PR structure:**
+```
+main
+└── sprint-2
+    ├── sprint-2/persistence → PR #1 (into sprint-2)
+    ├── sprint-2/types → PR #2 (into sprint-2)
+    ├── sprint-2/validation → PR #3 (into sprint-2)
+    └── sprint-2/tests → PR #4 (into sprint-2, after #1-3 merge)
+
+    Then: sprint-2 → PR #5 (into main)
+```
+
+### Worktree Management
+
+**List all worktrees:**
+```bash
+git worktree list
+```
+
+**Remove a worktree:**
+```bash
+git worktree remove ../kitchen-sink-sprint-2-persistence
+```
+
+**Prune deleted worktrees:**
+```bash
+git worktree prune
+```
+
+### When to Use Worktrees
+
+**Good candidates for parallel worktrees:**
+- Sprint 2: Storage, Types, Validation (all independent)
+- Sprint 3: Indexing and Query Operations
+- Sprint 5: CLI commands, Project structure, File watching
+- Sprint 9: Different CRUD endpoint implementations
+
+**Keep serialized:**
+- Sprint 1: Small MVP, needs full integration
+- Sprint 7: WAL components are tightly coupled
+- Sprint 16: Migrations are sequential by nature
+
+### Orchestrator Implementation
+
+The orchestrator automates parallel development by:
+1. Parsing sprint metadata from this document
+2. Setting up Cargo workspace members as git worktrees
+3. Generating Turborepo configuration aligned with Cargo.toml
+4. Running parallel `claude-code -p` instances for each task
+
+**Source of truth**: `Cargo.toml` workspace members
+**Alignment**: npm/bun workspaces mirror Cargo workspace structure
+
+**Example orchestrator invocation:**
+```bash
+# Run orchestrator for Sprint 2
+bun run orchestrate sprint-2
+
+# Generated structure:
+# .orchestrator/
+# ├── package.json          # bun workspace root
+# ├── turbo.json            # Turborepo pipeline config
+# └── worktrees/
+#     ├── persistence/      # mirrors Cargo member: storage
+#     ├── types/            # mirrors Cargo member: types
+#     └── validation/       # mirrors Cargo member: validation
+```
+
+**Orchestrator workflow:**
+1. Parse sprint YAML metadata
+2. Read `Cargo.toml` workspace members
+3. Create git worktree for each Cargo member
+4. Generate bun workspace with matching structure
+5. Create `turbo.json` with dependency graph
+6. Generate package.json scripts: `claude-code -p --permission-mode=bypassPermissions "{prompt}"`
+7. Run: `turbo run build --parallel`
+8. Collect logs from `.turbo/runs/`
+
+**Permission mode**: `bypassPermissions` ensures Claude Code workers can create files, run commands, and make changes without interactive prompts.
+
+**Key insight**: Cargo workspace members define the code structure, orchestrator just automates parallel Claude Code invocations for each member.
+
+---
+
 ## Sprint 1: MVP - End-to-End Proof of Concept
 
 **Goal**: Demonstrate the core concept with a minimal but complete working system.
 
 **Deliverables**: A working schema → code → database → query pipeline for a single simple model.
+
+**Orchestration**: ⚠️ Serialized (small MVP, needs full integration)
+```yaml
+parallelization: none
+reason: "MVP is small and tightly integrated - better as single implementation"
+```
 
 ### Tasks
 
@@ -68,6 +216,65 @@ User {
 
 **Goal**: Add persistence and expand type support.
 
+**Orchestration**: ✅ Parallelizable
+```yaml
+cargo_workspace_members:
+  - storage     # Storage persistence implementation
+  - types       # Type system and primitives
+  - validation  # Schema validation
+  - tests       # Integration tests (depends on all)
+
+tasks:
+  - name: persistence
+    cargo_member: storage
+    branch: sprint-2/persistence
+    dependencies: []
+    prompt: |
+      Implement storage persistence for Sprint 2:
+      - Memory-mapped files for fixed-size columns (write u64 to fixed/u64_0.bin)
+      - Variable-length string storage (variable/string_data.bin + offsets)
+      - Basic manifest.json for metadata
+      - Ensure database survives restart
+      - Write comprehensive tests
+
+  - name: types
+    cargo_member: types
+    branch: sprint-2/types
+    dependencies: []
+    prompt: |
+      Implement expanded type support for Sprint 2:
+      - Add primitive types: i32, i64, f64, bool
+      - Add uuid type with auto-generation
+      - Add timestamp type with auto-set (+timestamp)
+      - Update parser to handle all primitive types
+      - Update codegen for each type
+      - Write unit tests for each type
+
+  - name: validation
+    cargo_member: validation
+    branch: sprint-2/validation
+    dependencies: []
+    prompt: |
+      Implement schema validation for Sprint 2:
+      - Validate field names (snake_case enforcement)
+      - Validate model names (PascalCase enforcement)
+      - Check for duplicate field names
+      - Better error messages with line numbers and suggestions
+      - Write validation unit tests
+
+  - name: integration-tests
+    cargo_member: tests
+    branch: sprint-2/tests
+    dependencies: [persistence, types, validation]
+    prompt: |
+      Write comprehensive integration tests for Sprint 2:
+      - Unit tests for parser with all types
+      - Unit tests for each storage type
+      - Persistence test (write → close → reopen → read)
+      - Test schema with all primitive types
+      - Verify all success criteria
+```
+
 ### Tasks
 
 #### Storage Persistence
@@ -119,6 +326,52 @@ User {
 
 **Goal**: Add indexes and basic query capabilities.
 
+**Orchestration**: ✅ Parallelizable
+```yaml
+cargo_workspace_members:
+  - indexing    # Index data structures and operations
+  - queries     # Query operations and filtering
+  - codegen     # Code generation for query methods
+
+tasks:
+  - name: indexing
+    cargo_member: indexing
+    branch: sprint-3/indexing
+    dependencies: []
+    prompt: |
+      Implement indexing for Sprint 3:
+      - Add index symbol '^' support in parser
+      - Hash index for '^&' fields (indexed + unique)
+      - Hash index for '^' fields (indexed only)
+      - Index stored in-memory (rebuild on load)
+      - Write index persistence and rebuild tests
+
+  - name: queries
+    cargo_member: queries
+    branch: sprint-3/queries
+    dependencies: []
+    prompt: |
+      Implement query operations for Sprint 3:
+      - List all with tombstone filtering
+      - Filter by indexed field (O(1) lookup)
+      - Filter by equality on any field (O(n) scan)
+      - Update operation with index maintenance
+      - Delete operation with tombstone marking
+      - Write comprehensive query tests
+
+  - name: codegen
+    cargo_member: codegen
+    branch: sprint-3/codegen
+    dependencies: [indexing, queries]
+    prompt: |
+      Generate query methods for Sprint 3:
+      - Generate find_by_X for '^' indexed fields
+      - Generate list() function with filtering
+      - Generate update() function
+      - Generate delete() function
+      - Write codegen tests and verify generated code compiles
+```
+
 ### Tasks
 
 #### Indexing
@@ -161,6 +414,48 @@ User {
 ## Sprint 4: Relations (One-to-Many)
 
 **Goal**: Support basic relationships.
+
+**Orchestration**: ⚠️ Partially Serialized
+```yaml
+cargo_workspace_members:
+  - relations   # Relation parsing and FK generation
+  - storage     # FK storage and validation (extends Sprint 2)
+  - codegen     # Relation method generation (extends Sprint 3)
+
+tasks:
+  - name: schema-relations
+    cargo_member: relations
+    branch: sprint-4/schema
+    dependencies: []
+    prompt: |
+      Implement relation parsing for Sprint 4:
+      - Parse relation syntax: posts: [Post] and author: *User
+      - Detect one-to-many patterns
+      - Generate foreign key column definitions
+      - Build relation graph and detect cycles
+
+  - name: storage-fk
+    cargo_member: storage
+    branch: sprint-4/storage
+    dependencies: [schema-relations]
+    prompt: |
+      Implement FK storage for Sprint 4:
+      - Store foreign key as regular indexed column
+      - Index foreign keys automatically
+      - Validate foreign key references exist
+      - Write FK constraint tests
+
+  - name: codegen-relations
+    cargo_member: codegen
+    branch: sprint-4/codegen
+    dependencies: [schema-relations, storage-fk]
+    prompt: |
+      Generate relation methods for Sprint 4:
+      - Generate FK column in child model
+      - Generate relation traversal: user.posts()
+      - Generate reverse lookup: post.author()
+      - Write integration tests with test schema
+```
 
 ### Tasks
 
@@ -206,6 +501,63 @@ Post {
 ## Sprint 5: CLI & Developer Experience
 
 **Goal**: Usable CLI tool with good DX.
+
+**Orchestration**: ✅ Highly Parallelizable
+```yaml
+cargo_workspace_members:
+  - cli         # CLI framework and commands
+  - scaffold    # Project scaffolding
+  - watcher     # File watching and auto-regen
+  - docs        # Documentation generation
+
+tasks:
+  - name: cli-commands
+    cargo_member: cli
+    branch: sprint-5/cli
+    dependencies: []
+    prompt: |
+      Implement CLI commands for Sprint 5:
+      - sinkdb init <project> - scaffold new project
+      - sinkdb generate - generate code from schema
+      - sinkdb validate - validate schema
+      - sinkdb build - compile generated code
+      - CLI help text and error messages with suggestions
+
+  - name: scaffolding
+    cargo_member: scaffold
+    branch: sprint-5/scaffold
+    dependencies: []
+    prompt: |
+      Implement project scaffolding for Sprint 5:
+      - Generate standard project layout
+      - Create schema.lang template file
+      - Create sinkdb.toml config
+      - Generate .gitignore with Rust/DB entries
+      - Write scaffolding tests
+
+  - name: file-watcher
+    cargo_member: watcher
+    branch: sprint-5/watcher
+    dependencies: []
+    prompt: |
+      Implement file watching for Sprint 5:
+      - Watch schema.lang for changes using notify crate
+      - Auto-regenerate on schema change
+      - Clear error display in terminal
+      - Debounce rapid changes
+      - Write watcher integration tests
+
+  - name: documentation
+    cargo_member: docs
+    branch: sprint-5/docs
+    dependencies: [cli-commands, scaffolding]
+    prompt: |
+      Create documentation for Sprint 5:
+      - Getting started guide (installation, first project)
+      - CLI help text for all commands
+      - Error messages with actionable suggestions
+      - Example project walkthrough
+```
 
 ### Tasks
 
@@ -295,6 +647,29 @@ Tag {
 
 **Goal**: ACID properties and crash recovery.
 
+**Orchestration**: ⚠️ Serialized (tightly coupled components)
+```yaml
+cargo_workspace_members:
+  - wal         # WAL implementation (all components tightly integrated)
+
+reason: |
+  WAL components are tightly coupled - file format, recovery, and transactions
+  all depend on each other. Better implemented as single cohesive unit.
+
+prompt: |
+  Implement Write-Ahead Log for Sprint 7:
+  - Design WAL file format (operation type + data)
+  - Write operations to WAL before data files
+  - Configurable fsync policy (immediate, periodic, none)
+  - WAL replay on startup with incomplete entry detection
+  - Truncate corrupted WAL entries
+  - WAL rotation and cleanup
+  - Begin/commit/rollback transaction API
+  - Group operations in transaction with atomic commit
+  - Comprehensive tests: crash recovery, commit, rollback, corruption
+  - Performance: recovery < 1s for 10k writes
+```
+
 ### Tasks
 
 #### WAL Implementation
@@ -383,6 +758,78 @@ User {
 ## Sprint 9: REST API Generation
 
 **Goal**: Auto-generate REST API from schema.
+
+**Orchestration**: ✅ Highly Parallelizable
+```yaml
+cargo_workspace_members:
+  - http-server  # HTTP server setup (Axum/Actix)
+  - crud-api     # CRUD endpoint handlers
+  - query-params # Query parameter parsing and filtering
+  - validation   # Request validation and error handling
+  - codegen      # API code generation
+
+tasks:
+  - name: http-server
+    cargo_member: http-server
+    branch: sprint-9/server
+    dependencies: []
+    prompt: |
+      Implement HTTP server for Sprint 9:
+      - Choose framework (Axum recommended)
+      - Basic server setup with routing
+      - JSON serialization/deserialization
+      - Error response formatting
+      - Server integration tests
+
+  - name: crud-endpoints
+    cargo_member: crud-api
+    branch: sprint-9/crud
+    dependencies: []
+    prompt: |
+      Implement CRUD endpoints for Sprint 9:
+      - GET /api/{model} - list
+      - GET /api/{model}/{id} - get by ID
+      - POST /api/{model} - create
+      - PUT /api/{model}/{id} - update
+      - DELETE /api/{model}/{id} - delete
+      - Write endpoint tests
+
+  - name: query-params
+    cargo_member: query-params
+    branch: sprint-9/query
+    dependencies: []
+    prompt: |
+      Implement query parameters for Sprint 9:
+      - Filter: ?email=x@y.com (equality matching)
+      - Sort: ?sort=created_at&order=desc
+      - Pagination: ?limit=50&offset=100
+      - Query parser with validation
+      - Write query parsing tests
+
+  - name: validation
+    cargo_member: validation
+    branch: sprint-9/validation
+    dependencies: []
+    prompt: |
+      Implement request validation for Sprint 9:
+      - Validate request body against schema
+      - Return 400 for validation errors with details
+      - Return 409 for unique constraint violations
+      - Return 404 for not found
+      - Write validation tests
+
+  - name: codegen-api
+    cargo_member: codegen
+    branch: sprint-9/codegen
+    dependencies: [http-server, crud-endpoints, query-params, validation]
+    prompt: |
+      Generate API code for Sprint 9:
+      - Generate handler functions for each model
+      - Generate request/response types (serde)
+      - Generate validation logic
+      - Generate router setup
+      - Test generated API with curl
+```
 
 ### Tasks
 
