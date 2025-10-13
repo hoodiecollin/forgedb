@@ -448,6 +448,30 @@ impl CodeGenerator {
         }
     }
 
+    fn generate_database_struct(&self, schema: &Schema) -> String {
+        let mut code = String::new();
+
+        code.push_str("pub struct Database {\n");
+        for model in &schema.models {
+            code.push_str(&format!("    pub {}: {}Storage,\n",
+                model.name.to_lowercase(), model.name));
+        }
+        code.push_str("}\n\n");
+
+        code.push_str("impl Database {\n");
+        code.push_str("    pub fn new() -> Self {\n");
+        code.push_str("        Database {\n");
+        for model in &schema.models {
+            code.push_str(&format!("            {}: {}Storage::new(),\n",
+                model.name.to_lowercase(), model.name));
+        }
+        code.push_str("        }\n");
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
+
+        code
+    }
+
     pub fn generate(&self, schema: &Schema) -> String {
         let mut code = String::new();
 
@@ -463,6 +487,9 @@ impl CodeGenerator {
             code.push_str(&self.generate_storage_struct(model));
             code.push_str(&self.generate_storage_impl(model));
         }
+
+        // Generate Database struct that holds all storages
+        code.push_str(&self.generate_database_struct(schema));
 
         code
     }
