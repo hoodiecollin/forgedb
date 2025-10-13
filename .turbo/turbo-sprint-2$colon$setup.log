@@ -1,9 +1,0 @@
-
-[0m[2m[35m$[0m [2m[1m.orchestrator/scripts/setup.sh[0m
-Setting up Sprint 2 worktrees...
-  ✓ sprint-2/persistence worktree already exists at ./.worktrees/persistence
-  ✓ sprint-2/types worktree already exists at ./.worktrees/types
-  ✓ sprint-2/validation worktree already exists at ./.worktrees/validation
-  ✓ sprint-2/tests worktree already exists at ./.worktrees/tests
-
-✓ All worktrees ready

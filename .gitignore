@@ -2,6 +2,7 @@
 /generated
 .orchestrator/
 .worktrees/
+.turbo/
 package.json
 turbo.json
 node_modules/
