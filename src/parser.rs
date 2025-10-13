@@ -1,16 +1,40 @@
 use crate::ast::{Field, FieldType, Model, Schema};
-use crate::lexer::{Lexer, Token};
+use crate::lexer::{Lexer, Token, TokenWithPos};
+use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
 pub struct Parser {
     tokens: Vec<Token>,
+    tokens_with_pos: Vec<TokenWithPos>,
     position: usize,
+    use_validation: bool,
 }
 
 impl Parser {
     pub fn new(input: &str) -> Result<Self, String> {
+        Self::new_with_validation(input, true)
+    }
+
+    pub fn new_with_validation(input: &str, use_validation: bool) -> Result<Self, String> {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
-        Ok(Parser { tokens, position: 0 })
+
+        let mut lexer = Lexer::new(input);
+        let tokens_with_pos = lexer.tokenize_with_pos()?;
+
+        Ok(Parser {
+            tokens,
+            tokens_with_pos,
+            position: 0,
+            use_validation,
+        })
+    }
+
+    fn get_current_position(&self) -> Option<Position> {
+        if self.position < self.tokens_with_pos.len() {
+            Some(self.tokens_with_pos[self.position].position)
+        } else {
+            None
+        }
     }
 
     fn current_token(&self) -> &Token {
@@ -63,11 +87,19 @@ impl Parser {
         self.skip_newlines();
 
         // Parse field name
+        let field_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => return Err(format!("Expected field name, found {:?}", self.current_token())),
         };
         self.advance();
+
+        // Validate field name
+        if self.use_validation {
+            if let Err(e) = validate_field_name(&name, field_pos) {
+                return Err(e.to_string());
+            }
+        }
 
         // Expect colon
         self.expect(Token::Colon)?;
@@ -113,11 +145,19 @@ impl Parser {
         self.skip_newlines();
 
         // Parse model name
+        let model_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => return Err(format!("Expected model name, found {:?}", self.current_token())),
         };
         self.advance();
+
+        // Validate model name
+        if self.use_validation {
+            if let Err(e) = validate_model_name(&name, model_pos) {
+                return Err(e.to_string());
+            }
+        }
 
         // Expect opening brace
         self.skip_newlines();
@@ -456,5 +496,170 @@ User {
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert!(error.contains("Auto-generate symbol '+' cannot be used"));
+    }
+
+    // Validation tests
+    #[test]
+    fn test_validation_field_name_snake_case() {
+        let input = r#"
+User {
+  UserName: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("snake_case"));
+        assert!(error.contains("user_name"));
+    }
+
+    #[test]
+    fn test_validation_model_name_pascal_case() {
+        let input = r#"
+user_model {
+  name: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("PascalCase"));
+        assert!(error.contains("UserModel"));
+    }
+
+    #[test]
+    fn test_validation_can_be_disabled() {
+        let input = r#"
+user_model {
+  UserName: string
+}
+"#;
+        let mut parser = Parser::new_with_validation(input, false).unwrap();
+        let result = parser.parse();
+        // Should succeed when validation is disabled
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_error_with_line_numbers() {
+        let input = r#"
+User {
+  id: +u64
+  BadFieldName: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("line"));
+        assert!(error.contains("snake_case"));
+    }
+
+    #[test]
+    fn test_validation_all_valid() {
+        let input = r#"
+User {
+  id: +u64
+  email: &string
+  user_name: string
+}
+
+Post {
+  id: +u64
+  title: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_ok());
+    }
+
+    // Integration edge case tests
+    #[test]
+    fn test_validation_single_char_names() {
+        let input = r#"
+A {
+  x: u32
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_private_fields() {
+        let input = r#"
+User {
+  id: +u64
+  _private: string
+  __internal: u32
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_numbers_in_names() {
+        let input = r#"
+User123 {
+  field_123: u32
+  abc_456_def: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validation_mixed_errors_stops_at_first() {
+        // Should report the first error encountered (model name)
+        let input = r#"
+bad_model {
+  BadField: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        // Should fail on model name first
+        assert!(error.contains("PascalCase"));
+        assert!(error.contains("bad_model"));
+    }
+
+    #[test]
+    fn test_validation_camel_case_field() {
+        let input = r#"
+User {
+  userName: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("snake_case"));
+        assert!(error.contains("user_name"));
+    }
+
+    #[test]
+    fn test_validation_screaming_snake_case_field() {
+        let input = r#"
+User {
+  USER_NAME: string
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let result = parser.parse();
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(error.contains("snake_case"));
     }
 }

@@ -19,6 +19,9 @@ sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
 
+[dev-dependencies]
+sinkdb-validation = { path = "crates/validation" }
+
 [lib]
 name = "sinkdb"
 path = "src/main.rs"
@@ -41,3 +44,8 @@ path = "examples/basic.rs"
 [[example]]
 name = "test_all_types"
 path = "examples/test_all_types.rs"
+
+# Validation demo
+[[example]]
+name = "test_validation"
+path = "examples/test_validation.rs"
