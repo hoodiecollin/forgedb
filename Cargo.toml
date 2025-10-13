@@ -35,3 +35,8 @@ path = "examples/sprint1_mvp/client.rs"
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+
+# Sprint 2 Persistence Example
+[[example]]
+name = "sprint2_persistence"
+path = "examples/sprint2_persistence/test_persistence.rs"
