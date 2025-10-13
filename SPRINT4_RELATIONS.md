@@ -29,19 +29,26 @@ Sprint 4 implements basic relationship support in SinkDB, specifically one-to-ma
    - 85 tests passing (including Sprint 4 relation tests)
    - Tests for all relation types and code generation
 
-### 🚧 Pending (Future Work)
+### ✅ Sprint 4.1 - Additional Features
 
-6. **Foreign Key Validation**
+6. **Database Struct**
+   - Central struct holding all model storages
+   - Enables cross-model operations
+
+7. **Foreign Key Validation**
    - Runtime validation that FKs reference existing records
-   - Error on insert/update if referenced record doesn't exist
+   - Generated `insert_X()` methods with FK checks
+   - Error on insert if referenced record doesn't exist
 
-7. **Relation Traversal Methods**
-   - `user.posts()` - Get all posts for a user
+8. **Relation Traversal Methods**
+   - `user_posts(user_id)` - Get all posts for a user
    - Automatic generation based on relation pairs
+   - Uses underlying `find_by_X_id()` methods
 
-8. **Reverse Lookup Methods**
-   - `post.author()` - Get the author of a post
+9. **Reverse Lookup Methods**
+   - `post_author(post_id)` - Get the author of a post
    - Type-safe navigation from child to parent
+   - Returns `Option<Parent>` for safe access
 
 ## Schema Syntax
 
@@ -71,7 +78,42 @@ Post {
 }
 ```
 
-## Generated Code
+## Generated Code (Sprint 4.1)
+
+### Database Struct
+
+```rust
+pub struct Database {
+    pub user: UserStorage,
+    pub post: PostStorage,
+}
+
+impl Database {
+    pub fn new() -> Self { ... }
+
+    // FK-validated insert
+    pub fn insert_post(&mut self, title: String, content: String, author_id: uuid::Uuid)
+        -> Result<Post, String> {
+        if self.user.get(author_id).is_none() {
+            return Err("Foreign key validation failed: User does not exist".to_string());
+        }
+        self.post.insert(title, content, author_id)
+    }
+
+    // Relation traversal
+    pub fn user_posts(&self, user_id: uuid::Uuid) -> Vec<Post> {
+        self.post.find_by_user_id(user_id)
+    }
+
+    // Reverse lookup
+    pub fn post_author(&self, post_id: uuid::Uuid) -> Option<User> {
+        if let Some(child) = self.post.get(post_id) {
+            return self.user.get(child.author_id);
+        }
+        None
+    }
+}
+```
 
 ### Struct Generation
 
@@ -223,33 +265,19 @@ cargo run --example sprint4_relations
 
 ## Success Criteria
 
-All Sprint 4 success criteria have been met:
+All Sprint 4 + 4.1 success criteria have been met:
 
 - ✅ Can create posts linked to users (via FK)
 - ✅ Can find posts by author_id (via generated index)
 - ✅ Foreign keys are automatically indexed
 - ✅ Schema validation prevents invalid references
-
-**Pending for future work:**
-- ⏳ Can traverse user → posts (relation traversal methods)
-- ⏳ Can traverse post → user (reverse lookup methods)
-- ⏳ Foreign key validation works at runtime
+- ✅ Can traverse user → posts (relation traversal methods)
+- ✅ Can traverse post → user (reverse lookup methods)
+- ✅ Foreign key validation works at runtime
 
 ## Next Steps (Future Sprints)
 
-1. **Implement FK Validation**
-   - Validate FK references on insert/update
-   - Return helpful error messages for dangling references
-
-2. **Generate Relation Traversal Methods**
-   - `user.posts() -> Vec<Post>` using `find_by_author_id`
-   - Automatically generated based on `detect_relations()`
-
-3. **Generate Reverse Lookup Methods**
-   - `post.author() -> User` using `author_id`
-   - Type-safe navigation from child to parent
-
-4. **Support Many-to-Many Relations**
+1. **Support Many-to-Many Relations** (Sprint 6)
    - Junction table generation
    - Bi-directional traversal methods
 
@@ -263,12 +291,19 @@ All Sprint 4 success criteria have been met:
 
 ## Statistics
 
+### Sprint 4
 - **Lines of code added**: ~400
 - **Tests added**: 5 new relation-specific tests
 - **Total tests passing**: 85
 - **Example programs**: 1 (sprint4_relations)
 
+### Sprint 4.1
+- **Lines of code added**: ~200
+- **Tests added**: 4 new Database/FK/relation tests
+- **Total tests passing**: 89
+- **Example programs**: 1 (sprint4_1_database)
+
 ---
 
-**Sprint Status**: Core features complete ✅
+**Sprint Status**: All features complete ✅✅
 **Next Sprint**: Sprint 5 - CLI & Developer Experience

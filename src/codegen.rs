@@ -466,10 +466,158 @@ impl CodeGenerator {
                 model.name.to_lowercase(), model.name));
         }
         code.push_str("        }\n");
-        code.push_str("    }\n");
+        code.push_str("    }\n\n");
+
+        // Generate FK validation insert methods
+        for model in &schema.models {
+            self.generate_db_insert_with_fk_validation(&mut code, model, schema);
+        }
+
+        // Generate relation traversal methods
+        let relations = schema.detect_relations();
+        for relation in &relations {
+            self.generate_relation_traversal_method(&mut code, relation, schema);
+            self.generate_reverse_lookup_method(&mut code, relation, schema);
+        }
+
         code.push_str("}\n\n");
 
         code
+    }
+
+    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, schema: &Schema) {
+        // Find FK fields in this model
+        let fk_fields: Vec<&Field> = model.fields.iter()
+            .filter(|f| matches!(&f.field_type, FieldType::Relation(rel) if rel.is_reference()))
+            .collect();
+
+        if fk_fields.is_empty() {
+            return; // No FKs to validate
+        }
+
+        let method_name = format!("insert_{}", model.name.to_lowercase());
+        code.push_str(&format!("    pub fn {}(&mut self", method_name));
+
+        // Parameters: all fields except auto-generated and OneToMany
+        for field in &model.fields {
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+
+            if !field.auto_generate {
+                let param_name = self.get_field_param_name(field);
+                let param_type = self.get_field_param_type(field);
+                code.push_str(&format!(", {}: {}", param_name, param_type));
+            }
+        }
+
+        code.push_str(&format!(") -> Result<{}, String> {{\n", model.name));
+
+        // Validate each FK
+        for field in &fk_fields {
+            if let FieldType::Relation(rel) = &field.field_type {
+                let target_model = rel.target_model();
+                let fk_param = format!("{}_id", field.name);
+                let storage_name = target_model.to_lowercase();
+
+                match rel {
+                    RelationType::RequiredReference(_) => {
+                        code.push_str(&format!("        if self.{}.get({}).is_none() {{\n", storage_name, fk_param));
+                        code.push_str(&format!("            return Err(\"Foreign key validation failed: {} does not exist\".to_string());\n", target_model));
+                        code.push_str("        }\n");
+                    }
+                    RelationType::OptionalReference(_) => {
+                        code.push_str(&format!("        if let Some(fk) = {} {{\n", fk_param));
+                        code.push_str(&format!("            if self.{}.get(fk).is_none() {{\n", storage_name));
+                        code.push_str(&format!("                return Err(\"Foreign key validation failed: {} does not exist\".to_string());\n", target_model));
+                        code.push_str("            }\n");
+                        code.push_str("        }\n");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Call the underlying storage insert
+        code.push_str(&format!("        self.{}.insert(", model.name.to_lowercase()));
+        let mut first = true;
+        for field in &model.fields {
+            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                continue;
+            }
+            if !field.auto_generate {
+                if !first {
+                    code.push_str(", ");
+                }
+                code.push_str(&self.get_field_param_name(field));
+                first = false;
+            }
+        }
+        code.push_str(")\n");
+        code.push_str("    }\n\n");
+    }
+
+    fn generate_relation_traversal_method(&self, code: &mut String, relation: &crate::ast::RelationPair, schema: &Schema) {
+        // Generate parent.children() method
+        // e.g., user.posts() -> Vec<Post>
+        let parent_storage = relation.parent_model.to_lowercase();
+        let child_storage = relation.child_model.to_lowercase();
+        let method_name = format!("{}_{}",
+            parent_storage,
+            relation.parent_field); // e.g., user_posts
+
+        let parent_model = schema.find_model(&relation.parent_model).unwrap();
+        let id_field = parent_model.fields.iter().find(|f| f.auto_generate).unwrap();
+
+        code.push_str(&format!("    pub fn {}(&self, {}_id: {}) -> Vec<{}> {{\n",
+            method_name,
+            parent_storage,
+            id_field.field_type.to_rust_type(),
+            relation.child_model));
+
+        code.push_str(&format!("        self.{}.find_by_{}_id({}_id)\n",
+            child_storage,
+            parent_storage,
+            parent_storage));
+
+        code.push_str("    }\n\n");
+    }
+
+    fn generate_reverse_lookup_method(&self, code: &mut String, relation: &crate::ast::RelationPair, schema: &Schema) {
+        // Generate child.parent() method
+        // e.g., post.author() -> Option<User>
+        let parent_storage = relation.parent_model.to_lowercase();
+        let child_storage = relation.child_model.to_lowercase();
+        let method_name = format!("{}_{}",
+            child_storage,
+            relation.child_field); // e.g., post_author
+
+        let child_model = schema.find_model(&relation.child_model).unwrap();
+        let id_field = child_model.fields.iter().find(|f| f.auto_generate).unwrap();
+
+        let return_type = if relation.is_required {
+            format!("Option<{}>", relation.parent_model)
+        } else {
+            format!("Option<{}>", relation.parent_model)
+        };
+
+        code.push_str(&format!("    pub fn {}(&self, {}_id: {}) -> {} {{\n",
+            method_name,
+            child_storage,
+            id_field.field_type.to_rust_type(),
+            return_type));
+
+        code.push_str(&format!("        if let Some(child) = self.{}.get({}_id) {{\n",
+            child_storage,
+            child_storage));
+
+        code.push_str(&format!("            return self.{}.get(child.{}_id);\n",
+            parent_storage,
+            relation.child_field));
+
+        code.push_str("        }\n");
+        code.push_str("        None\n");
+        code.push_str("    }\n\n");
     }
 
     pub fn generate(&self, schema: &Schema) -> String {
@@ -1031,5 +1179,108 @@ Post {
         assert_eq!(relations[0].child_model, "Post");
         assert_eq!(relations[0].child_field, "author");
         assert!(relations[0].is_required);
+    }
+
+    // Sprint 4.1: Database struct tests
+    #[test]
+    fn test_generate_database_struct() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check Database struct
+        assert!(code.contains("pub struct Database"));
+        assert!(code.contains("pub user: UserStorage"));
+        assert!(code.contains("pub post: PostStorage"));
+
+        // Check Database::new()
+        assert!(code.contains("pub fn new() -> Self"));
+        assert!(code.contains("user: UserStorage::new()"));
+        assert!(code.contains("post: PostStorage::new()"));
+    }
+
+    #[test]
+    fn test_generate_fk_validation() {
+        let input = r#"
+User {
+  id: +uuid
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check FK validation method
+        assert!(code.contains("pub fn insert_post("));
+        assert!(code.contains("if self.user.get(author_id).is_none()"));
+        assert!(code.contains("Foreign key validation failed: User does not exist"));
+        assert!(code.contains("self.post.insert("));
+    }
+
+    #[test]
+    fn test_generate_relation_traversal() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check relation traversal method
+        assert!(code.contains("pub fn user_posts(&self, user_id: uuid::Uuid) -> Vec<Post>"));
+        assert!(code.contains("self.post.find_by_user_id(user_id)"));
+    }
+
+    #[test]
+    fn test_generate_reverse_lookup() {
+        let input = r#"
+User {
+  id: +uuid
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let generator = CodeGenerator::new();
+        let code = generator.generate(&schema);
+
+        // Check reverse lookup method
+        assert!(code.contains("pub fn post_author(&self, post_id: uuid::Uuid) -> Option<User>"));
+        assert!(code.contains("if let Some(child) = self.post.get(post_id)"));
+        assert!(code.contains("self.user.get(child.author_id)"));
     }
 }

@@ -210,30 +210,32 @@ TBD
 
 ---
 
-## Sprint 4 Implementation: ✅ COMPLETE (Core Features)
+## Sprint 4 + 4.1 Implementation: ✅ COMPLETE
 
-All Sprint 4 core success criteria have been met:
+All Sprint 4 success criteria have been met, plus Sprint 4.1 additions:
 
+**Sprint 4 (Core):**
 - ✅ Parse relation syntax: `[Post]`, `*User`, `?User`
 - ✅ Generate foreign key columns (e.g., `author_id`)
 - ✅ Foreign keys automatically indexed
 - ✅ Schema validation prevents invalid references
-- ✅ Comprehensive test suite (85 tests total, 5 new for Sprint 4)
-- ✅ Example demonstrating relations
 
-**Pending for future work:**
-- ⏳ Runtime FK validation
-- ⏳ Relation traversal methods (`user.posts()`)
-- ⏳ Reverse lookup methods (`post.author()`)
+**Sprint 4.1 (Database & Relations):**
+- ✅ Database struct holding all model storages
+- ✅ Runtime FK validation on insert
+- ✅ Relation traversal methods (`db.user_posts(id)`)
+- ✅ Reverse lookup methods (`db.post_author(id)`)
+- ✅ Comprehensive test suite (89 tests total)
 
-### Quick Start (Sprint 4)
+### Quick Start (Sprint 4.1)
 
 ```bash
 # Run all tests
 cargo test --lib
 
-# Run Sprint 4 example
+# Run Sprint 4 examples
 cargo run --example sprint4_relations
+cargo run --example sprint4_1_database
 ```
 
 ### Example Schema (Sprint 4)
