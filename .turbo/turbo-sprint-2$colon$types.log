@@ -1,5 +1,8 @@
 
 [0m[2m[35m$[0m [2m[1m.orchestrator/scripts/run-task.sh types[0m
-Error: Worktree not found at .worktrees/types
-Run 'bun run sprint-2:setup' first
-[0m[31merror[0m[2m:[0m script [1m"sprint-2:types"[0m exited with code 1[0m
+Running Sprint 2 task: types
+Worktree: .worktrees/types
+Prompt: .orchestrator/prompts/types.md
+
+.orchestrator/scripts/run-task.sh: line 34: claude-code: command not found
+[0m[31merror[0m[2m:[0m script [1m"sprint-2:types"[0m exited with code 127[0m

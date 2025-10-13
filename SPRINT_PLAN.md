@@ -14,7 +14,7 @@ This project uses git worktrees, Turborepo, and shell scripts to enable parallel
 - **Package Manager**: `bun` (TypeScript runtime and package manager)
 - **Task Runner**: Turborepo (parallel task execution with dependency management)
 - **Source of Truth**: Cargo workspace structure (defines parallelizable tasks)
-- **CLI**: `claude-code -p --permission-mode=bypassPermissions` for non-interactive parallel execution
+- **CLI**: `claude -p --permission-mode=bypassPermissions` for non-interactive parallel execution
 
 ### Quick Start Pattern
 ```bash
@@ -126,7 +126,7 @@ The orchestrator automates parallel development by:
 1. Parsing sprint metadata from this document
 2. Setting up Cargo workspace members as git worktrees
 3. Generating Turborepo configuration aligned with Cargo.toml
-4. Running parallel `claude-code -p` instances for each task
+4. Running parallel `claude -p` instances for each task
 
 **Source of truth**: `Cargo.toml` workspace members
 **Alignment**: npm/bun workspaces mirror Cargo workspace structure
@@ -152,13 +152,13 @@ bun run orchestrate sprint-2
 3. Create git worktree for each Cargo member
 4. Generate bun workspace with matching structure
 5. Create `turbo.json` with dependency graph
-6. Generate package.json scripts: `claude-code -p --permission-mode=bypassPermissions "{prompt}"`
+6. Generate package.json scripts: `claude -p --permission-mode=bypassPermissions "{prompt}"`
 7. Run: `turbo run build --parallel`
 8. Collect logs from `.turbo/runs/`
 
-**Permission mode**: `bypassPermissions` ensures Claude Code workers can create files, run commands, and make changes without interactive prompts.
+**Permission mode**: `bypassPermissions` ensures Claude workers can create files, run commands, and make changes without interactive prompts.
 
-**Key insight**: Cargo workspace members define the code structure, orchestrator just automates parallel Claude Code invocations for each member.
+**Key insight**: Cargo workspace members define the code structure, orchestrator just automates parallel Claude invocations for each member.
 
 ---
 
