@@ -32,9 +32,11 @@ bun sprint-2
 
 **All work must be done in conventionally named branches**, even for sequential (non-parallel) work:
 
-- Sprint branches: `sprint-N` (e.g., `sprint-1`, `sprint-2`)
+- Sprint branches: `sprint-N/main` (e.g., `sprint-1/main`, `sprint-2/main`)
 - Feature branches: `sprint-N/feature-name` (e.g., `sprint-2/persistence`, `sprint-5/cli`)
 - Never work directly on `main` branch
+
+**Note**: Use `sprint-N/main` pattern (not just `sprint-N`) to allow feature branches with the same prefix.
 
 This ensures:
 - Clean git history with atomic, reviewable PRs

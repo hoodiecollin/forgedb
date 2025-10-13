@@ -192,8 +192,9 @@ git branch | grep "sprint-2/" | xargs git branch -D
 When preparing a new sprint (e.g., Sprint 3), follow this pattern:
 
 ### 1. Create Sprint Branch
+**Important**: Use `sprint-N/main` naming pattern to allow feature branches:
 ```bash
-git checkout -b sprint-3
+git checkout -b sprint-3/main
 ```
 
 ### 2. Update Cargo Workspace
@@ -272,18 +273,34 @@ Define task dependencies using `//#` prefix for root tasks:
 }
 ```
 
-### 7. Update Setup Script (if needed)
-Modify `.orchestrator/scripts/setup.sh` to create appropriate worktrees:
+### 7. Update Setup Script
+Update `.orchestrator/scripts/setup.sh` for the new sprint:
 ```bash
 #!/usr/bin/env bash
 set -e
 
 echo "Setting up Sprint 3 worktrees..."
 
-git worktree add -b sprint-3/indexing .worktrees/indexing 2>/dev/null || echo "  ✓ indexing worktree exists"
-git worktree add -b sprint-3/queries .worktrees/queries 2>/dev/null || echo "  ✓ queries worktree exists"
-git worktree add -b sprint-3/codegen .worktrees/codegen 2>/dev/null || echo "  ✓ codegen worktree exists"
+# Helper function to create worktree if it doesn't exist
+create_worktree() {
+  local branch=$1
+  local path=$2
 
+  if [ -d "$path" ]; then
+    echo "  ✓ $branch worktree already exists at $path"
+  else
+    echo "  Creating $branch worktree..."
+    git worktree add -b "$branch" "$path" HEAD
+    echo "  ✓ Created $branch"
+  fi
+}
+
+# Create worktrees
+create_worktree "sprint-3/indexing" "./.worktrees/indexing"
+create_worktree "sprint-3/queries" "./.worktrees/queries"
+create_worktree "sprint-3/codegen" "./.worktrees/codegen"
+
+echo ""
 echo "✓ All worktrees ready"
 ```
 
@@ -323,9 +340,9 @@ bun sprint-3
    - List expected deliverables clearly
 
 5. **Branch Naming**:
-   - Base sprint branch: `sprint-N`
-   - Feature branches: `sprint-N/task-name`
-   - Worktrees use feature branch names
+   - Base sprint branch: `sprint-N/main` (allows feature branches with same prefix)
+   - Feature branches: `sprint-N/task-name` (e.g., `sprint-2/persistence`)
+   - Worktrees checkout feature branches
 
 6. **Cargo Workspace**:
    - Align workspace members with parallelizable tasks
