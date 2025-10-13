@@ -1,3 +1,13 @@
+// Re-export Position from validation crate for consistency
+pub use sinkdb_validation::Position;
+
+/// Token with position information
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenWithPos {
+    pub token: Token,
+    pub position: Position,
+}
+
 /// Token types for the schema language
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -145,6 +155,15 @@ impl Lexer {
         }
     }
 
+    pub fn next_token_with_pos(&mut self) -> Result<TokenWithPos, String> {
+        let pos = Position {
+            line: self.line,
+            column: self.column,
+        };
+        let token = self.next_token()?;
+        Ok(TokenWithPos { token, position: pos })
+    }
+
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
         loop {
@@ -154,6 +173,19 @@ impl Lexer {
                 break;
             }
             tokens.push(token);
+        }
+        Ok(tokens)
+    }
+
+    pub fn tokenize_with_pos(&mut self) -> Result<Vec<TokenWithPos>, String> {
+        let mut tokens = Vec::new();
+        loop {
+            let token_with_pos = self.next_token_with_pos()?;
+            let is_eof = token_with_pos.token == Token::Eof;
+            tokens.push(token_with_pos);
+            if is_eof {
+                break;
+            }
         }
         Ok(tokens)
     }

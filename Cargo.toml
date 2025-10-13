@@ -18,6 +18,9 @@ sinkdb-storage = { path = "crates/storage" }
 sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
 
+[dev-dependencies]
+sinkdb-validation = { path = "crates/validation" }
+
 [lib]
 name = "sinkdb"
 path = "src/main.rs"
@@ -35,3 +38,8 @@ path = "examples/sprint1_mvp/client.rs"
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+
+# Validation demo
+[[example]]
+name = "test_validation"
+path = "examples/test_validation.rs"
