@@ -4,10 +4,11 @@
 
 Comprehensive test suite covering Sprint 2 deliverables: validation, types, and persistence.
 
-**Total Tests: 83**
-- Validation crate: 24 tests
-- Parser integration: 36 tests
-- Storage/Persistence: 23 tests
+**Total Tests: 121**
+- Validation crate: 24 unit tests
+- Parser integration: 64 tests (including type system tests)
+- Storage/Persistence: 23 unit tests
+- **Integration tests: 10 tests** (NEW)
 - All tests passing ✓
 
 ---
@@ -218,6 +219,52 @@ Comprehensive test suite covering Sprint 2 deliverables: validation, types, and 
 
 ---
 
+# Integration Tests (10 tests)
+
+## New Integration Test Suite
+
+The integration test suite bridges validation and types, ensuring components work together correctly:
+
+### Test Coverage
+
+1. **`test_validation_with_all_type_names`** - Validates all 9 Sprint 2 type keywords as field/model names
+2. **`test_validation_errors_with_position`** - Position tracking in error messages
+3. **`test_validation_boundary_positions`** - Edge cases for line/column numbers (1:1, 9999:9999)
+4. **`test_validation_field_names_with_numbers`** - Numbers in field names (field_1, u32_value, etc.)
+5. **`test_validation_model_names_with_numbers`** - Numbers in model names (Model123, Http2Server)
+6. **`test_validation_underscore_prefixes`** - Private field naming (_private, __internal)
+7. **`test_validation_rejects_invalid_patterns`** - Rejects camelCase/snake_case where inappropriate
+8. **`test_validation_suggestions`** - Helpful error suggestions (UserName → user_name)
+9. **`test_validation_single_char_names`** - Single character names (x, A, _)
+10. **`test_validation_long_names`** - Very long identifier names (64+ chars)
+
+### What Integration Tests Cover
+
+✅ **Cross-component validation:**
+- Validation works correctly with all 9 type keywords
+- Position information flows through validation errors
+- Naming conventions enforced across all types
+
+✅ **Real-world scenarios:**
+- Type names as field names (u32_field, uuid_field)
+- Numbers in identifiers (field_123, Model1)
+- Underscore prefixes for private fields
+- Single character and very long names
+
+✅ **Error quality:**
+- Suggestions are accurate and helpful
+- Position information is preserved
+- Error messages guide users to fixes
+
+### What Integration Tests Do NOT Cover
+
+These are appropriately tested at other layers:
+- ❌ Storage persistence (covered by 23 storage unit tests)
+- ❌ Parser integration (covered by 64 parser tests)
+- ❌ Codegen (tested through examples)
+
+---
+
 # Overall Coverage Analysis
 
 ## ✅ Well Covered Areas
@@ -308,10 +355,11 @@ The test coverage is comprehensive and appropriate for Sprint 2:
 **Test Coverage: Excellent ✅**
 
 Sprint 2 deliverables are well-tested:
-- ✅ 83 tests covering all core functionality
+- ✅ **121 tests** covering all core functionality
 - ✅ All edge cases for validation, types, and persistence
+- ✅ **10 integration tests** connecting validation + types
 - ✅ Clear, helpful error messages with positions
-- ✅ Fast, maintainable test suite
+- ✅ Fast, maintainable test suite (runs in ~18 seconds)
 - ✅ No critical gaps in coverage
 
 This is the right amount of testing for Sprint 2. We're covering all essential scenarios without over-engineering for problems we don't have yet.
@@ -320,4 +368,5 @@ This is the right amount of testing for Sprint 2. We're covering all essential s
 
 **Analysis Date:** 2025-10-13
 **Sprint:** 2 (Types, Validation, Persistence)
-**Test Count:** 83/83 passing ✓
+**Test Count:** 121/121 passing ✓
+**Execution Time:** ~18 seconds

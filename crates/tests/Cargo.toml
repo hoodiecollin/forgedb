@@ -7,3 +7,4 @@ edition = "2021"
 sinkdb-storage = { path = "../storage" }
 sinkdb-types = { path = "../types" }
 sinkdb-validation = { path = "../validation" }
+uuid = { version = "1.6", features = ["v4"] }
