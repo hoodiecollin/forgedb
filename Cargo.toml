@@ -17,6 +17,7 @@ edition = "2021"
 sinkdb-storage = { path = "crates/storage" }
 sinkdb-types = { path = "crates/types" }
 sinkdb-validation = { path = "crates/validation" }
+uuid = { version = "1.6", features = ["v4"] }
 
 [lib]
 name = "sinkdb"
@@ -35,3 +36,8 @@ path = "examples/sprint1_mvp/client.rs"
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
+
+# Sprint 2: Test all types
+[[example]]
+name = "test_all_types"
+path = "examples/test_all_types.rs"

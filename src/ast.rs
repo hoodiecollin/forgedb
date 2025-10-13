@@ -4,7 +4,13 @@
 pub enum FieldType {
     U32,
     U64,
+    I32,
+    I64,
+    F64,
+    Bool,
     String,
+    Uuid,
+    Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,7 +37,21 @@ impl FieldType {
         match self {
             FieldType::U32 => "u32",
             FieldType::U64 => "u64",
+            FieldType::I32 => "i32",
+            FieldType::I64 => "i64",
+            FieldType::F64 => "f64",
+            FieldType::Bool => "bool",
             FieldType::String => "String",
+            FieldType::Uuid => "uuid::Uuid",
+            FieldType::Timestamp => "i64",
         }
+    }
+
+    pub fn is_auto_incrementable(&self) -> bool {
+        matches!(self, FieldType::U32 | FieldType::U64)
+    }
+
+    pub fn is_auto_generatable(&self) -> bool {
+        matches!(self, FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp)
     }
 }
