@@ -347,11 +347,16 @@ impl Parser {
         // Parse constraints (@directives)
         let mut constraints = Vec::new();
         let mut is_computed = false;
+        let mut fulltext_indexed = false;
         while matches!(self.current_token(), Token::At) {
             let constraint = self.parse_constraint()?;
             // Check if this is the @computed directive
             if constraint.name == "computed" {
                 is_computed = true;
+            }
+            // Check if this is the @fulltext directive (Sprint 18)
+            if constraint.name == "fulltext" {
+                fulltext_indexed = true;
             }
             constraints.push(constraint);
         }
@@ -368,6 +373,7 @@ impl Parser {
             constraints,
             index_type,
             is_computed,
+            fulltext_indexed,
         })
     }
 

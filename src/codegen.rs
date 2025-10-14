@@ -238,6 +238,18 @@ impl CodeGenerator {
                 index_name, tuple_type));
         }
 
+        // Add full-text search indexes (Sprint 18)
+        let has_fulltext = model.fields.iter().any(|f| f.fulltext_indexed);
+        if has_fulltext {
+            code.push_str("    // Full-text search indexes\n");
+            for field in &model.fields {
+                if field.fulltext_indexed {
+                    code.push_str(&format!("    {}_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>,\n",
+                        field.name));
+                }
+            }
+        }
+
         code.push_str("}\n\n");
 
         code
@@ -288,6 +300,14 @@ impl CodeGenerator {
             code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", index_name));
         }
 
+        // Initialize full-text indexes (Sprint 18)
+        for field in &model.fields {
+            if field.fulltext_indexed {
+                code.push_str(&format!("            {}_fulltext: std::sync::Arc::new(std::sync::RwLock::new(sinkdb_fulltext::FullTextIndex::new())),\n",
+                    field.name));
+            }
+        }
+
         code.push_str("        }\n");
         code.push_str("    }\n\n");
 
@@ -302,6 +322,9 @@ impl CodeGenerator {
 
         // Generate list() method
         self.generate_list_method(&mut code, model);
+
+        // Generate full-text search methods (Sprint 18)
+        self.generate_search_methods(&mut code, model);
 
         // Generate update() method
         self.generate_update_method(&mut code, model);
@@ -561,6 +584,20 @@ impl CodeGenerator {
                 index_name, tuple_value));
         }
 
+        // Add to full-text indexes (Sprint 18)
+        // Get the ID field to use as document ID
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+        for field in &model.fields {
+            if field.fulltext_indexed {
+                if let Some(id_field) = id_field {
+                    if matches!(id_field.field_type, FieldType::Uuid) {
+                        code.push_str(&format!("        self.{}_fulltext.write().unwrap().add_document(record.{}, &record.{});\n",
+                            field.name, id_field.name, field.name));
+                    }
+                }
+            }
+        }
+
         // Add record
         code.push_str("        self.records.push(record.clone());\n");
         code.push_str("        self.tombstones.push(false);\n");
@@ -790,6 +827,50 @@ impl CodeGenerator {
         code.push_str("            .map(|(_, r)| r.clone())\n");
         code.push_str("            .collect()\n");
         code.push_str("    }\n\n");
+    }
+
+    fn generate_search_methods(&self, code: &mut String, model: &Model) {
+        // Generate search methods for full-text indexed fields (Sprint 18)
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+
+        for field in &model.fields {
+            if field.fulltext_indexed {
+                // Only generate if we have a UUID ID field
+                if let Some(id_field) = id_field {
+                    if matches!(id_field.field_type, FieldType::Uuid) {
+                        // Generate search method
+                        code.push_str(&format!("    /// Full-text search on the '{}' field\n", field.name));
+                        code.push_str(&format!("    pub fn search_{}(&self, query: &str) -> Vec<{}> {{\n", field.name, model.name));
+                        code.push_str(&format!("        let matches = self.{}_fulltext.read().unwrap().search(query);\n", field.name));
+                        code.push_str("        let mut results = Vec::new();\n");
+                        code.push_str("        for doc_match in matches {\n");
+                        code.push_str("            if let Some(record) = self.records.iter().enumerate()\n");
+                        code.push_str(&format!("                .find(|(i, r)| !self.tombstones[*i] && r.{} == doc_match.doc_id)\n", id_field.name));
+                        code.push_str("                .map(|(_, r)| r.clone()) {\n");
+                        code.push_str("                results.push(record);\n");
+                        code.push_str("            }\n");
+                        code.push_str("        }\n");
+                        code.push_str("        results\n");
+                        code.push_str("    }\n\n");
+
+                        // Generate phrase search method
+                        code.push_str(&format!("    /// Phrase search on the '{}' field\n", field.name));
+                        code.push_str(&format!("    pub fn search_{}_phrase(&self, phrase: &str) -> Vec<{}> {{\n", field.name, model.name));
+                        code.push_str(&format!("        let matches = self.{}_fulltext.read().unwrap().search_phrase(phrase);\n", field.name));
+                        code.push_str("        let mut results = Vec::new();\n");
+                        code.push_str("        for doc_match in matches {\n");
+                        code.push_str("            if let Some(record) = self.records.iter().enumerate()\n");
+                        code.push_str(&format!("                .find(|(i, r)| !self.tombstones[*i] && r.{} == doc_match.doc_id)\n", id_field.name));
+                        code.push_str("                .map(|(_, r)| r.clone()) {\n");
+                        code.push_str("                results.push(record);\n");
+                        code.push_str("            }\n");
+                        code.push_str("        }\n");
+                        code.push_str("        results\n");
+                        code.push_str("    }\n\n");
+                    }
+                }
+            }
+        }
     }
 
     fn generate_update_method(&self, code: &mut String, model: &Model) {

@@ -1,0 +1,11 @@
+[package]
+name = "sinkdb-fulltext"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uuid = { version = "1.6", features = ["v4"] }
+regex = "1.10"
+unicode-segmentation = "1.10"
+
+[dev-dependencies]

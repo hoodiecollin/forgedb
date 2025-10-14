@@ -81,6 +81,7 @@ pub struct Field {
     pub constraints: Vec<Constraint>, // @ directives
     pub index_type: IndexType, // Hash or BTree
     pub is_computed: bool,   // @computed directive
+    pub fulltext_indexed: bool, // @fulltext directive (Sprint 18)
 }
 
 /// Represents a struct definition (Sprint 8)
@@ -531,6 +532,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                         Field {
                             name: "tags".to_string(),
@@ -541,6 +543,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                     ],
                     composite_indexes: vec![],
@@ -557,6 +560,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                         Field {
                             name: "posts".to_string(),
@@ -567,6 +571,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                     ],
                     composite_indexes: vec![],
@@ -600,6 +605,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                         Field {
                             name: "posts".to_string(),
@@ -610,6 +616,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                     ],
                     composite_indexes: vec![],
@@ -626,6 +633,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                         Field {
                             name: "author".to_string(),
@@ -636,6 +644,7 @@ mod tests {
                             constraints: vec![],
                             index_type: IndexType::Hash,
                             is_computed: false,
+                            fulltext_indexed: false,
                         },
                     ],
                     composite_indexes: vec![],

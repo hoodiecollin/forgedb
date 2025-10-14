@@ -13,6 +13,7 @@ members = [
     "crates/query-params",
     "crates/migrations",
     "crates/compaction",
+    "crates/fulltext",
 ]
 resolver = "2"
 
@@ -40,6 +41,7 @@ sinkdb-crud-api = { path = "crates/crud-api" }
 sinkdb-query-params = { path = "crates/query-params" }
 sinkdb-migrations = { path = "crates/migrations" }
 sinkdb-compaction = { path = "crates/compaction" }
+sinkdb-fulltext = { path = "crates/fulltext" }
 
 [lib]
 name = "sinkdb"

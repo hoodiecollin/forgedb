@@ -641,6 +641,7 @@ mod tests {
                         constraints: vec![],
                         index_type: IndexType::Hash,
                         is_computed: false,
+                        fulltext_indexed: false,
                     },
                     Field {
                         name: "email".to_string(),
@@ -651,6 +652,7 @@ mod tests {
                         constraints: vec![],
                         index_type: IndexType::Hash,
                         is_computed: false,
+                        fulltext_indexed: false,
                     },
                 ],
                 composite_indexes: vec![],

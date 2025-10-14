@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+sinkdb = { path = "../.." }
 sinkdb-storage = { path = "../storage" }
 sinkdb-types = { path = "../types" }
 sinkdb-validation = { path = "../validation" }

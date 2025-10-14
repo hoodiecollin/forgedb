@@ -2,6 +2,9 @@
 // Tests validation + types + storage working together
 
 #[cfg(test)]
+mod fulltext_search_tests;
+
+#[cfg(test)]
 mod integration_tests {
     use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
