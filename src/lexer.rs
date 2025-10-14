@@ -1,5 +1,5 @@
 // Re-export Position from validation crate for consistency
-pub use sinkdb_validation::Position;
+pub use forgedb_validation::Position;
 
 /// Token with position information
 #[derive(Debug, Clone, PartialEq)]

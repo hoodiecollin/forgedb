@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 5 implements the SinkDB CLI tool with developer-friendly commands for project initialization, code generation, schema validation, and building.
+Sprint 5 implements the ForgeDB CLI tool with developer-friendly commands for project initialization, code generation, schema validation, and building.
 
 ## Implementation Summary
 
@@ -16,11 +16,11 @@ Sprint 5 implements the SinkDB CLI tool with developer-friendly commands for pro
 
 #### 2. Commands Implemented
 
-##### `sinkdb init <project>`
-Scaffolds a new SinkDB project with:
+##### `forgedb init <project>`
+Scaffolds a new ForgeDB project with:
 - Project directory structure
 - Schema file (with template support: blank, blog, ecommerce, todo)
-- Configuration file (sinkdb.toml)
+- Configuration file (forgedb.toml)
 - .gitignore
 - README.md
 - Rust project files (Cargo.toml, src/main.rs, examples/)
@@ -33,12 +33,12 @@ Scaffolds a new SinkDB project with:
 
 **Example:**
 ```bash
-sinkdb init my-blog --template blog
+forgedb init my-blog --template blog
 ```
 
-##### `sinkdb generate [target]`
+##### `forgedb generate [target]`
 Generates code from schema:
-- Parses schema file (schema.sink, schema.lang, or schema.sinkdb)
+- Parses schema file (schema.forge, schema.lang, or schema.forgedb)
 - Generates Rust database code
 - Reports statistics (models, fields, lines of code)
 
@@ -57,10 +57,10 @@ Generates code from schema:
 
 **Example:**
 ```bash
-sinkdb generate rust --force
+forgedb generate rust --force
 ```
 
-##### `sinkdb validate`
+##### `forgedb validate`
 Validates schema and project:
 - **Syntax validation** - Parse schema for errors
 - **Semantic validation** - Check naming conventions, relations, duplicates
@@ -82,10 +82,10 @@ Validates schema and project:
 
 **Example:**
 ```bash
-sinkdb validate --strict
+forgedb validate --strict
 ```
 
-##### `sinkdb build`
+##### `forgedb build`
 Builds production-ready artifacts:
 - Validates schema
 - Generates code
@@ -100,7 +100,7 @@ Builds production-ready artifacts:
 
 **Example:**
 ```bash
-sinkdb build --release --target wasm
+forgedb build --release --target wasm
 ```
 
 #### 3. Templates
@@ -167,7 +167,7 @@ crates/cli/
 - `colored` - Terminal colors
 - `thiserror` - Error handling
 - `anyhow` - Error context
-- `sinkdb` - Core library (parser, codegen)
+- `forgedb` - Core library (parser, codegen)
 
 ## Usage Examples
 
@@ -175,10 +175,10 @@ crates/cli/
 
 ```bash
 # 1. Initialize a new blog project
-$ sinkdb init my-blog --template blog
+$ forgedb init my-blog --template blog
 ✨ Creating project: my-blog
-📄 Created schema.sink
-⚙️  Created sinkdb.toml
+📄 Created schema.forge
+⚙️  Created forgedb.toml
 📝 Created .gitignore
 📖 Created README.md
 🦀 Created Rust project files
@@ -191,9 +191,9 @@ $ sinkdb init my-blog --template blog
 $ cd my-blog
 
 # 3. Validate schema
-$ sinkdb validate
+$ forgedb validate
 🔍 Validating project
-ℹ Validating schema: schema.sink
+ℹ Validating schema: schema.forge
 ✓ Schema syntax valid
 
 ℹ   3 models
@@ -203,9 +203,9 @@ $ sinkdb validate
 ✓ Validation complete
 
 # 4. Generate code
-$ sinkdb generate
+$ forgedb generate
 🔨 Generating code from schema
-ℹ Using schema: schema.sink
+ℹ Using schema: schema.forge
 ✓ Parsed schema (3 models, 15 total fields)
 ✓ Generated generated/database.rs (1234 lines)
 ✓ Code generation complete!
@@ -215,7 +215,7 @@ Next steps:
   - Run your application: cargo run
 
 # 5. Build for production
-$ sinkdb build --release
+$ forgedb build --release
 🔨 Building production artifacts
 ℹ Validating schema...
 ✓ Schema syntax valid
@@ -234,31 +234,31 @@ Artifacts:
 
 Run CLI tests:
 ```bash
-cargo test -p sinkdb-cli
+cargo test -p forgedb-cli
 ```
 
 Test CLI manually:
 ```bash
 # Build CLI
-cargo build -p sinkdb-cli --release
+cargo build -p forgedb-cli --release
 
 # Test commands
-./target/release/sinkdb --help
-./target/release/sinkdb init test-project
-./target/release/sinkdb generate --help
+./target/release/forgedb --help
+./target/release/forgedb init test-project
+./target/release/forgedb generate --help
 ```
 
 ## Future Enhancements (Not Yet Implemented)
 
 From the CLI specification, these features are planned but not yet implemented:
 
-1. **Dev Server** (`sinkdb dev`)
+1. **Dev Server** (`forgedb dev`)
    - File watching with hot reload
    - Auto-regeneration on schema changes
    - HTTP API server
    - Browser auto-open
 
-2. **Migrations** (`sinkdb migrate`)
+2. **Migrations** (`forgedb migrate`)
    - Schema diffing
    - Migration generation
    - Up/down migrations
@@ -270,38 +270,38 @@ From the CLI specification, these features are planned but not yet implemented:
    - OpenAPI specification
    - Component stubs
 
-4. **Inspection** (`sinkdb inspect`)
+4. **Inspection** (`forgedb inspect`)
    - Schema introspection
    - Route listing
    - Statistics
 
-5. **Testing** (`sinkdb test`)
+5. **Testing** (`forgedb test`)
    - Unit tests
    - Integration tests
    - Coverage reports
 
-6. **Benchmarking** (`sinkdb benchmark`)
+6. **Benchmarking** (`forgedb benchmark`)
    - Performance benchmarks
    - Comparison with other databases
 
 ## Success Criteria
 
-- [x] `sinkdb init` creates complete project structure
-- [x] `sinkdb generate` produces valid Rust code
-- [x] `sinkdb validate` detects schema errors
-- [x] `sinkdb build` compiles successfully
+- [x] `forgedb init` creates complete project structure
+- [x] `forgedb generate` produces valid Rust code
+- [x] `forgedb validate` detects schema errors
+- [x] `forgedb build` compiles successfully
 - [x] Colored output for better UX
 - [x] Helpful error messages
 - [x] Template support (blog, ecommerce, todo)
 - [x] Integration tests passing
-- [ ] File watching (`sinkdb dev`) - TODO Sprint 5 (watcher crate)
+- [ ] File watching (`forgedb dev`) - TODO Sprint 5 (watcher crate)
 - [ ] Documentation generation - TODO Sprint 5 (docs crate)
 - [ ] Project scaffolding automation - TODO Sprint 5 (scaffold crate)
 
 ## Documentation
 
 - **CLI Specification**: See `CLI_SPECIFICATION.md` for full command reference
-- **Examples**: Try `sinkdb <command> --help` for detailed usage
+- **Examples**: Try `forgedb <command> --help` for detailed usage
 - **Templates**: Built-in templates in `crates/cli/src/templates.rs`
 
 ## Status

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 9 adds REST API generation to SinkDB. This guide provides a quick reference for implementation.
+Sprint 9 adds REST API generation to ForgeDB. This guide provides a quick reference for implementation.
 
 ## Workspace Structure
 
@@ -33,7 +33,7 @@ cd crates/http-server
 # Create Cargo.toml
 cat > Cargo.toml << 'EOF'
 [package]
-name = "sinkdb-http-server"
+name = "forgedb-http-server"
 version = "0.1.0"
 edition = "2021"
 
@@ -59,12 +59,12 @@ cd crates/crud-api
 # Create Cargo.toml
 cat > Cargo.toml << 'EOF'
 [package]
-name = "sinkdb-crud-api"
+name = "forgedb-crud-api"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sinkdb-storage = { path = "../storage" }
+forgedb-storage = { path = "../storage" }
 uuid = { version = "1.6", features = ["v4"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -81,7 +81,7 @@ cd crates/query-params
 # Create Cargo.toml
 cat > Cargo.toml << 'EOF'
 [package]
-name = "sinkdb-query-params"
+name = "forgedb-query-params"
 version = "0.1.0"
 edition = "2021"
 
@@ -166,10 +166,10 @@ Each task should include comprehensive tests:
 
 ```bash
 # Unit tests for each crate
-cargo test --package sinkdb-http-server
-cargo test --package sinkdb-crud-api
-cargo test --package sinkdb-query-params
-cargo test --package sinkdb-validation
+cargo test --package forgedb-http-server
+cargo test --package forgedb-crud-api
+cargo test --package forgedb-query-params
+cargo test --package forgedb-validation
 
 # Integration tests
 cargo test --test api_integration
@@ -278,9 +278,9 @@ members = [
 
 [dependencies]
 # Add new dependencies
-sinkdb-http-server = { path = "crates/http-server" }
-sinkdb-crud-api = { path = "crates/crud-api" }
-sinkdb-query-params = { path = "crates/query-params" }
+forgedb-http-server = { path = "crates/http-server" }
+forgedb-crud-api = { path = "crates/crud-api" }
+forgedb-query-params = { path = "crates/query-params" }
 ```
 
 ## Branch Strategy

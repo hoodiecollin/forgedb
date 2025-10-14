@@ -1,8 +1,8 @@
-# SinkDB Development Roadmap
+# ForgeDB Development Roadmap
 
 ## Overview
 
-This document outlines the development phases for SinkDB, from initial prototype through production-ready system and advanced features.
+This document outlines the development phases for ForgeDB, from initial prototype through production-ready system and advanced features.
 
 ## Development Philosophy
 
@@ -28,7 +28,7 @@ This document outlines the development phases for SinkDB, from initial prototype
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── schema-lang/
 │   ├── lexer.rs         # Tokenization
 │   ├── parser.rs        # Parsing logic
@@ -60,7 +60,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── transpiler/
 │   ├── codegen/
 │   │   ├── mod.rs
@@ -95,7 +95,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── storage/
 │   │   ├── mod.rs
@@ -129,7 +129,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── storage/
 │   │   ├── variable.rs   # Variable-length storage
@@ -160,7 +160,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── query/
 │   │   ├── mod.rs
@@ -193,7 +193,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── query/
 │   │   ├── join.rs       # Join algorithms
@@ -223,7 +223,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── wal/
 │   │   ├── mod.rs
@@ -255,7 +255,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── storage/
 │   │   └── structs.rs    # Inline struct storage
@@ -306,7 +306,7 @@ sinkdb/
 ### Milestone 2.1: CLI Tool (Weeks 31-34)
 
 **Deliverables:**
-- [ ] `sinkdb` CLI binary
+- [ ] `forgedb` CLI binary
 - [ ] Project initialization
 - [ ] Schema validation
 - [ ] Code generation commands
@@ -314,16 +314,16 @@ sinkdb/
 
 **Commands:**
 ```bash
-sinkdb init <project>
-sinkdb dev
-sinkdb generate
-sinkdb validate
-sinkdb build
+forgedb init <project>
+forgedb dev
+forgedb generate
+forgedb validate
+forgedb build
 ```
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── cli/
 │   ├── main.rs
 │   ├── commands/
@@ -370,7 +370,7 @@ GET    /api/users/{id}/posts
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── api/
 │   │   ├── mod.rs
@@ -404,7 +404,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── runtime/
 │   ├── computed/
 │   │   ├── mod.rs
@@ -437,7 +437,7 @@ sinkdb/
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── cli/
 │   ├── scaffold.rs       # Stub generation
 │   └── ssr.rs           # Server-side rendering
@@ -472,15 +472,15 @@ sinkdb/
 
 **Commands:**
 ```bash
-sinkdb migrate create "add users"
-sinkdb migrate up
-sinkdb migrate down
-sinkdb migrate status
+forgedb migrate create "add users"
+forgedb migrate up
+forgedb migrate down
+forgedb migrate status
 ```
 
 **Files to Create:**
 ```
-sinkdb/
+forgedb/
 ├── cli/
 │   └── migrate.rs
 ├── transpiler/
@@ -614,7 +614,7 @@ User {
 ```
 
 ```bash
-$ sinkdb dev --ai
+$ forgedb dev --ai
 🤖 AI analyzing schema...
 📝 Generating Profile.jsx...
 ✓ Created component with tests

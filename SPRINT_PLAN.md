@@ -1,4 +1,4 @@
-# SinkDB Sprint Plan
+# ForgeDB Sprint Plan
 
 Incremental development plan organized into focused sprints. Each sprint builds on the previous, with Sprint 1 delivering a working end-to-end MVP.
 
@@ -574,10 +574,10 @@ tasks:
     dependencies: []
     prompt: |
       Implement CLI commands for Sprint 5:
-      - sinkdb init <project> - scaffold new project
-      - sinkdb generate - generate code from schema
-      - sinkdb validate - validate schema
-      - sinkdb build - compile generated code
+      - forgedb init <project> - scaffold new project
+      - forgedb generate - generate code from schema
+      - forgedb validate - validate schema
+      - forgedb build - compile generated code
       - CLI help text and error messages with suggestions
 
   - name: scaffolding
@@ -588,7 +588,7 @@ tasks:
       Implement project scaffolding for Sprint 5:
       - Generate standard project layout
       - Create schema.lang template file
-      - Create sinkdb.toml config
+      - Create forgedb.toml config
       - Generate .gitignore with Rust/DB entries
       - Write scaffolding tests
 
@@ -619,25 +619,25 @@ tasks:
 ### Tasks
 
 #### CLI Commands (✅ COMPLETE - crates/cli)
-- [x] `sinkdb init <project>` - scaffolds new project
-- [x] `sinkdb generate` - generates code from schema
-- [x] `sinkdb validate` - validates schema
-- [x] `sinkdb build` - compiles generated code
+- [x] `forgedb init <project>` - scaffolds new project
+- [x] `forgedb generate` - generates code from schema
+- [x] `forgedb validate` - validates schema
+- [x] `forgedb build` - compiles generated code
 
 #### Project Structure (✅ COMPLETE)
 - [x] Generate standard project layout
-- [x] Create `schema.sink` file (with templates: blank, blog, ecommerce, todo)
-- [x] Create `sinkdb.toml` config
+- [x] Create `schema.forge` file (with templates: blank, blog, ecommerce, todo)
+- [x] Create `forgedb.toml` config
 - [x] Generate `.gitignore`
 - [x] Generate README.md
 - [x] Generate Cargo.toml and Rust project files
 
 #### File Watching (✅ COMPLETE)
-- [x] Watch `schema.sink` for changes
+- [x] Watch `schema.forge` for changes
 - [x] Auto-regenerate on schema change
 - [x] Clear terminal display
 - [x] Debouncing support (configurable)
-- [x] `sinkdb dev` command with options
+- [x] `forgedb dev` command with options
 
 #### Documentation (✅ COMPLETE)
 - [x] CLI help text for all commands
@@ -647,14 +647,14 @@ tasks:
 
 **Success Criteria:** ✅ All Met
 ```bash
-$ sinkdb init my-app
+$ forgedb init my-app
 $ cd my-app
-$ sinkdb dev  # watches and regenerates automatically
+$ forgedb dev  # watches and regenerates automatically
 
 # Options:
-$ sinkdb dev --schema schema.sink --output generated
-$ sinkdb dev --debounce 500  # custom debounce delay
-$ sinkdb dev --clear=false   # disable terminal clearing
+$ forgedb dev --schema schema.forge --output generated
+$ forgedb dev --debounce 500  # custom debounce delay
+$ forgedb dev --clear=false   # disable terminal clearing
 ```
 
 **Features:**
@@ -982,9 +982,9 @@ tasks:
 
 **Generated Output:**
 ```typescript
-import { SinkDBClient } from '@sinkdb/client'
+import { ForgeDBClient } from '@forgedb/client'
 
-const client = new SinkDBClient('http://localhost:3000')
+const client = new ForgeDBClient('http://localhost:3000')
 const users = await client.user.list({ email: 'test@example.com' })
 const user = await client.user.get(users.data[0].id)
 ```
@@ -1246,16 +1246,16 @@ See: `archive/sprint-summaries/SPRINT15_COMPACTION.md` for full details.
 - [x] Type change migrations (manual required)
 
 #### Migration Execution
-- [x] `sinkdb migrate up`
-- [x] `sinkdb migrate down` (rollback)
+- [x] `forgedb migrate up`
+- [x] `forgedb migrate down` (rollback)
 - [x] Track applied migrations
 - [x] Prevent partial migrations
 
 #### CLI
-- [x] `sinkdb migrate create "description"`
-- [x] `sinkdb migrate status`
-- [x] `sinkdb migrate up`
-- [x] `sinkdb migrate down`
+- [x] `forgedb migrate create "description"`
+- [x] `forgedb migrate status`
+- [x] `forgedb migrate up`
+- [x] `forgedb migrate down`
 
 #### Success Criteria
 - [x] Safe migrations automatic ✅
@@ -1454,7 +1454,7 @@ See: `crates/fulltext/src/lib.rs` and `examples/fulltext_search.rs`
 
 ## Sprint 21: IDE Syntax Highlighting
 
-**Goal**: Enable syntax highlighting for `.sink` schema files in VSCode and other editors.
+**Goal**: Enable syntax highlighting for `.forge` schema files in VSCode and other editors.
 
 ### Tasks
 
@@ -1466,9 +1466,9 @@ See: `crates/fulltext/src/lib.rs` and `examples/fulltext_search.rs`
 
 #### VSCode Extension
 - [ ] Create basic VSCode extension structure
-- [ ] Register `.sink` file extension
+- [ ] Register `.forge` file extension
 - [ ] Include TextMate grammar
-- [ ] Add icon for `.sink` files
+- [ ] Add icon for `.forge` files
 - [ ] Package and publish extension
 
 #### Language Configuration
@@ -1578,10 +1578,10 @@ Post {
 - [ ] Set up language client
 
 #### Commands
-- [ ] `SinkDB: Generate Code` - Run codegen
-- [ ] `SinkDB: Validate Schema` - Run validation
-- [ ] `SinkDB: Start Dev Mode` - Start file watcher
-- [ ] `SinkDB: Create New Model` - Scaffold model
+- [ ] `ForgeDB: Generate Code` - Run codegen
+- [ ] `ForgeDB: Validate Schema` - Run validation
+- [ ] `ForgeDB: Start Dev Mode` - Start file watcher
+- [ ] `ForgeDB: Create New Model` - Scaffold model
 
 #### Snippets
 - [ ] Model template snippet
@@ -1596,15 +1596,15 @@ Post {
 - [ ] LSP server path configuration
 
 #### Status Bar
-- [ ] Show SinkDB status (active/inactive)
+- [ ] Show ForgeDB status (active/inactive)
 - [ ] Show schema validation status
 - [ ] Quick access to commands
 
 #### Extension Features
-- [ ] File icons for `.sink` files
+- [ ] File icons for `.forge` files
 - [ ] Custom activity bar view (optional)
 - [ ] Problem matcher for build output
-- [ ] Task provider for SinkDB commands
+- [ ] Task provider for ForgeDB commands
 
 #### Testing
 - [ ] Extension integration tests
@@ -1622,7 +1622,7 @@ Post {
 
 **Extension Structure:**
 ```
-vscode-sinkdb/
+vscode-forgedb/
 ├── syntaxes/
 │   └── sink.tmLanguage.json
 ├── language-configuration.json

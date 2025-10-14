@@ -1,8 +1,8 @@
-# SinkDB - Type-Safe, Schema-First Full-Stack Database Framework
+# ForgeDB - Type-Safe, Schema-First Full-Stack Database Framework
 
 ## Executive Summary
 
-SinkDB is a revolutionary database system that uses a declarative schema language to generate a complete full-stack application: database, type-safe APIs, UI components, and developer tooling. The system transpiles schema definitions into highly optimized Rust code with columnar storage, providing exceptional performance through compile-time optimization while maintaining perfect type safety across the entire stack.
+ForgeDB is a revolutionary database system that uses a declarative schema language to generate a complete full-stack application: database, type-safe APIs, UI components, and developer tooling. The system transpiles schema definitions into highly optimized Rust code with columnar storage, providing exceptional performance through compile-time optimization while maintaining perfect type safety across the entire stack.
 
 ## Core Innovation
 
@@ -131,7 +131,7 @@ Timeline: TBD (experimental)
 ## Project Structure
 
 ```
-sinkdb/
+forgedb/
 ├── schema-lang/          # DSL parser and AST
 ├── transpiler/           # Code generation engine
 ├── runtime/              # Rust runtime library
@@ -149,8 +149,8 @@ sinkdb/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/sinkdb
-cd sinkdb
+git clone https://github.com/yourusername/forgedb
+cd forgedb
 
 # Run the comprehensive blog platform example
 cargo run --example blog_platform
@@ -159,7 +159,7 @@ cargo run --example blog_platform
 ls generated/blog_platform/
 ```
 
-This example demonstrates **all SinkDB features** including:
+This example demonstrates **all ForgeDB features** including:
 - Multi-model schemas with relations
 - All data types and indexes
 - REST API generation
@@ -172,10 +172,10 @@ See [examples/README.md](./examples/README.md) for detailed usage.
 
 ```bash
 # Install CLI (coming soon)
-cargo install sinkdb-cli
+cargo install forgedb-cli
 
 # Create new project
-sinkdb init my-app
+forgedb init my-app
 cd my-app
 
 # Define schema
@@ -188,7 +188,7 @@ User {
 EOF
 
 # Generate and run
-sinkdb dev
+forgedb dev
 # Server running at http://localhost:3000
 # API docs at http://localhost:3000/docs
 ```

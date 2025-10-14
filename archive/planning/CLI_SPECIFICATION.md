@@ -1,20 +1,20 @@
-# SinkDB CLI Specification
+# ForgeDB CLI Specification
 
 ## Overview
 
-The `sinkdb` CLI is the primary developer interface for SinkDB. It handles project initialization, code generation, schema validation, development server, migrations, and more.
+The `forgedb` CLI is the primary developer interface for ForgeDB. It handles project initialization, code generation, schema validation, development server, migrations, and more.
 
 ## Installation
 
 ```bash
 # Via cargo
-cargo install sinkdb-cli
+cargo install forgedb-cli
 
 # Via homebrew (future)
-brew install sinkdb
+brew install forgedb
 
 # Via npm (wrapper, future)
-npm install -g sinkdb-cli
+npm install -g forgedb-cli
 ```
 
 ## Project Structure
@@ -24,7 +24,7 @@ When you initialize a project, the CLI creates the following structure:
 ```
 my-app/
 ├── schema.lang              # Your schema definition
-├── sinkdb.toml             # Project configuration
+├── forgedb.toml             # Project configuration
 │
 ├── generated/              # Auto-generated (never edit)
 │   ├── db.rs              # Rust database implementation
@@ -63,21 +63,21 @@ my-app/
 ```bash
 --verbose, -v         # Verbose output
 --quiet, -q          # Suppress output
---config, -c <path>  # Path to sinkdb.toml (default: ./sinkdb.toml)
+--config, -c <path>  # Path to forgedb.toml (default: ./forgedb.toml)
 --help, -h           # Show help
 --version, -V        # Show version
 ```
 
 ---
 
-## `sinkdb init`
+## `forgedb init`
 
-Initialize a new SinkDB project.
+Initialize a new ForgeDB project.
 
 ### Usage
 
 ```bash
-sinkdb init <project-name> [options]
+forgedb init <project-name> [options]
 ```
 
 ### Options
@@ -94,23 +94,23 @@ sinkdb init <project-name> [options]
 
 ```bash
 # Interactive mode
-sinkdb init my-app
+forgedb init my-app
 
 # With template
-sinkdb init my-blog --template blog
+forgedb init my-blog --template blog
 
 # API only
-sinkdb init my-api --api-only
+forgedb init my-api --api-only
 
 # Rust backend only
-sinkdb init my-service --rust --no-typescript
+forgedb init my-service --rust --no-typescript
 ```
 
 ### What It Does
 
 1. Creates project directory
 2. Generates initial schema from template or blank
-3. Creates config file (`sinkdb.toml`)
+3. Creates config file (`forgedb.toml`)
 4. Runs initial code generation
 5. Installs dependencies (if applicable)
 6. Initializes git repository
@@ -120,26 +120,26 @@ sinkdb init my-service --rust --no-typescript
 ```
 ✨ Creating project: my-app
 📄 Created schema.lang
-⚙️  Created sinkdb.toml
+⚙️  Created forgedb.toml
 🔨 Generating code...
   ✓ Generated db.rs
   ✓ Generated types.ts
   ✓ Generated api.rs
   ✓ Generated openapi.yaml
 📦 Installing dependencies...
-✓ Done! Run 'cd my-app && sinkdb dev' to start
+✓ Done! Run 'cd my-app && forgedb dev' to start
 ```
 
 ---
 
-## `sinkdb dev`
+## `forgedb dev`
 
 Start development server with hot reload.
 
 ### Usage
 
 ```bash
-sinkdb dev [options]
+forgedb dev [options]
 ```
 
 ### Options
@@ -158,16 +158,16 @@ sinkdb dev [options]
 
 ```bash
 # Basic dev mode
-sinkdb dev
+forgedb dev
 
 # Custom port
-sinkdb dev --port 8080
+forgedb dev --port 8080
 
 # Watch additional directories
-sinkdb dev --watch ./lib
+forgedb dev --watch ./lib
 
 # API only (no UI)
-sinkdb dev --api-only
+forgedb dev --api-only
 ```
 
 ### What It Does
@@ -185,7 +185,7 @@ sinkdb dev --api-only
 ### Output
 
 ```
-🚀 SinkDB Dev Server
+🚀 ForgeDB Dev Server
 
 Watching: schema.lang
 API Server: http://localhost:3000
@@ -210,14 +210,14 @@ Ready! Edit schema.lang to see changes.
 
 ---
 
-## `sinkdb generate`
+## `forgedb generate`
 
 Generate code from schema without starting dev server.
 
 ### Usage
 
 ```bash
-sinkdb generate [targets] [options]
+forgedb generate [targets] [options]
 ```
 
 ### Targets
@@ -244,16 +244,16 @@ stubs        # Generate missing computed/component stubs
 
 ```bash
 # Generate everything
-sinkdb generate
+forgedb generate
 
 # TypeScript types only
-sinkdb generate typescript
+forgedb generate typescript
 
 # Check if generation is needed (CI)
-sinkdb generate --check
+forgedb generate --check
 
 # Force regeneration
-sinkdb generate --force
+forgedb generate --force
 ```
 
 ### What It Does
@@ -279,21 +279,21 @@ sinkdb generate --force
    - src/computed/User.ts: fullName
    - src/views/Dashboard.jsx
 
-Run 'sinkdb generate stubs' to create them.
+Run 'forgedb generate stubs' to create them.
 
 ✓ Done in 1.2s
 ```
 
 ---
 
-## `sinkdb validate`
+## `forgedb validate`
 
 Validate schema and check for missing implementations.
 
 ### Usage
 
 ```bash
-sinkdb validate [options]
+forgedb validate [options]
 ```
 
 ### Options
@@ -309,13 +309,13 @@ sinkdb validate [options]
 
 ```bash
 # Validate everything
-sinkdb validate
+forgedb validate
 
 # Schema only
-sinkdb validate --schema-only
+forgedb validate --schema-only
 
 # Strict mode (fail on missing impls)
-sinkdb validate --strict
+forgedb validate --strict
 ```
 
 ### What It Does
@@ -351,21 +351,21 @@ sinkdb validate --strict
    - src/views/OldComponent.jsx
    - src/computed/DeletedModel.ts
 
-Run 'sinkdb generate stubs' to create missing files.
+Run 'forgedb generate stubs' to create missing files.
 
 Validation failed with 4 errors.
 ```
 
 ---
 
-## `sinkdb migrate`
+## `forgedb migrate`
 
 Manage schema migrations.
 
 ### Usage
 
 ```bash
-sinkdb migrate <command> [options]
+forgedb migrate <command> [options]
 ```
 
 ### Subcommands
@@ -379,10 +379,10 @@ history             # Show migration history
 rollback <version>  # Rollback to specific version
 ```
 
-### `sinkdb migrate create`
+### `forgedb migrate create`
 
 ```bash
-sinkdb migrate create "add user profiles" [options]
+forgedb migrate create "add user profiles" [options]
 
 Options:
   --auto              # Auto-generate migration (if safe)
@@ -402,13 +402,13 @@ Options:
 ✓ Generated migration: migrations/003_add_user_profiles.sql
 ✓ Generated rollback: migrations/003_add_user_profiles.down.sql
 
-⚠  Review migration before running 'sinkdb migrate up'
+⚠  Review migration before running 'forgedb migrate up'
 ```
 
-### `sinkdb migrate up`
+### `forgedb migrate up`
 
 ```bash
-sinkdb migrate up [options]
+forgedb migrate up [options]
 
 Options:
   --to <version>      # Migrate to specific version
@@ -434,10 +434,10 @@ Apply these migrations? (y/N): y
 ✓ Applied 3 migrations in 446ms
 ```
 
-### `sinkdb migrate down`
+### `forgedb migrate down`
 
 ```bash
-sinkdb migrate down [n] [options]
+forgedb migrate down [n] [options]
 
 Options:
   --force            # Skip confirmation
@@ -457,7 +457,7 @@ Continue? (y/N): y
 Current version: 002
 ```
 
-### `sinkdb migrate status`
+### `forgedb migrate status`
 
 **Output:**
 ```
@@ -473,19 +473,19 @@ Applied:
 Pending:
   - 003_add_user_profiles.sql
 
-Run 'sinkdb migrate up' to apply pending migrations.
+Run 'forgedb migrate up' to apply pending migrations.
 ```
 
 ---
 
-## `sinkdb build`
+## `forgedb build`
 
 Build production-ready artifacts.
 
 ### Usage
 
 ```bash
-sinkdb build [options]
+forgedb build [options]
 ```
 
 ### Options
@@ -502,13 +502,13 @@ sinkdb build [options]
 
 ```bash
 # Production build
-sinkdb build --release
+forgedb build --release
 
 # WASM target
-sinkdb build --target wasm
+forgedb build --target wasm
 
 # API server only
-sinkdb build --no-db
+forgedb build --no-db
 ```
 
 ### What It Does
@@ -532,23 +532,23 @@ sinkdb build --no-db
 
 📦 Output:
   dist/
-  ├── sinkdb-api (binary)
-  ├── libsinkdb.a (static library)
-  └── sinkdb.wasm (if --target wasm)
+  ├── forgedb-api (binary)
+  ├── libforgedb.a (static library)
+  └── forgedb.wasm (if --target wasm)
 
 ✓ Build complete in 45.2s
 ```
 
 ---
 
-## `sinkdb inspect`
+## `forgedb inspect`
 
 Inspect and introspect the project.
 
 ### Usage
 
 ```bash
-sinkdb inspect <target> [options]
+forgedb inspect <target> [options]
 ```
 
 ### Targets
@@ -566,18 +566,18 @@ stats           # Show project statistics
 
 ```bash
 # Show schema
-sinkdb inspect schema
+forgedb inspect schema
 
 # Show API routes
-sinkdb inspect routes
+forgedb inspect routes
 
 # Show statistics
-sinkdb inspect stats
+forgedb inspect stats
 ```
 
 ### Output Examples
 
-**`sinkdb inspect routes`**
+**`forgedb inspect routes`**
 
 ```
 🔍 Generated API Routes
@@ -603,7 +603,7 @@ Posts:
 Total: 11 routes
 ```
 
-**`sinkdb inspect stats`**
+**`forgedb inspect stats`**
 
 ```
 📊 Project Statistics
@@ -633,14 +633,14 @@ Implementations:
 
 ---
 
-## `sinkdb test`
+## `forgedb test`
 
 Run tests for generated code and implementations.
 
 ### Usage
 
 ```bash
-sinkdb test [pattern] [options]
+forgedb test [pattern] [options]
 ```
 
 ### Options
@@ -656,28 +656,28 @@ sinkdb test [pattern] [options]
 
 ```bash
 # Run all tests
-sinkdb test
+forgedb test
 
 # Run unit tests only
-sinkdb test --unit
+forgedb test --unit
 
 # Run specific test file
-sinkdb test user_test
+forgedb test user_test
 
 # With coverage
-sinkdb test --coverage
+forgedb test --coverage
 ```
 
 ---
 
-## `sinkdb plugin`
+## `forgedb plugin`
 
 Manage computed field plugins (WASM, Lua, etc.).
 
 ### Usage
 
 ```bash
-sinkdb plugin <command> [options]
+forgedb plugin <command> [options]
 ```
 
 ### Subcommands
@@ -693,25 +693,25 @@ info <name>         # Show plugin info
 
 ```bash
 # Add WASM plugin
-sinkdb plugin add ./credit_score.wasm
+forgedb plugin add ./credit_score.wasm
 
 # List plugins
-sinkdb plugin list
+forgedb plugin list
 
 # Remove plugin
-sinkdb plugin remove credit_score
+forgedb plugin remove credit_score
 ```
 
 ---
 
-## `sinkdb benchmark`
+## `forgedb benchmark`
 
 Run performance benchmarks.
 
 ### Usage
 
 ```bash
-sinkdb benchmark [options]
+forgedb benchmark [options]
 ```
 
 ### Options
@@ -728,13 +728,13 @@ sinkdb benchmark [options]
 
 ```bash
 # Run all benchmarks
-sinkdb benchmark
+forgedb benchmark
 
 # Compare with SQLite
-sinkdb benchmark --compare sqlite
+forgedb benchmark --compare sqlite
 
 # Specific suite
-sinkdb benchmark --suite insert
+forgedb benchmark --suite insert
 ```
 
 ### Output
@@ -743,26 +743,26 @@ sinkdb benchmark --suite insert
 🏃 Running Benchmarks...
 
 Insert (1M rows):
-  SinkDB:    2.3s  ████████████████████ (baseline)
+  ForgeDB:    2.3s  ████████████████████ (baseline)
   SQLite:    3.8s  █████████████████████████████████ (+65%)
 
 Query (scan 1M rows, filter):
-  SinkDB:    89ms  █████ (baseline)
+  ForgeDB:    89ms  █████ (baseline)
   DuckDB:    67ms  ████ (-25%)
   SQLite:   234ms  ████████████ (+163%)
 
 Join (10k users × 100k posts):
-  SinkDB:    42ms  ████████████████ (baseline)
+  ForgeDB:    42ms  ████████████████ (baseline)
   PostgreSQL: 38ms  ██████████████ (-10%)
 
 Memory (1M rows):
-  SinkDB:    85 MB
+  ForgeDB:    85 MB
   SQLite:   142 MB (+67%)
 ```
 
 ---
 
-## Configuration File: `sinkdb.toml`
+## Configuration File: `forgedb.toml`
 
 ```toml
 [project]
@@ -808,8 +808,8 @@ enable_simd = true          # Use SIMD instructions
 ## Environment Variables
 
 ```bash
-TYPEDB_HOME          # SinkDB installation directory
-TYPEDB_CONFIG        # Path to sinkdb.toml (overrides --config)
+TYPEDB_HOME          # ForgeDB installation directory
+TYPEDB_CONFIG        # Path to forgedb.toml (overrides --config)
 TYPEDB_LOG           # Log level (error, warn, info, debug, trace)
 TYPEDB_NO_COLOR     # Disable colored output
 RUST_LOG            # Rust logging (for internal debugging)
@@ -838,7 +838,7 @@ RUST_LOG            # Rust logging (for internal debugging)
 ### GitHub Actions Example
 
 ```yaml
-name: SinkDB CI
+name: ForgeDB CI
 
 on: [push, pull_request]
 
@@ -848,20 +848,20 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Install SinkDB CLI
-        run: cargo install sinkdb-cli
+      - name: Install ForgeDB CLI
+        run: cargo install forgedb-cli
       
       - name: Validate Schema
-        run: sinkdb validate --strict
+        run: forgedb validate --strict
       
       - name: Generate Code
-        run: sinkdb generate --check
+        run: forgedb generate --check
       
       - name: Run Tests
-        run: sinkdb test --coverage
+        run: forgedb test --coverage
       
       - name: Build
-        run: sinkdb build --release
+        run: forgedb build --release
 ```
 
 ---
@@ -873,39 +873,39 @@ jobs:
 **Schema changes not reloading:**
 ```bash
 # Force regeneration
-sinkdb generate --force
+forgedb generate --force
 
 # Restart dev server
-sinkdb dev
+forgedb dev
 ```
 
 **Port already in use:**
 ```bash
 # Use different port
-sinkdb dev --port 8080
+forgedb dev --port 8080
 ```
 
 **Generated code doesn't compile:**
 ```bash
 # Check for schema errors
-sinkdb validate
+forgedb validate
 
 # Clean and regenerate
 rm -rf generated/
-sinkdb generate
+forgedb generate
 ```
 
 **Database corruption:**
 ```bash
 # Verify database
-sinkdb inspect stats
+forgedb inspect stats
 
 # Restore from WAL
-sinkdb recover
+forgedb recover
 
 # Last resort: rebuild from migrations
-sinkdb migrate down --all
-sinkdb migrate up
+forgedb migrate down --all
+forgedb migrate up
 ```
 
 ---
@@ -913,12 +913,12 @@ sinkdb migrate up
 ## Future Commands (v2+)
 
 ```bash
-sinkdb export        # Export data (JSON, CSV, SQL)
-sinkdb import        # Import data
-sinkdb backup        # Create backup
-sinkdb restore       # Restore from backup
-sinkdb replicate     # Setup replication
-sinkdb ai            # AI assistant (v3)
+forgedb export        # Export data (JSON, CSV, SQL)
+forgedb import        # Import data
+forgedb backup        # Create backup
+forgedb restore       # Restore from backup
+forgedb replicate     # Setup replication
+forgedb ai            # AI assistant (v3)
 ```
 
 ---

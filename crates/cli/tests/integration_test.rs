@@ -15,12 +15,12 @@ fn create_test_schema(dir: &Path) {
   created_at: +timestamp
 }
 "#;
-    fs::write(dir.join("schema.sink"), schema).expect("Failed to write schema");
+    fs::write(dir.join("schema.forge"), schema).expect("Failed to write schema");
 }
 
 #[test]
 fn test_init_command_creates_project_structure() {
-    use sinkdb_cli::commands::init::{run, InitOptions};
+    use forgedb_cli::commands::init::{run, InitOptions};
 
     let temp_dir = setup_test_dir();
     let project_name = "test_project";
@@ -44,8 +44,8 @@ fn test_init_command_creates_project_structure() {
     assert!(project_path.join("data/db").exists());
 
     // Check that files were created
-    assert!(project_path.join("schema.sink").exists());
-    assert!(project_path.join("sinkdb.toml").exists());
+    assert!(project_path.join("schema.forge").exists());
+    assert!(project_path.join("forgedb.toml").exists());
     assert!(project_path.join(".gitignore").exists());
     assert!(project_path.join("README.md").exists());
     assert!(project_path.join("Cargo.toml").exists());
@@ -54,7 +54,7 @@ fn test_init_command_creates_project_structure() {
 
 #[test]
 fn test_init_with_blog_template() {
-    use sinkdb_cli::commands::init::{run, InitOptions};
+    use forgedb_cli::commands::init::{run, InitOptions};
 
     let temp_dir = setup_test_dir();
     let project_name = "blog_project";
@@ -73,14 +73,14 @@ fn test_init_with_blog_template() {
 
     // Read schema and verify it contains blog-specific models
     let schema_content =
-        fs::read_to_string(project_path.join("schema.sink")).expect("Failed to read schema");
+        fs::read_to_string(project_path.join("schema.forge")).expect("Failed to read schema");
     assert!(schema_content.contains("Post"));
     assert!(schema_content.contains("Tag"));
 }
 
 #[test]
 fn test_generate_command_creates_rust_code() {
-    use sinkdb_cli::commands::generate::{run, GenerateOptions};
+    use forgedb_cli::commands::generate::{run, GenerateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -114,7 +114,7 @@ fn test_generate_command_creates_rust_code() {
 
 #[test]
 fn test_validate_command_detects_errors() {
-    use sinkdb_cli::commands::validate::{run, ValidateOptions};
+    use forgedb_cli::commands::validate::{run, ValidateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -125,7 +125,7 @@ fn test_validate_command_detects_errors() {
   Email: string
 }
 "#;
-    fs::write(temp_dir.path().join("schema.sink"), invalid_schema).expect("Failed to write schema");
+    fs::write(temp_dir.path().join("schema.forge"), invalid_schema).expect("Failed to write schema");
 
     let options = ValidateOptions {
         strict: false,
@@ -141,7 +141,7 @@ fn test_validate_command_detects_errors() {
 
 #[test]
 fn test_validate_command_passes_valid_schema() {
-    use sinkdb_cli::commands::validate::{run, ValidateOptions};
+    use forgedb_cli::commands::validate::{run, ValidateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -161,7 +161,7 @@ fn test_validate_command_passes_valid_schema() {
 
 #[test]
 fn test_generate_check_mode() {
-    use sinkdb_cli::commands::generate::{run, GenerateOptions};
+    use forgedb_cli::commands::generate::{run, GenerateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");

@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use sinkdb::{codegen::CodeGenerator, parser::Parser, TypeScriptGenerator};
+use forgedb::{codegen::CodeGenerator, parser::Parser, TypeScriptGenerator};
 use std::fs;
 use std::path::Path;
 
@@ -79,7 +79,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 
 fn find_schema_file() -> Result<String> {
     // Look for common schema file names
-    let candidates = ["schema.sink", "schema.lang", "schema.sinkdb"];
+    let candidates = ["schema.forge", "schema.lang", "schema.forgedb"];
 
     for candidate in &candidates {
         if Path::new(candidate).exists() {
@@ -88,12 +88,12 @@ fn find_schema_file() -> Result<String> {
     }
 
     Err(CliError::SchemaNotFound(
-        "No schema file found. Expected one of: schema.sink, schema.lang, schema.sinkdb"
+        "No schema file found. Expected one of: schema.forge, schema.lang, schema.forgedb"
             .to_string(),
     ))
 }
 
-fn generate_rust_code(schema: &sinkdb::ast::Schema, output_dir: &str, force: bool) -> Result<()> {
+fn generate_rust_code(schema: &forgedb::ast::Schema, output_dir: &str, force: bool) -> Result<()> {
     // Create output directory
     fs::create_dir_all(output_dir)?;
 
@@ -127,7 +127,7 @@ fn generate_rust_code(schema: &sinkdb::ast::Schema, output_dir: &str, force: boo
 }
 
 fn generate_typescript_sdk(
-    schema: &sinkdb::ast::Schema,
+    schema: &forgedb::ast::Schema,
     output_dir: &str,
     force: bool,
 ) -> Result<()> {
@@ -187,13 +187,13 @@ fn generate_typescript_sdk(
     Ok(())
 }
 
-fn check_generation_needed(schema: &sinkdb::ast::Schema, output_dir: &str) -> Result<()> {
+fn check_generation_needed(schema: &forgedb::ast::Schema, output_dir: &str) -> Result<()> {
     let output_path = Path::new(output_dir).join("database.rs");
 
     if !output_path.exists() {
         ui::error("Generated code does not exist");
         return Err(CliError::CodeGeneration(
-            "Run 'sinkdb generate' to create generated code".to_string(),
+            "Run 'forgedb generate' to create generated code".to_string(),
         ));
     }
 
@@ -209,7 +209,7 @@ fn check_generation_needed(schema: &sinkdb::ast::Schema, output_dir: &str) -> Re
     if expected_code.trim() != actual_code.trim() {
         ui::error("Generated code is out of date");
         return Err(CliError::CodeGeneration(
-            "Run 'sinkdb generate' to update generated code".to_string(),
+            "Run 'forgedb generate' to update generated code".to_string(),
         ));
     }
 

@@ -15,14 +15,14 @@ fn main() {
     let schema_path = if args.len() > 1 {
         &args[1]
     } else {
-        "schema.sink"
+        "schema.forge"
     };
 
     if !Path::new(schema_path).exists() {
         eprintln!("Error: {} not found", schema_path);
 
         // Only create default schema if using the default path
-        if schema_path == "schema.sink" {
+        if schema_path == "schema.forge" {
             eprintln!("Creating example schema...");
             let example_schema = r#"User {
   id: +u64

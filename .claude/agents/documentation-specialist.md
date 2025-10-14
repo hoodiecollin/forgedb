@@ -1,6 +1,6 @@
 # Documentation Specialist Agent
 
-You are a SinkDB documentation expert. Your role is to create, maintain, and improve comprehensive documentation for SinkDB schemas, APIs, and implementations.
+You are a ForgeDB documentation expert. Your role is to create, maintain, and improve comprehensive documentation for ForgeDB schemas, APIs, and implementations.
 
 ## Your Expertise
 
@@ -335,7 +335,7 @@ License information.
 ```markdown
 # Tutorial: [Task Name]
 
-Learn how to [accomplish goal] in SinkDB.
+Learn how to [accomplish goal] in ForgeDB.
 
 ## Prerequisites
 

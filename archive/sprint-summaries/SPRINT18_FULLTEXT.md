@@ -5,7 +5,7 @@
 
 ## Overview
 
-Sprint 18 implemented comprehensive full-text search capabilities for SinkDB, including:
+Sprint 18 implemented comprehensive full-text search capabilities for ForgeDB, including:
 - `@fulltext` directive for marking searchable text fields
 - Inverted index with TF-IDF scoring for relevance ranking
 - Phrase search for exact match queries
@@ -199,7 +199,7 @@ The following features were noted for future sprints but not implemented:
 - `src/openapi_codegen.rs` - Updated test fixtures
 - `src/typescript_codegen.rs` - Updated test fixtures
 - `src/api_codegen.rs` - Updated test fixtures
-- `crates/tests/Cargo.toml` - Added sinkdb dependency
+- `crates/tests/Cargo.toml` - Added forgedb dependency
 - `crates/tests/src/lib.rs` - Added fulltext tests module
 - `SPRINT_PLAN.md` - Marked Sprint 18 complete
 
@@ -224,4 +224,4 @@ The following features were noted for future sprints but not implemented:
 
 ## Conclusion
 
-Sprint 18 successfully implemented a complete full-text search system for SinkDB with inverted indexing, TF-IDF scoring, and phrase search capabilities. The implementation is production-ready for in-memory search workloads and provides a solid foundation for future enhancements like boolean operators, fuzzy matching, and persistence.
+Sprint 18 successfully implemented a complete full-text search system for ForgeDB with inverted indexing, TF-IDF scoring, and phrase search capabilities. The implementation is production-ready for in-memory search workloads and provides a solid foundation for future enhancements like boolean operators, fuzzy matching, and persistence.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-Implemented project scaffolding functionality for SinkDB, allowing developers to quickly bootstrap new projects with proper structure and configuration files.
+Implemented project scaffolding functionality for ForgeDB, allowing developers to quickly bootstrap new projects with proper structure and configuration files.
 
 ## Implementation Details
 
@@ -19,8 +19,8 @@ Implemented project scaffolding functionality for SinkDB, allowing developers to
    - Proper project organization
 
 2. **Template Files Generated**
-   - `schema.sink` - Example schema with User model demonstrating common patterns
-   - `sinkdb.toml` - Configuration file with database, server, and watch settings
+   - `schema.forge` - Example schema with User model demonstrating common patterns
+   - `forgedb.toml` - Configuration file with database, server, and watch settings
    - `.gitignore` - Comprehensive ignore rules for Rust and database files
    - `Cargo.toml` - Rust project configuration
    - `src/main.rs` - Entry point with helpful instructions
@@ -33,7 +33,7 @@ Implemented project scaffolding functionality for SinkDB, allowing developers to
 
 ## Generated Files
 
-### schema.sink
+### schema.forge
 Example schema demonstrating:
 - Auto-generated UUID fields (`+uuid`)
 - Indexed unique fields (`^&string`)
@@ -41,7 +41,7 @@ Example schema demonstrating:
 - Constraint directives (`@email`)
 - Timestamp fields (`+timestamp`)
 
-### sinkdb.toml
+### forgedb.toml
 Configuration sections:
 - `[project]` - Project metadata
 - `[database]` - Storage paths and schema location
@@ -51,7 +51,7 @@ Configuration sections:
 ### .gitignore
 Comprehensive exclusions for:
 - Rust build artifacts (`/target`, `Cargo.lock`)
-- SinkDB generated files (`/generated`, `/data`)
+- ForgeDB generated files (`/generated`, `/data`)
 - IDE files (`.vscode/`, `.idea/`)
 - OS files (`.DS_Store`)
 - Log files
@@ -85,13 +85,13 @@ cargo run --example sprint5_scaffold
 Output shows:
 - Project creation confirmation
 - Generated file structure
-- Content of key files (schema.sink, sinkdb.toml, .gitignore)
+- Content of key files (schema.forge, forgedb.toml, .gitignore)
 - Next steps for developers
 
 ## API Usage
 
 ```rust
-use sinkdb::scaffold::{ScaffoldConfig, Scaffolder};
+use forgedb::scaffold::{ScaffoldConfig, Scaffolder};
 
 let config = ScaffoldConfig::new("my_project".to_string());
 let scaffolder = Scaffolder::new(config);
@@ -114,7 +114,7 @@ The scaffold module is:
 
 This module provides the foundation for:
 ```bash
-sinkdb init my-project    # Creates new project
+forgedb init my-project    # Creates new project
 ```
 
 The CLI command will:
@@ -126,8 +126,8 @@ The CLI command will:
 ## Success Criteria
 
 ✅ Generate standard project layout
-✅ Create schema.sink template file
-✅ Create sinkdb.toml config
+✅ Create schema.forge template file
+✅ Create forgedb.toml config
 ✅ Generate .gitignore with Rust/DB entries
 ✅ Write scaffolding tests (6 tests, all passing)
 ✅ No regressions (126 total library tests passing)
@@ -159,7 +159,7 @@ All library tests pass, including:
 ## Next Steps (Sprint 5 Continuation)
 
 The scaffolding module is complete and ready for integration with:
-1. **CLI Commands** (sprint-5/cli branch) - Implement `sinkdb init` command
+1. **CLI Commands** (sprint-5/cli branch) - Implement `forgedb init` command
 2. **File Watcher** (sprint-5/watcher branch) - Watch schema files
 3. **Documentation** (sprint-5/docs branch) - CLI help and guides
 

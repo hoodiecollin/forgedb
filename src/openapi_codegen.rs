@@ -32,8 +32,8 @@ impl OpenApiGenerator {
         let mut spec = json!({
             "openapi": "3.0.3",
             "info": {
-                "title": "SinkDB Generated API",
-                "description": "Auto-generated REST API from SinkDB schema",
+                "title": "ForgeDB Generated API",
+                "description": "Auto-generated REST API from ForgeDB schema",
                 "version": "1.0.0"
             },
             "servers": [
@@ -546,7 +546,7 @@ impl OpenApiGenerator {
         let mut content = String::new();
 
         content.push_str("# API Documentation\n\n");
-        content.push_str("Auto-generated from SinkDB schema.\n\n");
+        content.push_str("Auto-generated from ForgeDB schema.\n\n");
 
         content.push_str("## Table of Contents\n\n");
         for model in &schema.models {

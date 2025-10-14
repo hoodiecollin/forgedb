@@ -12,7 +12,7 @@ Sprint 9 has been successfully completed! All 5 tasks implemented with comprehen
 
 ## Summary
 
-Sprint 9 adds automatic REST API code generation from SinkDB schemas. Given a schema definition, the system now generates:
+Sprint 9 adds automatic REST API code generation from ForgeDB schemas. Given a schema definition, the system now generates:
 - Type-safe request/response types with serde
 - CRUD handler functions using Axum
 - Router setup with all endpoints
@@ -208,7 +208,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use super::user_types::*;
-use sinkdb_query_params::QueryParams;
+use forgedb_query_params::QueryParams;
 
 /// List all User
 pub async fn list_user(
@@ -239,7 +239,7 @@ pub async fn create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> impl IntoResponse {
     // TODO: Implement create logic with storage
-    // Validate request with sinkdb_validation
+    // Validate request with forgedb_validation
     // Call storage.insert()
     (StatusCode::CREATED, Json(json!({
         "id": Uuid::new_v4()
@@ -357,7 +357,7 @@ for file in &api_files {
 
 // 4. Use generated router
 use generated::api::create_router;
-use sinkdb_http_server::Server;
+use forgedb_http_server::Server;
 
 let app = create_router();
 Server::new().serve(app).await?;
@@ -490,10 +490,10 @@ Server::new().serve(app).await?;
 - `tower-http = { version = "0.5", features = ["cors", "trace"] }` - HTTP middleware
 
 ### Workspace Crates
-- `sinkdb-http-server`
-- `sinkdb-crud-api`
-- `sinkdb-query-params`
-- `sinkdb-validation` (extended)
+- `forgedb-http-server`
+- `forgedb-crud-api`
+- `forgedb-query-params`
+- `forgedb-validation` (extended)
 
 ---
 

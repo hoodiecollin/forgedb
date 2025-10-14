@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_wal_basic_write_read() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_test_basic");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_test_basic");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_wal_empty() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_test_empty");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_test_empty");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 

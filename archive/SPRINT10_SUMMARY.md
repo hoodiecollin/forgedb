@@ -5,7 +5,7 @@
 
 ## Overview
 
-Sprint 10 successfully implemented automatic TypeScript SDK generation from SinkDB schemas. The generated SDK provides type-safe client libraries that frontend developers can use to interact with SinkDB REST APIs.
+Sprint 10 successfully implemented automatic TypeScript SDK generation from ForgeDB schemas. The generated SDK provides type-safe client libraries that frontend developers can use to interact with ForgeDB REST APIs.
 
 ## Key Deliverables
 
@@ -26,7 +26,7 @@ generated/sdk/
 ├── types.ts           # All TypeScript interfaces and types
 ├── UserApi.ts         # API client for User model
 ├── PostApi.ts         # API client for Post model
-├── index.ts           # Main SDK entry point with SinkDBClient
+├── index.ts           # Main SDK entry point with ForgeDBClient
 ├── package.json       # NPM package configuration
 ├── tsconfig.json      # TypeScript compiler config
 ├── tsup.config.ts     # Bundler configuration (tsup)
@@ -35,16 +35,16 @@ generated/sdk/
 
 ### 3. CLI Integration
 
-Updated `sinkdb generate` command to support:
+Updated `forgedb generate` command to support:
 ```bash
-sinkdb generate --target typescript  # Generate TypeScript SDK only
-sinkdb generate --target sdk          # Alias for typescript
-sinkdb generate --target all          # Generate both Rust and TypeScript
+forgedb generate --target typescript  # Generate TypeScript SDK only
+forgedb generate --target sdk          # Alias for typescript
+forgedb generate --target all          # Generate both Rust and TypeScript
 ```
 
 ### 4. Type Mappings
 
-Intelligent type mapping from SinkDB to TypeScript:
+Intelligent type mapping from ForgeDB to TypeScript:
 - `u32, u64, i32, i64, f64` → `number`
 - `bool` → `boolean`
 - `string, uuid, timestamp` → `string`
@@ -104,7 +104,7 @@ async author(id: string): Promise<User>
 
 Unified client class for all models:
 ```typescript
-export class SinkDBClient {
+export class ForgeDBClient {
   public user: UserApi;
   public post: PostApi;
   public tag: TagApi;
@@ -120,10 +120,10 @@ export class SinkDBClient {
 ## Usage Example
 
 ```typescript
-import { SinkDBClient } from '@sinkdb/client';
+import { ForgeDBClient } from '@forgedb/client';
 
 // Initialize client
-const client = new SinkDBClient('http://localhost:3000');
+const client = new ForgeDBClient('http://localhost:3000');
 
 // List users with filtering
 const users = await client.user.list({
@@ -154,7 +154,7 @@ const userPosts = await client.user.posts(user.id);
 ## Package Configuration
 
 ### package.json
-- Package name: `@sinkdb/client`
+- Package name: `@forgedb/client`
 - Dual format: CommonJS and ESM
 - TypeScript declarations included
 - Dev dependencies: `tsup`, `typescript`
@@ -238,7 +238,7 @@ Potential improvements for future sprints:
 
 ## Conclusion
 
-Sprint 10 successfully delivers a production-ready TypeScript SDK generator that complements the REST API from Sprint 9. Frontend developers can now consume SinkDB APIs with full type safety and excellent developer experience.
+Sprint 10 successfully delivers a production-ready TypeScript SDK generator that complements the REST API from Sprint 9. Frontend developers can now consume ForgeDB APIs with full type safety and excellent developer experience.
 
 The generated SDK is framework-agnostic and works with React, Vue, Svelte, and vanilla TypeScript applications.
 

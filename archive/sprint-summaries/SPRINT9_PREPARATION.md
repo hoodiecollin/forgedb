@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Sprint 9 will auto-generate a complete REST API from SinkDB schemas, including CRUD endpoints, query parameters, validation, and OpenAPI documentation. This sprint is highly parallelizable across 5 independent workspace members.
+Sprint 9 will auto-generate a complete REST API from ForgeDB schemas, including CRUD endpoints, query parameters, validation, and OpenAPI documentation. This sprint is highly parallelizable across 5 independent workspace members.
 
 ## Current Project Status
 
@@ -96,7 +96,7 @@ Criteria for selection:
 1. **Axum** ⭐ RECOMMENDED
    - Pros: Type-safe extractors, Tower middleware, excellent ergonomics
    - Cons: Newer (but stable)
-   - Best fit: Aligns with SinkDB's type-safety philosophy
+   - Best fit: Aligns with ForgeDB's type-safety philosophy
 
 2. **Actix-web**
    - Pros: Battle-tested, high performance
@@ -185,7 +185,7 @@ Files:
         └── unit.rs
 
 Dependencies:
-  - sinkdb-storage
+  - forgedb-storage
   - uuid
   - serde
   - serde_json
@@ -233,7 +233,7 @@ Files:
     └── errors.rs           # Enhanced error messages
 
 Dependencies:
-  - existing sinkdb-validation
+  - existing forgedb-validation
   - http (for status codes)
 
 Deliverables:

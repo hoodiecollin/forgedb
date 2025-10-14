@@ -1,5 +1,5 @@
 [package]
-name = "sinkdb-query-params"
+name = "forgedb-query-params"
 version = "0.1.0"
 edition = "2021"
 

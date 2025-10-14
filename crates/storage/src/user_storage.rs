@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_insert_and_get() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_user_storage");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_user_storage");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_unique_constraint() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_unique");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_unique");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_persistence() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_persistence");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_persistence");
         let _ = fs::remove_dir_all(&temp_dir);
 
         // Create and insert data
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_list_all() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_list_all");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_list_all");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_get_nonexistent() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_nonexistent");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_nonexistent");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_empty_database() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_empty_db");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_empty_db");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_large_dataset() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_large");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_large");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -336,7 +336,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_unique_constraint_after_reopen() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_unique_reopen");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_unique_reopen");
         let _ = fs::remove_dir_all(&temp_dir);
 
         // Insert user and close
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_id_continuity_after_reopen() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_id_continuity");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_id_continuity");
         let _ = fs::remove_dir_all(&temp_dir);
 
         // Insert 3 users
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_empty_email() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_empty_email");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_empty_email");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_user_storage_long_email() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_long_email");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_long_email");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut storage = UserStorage::new(temp_dir.clone()).unwrap();

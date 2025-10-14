@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 5 adds schema-level constraint directives and automatic validation to SinkDB. This includes field-level validation rules that are enforced at runtime through generated validation code in insert and update operations.
+Sprint 5 adds schema-level constraint directives and automatic validation to ForgeDB. This includes field-level validation rules that are enforced at runtime through generated validation code in insert and update operations.
 
 ## Success Criteria
 

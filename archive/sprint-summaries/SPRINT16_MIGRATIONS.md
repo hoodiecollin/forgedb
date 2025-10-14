@@ -5,7 +5,7 @@
 
 ## Overview
 
-Implemented a comprehensive migration system for SinkDB that enables safe schema evolution over time. The system supports automatic change detection, migration generation, execution, rollback, and state tracking.
+Implemented a comprehensive migration system for ForgeDB that enables safe schema evolution over time. The system supports automatic change detection, migration generation, execution, rollback, and state tracking.
 
 ## Deliverables
 
@@ -64,20 +64,20 @@ Created a complete migrations crate with the following components:
 
 ### 2. CLI Commands (`crates/cli/src/commands/migrate.rs`)
 
-Added four migration commands to the SinkDB CLI:
+Added four migration commands to the ForgeDB CLI:
 
 ```bash
 # Create a new migration
-sinkdb migrate create "Description" [--auto]
+forgedb migrate create "Description" [--auto]
 
 # Show migration status
-sinkdb migrate status
+forgedb migrate status
 
 # Apply pending migrations
-sinkdb migrate up [--steps N]
+forgedb migrate up [--steps N]
 
 # Rollback migrations
-sinkdb migrate down [--steps N]
+forgedb migrate down [--steps N]
 ```
 
 Features:
@@ -217,7 +217,7 @@ The system automatically identifies breaking changes:
 ## Usage Example
 
 ```rust
-use sinkdb_migrations::*;
+use forgedb_migrations::*;
 
 // Create a migration
 let changes = vec![
@@ -246,22 +246,22 @@ tracker.mark_rolled_back()?;
 
 ```bash
 # Initialize a new project
-$ sinkdb init my-app
+$ forgedb init my-app
 $ cd my-app
 
 # Create initial migration
-$ sinkdb migrate create "Initial schema"
+$ forgedb migrate create "Initial schema"
 ✓ Created migration: 20241014_initial_schema.json
 
-# Edit schema.sink file...
+# Edit schema.forge file...
 
 # Create migration from changes
-$ sinkdb migrate create "Add user fields" --auto
+$ forgedb migrate create "Add user fields" --auto
 ✓ Created migration: 20241014_add_user_fields.json
   Detected 3 changes
 
 # Check status
-$ sinkdb migrate status
+$ forgedb migrate status
 Migration Status
 ================================================================
 Applied: 1 | Pending: 1 | Total: 2
@@ -270,14 +270,14 @@ Applied: 1 | Pending: 1 | Total: 2
 ○ 20241014_add_user_fields - Add user fields (3 changes)
 
 # Apply pending migrations
-$ sinkdb migrate up
+$ forgedb migrate up
 Running 1 migration(s)...
 → Add user fields
 ✓ Applied migration 20241014_add_user_fields
 ✓ All migrations completed successfully
 
 # Rollback if needed
-$ sinkdb migrate down
+$ forgedb migrate down
 Rolling back 1 migration(s)...
 ← Add user fields
 ✓ Rolled back migration 20241014_add_user_fields
@@ -303,7 +303,7 @@ All sprint goals achieved:
 
 Potential improvements for future sprints:
 
-1. **Auto-detection from AST**: Parse `schema.sink` file and automatically generate migrations
+1. **Auto-detection from AST**: Parse `schema.forge` file and automatically generate migrations
 2. **Data Migration Support**: Support for transforming data during type changes
 3. **Dry-run Mode**: Preview migrations without applying them
 4. **Migration Squashing**: Combine multiple migrations into one
@@ -342,7 +342,7 @@ tempfile = "3.8"
 
 ## Conclusion
 
-Sprint 16 successfully delivered a production-ready migration system for SinkDB. The implementation provides a solid foundation for schema evolution with strong safety guarantees through breaking change detection, checksum verification, and rollback support.
+Sprint 16 successfully delivered a production-ready migration system for ForgeDB. The implementation provides a solid foundation for schema evolution with strong safety guarantees through breaking change detection, checksum verification, and rollback support.
 
 The system integrates seamlessly with the existing CLI and provides both programmatic and command-line interfaces for managing migrations. All tests pass and the example demonstrates the complete workflow.
 

@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use sinkdb_watcher::{auto_watch, RegenerateResult};
+use forgedb_watcher::{auto_watch, RegenerateResult};
 use std::path::Path;
 
 pub struct DevOptions {
@@ -20,7 +20,7 @@ pub fn run(options: DevOptions) -> Result<()> {
     }
 
     // Print initial header
-    ui::header("👁️", "SinkDB Dev Mode");
+    ui::header("👁️", "ForgeDB Dev Mode");
     println!();
     ui::info(&format!("Watching: {}", options.schema));
     ui::info(&format!("Output:   {}", options.output));

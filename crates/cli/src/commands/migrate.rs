@@ -1,6 +1,6 @@
 use crate::{ui, CliError, Result};
 use colored::Colorize;
-use sinkdb_migrations::{MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange};
+use forgedb_migrations::{MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange};
 use std::path::PathBuf;
 
 // Helper to convert String errors to CliError
@@ -269,13 +269,13 @@ pub fn down(opts: MigrateDownOptions) -> Result<()> {
 /// Detect schema changes by comparing schemas
 fn detect_schema_changes() -> Result<Vec<SchemaChange>> {
     // For this to work properly, we'd need to:
-    // 1. Parse the current schema.sink file
+    // 1. Parse the current schema.forge file
     // 2. Load the last schema snapshot (stored when last migration was created)
     // 3. Diff them using SchemaDiffer
 
     // For now, return a placeholder
     // In a real implementation, this would:
-    // - Read schema.sink
+    // - Read schema.forge
     // - Parse it into SimpleSchema
     // - Load .last_schema.json
     // - Call SchemaDiffer::diff()

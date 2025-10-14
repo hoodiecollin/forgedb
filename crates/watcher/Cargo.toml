@@ -1,9 +1,9 @@
 [package]
-name = "sinkdb-watcher"
+name = "forgedb-watcher"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 notify = "6.1"
 crossbeam-channel = "0.5"
-sinkdb = { path = "../.." }
+forgedb = { path = "../.." }

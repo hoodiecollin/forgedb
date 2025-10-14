@@ -70,7 +70,7 @@
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                            SCHEMA DEFINITION                             │
 │                                                                           │
-│  schema.sink:                                                            │
+│  schema.forge:                                                            │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
 │  │ User {                                                           │    │
 │  │   id: +uuid                                                      │    │
@@ -261,7 +261,7 @@ kitchen-sink/
 │
 ├── Cargo.toml (workspace)
 │
-├── src/                       ← Main sinkdb crate
+├── src/                       ← Main forgedb crate
 │   ├── lib.rs
 │   ├── lexer.rs
 │   ├── parser.rs

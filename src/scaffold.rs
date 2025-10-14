@@ -59,14 +59,14 @@ impl Scaffolder {
     }
 
     fn generate_schema_file(&self) -> io::Result<()> {
-        let schema_path = self.config.project_path.join("schema.sink");
+        let schema_path = self.config.project_path.join("schema.forge");
         let schema_content = self.get_schema_template();
         fs::write(schema_path, schema_content)?;
         Ok(())
     }
 
     fn generate_config_file(&self) -> io::Result<()> {
-        let config_path = self.config.project_path.join("sinkdb.toml");
+        let config_path = self.config.project_path.join("forgedb.toml");
         let config_content = self.get_config_template();
         fs::write(config_path, config_content)?;
         Ok(())
@@ -118,7 +118,7 @@ User {{
 
     fn get_config_template(&self) -> String {
         format!(
-            r#"# SinkDB Configuration
+            r#"# ForgeDB Configuration
 [project]
 name = "{}"
 version = "0.1.0"
@@ -128,7 +128,7 @@ version = "0.1.0"
 path = "./data"
 
 # Schema file location
-schema = "./schema.sink"
+schema = "./schema.forge"
 
 # Generated code output directory
 output = "./generated"
@@ -157,7 +157,7 @@ Cargo.lock
 **/*.rs.bk
 *.pdb
 
-# SinkDB
+# ForgeDB
 /generated
 /data
 *.db
@@ -189,8 +189,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Add sinkdb runtime dependencies here
-# sinkdb-runtime = "0.1"
+# Add forgedb runtime dependencies here
+# forgedb-runtime = "0.1"
 
 [[bin]]
 name = "{}"
@@ -205,11 +205,11 @@ path = "src/main.rs"
 // mod generated;
 
 fn main() {
-    println!("Welcome to your SinkDB project!");
+    println!("Welcome to your ForgeDB project!");
     println!("");
     println!("Next steps:");
-    println!("  1. Edit schema.sink to define your data models");
-    println!("  2. Run 'sinkdb generate' to generate database code");
+    println!("  1. Edit schema.forge to define your data models");
+    println!("  2. Run 'forgedb generate' to generate database code");
     println!("  3. Import and use the generated code in your application");
     println!("");
     println!("For more information, see README.md");
@@ -222,13 +222,13 @@ fn main() {
         format!(
             r#"# {}
 
-A SinkDB database project.
+A ForgeDB database project.
 
 ## Getting Started
 
 ### 1. Define Your Schema
 
-Edit `schema.sink` to define your data models:
+Edit `schema.forge` to define your data models:
 
 ```sink
 User {{
@@ -242,7 +242,7 @@ User {{
 ### 2. Generate Database Code
 
 ```bash
-sinkdb generate
+forgedb generate
 ```
 
 This will parse your schema and generate type-safe Rust code in the `generated/` directory.
@@ -270,20 +270,20 @@ fn main() {{
 
 ## Commands
 
-- `sinkdb generate` - Generate database code from schema
-- `sinkdb validate` - Validate schema without generating code
-- `sinkdb watch` - Watch schema file and auto-regenerate on changes
-- `sinkdb build` - Generate and compile code
+- `forgedb generate` - Generate database code from schema
+- `forgedb validate` - Validate schema without generating code
+- `forgedb watch` - Watch schema file and auto-regenerate on changes
+- `forgedb build` - Generate and compile code
 
 ## Configuration
 
-See `sinkdb.toml` for configuration options.
+See `forgedb.toml` for configuration options.
 
 ## Learn More
 
-- [SinkDB Documentation](https://github.com/yourusername/sinkdb)
-- [Schema Language Reference](https://github.com/yourusername/sinkdb/docs/schema.md)
-- [API Reference](https://github.com/yourusername/sinkdb/docs/api.md)
+- [ForgeDB Documentation](https://github.com/yourusername/forgedb)
+- [Schema Language Reference](https://github.com/yourusername/forgedb/docs/schema.md)
+- [API Reference](https://github.com/yourusername/forgedb/docs/api.md)
 "#,
             self.config.project_name
         )
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_scaffold_creates_project_directory() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_scaffold_basic");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_scaffold_basic");
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir).ok();
         }
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_scaffold_creates_required_files() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_scaffold_files");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_scaffold_files");
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir).ok();
         }
@@ -332,8 +332,8 @@ mod tests {
         scaffolder.scaffold().unwrap();
 
         // Check required files exist
-        assert!(temp_dir.join("schema.sink").exists());
-        assert!(temp_dir.join("sinkdb.toml").exists());
+        assert!(temp_dir.join("schema.forge").exists());
+        assert!(temp_dir.join("forgedb.toml").exists());
         assert!(temp_dir.join(".gitignore").exists());
         assert!(temp_dir.join("Cargo.toml").exists());
         assert!(temp_dir.join("src/main.rs").exists());
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_scaffold_rejects_existing_directory() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_scaffold_exists");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_scaffold_exists");
         fs::create_dir_all(&temp_dir).unwrap();
 
         let config = ScaffoldConfig {

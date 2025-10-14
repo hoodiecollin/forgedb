@@ -18,31 +18,31 @@ members = [
 resolver = "2"
 
 [package]
-name = "sinkdb"
+name = "forgedb"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sinkdb-storage = { path = "crates/storage" }
-sinkdb-types = { path = "crates/types" }
-sinkdb-validation = { path = "crates/validation" }
+forgedb-storage = { path = "crates/storage" }
+forgedb-types = { path = "crates/types" }
+forgedb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
 regex = "1.10"
 ordered-float = "4.2"
 serde_json = "1.0"
 
 [dev-dependencies]
-sinkdb-validation = { path = "crates/validation" }
-sinkdb-watcher = { path = "crates/watcher" }
-sinkdb-cli = { path = "crates/cli" }
-sinkdb-wal = { path = "crates/wal" }
-sinkdb-http-server = { path = "crates/http-server" }
-sinkdb-crud-api = { path = "crates/crud-api" }
-sinkdb-query-params = { path = "crates/query-params" }
-sinkdb-migrations = { path = "crates/migrations" }
-sinkdb-compaction = { path = "crates/compaction" }
-sinkdb-fulltext = { path = "crates/fulltext" }
+forgedb-validation = { path = "crates/validation" }
+forgedb-watcher = { path = "crates/watcher" }
+forgedb-cli = { path = "crates/cli" }
+forgedb-wal = { path = "crates/wal" }
+forgedb-http-server = { path = "crates/http-server" }
+forgedb-crud-api = { path = "crates/crud-api" }
+forgedb-query-params = { path = "crates/query-params" }
+forgedb-migrations = { path = "crates/migrations" }
+forgedb-compaction = { path = "crates/compaction" }
+forgedb-fulltext = { path = "crates/fulltext" }
 
 [lib]
-name = "sinkdb"
+name = "forgedb"
 path = "src/lib.rs"

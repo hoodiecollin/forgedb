@@ -1,8 +1,8 @@
-# SinkDB: Complete Feature Integration
+# ForgeDB: Complete Feature Integration
 
 ## The Complete Picture
 
-This document shows how ALL SinkDB features work together to create a revolutionary full-stack database framework.
+This document shows how ALL ForgeDB features work together to create a revolutionary full-stack database framework.
 
 ---
 
@@ -187,7 +187,7 @@ Transaction:
 
 ```javascript
 // Browser = first-class distributed node
-const db = await SinkDB.init({
+const db = await ForgeDB.init({
   url: 'wss://api.example.com',
   liveSync: true,
   models: ['Post', 'User'],
@@ -243,7 +243,7 @@ function PostList() {
 
 ### 5. Custom Macro System
 
-**Compile-time** (executed during `sinkdb generate`):
+**Compile-time** (executed during `forgedb generate`):
 
 ```typescript
 // macros/build-info.ts
@@ -337,10 +337,10 @@ User {
 }
 ```
 
-### 2. Run `sinkdb dev`
+### 2. Run `forgedb dev`
 
 ```bash
-$ sinkdb dev
+$ forgedb dev
 
 ✓ Schema parsed
 ✓ Generated db.rs (15,234 lines)
@@ -396,7 +396,7 @@ export default function UserCard({ data, computed }) {
 
 ```javascript
 // Initialize WASM instance with live sync
-const db = await SinkDB.init({
+const db = await ForgeDB.init({
   url: 'wss://api.example.com',
   liveSync: true,
   offline: true
@@ -566,7 +566,7 @@ One schema defines everything:
 
 ## Comparison Matrix
 
-| Feature | SinkDB | PostgreSQL | SQLite | MongoDB | Prisma |
+| Feature | ForgeDB | PostgreSQL | SQLite | MongoDB | Prisma |
 |---------|--------|------------|--------|---------|--------|
 | Columnar storage | ✅ Hybrid | ❌ Row | ❌ Row | ❌ Doc | N/A |
 | Hot cache layer | ✅ Built-in | ⚠️ External | ❌ | ⚠️ External | N/A |
@@ -629,7 +629,7 @@ One schema defines everything:
 
 ## Conclusion
 
-SinkDB is not just a database. It's a **complete application framework** where:
+ForgeDB is not just a database. It's a **complete application framework** where:
 
 1. **Schema is code**
 2. **Compile-time is runtime**

@@ -30,7 +30,7 @@ Implemented comprehensive schema validation for Sprint 2, as specified in the SP
 
 ## Code Structure
 
-### New Crate: `sinkdb-validation`
+### New Crate: `forgedb-validation`
 Location: `crates/validation/`
 
 **Main Components:**
@@ -132,7 +132,7 @@ Error at line 3, column 1: Field name 'UserName' must be in snake_case
 
 ```bash
 # Run all validation tests
-cargo test -p sinkdb-validation
+cargo test -p forgedb-validation
 
 # Run all tests including integration
 cargo test
@@ -144,7 +144,7 @@ cargo run --example test_validation
 ## Test Results
 
 All tests passing:
-- 16 unit tests in `sinkdb-validation` crate ✓
+- 16 unit tests in `forgedb-validation` crate ✓
 - 30 tests in main crate (including 5 new validation tests) ✓
 - Total: 46 tests passing ✓
 
@@ -180,7 +180,7 @@ All Sprint 2 validation requirements met:
 - `crates/validation/src/lib.rs` - Validation library
 - `crates/validation/Cargo.toml` - Validation crate config
 - `examples/test_validation.rs` - Validation demo
-- `test_schema_invalid.sink` - Test file with invalid schema
+- `test_schema_invalid.forge` - Test file with invalid schema
 - `VALIDATION_IMPLEMENTATION.md` - This document
 
 ### Modified:

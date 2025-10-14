@@ -74,19 +74,19 @@ fn create_schema_file(options: &InitOptions) -> Result<()> {
         }
     };
 
-    let schema_path = Path::new(&options.project_name).join("schema.sink");
+    let schema_path = Path::new(&options.project_name).join("schema.forge");
     fs::write(schema_path, schema_content)?;
 
-    ui::step("📄", "Created schema.sink");
+    ui::step("📄", "Created schema.forge");
     Ok(())
 }
 
 fn create_config_file(options: &InitOptions) -> Result<()> {
     let config_content = templates::default_config(&options.project_name);
-    let config_path = Path::new(&options.project_name).join("sinkdb.toml");
+    let config_path = Path::new(&options.project_name).join("forgedb.toml");
     fs::write(config_path, config_content)?;
 
-    ui::step("⚙️", "Created sinkdb.toml");
+    ui::step("⚙️", "Created forgedb.toml");
     Ok(())
 }
 
@@ -116,8 +116,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sinkdb-storage = {{ path = "../../crates/storage" }}
-sinkdb-types = {{ path = "../../crates/types" }}
+forgedb-storage = {{ path = "../../crates/storage" }}
+forgedb-types = {{ path = "../../crates/types" }}
 uuid = {{ version = "1.6", features = ["v4"] }}
 
 [[example]]

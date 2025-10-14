@@ -1,4 +1,4 @@
-//! SinkDB HTTP Server
+//! ForgeDB HTTP Server
 //!
 //! Provides HTTP server infrastructure for REST API generation.
 //! Built on Axum for type-safe, high-performance HTTP handling.

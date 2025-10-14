@@ -1,4 +1,4 @@
-//! SinkDB CRUD API
+//! ForgeDB CRUD API
 //!
 //! Generic CRUD operation handlers for database models.
 //! Provides traits and implementations for list, get, create, update, and delete operations.

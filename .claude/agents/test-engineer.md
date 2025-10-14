@@ -1,6 +1,6 @@
 # Testing and Benchmarking Agent
 
-You are a SinkDB testing and performance benchmarking expert. Your role is to design, implement, and maintain comprehensive test suites and performance benchmarks for SinkDB.
+You are a ForgeDB testing and performance benchmarking expert. Your role is to design, implement, and maintain comprehensive test suites and performance benchmarks for ForgeDB.
 
 ## Your Expertise
 
@@ -319,16 +319,16 @@ fn benchmark_blog_workload() {
 ### Comparison Benchmarks
 
 ```rust
-// Compare SinkDB vs SQLite vs DuckDB
+// Compare ForgeDB vs SQLite vs DuckDB
 #[test]
 fn benchmark_comparison_insert() {
-    // SinkDB
+    // ForgeDB
     let start = Instant::now();
-    let mut sinkdb = UserDb::new_temp()?;
+    let mut forgedb = UserDb::new_temp()?;
     for i in 0..100_000 {
-        sinkdb.insert(format!("user{}@example.com", i))?;
+        forgedb.insert(format!("user{}@example.com", i))?;
     }
-    let sinkdb_time = start.elapsed();
+    let forgedb_time = start.elapsed();
 
     // SQLite
     let start = Instant::now();
@@ -339,7 +339,7 @@ fn benchmark_comparison_insert() {
     }
     let sqlite_time = start.elapsed();
 
-    println!("SinkDB: {:?}", sinkdb_time);
+    println!("ForgeDB: {:?}", forgedb_time);
     println!("SQLite: {:?}", sqlite_time);
 }
 ```

@@ -1,5 +1,5 @@
 use crate::error::CliError;
-use sinkdb_compaction::{CompactionConfig, MaintenanceApi};
+use forgedb_compaction::{CompactionConfig, MaintenanceApi};
 use std::path::PathBuf;
 
 pub struct CompactOptions {
@@ -173,14 +173,14 @@ pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
                     model.dead_space_ratio * 100.0
                 );
             }
-            println!("\n  Run 'sinkdb compact' to reclaim space");
+            println!("\n  Run 'forgedb compact' to reclaim space");
         }
     }
 
     Ok(())
 }
 
-fn print_database_stats(stats: &sinkdb_compaction::DatabaseStats) {
+fn print_database_stats(stats: &forgedb_compaction::DatabaseStats) {
     println!("\nDatabase Statistics");
     println!("===================");
     println!(
@@ -223,7 +223,7 @@ fn print_database_stats(stats: &sinkdb_compaction::DatabaseStats) {
     }
 }
 
-fn print_model_stats(stats: &sinkdb_compaction::ModelStats) {
+fn print_model_stats(stats: &forgedb_compaction::ModelStats) {
     println!("\nModel: {}", stats.name);
     println!("===================");
     println!();
@@ -263,8 +263,8 @@ fn print_model_stats(stats: &sinkdb_compaction::ModelStats) {
 
         for col in &stats.columns {
             let col_type = match col.column_type {
-                sinkdb_compaction::ColumnType::Fixed => "Fixed",
-                sinkdb_compaction::ColumnType::Variable => "Variable",
+                forgedb_compaction::ColumnType::Fixed => "Fixed",
+                forgedb_compaction::ColumnType::Variable => "Variable",
             };
             println!(
                 "{:<20} {:>10} {:>12} {:>12} {:>9.1}%",

@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document describes the file watcher implementation for SinkDB, which automatically regenerates code when schema files change. This feature is part of Sprint 5's focus on CLI and Developer Experience improvements.
+This document describes the file watcher implementation for ForgeDB, which automatically regenerates code when schema files change. This feature is part of Sprint 5's focus on CLI and Developer Experience improvements.
 
 ## Features
 
@@ -19,7 +19,7 @@ This document describes the file watcher implementation for SinkDB, which automa
 
 ### 3. Auto-Regeneration
 - **Automatic code generation** triggered by schema changes
-- **Full integration** with SinkDB's parser and code generator
+- **Full integration** with ForgeDB's parser and code generator
 - **Error handling** with clear, actionable error messages
 - **Output validation** ensures generated code is written successfully
 
@@ -34,7 +34,7 @@ This document describes the file watcher implementation for SinkDB, which automa
 ```
 ┌─────────────────────┐
 │  Schema File        │
-│  (schema.sink)      │
+│  (schema.forge)      │
 └──────────┬──────────┘
            │ (changes)
            ▼
@@ -93,7 +93,7 @@ Handles the code regeneration logic when schema changes are detected.
 
 **Regeneration Flow:**
 1. Read schema file content
-2. Parse with SinkDB parser (lexer → AST)
+2. Parse with ForgeDB parser (lexer → AST)
 3. Generate Rust code via CodeGenerator
 4. Write to output directory
 5. Return detailed result with success/failure info
@@ -104,10 +104,10 @@ High-level convenience function that combines watching and regeneration.
 
 **Usage:**
 ```rust
-use sinkdb_watcher::auto_watch;
+use forgedb_watcher::auto_watch;
 
 auto_watch(
-    "schema.sink",
+    "schema.forge",
     "generated",
     200,
     Some(Box::new(|result| {
@@ -137,14 +137,14 @@ cargo run --example sprint5_watcher
 ### Library Integration
 
 ```rust
-use sinkdb_watcher::{SchemaWatcher, SchemaRegenerator};
+use forgedb_watcher::{SchemaWatcher, SchemaRegenerator};
 
 // Create watcher and regenerator
 let mut watcher = SchemaWatcher::new(200)?;
-let regenerator = SchemaRegenerator::new("schema.sink", "generated");
+let regenerator = SchemaRegenerator::new("schema.forge", "generated");
 
 // Watch the schema file
-watcher.watch("schema.sink")?;
+watcher.watch("schema.forge")?;
 
 // Event loop
 loop {
@@ -178,13 +178,13 @@ The watcher includes comprehensive tests:
 
 ```bash
 # Run all watcher tests
-cargo test -p sinkdb-watcher
+cargo test -p forgedb-watcher
 
 # Run with output
-cargo test -p sinkdb-watcher -- --nocapture
+cargo test -p forgedb-watcher -- --nocapture
 
 # Run specific test
-cargo test -p sinkdb-watcher test_debouncing
+cargo test -p forgedb-watcher test_debouncing
 ```
 
 ## Configuration
@@ -214,7 +214,7 @@ The watcher provides clear error messages for common scenarios:
 ### Schema Not Found
 ```
 ✗ FAILED
-  Schema file not found: schema.sink
+  Schema file not found: schema.forge
 
   Hint: Make sure the schema file exists
 ```
@@ -289,12 +289,12 @@ The watcher uses channels for thread-safe event communication:
 [dependencies]
 notify = "6.1"              # File system watching
 crossbeam-channel = "0.5"   # High-performance channels
-sinkdb = { path = "../.." } # Parser and codegen integration
+forgedb = { path = "../.." } # Parser and codegen integration
 ```
 
 ## Success Criteria (Sprint 5)
 
-- [x] Watch `schema.sink` for changes
+- [x] Watch `schema.forge` for changes
 - [x] Auto-regenerate on schema change
 - [x] Clear error display in terminal
 - [x] Debounce rapid changes

@@ -348,7 +348,7 @@ impl TypeScriptGenerator {
         }
 
         code.push_str("\n// Main SDK class\n");
-        code.push_str("export class SinkDBClient {\n");
+        code.push_str("export class ForgeDBClient {\n");
         for model in &schema.models {
             code.push_str(&format!(
                 "  public {}: {}Api;\n",
@@ -377,9 +377,9 @@ impl TypeScriptGenerator {
     /// Generate package.json
     fn generate_package_json() -> GeneratedFile {
         let content = r#"{
-  "name": "@sinkdb/client",
+  "name": "@forgedb/client",
   "version": "0.1.0",
-  "description": "Auto-generated TypeScript SDK for SinkDB API",
+  "description": "Auto-generated TypeScript SDK for ForgeDB API",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -395,8 +395,8 @@ impl TypeScriptGenerator {
     "dev": "tsup --watch",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["sinkdb", "api", "client", "sdk", "typescript"],
-  "author": "SinkDB",
+  "keywords": ["forgedb", "api", "client", "sdk", "typescript"],
+  "author": "ForgeDB",
   "license": "MIT",
   "devDependencies": {
     "tsup": "^8.0.0",
@@ -465,18 +465,18 @@ export default defineConfig({
     fn generate_readme(schema: &Schema) -> GeneratedFile {
         let mut content = String::new();
 
-        content.push_str("# SinkDB TypeScript SDK\n\n");
-        content.push_str("Auto-generated TypeScript client for SinkDB API.\n\n");
+        content.push_str("# ForgeDB TypeScript SDK\n\n");
+        content.push_str("Auto-generated TypeScript client for ForgeDB API.\n\n");
 
         content.push_str("## Installation\n\n");
         content.push_str("```bash\n");
-        content.push_str("npm install @sinkdb/client\n");
+        content.push_str("npm install @forgedb/client\n");
         content.push_str("```\n\n");
 
         content.push_str("## Usage\n\n");
         content.push_str("```typescript\n");
-        content.push_str("import { SinkDBClient } from '@sinkdb/client';\n\n");
-        content.push_str("const client = new SinkDBClient('http://localhost:3000');\n\n");
+        content.push_str("import { ForgeDBClient } from '@forgedb/client';\n\n");
+        content.push_str("const client = new ForgeDBClient('http://localhost:3000');\n\n");
 
         // Show example for first model if available
         if let Some(model) = schema.models.first() {

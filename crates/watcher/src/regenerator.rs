@@ -85,7 +85,7 @@ impl SchemaRegenerator {
             };
         }
 
-        // Call the code generation (this would normally use the sinkdb library)
+        // Call the code generation (this would normally use the forgedb library)
         // For now, we'll invoke it as a command since we're in a separate crate
         let output_path = self.output_dir.join("database.rs");
 
@@ -114,16 +114,16 @@ impl SchemaRegenerator {
 
     /// Internal regeneration logic
     fn regenerate_internal(&self, schema_content: &str) -> Result<String, RegenerateError> {
-        // Parse the schema using sinkdb parser
-        let mut parser = sinkdb::parser::Parser::new(schema_content)
+        // Parse the schema using forgedb parser
+        let mut parser = forgedb::parser::Parser::new(schema_content)
             .map_err(|e| RegenerateError::ParseError(format!("Lexer error: {}", e)))?;
 
         let schema = parser
             .parse()
             .map_err(|e| RegenerateError::ParseError(format!("Parser error: {}", e)))?;
 
-        // Generate code using sinkdb codegen
-        let generator = sinkdb::codegen::CodeGenerator::new();
+        // Generate code using forgedb codegen
+        let generator = forgedb::codegen::CodeGenerator::new();
         let generated_code = generator.generate(&schema);
 
         Ok(generated_code)
@@ -149,14 +149,14 @@ mod tests {
 
     #[test]
     fn test_regenerator_creation() {
-        let regen = SchemaRegenerator::new("schema.sink", "generated");
-        assert_eq!(regen.schema_path(), Path::new("schema.sink"));
+        let regen = SchemaRegenerator::new("schema.forge", "generated");
+        assert_eq!(regen.schema_path(), Path::new("schema.forge"));
         assert_eq!(regen.output_dir(), Path::new("generated"));
     }
 
     #[test]
     fn test_regenerate_missing_file() {
-        let regen = SchemaRegenerator::new("/nonexistent/schema.sink", "generated");
+        let regen = SchemaRegenerator::new("/nonexistent/schema.forge", "generated");
         let result = regen.regenerate();
         assert!(!result.success);
         assert!(result.message.contains("not found"));

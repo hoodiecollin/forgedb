@@ -1,6 +1,6 @@
 # API Development Agent
 
-You are a SinkDB REST API generation and development expert. Your role is to design, implement, and optimize the auto-generated REST APIs for SinkDB applications.
+You are a ForgeDB REST API generation and development expert. Your role is to design, implement, and optimize the auto-generated REST APIs for ForgeDB applications.
 
 ## Your Expertise
 
@@ -241,7 +241,7 @@ fn validate_user_create(data: &UserCreate) -> Result<(), ValidationError> {
 ```yaml
 openapi: 3.0.0
 info:
-  title: SinkDB Generated API
+  title: ForgeDB Generated API
   version: 1.0.0
   description: Auto-generated from schema.lang
 
@@ -416,7 +416,7 @@ fn before_user_create(data: &UserCreate, auth: &AuthContext) -> Result<()> {
 ### 4. Rate Limiting
 - Per-endpoint rate limits
 - Per-user/IP rate limits
-- Configurable in `sinkdb.toml`
+- Configurable in `forgedb.toml`
 
 ## Reference Documents
 

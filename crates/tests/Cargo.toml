@@ -1,11 +1,11 @@
 [package]
-name = "sinkdb-tests"
+name = "forgedb-tests"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sinkdb = { path = "../.." }
-sinkdb-storage = { path = "../storage" }
-sinkdb-types = { path = "../types" }
-sinkdb-validation = { path = "../validation" }
+forgedb = { path = "../.." }
+forgedb-storage = { path = "../storage" }
+forgedb-types = { path = "../types" }
+forgedb-validation = { path = "../validation" }
 uuid = { version = "1.6", features = ["v4"] }

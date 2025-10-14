@@ -4,7 +4,7 @@ pub mod user_storage;
 pub use user_storage::{User, UserStorage};
 
 // Sprint 7: WAL re-exports
-pub use sinkdb_wal::{
+pub use forgedb_wal::{
     FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue,
 };
 
@@ -261,7 +261,7 @@ impl Tombstones {
 pub struct Database {
     root_path: PathBuf,
     manifest: Manifest,
-    wal_manager: Option<sinkdb_wal::WalManager>,
+    wal_manager: Option<forgedb_wal::WalManager>,
 }
 
 impl Database {
@@ -294,7 +294,7 @@ impl Database {
     /// Open database with WAL support
     pub fn open_with_wal(
         root_path: PathBuf,
-        fsync_policy: sinkdb_wal::FsyncPolicy,
+        fsync_policy: forgedb_wal::FsyncPolicy,
     ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
 
@@ -319,7 +319,7 @@ impl Database {
 
         // Open WAL
         let wal_path = root_path.join("wal.log");
-        let wal_manager = sinkdb_wal::WalManager::open(wal_path, fsync_policy)?;
+        let wal_manager = forgedb_wal::WalManager::open(wal_path, fsync_policy)?;
 
         Ok(Database {
             root_path,
@@ -329,12 +329,12 @@ impl Database {
     }
 
     /// Get a mutable reference to the WAL manager
-    pub fn wal_mut(&mut self) -> Option<&mut sinkdb_wal::WalManager> {
+    pub fn wal_mut(&mut self) -> Option<&mut forgedb_wal::WalManager> {
         self.wal_manager.as_mut()
     }
 
     /// Get a reference to the WAL manager
-    pub fn wal(&self) -> Option<&sinkdb_wal::WalManager> {
+    pub fn wal(&self) -> Option<&forgedb_wal::WalManager> {
         self.wal_manager.as_ref()
     }
 
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_fixed_column_u64() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_fixed");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_fixed");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_variable_column_string() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_variable");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_variable");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_tombstones() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_tombstones");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_tombstones");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_database_manifest() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_manifest");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_manifest");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let mut db = Database::open(temp_dir.clone()).unwrap();
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_fixed_column_out_of_bounds() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_oob");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_oob");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_fixed_column_persistence() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_fixed_persist");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_fixed_persist");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn test_variable_column_empty_string() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_empty_string");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_empty_string");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_variable_column_large_string() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_large_string");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_large_string");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_variable_column_persistence() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_var_persist");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_var_persist");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_variable_column_out_of_bounds() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_var_oob");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_var_oob");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_tombstones_out_of_bounds() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_tomb_oob");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_tomb_oob");
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_database_empty() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_test_empty");
+        let temp_dir = std::env::temp_dir().join("forgedb_test_empty");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let db = Database::open(temp_dir.clone()).unwrap();

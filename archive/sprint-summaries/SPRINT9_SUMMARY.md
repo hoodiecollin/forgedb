@@ -2,7 +2,7 @@
 
 ## What We're Building
 
-Auto-generate a production-ready REST API from SinkDB schemas with full CRUD operations, query parameters, validation, and type safety.
+Auto-generate a production-ready REST API from ForgeDB schemas with full CRUD operations, query parameters, validation, and type safety.
 
 ## The Big Picture
 

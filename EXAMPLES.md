@@ -1,28 +1,28 @@
-# SinkDB Examples & Getting Started
+# ForgeDB Examples & Getting Started
 
 ## Quick Start
 
 ### Installation
 
 ```bash
-# Install SinkDB CLI
-cargo install sinkdb-cli
+# Install ForgeDB CLI
+cargo install forgedb-cli
 
 # Verify installation
-sinkdb --version
+forgedb --version
 ```
 
 ### Create Your First App
 
 ```bash
 # Initialize a new blog project
-sinkdb init my-blog --template blog
+forgedb init my-blog --template blog
 
 # Navigate to project
 cd my-blog
 
 # Start development server
-sinkdb dev
+forgedb dev
 ```
 
 Open your browser to `http://localhost:3000` and you'll see:
@@ -142,7 +142,7 @@ Comment {
 ### Step 2: Generate Code
 
 ```bash
-sinkdb generate
+forgedb generate
 ```
 
 This creates:
@@ -200,7 +200,7 @@ export default function PostPreview({ data, computed }) {
 ### Step 5: Start Dev Server
 
 ```bash
-sinkdb dev
+forgedb dev
 ```
 
 ### Step 6: Use the API
@@ -812,9 +812,9 @@ describe('Blog API', () => {
 
 ```bash
 # Build optimized binary
-sinkdb build --release
+forgedb build --release
 
-# Output: dist/sinkdb-api
+# Output: dist/forgedb-api
 ```
 
 ### Docker
@@ -823,16 +823,16 @@ sinkdb build --release
 FROM rust:1.75 AS builder
 WORKDIR /app
 COPY . .
-RUN cargo install sinkdb-cli
-RUN sinkdb build --release
+RUN cargo install forgedb-cli
+RUN forgedb build --release
 
 FROM debian:bookworm-slim
-COPY --from=builder /app/dist/sinkdb-api /usr/local/bin/
+COPY --from=builder /app/dist/forgedb-api /usr/local/bin/
 COPY schema.lang /app/
 COPY data/ /app/data/
 
 EXPOSE 3000
-CMD ["sinkdb-api", "--config", "/app/sinkdb.toml"]
+CMD ["forgedb-api", "--config", "/app/forgedb.toml"]
 ```
 
 ### Environment Variables
@@ -876,7 +876,7 @@ RUST_LOG=info
 ### Development Workflow
 
 1. **Edit schema** in `schema.lang`
-2. **Run `sinkdb dev`** to see changes immediately
+2. **Run `forgedb dev`** to see changes immediately
 3. **Implement stubs** for new computed fields/components
 4. **Test thoroughly** before deployment
 5. **Create migrations** for schema changes
@@ -888,48 +888,48 @@ RUST_LOG=info
 ### Schema Validation Errors
 
 ```bash
-$ sinkdb validate
+$ forgedb validate
 
 ❌ Error at line 15:
    Field 'email' has invalid type 'string!'
    Did you mean 'string' (nullable) or just 'string' (required)?
 ```
 
-**Fix**: Remove the `!` suffix. In SinkDB, fields are required by default.
+**Fix**: Remove the `!` suffix. In ForgeDB, fields are required by default.
 
 ### Missing Implementations
 
 ```bash
-$ sinkdb validate --strict
+$ forgedb validate --strict
 
 ❌ Missing implementations:
    - User.fullName (src/computed/User.ts)
 ```
 
-**Fix**: Run `sinkdb generate stubs` to create the file, then implement.
+**Fix**: Run `forgedb generate stubs` to create the file, then implement.
 
 ### Hot Reload Not Working
 
 ```bash
 # Check file watcher
-sinkdb dev --verbose
+forgedb dev --verbose
 
 # Manual regeneration
-sinkdb generate --force
+forgedb generate --force
 ```
 
 ### Database Corruption
 
 ```bash
 # Verify database
-sinkdb inspect stats
+forgedb inspect stats
 
 # Restore from WAL
-sinkdb recover
+forgedb recover
 
 # Rebuild from migrations
-sinkdb migrate down --all
-sinkdb migrate up
+forgedb migrate down --all
+forgedb migrate up
 ```
 
 ---
@@ -938,7 +938,7 @@ sinkdb migrate up
 
 - **Documentation**: Full docs at `/docs` when running dev server
 - **Examples**: See `/examples` directory in repo
-- **Templates**: Use `sinkdb init --template <n>` for starter projects
+- **Templates**: Use `forgedb init --template <n>` for starter projects
 - **Community**: (TBD - Discord, GitHub Discussions)
 
 ---

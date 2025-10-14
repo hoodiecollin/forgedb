@@ -1,11 +1,11 @@
-# SinkDB Claude Agents
+# ForgeDB Claude Agents
 
-This directory contains specialized Claude Code sub-agents for the SinkDB project. Each agent is an expert in a specific aspect of SinkDB development.
+This directory contains specialized Claude Code sub-agents for the ForgeDB project. Each agent is an expert in a specific aspect of ForgeDB development.
 
 ## Available Agents
 
 ### 1. Schema Specialist (`schema-specialist.md`)
-**Expertise**: SinkDB schema language design and optimization
+**Expertise**: ForgeDB schema language design and optimization
 
 **Use when:**
 - Designing new schema models
@@ -134,7 +134,7 @@ Read the agent files directly to understand their expertise and use that knowled
 ## Agent Capabilities
 
 All agents have deep knowledge of:
-- SinkDB documentation (README, INDEX, ROADMAP, etc.)
+- ForgeDB documentation (README, INDEX, ROADMAP, etc.)
 - Domain-specific expertise
 - Best practices and patterns
 - Common pitfalls and solutions
@@ -194,7 +194,7 @@ kitchen-sink/
 
 ## Agent Maintenance
 
-These agents are based on the SinkDB documentation as of **October 11, 2025**.
+These agents are based on the ForgeDB documentation as of **October 11, 2025**.
 
 If project documentation changes significantly, agents may need updates to reflect:
 - New schema syntax

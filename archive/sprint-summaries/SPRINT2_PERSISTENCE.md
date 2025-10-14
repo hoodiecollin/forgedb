@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 2 adds persistent storage to SinkDB using a columnar storage architecture. Data now survives database restarts, and the storage layer is designed for performance with fixed-size and variable-length columns stored separately.
+Sprint 2 adds persistent storage to ForgeDB using a columnar storage architecture. Data now survives database restarts, and the storage layer is designed for performance with fixed-size and variable-length columns stored separately.
 
 ## Architecture
 
@@ -122,7 +122,7 @@ User {
 
 Run all storage tests:
 ```bash
-cargo test --package sinkdb-storage
+cargo test --package forgedb-storage
 ```
 
 **Test coverage:**
@@ -151,7 +151,7 @@ cargo run --example sprint2_persistence
 ## API Usage
 
 ```rust
-use sinkdb_storage::UserStorage;
+use forgedb_storage::UserStorage;
 use std::path::PathBuf;
 
 // Create or open database

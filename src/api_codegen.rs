@@ -109,7 +109,7 @@ impl ApiCodeGenerator {
         code.push_str("use std::sync::Arc;\n");
         code.push_str("use uuid::Uuid;\n\n");
         code.push_str(&format!("use super::{}_types::*;\n", model_lower));
-        code.push_str("use sinkdb_query_params::QueryParams;\n\n");
+        code.push_str("use forgedb_query_params::QueryParams;\n\n");
 
         // List handler
         code.push_str(&format!("/// List all {}\n", model.name));
@@ -146,7 +146,7 @@ impl ApiCodeGenerator {
         ));
         code.push_str(") -> impl IntoResponse {\n");
         code.push_str("    // TODO: Implement create logic with storage\n");
-        code.push_str("    // Validate request with sinkdb_validation\n");
+        code.push_str("    // Validate request with forgedb_validation\n");
         code.push_str("    // Call storage.insert()\n");
         code.push_str("    (StatusCode::CREATED, Json(json!({\n");
         code.push_str("        \"id\": Uuid::new_v4()\n");

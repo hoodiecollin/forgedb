@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 mod tests {
-    use sinkdb::{CodeGenerator, Parser};
+    use forgedb::{CodeGenerator, Parser};
 
     #[test]
     fn test_fulltext_directive_parsing() {
@@ -67,17 +67,17 @@ Article {
         // Check that full-text index fields are generated
         assert!(
             code.contains(
-                "title_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>"
+                "title_fulltext: std::sync::Arc<std::sync::RwLock<forgedb_fulltext::FullTextIndex>>"
             ),
             "title_fulltext field should be generated"
         );
-        assert!(code.contains("content_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>"),
+        assert!(code.contains("content_fulltext: std::sync::Arc<std::sync::RwLock<forgedb_fulltext::FullTextIndex>>"),
             "content_fulltext field should be generated");
 
         // Check that indexes are initialized
-        assert!(code.contains("title_fulltext: std::sync::Arc::new(std::sync::RwLock::new(sinkdb_fulltext::FullTextIndex::new()))"),
+        assert!(code.contains("title_fulltext: std::sync::Arc::new(std::sync::RwLock::new(forgedb_fulltext::FullTextIndex::new()))"),
             "title_fulltext should be initialized");
-        assert!(code.contains("content_fulltext: std::sync::Arc::new(std::sync::RwLock::new(sinkdb_fulltext::FullTextIndex::new()))"),
+        assert!(code.contains("content_fulltext: std::sync::Arc::new(std::sync::RwLock::new(forgedb_fulltext::FullTextIndex::new()))"),
             "content_fulltext should be initialized");
     }
 

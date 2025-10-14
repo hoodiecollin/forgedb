@@ -1,6 +1,6 @@
 /// Default blank schema template
 pub fn blank_schema() -> &'static str {
-    r#"// SinkDB Schema
+    r#"// ForgeDB Schema
 // Define your models below
 
 User {
@@ -111,7 +111,7 @@ Todo {
 "#
 }
 
-/// Default sinkdb.toml configuration
+/// Default forgedb.toml configuration
 pub fn default_config(project_name: &str) -> String {
     format!(
         r#"[project]
@@ -131,7 +131,7 @@ cors_origins = ["http://localhost:5173"]
 
 [dev]
 hot_reload = true
-watch_paths = ["schema.sink", "src/"]
+watch_paths = ["schema.forge", "src/"]
 browser = true
 
 [codegen]
@@ -146,7 +146,7 @@ format_typescript = false
 
 /// Default .gitignore
 pub fn default_gitignore() -> &'static str {
-    r#"# SinkDB Generated Files
+    r#"# ForgeDB Generated Files
 /generated/
 
 # Database Files
@@ -188,7 +188,7 @@ mod generated {
 use generated::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting SinkDB application...");
+    println!("🚀 Starting ForgeDB application...");
 
     // Initialize database
     let db_path = Path::new("./data/db");
@@ -207,7 +207,7 @@ pub fn readme_template(project_name: &str) -> String {
     format!(
         r#"# {}
 
-A SinkDB project.
+A ForgeDB project.
 
 ## Getting Started
 
@@ -223,7 +223,7 @@ cargo run --example basic
 
 ### Schema
 
-Edit `schema.sink` to define your data models. The code will be automatically generated.
+Edit `schema.forge` to define your data models. The code will be automatically generated.
 
 ### Generated Code
 
@@ -231,8 +231,8 @@ Edit `schema.sink` to define your data models. The code will be automatically ge
 
 ## Learn More
 
-- [SinkDB Documentation](https://github.com/yourusername/sinkdb)
-- [Schema Language Guide](https://github.com/yourusername/sinkdb/blob/main/docs/schema.md)
+- [ForgeDB Documentation](https://github.com/yourusername/forgedb)
+- [Schema Language Guide](https://github.com/yourusername/forgedb/blob/main/docs/schema.md)
 "#,
         project_name
     )

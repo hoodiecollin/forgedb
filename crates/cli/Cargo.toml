@@ -1,10 +1,10 @@
 [package]
-name = "sinkdb-cli"
+name = "forgedb-cli"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "sinkdb"
+name = "forgedb"
 path = "src/main.rs"
 
 [dependencies]
@@ -13,10 +13,10 @@ anyhow = "1.0"
 thiserror = "1.0"
 colored = "2.1"
 serde_json = "1.0"
-sinkdb = { path = "../.." }
-sinkdb-watcher = { path = "../watcher" }
-sinkdb-migrations = { path = "../migrations" }
-sinkdb-compaction = { path = "../compaction" }
+forgedb = { path = "../.." }
+forgedb-watcher = { path = "../watcher" }
+forgedb-migrations = { path = "../migrations" }
+forgedb-compaction = { path = "../compaction" }
 
 [dev-dependencies]
 tempfile = "3.8"

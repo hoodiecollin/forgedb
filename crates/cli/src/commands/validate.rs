@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use sinkdb::parser::Parser;
+use forgedb::parser::Parser;
 use std::fs;
 
 pub struct ValidateOptions {
@@ -38,7 +38,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         .map(|m| {
             m.fields
                 .iter()
-                .filter(|f| matches!(f.field_type, sinkdb::ast::FieldType::Relation { .. }))
+                .filter(|f| matches!(f.field_type, forgedb::ast::FieldType::Relation { .. }))
                 .count()
         })
         .sum();
@@ -96,12 +96,12 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // Validate relations reference existing models
     for model in &schema.models {
         for field in &model.fields {
-            if let sinkdb::ast::FieldType::Relation(rel_type) = &field.field_type {
+            if let forgedb::ast::FieldType::Relation(rel_type) = &field.field_type {
                 let target = match rel_type {
-                    sinkdb::ast::RelationType::OneToMany(t) => t,
-                    sinkdb::ast::RelationType::RequiredReference(t) => t,
-                    sinkdb::ast::RelationType::OptionalReference(t) => t,
-                    sinkdb::ast::RelationType::ManyToMany(t) => t,
+                    forgedb::ast::RelationType::OneToMany(t) => t,
+                    forgedb::ast::RelationType::RequiredReference(t) => t,
+                    forgedb::ast::RelationType::OptionalReference(t) => t,
+                    forgedb::ast::RelationType::ManyToMany(t) => t,
                 };
                 if !schema.models.iter().any(|m| &m.name == target) {
                     errors.push(format!(
@@ -132,7 +132,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         let has_timestamp = model
             .fields
             .iter()
-            .any(|f| matches!(f.field_type, sinkdb::ast::FieldType::Timestamp));
+            .any(|f| matches!(f.field_type, forgedb::ast::FieldType::Timestamp));
 
         if !has_timestamp {
             warnings.push(format!(
@@ -180,7 +180,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
 }
 
 fn find_schema_file() -> Result<String> {
-    let candidates = ["schema.sink", "schema.lang", "schema.sinkdb"];
+    let candidates = ["schema.forge", "schema.lang", "schema.forgedb"];
 
     for candidate in &candidates {
         if std::path::Path::new(candidate).exists() {
@@ -189,7 +189,7 @@ fn find_schema_file() -> Result<String> {
     }
 
     Err(CliError::SchemaNotFound(
-        "No schema file found. Expected one of: schema.sink, schema.lang, schema.sinkdb"
+        "No schema file found. Expected one of: schema.forge, schema.lang, schema.forgedb"
             .to_string(),
     ))
 }

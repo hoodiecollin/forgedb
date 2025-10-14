@@ -1,6 +1,6 @@
 // Additional edge case tests for comprehensive coverage
 
-use sinkdb::{ast::FieldType, CodeGenerator, Parser};
+use forgedb::{ast::FieldType, CodeGenerator, Parser};
 
 // === Type Boundary Tests ===
 

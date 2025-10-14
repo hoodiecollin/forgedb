@@ -5,7 +5,7 @@
 
 ## Overview
 
-Sprint 13 successfully implemented comprehensive OpenAPI 3.0 specification generation and markdown documentation for SinkDB schemas. This completes the API documentation story started in Sprint 9 (REST API) and Sprint 10 (TypeScript SDK).
+Sprint 13 successfully implemented comprehensive OpenAPI 3.0 specification generation and markdown documentation for ForgeDB schemas. This completes the API documentation story started in Sprint 9 (REST API) and Sprint 10 (TypeScript SDK).
 
 ## Implemented Features
 
@@ -16,7 +16,7 @@ Sprint 13 successfully implemented comprehensive OpenAPI 3.0 specification gener
   - Generates valid OpenAPI 3.0.3 specifications
 
 - **Complete model schemas**
-  - All SinkDB models mapped to OpenAPI schemas
+  - All ForgeDB models mapped to OpenAPI schemas
   - Request schemas (CreateXRequest, UpdateXRequest)
   - Response schemas (full model with all fields)
 
@@ -116,7 +116,7 @@ impl OpenApiGenerator {
 ## Example Usage
 
 ```rust
-use sinkdb::{Parser, OpenApiGenerator};
+use forgedb::{Parser, OpenApiGenerator};
 
 let schema_text = r#"
 User {
@@ -190,7 +190,7 @@ Sprint 13: OpenAPI & Documentation
 🔍 Validating OpenAPI spec...
 ✓ OpenAPI spec is valid JSON
   - OpenAPI version: "3.0.3"
-  - API title: "SinkDB Generated API"
+  - API title: "ForgeDB Generated API"
   - API version: "1.0.0"
   - Endpoints: 6
   - Schemas: 9
@@ -284,19 +284,19 @@ While Sprint 13 is complete, potential future improvements:
    - Solution: Check for `=` in raw syntax
 
 4. **Relation Mapping**
-   - Challenge: Map SinkDB relations to OpenAPI
+   - Challenge: Map ForgeDB relations to OpenAPI
    - Solution: Convert to uuid foreign keys with descriptions
 
 ## Conclusion
 
-Sprint 13 successfully delivers a complete OpenAPI documentation generation system for SinkDB. The implementation provides both machine-readable OpenAPI specs and human-readable markdown documentation, enabling developers to:
+Sprint 13 successfully delivers a complete OpenAPI documentation generation system for ForgeDB. The implementation provides both machine-readable OpenAPI specs and human-readable markdown documentation, enabling developers to:
 
 1. Import specs into API testing tools
 2. Generate client SDKs from OpenAPI
 3. View comprehensive API documentation
 4. Validate API requests against the schema
 
-This completes the API documentation story and provides a solid foundation for API-first development with SinkDB.
+This completes the API documentation story and provides a solid foundation for API-first development with ForgeDB.
 
 ---
 

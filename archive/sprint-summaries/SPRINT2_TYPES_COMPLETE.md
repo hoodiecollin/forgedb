@@ -1,7 +1,7 @@
 # Sprint 2: Type System Expansion - Complete
 
 ## Overview
-Successfully expanded SinkDB type system from 3 types (u32, u64, string) to 9 types, including numeric primitives, UUID, and timestamp with full auto-generation support.
+Successfully expanded ForgeDB type system from 3 types (u32, u64, string) to 9 types, including numeric primitives, UUID, and timestamp with full auto-generation support.
 
 ## Implemented Types
 

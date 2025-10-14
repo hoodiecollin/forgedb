@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
-use sinkdb_cli::{commands, Result};
+use forgedb_cli::{commands, Result};
 
 #[derive(Parser)]
-#[command(name = "sinkdb")]
-#[command(author, version, about = "SinkDB - Type-safe database from schemas", long_about = None)]
+#[command(name = "forgedb")]
+#[command(author, version, about = "ForgeDB - Type-safe database from schemas", long_about = None)]
 struct Cli {
     /// Enable verbose output
     #[arg(short, long, global = true)]
@@ -13,7 +13,7 @@ struct Cli {
     #[arg(short, long, global = true)]
     quiet: bool,
 
-    /// Path to sinkdb.toml config file
+    /// Path to forgedb.toml config file
     #[arg(short, long, global = true)]
     config: Option<String>,
 
@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new SinkDB project
+    /// Initialize a new ForgeDB project
     Init {
         /// Project name
         project_name: String,
@@ -109,7 +109,7 @@ enum Commands {
     /// Watch schema file and auto-regenerate on changes
     Dev {
         /// Schema file to watch
-        #[arg(short, long, default_value = "schema.sink")]
+        #[arg(short, long, default_value = "schema.forge")]
         schema: String,
 
         /// Output directory for generated code

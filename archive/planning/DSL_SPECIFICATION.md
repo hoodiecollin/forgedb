@@ -1,4 +1,4 @@
-# SinkDB Schema Language Specification
+# ForgeDB Schema Language Specification
 
 ## Version 0.1.0
 
@@ -16,7 +16,7 @@
 
 ## Overview
 
-The SinkDB schema language is a declarative DSL for defining data models, relationships, constraints, and UI integration. It prioritizes clarity, type safety, and compile-time optimization.
+The ForgeDB schema language is a declarative DSL for defining data models, relationships, constraints, and UI integration. It prioritizes clarity, type safety, and compile-time optimization.
 
 ### Design Principles
 

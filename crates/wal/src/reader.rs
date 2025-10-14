@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_reader_read_all() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_reader_all");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_reader_all");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_reader_read_one() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_reader_one");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_reader_one");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_reader_corrupted_entry() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_reader_corrupt");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_reader_corrupt");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_reader_empty_file() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_reader_empty");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_reader_empty");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 

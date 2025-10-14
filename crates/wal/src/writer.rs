@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_writer_always_fsync() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_writer_always");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_writer_always");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_writer_never_fsync() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_writer_never");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_writer_never");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_writer_periodic_fsync() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_writer_periodic");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_writer_periodic");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_writer_truncate() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_wal_writer_truncate");
+        let temp_dir = std::env::temp_dir().join("forgedb_wal_writer_truncate");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 

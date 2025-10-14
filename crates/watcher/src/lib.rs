@@ -204,10 +204,10 @@ impl SchemaWatcher {
 ///
 /// # Example
 /// ```no_run
-/// use sinkdb_watcher::auto_watch;
+/// use forgedb_watcher::auto_watch;
 ///
 /// auto_watch(
-///     "schema.sink",
+///     "schema.forge",
 ///     "generated",
 ///     200,
 ///     Some(Box::new(|result| {
@@ -277,14 +277,14 @@ mod tests {
     #[test]
     fn test_watch_nonexistent_path() {
         let mut watcher = SchemaWatcher::new(100).unwrap();
-        let result = watcher.watch("/nonexistent/path/schema.sink");
+        let result = watcher.watch("/nonexistent/path/schema.forge");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_watch_and_detect_change() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test_schema_watch.sink");
+        let test_file = temp_dir.join("test_schema_watch.forge");
 
         // Create test file
         fs::write(&test_file, "User { id: +u64 }").unwrap();
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn test_debouncing() {
         let temp_dir = std::env::temp_dir();
-        let test_file = temp_dir.join("test_schema_debounce.sink");
+        let test_file = temp_dir.join("test_schema_debounce.forge");
 
         // Create test file
         fs::write(&test_file, "User { id: +u64 }").unwrap();

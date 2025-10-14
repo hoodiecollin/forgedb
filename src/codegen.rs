@@ -272,7 +272,7 @@ impl CodeGenerator {
             code.push_str("    // Full-text search indexes\n");
             for field in &model.fields {
                 if field.fulltext_indexed {
-                    code.push_str(&format!("    {}_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>,\n",
+                    code.push_str(&format!("    {}_fulltext: std::sync::Arc<std::sync::RwLock<forgedb_fulltext::FullTextIndex>>,\n",
                         field.name));
                 }
             }
@@ -364,7 +364,7 @@ impl CodeGenerator {
         // Initialize full-text indexes (Sprint 18)
         for field in &model.fields {
             if field.fulltext_indexed {
-                code.push_str(&format!("            {}_fulltext: std::sync::Arc::new(std::sync::RwLock::new(sinkdb_fulltext::FullTextIndex::new())),\n",
+                code.push_str(&format!("            {}_fulltext: std::sync::Arc::new(std::sync::RwLock::new(forgedb_fulltext::FullTextIndex::new())),\n",
                     field.name));
             }
         }

@@ -214,7 +214,7 @@ if replay.is_committed(txn_id) {
 **Database with WAL Support**:
 ```rust
 // Storage crate now supports WAL
-use sinkdb_storage::{Database, FsyncPolicy};
+use forgedb_storage::{Database, FsyncPolicy};
 
 // Open with WAL
 let mut db = Database::open_with_wal(
@@ -479,7 +479,7 @@ Type Tags:
 
 ### 6. WAL in Separate Crate
 
-**Decision**: Create `sinkdb-wal` as standalone crate
+**Decision**: Create `forgedb-wal` as standalone crate
 
 **Rationale**:
 - **Modularity**: WAL can be used independently
@@ -567,7 +567,7 @@ Type Tags:
 ### Pattern 1: Manual WAL Integration
 
 ```rust
-use sinkdb_wal::{WalManager, WalEntry, WalValue, FsyncPolicy};
+use forgedb_wal::{WalManager, WalEntry, WalValue, FsyncPolicy};
 use std::collections::HashMap;
 
 struct MyStorage {

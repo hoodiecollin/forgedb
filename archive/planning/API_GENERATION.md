@@ -1,8 +1,8 @@
-# SinkDB API Generation Specification
+# ForgeDB API Generation Specification
 
 ## Overview
 
-SinkDB automatically generates a complete REST API from the schema, including CRUD operations, relationship traversal, query parameters, validation, and OpenAPI documentation.
+ForgeDB automatically generates a complete REST API from the schema, including CRUD operations, relationship traversal, query parameters, validation, and OpenAPI documentation.
 
 ## Design Principles
 
@@ -629,7 +629,7 @@ ws.onmessage = (event) => {
 
 ## Authentication & Authorization (Plugin)
 
-SinkDB doesn't enforce auth by default, but provides hooks:
+ForgeDB doesn't enforce auth by default, but provides hooks:
 
 ```rust
 // Custom middleware
@@ -654,7 +654,7 @@ fn get_users(req: Request) -> Response {
 
 ## Rate Limiting
 
-Configured in `sinkdb.toml`:
+Configured in `forgedb.toml`:
 
 ```toml
 [api]
@@ -676,7 +676,7 @@ X-RateLimit-Reset: 1697123456
 
 ## CORS
 
-Configured in `sinkdb.toml`:
+Configured in `forgedb.toml`:
 
 ```toml
 [api]
@@ -726,7 +726,7 @@ openapi: 3.0.0
 info:
   title: My App API
   version: 1.0.0
-  description: Auto-generated API from SinkDB schema
+  description: Auto-generated API from ForgeDB schema
 
 servers:
   - url: http://localhost:3000/api
@@ -891,7 +891,7 @@ For operations not covered by generated CRUD:
 
 ```rust
 // In your application code
-use sinkdb::api::Server;
+use forgedb::api::Server;
 
 let mut server = Server::from_schema()?;
 

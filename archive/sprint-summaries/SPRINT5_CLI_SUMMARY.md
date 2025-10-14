@@ -7,7 +7,7 @@ The Sprint 5 CLI implementation is **complete and functional** on the `sprint-5/
 ## What Was Implemented
 
 ### 1. Core CLI Binary (`crates/cli`)
-- **sinkdb** command-line tool built with clap
+- **forgedb** command-line tool built with clap
 - 4 core commands implemented and working
 - Colored terminal output with emoji indicators
 - Comprehensive help text
@@ -15,11 +15,11 @@ The Sprint 5 CLI implementation is **complete and functional** on the `sprint-5/
 
 ### 2. Commands
 
-#### ✅ `sinkdb init <project>`
-Creates new SinkDB projects with:
+#### ✅ `forgedb init <project>`
+Creates new ForgeDB projects with:
 - Full project structure (src/, generated/, data/, examples/)
 - Schema file with template support (blank, blog, ecommerce, todo)
-- Configuration (sinkdb.toml)
+- Configuration (forgedb.toml)
 - .gitignore
 - README.md
 - Cargo.toml and Rust project files
@@ -27,7 +27,7 @@ Creates new SinkDB projects with:
 
 **Verified:** ✅ Working
 
-#### ✅ `sinkdb generate [target]`
+#### ✅ `forgedb generate [target]`
 Generates code from schema:
 - Finds schema file automatically
 - Parses and validates schema
@@ -38,7 +38,7 @@ Generates code from schema:
 
 **Verified:** ✅ Working
 
-#### ✅ `sinkdb validate`
+#### ✅ `forgedb validate`
 Validates schema and project:
 - Syntax validation
 - Semantic validation (naming conventions, relations)
@@ -47,7 +47,7 @@ Validates schema and project:
 
 **Verified:** ✅ Working
 
-#### ✅ `sinkdb build`
+#### ✅ `forgedb build`
 Builds production artifacts:
 - Validates schema first
 - Generates code
@@ -99,25 +99,25 @@ Integration tests for:
 
 ### Build Status
 ```bash
-cargo build -p sinkdb-cli --release
+cargo build -p forgedb-cli --release
 # ✅ Compiles successfully
 ```
 
 ### CLI Works
 ```bash
-./target/release/sinkdb --help
+./target/release/forgedb --help
 # ✅ Shows help
 
-./target/release/sinkdb init test-project --template blog
+./target/release/forgedb init test-project --template blog
 # ✅ Creates project with blog template
 
-./target/release/sinkdb validate
+./target/release/forgedb validate
 # ✅ Validates schema
 
-./target/release/sinkdb generate
+./target/release/forgedb generate
 # ✅ Generates code
 
-./target/release/sinkdb build --release
+./target/release/forgedb build --release
 # ✅ Builds project
 ```
 
@@ -152,7 +152,7 @@ SPRINT5_CLI_SUMMARY.md                   # This file
 - **SPRINT5_CLI.md** - Complete implementation documentation
 - **CLI_SPECIFICATION.md** - Full specification (already existed)
 - **examples/cli_demo.sh** - Runnable demo script
-- **Built-in help** - `sinkdb --help` and `sinkdb <command> --help`
+- **Built-in help** - `forgedb --help` and `forgedb <command> --help`
 
 ## Git Status
 
@@ -171,7 +171,7 @@ Sprint 5: Implement CLI commands (init, generate, validate, build)
 
 As noted in the Sprint Plan, these features are planned for separate crates:
 
-1. **File Watching** (`sinkdb dev`) - Separate `watcher` crate
+1. **File Watching** (`forgedb dev`) - Separate `watcher` crate
 2. **Project Scaffolding Automation** - Separate `scaffold` crate
 3. **Documentation Generation** - Separate `docs` crate
 
@@ -180,10 +180,10 @@ These align with the Sprint 5 orchestration plan which calls for parallel develo
 ## Success Criteria
 
 ✅ **All core success criteria met:**
-- [x] `sinkdb init` creates complete project structure
-- [x] `sinkdb generate` produces valid Rust code
-- [x] `sinkdb validate` detects schema errors
-- [x] `sinkdb build` compiles successfully
+- [x] `forgedb init` creates complete project structure
+- [x] `forgedb generate` produces valid Rust code
+- [x] `forgedb validate` detects schema errors
+- [x] `forgedb build` compiles successfully
 - [x] Colored output for better UX
 - [x] Helpful error messages
 - [x] Template support (blog, ecommerce, todo)
@@ -195,23 +195,23 @@ To use the CLI:
 
 ```bash
 # Build the CLI
-cargo build -p sinkdb-cli --release
+cargo build -p forgedb-cli --release
 
 # The binary is at:
-./target/release/sinkdb
+./target/release/forgedb
 
 # Try it out:
-./target/release/sinkdb init my-app --template blog
+./target/release/forgedb init my-app --template blog
 cd my-app
-../target/release/sinkdb validate
-../target/release/sinkdb generate
+../target/release/forgedb validate
+../target/release/forgedb generate
 cargo run --example basic
 ```
 
 To install globally:
 ```bash
 cargo install --path crates/cli
-sinkdb --help
+forgedb --help
 ```
 
 ## Conclusion

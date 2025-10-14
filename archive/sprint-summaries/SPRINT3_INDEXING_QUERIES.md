@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 3 adds indexing capabilities and full CRUD query operations to SinkDB. This includes hash indexes for fast lookups, query methods, update/delete operations with index maintenance, and tombstone-based deletion.
+Sprint 3 adds indexing capabilities and full CRUD query operations to ForgeDB. This includes hash indexes for fast lookups, query methods, update/delete operations with index maintenance, and tombstone-based deletion.
 
 ## Success Criteria
 

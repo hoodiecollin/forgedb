@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 8 successfully implements support for compound fixed-size types in SinkDB, including:
+Sprint 8 successfully implements support for compound fixed-size types in ForgeDB, including:
 - Struct definitions with fixed-size fields
 - Inline struct storage in models
 - Fixed-size arrays with `[type; count]` syntax
@@ -411,13 +411,13 @@ Potential improvements for future sprints:
 
 ## Conclusion
 
-Sprint 8 successfully implements inline structs and fixed arrays for SinkDB, enabling:
+Sprint 8 successfully implements inline structs and fixed arrays for ForgeDB, enabling:
 - Efficient storage of compound data types
 - Zero-copy access patterns
 - Type-safe schema definitions
 - Predictable memory layout
 
-The implementation maintains SinkDB's focus on performance while adding powerful modeling capabilities for complex data structures.
+The implementation maintains ForgeDB's focus on performance while adding powerful modeling capabilities for complex data structures.
 
 ---
 

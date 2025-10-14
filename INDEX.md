@@ -1,8 +1,8 @@
-# SinkDB - Documentation Index
+# ForgeDB - Documentation Index
 
 ## Overview
 
-This directory contains documentation for **SinkDB**, a schema-first database system that transpiles declarative schemas into highly optimized columnar storage with code generation.
+This directory contains documentation for **ForgeDB**, a schema-first database system that transpiles declarative schemas into highly optimized columnar storage with code generation.
 
 **Version**: 0.1.0 (Sprint 5 Complete)
 **Last Updated**: October 13, 2025
@@ -54,7 +54,7 @@ Core features are now complete and tested:
 - Philosophy and design principles
 - Related projects and differentiators
 
-**Read this if:** You want a high-level understanding of SinkDB and its current implementation status.
+**Read this if:** You want a high-level understanding of ForgeDB and its current implementation status.
 
 ---
 
@@ -64,7 +64,7 @@ Core features are now complete and tested:
 - Sprint-specific demonstrations
 - Usage patterns and best practices
 
-**Read this if:** You want to see how to use SinkDB features in practice.
+**Read this if:** You want to see how to use ForgeDB features in practice.
 
 ---
 
@@ -145,7 +145,7 @@ Core features are now complete and tested:
 **What it covers:**
 - All CLI commands (`init`, `dev`, `generate`, `validate`, `migrate`, `build`, etc.)
 - Project structure
-- Configuration file (`sinkdb.toml`)
+- Configuration file (`forgedb.toml`)
 - Development workflow
 - Watch mode and hot reload
 - Migration management
@@ -153,7 +153,7 @@ Core features are now complete and tested:
 - Deployment
 - Troubleshooting
 
-**Read this if:** You'll be using the SinkDB CLI for development.
+**Read this if:** You'll be using the ForgeDB CLI for development.
 
 ---
 
@@ -219,14 +219,14 @@ User {
 ### The Workflow
 
 1. **Define schema** in `schema.lang`
-2. **Run `sinkdb dev`** - generates code, starts server
+2. **Run `forgedb dev`** - generates code, starts server
 3. **Implement stubs** - computed fields, UI components
 4. **Build your app** - use type-safe APIs
 5. **Deploy** - production-optimized binary
 
 ### The Generated Output
 
-From one schema file, SinkDB generates:
+From one schema file, ForgeDB generates:
 - Rust database implementation (columnar storage)
 - TypeScript types
 - REST API server
@@ -254,7 +254,7 @@ From one schema file, SinkDB generates:
 - Schema constraints (@min, @max, @email, @url, @pattern) ✅
 
 **Developer Tools:**
-- CLI (`sinkdb init`, `generate`, `validate`, `build`) ✅
+- CLI (`forgedb init`, `generate`, `validate`, `build`) ✅
 - Project scaffolding ✅
 - File watching and auto-regeneration ✅
 - Validation with helpful error messages ✅
@@ -450,24 +450,24 @@ Comment {
 ## Comparisons
 
 ### vs SQLite
-- **SinkDB**: Columnar, optimized for analytics + OLTP hybrid
+- **ForgeDB**: Columnar, optimized for analytics + OLTP hybrid
 - **SQLite**: Row-based, pure OLTP
-- **Trade-off**: SinkDB requires schema at compile-time
+- **Trade-off**: ForgeDB requires schema at compile-time
 
 ### vs PostgreSQL
-- **SinkDB**: Embedded, single-node, schema-first
+- **ForgeDB**: Embedded, single-node, schema-first
 - **PostgreSQL**: Client-server, distributed-ready, schema-flexible
-- **Trade-off**: SinkDB sacrifices flexibility for performance
+- **Trade-off**: ForgeDB sacrifices flexibility for performance
 
 ### vs Prisma (ORM)
-- **SinkDB**: Database + ORM + API in one
+- **ForgeDB**: Database + ORM + API in one
 - **Prisma**: ORM layer over existing databases
-- **Trade-off**: SinkDB is more opinionated but more integrated
+- **Trade-off**: ForgeDB is more opinionated but more integrated
 
 ### vs PostgREST
-- **SinkDB**: Generates optimized database + API
+- **ForgeDB**: Generates optimized database + API
 - **PostgREST**: Generates API over PostgreSQL
-- **Trade-off**: SinkDB owns the storage layer
+- **Trade-off**: ForgeDB owns the storage layer
 
 ---
 
@@ -479,7 +479,7 @@ Comment {
 - Join discussions (Discord - future)
 
 ### Once Released
-- CLI: `sinkdb --help`
+- CLI: `forgedb --help`
 - Dev server docs: `http://localhost:3000/docs`
 - API docs: OpenAPI spec at `/api/docs`
 
@@ -531,12 +531,12 @@ TBD (likely MIT or Apache 2.0)
 
 ### Common Commands
 ```bash
-sinkdb init my-app          # Create new project
-sinkdb dev                  # Start dev server
-sinkdb generate             # Generate code
-sinkdb validate             # Check schema
-sinkdb migrate up           # Run migrations
-sinkdb build --release      # Production build
+forgedb init my-app          # Create new project
+forgedb dev                  # Start dev server
+forgedb generate             # Generate code
+forgedb validate             # Check schema
+forgedb migrate up           # Run migrations
+forgedb build --release      # Production build
 ```
 
 ### Common Patterns

@@ -1,10 +1,10 @@
-# SinkDB Watcher
+# ForgeDB Watcher
 
-File watching and auto-regeneration for SinkDB schemas.
+File watching and auto-regeneration for ForgeDB schemas.
 
 ## Overview
 
-The `sinkdb-watcher` crate provides file system watching capabilities for SinkDB schema files. When a schema file changes, the watcher automatically triggers code regeneration, providing a seamless development experience.
+The `forgedb-watcher` crate provides file system watching capabilities for ForgeDB schema files. When a schema file changes, the watcher automatically triggers code regeneration, providing a seamless development experience.
 
 ## Features
 
@@ -19,13 +19,13 @@ The `sinkdb-watcher` crate provides file system watching capabilities for SinkDB
 ### Basic Example
 
 ```rust
-use sinkdb_watcher::auto_watch;
+use forgedb_watcher::auto_watch;
 
 fn main() {
-    // Watch schema.sink and regenerate to generated/ directory
+    // Watch schema.forge and regenerate to generated/ directory
     // with 200ms debounce
     auto_watch(
-        "schema.sink",
+        "schema.forge",
         "generated",
         200,
         Some(Box::new(|result| {
@@ -42,13 +42,13 @@ fn main() {
 ### Advanced Usage
 
 ```rust
-use sinkdb_watcher::{SchemaWatcher, SchemaRegenerator};
+use forgedb_watcher::{SchemaWatcher, SchemaRegenerator};
 
 fn main() {
     let mut watcher = SchemaWatcher::new(200).unwrap();
-    let regenerator = SchemaRegenerator::new("schema.sink", "generated");
+    let regenerator = SchemaRegenerator::new("schema.forge", "generated");
 
-    watcher.watch("schema.sink").unwrap();
+    watcher.watch("schema.forge").unwrap();
 
     loop {
         match watcher.next_event() {
@@ -101,17 +101,17 @@ pub fn auto_watch<P, Q>(
 
 ```bash
 # Run all tests
-cargo test -p sinkdb-watcher
+cargo test -p forgedb-watcher
 
 # Run with output
-cargo test -p sinkdb-watcher -- --nocapture
+cargo test -p forgedb-watcher -- --nocapture
 ```
 
 ## Dependencies
 
 - `notify` - Cross-platform file system notifications
 - `crossbeam-channel` - High-performance channels for event communication
-- `sinkdb` - Parser and code generation
+- `forgedb` - Parser and code generation
 
 ## Documentation
 
@@ -119,4 +119,4 @@ See [SPRINT5_WATCHER.md](../../SPRINT5_WATCHER.md) for complete documentation.
 
 ## License
 
-Part of the SinkDB project.
+Part of the ForgeDB project.

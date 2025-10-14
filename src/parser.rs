@@ -3,7 +3,7 @@ use crate::ast::{
     Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
-use sinkdb_validation::{validate_field_name, validate_model_name, Position};
+use forgedb_validation::{validate_field_name, validate_model_name, Position};
 
 pub struct Parser {
     tokens: Vec<Token>,

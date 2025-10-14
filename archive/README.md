@@ -1,6 +1,6 @@
 # Archive
 
-This directory contains historical documentation from the SinkDB development process.
+This directory contains historical documentation from the ForgeDB development process.
 
 ## Structure
 

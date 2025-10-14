@@ -1,6 +1,6 @@
 // Sprint 12: Computed Fields - Comprehensive Tests
 
-use sinkdb::{CodeGenerator, Parser};
+use forgedb::{CodeGenerator, Parser};
 
 #[test]
 fn test_parse_computed_directive() {
@@ -168,7 +168,7 @@ User {
     let mut parser = Parser::new(schema_source).expect("Failed to create parser");
     let schema = parser.parse().expect("Failed to parse schema");
 
-    use sinkdb::ApiCodeGenerator;
+    use forgedb::ApiCodeGenerator;
     let api_files = ApiCodeGenerator::generate(&schema);
 
     // Find the types file
@@ -221,7 +221,7 @@ User {
     let mut parser = Parser::new(schema_source).expect("Failed to create parser");
     let schema = parser.parse().expect("Failed to parse schema");
 
-    use sinkdb::TypeScriptGenerator;
+    use forgedb::TypeScriptGenerator;
     let ts_files = TypeScriptGenerator::generate(&schema);
 
     // Find the types file
@@ -288,7 +288,7 @@ Model {
     assert_eq!(computed_fields.len(), 4, "Should have 4 computed fields");
 
     // Check field types
-    use sinkdb::ast::FieldType;
+    use forgedb::ast::FieldType;
     assert!(matches!(computed_fields[0].field_type, FieldType::U32));
     assert!(matches!(computed_fields[1].field_type, FieldType::F64));
     assert!(matches!(computed_fields[2].field_type, FieldType::Bool));

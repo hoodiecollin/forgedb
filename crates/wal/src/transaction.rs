@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_transaction_commit() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_txn_commit");
+        let temp_dir = std::env::temp_dir().join("forgedb_txn_commit");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_transaction_rollback() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_txn_rollback");
+        let temp_dir = std::env::temp_dir().join("forgedb_txn_rollback");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 
@@ -348,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_transaction_empty_rollback() {
-        let temp_dir = std::env::temp_dir().join("sinkdb_txn_empty_rollback");
+        let temp_dir = std::env::temp_dir().join("forgedb_txn_empty_rollback");
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
 

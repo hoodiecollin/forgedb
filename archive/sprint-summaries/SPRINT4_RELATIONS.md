@@ -2,7 +2,7 @@
 
 ## Overview
 
-Sprint 4 implements basic relationship support in SinkDB, specifically one-to-many relationships. This allows models to reference each other through foreign keys with automatic indexing and type-safe code generation.
+Sprint 4 implements basic relationship support in ForgeDB, specifically one-to-many relationships. This allows models to reference each other through foreign keys with automatic indexing and type-safe code generation.
 
 ## Features Implemented
 
@@ -163,8 +163,8 @@ pub fn find_by_author_id(&self, author_id: uuid::Uuid) -> Vec<Post>
 ## Example Usage
 
 ```rust
-use sinkdb::parser::Parser;
-use sinkdb::codegen::CodeGenerator;
+use forgedb::parser::Parser;
+use forgedb::codegen::CodeGenerator;
 
 let schema = r#"
 User {

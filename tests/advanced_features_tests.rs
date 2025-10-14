@@ -5,7 +5,7 @@
 /// - Soft delete
 /// - Batch operations
 /// - Partial field selection (schema parsing)
-use sinkdb::{ast::FieldType, CodeGenerator, Parser};
+use forgedb::{ast::FieldType, CodeGenerator, Parser};
 
 #[test]
 fn test_parse_materialized_directive() {
@@ -243,7 +243,7 @@ email: &string
     let mut parser = Parser::new(input).unwrap();
     let schema = parser.parse().unwrap();
 
-    let files = sinkdb::OpenApiGenerator::generate(&schema);
+    let files = forgedb::OpenApiGenerator::generate(&schema);
     let openapi_file = files
         .iter()
         .find(|f| f.path.contains("openapi.json"))
@@ -277,7 +277,7 @@ name: string
     let mut parser = Parser::new(input).unwrap();
     let schema = parser.parse().unwrap();
 
-    let files = sinkdb::OpenApiGenerator::generate(&schema);
+    let files = forgedb::OpenApiGenerator::generate(&schema);
     let openapi_file = files
         .iter()
         .find(|f| f.path.contains("openapi.json"))
@@ -309,7 +309,7 @@ email: &string
     let mut parser = Parser::new(input).unwrap();
     let schema = parser.parse().unwrap();
 
-    let files = sinkdb::OpenApiGenerator::generate(&schema);
+    let files = forgedb::OpenApiGenerator::generate(&schema);
     let openapi_file = files
         .iter()
         .find(|f| f.path.contains("openapi.json"))

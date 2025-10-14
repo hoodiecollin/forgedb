@@ -175,7 +175,7 @@ kitchen-sink/
 ### HTTP Server
 
 ```rust
-use sinkdb_http_server::{Server, ServerConfig, ApiError, Router, get};
+use forgedb_http_server::{Server, ServerConfig, ApiError, Router, get};
 
 // Create server
 let server = Server::new();
@@ -200,7 +200,7 @@ server.serve(app).await?;
 ### CRUD Operations
 
 ```rust
-use sinkdb_crud_api::{CrudOperations, CrudHandlers};
+use forgedb_crud_api::{CrudOperations, CrudHandlers};
 
 // Implement CrudOperations for your storage
 impl CrudOperations for MyStorage {
@@ -223,7 +223,7 @@ let user = handlers.get(&id)?;
 ### Query Parameters
 
 ```rust
-use sinkdb_query_params::QueryParams;
+use forgedb_query_params::QueryParams;
 
 // Parse query string
 let params = QueryParams::from_query_string(
@@ -247,7 +247,7 @@ let page = params.pagination.apply(&all_items);
 ### HTTP Validation
 
 ```rust
-use sinkdb_validation::{HttpValidationError, HttpValidator};
+use forgedb_validation::{HttpValidationError, HttpValidator};
 
 // Validate email
 HttpValidator::validate_email("test@example.com")?;

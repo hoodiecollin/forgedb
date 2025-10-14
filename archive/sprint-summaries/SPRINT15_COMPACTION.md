@@ -5,7 +5,7 @@
 
 ## Overview
 
-Implemented a comprehensive compaction and maintenance system for SinkDB that enables background optimization, dead space reclamation, and database statistics tracking. The system provides automatic and manual compaction with configurable thresholds and a complete CLI interface.
+Implemented a comprehensive compaction and maintenance system for ForgeDB that enables background optimization, dead space reclamation, and database statistics tracking. The system provides automatic and manual compaction with configurable thresholds and a complete CLI interface.
 
 ## Deliverables
 
@@ -101,20 +101,20 @@ Features:
 
 ### 2. CLI Commands (`crates/cli/src/commands/compact.rs`)
 
-Added four compaction commands to the SinkDB CLI:
+Added four compaction commands to the ForgeDB CLI:
 
 ```bash
 # Compact database
-sinkdb compact run [--model MODEL] [--all] [--threshold 0.3]
+forgedb compact run [--model MODEL] [--all] [--threshold 0.3]
 
 # Show statistics
-sinkdb compact stats [--model MODEL] [--json]
+forgedb compact stats [--model MODEL] [--json]
 
 # Vacuum all models
-sinkdb compact vacuum
+forgedb compact vacuum
 
 # Analyze and show recommendations
-sinkdb compact analyze [--json]
+forgedb compact analyze [--json]
 ```
 
 Features:
@@ -248,13 +248,13 @@ The compaction process works as follows:
 
 ```bash
 # Initialize a new project
-$ sinkdb init my-app
+$ forgedb init my-app
 $ cd my-app
 
 # After inserting and deleting some data...
 
 # Check database statistics
-$ sinkdb compact stats
+$ forgedb compact stats
 Database Statistics
 ===================
 Storage:
@@ -271,7 +271,7 @@ User                 800.00 KB    600.00 KB   200.00 KB    25.0%
 Post                 700.00 KB    400.00 KB   300.00 KB    42.9%
 
 # Compact database (only models exceeding threshold)
-$ sinkdb compact run
+$ forgedb compact run
 
 ✓ Compaction completed
 
@@ -280,7 +280,7 @@ Model                Before          Reclaimed    Percent        Time
 Post                 700.00 KB       300.00 KB     42.9%         12ms
 
 # Check specific model
-$ sinkdb compact stats --model User
+$ forgedb compact stats --model User
 
 Model: User
 ===================
@@ -304,7 +304,7 @@ email                Variable       600.00 KB    150.00 KB  25.0%
 created_at           Fixed          8.00 KB      2.00 KB    25.0%
 
 # Vacuum entire database
-$ sinkdb compact vacuum
+$ forgedb compact vacuum
 Running vacuum on database...
 
 ✓ Vacuum completed
@@ -314,7 +314,7 @@ Running vacuum on database...
 Total space reclaimed: 500.00 KB
 
 # Analyze and get recommendations
-$ sinkdb compact analyze
+$ forgedb compact analyze
 
 Database Statistics
 ===================
@@ -324,7 +324,7 @@ Recommendations:
   ⚠  1 model(s) exceed dead space threshold:
     - Post (42.9% dead space)
 
-  Run 'sinkdb compact' to reclaim space
+  Run 'forgedb compact' to reclaim space
 ```
 
 ## Success Criteria
@@ -431,11 +431,11 @@ Potential improvements for future sprints:
 
 ## Conclusion
 
-Sprint 15 successfully delivered a production-ready compaction and maintenance system for SinkDB. The implementation provides efficient space reclamation, comprehensive statistics tracking, and a complete CLI interface for database maintenance operations.
+Sprint 15 successfully delivered a production-ready compaction and maintenance system for ForgeDB. The implementation provides efficient space reclamation, comprehensive statistics tracking, and a complete CLI interface for database maintenance operations.
 
 The compaction algorithm is non-blocking, atomic, and reclaims over 90% of dead space. The background compaction thread enables automatic maintenance with configurable thresholds. The CLI provides user-friendly commands for manual maintenance operations.
 
-All tests pass and the system integrates seamlessly with the existing SinkDB architecture.
+All tests pass and the system integrates seamlessly with the existing ForgeDB architecture.
 
 **Total Implementation Time**: ~1 sprint session
 **Lines of Code**: ~2,500+ (compaction crate + CLI + tests)
