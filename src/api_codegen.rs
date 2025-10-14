@@ -41,22 +41,22 @@ impl ApiCodeGenerator {
         code.push_str("use serde::{Deserialize, Serialize};\n");
         code.push_str("use uuid::Uuid;\n\n");
 
-        // CreateRequest type (fields without auto-generated ones)
+        // CreateRequest type (fields without auto-generated or computed ones)
         code.push_str(&format!("#[derive(Debug, Deserialize)]\n"));
         code.push_str(&format!("pub struct Create{}Request {{\n", model.name));
         for field in &model.fields {
-            if !field.auto_generate && !Self::is_virtual_field(field) {
+            if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                 let field_type = Self::map_field_type_to_rust(&field.field_type, false);
                 code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
             }
         }
         code.push_str("}\n\n");
 
-        // UpdateRequest type (all non-auto fields are optional)
+        // UpdateRequest type (all non-auto, non-computed fields are optional)
         code.push_str(&format!("#[derive(Debug, Deserialize)]\n"));
         code.push_str(&format!("pub struct Update{}Request {{\n", model.name));
         for field in &model.fields {
-            if !field.auto_generate && !Self::is_virtual_field(field) {
+            if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                 let field_type = Self::map_field_type_to_rust(&field.field_type, false);
                 code.push_str(&format!("    pub {}: Option<{}>,\n", field.name, field_type));
             }
@@ -72,6 +72,17 @@ impl ApiCodeGenerator {
                 code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
             }
         }
+
+        // Add computed fields to response (Sprint 12)
+        let computed_fields: Vec<_> = model.fields.iter().filter(|f| f.is_computed).collect();
+        if !computed_fields.is_empty() {
+            code.push_str("\n    // Computed fields\n");
+            for field in computed_fields {
+                let field_type = Self::map_field_type_to_rust(&field.field_type, true);
+                code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
+            }
+        }
+
         code.push_str("}\n");
 
         GeneratedFile {
@@ -303,6 +314,7 @@ mod tests {
                     auto_generate: true,
                     constraints: vec![],
                     index_type: IndexType::Hash,
+                    is_computed: false,
                 },
                 Field {
                     name: "email".to_string(),
@@ -312,6 +324,7 @@ mod tests {
                     auto_generate: false,
                     constraints: vec![],
                     index_type: IndexType::Hash,
+                    is_computed: false,
                 },
                 Field {
                     name: "name".to_string(),
@@ -321,6 +334,7 @@ mod tests {
                     auto_generate: false,
                     constraints: vec![],
                     index_type: IndexType::Hash,
+                    is_computed: false,
                 },
             ],
             composite_indexes: vec![],

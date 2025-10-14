@@ -69,12 +69,23 @@ impl TypeScriptGenerator {
                     code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
                 }
             }
+
+            // Add computed fields to model interface (Sprint 12)
+            let computed_fields: Vec<_> = model.fields.iter().filter(|f| f.is_computed).collect();
+            if !computed_fields.is_empty() {
+                code.push_str("\n  // Computed fields\n");
+                for field in computed_fields {
+                    let ts_type = Self::map_field_type_to_ts(&field.field_type);
+                    code.push_str(&format!("  {}: {};\n", field.name, ts_type));
+                }
+            }
+
             code.push_str("}\n\n");
 
-            // Generate CreateRequest type (omit auto-generated fields)
+            // Generate CreateRequest type (omit auto-generated and computed fields)
             code.push_str(&format!("export interface Create{}Request {{\n", model.name));
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) {
+                if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
                     let optional = if Self::is_optional(&field.field_type) { "?" } else { "" };
                     code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
@@ -82,10 +93,10 @@ impl TypeScriptGenerator {
             }
             code.push_str("}\n\n");
 
-            // Generate UpdateRequest type (all fields optional)
+            // Generate UpdateRequest type (all non-computed fields optional)
             code.push_str(&format!("export interface Update{}Request {{\n", model.name));
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) {
+                if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
                     code.push_str(&format!("  {}?: {};\n", field.name, ts_type));
                 }
@@ -535,6 +546,7 @@ mod tests {
                         auto_generate: true,
                         constraints: vec![],
                         index_type: IndexType::Hash,
+                        is_computed: false,
                     },
                     Field {
                         name: "email".to_string(),
@@ -544,6 +556,7 @@ mod tests {
                         auto_generate: false,
                         constraints: vec![],
                         index_type: IndexType::Hash,
+                        is_computed: false,
                     },
                 ],
                 composite_indexes: vec![],

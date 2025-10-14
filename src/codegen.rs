@@ -98,6 +98,66 @@ impl CodeGenerator {
         code
     }
 
+    /// Generate computed field trait for a model (Sprint 12)
+    fn generate_computed_trait(&self, model: &Model) -> String {
+        let computed_fields: Vec<&Field> = model.fields.iter()
+            .filter(|f| f.is_computed)
+            .collect();
+
+        if computed_fields.is_empty() {
+            return String::new();
+        }
+
+        let mut code = String::new();
+
+        code.push_str(&format!("/// Computed fields trait for {}\n", model.name));
+        code.push_str(&format!("pub trait {}Computed {{\n", model.name));
+
+        for field in &computed_fields {
+            // Determine parameters based on field dependencies
+            // For now, we pass a reference to the entire model instance
+            code.push_str(&format!("    /// Compute the value of '{}'\n", field.name));
+            code.push_str(&format!("    fn {}(instance: &{}) -> {};\n",
+                field.name,
+                model.name,
+                field.field_type.to_rust_type()));
+        }
+
+        code.push_str("}\n\n");
+
+        // Generate a default stub implementation
+        code.push_str(&format!("/// Default stub implementation for {}Computed\n", model.name));
+        code.push_str(&format!("pub struct Default{}Computed;\n\n", model.name));
+        code.push_str(&format!("impl {}Computed for Default{}Computed {{\n", model.name, model.name));
+
+        for field in &computed_fields {
+            code.push_str(&format!("    fn {}(instance: &{}) -> {} {{\n",
+                field.name,
+                model.name,
+                field.field_type.to_rust_type()));
+            code.push_str("        // TODO: Implement computation logic\n");
+
+            // Generate a placeholder return value based on type
+            let default_value = match &field.field_type {
+                FieldType::String => "String::new()".to_string(),
+                FieldType::U32 => "0u32".to_string(),
+                FieldType::U64 => "0u64".to_string(),
+                FieldType::I32 => "0i32".to_string(),
+                FieldType::I64 => "0i64".to_string(),
+                FieldType::F64 => "0.0f64".to_string(),
+                FieldType::Bool => "false".to_string(),
+                FieldType::Uuid => "Uuid::nil()".to_string(),
+                _ => "unimplemented!()".to_string(),
+            };
+            code.push_str(&format!("        {}\n", default_value));
+            code.push_str("    }\n");
+        }
+
+        code.push_str("}\n\n");
+
+        code
+    }
+
     fn generate_storage_struct(&self, model: &Model) -> String {
         let mut code = String::new();
 
@@ -248,6 +308,9 @@ impl CodeGenerator {
 
         // Generate delete() method
         self.generate_delete_method(&mut code, model);
+
+        // Generate computed field accessors (Sprint 12)
+        self.generate_computed_accessors(&mut code, model);
 
         code.push_str("}\n\n");
 
@@ -952,6 +1015,46 @@ impl CodeGenerator {
         }
     }
 
+    /// Generate helper methods for computed fields (Sprint 12)
+    fn generate_computed_accessors(&self, code: &mut String, model: &Model) {
+        let computed_fields: Vec<&Field> = model.fields.iter()
+            .filter(|f| f.is_computed)
+            .collect();
+
+        if computed_fields.is_empty() {
+            return;
+        }
+
+        // Generate a method to get a record with computed fields
+        // This method takes a trait implementation as a generic parameter
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+        if let Some(id_field) = id_field {
+            code.push_str(&format!("    /// Get a record with its computed fields\n"));
+            code.push_str(&format!("    pub fn get_with_computed<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
+                model.name,
+                id_field.name,
+                id_field.field_type.to_rust_type(),
+                model.name));
+
+            code.push_str(&format!("        self.get({})\n", id_field.name));
+            code.push_str("    }\n\n");
+
+            // Generate a method to compute a specific field value
+            for field in &computed_fields {
+                code.push_str(&format!("    /// Compute the value of '{}' for a record\n", field.name));
+                code.push_str(&format!("    pub fn compute_{}<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
+                    field.name,
+                    model.name,
+                    id_field.name,
+                    id_field.field_type.to_rust_type(),
+                    field.field_type.to_rust_type()));
+
+                code.push_str(&format!("        self.get({}).map(|record| C::{}(&record))\n", id_field.name, field.name));
+                code.push_str("    }\n\n");
+            }
+        }
+    }
+
     fn generate_database_struct(&self, schema: &Schema) -> String {
         let mut code = String::new();
 
@@ -1299,6 +1402,7 @@ impl CodeGenerator {
             }
 
             content.push_str(&self.generate_struct(model));
+            content.push_str(&self.generate_computed_trait(model));
             content.push_str(&self.generate_storage_struct(model));
             content.push_str(&self.generate_storage_impl(model));
 
@@ -1451,6 +1555,7 @@ impl CodeGenerator {
         // Generate code for each model
         for model in &schema.models {
             code.push_str(&self.generate_struct(model));
+            code.push_str(&self.generate_computed_trait(model));
             code.push_str(&self.generate_storage_struct(model));
             code.push_str(&self.generate_storage_impl(model));
         }

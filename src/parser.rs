@@ -346,8 +346,13 @@ impl Parser {
 
         // Parse constraints (@directives)
         let mut constraints = Vec::new();
+        let mut is_computed = false;
         while matches!(self.current_token(), Token::At) {
             let constraint = self.parse_constraint()?;
+            // Check if this is the @computed directive
+            if constraint.name == "computed" {
+                is_computed = true;
+            }
             constraints.push(constraint);
         }
 
@@ -362,6 +367,7 @@ impl Parser {
             indexed,
             constraints,
             index_type,
+            is_computed,
         })
     }
 
