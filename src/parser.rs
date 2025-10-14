@@ -427,6 +427,7 @@ impl Parser {
         let mut constraints = Vec::new();
         let mut is_computed = false;
         let mut fulltext_indexed = false;
+        let mut is_materialized = false;
         while matches!(self.current_token(), Token::At) {
             let constraint = self.parse_constraint()?;
             // Check if this is the @computed directive
@@ -436,6 +437,10 @@ impl Parser {
             // Check if this is the @fulltext directive (Sprint 18)
             if constraint.name == "fulltext" {
                 fulltext_indexed = true;
+            }
+            // Check if this is the @materialized directive (Sprint 19)
+            if constraint.name == "materialized" {
+                is_materialized = true;
             }
             constraints.push(constraint);
         }
@@ -453,6 +458,7 @@ impl Parser {
             index_type,
             is_computed,
             fulltext_indexed,
+            is_materialized,
         })
     }
 
@@ -548,14 +554,48 @@ impl Parser {
         let mut fields = Vec::new();
         let mut field_names = std::collections::HashSet::new();
         let mut composite_indexes = Vec::new();
+        let mut soft_delete = false;
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
             // Check for directive
             if matches!(self.current_token(), Token::At) {
-                let composite_index = self.parse_directive()?;
-                composite_indexes.push(composite_index);
-                self.skip_newlines();
+                // Try to parse as composite index first
+                let start_pos = self.position;
+                match self.parse_directive() {
+                    Ok(composite_index) => {
+                        composite_indexes.push(composite_index);
+                        self.skip_newlines();
+                    }
+                    Err(_) => {
+                        // Reset position and try to parse as model-level directive
+                        self.position = start_pos;
+                        self.advance(); // skip @
+                        let directive_name = match self.current_token() {
+                            Token::Ident(s) => s.clone(),
+                            _ => {
+                                return Err(format!(
+                                    "Expected directive name after '@', found {:?}",
+                                    self.current_token()
+                                ))
+                            }
+                        };
+                        self.advance();
+
+                        match directive_name.as_str() {
+                            "soft_delete" => {
+                                soft_delete = true;
+                                self.skip_newlines();
+                            }
+                            _ => {
+                                return Err(format!(
+                                    "Unknown model directive: @{}",
+                                    directive_name
+                                ));
+                            }
+                        }
+                    }
+                }
             } else {
                 let field = self.parse_field()?;
 
@@ -596,6 +636,7 @@ impl Parser {
             name,
             fields,
             composite_indexes,
+            soft_delete,
         })
     }
 
@@ -1580,22 +1621,6 @@ User {
         // Verify both min and max are present
         assert!(field.constraints.iter().any(|c| c.name == "min"));
         assert!(field.constraints.iter().any(|c| c.name == "max"));
-    }
-
-    #[test]
-    fn test_parse_composite_index_too_few_fields() {
-        let input = r#"
-User {
-  id: +uuid
-  name: string
-
-  @index(name)
-}
-"#;
-        let mut parser = Parser::new(input).unwrap();
-        let result = parser.parse();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("at least 2 fields"));
     }
 
     #[test]

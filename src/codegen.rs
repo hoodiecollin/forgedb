@@ -278,6 +278,27 @@ impl CodeGenerator {
             }
         }
 
+        // Add materialized computed field storage (Sprint 19)
+        let has_materialized = model.fields.iter().any(|f| f.is_materialized);
+        if has_materialized {
+            code.push_str("    // Materialized computed fields\n");
+            for field in &model.fields {
+                if field.is_materialized {
+                    code.push_str(&format!(
+                        "    materialized_{}: std::collections::HashMap<uuid::Uuid, {}>,\n",
+                        field.name,
+                        field.field_type.to_rust_type()
+                    ));
+                }
+            }
+        }
+
+        // Add soft delete tracking (Sprint 19)
+        if model.soft_delete {
+            code.push_str("    // Soft delete tracking\n");
+            code.push_str("    deleted_at: std::collections::HashMap<uuid::Uuid, i64>,\n");
+        }
+
         code.push_str("}\n\n");
 
         code
@@ -346,6 +367,21 @@ impl CodeGenerator {
                 code.push_str(&format!("            {}_fulltext: std::sync::Arc::new(std::sync::RwLock::new(sinkdb_fulltext::FullTextIndex::new())),\n",
                     field.name));
             }
+        }
+
+        // Initialize materialized fields (Sprint 19)
+        for field in &model.fields {
+            if field.is_materialized {
+                code.push_str(&format!(
+                    "            materialized_{}: std::collections::HashMap::new(),\n",
+                    field.name
+                ));
+            }
+        }
+
+        // Initialize soft delete tracking (Sprint 19)
+        if model.soft_delete {
+            code.push_str("            deleted_at: std::collections::HashMap::new(),\n");
         }
 
         code.push_str("        }\n");
@@ -673,6 +709,32 @@ impl CodeGenerator {
         // Add record
         code.push_str("        self.records.push(record.clone());\n");
         code.push_str("        self.tombstones.push(false);\n");
+
+        // Compute and store materialized fields (Sprint 19)
+        let materialized_fields: Vec<&Field> =
+            model.fields.iter().filter(|f| f.is_materialized).collect();
+        if !materialized_fields.is_empty() {
+            if let Some(id_field) = id_field {
+                if matches!(id_field.field_type, FieldType::Uuid) {
+                    code.push_str("\n        // Compute materialized fields\n");
+                    for field in &materialized_fields {
+                        code.push_str(&format!(
+                            "        // TODO: Implement computation for materialized field '{}'\n",
+                            field.name
+                        ));
+                        code.push_str(&format!(
+                            "        // Example: let {} = compute_{}(&record);\n",
+                            field.name, field.name
+                        ));
+                        code.push_str(&format!(
+                            "        // self.materialized_{}.insert(record.{}, {});\n",
+                            field.name, id_field.name, field.name
+                        ));
+                    }
+                }
+            }
+        }
+
         code.push_str("        Ok(record)\n");
         code.push_str("    }\n\n");
     }
@@ -688,11 +750,21 @@ impl CodeGenerator {
                 id_field.field_type.to_rust_type(),
                 model.name
             ));
-            code.push_str("        self.records.iter().enumerate()\n");
-            code.push_str("            .find(|(i, r)| !self.tombstones[*i] && r.");
-            code.push_str(&format!("{} == {})\n", id_field.name, id_field.name));
-            code.push_str("            .map(|(_, r)| r.clone())\n");
-            code.push_str("    }\n\n");
+
+            if model.soft_delete && matches!(id_field.field_type, FieldType::Uuid) {
+                // Filter out soft-deleted records
+                code.push_str("        self.records.iter().enumerate()\n");
+                code.push_str(&format!("            .find(|(i, r)| !self.tombstones[*i] && !self.deleted_at.contains_key(&r.{}) && r.", id_field.name));
+                code.push_str(&format!("{} == {})\n", id_field.name, id_field.name));
+                code.push_str("            .map(|(_, r)| r.clone())\n");
+                code.push_str("    }\n\n");
+            } else {
+                code.push_str("        self.records.iter().enumerate()\n");
+                code.push_str("            .find(|(i, r)| !self.tombstones[*i] && r.");
+                code.push_str(&format!("{} == {})\n", id_field.name, id_field.name));
+                code.push_str("            .map(|(_, r)| r.clone())\n");
+                code.push_str("    }\n\n");
+            }
         }
     }
 
@@ -962,10 +1034,44 @@ impl CodeGenerator {
     }
 
     fn generate_list_method(&self, code: &mut String, model: &Model) {
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+
         code.push_str(&format!(
             "    pub fn list(&self) -> Vec<{}> {{\n",
             model.name
         ));
+
+        if model.soft_delete {
+            // Filter out soft-deleted records by default
+            if let Some(id_field) = id_field {
+                if matches!(id_field.field_type, FieldType::Uuid) {
+                    code.push_str("        self.records.iter().enumerate()\n");
+                    code.push_str("            .filter(|(i, r)| !self.tombstones[*i] && !self.deleted_at.contains_key(&r.");
+                    code.push_str(&format!("{}))\n", id_field.name));
+                    code.push_str("            .map(|(_, r)| r.clone())\n");
+                    code.push_str("            .collect()\n");
+                    code.push_str("    }\n\n");
+
+                    // Add list_with_deleted method
+                    code.push_str(&format!(
+                        "    pub fn list_with_deleted(&self, include_deleted: bool) -> Vec<{}> {{\n",
+                        model.name
+                    ));
+                    code.push_str("        if include_deleted {\n");
+                    code.push_str("            self.records.iter().enumerate()\n");
+                    code.push_str("                .filter(|(i, _)| !self.tombstones[*i])\n");
+                    code.push_str("                .map(|(_, r)| r.clone())\n");
+                    code.push_str("                .collect()\n");
+                    code.push_str("        } else {\n");
+                    code.push_str("            self.list()\n");
+                    code.push_str("        }\n");
+                    code.push_str("    }\n\n");
+                    return;
+                }
+            }
+        }
+
+        // Default list without soft delete
         code.push_str("        self.records.iter().enumerate()\n");
         code.push_str("            .filter(|(i, _)| !self.tombstones[*i])\n");
         code.push_str("            .map(|(_, r)| r.clone())\n");
@@ -1228,7 +1334,47 @@ impl CodeGenerator {
                 id_field.field_type.to_rust_type()
             ));
 
-            // Find the record
+            if model.soft_delete {
+                // Soft delete: set deleted_at timestamp
+                if matches!(id_field.field_type, FieldType::Uuid) {
+                    code.push_str(
+                        "        // Soft delete: mark record as deleted with timestamp\n",
+                    );
+                    code.push_str("        let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;\n");
+                    code.push_str(&format!(
+                        "        self.deleted_at.insert({}, timestamp);\n",
+                        id_field.name
+                    ));
+                    code.push_str("        Ok(())\n");
+                    code.push_str("    }\n\n");
+
+                    // Generate restore and batch methods even for soft delete
+                    // Add restore method for soft delete (Sprint 19)
+                    code.push_str(&format!("    /// Restore a soft-deleted record\n"));
+                    code.push_str(&format!(
+                        "    pub fn restore(&mut self, {}: {}) -> Result<(), String> {{\n",
+                        id_field.name,
+                        id_field.field_type.to_rust_type()
+                    ));
+                    code.push_str(&format!(
+                        "        if self.deleted_at.remove(&{}).is_some() {{\n",
+                        id_field.name
+                    ));
+                    code.push_str("            Ok(())\n");
+                    code.push_str("        } else {\n");
+                    code.push_str(
+                        "            Err(\"Record not found or not deleted\".to_string())\n",
+                    );
+                    code.push_str("        }\n");
+                    code.push_str("    }\n\n");
+
+                    // Add batch operations (Sprint 19)
+                    self.generate_batch_methods(code, model);
+                    return;
+                }
+            }
+
+            // Hard delete: Find the record
             code.push_str("        let idx = self.records.iter().enumerate()\n");
             code.push_str(&format!(
                 "            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n",
@@ -1298,12 +1444,161 @@ impl CodeGenerator {
 
             code.push_str("        Ok(())\n");
             code.push_str("    }\n\n");
+
+            // Add restore method for soft delete (Sprint 19)
+            if model.soft_delete && matches!(id_field.field_type, FieldType::Uuid) {
+                code.push_str(&format!("    /// Restore a soft-deleted record\n"));
+                code.push_str(&format!(
+                    "    pub fn restore(&mut self, {}: {}) -> Result<(), String> {{\n",
+                    id_field.name,
+                    id_field.field_type.to_rust_type()
+                ));
+                code.push_str(&format!(
+                    "        if self.deleted_at.remove(&{}).is_some() {{\n",
+                    id_field.name
+                ));
+                code.push_str("            Ok(())\n");
+                code.push_str("        } else {\n");
+                code.push_str("            Err(\"Record not found or not deleted\".to_string())\n");
+                code.push_str("        }\n");
+                code.push_str("    }\n\n");
+            }
+
+            // Add batch operations (Sprint 19)
+            self.generate_batch_methods(code, model);
+        }
+    }
+
+    /// Generate batch operation methods (Sprint 19)
+    fn generate_batch_methods(&self, code: &mut String, model: &Model) {
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+
+        if let Some(id_field) = id_field {
+            // Generate batch insert
+            code.push_str("    /// Batch insert multiple records\n");
+            code.push_str("    pub fn insert_batch(&mut self, records: Vec<(");
+
+            let mut first = true;
+            for field in &model.fields {
+                if Self::is_virtual_field(field) {
+                    continue;
+                }
+                if !field.auto_generate {
+                    if !first {
+                        code.push_str(", ");
+                    }
+                    code.push_str(&self.get_field_param_type(field));
+                    first = false;
+                }
+            }
+
+            code.push_str(&format!(")>) -> Result<Vec<{}>, String> {{\n", model.name));
+            code.push_str("        let mut results = Vec::new();\n");
+            code.push_str("        for record in records {\n");
+            code.push_str("            // Unpack tuple\n");
+
+            let mut tuple_index = 0;
+            let mut param_names = Vec::new();
+            for field in &model.fields {
+                if Self::is_virtual_field(field) {
+                    continue;
+                }
+                if !field.auto_generate {
+                    let param_name = self.get_field_param_name(field);
+                    param_names.push(param_name.clone());
+                    code.push_str(&format!(
+                        "            let {} = record.{};\n",
+                        param_name, tuple_index
+                    ));
+                    tuple_index += 1;
+                }
+            }
+
+            code.push_str("            let result = self.insert(");
+            code.push_str(&param_names.join(", "));
+            code.push_str(")?;\n");
+            code.push_str("            results.push(result);\n");
+            code.push_str("        }\n");
+            code.push_str("        Ok(results)\n");
+            code.push_str("    }\n\n");
+
+            // Generate batch delete
+            code.push_str("    /// Batch delete multiple records\n");
+            code.push_str(&format!(
+                "    pub fn delete_batch(&mut self, ids: Vec<{}>) -> Result<(), String> {{\n",
+                id_field.field_type.to_rust_type()
+            ));
+            code.push_str("        for id in ids {\n");
+            code.push_str("            self.delete(id)?;\n");
+            code.push_str("        }\n");
+            code.push_str("        Ok(())\n");
+            code.push_str("    }\n\n");
         }
     }
 
     /// Generate helper methods for computed fields (Sprint 12)
     fn generate_computed_accessors(&self, code: &mut String, model: &Model) {
         let computed_fields: Vec<&Field> = model.fields.iter().filter(|f| f.is_computed).collect();
+        let materialized_fields: Vec<&Field> =
+            model.fields.iter().filter(|f| f.is_materialized).collect();
+
+        // Generate materialized field accessors (Sprint 19)
+        if !materialized_fields.is_empty() {
+            let id_field = model.fields.iter().find(|f| f.auto_generate);
+            if let Some(id_field) = id_field {
+                if matches!(id_field.field_type, FieldType::Uuid) {
+                    for field in &materialized_fields {
+                        code.push_str(&format!(
+                            "    /// Get the materialized value of '{}'\n",
+                            field.name
+                        ));
+                        code.push_str(&format!(
+                            "    pub fn get_materialized_{}(&self, {}: {}) -> Option<{}> {{\n",
+                            field.name,
+                            id_field.name,
+                            id_field.field_type.to_rust_type(),
+                            field.field_type.to_rust_type()
+                        ));
+                        code.push_str(&format!(
+                            "        self.materialized_{}.get(&{}).cloned()\n",
+                            field.name, id_field.name
+                        ));
+                        code.push_str("    }\n\n");
+
+                        // Add method to recompute materialized field
+                        code.push_str(&format!(
+                            "    /// Recompute and update the materialized value of '{}'\n",
+                            field.name
+                        ));
+                        code.push_str(&format!(
+                            "    pub fn recompute_materialized_{}<F>(&mut self, {}: {}, compute_fn: F) -> Result<(), String>\n",
+                            field.name,
+                            id_field.name,
+                            id_field.field_type.to_rust_type()
+                        ));
+                        code.push_str(&format!(
+                            "    where F: FnOnce(&{}) -> {} {{\n",
+                            model.name,
+                            field.field_type.to_rust_type()
+                        ));
+                        code.push_str(&format!(
+                            "        if let Some(record) = self.get({}) {{\n",
+                            id_field.name
+                        ));
+                        code.push_str("            let value = compute_fn(&record);\n");
+                        code.push_str(&format!(
+                            "            self.materialized_{}.insert({}, value);\n",
+                            field.name, id_field.name
+                        ));
+                        code.push_str("            Ok(())\n");
+                        code.push_str("        } else {\n");
+                        code.push_str("            Err(\"Record not found\".to_string())\n");
+                        code.push_str("        }\n");
+                        code.push_str("    }\n\n");
+                    }
+                }
+            }
+        }
 
         if computed_fields.is_empty() {
             return;

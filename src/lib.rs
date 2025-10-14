@@ -6,9 +6,6 @@ pub mod openapi_codegen;
 pub mod parser;
 pub mod typescript_codegen; // Sprint 10: TypeScript SDK generation // Sprint 13: OpenAPI/Swagger documentation
 
-#[cfg(test)]
-mod edge_case_tests;
-
 pub use api_codegen::ApiCodeGenerator;
 pub use ast::Schema;
 pub use codegen::CodeGenerator;

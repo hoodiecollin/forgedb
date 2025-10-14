@@ -325,6 +325,7 @@ mod tests {
                     index_type: IndexType::Hash,
                     is_computed: false,
                     fulltext_indexed: false,
+                    is_materialized: false,
                 },
                 Field {
                     name: "email".to_string(),
@@ -336,6 +337,7 @@ mod tests {
                     index_type: IndexType::Hash,
                     is_computed: false,
                     fulltext_indexed: false,
+                    is_materialized: false,
                 },
                 Field {
                     name: "name".to_string(),
@@ -347,9 +349,11 @@ mod tests {
                     index_type: IndexType::Hash,
                     is_computed: false,
                     fulltext_indexed: false,
+                    is_materialized: false,
                 },
             ],
             composite_indexes: vec![],
+            soft_delete: false,
         }
     }
 

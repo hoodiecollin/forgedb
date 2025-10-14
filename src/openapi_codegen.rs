@@ -189,6 +189,18 @@ impl OpenApiGenerator {
                             "in": "query",
                             "schema": { "type": "string" },
                             "description": "Field to sort by (prefix with - for descending)"
+                        },
+                        {
+                            "name": "fields",
+                            "in": "query",
+                            "schema": { "type": "string" },
+                            "description": "Comma-separated list of fields to include in response (e.g., 'id,name,email')"
+                        },
+                        {
+                            "name": "include_deleted",
+                            "in": "query",
+                            "schema": { "type": "boolean" },
+                            "description": "Include soft-deleted records (only for models with @soft_delete)"
                         }
                     ],
                     "responses": {
@@ -335,6 +347,74 @@ impl OpenApiGenerator {
                             },
                             "404": {
                                 "description": "Not found"
+                            }
+                        }
+                    }
+                }),
+            );
+
+            // Batch operations endpoints (Sprint 19)
+            // Batch create: POST /api/models/batch
+            paths.insert(
+                format!("/api/{}/batch", model_plural),
+                json!({
+                    "post": {
+                        "summary": format!("Batch create {} records", model_plural),
+                        "tags": [model.name],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": { "$ref": format!("#/components/schemas/Create{}Request", model.name) }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "201": {
+                                "description": "Batch created successfully",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {
+                                            "type": "array",
+                                            "items": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                        }
+                                    }
+                                }
+                            },
+                            "400": {
+                                "description": "Validation error"
+                            }
+                        }
+                    },
+                    "delete": {
+                        "summary": format!("Batch delete {} records", model_plural),
+                        "tags": [model.name],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "ids": {
+                                                "type": "array",
+                                                "items": Self::type_to_openapi_type(&id_field.field_type)
+                                            }
+                                        },
+                                        "required": ["ids"]
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "204": {
+                                "description": "Batch deleted successfully"
+                            },
+                            "400": {
+                                "description": "Validation error"
                             }
                         }
                     }
@@ -619,6 +699,7 @@ mod tests {
                     index_type: IndexType::Hash,
                     is_computed: false,
                     fulltext_indexed: false,
+                    is_materialized: false,
                 },
                 Field {
                     name: "email".to_string(),
@@ -630,9 +711,11 @@ mod tests {
                     index_type: IndexType::Hash,
                     is_computed: false,
                     fulltext_indexed: false,
+                    is_materialized: false,
                 },
             ],
             composite_indexes: vec![],
+            soft_delete: false,
         }
     }
 

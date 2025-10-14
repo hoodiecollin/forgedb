@@ -46,9 +46,3 @@ sinkdb-fulltext = { path = "crates/fulltext" }
 [lib]
 name = "sinkdb"
 path = "src/lib.rs"
-
-# Comprehensive Example: Full-Featured Blog Platform
-# Demonstrates ALL SinkDB features from Sprints 1-13
-[[example]]
-name = "blog_platform"
-path = "examples/blog_platform.rs"

@@ -82,6 +82,7 @@ pub struct Field {
     pub index_type: IndexType,        // Hash or BTree
     pub is_computed: bool,            // @computed directive
     pub fulltext_indexed: bool,       // @fulltext directive (Sprint 18)
+    pub is_materialized: bool,        // @materialized directive (Sprint 19)
 }
 
 /// Represents a struct definition (Sprint 8)
@@ -96,6 +97,7 @@ pub struct Model {
     pub name: String,
     pub fields: Vec<Field>,
     pub composite_indexes: Vec<CompositeIndex>,
+    pub soft_delete: bool, // @soft_delete directive at model level (Sprint 19)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -595,6 +597,7 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                         Field {
                             name: "tags".to_string(),
@@ -608,9 +611,11 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                     ],
                     composite_indexes: vec![],
+                    soft_delete: false,
                 },
                 Model {
                     name: "Tag".to_string(),
@@ -625,6 +630,7 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                         Field {
                             name: "posts".to_string(),
@@ -638,9 +644,11 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                     ],
                     composite_indexes: vec![],
+                    soft_delete: false,
                 },
             ],
         };
@@ -672,6 +680,7 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                         Field {
                             name: "posts".to_string(),
@@ -685,9 +694,11 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                     ],
                     composite_indexes: vec![],
+                    soft_delete: false,
                 },
                 Model {
                     name: "Post".to_string(),
@@ -702,6 +713,7 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                         Field {
                             name: "author".to_string(),
@@ -715,9 +727,11 @@ mod tests {
                             index_type: IndexType::Hash,
                             is_computed: false,
                             fulltext_indexed: false,
+                            is_materialized: false,
                         },
                     ],
                     composite_indexes: vec![],
+                    soft_delete: false,
                 },
             ],
         };
