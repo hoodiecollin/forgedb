@@ -30,8 +30,8 @@ impl Constraint {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IndexType {
-    Hash,   // Default for exact matches, unordered types
-    BTree,  // For range queries on ordered types
+    Hash,  // Default for exact matches, unordered types
+    BTree, // For range queries on ordered types
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,10 +51,10 @@ pub enum FieldType {
     Uuid,
     Timestamp,
     // Fixed-size types (Sprint 8)
-    Char(usize), // Fixed-size character array: char(N)
+    Char(usize),                       // Fixed-size character array: char(N)
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
-    StructType(String), // Reference to a struct by name
-    OptionalStructType(String), // Optional struct reference
+    StructType(String),                // Reference to a struct by name
+    OptionalStructType(String),        // Optional struct reference
     // Relations
     Relation(RelationType),
 }
@@ -75,13 +75,13 @@ pub enum RelationType {
 pub struct Field {
     pub name: String,
     pub field_type: FieldType,
-    pub auto_generate: bool, // + symbol
-    pub unique: bool,        // & symbol
-    pub indexed: bool,       // ^ symbol
+    pub auto_generate: bool,          // + symbol
+    pub unique: bool,                 // & symbol
+    pub indexed: bool,                // ^ symbol
     pub constraints: Vec<Constraint>, // @ directives
-    pub index_type: IndexType, // Hash or BTree
-    pub is_computed: bool,   // @computed directive
-    pub fulltext_indexed: bool, // @fulltext directive (Sprint 18)
+    pub index_type: IndexType,        // Hash or BTree
+    pub is_computed: bool,            // @computed directive
+    pub fulltext_indexed: bool,       // @fulltext directive (Sprint 18)
 }
 
 /// Represents a struct definition (Sprint 8)
@@ -170,7 +170,9 @@ impl Schema {
 
         for model in &self.models {
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(target_model)) = &field.field_type {
+                if let FieldType::Relation(RelationType::OneToMany(target_model)) =
+                    &field.field_type
+                {
                     // Found a one-to-many field, look for corresponding FK in target model
                     if let Some(target) = self.find_model(target_model) {
                         // Find a reference back to this model
@@ -182,7 +184,10 @@ impl Schema {
                                         parent_field: field.name.clone(),
                                         child_model: target.name.clone(),
                                         child_field: target_field.name.clone(),
-                                        is_required: matches!(rel, RelationType::RequiredReference(_)),
+                                        is_required: matches!(
+                                            rel,
+                                            RelationType::RequiredReference(_)
+                                        ),
                                     });
                                 }
                             }
@@ -204,26 +209,41 @@ impl Schema {
 
         // First, identify all 1:N relationships (OneToMany with matching FK)
         // We need to track specific FIELD pairs, not just model pairs
-        let one_to_many_field_pairs: std::collections::HashSet<(String, String, String, String)> = self.detect_relations()
-            .iter()
-            .map(|rel| {
-                // For a 1:N relation, the parent's OneToMany field and child's FK field form a pair
-                // We store both orderings to match against
-                vec![
-                    (rel.parent_model.clone(), rel.parent_field.clone(), rel.child_model.clone(), rel.child_field.clone()),
-                    (rel.child_model.clone(), rel.child_field.clone(), rel.parent_model.clone(), rel.parent_field.clone()),
-                ]
-            })
-            .flatten()
-            .collect();
+        let one_to_many_field_pairs: std::collections::HashSet<(String, String, String, String)> =
+            self.detect_relations()
+                .iter()
+                .map(|rel| {
+                    // For a 1:N relation, the parent's OneToMany field and child's FK field form a pair
+                    // We store both orderings to match against
+                    vec![
+                        (
+                            rel.parent_model.clone(),
+                            rel.parent_field.clone(),
+                            rel.child_model.clone(),
+                            rel.child_field.clone(),
+                        ),
+                        (
+                            rel.child_model.clone(),
+                            rel.child_field.clone(),
+                            rel.parent_model.clone(),
+                            rel.parent_field.clone(),
+                        ),
+                    ]
+                })
+                .flatten()
+                .collect();
 
         for model in &self.models {
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(target_model)) = &field.field_type {
+                if let FieldType::Relation(RelationType::OneToMany(target_model)) =
+                    &field.field_type
+                {
                     // Check if target model has a OneToMany field pointing back to this model
                     if let Some(target) = self.find_model(target_model) {
                         for target_field in &target.fields {
-                            if let FieldType::Relation(RelationType::OneToMany(back_ref)) = &target_field.field_type {
+                            if let FieldType::Relation(RelationType::OneToMany(back_ref)) =
+                                &target_field.field_type
+                            {
                                 if back_ref == &model.name {
                                     // Check if this specific FIELD pair is NOT a 1:N relationship (no FK)
                                     // by checking if this field pair is in the one_to_many_field_pairs set
@@ -231,7 +251,7 @@ impl Schema {
                                         model.name.clone(),
                                         field.name.clone(),
                                         target_model.clone(),
-                                        target_field.name.clone()
+                                        target_field.name.clone(),
                                     ));
 
                                     if !is_one_to_many {
@@ -239,23 +259,38 @@ impl Schema {
                                         // Create a consistent ordering to avoid duplicates
                                         let mut models_fields = vec![
                                             (model.name.as_str(), field.name.as_str()),
-                                            (target.name.as_str(), target_field.name.as_str())
+                                            (target.name.as_str(), target_field.name.as_str()),
                                         ];
                                         models_fields.sort();
 
-                                        let pair_key = format!("{}:{}:{}:{}",
-                                            models_fields[0].0, models_fields[0].1,
-                                            models_fields[1].0, models_fields[1].1);
+                                        let pair_key = format!(
+                                            "{}:{}:{}:{}",
+                                            models_fields[0].0,
+                                            models_fields[0].1,
+                                            models_fields[1].0,
+                                            models_fields[1].1
+                                        );
 
                                         if !processed_pairs.contains(&pair_key) {
                                             processed_pairs.insert(pair_key);
 
                                             // Always store with consistent ordering
-                                            let (model1, field1, model2, field2) = if model.name < target.name {
-                                                (model.name.clone(), field.name.clone(), target.name.clone(), target_field.name.clone())
-                                            } else {
-                                                (target.name.clone(), target_field.name.clone(), model.name.clone(), field.name.clone())
-                                            };
+                                            let (model1, field1, model2, field2) =
+                                                if model.name < target.name {
+                                                    (
+                                                        model.name.clone(),
+                                                        field.name.clone(),
+                                                        target.name.clone(),
+                                                        target_field.name.clone(),
+                                                    )
+                                                } else {
+                                                    (
+                                                        target.name.clone(),
+                                                        target_field.name.clone(),
+                                                        model.name.clone(),
+                                                        field.name.clone(),
+                                                    )
+                                                };
 
                                             m2m_relations.push(ManyToManyRelation {
                                                 model1,
@@ -308,14 +343,22 @@ impl FieldType {
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
             FieldType::Char(size) => format!("[u8; {}]", size),
-            FieldType::FixedArray(inner_type, count) => format!("[{}; {}]", inner_type.to_rust_type(), count),
+            FieldType::FixedArray(inner_type, count) => {
+                format!("[{}; {}]", inner_type.to_rust_type(), count)
+            }
             FieldType::StructType(name) => name.clone(),
             FieldType::OptionalStructType(name) => format!("Option<{}>", name),
             FieldType::Relation(rel) => match rel {
-                RelationType::RequiredReference(model) => format!("uuid::Uuid /* FK to {} */", model),
-                RelationType::OptionalReference(model) => format!("Option<uuid::Uuid> /* FK to {} */", model),
+                RelationType::RequiredReference(model) => {
+                    format!("uuid::Uuid /* FK to {} */", model)
+                }
+                RelationType::OptionalReference(model) => {
+                    format!("Option<uuid::Uuid> /* FK to {} */", model)
+                }
                 RelationType::OneToMany(_) => "/* virtual field - no storage */".to_string(),
-                RelationType::ManyToMany(_) => "/* virtual field - stored in junction table */".to_string(),
+                RelationType::ManyToMany(_) => {
+                    "/* virtual field - stored in junction table */".to_string()
+                }
             },
         }
     }
@@ -325,7 +368,10 @@ impl FieldType {
     }
 
     pub fn is_auto_generatable(&self) -> bool {
-        matches!(self, FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp)
+        matches!(
+            self,
+            FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp
+        )
     }
 
     pub fn is_relation(&self) -> bool {
@@ -335,8 +381,14 @@ impl FieldType {
     /// Check if this type is fixed-size (Sprint 8)
     pub fn is_fixed_size(&self) -> bool {
         match self {
-            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-            | FieldType::F64 | FieldType::Bool | FieldType::Uuid | FieldType::Timestamp
+            FieldType::U32
+            | FieldType::U64
+            | FieldType::I32
+            | FieldType::I64
+            | FieldType::F64
+            | FieldType::Bool
+            | FieldType::Uuid
+            | FieldType::Timestamp
             | FieldType::Char(_) => true,
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size
@@ -414,9 +466,12 @@ impl FieldType {
     pub fn supports_range_queries(&self) -> bool {
         matches!(
             self,
-            FieldType::U32 | FieldType::U64
-            | FieldType::I32 | FieldType::I64
-            | FieldType::F64 | FieldType::Timestamp
+            FieldType::U32
+                | FieldType::U64
+                | FieldType::I32
+                | FieldType::I64
+                | FieldType::F64
+                | FieldType::Timestamp
         )
     }
 
@@ -460,7 +515,9 @@ impl Struct {
 
     /// Calculate the alignment requirement for a struct (Sprint 8)
     pub fn calculate_alignment(struct_def: &Struct, schema: &Schema) -> usize {
-        struct_def.fields.iter()
+        struct_def
+            .fields
+            .iter()
             .map(|f| f.field_type.alignment(schema))
             .max()
             .unwrap_or(1)
@@ -481,9 +538,11 @@ impl Field {
     /// Check if field is nullable (no constraint yet, but useful for future)
     pub fn is_nullable(&self) -> bool {
         // For now, only optional references and optional structs are nullable
-        matches!(&self.field_type,
-            FieldType::Relation(RelationType::OptionalReference(_)) |
-            FieldType::OptionalStructType(_))
+        matches!(
+            &self.field_type,
+            FieldType::Relation(RelationType::OptionalReference(_))
+                | FieldType::OptionalStructType(_)
+        )
     }
 }
 
@@ -502,7 +561,10 @@ impl RelationType {
     }
 
     pub fn is_reference(&self) -> bool {
-        matches!(self, RelationType::RequiredReference(_) | RelationType::OptionalReference(_))
+        matches!(
+            self,
+            RelationType::RequiredReference(_) | RelationType::OptionalReference(_)
+        )
     }
 
     pub fn is_many_to_many(&self) -> bool {
@@ -536,7 +598,9 @@ mod tests {
                         },
                         Field {
                             name: "tags".to_string(),
-                            field_type: FieldType::Relation(RelationType::OneToMany("Tag".to_string())),
+                            field_type: FieldType::Relation(RelationType::OneToMany(
+                                "Tag".to_string(),
+                            )),
                             auto_generate: false,
                             unique: false,
                             indexed: false,
@@ -564,7 +628,9 @@ mod tests {
                         },
                         Field {
                             name: "posts".to_string(),
-                            field_type: FieldType::Relation(RelationType::OneToMany("Post".to_string())),
+                            field_type: FieldType::Relation(RelationType::OneToMany(
+                                "Post".to_string(),
+                            )),
                             auto_generate: false,
                             unique: false,
                             indexed: false,
@@ -609,7 +675,9 @@ mod tests {
                         },
                         Field {
                             name: "posts".to_string(),
-                            field_type: FieldType::Relation(RelationType::OneToMany("Post".to_string())),
+                            field_type: FieldType::Relation(RelationType::OneToMany(
+                                "Post".to_string(),
+                            )),
                             auto_generate: false,
                             unique: false,
                             indexed: false,
@@ -637,7 +705,9 @@ mod tests {
                         },
                         Field {
                             name: "author".to_string(),
-                            field_type: FieldType::Relation(RelationType::RequiredReference("User".to_string())),
+                            field_type: FieldType::Relation(RelationType::RequiredReference(
+                                "User".to_string(),
+                            )),
                             auto_generate: false,
                             unique: false,
                             indexed: false,

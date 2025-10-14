@@ -49,7 +49,10 @@ pub fn run(options: BuildOptions) -> Result<()> {
     if let Some(output) = &options.output {
         println!("  Output directory: {}/", output);
     } else {
-        println!("  Output directory: target/{}/", if options.release { "release" } else { "debug" });
+        println!(
+            "  Output directory: target/{}/",
+            if options.release { "release" } else { "debug" }
+        );
     }
 
     Ok(())

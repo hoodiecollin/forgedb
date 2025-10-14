@@ -23,7 +23,7 @@ impl Default for CompactionConfig {
         Self {
             dead_space_threshold: 0.3, // 30% dead space triggers compaction
             auto_compact: true,
-            check_interval_secs: 300, // Check every 5 minutes
+            check_interval_secs: 300,      // Check every 5 minutes
             max_compaction_time_secs: 600, // Max 10 minutes per compaction
         }
     }

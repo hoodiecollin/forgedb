@@ -1,4 +1,7 @@
-use crate::ast::{CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema, Struct};
+use crate::ast::{
+    CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema,
+    Struct,
+};
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
@@ -62,7 +65,11 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(format!("Expected {:?}, found {:?}", expected, self.current_token()))
+            Err(format!(
+                "Expected {:?}, found {:?}",
+                expected,
+                self.current_token()
+            ))
         }
     }
 
@@ -73,7 +80,12 @@ impl Parser {
         // Parse constraint name
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
-            _ => return Err(format!("Expected constraint name after '@', found {:?}", self.current_token())),
+            _ => {
+                return Err(format!(
+                    "Expected constraint name after '@', found {:?}",
+                    self.current_token()
+                ))
+            }
         };
         self.advance();
 
@@ -94,7 +106,12 @@ impl Parser {
                         constraint = constraint.with_param(ConstraintParam::String(s.clone()));
                         self.advance();
                     }
-                    _ => return Err(format!("Expected constraint parameter, found {:?}", self.current_token())),
+                    _ => {
+                        return Err(format!(
+                            "Expected constraint parameter, found {:?}",
+                            self.current_token()
+                        ))
+                    }
                 }
 
                 // Check for comma (more params) or closing paren
@@ -107,7 +124,12 @@ impl Parser {
                         self.advance();
                         break;
                     }
-                    _ => return Err(format!("Expected ',' or ')' in constraint parameters, found {:?}", self.current_token())),
+                    _ => {
+                        return Err(format!(
+                            "Expected ',' or ')' in constraint parameters, found {:?}",
+                            self.current_token()
+                        ))
+                    }
                 }
             }
         }
@@ -136,19 +158,32 @@ impl Parser {
                                 self.advance();
                                 let count = match self.current_token() {
                                     Token::Number(n) => *n as usize,
-                                    _ => return Err(format!("Expected array count after ';', found {:?}", self.current_token())),
+                                    _ => {
+                                        return Err(format!(
+                                            "Expected array count after ';', found {:?}",
+                                            self.current_token()
+                                        ))
+                                    }
                                 };
                                 self.advance();
                                 self.expect(Token::RBracket)?;
                                 // The Ident could be a struct type
-                                return Ok(FieldType::FixedArray(Box::new(FieldType::StructType(name)), count));
+                                return Ok(FieldType::FixedArray(
+                                    Box::new(FieldType::StructType(name)),
+                                    count,
+                                ));
                             }
                             Token::RBracket => {
                                 // This is [Model] - one-to-many relation
                                 self.advance();
                                 return Ok(FieldType::Relation(RelationType::OneToMany(name)));
                             }
-                            _ => return Err(format!("Expected ';' or ']' after type name, found {:?}", self.current_token())),
+                            _ => {
+                                return Err(format!(
+                                    "Expected ';' or ']' after type name, found {:?}",
+                                    self.current_token()
+                                ))
+                            }
                         }
                     }
                     _ => {
@@ -157,7 +192,12 @@ impl Parser {
                         self.expect(Token::Semicolon)?;
                         let count = match self.current_token() {
                             Token::Number(n) => *n as usize,
-                            _ => return Err(format!("Expected array count, found {:?}", self.current_token())),
+                            _ => {
+                                return Err(format!(
+                                    "Expected array count, found {:?}",
+                                    self.current_token()
+                                ))
+                            }
                         };
                         self.advance();
                         self.expect(Token::RBracket)?;
@@ -170,20 +210,34 @@ impl Parser {
                 self.advance();
                 let model_name = match self.current_token() {
                     Token::Ident(name) => name.clone(),
-                    _ => return Err(format!("Expected model name after '*', found {:?}", self.current_token())),
+                    _ => {
+                        return Err(format!(
+                            "Expected model name after '*', found {:?}",
+                            self.current_token()
+                        ))
+                    }
                 };
                 self.advance();
-                return Ok(FieldType::Relation(RelationType::RequiredReference(model_name)));
+                return Ok(FieldType::Relation(RelationType::RequiredReference(
+                    model_name,
+                )));
             }
             // Optional reference: ?User
             Token::Question => {
                 self.advance();
                 let model_name = match self.current_token() {
                     Token::Ident(name) => name.clone(),
-                    _ => return Err(format!("Expected model name after '?', found {:?}", self.current_token())),
+                    _ => {
+                        return Err(format!(
+                            "Expected model name after '?', found {:?}",
+                            self.current_token()
+                        ))
+                    }
                 };
                 self.advance();
-                return Ok(FieldType::Relation(RelationType::OptionalReference(model_name)));
+                return Ok(FieldType::Relation(RelationType::OptionalReference(
+                    model_name,
+                )));
             }
             // Struct types or primitive identifiers
             Token::Ident(name) => {
@@ -216,7 +270,12 @@ impl Parser {
                 self.expect(Token::LParen)?;
                 let size = match self.current_token() {
                     Token::Number(n) => *n as usize,
-                    _ => return Err(format!("Expected size after 'char(', found {:?}", self.current_token())),
+                    _ => {
+                        return Err(format!(
+                            "Expected size after 'char(', found {:?}",
+                            self.current_token()
+                        ))
+                    }
                 };
                 self.advance();
                 self.expect(Token::RParen)?;
@@ -235,7 +294,12 @@ impl Parser {
         // Get directive name
         let directive_name = match self.current_token() {
             Token::Ident(s) => s.clone(),
-            _ => return Err(format!("Expected directive name after '@', found {:?}", self.current_token())),
+            _ => {
+                return Err(format!(
+                    "Expected directive name after '@', found {:?}",
+                    self.current_token()
+                ))
+            }
         };
         self.advance();
 
@@ -255,7 +319,12 @@ impl Parser {
             // Parse field name
             let field_name = match self.current_token() {
                 Token::Ident(s) => s.clone(),
-                _ => return Err(format!("Expected field name in @index directive, found {:?}", self.current_token())),
+                _ => {
+                    return Err(format!(
+                        "Expected field name in @index directive, found {:?}",
+                        self.current_token()
+                    ))
+                }
             };
             self.advance();
             fields.push(field_name);
@@ -270,7 +339,12 @@ impl Parser {
                     self.advance();
                     break;
                 }
-                _ => return Err(format!("Expected ',' or ')' in @index directive, found {:?}", self.current_token())),
+                _ => {
+                    return Err(format!(
+                        "Expected ',' or ')' in @index directive, found {:?}",
+                        self.current_token()
+                    ))
+                }
             }
         }
 
@@ -288,7 +362,12 @@ impl Parser {
         let field_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
-            _ => return Err(format!("Expected field name, found {:?}", self.current_token())),
+            _ => {
+                return Err(format!(
+                    "Expected field name, found {:?}",
+                    self.current_token()
+                ))
+            }
         };
         self.advance();
 
@@ -387,7 +466,12 @@ impl Parser {
         let struct_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
-            _ => return Err(format!("Expected struct name, found {:?}", self.current_token())),
+            _ => {
+                return Err(format!(
+                    "Expected struct name, found {:?}",
+                    self.current_token()
+                ))
+            }
         };
         self.advance();
 
@@ -412,7 +496,10 @@ impl Parser {
 
             // Check for duplicate field name
             if field_names.contains(&field.name) {
-                return Err(format!("Duplicate field name '{}' in struct '{}'", field.name, name));
+                return Err(format!(
+                    "Duplicate field name '{}' in struct '{}'",
+                    field.name, name
+                ));
             }
             field_names.insert(field.name.clone());
 
@@ -437,7 +524,12 @@ impl Parser {
         let model_pos = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
-            _ => return Err(format!("Expected model name, found {:?}", self.current_token())),
+            _ => {
+                return Err(format!(
+                    "Expected model name, found {:?}",
+                    self.current_token()
+                ))
+            }
         };
         self.advance();
 
@@ -469,7 +561,10 @@ impl Parser {
 
                 // Check for duplicate field name
                 if field_names.contains(&field.name) {
-                    return Err(format!("Duplicate field name '{}' in model '{}'", field.name, name));
+                    return Err(format!(
+                        "Duplicate field name '{}' in model '{}'",
+                        field.name, name
+                    ));
                 }
                 field_names.insert(field.name.clone());
 
@@ -497,7 +592,11 @@ impl Parser {
             }
         }
 
-        Ok(Model { name, fields, composite_indexes })
+        Ok(Model {
+            name,
+            fields,
+            composite_indexes,
+        })
     }
 
     pub fn parse(&mut self) -> Result<Schema, String> {
@@ -1397,7 +1496,10 @@ User {
 
         let model = &schema.models[0];
         assert_eq!(model.composite_indexes.len(), 2);
-        assert_eq!(model.composite_indexes[0].fields, vec!["first_name", "last_name"]);
+        assert_eq!(
+            model.composite_indexes[0].fields,
+            vec!["first_name", "last_name"]
+        );
         assert_eq!(model.composite_indexes[1].fields, vec!["city", "state"]);
     }
 

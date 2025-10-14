@@ -1,14 +1,14 @@
-mod types;
 pub mod diff;
-mod generator;
 mod executor;
+mod generator;
 mod tracker;
+mod types;
 
-pub use types::*;
 pub use diff::SchemaDiffer;
-pub use generator::MigrationGenerator;
 pub use executor::MigrationExecutor;
+pub use generator::MigrationGenerator;
 pub use tracker::MigrationTracker;
+pub use types::*;
 
 #[cfg(test)]
 mod tests;

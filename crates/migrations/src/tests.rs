@@ -29,12 +29,9 @@ fn test_full_migration_workflow() {
     ];
 
     // Generate migration
-    let migration = MigrationGenerator::generate(
-        &migrations_dir,
-        "Create User model".to_string(),
-        changes,
-    )
-    .unwrap();
+    let migration =
+        MigrationGenerator::generate(&migrations_dir, "Create User model".to_string(), changes)
+            .unwrap();
 
     assert_eq!(migration.changes.len(), 3);
 
@@ -97,12 +94,9 @@ fn test_migration_rollback() {
         model_name: "TestModel".to_string(),
     }];
 
-    let migration = MigrationGenerator::generate(
-        &migrations_dir,
-        "Add test model".to_string(),
-        changes,
-    )
-    .unwrap();
+    let migration =
+        MigrationGenerator::generate(&migrations_dir, "Add test model".to_string(), changes)
+            .unwrap();
 
     // Execute up
     MigrationExecutor::execute_up(&migration, &data_dir).unwrap();
@@ -178,6 +172,8 @@ fn test_schema_differ() {
     assert!(changes.len() >= 1);
 
     // Check that we detected the new field
-    let has_add_field = changes.iter().any(|c| matches!(c, SchemaChange::AddField { .. }));
+    let has_add_field = changes
+        .iter()
+        .any(|c| matches!(c, SchemaChange::AddField { .. }));
     assert!(has_add_field);
 }

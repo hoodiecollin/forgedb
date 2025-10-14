@@ -31,11 +31,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     ui::success(&format!(
         "Parsed schema ({} models, {} total fields)",
         schema.models.len(),
-        schema
-            .models
-            .iter()
-            .map(|m| m.fields.len())
-            .sum::<usize>()
+        schema.models.iter().map(|m| m.fields.len()).sum::<usize>()
     ));
 
     // Determine output directory
@@ -97,11 +93,7 @@ fn find_schema_file() -> Result<String> {
     ))
 }
 
-fn generate_rust_code(
-    schema: &sinkdb::ast::Schema,
-    output_dir: &str,
-    force: bool,
-) -> Result<()> {
+fn generate_rust_code(schema: &sinkdb::ast::Schema, output_dir: &str, force: bool) -> Result<()> {
     // Create output directory
     fs::create_dir_all(output_dir)?;
 
@@ -161,8 +153,9 @@ fn generate_typescript_sdk(
         }
 
         // Write file
-        fs::write(&file_path, &file.content)
-            .map_err(|e| CliError::CodeGeneration(format!("Failed to write {}: {}", file.path, e)))?;
+        fs::write(&file_path, &file.content).map_err(|e| {
+            CliError::CodeGeneration(format!("Failed to write {}: {}", file.path, e))
+        })?;
 
         files_written += 1;
         total_lines += file.content.lines().count();
@@ -176,9 +169,15 @@ fn generate_typescript_sdk(
     println!();
     println!("SDK structure:");
     println!("  - {}/sdk/types.ts         - Type definitions", output_dir);
-    println!("  - {}/sdk/*Api.ts          - API client classes", output_dir);
+    println!(
+        "  - {}/sdk/*Api.ts          - API client classes",
+        output_dir
+    );
     println!("  - {}/sdk/index.ts         - Main entry point", output_dir);
-    println!("  - {}/sdk/package.json     - NPM package config", output_dir);
+    println!(
+        "  - {}/sdk/package.json     - NPM package config",
+        output_dir
+    );
     println!();
     println!("To use the SDK:");
     println!("  cd {}/sdk", output_dir);

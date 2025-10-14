@@ -1,17 +1,13 @@
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Represents a change detected in a schema migration
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SchemaChange {
     /// A new model was added
-    AddModel {
-        model_name: String,
-    },
+    AddModel { model_name: String },
     /// A model was removed
-    RemoveModel {
-        model_name: String,
-    },
+    RemoveModel { model_name: String },
     /// A field was added to a model
     AddField {
         model_name: String,
@@ -46,10 +42,7 @@ pub enum SchemaChange {
         new_name: String,
     },
     /// A model was renamed
-    RenameModel {
-        old_name: String,
-        new_name: String,
-    },
+    RenameModel { old_name: String, new_name: String },
     /// An index was added
     AddIndex {
         model_name: String,
@@ -103,9 +96,13 @@ impl SchemaChange {
             SchemaChange::RemoveModel { .. } => true,
             SchemaChange::RemoveField { .. } => true,
             SchemaChange::ChangeFieldType { .. } => true,
-            SchemaChange::ChangeFieldNullability { old_nullable: true, new_nullable: false, .. } => true,
+            SchemaChange::ChangeFieldNullability {
+                old_nullable: true,
+                new_nullable: false,
+                ..
+            } => true,
             SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
-            SchemaChange::AddUniqueConstraint { .. } => true, // May fail if duplicates exist
+            SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
             _ => false,
         }
     }
@@ -119,51 +116,141 @@ impl SchemaChange {
             SchemaChange::RemoveModel { model_name } => {
                 format!("Remove model '{}' (⚠️  BREAKING)", model_name)
             }
-            SchemaChange::AddField { model_name, field_name, field_type, nullable, .. } => {
+            SchemaChange::AddField {
+                model_name,
+                field_name,
+                field_type,
+                nullable,
+                ..
+            } => {
                 let null_str = if *nullable { "?" } else { "" };
-                format!("Add field '{}.{}{}' ({})", model_name, field_name, null_str, field_type)
+                format!(
+                    "Add field '{}.{}{}' ({})",
+                    model_name, field_name, null_str, field_type
+                )
             }
-            SchemaChange::RemoveField { model_name, field_name } => {
-                format!("Remove field '{}.{}' (⚠️  BREAKING)", model_name, field_name)
+            SchemaChange::RemoveField {
+                model_name,
+                field_name,
+            } => {
+                format!(
+                    "Remove field '{}.{}' (⚠️  BREAKING)",
+                    model_name, field_name
+                )
             }
-            SchemaChange::ChangeFieldType { model_name, field_name, old_type, new_type } => {
-                format!("Change type of '{}.{}' from {} to {} (⚠️  BREAKING)",
-                    model_name, field_name, old_type, new_type)
+            SchemaChange::ChangeFieldType {
+                model_name,
+                field_name,
+                old_type,
+                new_type,
+            } => {
+                format!(
+                    "Change type of '{}.{}' from {} to {} (⚠️  BREAKING)",
+                    model_name, field_name, old_type, new_type
+                )
             }
-            SchemaChange::ChangeFieldNullability { model_name, field_name, old_nullable, new_nullable } => {
-                let change = if *new_nullable { "nullable" } else { "non-nullable" };
-                let breaking = if !new_nullable { " (⚠️  BREAKING)" } else { "" };
-                format!("Make '{}.{}' {}{}", model_name, field_name, change, breaking)
+            SchemaChange::ChangeFieldNullability {
+                model_name,
+                field_name,
+                old_nullable,
+                new_nullable,
+            } => {
+                let change = if *new_nullable {
+                    "nullable"
+                } else {
+                    "non-nullable"
+                };
+                let breaking = if !new_nullable {
+                    " (⚠️  BREAKING)"
+                } else {
+                    ""
+                };
+                format!(
+                    "Make '{}.{}' {}{}",
+                    model_name, field_name, change, breaking
+                )
             }
-            SchemaChange::RenameField { model_name, old_name, new_name } => {
-                format!("Rename field '{}.{}' to '{}'", model_name, old_name, new_name)
+            SchemaChange::RenameField {
+                model_name,
+                old_name,
+                new_name,
+            } => {
+                format!(
+                    "Rename field '{}.{}' to '{}'",
+                    model_name, old_name, new_name
+                )
             }
             SchemaChange::RenameModel { old_name, new_name } => {
                 format!("Rename model '{}' to '{}'", old_name, new_name)
             }
-            SchemaChange::AddIndex { model_name, field_name, index_type } => {
-                format!("Add {} index on '{}.{}'", index_type, model_name, field_name)
+            SchemaChange::AddIndex {
+                model_name,
+                field_name,
+                index_type,
+            } => {
+                format!(
+                    "Add {} index on '{}.{}'",
+                    index_type, model_name, field_name
+                )
             }
-            SchemaChange::RemoveIndex { model_name, field_name } => {
+            SchemaChange::RemoveIndex {
+                model_name,
+                field_name,
+            } => {
                 format!("Remove index from '{}.{}'", model_name, field_name)
             }
-            SchemaChange::AddUniqueConstraint { model_name, field_name } => {
-                format!("Add unique constraint to '{}.{}' (⚠️  may fail)", model_name, field_name)
+            SchemaChange::AddUniqueConstraint {
+                model_name,
+                field_name,
+            } => {
+                format!(
+                    "Add unique constraint to '{}.{}' (⚠️  may fail)",
+                    model_name, field_name
+                )
             }
-            SchemaChange::RemoveUniqueConstraint { model_name, field_name } => {
-                format!("Remove unique constraint from '{}.{}'", model_name, field_name)
+            SchemaChange::RemoveUniqueConstraint {
+                model_name,
+                field_name,
+            } => {
+                format!(
+                    "Remove unique constraint from '{}.{}'",
+                    model_name, field_name
+                )
             }
             SchemaChange::AddCompositeIndex { model_name, fields } => {
-                format!("Add composite index on '{}.{}'", model_name, fields.join(", "))
+                format!(
+                    "Add composite index on '{}.{}'",
+                    model_name,
+                    fields.join(", ")
+                )
             }
             SchemaChange::RemoveCompositeIndex { model_name, fields } => {
-                format!("Remove composite index from '{}.{}'", model_name, fields.join(", "))
+                format!(
+                    "Remove composite index from '{}.{}'",
+                    model_name,
+                    fields.join(", ")
+                )
             }
-            SchemaChange::AddConstraint { model_name, field_name, constraint_name, .. } => {
-                format!("Add @{} constraint to '{}.{}'", constraint_name, model_name, field_name)
+            SchemaChange::AddConstraint {
+                model_name,
+                field_name,
+                constraint_name,
+                ..
+            } => {
+                format!(
+                    "Add @{} constraint to '{}.{}'",
+                    constraint_name, model_name, field_name
+                )
             }
-            SchemaChange::RemoveConstraint { model_name, field_name, constraint_name } => {
-                format!("Remove @{} constraint from '{}.{}'", constraint_name, model_name, field_name)
+            SchemaChange::RemoveConstraint {
+                model_name,
+                field_name,
+                constraint_name,
+            } => {
+                format!(
+                    "Remove @{} constraint from '{}.{}'",
+                    constraint_name, model_name, field_name
+                )
             }
         }
     }
@@ -219,7 +306,8 @@ impl Migration {
 
     /// Get the filename for this migration
     pub fn filename(&self) -> String {
-        let safe_desc = self.description
+        let safe_desc = self
+            .description
             .to_lowercase()
             .replace(' ', "_")
             .chars()
@@ -269,7 +357,9 @@ impl Default for MigrationState {
 impl MigrationState {
     /// Check if a migration has been applied
     pub fn is_applied(&self, migration_id: &str) -> bool {
-        self.applied_migrations.iter().any(|r| r.migration_id == migration_id)
+        self.applied_migrations
+            .iter()
+            .any(|r| r.migration_id == migration_id)
     }
 
     /// Add a migration record

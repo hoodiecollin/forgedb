@@ -1,4 +1,4 @@
-use crate::types::{MigrationState, MigrationRecord};
+use crate::types::{MigrationRecord, MigrationState};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,7 +81,11 @@ impl MigrationTracker {
     }
 
     /// Verify checksum of applied migration
-    pub fn verify_checksum(&self, migration_id: &str, expected_checksum: &str) -> Result<(), String> {
+    pub fn verify_checksum(
+        &self,
+        migration_id: &str,
+        expected_checksum: &str,
+    ) -> Result<(), String> {
         for record in &self.state.applied_migrations {
             if record.migration_id == migration_id {
                 if record.checksum != expected_checksum {
@@ -93,7 +97,10 @@ impl MigrationTracker {
                 return Ok(());
             }
         }
-        Err(format!("Migration {} not found in applied migrations", migration_id))
+        Err(format!(
+            "Migration {} not found in applied migrations",
+            migration_id
+        ))
     }
 
     /// Get migration status summary
@@ -120,7 +127,9 @@ mod tests {
 
         assert!(!tracker.is_applied("20241014000000"));
 
-        tracker.mark_applied("20241014000000".to_string(), "abc123".to_string()).unwrap();
+        tracker
+            .mark_applied("20241014000000".to_string(), "abc123".to_string())
+            .unwrap();
         assert!(tracker.is_applied("20241014000000"));
 
         // Create a new tracker instance to verify persistence
@@ -133,8 +142,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut tracker = MigrationTracker::new(temp_dir.path()).unwrap();
 
-        tracker.mark_applied("20241014000000".to_string(), "abc123".to_string()).unwrap();
-        tracker.mark_applied("20241014000001".to_string(), "def456".to_string()).unwrap();
+        tracker
+            .mark_applied("20241014000000".to_string(), "abc123".to_string())
+            .unwrap();
+        tracker
+            .mark_applied("20241014000001".to_string(), "def456".to_string())
+            .unwrap();
 
         assert_eq!(tracker.applied_migrations().len(), 2);
 
@@ -149,7 +162,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let mut tracker = MigrationTracker::new(temp_dir.path()).unwrap();
 
-        tracker.mark_applied("20241014000000".to_string(), "abc123".to_string()).unwrap();
+        tracker
+            .mark_applied("20241014000000".to_string(), "abc123".to_string())
+            .unwrap();
 
         let all = vec![
             "20241014000000".to_string(),

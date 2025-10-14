@@ -6,7 +6,7 @@
 // - search_<field>_phrase() methods for exact phrase matching
 // - TF-IDF scoring for search results
 
-use sinkdb::{Parser, CodeGenerator};
+use sinkdb::{CodeGenerator, Parser};
 
 fn main() -> Result<(), String> {
     let schema = r#"
@@ -34,24 +34,38 @@ Article {
     println!("- Automatically maintain full-text indexes on insert/update/delete");
 
     // Verify full-text index fields
-    assert!(generated_code.contains("title_fulltext"),
-        "Missing title_fulltext index field");
-    assert!(generated_code.contains("content_fulltext"),
-        "Missing content_fulltext index field");
+    assert!(
+        generated_code.contains("title_fulltext"),
+        "Missing title_fulltext index field"
+    );
+    assert!(
+        generated_code.contains("content_fulltext"),
+        "Missing content_fulltext index field"
+    );
 
     // Verify search methods
-    assert!(generated_code.contains("pub fn search_title"),
-        "Missing search_title method");
-    assert!(generated_code.contains("pub fn search_content"),
-        "Missing search_content method");
-    assert!(generated_code.contains("pub fn search_title_phrase"),
-        "Missing search_title_phrase method");
-    assert!(generated_code.contains("pub fn search_content_phrase"),
-        "Missing search_content_phrase method");
+    assert!(
+        generated_code.contains("pub fn search_title"),
+        "Missing search_title method"
+    );
+    assert!(
+        generated_code.contains("pub fn search_content"),
+        "Missing search_content method"
+    );
+    assert!(
+        generated_code.contains("pub fn search_title_phrase"),
+        "Missing search_title_phrase method"
+    );
+    assert!(
+        generated_code.contains("pub fn search_content_phrase"),
+        "Missing search_content_phrase method"
+    );
 
     // Verify full-text import
-    assert!(generated_code.contains("sinkdb_fulltext"),
-        "Missing sinkdb_fulltext import");
+    assert!(
+        generated_code.contains("sinkdb_fulltext"),
+        "Missing sinkdb_fulltext import"
+    );
 
     println!("\n✅ All full-text search features generated successfully!");
     println!("\nExample usage:");

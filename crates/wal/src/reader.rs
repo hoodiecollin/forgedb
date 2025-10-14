@@ -129,7 +129,7 @@ pub struct CorruptionInfo {
 mod tests {
     use super::*;
     use crate::entry::{WalEntry, WalValue};
-    use crate::writer::{WalWriter, FsyncPolicy};
+    use crate::writer::{FsyncPolicy, WalWriter};
     use std::collections::HashMap;
 
     #[test]

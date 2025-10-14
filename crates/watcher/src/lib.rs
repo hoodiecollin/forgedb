@@ -1,11 +1,13 @@
 pub mod regenerator;
 
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{
+    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
-pub use regenerator::{SchemaRegenerator, RegenerateResult, RegenerateError};
+pub use regenerator::{RegenerateError, RegenerateResult, SchemaRegenerator};
 
 /// Error types for the watcher
 #[derive(Debug)]
@@ -79,9 +81,10 @@ impl SchemaWatcher {
         let path_ref = path.as_ref();
 
         if !path_ref.exists() {
-            return Err(WatchError::InvalidPath(
-                format!("Path does not exist: {}", path_ref.display())
-            ));
+            return Err(WatchError::InvalidPath(format!(
+                "Path does not exist: {}",
+                path_ref.display()
+            )));
         }
 
         self.watcher.watch(path_ref, RecursiveMode::NonRecursive)?;
@@ -102,10 +105,10 @@ impl SchemaWatcher {
     pub fn next_event(&self) -> Result<FileChangeEvent, WatchError> {
         loop {
             // Wait for first event
-            let event = self.receiver.recv()
-                .map_err(|_| WatchError::NotifyError(
-                    notify::Error::generic("Channel closed")
-                ))?
+            let event = self
+                .receiver
+                .recv()
+                .map_err(|_| WatchError::NotifyError(notify::Error::generic("Channel closed")))?
                 .map_err(WatchError::NotifyError)?;
 
             let (path, kind) = match self.extract_event_info(&event) {
@@ -120,7 +123,8 @@ impl SchemaWatcher {
 
             loop {
                 let now = Instant::now();
-                if now >= deadline && now.duration_since(last_event_time) >= self.debounce_duration {
+                if now >= deadline && now.duration_since(last_event_time) >= self.debounce_duration
+                {
                     // Debounce period elapsed with no new events
                     break;
                 }
@@ -166,9 +170,9 @@ impl SchemaWatcher {
             }
             Ok(Err(e)) => Err(WatchError::NotifyError(e)),
             Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Err(WatchError::NotifyError(notify::Error::generic("Channel closed")))
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(WatchError::NotifyError(
+                notify::Error::generic("Channel closed"),
+            )),
         }
     }
 

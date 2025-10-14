@@ -120,7 +120,10 @@ mod tests {
         let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Always).unwrap();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         writer.write(&entry).unwrap();
@@ -139,7 +142,10 @@ mod tests {
         let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Never).unwrap();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         writer.write(&entry).unwrap();
@@ -158,10 +164,14 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let wal_path = temp_dir.join("test.wal");
-        let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Periodic(Duration::from_millis(100))).unwrap();
+        let mut writer =
+            WalWriter::new(&wal_path, FsyncPolicy::Periodic(Duration::from_millis(100))).unwrap();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         // First write shouldn't fsync immediately
@@ -188,7 +198,10 @@ mod tests {
         let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Always).unwrap();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         writer.write(&entry).unwrap();

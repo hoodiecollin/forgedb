@@ -15,10 +15,7 @@ pub struct MaintenanceApi {
 }
 
 impl MaintenanceApi {
-    pub fn new<P: AsRef<std::path::Path>>(
-        data_dir: P,
-        config: CompactionConfig,
-    ) -> Self {
+    pub fn new<P: AsRef<std::path::Path>>(data_dir: P, config: CompactionConfig) -> Self {
         let data_dir = data_dir.as_ref();
         Self {
             compactor: Compactor::new(data_dir, config),

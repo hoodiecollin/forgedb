@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 mod tests {
-    use sinkdb::{Parser, CodeGenerator};
+    use sinkdb::{CodeGenerator, Parser};
 
     #[test]
     fn test_fulltext_directive_parsing() {
@@ -30,13 +30,22 @@ Article {
 
         // Check that fulltext_indexed is set correctly
         let title_field = model.fields.iter().find(|f| f.name == "title").unwrap();
-        assert!(title_field.fulltext_indexed, "title should be fulltext indexed");
+        assert!(
+            title_field.fulltext_indexed,
+            "title should be fulltext indexed"
+        );
 
         let content_field = model.fields.iter().find(|f| f.name == "content").unwrap();
-        assert!(content_field.fulltext_indexed, "content should be fulltext indexed");
+        assert!(
+            content_field.fulltext_indexed,
+            "content should be fulltext indexed"
+        );
 
         let id_field = model.fields.iter().find(|f| f.name == "id").unwrap();
-        assert!(!id_field.fulltext_indexed, "id should not be fulltext indexed");
+        assert!(
+            !id_field.fulltext_indexed,
+            "id should not be fulltext indexed"
+        );
     }
 
     #[test]
@@ -56,8 +65,12 @@ Article {
         let code = generator.generate(&parsed_schema);
 
         // Check that full-text index fields are generated
-        assert!(code.contains("title_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>"),
-            "title_fulltext field should be generated");
+        assert!(
+            code.contains(
+                "title_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>"
+            ),
+            "title_fulltext field should be generated"
+        );
         assert!(code.contains("content_fulltext: std::sync::Arc<std::sync::RwLock<sinkdb_fulltext::FullTextIndex>>"),
             "content_fulltext field should be generated");
 
@@ -85,16 +98,24 @@ Article {
         let code = generator.generate(&parsed_schema);
 
         // Check that search methods are generated
-        assert!(code.contains("pub fn search_title(&self, query: &str) -> Vec<Article>"),
-            "search_title method should be generated");
-        assert!(code.contains("pub fn search_content(&self, query: &str) -> Vec<Article>"),
-            "search_content method should be generated");
+        assert!(
+            code.contains("pub fn search_title(&self, query: &str) -> Vec<Article>"),
+            "search_title method should be generated"
+        );
+        assert!(
+            code.contains("pub fn search_content(&self, query: &str) -> Vec<Article>"),
+            "search_content method should be generated"
+        );
 
         // Check that phrase search methods are generated
-        assert!(code.contains("pub fn search_title_phrase(&self, phrase: &str) -> Vec<Article>"),
-            "search_title_phrase method should be generated");
-        assert!(code.contains("pub fn search_content_phrase(&self, phrase: &str) -> Vec<Article>"),
-            "search_content_phrase method should be generated");
+        assert!(
+            code.contains("pub fn search_title_phrase(&self, phrase: &str) -> Vec<Article>"),
+            "search_title_phrase method should be generated"
+        );
+        assert!(
+            code.contains("pub fn search_content_phrase(&self, phrase: &str) -> Vec<Article>"),
+            "search_content_phrase method should be generated"
+        );
     }
 
     #[test]
@@ -113,8 +134,10 @@ Article {
         let code = generator.generate(&parsed_schema);
 
         // Check that insert adds to full-text index
-        assert!(code.contains("self.title_fulltext.write().unwrap().add_document"),
-            "insert should add document to full-text index");
+        assert!(
+            code.contains("self.title_fulltext.write().unwrap().add_document"),
+            "insert should add document to full-text index"
+        );
     }
 
     #[test]

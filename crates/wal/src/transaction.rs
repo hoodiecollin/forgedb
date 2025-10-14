@@ -225,7 +225,10 @@ mod tests {
         assert_eq!(txn.len(), 0);
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         txn.add_entry(entry).unwrap();
@@ -245,7 +248,10 @@ mod tests {
         let txn_id = txn.id();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         txn.add_entry(entry).unwrap();
@@ -291,7 +297,10 @@ mod tests {
         let txn_id = txn.id();
 
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         txn.add_entry(entry).unwrap();

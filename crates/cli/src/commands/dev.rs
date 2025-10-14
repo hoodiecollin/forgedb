@@ -55,8 +55,13 @@ pub fn run(options: DevOptions) -> Result<()> {
     });
 
     // Run watcher (blocks until Ctrl+C)
-    auto_watch(&options.schema, &options.output, options.debounce, Some(callback))
-        .map_err(|e| CliError::Other(format!("Watcher error: {}", e)))?;
+    auto_watch(
+        &options.schema,
+        &options.output,
+        options.debounce,
+        Some(callback),
+    )
+    .map_err(|e| CliError::Other(format!("Watcher error: {}", e)))?;
 
     Ok(())
 }

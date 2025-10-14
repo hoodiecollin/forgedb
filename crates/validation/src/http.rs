@@ -90,7 +90,10 @@ impl HttpValidator {
             .iter()
             .filter_map(|(name, value)| {
                 if value.is_none() || value.unwrap().is_empty() {
-                    Some(ValidationError::new(format!("Field '{}' is required", name)))
+                    Some(ValidationError::new(format!(
+                        "Field '{}' is required",
+                        name
+                    )))
                 } else {
                     None
                 }

@@ -78,7 +78,7 @@
 //! - Markdown documentation
 //! - Swagger UI integration
 
-use sinkdb::{Parser, CodeGenerator, ApiCodeGenerator, TypeScriptGenerator, OpenApiGenerator};
+use sinkdb::{ApiCodeGenerator, CodeGenerator, OpenApiGenerator, Parser, TypeScriptGenerator};
 use std::fs;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -242,9 +242,7 @@ Comment {
     println!("✓ Schema parsed successfully");
     println!("  • {} models defined", parsed_schema.models.len());
 
-    let total_fields: usize = parsed_schema.models.iter()
-        .map(|m| m.fields.len())
-        .sum();
+    let total_fields: usize = parsed_schema.models.iter().map(|m| m.fields.len()).sum();
     println!("  • {} total fields", total_fields);
 
     let one_to_many = parsed_schema.detect_relations();
@@ -359,7 +357,8 @@ Comment {
     // Show example usage
     println!("📚 Example Usage");
     println!("───────────────────────────────────────────────────────────────");
-    println!(r#"
+    println!(
+        r#"
 // 1. Create database
 let mut db = Database::new();
 
@@ -461,7 +460,8 @@ use sinkdb_http_server::Server;
 let app = create_router(db);
 Server::new().serve(app).await?;
 // API now available at http://localhost:3000/api
-"#);
+"#
+    );
     println!("───────────────────────────────────────────────────────────────\n");
 
     // Summary

@@ -1,10 +1,10 @@
 // Persistent UserStorage implementation using columnar storage
 // This is a concrete implementation for User { id: +u64, email: &string }
 
-use crate::{Database, FixedColumn, VariableColumn, Tombstones, ColumnMetadata, ColumnType};
+use crate::{ColumnMetadata, ColumnType, Database, FixedColumn, Tombstones, VariableColumn};
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::io;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
@@ -45,10 +45,8 @@ impl UserStorage {
 
         // Open column files
         let id_column = FixedColumn::new(db.fixed_column_path(0), 8)?;
-        let email_column = VariableColumn::new(
-            db.variable_data_path(0),
-            db.variable_offsets_path(0),
-        )?;
+        let email_column =
+            VariableColumn::new(db.variable_data_path(0), db.variable_offsets_path(0))?;
         let tombstones = Tombstones::new(db.tombstones_path())?;
 
         // Calculate next_id from existing data
@@ -89,13 +87,16 @@ impl UserStorage {
         self.next_id += 1;
 
         // Write to persistent storage
-        self.id_column.append_u64(id)
+        self.id_column
+            .append_u64(id)
             .map_err(|e| format!("Failed to write id: {}", e))?;
 
-        self.email_column.append_string(&email)
+        self.email_column
+            .append_string(&email)
             .map_err(|e| format!("Failed to write email: {}", e))?;
 
-        self.tombstones.append(false)
+        self.tombstones
+            .append(false)
             .map_err(|e| format!("Failed to write tombstone: {}", e))?;
 
         // Update index
@@ -104,7 +105,8 @@ impl UserStorage {
 
         // Update manifest
         self.db.update_row_count(self.id_column.len());
-        self.db.save_manifest()
+        self.db
+            .save_manifest()
             .map_err(|e| format!("Failed to save manifest: {}", e))?;
 
         Ok(User { id, email })

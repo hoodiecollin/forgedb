@@ -100,7 +100,10 @@ fn test_generate_command_creates_rust_code() {
 
     // Check that generated code exists
     let generated_file = temp_dir.path().join("generated/database.rs");
-    assert!(generated_file.exists(), "Generated database.rs should exist");
+    assert!(
+        generated_file.exists(),
+        "Generated database.rs should exist"
+    );
 
     // Verify generated code contains expected content
     let generated_content =
@@ -122,8 +125,7 @@ fn test_validate_command_detects_errors() {
   Email: string
 }
 "#;
-    fs::write(temp_dir.path().join("schema.sink"), invalid_schema)
-        .expect("Failed to write schema");
+    fs::write(temp_dir.path().join("schema.sink"), invalid_schema).expect("Failed to write schema");
 
     let options = ValidateOptions {
         strict: false,

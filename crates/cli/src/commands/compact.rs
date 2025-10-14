@@ -57,7 +57,10 @@ pub fn compact(opts: CompactOptions) -> Result<(), CliError> {
     }
 
     println!("\n✓ Compaction completed\n");
-    println!("{:<20} {:>15} {:>15} {:>10} {:>10}", "Model", "Before", "Reclaimed", "Percent", "Time");
+    println!(
+        "{:<20} {:>15} {:>15} {:>10} {:>10}",
+        "Model", "Before", "Reclaimed", "Percent", "Time"
+    );
     println!("{}", "=".repeat(75));
 
     for result in results {
@@ -74,7 +77,10 @@ pub fn compact(opts: CompactOptions) -> Result<(), CliError> {
             eprintln!(
                 "{:<20} Error: {}",
                 result.model_name,
-                result.error.as_ref().unwrap_or(&"Unknown error".to_string())
+                result
+                    .error
+                    .as_ref()
+                    .unwrap_or(&"Unknown error".to_string())
             );
         }
     }
@@ -156,7 +162,10 @@ pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
         if models_needing_compact.is_empty() {
             println!("  ✓ No models need compaction");
         } else {
-            println!("  ⚠  {} model(s) exceed dead space threshold:", models_needing_compact.len());
+            println!(
+                "  ⚠  {} model(s) exceed dead space threshold:",
+                models_needing_compact.len()
+            );
             for model in models_needing_compact {
                 println!(
                     "    - {} ({:.1}% dead space)",
@@ -174,19 +183,31 @@ pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
 fn print_database_stats(stats: &sinkdb_compaction::DatabaseStats) {
     println!("\nDatabase Statistics");
     println!("===================");
-    println!("Collected at: {}", stats.collected_at.format("%Y-%m-%d %H:%M:%S"));
+    println!(
+        "Collected at: {}",
+        stats.collected_at.format("%Y-%m-%d %H:%M:%S")
+    );
     println!();
     println!("Storage:");
-    println!("  Total disk usage:  {}", format_bytes(stats.total_disk_bytes));
+    println!(
+        "  Total disk usage:  {}",
+        format_bytes(stats.total_disk_bytes)
+    );
     println!("  Used space:        {}", format_bytes(stats.used_bytes));
     println!("  Dead space:        {}", format_bytes(stats.dead_bytes));
-    println!("  Dead space ratio:  {:.1}%", stats.dead_space_ratio * 100.0);
+    println!(
+        "  Dead space ratio:  {:.1}%",
+        stats.dead_space_ratio * 100.0
+    );
     println!();
     println!("Models: {}", stats.models.len());
     println!();
 
     if !stats.models.is_empty() {
-        println!("{:<20} {:>12} {:>12} {:>12} {:>10}", "Model", "Total", "Used", "Dead", "Dead %");
+        println!(
+            "{:<20} {:>12} {:>12} {:>12} {:>10}",
+            "Model", "Total", "Used", "Dead", "Dead %"
+        );
         println!("{}", "=".repeat(70));
 
         for model in &stats.models {
@@ -212,20 +233,32 @@ fn print_model_stats(stats: &sinkdb_compaction::ModelStats) {
     println!("  Deleted: {}", stats.deleted_rows);
     println!();
     println!("Storage:");
-    println!("  Total disk usage:  {}", format_bytes(stats.total_disk_bytes));
+    println!(
+        "  Total disk usage:  {}",
+        format_bytes(stats.total_disk_bytes)
+    );
     println!("  Used space:        {}", format_bytes(stats.used_bytes));
     println!("  Dead space:        {}", format_bytes(stats.dead_bytes));
-    println!("  Dead space ratio:  {:.1}%", stats.dead_space_ratio * 100.0);
+    println!(
+        "  Dead space ratio:  {:.1}%",
+        stats.dead_space_ratio * 100.0
+    );
 
     if let Some(last_compact) = stats.last_compaction {
         println!();
-        println!("Last compaction: {}", last_compact.format("%Y-%m-%d %H:%M:%S"));
+        println!(
+            "Last compaction: {}",
+            last_compact.format("%Y-%m-%d %H:%M:%S")
+        );
     }
 
     if !stats.columns.is_empty() {
         println!();
         println!("Columns:");
-        println!("{:<20} {:>10} {:>12} {:>12} {:>10}", "Name", "Type", "Total", "Dead", "Dead %");
+        println!(
+            "{:<20} {:>10} {:>12} {:>12} {:>10}",
+            "Name", "Type", "Total", "Dead", "Dead %"
+        );
         println!("{}", "=".repeat(68));
 
         for col in &stats.columns {

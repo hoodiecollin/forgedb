@@ -6,10 +6,7 @@ pub struct MigrationExecutor;
 
 impl MigrationExecutor {
     /// Execute a migration (up direction)
-    pub fn execute_up<P: AsRef<Path>>(
-        migration: &Migration,
-        data_dir: P,
-    ) -> Result<(), String> {
+    pub fn execute_up<P: AsRef<Path>>(migration: &Migration, data_dir: P) -> Result<(), String> {
         let data_dir = data_dir.as_ref();
 
         // Ensure data directory exists
@@ -27,10 +24,7 @@ impl MigrationExecutor {
     }
 
     /// Execute a migration (down direction - rollback)
-    pub fn execute_down<P: AsRef<Path>>(
-        migration: &Migration,
-        data_dir: P,
-    ) -> Result<(), String> {
+    pub fn execute_down<P: AsRef<Path>>(migration: &Migration, data_dir: P) -> Result<(), String> {
         let data_dir = data_dir.as_ref();
 
         // Execute changes in reverse order
@@ -63,21 +57,52 @@ impl MigrationExecutor {
                 Self::drop_model_storage(data_dir, model_name)?;
             }
 
-            SchemaChange::AddField { model_name, field_name, field_type, nullable, default_value } if is_up => {
-                Self::add_column(data_dir, model_name, field_name, field_type, *nullable, default_value.as_deref())?;
+            SchemaChange::AddField {
+                model_name,
+                field_name,
+                field_type,
+                nullable,
+                default_value,
+            } if is_up => {
+                Self::add_column(
+                    data_dir,
+                    model_name,
+                    field_name,
+                    field_type,
+                    *nullable,
+                    default_value.as_deref(),
+                )?;
             }
-            SchemaChange::RemoveField { model_name, field_name } if !is_up => {
+            SchemaChange::RemoveField {
+                model_name,
+                field_name,
+            } if !is_up => {
                 // For rollback, we'd need to restore the field (complex - requires stored metadata)
-                println!("Warning: Rolling back field removal for {}.{} - data may be lost", model_name, field_name);
+                println!(
+                    "Warning: Rolling back field removal for {}.{} - data may be lost",
+                    model_name, field_name
+                );
             }
-            SchemaChange::RemoveField { model_name, field_name } if is_up => {
+            SchemaChange::RemoveField {
+                model_name,
+                field_name,
+            } if is_up => {
                 Self::remove_column(data_dir, model_name, field_name)?;
             }
-            SchemaChange::AddField { model_name, field_name, .. } if !is_up => {
+            SchemaChange::AddField {
+                model_name,
+                field_name,
+                ..
+            } if !is_up => {
                 Self::remove_column(data_dir, model_name, field_name)?;
             }
 
-            SchemaChange::ChangeFieldType { model_name, field_name, old_type, new_type } => {
+            SchemaChange::ChangeFieldType {
+                model_name,
+                field_name,
+                old_type,
+                new_type,
+            } => {
                 let (from_type, to_type) = if is_up {
                     (old_type, new_type)
                 } else {
@@ -86,23 +111,43 @@ impl MigrationExecutor {
                 Self::change_column_type(data_dir, model_name, field_name, from_type, to_type)?;
             }
 
-            SchemaChange::AddIndex { model_name, field_name, index_type } if is_up => {
+            SchemaChange::AddIndex {
+                model_name,
+                field_name,
+                index_type,
+            } if is_up => {
                 Self::create_index(data_dir, model_name, field_name, index_type)?;
             }
-            SchemaChange::RemoveIndex { model_name, field_name } if !is_up => {
+            SchemaChange::RemoveIndex {
+                model_name,
+                field_name,
+            } if !is_up => {
                 println!("Restoring index on {}.{}", model_name, field_name);
             }
-            SchemaChange::RemoveIndex { model_name, field_name } if is_up => {
+            SchemaChange::RemoveIndex {
+                model_name,
+                field_name,
+            } if is_up => {
                 Self::drop_index(data_dir, model_name, field_name)?;
             }
-            SchemaChange::AddIndex { model_name, field_name, .. } if !is_up => {
+            SchemaChange::AddIndex {
+                model_name,
+                field_name,
+                ..
+            } if !is_up => {
                 Self::drop_index(data_dir, model_name, field_name)?;
             }
 
-            SchemaChange::AddUniqueConstraint { model_name, field_name } if is_up => {
+            SchemaChange::AddUniqueConstraint {
+                model_name,
+                field_name,
+            } if is_up => {
                 Self::add_unique_constraint(data_dir, model_name, field_name)?;
             }
-            SchemaChange::RemoveUniqueConstraint { model_name, field_name } if is_up => {
+            SchemaChange::RemoveUniqueConstraint {
+                model_name,
+                field_name,
+            } if is_up => {
                 Self::remove_unique_constraint(data_dir, model_name, field_name)?;
             }
 
@@ -192,7 +237,9 @@ impl MigrationExecutor {
 
         // For now, just create a placeholder file
         // In a real implementation, this would migrate existing data
-        let column_file = model_dir.join(subdir).join(format!("{}_{}.bin", field_type, field_name));
+        let column_file = model_dir
+            .join(subdir)
+            .join(format!("{}_{}.bin", field_type, field_name));
 
         if !column_file.exists() {
             std::fs::write(&column_file, &[])
@@ -206,7 +253,10 @@ impl MigrationExecutor {
             String::new()
         };
 
-        println!("✓ Added column '{}.{}: {}{}{}'", model_name, field_name, field_type, null_str, default_str);
+        println!(
+            "✓ Added column '{}.{}: {}{}{}'",
+            model_name, field_name, field_type, null_str, default_str
+        );
         Ok(())
     }
 
@@ -232,7 +282,10 @@ impl MigrationExecutor {
     ) -> Result<(), String> {
         // Type changes require data migration
         // This would need to read all rows, convert values, and rewrite
-        println!("⚠️  Type change for '{}.{}' requires manual data migration", model_name, field_name);
+        println!(
+            "⚠️  Type change for '{}.{}' requires manual data migration",
+            model_name, field_name
+        );
         Ok(())
     }
 
@@ -243,7 +296,10 @@ impl MigrationExecutor {
         field_name: &str,
         index_type: &str,
     ) -> Result<(), String> {
-        println!("✓ Created {} index on '{}.{}'", index_type, model_name, field_name);
+        println!(
+            "✓ Created {} index on '{}.{}'",
+            index_type, model_name, field_name
+        );
         Ok(())
     }
 
@@ -263,7 +319,10 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        println!("✓ Added unique constraint to '{}.{}'", model_name, field_name);
+        println!(
+            "✓ Added unique constraint to '{}.{}'",
+            model_name, field_name
+        );
         // In real implementation, would check for duplicates first
         Ok(())
     }
@@ -274,7 +333,10 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        println!("✓ Removed unique constraint from '{}.{}'", model_name, field_name);
+        println!(
+            "✓ Removed unique constraint from '{}.{}'",
+            model_name, field_name
+        );
         Ok(())
     }
 
@@ -284,7 +346,11 @@ impl MigrationExecutor {
         model_name: &str,
         fields: &[String],
     ) -> Result<(), String> {
-        println!("✓ Created composite index on '{}.{}'", model_name, fields.join(", "));
+        println!(
+            "✓ Created composite index on '{}.{}'",
+            model_name,
+            fields.join(", ")
+        );
         Ok(())
     }
 
@@ -294,7 +360,11 @@ impl MigrationExecutor {
         model_name: &str,
         fields: &[String],
     ) -> Result<(), String> {
-        println!("✓ Dropped composite index from '{}.{}'", model_name, fields.join(", "));
+        println!(
+            "✓ Dropped composite index from '{}.{}'",
+            model_name,
+            fields.join(", ")
+        );
         Ok(())
     }
 

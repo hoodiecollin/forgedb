@@ -86,8 +86,7 @@ impl Server {
         let app = self.apply_middleware(router);
 
         // Build address
-        let addr = format!("{}:{}", self.config.host, self.config.port)
-            .parse::<SocketAddr>()?;
+        let addr = format!("{}:{}", self.config.host, self.config.port).parse::<SocketAddr>()?;
 
         tracing::info!("Server listening on http://{}", addr);
 

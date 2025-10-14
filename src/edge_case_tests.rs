@@ -2,8 +2,8 @@
 #[cfg(test)]
 mod edge_case_tests {
     use crate::ast::FieldType;
-    use crate::parser::Parser;
     use crate::codegen::CodeGenerator;
+    use crate::parser::Parser;
 
     // === Type Boundary Tests ===
 
@@ -31,7 +31,9 @@ Model {
         let mut parser = Parser::new(input).unwrap();
         let result = parser.parse();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Auto-generate symbol '+' cannot be used"));
+        assert!(result
+            .unwrap_err()
+            .contains("Auto-generate symbol '+' cannot be used"));
     }
 
     #[test]
@@ -268,12 +270,24 @@ Model {
         // Check auto-generated fields are NOT in insert params
         // (they should be in the struct, but not as function parameters)
         let insert_start = code.find("pub fn insert").expect("insert method not found");
-        let insert_end = code[insert_start..].find("-> Result").expect("Result not found") + insert_start;
+        let insert_end = code[insert_start..]
+            .find("-> Result")
+            .expect("Result not found")
+            + insert_start;
         let insert_signature = &code[insert_start..insert_end];
 
-        assert!(!insert_signature.contains("id:"), "id should not be in insert params");
-        assert!(!insert_signature.contains("counter:"), "counter should not be in insert params");
-        assert!(!insert_signature.contains("created:"), "created should not be in insert params");
+        assert!(
+            !insert_signature.contains("id:"),
+            "id should not be in insert params"
+        );
+        assert!(
+            !insert_signature.contains("counter:"),
+            "counter should not be in insert params"
+        );
+        assert!(
+            !insert_signature.contains("created:"),
+            "created should not be in insert params"
+        );
 
         // Check non-auto fields ARE in params
         assert!(code.contains("name: String"));

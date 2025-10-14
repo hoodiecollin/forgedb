@@ -4,7 +4,9 @@ pub mod user_storage;
 pub use user_storage::{User, UserStorage};
 
 // Sprint 7: WAL re-exports
-pub use sinkdb_wal::{FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue};
+pub use sinkdb_wal::{
+    FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue,
+};
 
 // Sprint 2: Storage Persistence Implementation
 //
@@ -25,7 +27,7 @@ pub use sinkdb_wal::{FsyncPolicy, Transaction, TransactionId, WalEntry, WalManag
 //       string_offsets_0.bin # (offset, length) pairs (16 bytes per record)
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// Manifest stores metadata about the database
@@ -92,7 +94,10 @@ impl FixedColumn {
 
     pub fn read_u64(&mut self, index: usize) -> io::Result<u64> {
         if index >= self.row_count {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
         }
 
         let offset = (index * self.value_size) as u64;
@@ -158,7 +163,8 @@ impl VariableColumn {
 
         // Write (offset, length) to offsets file
         self.offsets_file.seek(SeekFrom::End(0))?;
-        self.offsets_file.write_all(&self.current_data_offset.to_le_bytes())?;
+        self.offsets_file
+            .write_all(&self.current_data_offset.to_le_bytes())?;
         self.offsets_file.write_all(&length.to_le_bytes())?;
         self.offsets_file.sync_all()?;
 
@@ -170,7 +176,10 @@ impl VariableColumn {
 
     pub fn read_string(&mut self, index: usize) -> io::Result<String> {
         if index >= self.row_count {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
         }
 
         // Read offset and length from offsets file
@@ -190,8 +199,7 @@ impl VariableColumn {
         let mut data = vec![0u8; length as usize];
         self.data_file.read_exact(&mut data)?;
 
-        String::from_utf8(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     pub fn len(&self) -> usize {
@@ -232,7 +240,10 @@ impl Tombstones {
 
     pub fn is_deleted(&mut self, index: usize) -> io::Result<bool> {
         if index >= self.count {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
         }
 
         self.file.seek(SeekFrom::Start(index as u64))?;
@@ -281,7 +292,10 @@ impl Database {
     }
 
     /// Open database with WAL support
-    pub fn open_with_wal(root_path: PathBuf, fsync_policy: sinkdb_wal::FsyncPolicy) -> io::Result<Self> {
+    pub fn open_with_wal(
+        root_path: PathBuf,
+        fsync_policy: sinkdb_wal::FsyncPolicy,
+    ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
 
         let manifest_path = root_path.join("manifest.json");
@@ -350,15 +364,18 @@ impl Database {
     }
 
     pub fn fixed_column_path(&self, column_index: usize) -> PathBuf {
-        self.root_path.join(format!("fixed/u64_{}.bin", column_index))
+        self.root_path
+            .join(format!("fixed/u64_{}.bin", column_index))
     }
 
     pub fn variable_data_path(&self, column_index: usize) -> PathBuf {
-        self.root_path.join(format!("variable/string_data_{}.bin", column_index))
+        self.root_path
+            .join(format!("variable/string_data_{}.bin", column_index))
     }
 
     pub fn variable_offsets_path(&self, column_index: usize) -> PathBuf {
-        self.root_path.join(format!("variable/string_offsets_{}.bin", column_index))
+        self.root_path
+            .join(format!("variable/string_offsets_{}.bin", column_index))
     }
 
     pub fn tombstones_path(&self) -> PathBuf {

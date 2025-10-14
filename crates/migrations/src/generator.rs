@@ -44,14 +44,18 @@ impl MigrationGenerator {
 
         // Verify checksum
         if !migration.verify_checksum() {
-            return Err("Migration file checksum verification failed - file may be corrupted".to_string());
+            return Err(
+                "Migration file checksum verification failed - file may be corrupted".to_string(),
+            );
         }
 
         Ok(migration)
     }
 
     /// Load all migrations from a directory
-    pub fn load_all_migrations<P: AsRef<Path>>(migrations_dir: P) -> Result<Vec<Migration>, String> {
+    pub fn load_all_migrations<P: AsRef<Path>>(
+        migrations_dir: P,
+    ) -> Result<Vec<Migration>, String> {
         let migrations_dir = migrations_dir.as_ref();
 
         if !migrations_dir.exists() {
@@ -85,8 +89,14 @@ impl MigrationGenerator {
     pub fn generate_report(migration: &Migration) -> String {
         let mut report = String::new();
 
-        report.push_str(&format!("Migration: {} ({})\n", migration.description, migration.id));
-        report.push_str(&format!("Created: {}\n", migration.created_at.format("%Y-%m-%d %H:%M:%S")));
+        report.push_str(&format!(
+            "Migration: {} ({})\n",
+            migration.description, migration.id
+        ));
+        report.push_str(&format!(
+            "Created: {}\n",
+            migration.created_at.format("%Y-%m-%d %H:%M:%S")
+        ));
         report.push_str(&format!("Changes: {}\n", migration.changes.len()));
 
         if migration.has_breaking_changes() {
@@ -136,7 +146,8 @@ mod tests {
             migrations_dir,
             "Create User model".to_string(),
             changes.clone(),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(migration.changes.len(), 2);
         assert_eq!(migration.description, "Create User model");

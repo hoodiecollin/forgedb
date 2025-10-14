@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug)]
 pub enum ApiError {
     /// Validation error (400)
-    ValidationError { message: String, details: Vec<ErrorDetail> },
+    ValidationError {
+        message: String,
+        details: Vec<ErrorDetail>,
+    },
     /// Resource not found (404)
     NotFound { resource: String, id: String },
     /// Conflict - unique constraint violation (409)

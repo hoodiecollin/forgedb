@@ -1,4 +1,7 @@
-use crate::ast::{ConstraintParam, Field, FieldType, IndexType, ManyToManyRelation, Model, RelationType, Schema, Struct};
+use crate::ast::{
+    ConstraintParam, Field, FieldType, IndexType, ManyToManyRelation, Model, RelationType, Schema,
+    Struct,
+};
 
 pub struct CodeGenerator;
 
@@ -15,9 +18,11 @@ impl CodeGenerator {
 
     /// Check if a field is virtual (OneToMany or ManyToMany) and doesn't need storage
     fn is_virtual_field(field: &Field) -> bool {
-        matches!(&field.field_type,
-            FieldType::Relation(RelationType::OneToMany(_)) |
-            FieldType::Relation(RelationType::ManyToMany(_)))
+        matches!(
+            &field.field_type,
+            FieldType::Relation(RelationType::OneToMany(_))
+                | FieldType::Relation(RelationType::ManyToMany(_))
+        )
     }
 
     /// Generate struct definition (Sprint 8)
@@ -44,7 +49,11 @@ impl CodeGenerator {
             if i > 0 {
                 code.push_str(", ");
             }
-            code.push_str(&format!("{}: {}", field.name, field.field_type.to_rust_type()));
+            code.push_str(&format!(
+                "{}: {}",
+                field.name,
+                field.field_type.to_rust_type()
+            ));
         }
         code.push_str(") -> Self {\n");
         code.push_str(&format!("        {} {{\n", struct_def.name));
@@ -69,9 +78,10 @@ impl CodeGenerator {
             FieldType::Relation(RelationType::RequiredReference(_)) => {
                 (format!("{}_id", field.name), "uuid::Uuid".to_string())
             }
-            FieldType::Relation(RelationType::OptionalReference(_)) => {
-                (format!("{}_id", field.name), "Option<uuid::Uuid>".to_string())
-            }
+            FieldType::Relation(RelationType::OptionalReference(_)) => (
+                format!("{}_id", field.name),
+                "Option<uuid::Uuid>".to_string(),
+            ),
             _ => (field.name.clone(), field.field_type.to_rust_type()),
         };
 
@@ -100,9 +110,7 @@ impl CodeGenerator {
 
     /// Generate computed field trait for a model (Sprint 12)
     fn generate_computed_trait(&self, model: &Model) -> String {
-        let computed_fields: Vec<&Field> = model.fields.iter()
-            .filter(|f| f.is_computed)
-            .collect();
+        let computed_fields: Vec<&Field> = model.fields.iter().filter(|f| f.is_computed).collect();
 
         if computed_fields.is_empty() {
             return String::new();
@@ -117,24 +125,34 @@ impl CodeGenerator {
             // Determine parameters based on field dependencies
             // For now, we pass a reference to the entire model instance
             code.push_str(&format!("    /// Compute the value of '{}'\n", field.name));
-            code.push_str(&format!("    fn {}(instance: &{}) -> {};\n",
+            code.push_str(&format!(
+                "    fn {}(instance: &{}) -> {};\n",
                 field.name,
                 model.name,
-                field.field_type.to_rust_type()));
+                field.field_type.to_rust_type()
+            ));
         }
 
         code.push_str("}\n\n");
 
         // Generate a default stub implementation
-        code.push_str(&format!("/// Default stub implementation for {}Computed\n", model.name));
+        code.push_str(&format!(
+            "/// Default stub implementation for {}Computed\n",
+            model.name
+        ));
         code.push_str(&format!("pub struct Default{}Computed;\n\n", model.name));
-        code.push_str(&format!("impl {}Computed for Default{}Computed {{\n", model.name, model.name));
+        code.push_str(&format!(
+            "impl {}Computed for Default{}Computed {{\n",
+            model.name, model.name
+        ));
 
         for field in &computed_fields {
-            code.push_str(&format!("    fn {}(instance: &{}) -> {} {{\n",
+            code.push_str(&format!(
+                "    fn {}(instance: &{}) -> {} {{\n",
                 field.name,
                 model.name,
-                field.field_type.to_rust_type()));
+                field.field_type.to_rust_type()
+            ));
             code.push_str("        // TODO: Implement computation logic\n");
 
             // Generate a placeholder return value based on type
@@ -178,9 +196,10 @@ impl CodeGenerator {
                 FieldType::Relation(RelationType::RequiredReference(_)) => {
                     (format!("{}_id", field.name), "uuid::Uuid".to_string())
                 }
-                FieldType::Relation(RelationType::OptionalReference(_)) => {
-                    (format!("{}_id", field.name), "Option<uuid::Uuid>".to_string())
-                }
+                FieldType::Relation(RelationType::OptionalReference(_)) => (
+                    format!("{}_id", field.name),
+                    "Option<uuid::Uuid>".to_string(),
+                ),
                 _ => (field.name.clone(), field.field_type.to_rust_type()),
             };
 
@@ -189,15 +208,19 @@ impl CodeGenerator {
 
             if field.unique {
                 // Unique index (& symbol) - maps value to single row index
-                code.push_str(&format!("    {}_index: std::collections::HashMap<{}, usize>,\n",
-                    field_name, field_type));
+                code.push_str(&format!(
+                    "    {}_index: std::collections::HashMap<{}, usize>,\n",
+                    field_name, field_type
+                ));
             } else if field.indexed || is_fk {
                 // Indexed fields use either Hash or BTree based on field type
                 match field.index_type {
                     IndexType::Hash => {
                         // Hash index for unordered types
-                        code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
-                            field_name, field_type));
+                        code.push_str(&format!(
+                            "    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                            field_name, field_type
+                        ));
                     }
                     IndexType::BTree => {
                         // B-tree index for ordered types (supports range queries)
@@ -206,8 +229,10 @@ impl CodeGenerator {
                         } else {
                             field_type.clone()
                         };
-                        code.push_str(&format!("    {}_btree: std::collections::BTreeMap<{}, Vec<usize>>,\n",
-                            field_name, btree_key_type));
+                        code.push_str(&format!(
+                            "    {}_btree: std::collections::BTreeMap<{}, Vec<usize>>,\n",
+                            field_name, btree_key_type
+                        ));
                     }
                 }
             }
@@ -216,11 +241,12 @@ impl CodeGenerator {
         // Add composite indexes
         for comp_idx in &model.composite_indexes {
             let index_name = comp_idx.fields.join("_");
-            let field_types: Vec<String> = comp_idx.fields.iter()
-                .filter_map(|fname| {
-                    model.fields.iter()
-                        .find(|f| &f.name == fname)
-                        .map(|f| {
+            let field_types: Vec<String> =
+                comp_idx
+                    .fields
+                    .iter()
+                    .filter_map(|fname| {
+                        model.fields.iter().find(|f| &f.name == fname).map(|f| {
                             match &f.field_type {
                                 FieldType::Relation(RelationType::RequiredReference(_)) => {
                                     "uuid::Uuid".to_string()
@@ -231,11 +257,13 @@ impl CodeGenerator {
                                 _ => f.field_type.to_rust_type(),
                             }
                         })
-                })
-                .collect();
+                    })
+                    .collect();
             let tuple_type = format!("({})", field_types.join(", "));
-            code.push_str(&format!("    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
-                index_name, tuple_type));
+            code.push_str(&format!(
+                "    {}_index: std::collections::HashMap<{}, Vec<usize>>,\n",
+                index_name, tuple_type
+            ));
         }
 
         // Add full-text search indexes (Sprint 18)
@@ -281,14 +309,23 @@ impl CodeGenerator {
             let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
             if field.unique {
-                code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+                code.push_str(&format!(
+                    "            {}_index: std::collections::HashMap::new(),\n",
+                    field_name
+                ));
             } else if field.indexed || is_fk {
                 match field.index_type {
                     IndexType::Hash => {
-                        code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", field_name));
+                        code.push_str(&format!(
+                            "            {}_index: std::collections::HashMap::new(),\n",
+                            field_name
+                        ));
                     }
                     IndexType::BTree => {
-                        code.push_str(&format!("            {}_btree: std::collections::BTreeMap::new(),\n", field_name));
+                        code.push_str(&format!(
+                            "            {}_btree: std::collections::BTreeMap::new(),\n",
+                            field_name
+                        ));
                     }
                 }
             }
@@ -297,7 +334,10 @@ impl CodeGenerator {
         // Initialize composite indexes
         for comp_idx in &model.composite_indexes {
             let index_name = comp_idx.fields.join("_");
-            code.push_str(&format!("            {}_index: std::collections::HashMap::new(),\n", index_name));
+            code.push_str(&format!(
+                "            {}_index: std::collections::HashMap::new(),\n",
+                index_name
+            ));
         }
 
         // Initialize full-text indexes (Sprint 18)
@@ -350,7 +390,9 @@ impl CodeGenerator {
     fn get_field_param_type(&self, field: &Field) -> String {
         match &field.field_type {
             FieldType::Relation(RelationType::RequiredReference(_)) => "uuid::Uuid".to_string(),
-            FieldType::Relation(RelationType::OptionalReference(_)) => "Option<uuid::Uuid>".to_string(),
+            FieldType::Relation(RelationType::OptionalReference(_)) => {
+                "Option<uuid::Uuid>".to_string()
+            }
             _ => field.field_type.to_rust_type(),
         }
     }
@@ -359,7 +401,8 @@ impl CodeGenerator {
         let mut code = String::new();
 
         // Email validation function
-        code.push_str(r#"fn validate_email(value: &str) -> Result<(), String> {
+        code.push_str(
+            r#"fn validate_email(value: &str) -> Result<(), String> {
     let email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$";
     if !regex::Regex::new(email_regex).unwrap().is_match(value) {
         return Err(format!("'{}' is not a valid email address", value));
@@ -367,10 +410,12 @@ impl CodeGenerator {
     Ok(())
 }
 
-"#);
+"#,
+        );
 
         // URL validation function
-        code.push_str(r#"fn validate_url(value: &str) -> Result<(), String> {
+        code.push_str(
+            r#"fn validate_url(value: &str) -> Result<(), String> {
     let url_regex = r"^https?://[^\s/$.?#].[^\s]*$";
     if !regex::Regex::new(url_regex).unwrap().is_match(value) {
         return Err(format!("'{}' is not a valid URL", value));
@@ -378,17 +423,20 @@ impl CodeGenerator {
     Ok(())
 }
 
-"#);
+"#,
+        );
 
         // Pattern validation function (generic)
-        code.push_str(r#"fn validate_pattern(value: &str, pattern: &str) -> Result<(), String> {
+        code.push_str(
+            r#"fn validate_pattern(value: &str, pattern: &str) -> Result<(), String> {
     if !regex::Regex::new(pattern).unwrap().is_match(value) {
         return Err(format!("'{}' does not match required pattern", value));
     }
     Ok(())
 }
 
-"#);
+"#,
+        );
 
         code
     }
@@ -417,13 +465,19 @@ impl CodeGenerator {
                     if let Some(ConstraintParam::Number(min_val)) = constraint.params.first() {
                         match field.field_type {
                             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => {
-                                code.push_str(&format!("        if {} < {} {{\n", field.name, min_val));
+                                code.push_str(&format!(
+                                    "        if {} < {} {{\n",
+                                    field.name, min_val
+                                ));
                                 code.push_str(&format!("            return Err(\"Validation error: {} must be at least {}\".to_string());\n", field.name, min_val));
                                 code.push_str("        }\n");
                             }
                             FieldType::String => {
                                 // For strings, min means minimum length
-                                code.push_str(&format!("        if {}.len() < {} {{\n", field.name, min_val));
+                                code.push_str(&format!(
+                                    "        if {}.len() < {} {{\n",
+                                    field.name, min_val
+                                ));
                                 code.push_str(&format!("            return Err(\"Validation error: {} must be at least {} characters\".to_string());\n", field.name, min_val));
                                 code.push_str("        }\n");
                             }
@@ -435,13 +489,19 @@ impl CodeGenerator {
                     if let Some(ConstraintParam::Number(max_val)) = constraint.params.first() {
                         match field.field_type {
                             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => {
-                                code.push_str(&format!("        if {} > {} {{\n", field.name, max_val));
+                                code.push_str(&format!(
+                                    "        if {} > {} {{\n",
+                                    field.name, max_val
+                                ));
                                 code.push_str(&format!("            return Err(\"Validation error: {} must be at most {}\".to_string());\n", field.name, max_val));
                                 code.push_str("        }\n");
                             }
                             FieldType::String => {
                                 // For strings, max means maximum length
-                                code.push_str(&format!("        if {}.len() > {} {{\n", field.name, max_val));
+                                code.push_str(&format!(
+                                    "        if {}.len() > {} {{\n",
+                                    field.name, max_val
+                                ));
                                 code.push_str(&format!("            return Err(\"Validation error: {} must be at most {} characters\".to_string());\n", field.name, max_val));
                                 code.push_str("        }\n");
                             }
@@ -452,7 +512,10 @@ impl CodeGenerator {
                 "pattern" => {
                     if let Some(ConstraintParam::String(pattern)) = constraint.params.first() {
                         if matches!(field.field_type, FieldType::String) {
-                            code.push_str(&format!("        validate_pattern(&{}, \"{}\")?;\n", field.name, pattern));
+                            code.push_str(&format!(
+                                "        validate_pattern(&{}, \"{}\")?;\n",
+                                field.name, pattern
+                            ));
                         }
                     }
                 }
@@ -498,7 +561,10 @@ impl CodeGenerator {
 
         // Check unique constraints
         for field in &unique_fields {
-            code.push_str(&format!("        if self.{}_index.contains_key(&{}) {{\n", field.name, field.name));
+            code.push_str(&format!(
+                "        if self.{}_index.contains_key(&{}) {{\n",
+                field.name, field.name
+            ));
             code.push_str(&format!("            return Err(\"Unique constraint violation: {} already exists\".to_string());\n", field.name));
             code.push_str("        }\n");
         }
@@ -546,8 +612,10 @@ impl CodeGenerator {
 
             if field.unique {
                 // Unique index: map value to single row index
-                code.push_str(&format!("        self.{}_index.insert(record.{}.clone(), row_index);\n",
-                    field_name, field_name));
+                code.push_str(&format!(
+                    "        self.{}_index.insert(record.{}.clone(), row_index);\n",
+                    field_name, field_name
+                ));
             } else if field.indexed || is_fk {
                 match field.index_type {
                     IndexType::Hash => {
@@ -572,7 +640,9 @@ impl CodeGenerator {
         // Add to composite indexes
         for comp_idx in &model.composite_indexes {
             let index_name = comp_idx.fields.join("_");
-            let field_values: Vec<String> = comp_idx.fields.iter()
+            let field_values: Vec<String> = comp_idx
+                .fields
+                .iter()
                 .map(|fname| {
                     let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                     let field_name = self.get_field_param_name(field);
@@ -580,8 +650,10 @@ impl CodeGenerator {
                 })
                 .collect();
             let tuple_value = format!("({})", field_values.join(", "));
-            code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(row_index);\n",
-                index_name, tuple_value));
+            code.push_str(&format!(
+                "        self.{}_index.entry({}).or_insert_with(Vec::new).push(row_index);\n",
+                index_name, tuple_value
+            ));
         }
 
         // Add to full-text indexes (Sprint 18)
@@ -610,8 +682,12 @@ impl CodeGenerator {
         let id_field = model.fields.iter().find(|f| f.auto_generate);
 
         if let Some(id_field) = id_field {
-            code.push_str(&format!("    pub fn get(&self, {}: {}) -> Option<{}> {{\n",
-                id_field.name, id_field.field_type.to_rust_type(), model.name));
+            code.push_str(&format!(
+                "    pub fn get(&self, {}: {}) -> Option<{}> {{\n",
+                id_field.name,
+                id_field.field_type.to_rust_type(),
+                model.name
+            ));
             code.push_str("        self.records.iter().enumerate()\n");
             code.push_str("            .find(|(i, r)| !self.tombstones[*i] && r.");
             code.push_str(&format!("{} == {})\n", id_field.name, id_field.name));
@@ -634,12 +710,17 @@ impl CodeGenerator {
                 let param_type = self.get_field_param_type(field);
                 let method_name = format!("find_by_{}", param_name);
 
-                code.push_str(&format!("    pub fn {}(&self, {}: {}) -> Vec<{}> {{\n",
-                    method_name, param_name, param_type, model.name));
+                code.push_str(&format!(
+                    "    pub fn {}(&self, {}: {}) -> Vec<{}> {{\n",
+                    method_name, param_name, param_type, model.name
+                ));
 
                 if field.unique {
                     // Unique index: O(1) lookup, returns 0 or 1 results
-                    code.push_str(&format!("        if let Some(&idx) = self.{}_index.get(&{}) {{\n", param_name, param_name));
+                    code.push_str(&format!(
+                        "        if let Some(&idx) = self.{}_index.get(&{}) {{\n",
+                        param_name, param_name
+                    ));
                     code.push_str("            if !self.tombstones[idx] {\n");
                     code.push_str("                return vec![self.records[idx].clone()];\n");
                     code.push_str("            }\n");
@@ -649,10 +730,17 @@ impl CodeGenerator {
                     match field.index_type {
                         IndexType::Hash => {
                             // Hash index: O(1) lookup, may return multiple results
-                            code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", param_name, param_name));
+                            code.push_str(&format!(
+                                "        if let Some(indices) = self.{}_index.get(&{}) {{\n",
+                                param_name, param_name
+                            ));
                             code.push_str("            return indices.iter()\n");
-                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
-                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str(
+                                "                .filter(|&&idx| !self.tombstones[idx])\n",
+                            );
+                            code.push_str(
+                                "                .map(|&idx| self.records[idx].clone())\n",
+                            );
                             code.push_str("                .collect();\n");
                             code.push_str("        }\n");
                             code.push_str("        Vec::new()\n");
@@ -662,11 +750,18 @@ impl CodeGenerator {
                             if matches!(field.field_type, FieldType::F64) {
                                 code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&ordered_float::OrderedFloat({})) {{\n", param_name, param_name));
                             } else {
-                                code.push_str(&format!("        if let Some(indices) = self.{}_btree.get(&{}) {{\n", param_name, param_name));
+                                code.push_str(&format!(
+                                    "        if let Some(indices) = self.{}_btree.get(&{}) {{\n",
+                                    param_name, param_name
+                                ));
                             }
                             code.push_str("            return indices.iter()\n");
-                            code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
-                            code.push_str("                .map(|&idx| self.records[idx].clone())\n");
+                            code.push_str(
+                                "                .filter(|&&idx| !self.tombstones[idx])\n",
+                            );
+                            code.push_str(
+                                "                .map(|&idx| self.records[idx].clone())\n",
+                            );
                             code.push_str("                .collect();\n");
                             code.push_str("        }\n");
                             code.push_str("        Vec::new()\n");
@@ -694,13 +789,18 @@ impl CodeGenerator {
         let param_type = self.get_field_param_type(field);
 
         // find_by_X_range(min, max)
-        code.push_str(&format!("    pub fn find_by_{}_range(&self, min: {}, max: {}) -> Vec<{}> {{\n",
-            param_name, param_type, param_type, model.name));
+        code.push_str(&format!(
+            "    pub fn find_by_{}_range(&self, min: {}, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, param_type, model.name
+        ));
         code.push_str("        let mut results = Vec::new();\n");
         if matches!(field.field_type, FieldType::F64) {
             code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..=ordered_float::OrderedFloat(max)) {{\n", param_name));
         } else {
-            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..=max) {{\n", param_name));
+            code.push_str(&format!(
+                "        for (_key, indices) in self.{}_btree.range(min..=max) {{\n",
+                param_name
+            ));
         }
         code.push_str("            for &idx in indices {\n");
         code.push_str("                if !self.tombstones[idx] {\n");
@@ -712,8 +812,10 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
 
         // find_by_X_gt(min) - greater than
-        code.push_str(&format!("    pub fn find_by_{}_gt(&self, min: {}) -> Vec<{}> {{\n",
-            param_name, param_type, model.name));
+        code.push_str(&format!(
+            "    pub fn find_by_{}_gt(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name
+        ));
         code.push_str("        let mut results = Vec::new();\n");
         if matches!(field.field_type, FieldType::F64) {
             code.push_str(&format!("        for (_key, indices) in self.{}_btree.range((std::ops::Bound::Excluded(ordered_float::OrderedFloat(min)), std::ops::Bound::Unbounded)) {{\n", param_name));
@@ -730,13 +832,18 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
 
         // find_by_X_gte(min) - greater than or equal
-        code.push_str(&format!("    pub fn find_by_{}_gte(&self, min: {}) -> Vec<{}> {{\n",
-            param_name, param_type, model.name));
+        code.push_str(&format!(
+            "    pub fn find_by_{}_gte(&self, min: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name
+        ));
         code.push_str("        let mut results = Vec::new();\n");
         if matches!(field.field_type, FieldType::F64) {
             code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(ordered_float::OrderedFloat(min)..) {{\n", param_name));
         } else {
-            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(min..) {{\n", param_name));
+            code.push_str(&format!(
+                "        for (_key, indices) in self.{}_btree.range(min..) {{\n",
+                param_name
+            ));
         }
         code.push_str("            for &idx in indices {\n");
         code.push_str("                if !self.tombstones[idx] {\n");
@@ -748,13 +855,18 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
 
         // find_by_X_lt(max) - less than
-        code.push_str(&format!("    pub fn find_by_{}_lt(&self, max: {}) -> Vec<{}> {{\n",
-            param_name, param_type, model.name));
+        code.push_str(&format!(
+            "    pub fn find_by_{}_lt(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name
+        ));
         code.push_str("        let mut results = Vec::new();\n");
         if matches!(field.field_type, FieldType::F64) {
             code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..ordered_float::OrderedFloat(max)) {{\n", param_name));
         } else {
-            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..max) {{\n", param_name));
+            code.push_str(&format!(
+                "        for (_key, indices) in self.{}_btree.range(..max) {{\n",
+                param_name
+            ));
         }
         code.push_str("            for &idx in indices {\n");
         code.push_str("                if !self.tombstones[idx] {\n");
@@ -766,13 +878,18 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
 
         // find_by_X_lte(max) - less than or equal
-        code.push_str(&format!("    pub fn find_by_{}_lte(&self, max: {}) -> Vec<{}> {{\n",
-            param_name, param_type, model.name));
+        code.push_str(&format!(
+            "    pub fn find_by_{}_lte(&self, max: {}) -> Vec<{}> {{\n",
+            param_name, param_type, model.name
+        ));
         code.push_str("        let mut results = Vec::new();\n");
         if matches!(field.field_type, FieldType::F64) {
             code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=ordered_float::OrderedFloat(max)) {{\n", param_name));
         } else {
-            code.push_str(&format!("        for (_key, indices) in self.{}_btree.range(..=max) {{\n", param_name));
+            code.push_str(&format!(
+                "        for (_key, indices) in self.{}_btree.range(..=max) {{\n",
+                param_name
+            ));
         }
         code.push_str("            for &idx in indices {\n");
         code.push_str("                if !self.tombstones[idx] {\n");
@@ -784,12 +901,27 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
     }
 
-    fn generate_composite_find_by_method(&self, code: &mut String, comp_idx: &crate::ast::CompositeIndex, model: &Model) {
-        let method_name = format!("find_by_{}", comp_idx.fields.iter().map(|f| format!("{}", f)).collect::<Vec<_>>().join("_and_"));
+    fn generate_composite_find_by_method(
+        &self,
+        code: &mut String,
+        comp_idx: &crate::ast::CompositeIndex,
+        model: &Model,
+    ) {
+        let method_name = format!(
+            "find_by_{}",
+            comp_idx
+                .fields
+                .iter()
+                .map(|f| format!("{}", f))
+                .collect::<Vec<_>>()
+                .join("_and_")
+        );
         let index_name = comp_idx.fields.join("_");
 
         // Generate parameters
-        let params: Vec<String> = comp_idx.fields.iter()
+        let params: Vec<String> = comp_idx
+            .fields
+            .iter()
             .map(|fname| {
                 let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                 let param_name = self.get_field_param_name(field);
@@ -798,11 +930,17 @@ impl CodeGenerator {
             })
             .collect();
 
-        code.push_str(&format!("    pub fn {}(&self, {}) -> Vec<{}> {{\n",
-            method_name, params.join(", "), model.name));
+        code.push_str(&format!(
+            "    pub fn {}(&self, {}) -> Vec<{}> {{\n",
+            method_name,
+            params.join(", "),
+            model.name
+        ));
 
         // Generate tuple key
-        let tuple_values: Vec<String> = comp_idx.fields.iter()
+        let tuple_values: Vec<String> = comp_idx
+            .fields
+            .iter()
             .map(|fname| {
                 let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                 self.get_field_param_name(field)
@@ -810,7 +948,10 @@ impl CodeGenerator {
             .collect();
         let tuple_key = format!("({})", tuple_values.join(", "));
 
-        code.push_str(&format!("        if let Some(indices) = self.{}_index.get(&{}) {{\n", index_name, tuple_key));
+        code.push_str(&format!(
+            "        if let Some(indices) = self.{}_index.get(&{}) {{\n",
+            index_name, tuple_key
+        ));
         code.push_str("            return indices.iter()\n");
         code.push_str("                .filter(|&&idx| !self.tombstones[idx])\n");
         code.push_str("                .map(|&idx| self.records[idx].clone())\n");
@@ -821,7 +962,10 @@ impl CodeGenerator {
     }
 
     fn generate_list_method(&self, code: &mut String, model: &Model) {
-        code.push_str(&format!("    pub fn list(&self) -> Vec<{}> {{\n", model.name));
+        code.push_str(&format!(
+            "    pub fn list(&self) -> Vec<{}> {{\n",
+            model.name
+        ));
         code.push_str("        self.records.iter().enumerate()\n");
         code.push_str("            .filter(|(i, _)| !self.tombstones[*i])\n");
         code.push_str("            .map(|(_, r)| r.clone())\n");
@@ -839,12 +983,20 @@ impl CodeGenerator {
                 if let Some(id_field) = id_field {
                     if matches!(id_field.field_type, FieldType::Uuid) {
                         // Generate search method
-                        code.push_str(&format!("    /// Full-text search on the '{}' field\n", field.name));
-                        code.push_str(&format!("    pub fn search_{}(&self, query: &str) -> Vec<{}> {{\n", field.name, model.name));
+                        code.push_str(&format!(
+                            "    /// Full-text search on the '{}' field\n",
+                            field.name
+                        ));
+                        code.push_str(&format!(
+                            "    pub fn search_{}(&self, query: &str) -> Vec<{}> {{\n",
+                            field.name, model.name
+                        ));
                         code.push_str(&format!("        let matches = self.{}_fulltext.read().unwrap().search(query);\n", field.name));
                         code.push_str("        let mut results = Vec::new();\n");
                         code.push_str("        for doc_match in matches {\n");
-                        code.push_str("            if let Some(record) = self.records.iter().enumerate()\n");
+                        code.push_str(
+                            "            if let Some(record) = self.records.iter().enumerate()\n",
+                        );
                         code.push_str(&format!("                .find(|(i, r)| !self.tombstones[*i] && r.{} == doc_match.doc_id)\n", id_field.name));
                         code.push_str("                .map(|(_, r)| r.clone()) {\n");
                         code.push_str("                results.push(record);\n");
@@ -854,12 +1006,20 @@ impl CodeGenerator {
                         code.push_str("    }\n\n");
 
                         // Generate phrase search method
-                        code.push_str(&format!("    /// Phrase search on the '{}' field\n", field.name));
-                        code.push_str(&format!("    pub fn search_{}_phrase(&self, phrase: &str) -> Vec<{}> {{\n", field.name, model.name));
+                        code.push_str(&format!(
+                            "    /// Phrase search on the '{}' field\n",
+                            field.name
+                        ));
+                        code.push_str(&format!(
+                            "    pub fn search_{}_phrase(&self, phrase: &str) -> Vec<{}> {{\n",
+                            field.name, model.name
+                        ));
                         code.push_str(&format!("        let matches = self.{}_fulltext.read().unwrap().search_phrase(phrase);\n", field.name));
                         code.push_str("        let mut results = Vec::new();\n");
                         code.push_str("        for doc_match in matches {\n");
-                        code.push_str("            if let Some(record) = self.records.iter().enumerate()\n");
+                        code.push_str(
+                            "            if let Some(record) = self.records.iter().enumerate()\n",
+                        );
                         code.push_str(&format!("                .find(|(i, r)| !self.tombstones[*i] && r.{} == doc_match.doc_id)\n", id_field.name));
                         code.push_str("                .map(|(_, r)| r.clone()) {\n");
                         code.push_str("                results.push(record);\n");
@@ -878,7 +1038,11 @@ impl CodeGenerator {
         let id_field = model.fields.iter().find(|f| f.auto_generate);
 
         if let Some(id_field) = id_field {
-            code.push_str(&format!("    pub fn update(&mut self, {}: {}", id_field.name, id_field.field_type.to_rust_type()));
+            code.push_str(&format!(
+                "    pub fn update(&mut self, {}: {}",
+                id_field.name,
+                id_field.field_type.to_rust_type()
+            ));
 
             // Parameters: all non-auto-generated, non-virtual fields
             for field in &model.fields {
@@ -897,7 +1061,10 @@ impl CodeGenerator {
 
             // Find the record
             code.push_str("        let idx = self.records.iter().enumerate()\n");
-            code.push_str(&format!("            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n", id_field.name, id_field.name));
+            code.push_str(&format!(
+                "            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n",
+                id_field.name, id_field.name
+            ));
             code.push_str("            .map(|(i, _)| i)\n");
             code.push_str("            .ok_or_else(|| \"Record not found\".to_string())?;\n\n");
 
@@ -908,10 +1075,14 @@ impl CodeGenerator {
                 }
 
                 let param_name = self.get_field_param_name(field);
-                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+                let is_fk =
+                    matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
+                    code.push_str(&format!(
+                        "        self.{}_index.remove(&self.records[idx].{});\n",
+                        param_name, param_name
+                    ));
                 } else if field.indexed || is_fk {
                     match field.index_type {
                         IndexType::Hash => {
@@ -935,7 +1106,9 @@ impl CodeGenerator {
             // Remove old values from composite indexes
             for comp_idx in &model.composite_indexes {
                 let index_name = comp_idx.fields.join("_");
-                let old_tuple_values: Vec<String> = comp_idx.fields.iter()
+                let old_tuple_values: Vec<String> = comp_idx
+                    .fields
+                    .iter()
                     .map(|fname| {
                         let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                         let field_name = self.get_field_param_name(field);
@@ -943,7 +1116,10 @@ impl CodeGenerator {
                     })
                     .collect();
                 let old_tuple = format!("({})", old_tuple_values.join(", "));
-                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, old_tuple));
+                code.push_str(&format!(
+                    "        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n",
+                    index_name, old_tuple
+                ));
                 code.push_str("            indices.retain(|&i| i != idx);\n");
                 code.push_str("        }\n");
             }
@@ -961,7 +1137,10 @@ impl CodeGenerator {
 
             // Update record
             code.push_str(&format!("        self.records[idx] = {} {{\n", model.name));
-            code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", id_field.name, id_field.name));
+            code.push_str(&format!(
+                "            {}: self.records[idx].{}.clone(),\n",
+                id_field.name, id_field.name
+            ));
             for field in &model.fields {
                 if Self::is_virtual_field(field) {
                     continue;
@@ -969,7 +1148,10 @@ impl CodeGenerator {
 
                 if field.auto_generate && field.name != id_field.name {
                     // Preserve auto-generated fields (except ID which is already handled)
-                    code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", field.name, field.name));
+                    code.push_str(&format!(
+                        "            {}: self.records[idx].{}.clone(),\n",
+                        field.name, field.name
+                    ));
                 } else if !field.auto_generate {
                     // Use parameter values for non-auto-generated fields
                     let param_name = self.get_field_param_name(field);
@@ -985,10 +1167,14 @@ impl CodeGenerator {
                 }
 
                 let param_name = self.get_field_param_name(field);
-                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+                let is_fk =
+                    matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n", param_name, param_name));
+                    code.push_str(&format!(
+                        "        self.{}_index.insert(self.records[idx].{}.clone(), idx);\n",
+                        param_name, param_name
+                    ));
                 } else if field.indexed || is_fk {
                     match field.index_type {
                         IndexType::Hash => {
@@ -1011,7 +1197,9 @@ impl CodeGenerator {
             // Add new values to composite indexes
             for comp_idx in &model.composite_indexes {
                 let index_name = comp_idx.fields.join("_");
-                let new_tuple_values: Vec<String> = comp_idx.fields.iter()
+                let new_tuple_values: Vec<String> = comp_idx
+                    .fields
+                    .iter()
                     .map(|fname| {
                         let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                         let field_name = self.get_field_param_name(field);
@@ -1019,8 +1207,10 @@ impl CodeGenerator {
                     })
                     .collect();
                 let new_tuple = format!("({})", new_tuple_values.join(", "));
-                code.push_str(&format!("        self.{}_index.entry({}).or_insert_with(Vec::new).push(idx);\n",
-                    index_name, new_tuple));
+                code.push_str(&format!(
+                    "        self.{}_index.entry({}).or_insert_with(Vec::new).push(idx);\n",
+                    index_name, new_tuple
+                ));
             }
 
             code.push_str("        Ok(self.records[idx].clone())\n");
@@ -1032,12 +1222,18 @@ impl CodeGenerator {
         let id_field = model.fields.iter().find(|f| f.auto_generate);
 
         if let Some(id_field) = id_field {
-            code.push_str(&format!("    pub fn delete(&mut self, {}: {}) -> Result<(), String> {{\n",
-                id_field.name, id_field.field_type.to_rust_type()));
+            code.push_str(&format!(
+                "    pub fn delete(&mut self, {}: {}) -> Result<(), String> {{\n",
+                id_field.name,
+                id_field.field_type.to_rust_type()
+            ));
 
             // Find the record
             code.push_str("        let idx = self.records.iter().enumerate()\n");
-            code.push_str(&format!("            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n", id_field.name, id_field.name));
+            code.push_str(&format!(
+                "            .find(|(i, r)| !self.tombstones[*i] && r.{} == {})\n",
+                id_field.name, id_field.name
+            ));
             code.push_str("            .map(|(i, _)| i)\n");
             code.push_str("            .ok_or_else(|| \"Record not found\".to_string())?;\n\n");
 
@@ -1051,10 +1247,14 @@ impl CodeGenerator {
                 }
 
                 let param_name = self.get_field_param_name(field);
-                let is_fk = matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
+                let is_fk =
+                    matches!(&field.field_type, FieldType::Relation(rel) if rel.is_reference());
 
                 if field.unique {
-                    code.push_str(&format!("        self.{}_index.remove(&self.records[idx].{});\n", param_name, param_name));
+                    code.push_str(&format!(
+                        "        self.{}_index.remove(&self.records[idx].{});\n",
+                        param_name, param_name
+                    ));
                 } else if field.indexed || is_fk {
                     match field.index_type {
                         IndexType::Hash => {
@@ -1078,7 +1278,9 @@ impl CodeGenerator {
             // Remove from composite indexes
             for comp_idx in &model.composite_indexes {
                 let index_name = comp_idx.fields.join("_");
-                let tuple_values: Vec<String> = comp_idx.fields.iter()
+                let tuple_values: Vec<String> = comp_idx
+                    .fields
+                    .iter()
                     .map(|fname| {
                         let field = model.fields.iter().find(|f| &f.name == fname).unwrap();
                         let field_name = self.get_field_param_name(field);
@@ -1086,7 +1288,10 @@ impl CodeGenerator {
                     })
                     .collect();
                 let tuple = format!("({})", tuple_values.join(", "));
-                code.push_str(&format!("        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n", index_name, tuple));
+                code.push_str(&format!(
+                    "        if let Some(indices) = self.{}_index.get_mut(&{}) {{\n",
+                    index_name, tuple
+                ));
                 code.push_str("            indices.retain(|&i| i != idx);\n");
                 code.push_str("        }\n");
             }
@@ -1098,9 +1303,7 @@ impl CodeGenerator {
 
     /// Generate helper methods for computed fields (Sprint 12)
     fn generate_computed_accessors(&self, code: &mut String, model: &Model) {
-        let computed_fields: Vec<&Field> = model.fields.iter()
-            .filter(|f| f.is_computed)
-            .collect();
+        let computed_fields: Vec<&Field> = model.fields.iter().filter(|f| f.is_computed).collect();
 
         if computed_fields.is_empty() {
             return;
@@ -1111,26 +1314,36 @@ impl CodeGenerator {
         let id_field = model.fields.iter().find(|f| f.auto_generate);
         if let Some(id_field) = id_field {
             code.push_str(&format!("    /// Get a record with its computed fields\n"));
-            code.push_str(&format!("    pub fn get_with_computed<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
+            code.push_str(&format!(
+                "    pub fn get_with_computed<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
                 model.name,
                 id_field.name,
                 id_field.field_type.to_rust_type(),
-                model.name));
+                model.name
+            ));
 
             code.push_str(&format!("        self.get({})\n", id_field.name));
             code.push_str("    }\n\n");
 
             // Generate a method to compute a specific field value
             for field in &computed_fields {
-                code.push_str(&format!("    /// Compute the value of '{}' for a record\n", field.name));
-                code.push_str(&format!("    pub fn compute_{}<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
+                code.push_str(&format!(
+                    "    /// Compute the value of '{}' for a record\n",
+                    field.name
+                ));
+                code.push_str(&format!(
+                    "    pub fn compute_{}<C: {}Computed>(&self, {}: {}) -> Option<{}> {{\n",
                     field.name,
                     model.name,
                     id_field.name,
                     id_field.field_type.to_rust_type(),
-                    field.field_type.to_rust_type()));
+                    field.field_type.to_rust_type()
+                ));
 
-                code.push_str(&format!("        self.get({}).map(|record| C::{}(&record))\n", id_field.name, field.name));
+                code.push_str(&format!(
+                    "        self.get({}).map(|record| C::{}(&record))\n",
+                    id_field.name, field.name
+                ));
                 code.push_str("    }\n\n");
             }
         }
@@ -1141,8 +1354,11 @@ impl CodeGenerator {
 
         code.push_str("pub struct Database {\n");
         for model in &schema.models {
-            code.push_str(&format!("    pub {}: {}Storage,\n",
-                model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "    pub {}: {}Storage,\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
         code.push_str("}\n\n");
 
@@ -1150,8 +1366,11 @@ impl CodeGenerator {
         code.push_str("    pub fn new() -> Self {\n");
         code.push_str("        Database {\n");
         for model in &schema.models {
-            code.push_str(&format!("            {}: {}Storage::new(),\n",
-                model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "            {}: {}Storage::new(),\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
         code.push_str("        }\n");
         code.push_str("    }\n\n");
@@ -1173,9 +1392,16 @@ impl CodeGenerator {
         code
     }
 
-    fn generate_db_insert_with_fk_validation(&self, code: &mut String, model: &Model, _schema: &Schema) {
+    fn generate_db_insert_with_fk_validation(
+        &self,
+        code: &mut String,
+        model: &Model,
+        _schema: &Schema,
+    ) {
         // Find FK fields in this model
-        let fk_fields: Vec<&Field> = model.fields.iter()
+        let fk_fields: Vec<&Field> = model
+            .fields
+            .iter()
             .filter(|f| matches!(&f.field_type, FieldType::Relation(rel) if rel.is_reference()))
             .collect();
 
@@ -1210,13 +1436,19 @@ impl CodeGenerator {
 
                 match rel {
                     RelationType::RequiredReference(_) => {
-                        code.push_str(&format!("        if self.{}.get({}).is_none() {{\n", storage_name, fk_param));
+                        code.push_str(&format!(
+                            "        if self.{}.get({}).is_none() {{\n",
+                            storage_name, fk_param
+                        ));
                         code.push_str(&format!("            return Err(\"Foreign key validation failed: {} does not exist\".to_string());\n", target_model));
                         code.push_str("        }\n");
                     }
                     RelationType::OptionalReference(_) => {
                         code.push_str(&format!("        if let Some(fk) = {} {{\n", fk_param));
-                        code.push_str(&format!("            if self.{}.get(fk).is_none() {{\n", storage_name));
+                        code.push_str(&format!(
+                            "            if self.{}.get(fk).is_none() {{\n",
+                            storage_name
+                        ));
                         code.push_str(&format!("                return Err(\"Foreign key validation failed: {} does not exist\".to_string());\n", target_model));
                         code.push_str("            }\n");
                         code.push_str("        }\n");
@@ -1227,7 +1459,10 @@ impl CodeGenerator {
         }
 
         // Call the underlying storage insert
-        code.push_str(&format!("        self.{}.insert(", model.name.to_lowercase()));
+        code.push_str(&format!(
+            "        self.{}.insert(",
+            model.name.to_lowercase()
+        ));
         let mut first = true;
         for field in &model.fields {
             if Self::is_virtual_field(field) {
@@ -1245,40 +1480,52 @@ impl CodeGenerator {
         code.push_str("    }\n\n");
     }
 
-    fn generate_relation_traversal_method(&self, code: &mut String, relation: &crate::ast::RelationPair, schema: &Schema) {
+    fn generate_relation_traversal_method(
+        &self,
+        code: &mut String,
+        relation: &crate::ast::RelationPair,
+        schema: &Schema,
+    ) {
         // Generate parent.children() method
         // e.g., user.posts() -> Vec<Post>
         let parent_storage = relation.parent_model.to_lowercase();
         let child_storage = relation.child_model.to_lowercase();
-        let method_name = format!("{}_{}",
-            parent_storage,
-            relation.parent_field); // e.g., user_posts
+        let method_name = format!("{}_{}", parent_storage, relation.parent_field); // e.g., user_posts
 
         let parent_model = schema.find_model(&relation.parent_model).unwrap();
-        let id_field = parent_model.fields.iter().find(|f| f.auto_generate).unwrap();
+        let id_field = parent_model
+            .fields
+            .iter()
+            .find(|f| f.auto_generate)
+            .unwrap();
 
-        code.push_str(&format!("    pub fn {}(&self, {}_id: {}) -> Vec<{}> {{\n",
+        code.push_str(&format!(
+            "    pub fn {}(&self, {}_id: {}) -> Vec<{}> {{\n",
             method_name,
             parent_storage,
             id_field.field_type.to_rust_type(),
-            relation.child_model));
+            relation.child_model
+        ));
 
-        code.push_str(&format!("        self.{}.find_by_{}_id({}_id)\n",
-            child_storage,
-            parent_storage,
-            parent_storage));
+        code.push_str(&format!(
+            "        self.{}.find_by_{}_id({}_id)\n",
+            child_storage, parent_storage, parent_storage
+        ));
 
         code.push_str("    }\n\n");
     }
 
-    fn generate_reverse_lookup_method(&self, code: &mut String, relation: &crate::ast::RelationPair, schema: &Schema) {
+    fn generate_reverse_lookup_method(
+        &self,
+        code: &mut String,
+        relation: &crate::ast::RelationPair,
+        schema: &Schema,
+    ) {
         // Generate child.parent() method
         // e.g., post.author() -> Option<User>
         let parent_storage = relation.parent_model.to_lowercase();
         let child_storage = relation.child_model.to_lowercase();
-        let method_name = format!("{}_{}",
-            child_storage,
-            relation.child_field); // e.g., post_author
+        let method_name = format!("{}_{}", child_storage, relation.child_field); // e.g., post_author
 
         let child_model = schema.find_model(&relation.child_model).unwrap();
         let id_field = child_model.fields.iter().find(|f| f.auto_generate).unwrap();
@@ -1289,19 +1536,23 @@ impl CodeGenerator {
             format!("Option<{}>", relation.parent_model)
         };
 
-        code.push_str(&format!("    pub fn {}(&self, {}_id: {}) -> {} {{\n",
+        code.push_str(&format!(
+            "    pub fn {}(&self, {}_id: {}) -> {} {{\n",
             method_name,
             child_storage,
             id_field.field_type.to_rust_type(),
-            return_type));
+            return_type
+        ));
 
-        code.push_str(&format!("        if let Some(child) = self.{}.get({}_id) {{\n",
-            child_storage,
-            child_storage));
+        code.push_str(&format!(
+            "        if let Some(child) = self.{}.get({}_id) {{\n",
+            child_storage, child_storage
+        ));
 
-        code.push_str(&format!("            return self.{}.get(child.{}_id);\n",
-            parent_storage,
-            relation.child_field));
+        code.push_str(&format!(
+            "            return self.{}.get(child.{}_id);\n",
+            parent_storage, relation.child_field
+        ));
 
         code.push_str("        }\n");
         code.push_str("        None\n");
@@ -1338,17 +1589,35 @@ impl CodeGenerator {
         // Junction record struct
         code.push_str(&format!("#[derive(Debug, Clone, PartialEq)]\n"));
         code.push_str(&format!("pub struct {} {{\n", junction_name));
-        code.push_str(&format!("    pub {}_id: {},\n", m2m.model1.to_lowercase(), id1_type));
-        code.push_str(&format!("    pub {}_id: {},\n", m2m.model2.to_lowercase(), id2_type));
+        code.push_str(&format!(
+            "    pub {}_id: {},\n",
+            m2m.model1.to_lowercase(),
+            id1_type
+        ));
+        code.push_str(&format!(
+            "    pub {}_id: {},\n",
+            m2m.model2.to_lowercase(),
+            id2_type
+        ));
         code.push_str("}\n\n");
 
         // Junction storage struct
         code.push_str(&format!("pub struct {}Storage {{\n", junction_name));
         code.push_str(&format!("    records: Vec<{}>,\n", junction_name));
-        code.push_str(&format!("    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), id1_type, id2_type));
-        code.push_str(&format!("    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
-            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), id2_type, id1_type));
+        code.push_str(&format!(
+            "    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            id1_type,
+            id2_type
+        ));
+        code.push_str(&format!(
+            "    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            id2_type,
+            id1_type
+        ));
         code.push_str("}\n\n");
 
         // Implementation
@@ -1358,19 +1627,33 @@ impl CodeGenerator {
         code.push_str("    pub fn new() -> Self {\n");
         code.push_str(&format!("        {}Storage {{\n", junction_name));
         code.push_str("            records: Vec::new(),\n");
-        code.push_str(&format!("            {}_to_{}_index: std::collections::HashMap::new(),\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
-        code.push_str(&format!("            {}_to_{}_index: std::collections::HashMap::new(),\n",
-            m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str(&format!(
+            "            {}_to_{}_index: std::collections::HashMap::new(),\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
+        code.push_str(&format!(
+            "            {}_to_{}_index: std::collections::HashMap::new(),\n",
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase()
+        ));
         code.push_str("        }\n");
         code.push_str("    }\n\n");
 
         // add_relation()
-        code.push_str(&format!("    pub fn add_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
-            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
+        code.push_str(&format!(
+            "    pub fn add_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
+            m2m.model1.to_lowercase(),
+            id1_type,
+            m2m.model2.to_lowercase(),
+            id2_type
+        ));
         code.push_str(&format!("        // Check if relation already exists\n"));
-        code.push_str(&format!("        if self.has_relation({}_id, {}_id) {{\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!(
+            "        if self.has_relation({}_id, {}_id) {{\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
         code.push_str("            return;\n");
         code.push_str("        }\n\n");
         code.push_str(&format!("        let record = {} {{\n", junction_name));
@@ -1378,50 +1661,114 @@ impl CodeGenerator {
         code.push_str(&format!("            {}_id,\n", m2m.model2.to_lowercase()));
         code.push_str("        };\n");
         code.push_str("        self.records.push(record);\n");
-        code.push_str(&format!("        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
-        code.push_str(&format!("        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
-            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str(&format!(
+            "        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
+        code.push_str(&format!(
+            "        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase()
+        ));
         code.push_str("    }\n\n");
 
         // remove_relation()
-        code.push_str(&format!("    pub fn remove_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
-            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
-        code.push_str(&format!("        self.records.retain(|r| !(r.{}_id == {}_id && r.{}_id == {}_id));\n",
-            m2m.model1.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model2.to_lowercase()));
-        code.push_str(&format!("        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
-        code.push_str(&format!("            ids.retain(|&id| id != {}_id);\n", m2m.model2.to_lowercase()));
+        code.push_str(&format!(
+            "    pub fn remove_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
+            m2m.model1.to_lowercase(),
+            id1_type,
+            m2m.model2.to_lowercase(),
+            id2_type
+        ));
+        code.push_str(&format!(
+            "        self.records.retain(|r| !(r.{}_id == {}_id && r.{}_id == {}_id));\n",
+            m2m.model1.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
+        code.push_str(&format!(
+            "        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase()
+        ));
+        code.push_str(&format!(
+            "            ids.retain(|&id| id != {}_id);\n",
+            m2m.model2.to_lowercase()
+        ));
         code.push_str("        }\n");
-        code.push_str(&format!("        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
-            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
-        code.push_str(&format!("            ids.retain(|&id| id != {}_id);\n", m2m.model1.to_lowercase()));
+        code.push_str(&format!(
+            "        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
+        code.push_str(&format!(
+            "            ids.retain(|&id| id != {}_id);\n",
+            m2m.model1.to_lowercase()
+        ));
         code.push_str("        }\n");
         code.push_str("    }\n\n");
 
         // get_related_ids() for model1 -> model2
-        code.push_str(&format!("    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
-            m2m.model1.to_lowercase(), m2m.field1, m2m.model1.to_lowercase(), id1_type, id2_type));
-        code.push_str(&format!("        self.{}_to_{}_index.get(&{}_id)\n",
-            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str(&format!(
+            "    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
+            m2m.model1.to_lowercase(),
+            m2m.field1,
+            m2m.model1.to_lowercase(),
+            id1_type,
+            id2_type
+        ));
+        code.push_str(&format!(
+            "        self.{}_to_{}_index.get(&{}_id)\n",
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase()
+        ));
         code.push_str("            .map(|ids| ids.clone())\n");
         code.push_str("            .unwrap_or_else(Vec::new)\n");
         code.push_str("    }\n\n");
 
         // get_related_ids() for model2 -> model1
-        code.push_str(&format!("    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
-            m2m.model2.to_lowercase(), m2m.field2, m2m.model2.to_lowercase(), id2_type, id1_type));
-        code.push_str(&format!("        self.{}_to_{}_index.get(&{}_id)\n",
-            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!(
+            "    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
+            m2m.model2.to_lowercase(),
+            m2m.field2,
+            m2m.model2.to_lowercase(),
+            id2_type,
+            id1_type
+        ));
+        code.push_str(&format!(
+            "        self.{}_to_{}_index.get(&{}_id)\n",
+            m2m.model2.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
         code.push_str("            .map(|ids| ids.clone())\n");
         code.push_str("            .unwrap_or_else(Vec::new)\n");
         code.push_str("    }\n\n");
 
         // has_relation()
-        code.push_str(&format!("    pub fn has_relation(&self, {}_id: {}, {}_id: {}) -> bool {{\n",
-            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
-        code.push_str(&format!("        self.records.iter().any(|r| r.{}_id == {}_id && r.{}_id == {}_id)\n",
-            m2m.model1.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!(
+            "    pub fn has_relation(&self, {}_id: {}, {}_id: {}) -> bool {{\n",
+            m2m.model1.to_lowercase(),
+            id1_type,
+            m2m.model2.to_lowercase(),
+            id2_type
+        ));
+        code.push_str(&format!(
+            "        self.records.iter().any(|r| r.{}_id == {}_id && r.{}_id == {}_id)\n",
+            m2m.model1.to_lowercase(),
+            m2m.model1.to_lowercase(),
+            m2m.model2.to_lowercase(),
+            m2m.model2.to_lowercase()
+        ));
         code.push_str("    }\n");
 
         code.push_str("}\n\n");
@@ -1437,7 +1784,9 @@ impl CodeGenerator {
         let common_imports = "use std::collections::HashMap;\nuse std::time::{SystemTime, UNIX_EPOCH};\nuse uuid::Uuid;\n";
 
         // Check if any model uses constraints - if so, add regex import
-        let has_constraints = schema.models.iter()
+        let has_constraints = schema
+            .models
+            .iter()
             .any(|m| m.fields.iter().any(|f| !f.constraints.is_empty()));
         let constraint_imports = if has_constraints { "use regex;\n" } else { "" };
 
@@ -1472,7 +1821,10 @@ impl CodeGenerator {
 
             // Import structs if this model uses them
             if !schema.structs.is_empty() {
-                let uses_structs = model.fields.iter().any(|f| f.field_type.struct_name().is_some());
+                let uses_structs = model
+                    .fields
+                    .iter()
+                    .any(|f| f.field_type.struct_name().is_some());
                 if uses_structs {
                     content.push_str("use super::structs::*;\n\n");
                 }
@@ -1522,13 +1874,19 @@ impl CodeGenerator {
 
         for model in &schema.models {
             mod_content.push_str(&format!("mod {}_storage;\n", model.name.to_lowercase()));
-            mod_content.push_str(&format!("pub use {}_storage::*;\n\n", model.name.to_lowercase()));
+            mod_content.push_str(&format!(
+                "pub use {}_storage::*;\n\n",
+                model.name.to_lowercase()
+            ));
         }
 
         for m2m in &m2m_relations {
             let junction_name = Self::junction_table_name(m2m);
             mod_content.push_str(&format!("mod {}_junction;\n", junction_name.to_lowercase()));
-            mod_content.push_str(&format!("pub use {}_junction::*;\n\n", junction_name.to_lowercase()));
+            mod_content.push_str(&format!(
+                "pub use {}_junction::*;\n\n",
+                junction_name.to_lowercase()
+            ));
         }
 
         files.push(GeneratedFile {
@@ -1551,13 +1909,20 @@ impl CodeGenerator {
         files
     }
 
-    fn generate_database_struct_multifile(&self, schema: &Schema, m2m_relations: &[ManyToManyRelation]) -> String {
+    fn generate_database_struct_multifile(
+        &self,
+        schema: &Schema,
+        m2m_relations: &[ManyToManyRelation],
+    ) -> String {
         let mut code = String::new();
 
         code.push_str("pub struct Database {\n");
         for model in &schema.models {
-            code.push_str(&format!("    pub {}: {}Storage,\n",
-                model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "    pub {}: {}Storage,\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
 
         // Add junction table storages with unique field names
@@ -1565,7 +1930,10 @@ impl CodeGenerator {
             let junction_name = Self::junction_table_name(m2m);
             // Use field name from model1's perspective for the junction field
             let field_name = format!("{}_{}", m2m.model1.to_lowercase(), m2m.field1);
-            code.push_str(&format!("    pub {}: {}Storage,\n", field_name, junction_name));
+            code.push_str(&format!(
+                "    pub {}: {}Storage,\n",
+                field_name, junction_name
+            ));
         }
         code.push_str("}\n\n");
 
@@ -1573,13 +1941,19 @@ impl CodeGenerator {
         code.push_str("    pub fn new() -> Self {\n");
         code.push_str("        Database {\n");
         for model in &schema.models {
-            code.push_str(&format!("            {}: {}Storage::new(),\n",
-                model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "            {}: {}Storage::new(),\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
         for m2m in m2m_relations {
             let junction_name = Self::junction_table_name(m2m);
             let field_name = format!("{}_{}", m2m.model1.to_lowercase(), m2m.field1);
-            code.push_str(&format!("            {}: {}Storage::new(),\n", field_name, junction_name));
+            code.push_str(&format!(
+                "            {}: {}Storage::new(),\n",
+                field_name, junction_name
+            ));
         }
         code.push_str("        }\n");
         code.push_str("    }\n\n");
@@ -1619,7 +1993,9 @@ impl CodeGenerator {
         }
 
         // Check if any model uses constraints - if so, add regex import
-        let has_constraints = schema.models.iter()
+        let has_constraints = schema
+            .models
+            .iter()
             .any(|m| m.fields.iter().any(|f| !f.constraints.is_empty()));
 
         if has_constraints {
@@ -2030,7 +2406,9 @@ User {
         assert!(code.contains("self.username_index.entry(self.records[idx].username.clone()).or_insert_with(Vec::new).push(idx)"));
 
         // Check unique constraint validation on update
-        assert!(code.contains("if self.email_index.contains_key(&email) && self.records[idx].email != email"));
+        assert!(code.contains(
+            "if self.email_index.contains_key(&email) && self.records[idx].email != email"
+        ));
     }
 
     // Sprint 4: Relation tests
@@ -2440,8 +2818,10 @@ User {
         let validation_pos = code.find("validate_email(&email)?").unwrap();
         let unique_check_pos = code.find("if self.email_index.contains_key").unwrap();
 
-        assert!(validation_pos < unique_check_pos,
-            "Validation should come before unique constraint checks");
+        assert!(
+            validation_pos < unique_check_pos,
+            "Validation should come before unique constraint checks"
+        );
     }
 
     #[test]

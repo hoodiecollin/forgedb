@@ -17,10 +17,20 @@ User {
     let schema = parser.parse().expect("Failed to parse schema");
 
     let user_model = schema.find_model("User").expect("User model not found");
-    let full_name_field = user_model.fields.iter().find(|f| f.name == "full_name").expect("full_name field not found");
+    let full_name_field = user_model
+        .fields
+        .iter()
+        .find(|f| f.name == "full_name")
+        .expect("full_name field not found");
 
-    assert!(full_name_field.is_computed, "full_name should be marked as computed");
-    assert!(full_name_field.has_constraint("computed"), "full_name should have @computed constraint");
+    assert!(
+        full_name_field.is_computed,
+        "full_name should be marked as computed"
+    );
+    assert!(
+        full_name_field.has_constraint("computed"),
+        "full_name should have @computed constraint"
+    );
 }
 
 #[test]
@@ -76,12 +86,24 @@ User {
     let generated = codegen.generate(&schema);
 
     // Check trait declaration
-    assert!(generated.contains("pub trait UserComputed"), "Should generate UserComputed trait");
-    assert!(generated.contains("fn full_name(instance: &User) -> String"), "Should have full_name method");
+    assert!(
+        generated.contains("pub trait UserComputed"),
+        "Should generate UserComputed trait"
+    );
+    assert!(
+        generated.contains("fn full_name(instance: &User) -> String"),
+        "Should have full_name method"
+    );
 
     // Check default implementation
-    assert!(generated.contains("pub struct DefaultUserComputed"), "Should generate default implementation");
-    assert!(generated.contains("impl UserComputed for DefaultUserComputed"), "Should implement trait for default");
+    assert!(
+        generated.contains("pub struct DefaultUserComputed"),
+        "Should generate default implementation"
+    );
+    assert!(
+        generated.contains("impl UserComputed for DefaultUserComputed"),
+        "Should implement trait for default"
+    );
 }
 
 #[test]
@@ -103,17 +125,34 @@ User {
     let generated = codegen.generate(&schema);
 
     // Check for get_with_computed method
-    assert!(generated.contains("pub fn get_with_computed<C: UserComputed>"), "Should generate get_with_computed method");
+    assert!(
+        generated.contains("pub fn get_with_computed<C: UserComputed>"),
+        "Should generate get_with_computed method"
+    );
 
     // Check for compute_* methods for each computed field
-    assert!(generated.contains("pub fn compute_full_name<C: UserComputed>"), "Should generate compute_full_name method");
-    assert!(generated.contains("pub fn compute_post_count<C: UserComputed>"), "Should generate compute_post_count method");
+    assert!(
+        generated.contains("pub fn compute_full_name<C: UserComputed>"),
+        "Should generate compute_full_name method"
+    );
+    assert!(
+        generated.contains("pub fn compute_post_count<C: UserComputed>"),
+        "Should generate compute_post_count method"
+    );
 
     // Verify method signatures
-    assert!(generated.contains("fn compute_full_name<C: UserComputed>(&self, id: uuid::Uuid) -> Option<String>"),
-        "compute_full_name should return Option<String>");
-    assert!(generated.contains("fn compute_post_count<C: UserComputed>(&self, id: uuid::Uuid) -> Option<u32>"),
-        "compute_post_count should return Option<u32>");
+    assert!(
+        generated.contains(
+            "fn compute_full_name<C: UserComputed>(&self, id: uuid::Uuid) -> Option<String>"
+        ),
+        "compute_full_name should return Option<String>"
+    );
+    assert!(
+        generated.contains(
+            "fn compute_post_count<C: UserComputed>(&self, id: uuid::Uuid) -> Option<u32>"
+        ),
+        "compute_post_count should return Option<u32>"
+    );
 }
 
 #[test]
@@ -133,25 +172,38 @@ User {
     let api_files = ApiCodeGenerator::generate(&schema);
 
     // Find the types file
-    let types_file = api_files.iter()
+    let types_file = api_files
+        .iter()
         .find(|f| f.path.contains("user_types.rs"))
         .expect("Should generate user_types.rs");
 
     // Check that computed fields are included in Response type
-    assert!(types_file.content.contains("pub struct UserResponse"), "Should generate UserResponse struct");
-    assert!(types_file.content.contains("// Computed fields"), "Should have computed fields comment");
-    assert!(types_file.content.contains("pub full_name: String"), "Response should include full_name computed field");
+    assert!(
+        types_file.content.contains("pub struct UserResponse"),
+        "Should generate UserResponse struct"
+    );
+    assert!(
+        types_file.content.contains("// Computed fields"),
+        "Should have computed fields comment"
+    );
+    assert!(
+        types_file.content.contains("pub full_name: String"),
+        "Response should include full_name computed field"
+    );
 
     // Check that computed fields are NOT in CreateRequest
     // Extract the CreateUserRequest section
-    let create_section = types_file.content
+    let create_section = types_file
+        .content
         .split("pub struct CreateUserRequest")
         .nth(1)
         .and_then(|s| s.split("}").next());
 
     if let Some(create_content) = create_section {
-        assert!(!create_content.contains("full_name"),
-            "CreateRequest should not include computed fields");
+        assert!(
+            !create_content.contains("full_name"),
+            "CreateRequest should not include computed fields"
+        );
     }
 }
 
@@ -173,25 +225,45 @@ User {
     let ts_files = TypeScriptGenerator::generate(&schema);
 
     // Find the types file
-    let types_file = ts_files.iter()
+    let types_file = ts_files
+        .iter()
         .find(|f| f.path.contains("types.ts"))
         .expect("Should generate types.ts");
 
     // Check that computed fields are in the interface
-    assert!(types_file.content.contains("export interface User"), "Should generate User interface");
-    assert!(types_file.content.contains("// Computed fields"), "Should have computed fields comment");
-    assert!(types_file.content.contains("full_name: string"), "Should include full_name as string");
-    assert!(types_file.content.contains("score: number"), "Should include score as number");
+    assert!(
+        types_file.content.contains("export interface User"),
+        "Should generate User interface"
+    );
+    assert!(
+        types_file.content.contains("// Computed fields"),
+        "Should have computed fields comment"
+    );
+    assert!(
+        types_file.content.contains("full_name: string"),
+        "Should include full_name as string"
+    );
+    assert!(
+        types_file.content.contains("score: number"),
+        "Should include score as number"
+    );
 
     // Check that computed fields are NOT in CreateUserRequest
-    let create_section = types_file.content
+    let create_section = types_file
+        .content
         .split("export interface CreateUserRequest")
         .nth(1)
         .and_then(|s| s.split("}").next());
 
     if let Some(create_content) = create_section {
-        assert!(!create_content.contains("full_name"), "CreateUserRequest should not include computed fields");
-        assert!(!create_content.contains("score"), "CreateUserRequest should not include computed fields");
+        assert!(
+            !create_content.contains("full_name"),
+            "CreateUserRequest should not include computed fields"
+        );
+        assert!(
+            !create_content.contains("score"),
+            "CreateUserRequest should not include computed fields"
+        );
     }
 }
 
@@ -240,6 +312,12 @@ User {
     let generated = codegen.generate(&schema);
 
     // Should not generate trait if no computed fields
-    assert!(!generated.contains("pub trait UserComputed"), "Should not generate trait when no computed fields");
-    assert!(!generated.contains("compute_"), "Should not generate compute methods");
+    assert!(
+        !generated.contains("pub trait UserComputed"),
+        "Should not generate trait when no computed fields"
+    );
+    assert!(
+        !generated.contains("compute_"),
+        "Should not generate compute methods"
+    );
 }

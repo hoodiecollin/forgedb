@@ -216,16 +216,14 @@ impl Compactor {
 
         // Write compacted data
         let temp_data_path = data_path.with_extension("bin.tmp");
-        let mut data_file =
-            fs::File::create(&temp_data_path).map_err(|e| e.to_string())?;
+        let mut data_file = fs::File::create(&temp_data_path).map_err(|e| e.to_string())?;
         data_file.write_all(&new_data).map_err(|e| e.to_string())?;
         data_file.sync_all().map_err(|e| e.to_string())?;
         drop(data_file);
 
         // Write compacted offsets
         let temp_offset_path = offset_path.with_extension("bin.tmp");
-        let mut offset_file =
-            fs::File::create(&temp_offset_path).map_err(|e| e.to_string())?;
+        let mut offset_file = fs::File::create(&temp_offset_path).map_err(|e| e.to_string())?;
         for (offset, length) in new_offsets {
             offset_file
                 .write_all(&offset.to_le_bytes())
@@ -346,7 +344,9 @@ impl Compactor {
             if let Ok(entries) = fs::read_dir(&fixed_dir) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
-                    if entry_path.is_file() && entry_path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                    if entry_path.is_file()
+                        && entry_path.extension().and_then(|s| s.to_str()) == Some("bin")
+                    {
                         if let Ok(metadata) = fs::metadata(&entry_path) {
                             let file_size = metadata.len();
                             // Try common element sizes

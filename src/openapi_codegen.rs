@@ -66,7 +66,6 @@ impl OpenApiGenerator {
 
     /// Add schemas for a model (Model, CreateRequest, UpdateRequest)
     fn add_model_schemas(spec: &mut Value, model: &Model) {
-
         // Main model schema
         let model_schema = {
             let mut properties = serde_json::Map::new();
@@ -101,7 +100,9 @@ impl OpenApiGenerator {
             })
         };
 
-        spec["components"]["schemas"].as_object_mut().unwrap()
+        spec["components"]["schemas"]
+            .as_object_mut()
+            .unwrap()
             .insert(model.name.clone(), model_schema);
 
         // CreateRequest schema (no auto-generated or computed fields)
@@ -129,7 +130,9 @@ impl OpenApiGenerator {
             })
         };
 
-        spec["components"]["schemas"].as_object_mut().unwrap()
+        spec["components"]["schemas"]
+            .as_object_mut()
+            .unwrap()
             .insert(format!("Create{}Request", model.name), create_schema);
 
         // UpdateRequest schema (all fields optional except computed)
@@ -149,7 +152,9 @@ impl OpenApiGenerator {
             update_props.insert(field_name, field_schema);
         }
 
-        spec["components"]["schemas"].as_object_mut().unwrap()
+        spec["components"]["schemas"]
+            .as_object_mut()
+            .unwrap()
             .insert(format!("Update{}Request", model.name), update_schema);
     }
 
@@ -359,39 +364,45 @@ impl OpenApiGenerator {
         for constraint in &field.constraints {
             match constraint.name.as_str() {
                 "email" => {
-                    schema.as_object_mut().unwrap().insert(
-                        "format".to_string(),
-                        json!("email"),
-                    );
+                    schema
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("format".to_string(), json!("email"));
                 }
                 "url" => {
-                    schema.as_object_mut().unwrap().insert(
-                        "format".to_string(),
-                        json!("uri"),
-                    );
+                    schema
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("format".to_string(), json!("uri"));
                 }
                 "min" => {
-                    if let Some(crate::ast::ConstraintParam::Number(min_val)) = constraint.params.first() {
-                        schema.as_object_mut().unwrap().insert(
-                            "minimum".to_string(),
-                            json!(min_val),
-                        );
+                    if let Some(crate::ast::ConstraintParam::Number(min_val)) =
+                        constraint.params.first()
+                    {
+                        schema
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("minimum".to_string(), json!(min_val));
                     }
                 }
                 "max" => {
-                    if let Some(crate::ast::ConstraintParam::Number(max_val)) = constraint.params.first() {
-                        schema.as_object_mut().unwrap().insert(
-                            "maximum".to_string(),
-                            json!(max_val),
-                        );
+                    if let Some(crate::ast::ConstraintParam::Number(max_val)) =
+                        constraint.params.first()
+                    {
+                        schema
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("maximum".to_string(), json!(max_val));
                     }
                 }
                 "pattern" => {
-                    if let Some(crate::ast::ConstraintParam::String(pattern)) = constraint.params.first() {
-                        schema.as_object_mut().unwrap().insert(
-                            "pattern".to_string(),
-                            json!(pattern),
-                        );
+                    if let Some(crate::ast::ConstraintParam::String(pattern)) =
+                        constraint.params.first()
+                    {
+                        schema
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("pattern".to_string(), json!(pattern));
                     }
                 }
                 _ => {}
@@ -445,7 +456,8 @@ impl OpenApiGenerator {
     fn is_optional_field(field: &Field) -> bool {
         matches!(
             &field.field_type,
-            FieldType::OptionalStructType(_) | FieldType::Relation(RelationType::OptionalReference(_))
+            FieldType::OptionalStructType(_)
+                | FieldType::Relation(RelationType::OptionalReference(_))
         )
     }
 
@@ -458,7 +470,11 @@ impl OpenApiGenerator {
 
         content.push_str("## Table of Contents\n\n");
         for model in &schema.models {
-            content.push_str(&format!("- [{}](#{})\n", model.name, model.name.to_lowercase()));
+            content.push_str(&format!(
+                "- [{}](#{})\n",
+                model.name,
+                model.name.to_lowercase()
+            ));
         }
         content.push_str("\n---\n\n");
 
@@ -548,7 +564,10 @@ impl OpenApiGenerator {
         content.push_str(&format!("```\nPUT /api/{}/{{id}}\n```\n\n", model_plural));
 
         content.push_str(&format!("#### Delete {}\n", model_lower));
-        content.push_str(&format!("```\nDELETE /api/{}/{{id}}\n```\n\n", model_plural));
+        content.push_str(&format!(
+            "```\nDELETE /api/{}/{{id}}\n```\n\n",
+            model_plural
+        ));
 
         content.push_str("---\n\n");
     }
@@ -566,7 +585,9 @@ impl OpenApiGenerator {
             FieldType::Uuid => "uuid".to_string(),
             FieldType::Timestamp => "timestamp".to_string(),
             FieldType::Char(n) => format!("char[{}]", n),
-            FieldType::FixedArray(inner, n) => format!("[{}; {}]", Self::type_to_markdown(inner), n),
+            FieldType::FixedArray(inner, n) => {
+                format!("[{}; {}]", Self::type_to_markdown(inner), n)
+            }
             FieldType::StructType(name) => name.clone(),
             FieldType::OptionalStructType(name) => format!("{}?", name),
             FieldType::Relation(rel) => match rel {
@@ -626,7 +647,10 @@ mod tests {
         assert_eq!(files.len(), 2); // openapi.json and API.md
 
         // Check OpenAPI file
-        let openapi_file = files.iter().find(|f| f.path.contains("openapi.json")).unwrap();
+        let openapi_file = files
+            .iter()
+            .find(|f| f.path.contains("openapi.json"))
+            .unwrap();
         assert!(openapi_file.content.contains("openapi"));
         assert!(openapi_file.content.contains("User"));
 

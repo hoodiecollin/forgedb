@@ -1,8 +1,6 @@
 use crate::{ui, CliError, Result};
 use colored::Colorize;
-use sinkdb_migrations::{
-    MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange,
-};
+use sinkdb_migrations::{MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange};
 use std::path::PathBuf;
 
 // Helper to convert String errors to CliError
@@ -45,7 +43,8 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
             println!("  • {}", change.description());
         }
 
-        let migration = MigrationGenerator::generate(migrations_dir, opts.description, changes).map_err(map_err)?;
+        let migration = MigrationGenerator::generate(migrations_dir, opts.description, changes)
+            .map_err(map_err)?;
         ui::success(&format!("Created migration: {}", migration.filename()));
 
         if migration.has_breaking_changes() {
@@ -65,9 +64,13 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
             migrations_dir,
             opts.description,
             vec![], // Empty changes
-        ).map_err(map_err)?;
+        )
+        .map_err(map_err)?;
 
-        ui::success(&format!("Created migration template: {}", migration.filename()));
+        ui::success(&format!(
+            "Created migration template: {}",
+            migration.filename()
+        ));
         ui::info("Edit the migration file to add your changes");
     }
 
@@ -79,7 +82,8 @@ pub fn status(_opts: MigrateStatusOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
 
     // Load all migrations
-    let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
+    let all_migrations =
+        MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
 
     if all_migrations.is_empty() {
         ui::info("No migrations found");
@@ -125,7 +129,11 @@ pub fn status(_opts: MigrateStatusOptions) -> Result<()> {
             {
                 println!(
                     "   Applied at: {}",
-                    record.applied_at.format("%Y-%m-%d %H:%M:%S").to_string().dimmed()
+                    record
+                        .applied_at
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                        .dimmed()
                 );
             }
         }
@@ -140,7 +148,8 @@ pub fn up(opts: MigrateUpOptions) -> Result<()> {
     let data_dir = PathBuf::from("data");
 
     // Load all migrations
-    let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
+    let all_migrations =
+        MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
 
     if all_migrations.is_empty() {
         ui::info("No migrations found");
@@ -191,7 +200,9 @@ pub fn up(opts: MigrateUpOptions) -> Result<()> {
         MigrationExecutor::execute_up(migration, &data_dir).map_err(map_err)?;
 
         // Mark as applied
-        tracker.mark_applied(migration.id.clone(), migration.checksum.clone()).map_err(map_err)?;
+        tracker
+            .mark_applied(migration.id.clone(), migration.checksum.clone())
+            .map_err(map_err)?;
 
         ui::success(&format!("Applied migration {}", migration.id));
     }
@@ -222,7 +233,8 @@ pub fn down(opts: MigrateDownOptions) -> Result<()> {
     ui::warning(&format!("Rolling back {} migration(s)...", steps));
 
     // Load all migrations
-    let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
+    let all_migrations =
+        MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
 
     for _ in 0..steps {
         let last_record = tracker.last_migration();
@@ -236,9 +248,7 @@ pub fn down(opts: MigrateDownOptions) -> Result<()> {
         let migration = all_migrations
             .iter()
             .find(|m| m.id == record.migration_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!("Migration {} not found", record.migration_id)
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("Migration {} not found", record.migration_id))?;
 
         println!("\n{} {}", "←".yellow(), migration.description.bold());
 

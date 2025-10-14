@@ -101,10 +101,7 @@ mod tests {
 
         // Find name filter
         let name_filter = filters.iter().find(|f| f.field == "name").unwrap();
-        assert_eq!(
-            name_filter.value,
-            FilterValue::String("John".to_string())
-        );
+        assert_eq!(name_filter.value, FilterValue::String("John".to_string()));
 
         // Find age filter
         let age_filter = filters.iter().find(|f| f.field == "age").unwrap();

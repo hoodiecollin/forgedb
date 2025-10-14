@@ -8,20 +8,19 @@
 /// - Checksums detect corruption
 /// - WAL replay on startup ensures durability
 /// - Transactions group operations with atomic commit
-
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod entry;
-mod writer;
 mod reader;
 mod transaction;
+mod writer;
 
 pub use entry::{WalEntry, WalOperation, WalValue};
-pub use writer::{WalWriter, FsyncPolicy};
 pub use reader::WalReader;
 pub use transaction::{Transaction, TransactionId};
+pub use writer::{FsyncPolicy, WalWriter};
 
 /// WAL file format:
 ///
@@ -150,13 +149,12 @@ mod tests {
 
         // Write an insert entry
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
-
-        let entry = WalEntry::insert(
-            "User".to_string(),
-            uuid::Uuid::new_v4(),
-            fields,
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
         );
+
+        let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
 
         wal.write(&entry).unwrap();
 

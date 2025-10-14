@@ -40,10 +40,14 @@ impl SchemaDiffer {
         let mut changes = Vec::new();
 
         // Build maps for easier lookup
-        let old_models: HashMap<_, _> = old_schema.models.iter()
+        let old_models: HashMap<_, _> = old_schema
+            .models
+            .iter()
             .map(|m| (m.name.clone(), m))
             .collect();
-        let new_models: HashMap<_, _> = new_schema.models.iter()
+        let new_models: HashMap<_, _> = new_schema
+            .models
+            .iter()
             .map(|m| (m.name.clone(), m))
             .collect();
 
@@ -80,13 +84,21 @@ impl SchemaDiffer {
     }
 
     /// Diff fields between two models
-    fn diff_fields(model_name: &str, old_model: &SimpleModel, new_model: &SimpleModel) -> Vec<SchemaChange> {
+    fn diff_fields(
+        model_name: &str,
+        old_model: &SimpleModel,
+        new_model: &SimpleModel,
+    ) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
-        let old_fields: HashMap<_, _> = old_model.fields.iter()
+        let old_fields: HashMap<_, _> = old_model
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f))
             .collect();
-        let new_fields: HashMap<_, _> = new_model.fields.iter()
+        let new_fields: HashMap<_, _> = new_model
+            .fields
+            .iter()
             .map(|f| (f.name.clone(), f))
             .collect();
 
@@ -157,9 +169,9 @@ impl SchemaDiffer {
                 }
 
                 // Constraint changes
-                let constraint_changes = Self::diff_constraints(model_name, field_name, old_field, new_field);
+                let constraint_changes =
+                    Self::diff_constraints(model_name, field_name, old_field, new_field);
                 changes.extend(constraint_changes);
-
             } else {
                 // New field
                 changes.push(SchemaChange::AddField {
@@ -184,10 +196,14 @@ impl SchemaDiffer {
     ) -> Vec<SchemaChange> {
         let mut changes = Vec::new();
 
-        let old_constraints: HashMap<_, _> = old_field.constraints.iter()
+        let old_constraints: HashMap<_, _> = old_field
+            .constraints
+            .iter()
             .map(|c| (c.name.clone(), c))
             .collect();
-        let new_constraints: HashMap<_, _> = new_field.constraints.iter()
+        let new_constraints: HashMap<_, _> = new_field
+            .constraints
+            .iter()
             .map(|c| (c.name.clone(), c))
             .collect();
 
@@ -226,10 +242,14 @@ impl SchemaDiffer {
         let mut changes = Vec::new();
 
         // Convert to sets for comparison
-        let old_indexes: HashSet<_> = old_model.composite_indexes.iter()
+        let old_indexes: HashSet<_> = old_model
+            .composite_indexes
+            .iter()
             .map(|idx| idx.clone())
             .collect();
-        let new_indexes: HashSet<_> = new_model.composite_indexes.iter()
+        let new_indexes: HashSet<_> = new_model
+            .composite_indexes
+            .iter()
             .map(|idx| idx.clone())
             .collect();
 

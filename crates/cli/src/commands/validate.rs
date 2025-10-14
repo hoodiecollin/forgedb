@@ -129,12 +129,10 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
 
         // Warn if model has no timestamp fields
-        let has_timestamp = model.fields.iter().any(|f| {
-            matches!(
-                f.field_type,
-                sinkdb::ast::FieldType::Timestamp
-            )
-        });
+        let has_timestamp = model
+            .fields
+            .iter()
+            .any(|f| matches!(f.field_type, sinkdb::ast::FieldType::Timestamp));
 
         if !has_timestamp {
             warnings.push(format!(
@@ -222,5 +220,6 @@ fn is_snake_case(s: &str) -> bool {
     }
 
     // Should be all lowercase with underscores
-    s.chars().all(|c| c.is_lowercase() || c == '_' || c.is_numeric())
+    s.chars()
+        .all(|c| c.is_lowercase() || c == '_' || c.is_numeric())
 }

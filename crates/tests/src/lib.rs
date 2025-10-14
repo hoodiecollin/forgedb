@@ -13,33 +13,56 @@ mod integration_tests {
     fn test_validation_with_all_type_names() {
         // All type keywords should be valid field names in snake_case context
         let type_names = vec![
-            "u32_field", "u64_field", "i32_field", "i64_field",
-            "f64_field", "bool_field", "string_field",
-            "uuid_field", "timestamp_field"
+            "u32_field",
+            "u64_field",
+            "i32_field",
+            "i64_field",
+            "f64_field",
+            "bool_field",
+            "string_field",
+            "uuid_field",
+            "timestamp_field",
         ];
 
         for name in type_names {
             let result = validate_field_name(name, None);
-            assert!(result.is_ok(), "Type name '{}' should be valid field name", name);
+            assert!(
+                result.is_ok(),
+                "Type name '{}' should be valid field name",
+                name
+            );
         }
 
         // Model names should use PascalCase
         let model_names = vec![
-            "U32Model", "U64Model", "I32Model", "I64Model",
-            "F64Model", "BoolModel", "StringModel",
-            "UuidModel", "TimestampModel"
+            "U32Model",
+            "U64Model",
+            "I32Model",
+            "I64Model",
+            "F64Model",
+            "BoolModel",
+            "StringModel",
+            "UuidModel",
+            "TimestampModel",
         ];
 
         for name in model_names {
             let result = validate_model_name(name, None);
-            assert!(result.is_ok(), "Type name '{}' should be valid model name", name);
+            assert!(
+                result.is_ok(),
+                "Type name '{}' should be valid model name",
+                name
+            );
         }
     }
 
     // Integration Test 2: Validation errors include positions
     #[test]
     fn test_validation_errors_with_position() {
-        let pos = Some(Position { line: 5, column: 10 });
+        let pos = Some(Position {
+            line: 5,
+            column: 10,
+        });
 
         // Invalid field name
         let result = validate_field_name("InvalidName", pos);
@@ -66,18 +89,28 @@ mod integration_tests {
         assert!(result.unwrap_err().to_string().contains("line 1, column 1"));
 
         // Test very large position numbers
-        let pos_large = Some(Position { line: 9999, column: 9999 });
+        let pos_large = Some(Position {
+            line: 9999,
+            column: 9999,
+        });
         let result = validate_model_name("bad_name", pos_large);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("line 9999, column 9999"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("line 9999, column 9999"));
     }
 
     // Integration Test 4: Field names with numbers validated correctly
     #[test]
     fn test_validation_field_names_with_numbers() {
         let valid_names = vec![
-            "field_1", "field_123", "u32_value",
-            "i64_count", "f64_price", "bool_1"
+            "field_1",
+            "field_123",
+            "u32_value",
+            "i64_count",
+            "f64_price",
+            "bool_1",
         ];
 
         for name in valid_names {
@@ -89,9 +122,7 @@ mod integration_tests {
     // Integration Test 5: Model names with numbers validated correctly
     #[test]
     fn test_validation_model_names_with_numbers() {
-        let valid_names = vec![
-            "Model1", "Model123", "User2", "Http2Server"
-        ];
+        let valid_names = vec!["Model1", "Model123", "User2", "Http2Server"];
 
         for name in valid_names {
             let result = validate_model_name(name, None);
@@ -106,7 +137,11 @@ mod integration_tests {
 
         for name in valid_names {
             let result = validate_field_name(name, None);
-            assert!(result.is_ok(), "Field name '{}' with underscores should be valid", name);
+            assert!(
+                result.is_ok(),
+                "Field name '{}' with underscores should be valid",
+                name
+            );
         }
     }
 
@@ -137,13 +172,19 @@ mod integration_tests {
         let result = validate_field_name("UserName", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("user_name"), "Should suggest correct snake_case");
+        assert!(
+            err.contains("user_name"),
+            "Should suggest correct snake_case"
+        );
 
         // Model name suggestion
         let result = validate_model_name("user_model", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("UserModel"), "Should suggest correct PascalCase");
+        assert!(
+            err.contains("UserModel"),
+            "Should suggest correct PascalCase"
+        );
     }
 
     // Integration Test 9: Single character names
@@ -163,7 +204,8 @@ mod integration_tests {
     #[test]
     fn test_validation_long_names() {
         // Long field name (snake_case)
-        let long_field = "this_is_a_very_long_field_name_that_should_still_be_valid_in_snake_case_format";
+        let long_field =
+            "this_is_a_very_long_field_name_that_should_still_be_valid_in_snake_case_format";
         assert!(validate_field_name(long_field, None).is_ok());
 
         // Long model name (PascalCase)

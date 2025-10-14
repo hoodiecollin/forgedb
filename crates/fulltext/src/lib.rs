@@ -6,7 +6,6 @@
 /// - TF-IDF scoring for relevance ranking
 /// - Boolean operators (AND, OR, NOT)
 /// - Phrase search support
-
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -111,7 +110,10 @@ impl FullTextIndex {
 
         for token in tokens {
             // Add to inverted index
-            let doc_map = self.index.entry(token.text.clone()).or_insert_with(HashMap::new);
+            let doc_map = self
+                .index
+                .entry(token.text.clone())
+                .or_insert_with(HashMap::new);
             let positions = doc_map.entry(doc_id).or_insert_with(Vec::new);
             positions.push(token.position);
 
@@ -380,16 +382,25 @@ mod tests {
         assert_eq!(results.len(), 2);
         // doc1 should score higher because "rust" appears 3 times
         // Debug: print scores
-        println!("doc1 score: {}, doc2 score: {}", results[0].score, results[1].score);
-        println!("doc1 id: {:?}, doc2 id: {:?}", results[0].doc_id, results[1].doc_id);
+        println!(
+            "doc1 score: {}, doc2 score: {}",
+            results[0].score, results[1].score
+        );
+        println!(
+            "doc1 id: {:?}, doc2 id: {:?}",
+            results[0].doc_id, results[1].doc_id
+        );
 
         // Find which result is doc1
         let doc1_result = results.iter().find(|r| r.doc_id == doc1).unwrap();
         let doc2_result = results.iter().find(|r| r.doc_id == doc2).unwrap();
 
-        assert!(doc1_result.score > doc2_result.score,
+        assert!(
+            doc1_result.score > doc2_result.score,
             "doc1 score ({}) should be > doc2 score ({})",
-            doc1_result.score, doc2_result.score);
+            doc1_result.score,
+            doc2_result.score
+        );
     }
 
     #[test]

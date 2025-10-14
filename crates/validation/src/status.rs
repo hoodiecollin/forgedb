@@ -7,16 +7,16 @@ impl StatusCodeMapper {
     /// Get status code for validation error type
     pub fn for_validation_error(error_type: &str) -> u16 {
         match error_type {
-            "required_field" => 400,       // Bad Request
-            "invalid_format" => 400,       // Bad Request
-            "invalid_type" => 400,         // Bad Request
-            "out_of_range" => 400,         // Bad Request
-            "not_found" => 404,            // Not Found
-            "already_exists" => 409,       // Conflict
-            "unique_violation" => 409,     // Conflict
+            "required_field" => 400,        // Bad Request
+            "invalid_format" => 400,        // Bad Request
+            "invalid_type" => 400,          // Bad Request
+            "out_of_range" => 400,          // Bad Request
+            "not_found" => 404,             // Not Found
+            "already_exists" => 409,        // Conflict
+            "unique_violation" => 409,      // Conflict
             "foreign_key_violation" => 422, // Unprocessable Entity
-            "internal_error" => 500,       // Internal Server Error
-            _ => 400,                      // Default to Bad Request
+            "internal_error" => 500,        // Internal Server Error
+            _ => 400,                       // Default to Bad Request
         }
     }
 
@@ -61,10 +61,19 @@ mod tests {
 
     #[test]
     fn test_for_validation_error() {
-        assert_eq!(StatusCodeMapper::for_validation_error("required_field"), 400);
+        assert_eq!(
+            StatusCodeMapper::for_validation_error("required_field"),
+            400
+        );
         assert_eq!(StatusCodeMapper::for_validation_error("not_found"), 404);
-        assert_eq!(StatusCodeMapper::for_validation_error("already_exists"), 409);
-        assert_eq!(StatusCodeMapper::for_validation_error("internal_error"), 500);
+        assert_eq!(
+            StatusCodeMapper::for_validation_error("already_exists"),
+            409
+        );
+        assert_eq!(
+            StatusCodeMapper::for_validation_error("internal_error"),
+            500
+        );
         assert_eq!(StatusCodeMapper::for_validation_error("unknown"), 400);
     }
 

@@ -123,7 +123,10 @@ impl StatsCollector {
                                 db_stats.models.push(model_stats);
                             }
                             Err(e) => {
-                                eprintln!("Warning: Failed to collect stats for {}: {}", model_name, e);
+                                eprintln!(
+                                    "Warning: Failed to collect stats for {}: {}",
+                                    model_name, e
+                                );
                             }
                         }
                     }
@@ -161,7 +164,9 @@ impl StatsCollector {
             if let Ok(entries) = fs::read_dir(&fixed_dir) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
-                    if entry_path.is_file() && entry_path.extension().and_then(|s| s.to_str()) == Some("bin") {
+                    if entry_path.is_file()
+                        && entry_path.extension().and_then(|s| s.to_str()) == Some("bin")
+                    {
                         if let Ok(metadata) = fs::metadata(&entry_path) {
                             let file_size = metadata.len();
                             // Common fixed sizes: uuid=16, timestamp=8, u64=8, etc.
@@ -199,9 +204,7 @@ impl StatsCollector {
             let path = entry.path();
 
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("bin") {
-                let file_size = fs::metadata(&path)
-                    .map_err(|e| e.to_string())?
-                    .len();
+                let file_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
 
                 let column_name = path
                     .file_stem()
@@ -263,9 +266,7 @@ impl StatsCollector {
                     .map(|s| s.ends_with("_data.bin"))
                     .unwrap_or(false)
             {
-                let data_size = fs::metadata(&path)
-                    .map_err(|e| e.to_string())?
-                    .len();
+                let data_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
 
                 let column_name = path
                     .file_stem()
@@ -291,9 +292,7 @@ impl StatsCollector {
 
                 // Total includes offset file
                 let offset_size = if offset_path.exists() {
-                    fs::metadata(&offset_path)
-                        .map_err(|e| e.to_string())?
-                        .len()
+                    fs::metadata(&offset_path).map_err(|e| e.to_string())?.len()
                 } else {
                     0
                 };
@@ -395,7 +394,9 @@ mod tests {
 
         // Create variable column
         let mut email_data = fs::File::create(model_dir.join("variable/email_data.bin")).unwrap();
-        email_data.write_all(b"alice@example.combob@example.comcharlie@example.com").unwrap();
+        email_data
+            .write_all(b"alice@example.combob@example.comcharlie@example.com")
+            .unwrap();
 
         let mut email_offsets =
             fs::File::create(model_dir.join("variable/email_offsets.bin")).unwrap();

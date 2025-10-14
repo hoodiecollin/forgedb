@@ -48,9 +48,7 @@ impl QueryParams {
         // Extract special parameters
         let sort_field = params.remove("sort");
         let order = params.remove("order");
-        let limit = params
-            .remove("limit")
-            .and_then(|s| s.parse::<usize>().ok());
+        let limit = params.remove("limit").and_then(|s| s.parse::<usize>().ok());
         let offset = params
             .remove("offset")
             .and_then(|s| s.parse::<usize>().ok());

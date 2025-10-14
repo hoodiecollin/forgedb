@@ -7,7 +7,9 @@ mod handlers;
 mod operations;
 
 pub use handlers::{CrudHandlers, CrudResult};
-pub use operations::{CreateOperation, DeleteOperation, GetOperation, ListOperation, UpdateOperation};
+pub use operations::{
+    CreateOperation, DeleteOperation, GetOperation, ListOperation, UpdateOperation,
+};
 
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -75,7 +77,11 @@ mod tests {
         type UpdateInput = UpdateTestModel;
 
         fn list(&self) -> CrudResult<Vec<Self::Model>> {
-            Ok(self.records.iter().map(|(_, model)| model.clone()).collect())
+            Ok(self
+                .records
+                .iter()
+                .map(|(_, model)| model.clone())
+                .collect())
         }
 
         fn get(&self, id: &Uuid) -> CrudResult<Option<Self::Model>> {
@@ -96,8 +102,16 @@ mod tests {
             Ok(model)
         }
 
-        fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> CrudResult<Option<Self::Model>> {
-            if let Some((_, model)) = self.records.iter_mut().find(|(record_id, _)| record_id == id) {
+        fn update(
+            &mut self,
+            id: &Uuid,
+            input: Self::UpdateInput,
+        ) -> CrudResult<Option<Self::Model>> {
+            if let Some((_, model)) = self
+                .records
+                .iter_mut()
+                .find(|(record_id, _)| record_id == id)
+            {
                 if let Some(name) = input.name {
                     model.name = name;
                 }

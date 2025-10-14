@@ -53,7 +53,11 @@ impl ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(pos) = self.position {
-            write!(f, "Error at line {}, column {}: {}", pos.line, pos.column, self.message)?;
+            write!(
+                f,
+                "Error at line {}, column {}: {}",
+                pos.line, pos.column, self.message
+            )?;
         } else {
             write!(f, "Error: {}", self.message)?;
         }
@@ -82,7 +86,8 @@ pub fn is_snake_case(s: &str) -> bool {
     }
 
     // Can only contain lowercase letters, digits, and underscores
-    s.chars().all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
+    s.chars()
+        .all(|c| c.is_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// Check if a string is in PascalCase format
@@ -117,7 +122,10 @@ pub fn to_snake_case(s: &str) -> String {
                 let prev = chars[i - 1];
                 let next_is_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
 
-                if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_is_lower) {
+                if prev.is_lowercase()
+                    || prev.is_ascii_digit()
+                    || (prev.is_uppercase() && next_is_lower)
+                {
                     result.push('_');
                 }
             }
@@ -382,8 +390,7 @@ mod tests {
 
     #[test]
     fn test_validation_error_display_without_position() {
-        let error = ValidationError::new("Test error")
-            .with_suggestion("Try this instead");
+        let error = ValidationError::new("Test error").with_suggestion("Try this instead");
 
         let display = format!("{}", error);
         assert!(!display.contains("line"));
@@ -499,10 +506,7 @@ mod tests {
         assert!(check_duplicate_fields(&single).is_ok());
 
         // Case sensitivity - these should be treated as different
-        let case_sensitive = vec![
-            ("email".to_string(), None),
-            ("Email".to_string(), None),
-        ];
+        let case_sensitive = vec![("email".to_string(), None), ("Email".to_string(), None)];
         assert!(check_duplicate_fields(&case_sensitive).is_ok());
 
         // First duplicate should be reported (not second)
@@ -529,10 +533,7 @@ mod tests {
         assert!(check_duplicate_models(&single).is_ok());
 
         // Case sensitivity
-        let case_sensitive = vec![
-            ("User".to_string(), None),
-            ("user".to_string(), None),
-        ];
+        let case_sensitive = vec![("User".to_string(), None), ("user".to_string(), None)];
         assert!(check_duplicate_models(&case_sensitive).is_ok());
     }
 
@@ -545,14 +546,12 @@ mod tests {
         assert_eq!(err1.suggestion, None);
 
         // Error with only position
-        let err2 = ValidationError::new("Error with position")
-            .with_position(Position::new(5, 10));
+        let err2 = ValidationError::new("Error with position").with_position(Position::new(5, 10));
         assert_eq!(err2.position, Some(Position::new(5, 10)));
         assert_eq!(err2.suggestion, None);
 
         // Error with only suggestion
-        let err3 = ValidationError::new("Error with suggestion")
-            .with_suggestion("Fix it this way");
+        let err3 = ValidationError::new("Error with suggestion").with_suggestion("Fix it this way");
         assert_eq!(err3.position, None);
         assert!(err3.suggestion.is_some());
 

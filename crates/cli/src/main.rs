@@ -233,43 +233,37 @@ fn main() -> Result<()> {
             rust,
             typescript,
             api_only,
-        } => {
-            commands::init::run(commands::init::InitOptions {
-                project_name,
-                template,
-                rust,
-                typescript,
-                api_only,
-            })
-        }
+        } => commands::init::run(commands::init::InitOptions {
+            project_name,
+            template,
+            rust,
+            typescript,
+            api_only,
+        }),
 
         Commands::Generate {
             target,
             check,
             output,
             force,
-        } => {
-            commands::generate::run(commands::generate::GenerateOptions {
-                target,
-                check,
-                output,
-                force,
-            })
-        }
+        } => commands::generate::run(commands::generate::GenerateOptions {
+            target,
+            check,
+            output,
+            force,
+        }),
 
         Commands::Validate {
             strict,
             schema_only,
             implementations,
             components,
-        } => {
-            commands::validate::run(commands::validate::ValidateOptions {
-                strict,
-                schema_only,
-                implementations,
-                components,
-            })
-        }
+        } => commands::validate::run(commands::validate::ValidateOptions {
+            strict,
+            schema_only,
+            implementations,
+            components,
+        }),
 
         Commands::Build {
             release,
@@ -277,29 +271,25 @@ fn main() -> Result<()> {
             output,
             no_api,
             no_db,
-        } => {
-            commands::build::run(commands::build::BuildOptions {
-                release,
-                target,
-                output,
-                no_api,
-                no_db,
-            })
-        }
+        } => commands::build::run(commands::build::BuildOptions {
+            release,
+            target,
+            output,
+            no_api,
+            no_db,
+        }),
 
         Commands::Dev {
             schema,
             output,
             debounce,
             clear,
-        } => {
-            commands::dev::run(commands::dev::DevOptions {
-                schema,
-                output,
-                debounce,
-                clear,
-            })
-        }
+        } => commands::dev::run(commands::dev::DevOptions {
+            schema,
+            output,
+            debounce,
+            clear,
+        }),
 
         Commands::Migrate(migrate_cmd) => match migrate_cmd {
             MigrateCommands::Create { description, auto } => {

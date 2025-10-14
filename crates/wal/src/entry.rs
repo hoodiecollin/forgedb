@@ -108,13 +108,20 @@ impl WalValue {
             0x02 => {
                 // String
                 if bytes.len() < offset + 4 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete string length"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete string length",
+                    ));
                 }
-                let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                let len =
+                    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
                 offset += 4;
 
                 if bytes.len() < offset + len {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete string data"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete string data",
+                    ));
                 }
                 let s = String::from_utf8(bytes[offset..offset + len].to_vec())
                     .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
@@ -152,14 +159,20 @@ impl WalValue {
             0x11 => {
                 // Option<U64>
                 if bytes.len() < offset + 1 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<U64>"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete Option<U64>",
+                    ));
                 }
                 let is_some = bytes[offset] != 0;
                 offset += 1;
 
                 if is_some {
                     if bytes.len() < offset + 8 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<U64> value"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<U64> value",
+                        ));
                     }
                     let val = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
                     offset += 8;
@@ -171,20 +184,30 @@ impl WalValue {
             0x12 => {
                 // Option<String>
                 if bytes.len() < offset + 1 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<String>"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete Option<String>",
+                    ));
                 }
                 let is_some = bytes[offset] != 0;
                 offset += 1;
 
                 if is_some {
                     if bytes.len() < offset + 4 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<String> length"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<String> length",
+                        ));
                     }
-                    let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
 
                     if bytes.len() < offset + len {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<String> data"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<String> data",
+                        ));
                     }
                     let s = String::from_utf8(bytes[offset..offset + len].to_vec())
                         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
@@ -197,14 +220,20 @@ impl WalValue {
             0x13 => {
                 // Option<Bool>
                 if bytes.len() < offset + 1 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<Bool>"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete Option<Bool>",
+                    ));
                 }
                 let is_some = bytes[offset] != 0;
                 offset += 1;
 
                 if is_some {
                     if bytes.len() < offset + 1 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<Bool> value"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<Bool> value",
+                        ));
                     }
                     let val = bytes[offset] != 0;
                     offset += 1;
@@ -216,14 +245,20 @@ impl WalValue {
             0x14 => {
                 // Option<F64>
                 if bytes.len() < offset + 1 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<F64>"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete Option<F64>",
+                    ));
                 }
                 let is_some = bytes[offset] != 0;
                 offset += 1;
 
                 if is_some {
                     if bytes.len() < offset + 8 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<F64> value"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<F64> value",
+                        ));
                     }
                     let val = f64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
                     offset += 8;
@@ -235,14 +270,20 @@ impl WalValue {
             0x15 => {
                 // Option<Uuid>
                 if bytes.len() < offset + 1 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<Uuid>"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete Option<Uuid>",
+                    ));
                 }
                 let is_some = bytes[offset] != 0;
                 offset += 1;
 
                 if is_some {
                     if bytes.len() < offset + 16 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete Option<Uuid> value"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete Option<Uuid> value",
+                        ));
                     }
                     let val = uuid::Uuid::from_slice(&bytes[offset..offset + 16])
                         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
@@ -252,7 +293,12 @@ impl WalValue {
                     WalValue::OptionUuid(None)
                 }
             }
-            _ => return Err(Error::new(ErrorKind::InvalidData, format!("Unknown type byte: {}", type_byte))),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Unknown type byte: {}", type_byte),
+                ))
+            }
         };
 
         Ok((value, offset))
@@ -276,21 +322,13 @@ pub enum WalOperation {
         fields: HashMap<String, WalValue>,
     },
     /// Delete a record
-    Delete {
-        record_id: uuid::Uuid,
-    },
+    Delete { record_id: uuid::Uuid },
     /// Begin a transaction
-    BeginTransaction {
-        txn_id: TransactionId,
-    },
+    BeginTransaction { txn_id: TransactionId },
     /// Commit a transaction
-    CommitTransaction {
-        txn_id: TransactionId,
-    },
+    CommitTransaction { txn_id: TransactionId },
     /// Rollback a transaction
-    RollbackTransaction {
-        txn_id: TransactionId,
-    },
+    RollbackTransaction { txn_id: TransactionId },
 }
 
 impl WalOperation {
@@ -367,7 +405,10 @@ impl WalOperation {
                 let mut offset = 16;
 
                 if bytes.len() < offset + 4 {
-                    return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete field count"));
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "Incomplete field count",
+                    ));
                 }
 
                 let field_count = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
@@ -377,10 +418,14 @@ impl WalOperation {
 
                 for _ in 0..field_count {
                     if bytes.len() < offset + 2 {
-                        return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete field key length"));
+                        return Err(Error::new(
+                            ErrorKind::UnexpectedEof,
+                            "Incomplete field key length",
+                        ));
                     }
 
-                    let key_len = u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
+                    let key_len =
+                        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize;
                     offset += 2;
 
                     if bytes.len() < offset + key_len {
@@ -441,7 +486,10 @@ impl WalOperation {
                 let txn_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
                 Ok(WalOperation::RollbackTransaction { txn_id })
             }
-            _ => Err(Error::new(ErrorKind::InvalidData, format!("Unknown operation type: {}", type_byte))),
+            _ => Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unknown operation type: {}", type_byte),
+            )),
         }
     }
 }
@@ -455,7 +503,11 @@ pub struct WalEntry {
 
 impl WalEntry {
     /// Create an insert entry
-    pub fn insert(model_name: String, record_id: uuid::Uuid, fields: HashMap<String, WalValue>) -> Self {
+    pub fn insert(
+        model_name: String,
+        record_id: uuid::Uuid,
+        fields: HashMap<String, WalValue>,
+    ) -> Self {
         WalEntry {
             model_name,
             operation: WalOperation::Insert { record_id, fields },
@@ -463,7 +515,11 @@ impl WalEntry {
     }
 
     /// Create an update entry
-    pub fn update(model_name: String, record_id: uuid::Uuid, fields: HashMap<String, WalValue>) -> Self {
+    pub fn update(
+        model_name: String,
+        record_id: uuid::Uuid,
+        fields: HashMap<String, WalValue>,
+    ) -> Self {
         WalEntry {
             model_name,
             operation: WalOperation::Update { record_id, fields },
@@ -535,7 +591,10 @@ impl WalEntry {
         use std::io::{Error, ErrorKind};
 
         if bytes.len() < 4 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete entry length"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Incomplete entry length",
+            ));
         }
 
         let total_length = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
@@ -548,11 +607,15 @@ impl WalEntry {
 
         // Verify checksum
         let data_bytes = &entry_bytes[..entry_bytes.len() - 4];
-        let stored_checksum = u32::from_le_bytes(entry_bytes[entry_bytes.len() - 4..].try_into().unwrap());
+        let stored_checksum =
+            u32::from_le_bytes(entry_bytes[entry_bytes.len() - 4..].try_into().unwrap());
         let calculated_checksum = crc32fast::hash(data_bytes);
 
         if stored_checksum != calculated_checksum {
-            return Err(Error::new(ErrorKind::InvalidData, "Checksum mismatch - entry corrupted"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Checksum mismatch - entry corrupted",
+            ));
         }
 
         // Parse entry
@@ -562,14 +625,21 @@ impl WalEntry {
         offset += 1;
 
         if data_bytes.len() < offset + 2 {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete model name length"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Incomplete model name length",
+            ));
         }
 
-        let model_name_len = u16::from_le_bytes(data_bytes[offset..offset + 2].try_into().unwrap()) as usize;
+        let model_name_len =
+            u16::from_le_bytes(data_bytes[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
 
         if data_bytes.len() < offset + model_name_len {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete model name"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Incomplete model name",
+            ));
         }
 
         let model_name = String::from_utf8(data_bytes[offset..offset + model_name_len].to_vec())
@@ -578,7 +648,13 @@ impl WalEntry {
 
         let operation = WalOperation::from_bytes(op_type, &data_bytes[offset..])?;
 
-        Ok((WalEntry { model_name, operation }, 4 + total_length))
+        Ok((
+            WalEntry {
+                model_name,
+                operation,
+            },
+            4 + total_length,
+        ))
     }
 }
 
@@ -622,7 +698,10 @@ mod tests {
     #[test]
     fn test_wal_entry_insert() {
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
         fields.insert("age".to_string(), WalValue::U64(30));
 
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
@@ -666,7 +745,10 @@ mod tests {
     #[test]
     fn test_corrupted_checksum() {
         let mut fields = HashMap::new();
-        fields.insert("email".to_string(), WalValue::String("test@example.com".to_string()));
+        fields.insert(
+            "email".to_string(),
+            WalValue::String("test@example.com".to_string()),
+        );
 
         let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
         let mut bytes = entry.to_bytes();

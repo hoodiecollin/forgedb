@@ -144,7 +144,11 @@ mod tests {
         type UpdateInput = UpdateTestModel;
 
         fn list(&self) -> CrudResult<Vec<Self::Model>> {
-            Ok(self.records.iter().map(|(_, model)| model.clone()).collect())
+            Ok(self
+                .records
+                .iter()
+                .map(|(_, model)| model.clone())
+                .collect())
         }
 
         fn get(&self, id: &Uuid) -> CrudResult<Option<Self::Model>> {
@@ -170,7 +174,10 @@ mod tests {
             id: &Uuid,
             input: Self::UpdateInput,
         ) -> CrudResult<Option<Self::Model>> {
-            if let Some((_, model)) = self.records.iter_mut().find(|(record_id, _)| record_id == id)
+            if let Some((_, model)) = self
+                .records
+                .iter_mut()
+                .find(|(record_id, _)| record_id == id)
             {
                 if let Some(name) = input.name {
                     model.name = name;

@@ -1,6 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
 use std::io;
+use std::path::PathBuf;
 
 pub struct ScaffoldConfig {
     pub project_name: String,
@@ -101,7 +101,8 @@ impl Scaffolder {
     }
 
     fn get_schema_template(&self) -> String {
-        format!(r#"// {} Schema
+        format!(
+            r#"// {} Schema
 // Define your data models here
 
 User {{
@@ -110,11 +111,14 @@ User {{
   username: ^string
   created_at: +timestamp
 }}
-"#, self.config.project_name)
+"#,
+            self.config.project_name
+        )
     }
 
     fn get_config_template(&self) -> String {
-        format!(r#"# SinkDB Configuration
+        format!(
+            r#"# SinkDB Configuration
 [project]
 name = "{}"
 version = "0.1.0"
@@ -141,7 +145,9 @@ enabled = true
 
 # Debounce delay in milliseconds
 debounce_ms = 100
-"#, self.config.project_name)
+"#,
+            self.config.project_name
+        )
     }
 
     fn get_gitignore_template(&self) -> String {
@@ -171,11 +177,13 @@ Thumbs.db
 # Logs
 *.log
 logs/
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn get_cargo_template(&self) -> String {
-        format!(r#"[package]
+        format!(
+            r#"[package]
 name = "{}"
 version = "0.1.0"
 edition = "2021"
@@ -187,7 +195,9 @@ edition = "2021"
 [[bin]]
 name = "{}"
 path = "src/main.rs"
-"#, self.config.project_name, self.config.project_name)
+"#,
+            self.config.project_name, self.config.project_name
+        )
     }
 
     fn get_main_template(&self) -> String {
@@ -204,11 +214,13 @@ fn main() {
     println!("");
     println!("For more information, see README.md");
 }
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn get_readme_template(&self) -> String {
-        format!(r#"# {}
+        format!(
+            r#"# {}
 
 A SinkDB database project.
 
@@ -272,7 +284,9 @@ See `sinkdb.toml` for configuration options.
 - [SinkDB Documentation](https://github.com/yourusername/sinkdb)
 - [Schema Language Reference](https://github.com/yourusername/sinkdb/docs/schema.md)
 - [API Reference](https://github.com/yourusername/sinkdb/docs/api.md)
-"#, self.config.project_name)
+"#,
+            self.config.project_name
+        )
     }
 }
 

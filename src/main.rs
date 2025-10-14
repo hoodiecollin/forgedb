@@ -1,14 +1,14 @@
 pub mod ast;
+pub mod codegen;
 pub mod lexer;
 pub mod parser;
-pub mod codegen;
 pub mod scaffold;
 
 #[cfg(test)]
 mod edge_case_tests;
 
-use parser::Parser;
 use codegen::CodeGenerator;
+use parser::Parser;
 use std::fs;
 use std::path::Path;
 
@@ -40,8 +40,7 @@ fn main() {
     }
 
     // Read schema file
-    let schema_content = fs::read_to_string(schema_path)
-        .expect("Failed to read schema file");
+    let schema_content = fs::read_to_string(schema_path).expect("Failed to read schema file");
 
     // Parse schema
     println!("Parsing schema...");

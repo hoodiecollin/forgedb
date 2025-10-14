@@ -92,25 +92,23 @@ impl SchemaRegenerator {
         // Here we use the internal regeneration logic
         // In production, this would call the parser and codegen directly
         match self.regenerate_internal(&schema_content) {
-            Ok(code) => {
-                match fs::write(&output_path, code) {
-                    Ok(_) => RegenerateResult {
-                        success: true,
-                        message: format!("✓ Code regenerated successfully"),
-                        output_path: Some(output_path),
-                    },
-                    Err(e) => RegenerateResult {
-                        success: false,
-                        message: format!("Failed to write generated code: {}", e),
-                        output_path: None,
-                    }
-                }
-            }
+            Ok(code) => match fs::write(&output_path, code) {
+                Ok(_) => RegenerateResult {
+                    success: true,
+                    message: format!("✓ Code regenerated successfully"),
+                    output_path: Some(output_path),
+                },
+                Err(e) => RegenerateResult {
+                    success: false,
+                    message: format!("Failed to write generated code: {}", e),
+                    output_path: None,
+                },
+            },
             Err(e) => RegenerateResult {
                 success: false,
                 message: format!("Generation failed: {}", e),
                 output_path: None,
-            }
+            },
         }
     }
 
@@ -120,7 +118,8 @@ impl SchemaRegenerator {
         let mut parser = sinkdb::parser::Parser::new(schema_content)
             .map_err(|e| RegenerateError::ParseError(format!("Lexer error: {}", e)))?;
 
-        let schema = parser.parse()
+        let schema = parser
+            .parse()
             .map_err(|e| RegenerateError::ParseError(format!("Parser error: {}", e)))?;
 
         // Generate code using sinkdb codegen
