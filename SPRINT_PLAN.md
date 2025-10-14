@@ -20,14 +20,14 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
 
 **Partially Complete:**
-- 🔄 Sprint 5: File watching (watcher crate exists, needs integration)
+- None
 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
 **Not Started:** Sprints 13, 15-21
 
-**Test Status:** 138/138 tests passing | 17/17 examples working
+**Test Status:** 138/138 tests passing | 18/18 examples working
 
 ---
 
@@ -628,10 +628,12 @@ tasks:
 - [x] Generate README.md
 - [x] Generate Cargo.toml and Rust project files
 
-#### File Watching (⏳ TODO - separate crate)
-- [ ] Watch `schema.sink` for changes
-- [ ] Auto-regenerate on schema change
-- [ ] Clear error display in terminal
+#### File Watching (✅ COMPLETE)
+- [x] Watch `schema.sink` for changes
+- [x] Auto-regenerate on schema change
+- [x] Clear terminal display
+- [x] Debouncing support (configurable)
+- [x] `sinkdb dev` command with options
 
 #### Documentation (✅ COMPLETE)
 - [x] CLI help text for all commands
@@ -639,12 +641,25 @@ tasks:
 - [x] Getting started guide (SPRINT5_CLI.md)
 - [x] Example demo script (examples/cli_demo.sh)
 
-**Success Criteria:**
+**Success Criteria:** ✅ All Met
 ```bash
 $ sinkdb init my-app
 $ cd my-app
-$ sinkdb dev  # watches and regenerates
+$ sinkdb dev  # watches and regenerates automatically
+
+# Options:
+$ sinkdb dev --schema schema.sink --output generated
+$ sinkdb dev --debounce 500  # custom debounce delay
+$ sinkdb dev --clear=false   # disable terminal clearing
 ```
+
+**Features:**
+- ✅ Auto-regeneration on schema changes
+- ✅ Debouncing (default 200ms, configurable)
+- ✅ Clear terminal output (optional)
+- ✅ Colored console output with status
+- ✅ Initial generation on startup
+- ✅ Error handling and display
 
 ---
 

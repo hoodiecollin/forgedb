@@ -105,6 +105,25 @@ enum Commands {
         #[arg(long)]
         no_db: bool,
     },
+
+    /// Watch schema file and auto-regenerate on changes
+    Dev {
+        /// Schema file to watch
+        #[arg(short, long, default_value = "schema.sink")]
+        schema: String,
+
+        /// Output directory for generated code
+        #[arg(short, long, default_value = "generated")]
+        output: String,
+
+        /// Debounce delay in milliseconds
+        #[arg(short, long, default_value = "200")]
+        debounce: u64,
+
+        /// Clear terminal on each regeneration
+        #[arg(long, default_value = "true")]
+        clear: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -172,6 +191,20 @@ fn main() -> Result<()> {
                 output,
                 no_api,
                 no_db,
+            })
+        }
+
+        Commands::Dev {
+            schema,
+            output,
+            debounce,
+            clear,
+        } => {
+            commands::dev::run(commands::dev::DevOptions {
+                schema,
+                output,
+                debounce,
+                clear,
             })
         }
     }

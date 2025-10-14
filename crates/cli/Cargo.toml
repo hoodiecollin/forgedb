@@ -13,6 +13,7 @@ anyhow = "1.0"
 thiserror = "1.0"
 colored = "2.1"
 sinkdb = { path = "../.." }
+sinkdb-watcher = { path = "../watcher" }
 
 [dev-dependencies]
 tempfile = "3.8"
