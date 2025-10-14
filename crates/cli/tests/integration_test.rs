@@ -125,7 +125,8 @@ fn test_validate_command_detects_errors() {
   Email: string
 }
 "#;
-    fs::write(temp_dir.path().join("schema.forge"), invalid_schema).expect("Failed to write schema");
+    fs::write(temp_dir.path().join("schema.forge"), invalid_schema)
+        .expect("Failed to write schema");
 
     let options = ValidateOptions {
         strict: false,
