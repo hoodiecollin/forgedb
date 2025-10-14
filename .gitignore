@@ -3,6 +3,7 @@
 .orchestrator/
 .worktrees/
 .turbo/
+.DS_Store
 package.json
 turbo.json
 node_modules/
