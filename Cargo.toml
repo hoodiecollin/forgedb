@@ -82,3 +82,8 @@ path = "examples/test_constraint_validation.rs"
 [[example]]
 name = "sprint5_advanced_indexing"
 path = "examples/sprint5_advanced_indexing.rs"
+
+# Sprint 5: Project Scaffolding
+[[example]]
+name = "sprint5_scaffold"
+path = "examples/sprint5_scaffold.rs"
