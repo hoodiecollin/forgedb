@@ -1,12 +1,12 @@
-# SinkDB - Complete Documentation Index
+# SinkDB - Documentation Index
 
 ## Overview
 
-This directory contains comprehensive documentation for **SinkDB**, a revolutionary schema-first database system that transpiles declarative schemas into highly optimized columnar storage with full-stack code generation.
+This directory contains documentation for **SinkDB**, a schema-first database system that transpiles declarative schemas into highly optimized columnar storage with code generation.
 
-**Version**: 0.1.0 (Design Phase)  
-**Last Updated**: October 11, 2025  
-**Status**: Specification & Planning
+**Version**: 0.1.0 (Sprint 5 Complete)
+**Last Updated**: October 13, 2025
+**Status**: Core Implementation Complete
 
 ---
 
@@ -16,17 +16,30 @@ This directory contains comprehensive documentation for **SinkDB**, a revolution
 - **[README.md](./README.md)** - Project overview, philosophy, and introduction
 - **[EXAMPLES.md](./EXAMPLES.md)** - Complete examples and tutorials to get started
 
-### 📖 Core Specifications
-- **[DSL_SPECIFICATION.md](./DSL_SPECIFICATION.md)** - Complete schema language reference
-- **[STORAGE_ARCHITECTURE.md](./STORAGE_ARCHITECTURE.md)** - Columnar storage design and implementation
-- **[API_GENERATION.md](./API_GENERATION.md)** - REST API generation and usage
-
-### 🛠️ Development Tools
-- **[CLI_SPECIFICATION.md](./CLI_SPECIFICATION.md)** - Command-line tool reference
+### 📋 Project Documentation
+- **[SPRINT_PLAN.md](./SPRINT_PLAN.md)** - Overall sprint structure and development plan
 - **[ROADMAP.md](./ROADMAP.md)** - Development phases and timeline
 
-### 🚀 Advanced Features
-- **[ADVANCED_FEATURES.md](./ADVANCED_FEATURES.md)** - Future features and experimental ideas
+### 📚 Archived Documentation
+Documentation from the design and implementation phases has been moved to the `archive/` directory:
+- **[archive/planning/](./archive/planning/)** - Original design specifications (DSL, Storage, API, CLI)
+- **[archive/sprint-summaries/](./archive/sprint-summaries/)** - Completed sprint implementation summaries
+
+---
+
+## Completed Sprints
+
+### Implementation Status (Sprint 1-5 ✅)
+
+Core features are now complete and tested:
+
+- **Sprint 1** - MVP (Schema parsing, code generation, basic storage) ✅
+- **Sprint 2** - Types & Persistence (9 type system, columnar storage, validation) ✅
+- **Sprint 3** - Indexing & Queries (Hash indexes, query operations, tombstones) ✅
+- **Sprint 4** - Relations (One-to-many, foreign key validation) ✅
+- **Sprint 5** - Developer Experience (CLI, scaffolding, file watching, constraints, advanced indexes) ✅
+
+**Detailed sprint documentation:** See `archive/sprint-summaries/` for implementation notes and test coverage.
 
 ---
 
@@ -41,11 +54,43 @@ This directory contains comprehensive documentation for **SinkDB**, a revolution
 - Philosophy and design principles
 - Related projects and differentiators
 
-**Read this if:** You want a high-level understanding of SinkDB and its value proposition.
+**Read this if:** You want a high-level understanding of SinkDB and its current implementation status.
 
 ---
 
-### DSL_SPECIFICATION.md
+### EXAMPLES.md
+**What it covers:**
+- Working code examples for all features
+- Sprint-specific demonstrations
+- Usage patterns and best practices
+
+**Read this if:** You want to see how to use SinkDB features in practice.
+
+---
+
+### SPRINT_PLAN.md
+**What it covers:**
+- Sprint breakdown and progression
+- Feature implementation order
+- Sprint dependencies and milestones
+
+**Read this if:** You want to understand the development approach and remaining work.
+
+---
+
+### ROADMAP.md
+**What it covers:**
+- Remaining sprints (6-20)
+- Future features and capabilities
+- Production readiness checklist
+
+**Read this if:** You want to see what's coming next.
+
+---
+
+## Archived Documentation
+
+### archive/planning/DSL_SPECIFICATION.md
 **What it covers:**
 - Complete schema language syntax
 - Type system (primitives, strings, UUIDs, timestamps, financial, hashes)
@@ -127,27 +172,7 @@ This directory contains comprehensive documentation for **SinkDB**, a revolution
 
 ---
 
-### EXAMPLES.md
-**What it covers:**
-- Quick start guide
-- Complete example applications:
-  - Blog platform
-  - E-commerce system
-  - Task management app
-- Step-by-step tutorials
-- Computed field implementations
-- UI component examples
-- API usage examples
-- Frontend integration (React)
-- Testing examples
-- Deployment guide
-- Best practices
-
-**Read this if:** You want practical, working examples to learn from.
-
----
-
-### ADVANCED_FEATURES.md
+### archive/planning/ADVANCED_FEATURES.md
 **What it covers:**
 - Partial column selection (projection optimization)
 - Hot cache / materialized in-memory views
@@ -211,42 +236,44 @@ From one schema file, SinkDB generates:
 
 ---
 
-## Development Phases
+## Current Status (Sprint 5 Complete)
 
-### Phase 1: Core Database (v1.0)
-**Timeline**: 6-8 months  
-**Focus**: Storage engine, schema transpiler, basic CRUD
+### ✅ Implemented Features
 
-**Key Milestones**:
-1. Schema parser & AST
-2. Code generation framework
-3. Columnar storage (fixed + variable)
-4. Query execution
-5. Relations & joins
-6. WAL & durability
-7. Inline structs & arrays
+**Core Database:**
+- Schema parsing and validation ✅
+- Code generation (Rust storage layer) ✅
+- Columnar storage (fixed + variable) ✅
+- 9-type type system (u32, u64, i32, i64, f64, bool, string, uuid, timestamp) ✅
+- Auto-generation (+uuid, +timestamp) ✅
+- Unique constraints (&) ✅
+- Hash indexes (^) ✅
+- Composite indexes ✅
+- One-to-many relations ✅
+- Tombstone deletion ✅
+- Schema constraints (@min, @max, @email, @url, @pattern) ✅
 
-### Phase 2: Full-Stack Integration (v2.0)
-**Timeline**: 4-6 months after v1  
-**Focus**: Developer tools, API generation, UI integration
+**Developer Tools:**
+- CLI (`sinkdb init`, `generate`, `validate`, `build`) ✅
+- Project scaffolding ✅
+- File watching and auto-regeneration ✅
+- Validation with helpful error messages ✅
 
-**Key Milestones**:
-1. CLI tool
-2. REST API generation
-3. Computed fields & plugins
-4. UI component integration
-5. Migration system
+**Testing:**
+- 189+ comprehensive tests ✅
+- Examples for all features ✅
 
-### Phase 3: Advanced Features (v3.0)
-**Timeline**: TBD  
-**Focus**: Production hardening, advanced features
+### 🚧 Remaining Work (Sprints 6-20)
 
-**Planned Features**:
-- WASM support
-- Distributed/replication
-- Advanced indexing
-- MVCC concurrency
-- AI-powered development
+See SPRINT_PLAN.md and ROADMAP.md for:
+- Write-Ahead Log (WAL) and crash recovery
+- Update/delete operations
+- API generation (REST)
+- Query engine improvements
+- Computed fields
+- Many-to-many relations
+- Transactions
+- Optimization and production hardening
 
 ---
 
@@ -546,14 +573,20 @@ dimensions: [f64; 3]
 
 ## Changelog
 
-### v0.1.0 (2025-10-11)
+### v0.1.0 - Sprint 5 (2025-10-13)
+- ✅ Complete core database implementation (Sprints 1-5)
+- ✅ CLI and developer tools
+- ✅ Comprehensive test suite (189+ tests)
+- ✅ Working examples for all features
+- 📚 Documentation reorganization (archived design docs)
+
+### v0.0.1 (2025-10-11)
 - Initial design documentation
 - Complete specifications
-- Example applications
 - Development roadmap
 
 ---
 
-**For questions or feedback during the design phase, please reach out to the development team.**
+**Project Status**: Core implementation complete, ready for remaining sprints.
 
-**Last Updated**: October 11, 2025
+**Last Updated**: October 13, 2025

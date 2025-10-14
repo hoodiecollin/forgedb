@@ -133,8 +133,8 @@ fn test_validate_command_detects_errors() {
     };
 
     let result = run(options);
-    // Should succeed but report errors
-    assert!(result.is_ok());
+    // Should fail due to validation errors in parsing phase
+    assert!(result.is_err(), "Invalid schema should fail validation");
 }
 
 #[test]

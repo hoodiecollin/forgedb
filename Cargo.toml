@@ -26,6 +26,7 @@ ordered-float = "4.2"
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
 sinkdb-watcher = { path = "crates/watcher" }
+sinkdb-cli = { path = "crates/cli" }
 
 [lib]
 name = "sinkdb"

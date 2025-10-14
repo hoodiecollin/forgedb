@@ -1,8 +1,36 @@
 // Generated code - do not edit manually
+// This file demonstrates what generated code looks like
 
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+fn main() {
+    println!("=== Generated Code Example ===\n");
+    println!("This example shows the structure of generated database code.");
+    println!("In a real application, this would be generated from a schema.sink file.\n");
+
+    // Create a new database and test basic operations
+    let mut db = Database::new();
+
+    println!("Inserting a test user...");
+    match db.user.insert(
+        "test@example.com".to_string(),
+        25,
+        100.50,
+        true,
+        42
+    ) {
+        Ok(user) => {
+            println!("✓ User created successfully!");
+            println!("  ID: {}", user.id);
+            println!("  Email: {}", user.email);
+            println!("  Age: {}", user.age);
+        }
+        Err(e) => println!("✗ Error: {}", e),
+    }
+
+    println!("\nThis demonstrates the generated API structure.");
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct User {
