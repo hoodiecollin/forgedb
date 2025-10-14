@@ -22,6 +22,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 15: Compaction & Maintenance (Background optimization and dead space reclamation)
 - ✅ Sprint 16: Migrations (Schema evolution and version management)
 - ✅ Sprint 18: Full-Text Search (Inverted index, TF-IDF ranking, phrase search)
+- ✅ Sprint 19: Advanced Features (Materialized computed fields, soft delete, batch operations, partial field selection)
 
 **Partially Complete:**
 - None
@@ -29,7 +30,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 17, 19-23
+**Not Started:** Sprints 17, 20-23
 
 **Test Status:** 162/162 tests passing (11 fulltext tests, 7 new tests) | 19/19 examples working
 
@@ -1372,33 +1373,35 @@ See: `crates/fulltext/src/lib.rs` and `examples/fulltext_search.rs`
 
 ---
 
-## Sprint 19: Advanced Features (Select)
+## Sprint 19: Advanced Features (Select) ✅
 
 **Goal**: High-value advanced features.
+
+**Status**: COMPLETED
 
 ### Tasks
 
 #### Materialized Computed Fields
-- [ ] `@materialized` directive
-- [ ] Store computed result
-- [ ] Invalidate on dependency change
+- [x] `@materialized` directive
+- [x] Store computed result
+- [x] Invalidate on dependency change
 
 #### Partial Field Selection
-- [ ] API: `?fields=id,email,created_at`
-- [ ] Only load selected columns
-- [ ] Reduce response size
+- [x] API: `?fields=id,email,created_at`
+- [x] Only load selected columns
+- [x] Reduce response size
 
 #### Batch Operations
-- [ ] Batch create: `POST /api/users/batch`
-- [ ] Batch update
-- [ ] Batch delete
-- [ ] Transactional batches
+- [x] Batch create: `POST /api/users/batch`
+- [x] Batch update
+- [x] Batch delete
+- [x] Transactional batches
 
 #### Soft Delete
-- [ ] `@soft_delete` directive
-- [ ] Add `deleted_at` timestamp
-- [ ] Filter deleted by default
-- [ ] `?include_deleted=true` to show
+- [x] `@soft_delete` directive
+- [x] Add `deleted_at` timestamp
+- [x] Filter deleted by default
+- [x] `?include_deleted=true` to show
 
 #### Success Criteria
 - [x] Materialized fields cached correctly
