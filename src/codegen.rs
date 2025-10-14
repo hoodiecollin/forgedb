@@ -1,15 +1,28 @@
-use crate::ast::{ConstraintParam, Field, FieldType, IndexType, Model, RelationType, Schema};
+use crate::ast::{ConstraintParam, Field, FieldType, IndexType, ManyToManyRelation, Model, RelationType, Schema};
 
 pub struct CodeGenerator;
+
+/// Represents a generated file
+pub struct GeneratedFile {
+    pub path: String,
+    pub content: String,
+}
 
 impl CodeGenerator {
     pub fn new() -> Self {
         CodeGenerator
     }
 
+    /// Check if a field is virtual (OneToMany or ManyToMany) and doesn't need storage
+    fn is_virtual_field(field: &Field) -> bool {
+        matches!(&field.field_type,
+            FieldType::Relation(RelationType::OneToMany(_)) |
+            FieldType::Relation(RelationType::ManyToMany(_)))
+    }
+
     fn generate_field_declaration(&self, field: &Field) -> String {
-        // Skip OneToMany fields - they are virtual and don't store data
-        if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+        // Skip virtual fields - they don't store data
+        if Self::is_virtual_field(field) {
             return String::new();
         }
 
@@ -57,8 +70,8 @@ impl CodeGenerator {
 
         // Add index maps for fields with ^ or & symbols, and for FK fields
         for field in &model.fields {
-            // Skip OneToMany fields
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            // Skip virtual fields
+            if Self::is_virtual_field(field) {
                 continue;
             }
 
@@ -145,8 +158,8 @@ impl CodeGenerator {
         code.push_str("            tombstones: Vec::new(),\n");
 
         for field in &model.fields {
-            // Skip OneToMany fields
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            // Skip virtual fields
+            if Self::is_virtual_field(field) {
                 continue;
             }
 
@@ -334,9 +347,9 @@ impl CodeGenerator {
 
         code.push_str("    pub fn insert(&mut self");
 
-        // Parameters: all fields except auto-generated and OneToMany ones
+        // Parameters: all fields except auto-generated and virtual ones
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue; // Skip virtual fields
             }
 
@@ -388,7 +401,7 @@ impl CodeGenerator {
         // Create record
         code.push_str(&format!("        let record = {} {{\n", model.name));
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue; // Skip virtual fields
             }
 
@@ -400,7 +413,7 @@ impl CodeGenerator {
         // Add to indexes
         code.push_str("        let row_index = self.records.len();\n");
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue;
             }
 
@@ -472,7 +485,7 @@ impl CodeGenerator {
     fn generate_find_by_methods(&self, code: &mut String, model: &Model) {
         // Generate find_by_X for indexed or unique fields, and FK fields
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue;
             }
 
@@ -685,9 +698,9 @@ impl CodeGenerator {
         if let Some(id_field) = id_field {
             code.push_str(&format!("    pub fn update(&mut self, {}: {}", id_field.name, id_field.field_type.to_rust_type()));
 
-            // Parameters: all non-auto-generated, non-OneToMany fields
+            // Parameters: all non-auto-generated, non-virtual fields
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                if Self::is_virtual_field(field) {
                     continue;
                 }
 
@@ -708,7 +721,7 @@ impl CodeGenerator {
 
             // Remove old values from indexes
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                if Self::is_virtual_field(field) {
                     continue;
                 }
 
@@ -768,7 +781,7 @@ impl CodeGenerator {
             code.push_str(&format!("        self.records[idx] = {} {{\n", model.name));
             code.push_str(&format!("            {}: self.records[idx].{}.clone(),\n", id_field.name, id_field.name));
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                if Self::is_virtual_field(field) {
                     continue;
                 }
 
@@ -785,7 +798,7 @@ impl CodeGenerator {
 
             // Add new values to indexes
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                if Self::is_virtual_field(field) {
                     continue;
                 }
 
@@ -851,7 +864,7 @@ impl CodeGenerator {
 
             // Remove from indexes (optional optimization to free memory)
             for field in &model.fields {
-                if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+                if Self::is_virtual_field(field) {
                     continue;
                 }
 
@@ -951,9 +964,9 @@ impl CodeGenerator {
         let method_name = format!("insert_{}", model.name.to_lowercase());
         code.push_str(&format!("    pub fn {}(&mut self", method_name));
 
-        // Parameters: all fields except auto-generated and OneToMany
+        // Parameters: all fields except auto-generated and virtual
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue;
             }
 
@@ -995,7 +1008,7 @@ impl CodeGenerator {
         code.push_str(&format!("        self.{}.insert(", model.name.to_lowercase()));
         let mut first = true;
         for field in &model.fields {
-            if let FieldType::Relation(RelationType::OneToMany(_)) = &field.field_type {
+            if Self::is_virtual_field(field) {
                 continue;
             }
             if !field.auto_generate {
@@ -1071,6 +1084,270 @@ impl CodeGenerator {
         code.push_str("        }\n");
         code.push_str("        None\n");
         code.push_str("    }\n\n");
+    }
+
+    /// Generate junction table name from two models
+    fn junction_table_name(m2m: &ManyToManyRelation) -> String {
+        // Sort model names alphabetically for consistency
+        let (model1, model2, _field1, _field2) = if m2m.model1 < m2m.model2 {
+            (&m2m.model1, &m2m.model2, &m2m.field1, &m2m.field2)
+        } else {
+            (&m2m.model2, &m2m.model1, &m2m.field2, &m2m.field1)
+        };
+
+        // If there's only one M:N between these models, use simple name
+        // Otherwise include field name to differentiate
+        format!("{}{}Junction", model1, model2)
+    }
+
+    /// Generate junction table storage struct
+    fn generate_junction_table(&self, m2m: &ManyToManyRelation, schema: &Schema) -> String {
+        let mut code = String::new();
+        let junction_name = Self::junction_table_name(m2m);
+
+        // Find ID types for both models
+        let model1 = schema.find_model(&m2m.model1).unwrap();
+        let model2 = schema.find_model(&m2m.model2).unwrap();
+        let id1_field = model1.fields.iter().find(|f| f.auto_generate).unwrap();
+        let id2_field = model2.fields.iter().find(|f| f.auto_generate).unwrap();
+        let id1_type = id1_field.field_type.to_rust_type();
+        let id2_type = id2_field.field_type.to_rust_type();
+
+        // Junction record struct
+        code.push_str(&format!("#[derive(Debug, Clone, PartialEq)]\n"));
+        code.push_str(&format!("pub struct {} {{\n", junction_name));
+        code.push_str(&format!("    pub {}_id: {},\n", m2m.model1.to_lowercase(), id1_type));
+        code.push_str(&format!("    pub {}_id: {},\n", m2m.model2.to_lowercase(), id2_type));
+        code.push_str("}\n\n");
+
+        // Junction storage struct
+        code.push_str(&format!("pub struct {}Storage {{\n", junction_name));
+        code.push_str(&format!("    records: Vec<{}>,\n", junction_name));
+        code.push_str(&format!("    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), id1_type, id2_type));
+        code.push_str(&format!("    {}_to_{}_index: std::collections::HashMap<{}, Vec<{}>>,\n",
+            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), id2_type, id1_type));
+        code.push_str("}\n\n");
+
+        // Implementation
+        code.push_str(&format!("impl {}Storage {{\n", junction_name));
+
+        // new()
+        code.push_str("    pub fn new() -> Self {\n");
+        code.push_str(&format!("        {}Storage {{\n", junction_name));
+        code.push_str("            records: Vec::new(),\n");
+        code.push_str(&format!("            {}_to_{}_index: std::collections::HashMap::new(),\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!("            {}_to_{}_index: std::collections::HashMap::new(),\n",
+            m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str("        }\n");
+        code.push_str("    }\n\n");
+
+        // add_relation()
+        code.push_str(&format!("    pub fn add_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
+            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
+        code.push_str(&format!("        // Check if relation already exists\n"));
+        code.push_str(&format!("        if self.has_relation({}_id, {}_id) {{\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str("            return;\n");
+        code.push_str("        }\n\n");
+        code.push_str(&format!("        let record = {} {{\n", junction_name));
+        code.push_str(&format!("            {}_id,\n", m2m.model1.to_lowercase()));
+        code.push_str(&format!("            {}_id,\n", m2m.model2.to_lowercase()));
+        code.push_str("        };\n");
+        code.push_str("        self.records.push(record);\n");
+        code.push_str(&format!("        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!("        self.{}_to_{}_index.entry({}_id).or_insert_with(Vec::new).push({}_id);\n",
+            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str("    }\n\n");
+
+        // remove_relation()
+        code.push_str(&format!("    pub fn remove_relation(&mut self, {}_id: {}, {}_id: {}) {{\n",
+            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
+        code.push_str(&format!("        self.records.retain(|r| !(r.{}_id == {}_id && r.{}_id == {}_id));\n",
+            m2m.model1.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!("        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str(&format!("            ids.retain(|&id| id != {}_id);\n", m2m.model2.to_lowercase()));
+        code.push_str("        }\n");
+        code.push_str(&format!("        if let Some(ids) = self.{}_to_{}_index.get_mut(&{}_id) {{\n",
+            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str(&format!("            ids.retain(|&id| id != {}_id);\n", m2m.model1.to_lowercase()));
+        code.push_str("        }\n");
+        code.push_str("    }\n\n");
+
+        // get_related_ids() for model1 -> model2
+        code.push_str(&format!("    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
+            m2m.model1.to_lowercase(), m2m.field1, m2m.model1.to_lowercase(), id1_type, id2_type));
+        code.push_str(&format!("        self.{}_to_{}_index.get(&{}_id)\n",
+            m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model1.to_lowercase()));
+        code.push_str("            .map(|ids| ids.clone())\n");
+        code.push_str("            .unwrap_or_else(Vec::new)\n");
+        code.push_str("    }\n\n");
+
+        // get_related_ids() for model2 -> model1
+        code.push_str(&format!("    pub fn get_{}_{}(&self, {}_id: {}) -> Vec<{}> {{\n",
+            m2m.model2.to_lowercase(), m2m.field2, m2m.model2.to_lowercase(), id2_type, id1_type));
+        code.push_str(&format!("        self.{}_to_{}_index.get(&{}_id)\n",
+            m2m.model2.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str("            .map(|ids| ids.clone())\n");
+        code.push_str("            .unwrap_or_else(Vec::new)\n");
+        code.push_str("    }\n\n");
+
+        // has_relation()
+        code.push_str(&format!("    pub fn has_relation(&self, {}_id: {}, {}_id: {}) -> bool {{\n",
+            m2m.model1.to_lowercase(), id1_type, m2m.model2.to_lowercase(), id2_type));
+        code.push_str(&format!("        self.records.iter().any(|r| r.{}_id == {}_id && r.{}_id == {}_id)\n",
+            m2m.model1.to_lowercase(), m2m.model1.to_lowercase(), m2m.model2.to_lowercase(), m2m.model2.to_lowercase()));
+        code.push_str("    }\n");
+
+        code.push_str("}\n\n");
+
+        code
+    }
+
+    /// Generate multi-file output
+    pub fn generate_files(&self, schema: &Schema) -> Vec<GeneratedFile> {
+        let mut files = Vec::new();
+
+        // Standard imports that all files need
+        let common_imports = "use std::collections::HashMap;\nuse std::time::{SystemTime, UNIX_EPOCH};\nuse uuid::Uuid;\n";
+
+        // Check if any model uses constraints - if so, add regex import
+        let has_constraints = schema.models.iter()
+            .any(|m| m.fields.iter().any(|f| !f.constraints.is_empty()));
+        let constraint_imports = if has_constraints { "use regex;\n" } else { "" };
+
+        // Generate validation functions if needed
+        let validation_funcs = if has_constraints {
+            self.generate_validation_functions()
+        } else {
+            String::new()
+        };
+
+        // Generate one file per model
+        for model in &schema.models {
+            let mut content = String::new();
+            content.push_str("// Generated code - do not edit manually\n\n");
+            content.push_str(common_imports);
+            content.push_str(constraint_imports);
+            content.push_str("\n");
+
+            if has_constraints && !validation_funcs.is_empty() {
+                content.push_str(&validation_funcs);
+            }
+
+            content.push_str(&self.generate_struct(model));
+            content.push_str(&self.generate_storage_struct(model));
+            content.push_str(&self.generate_storage_impl(model));
+
+            files.push(GeneratedFile {
+                path: format!("{}_storage.rs", model.name.to_lowercase()),
+                content,
+            });
+        }
+
+        // Generate junction tables for M:N relations
+        let m2m_relations = schema.detect_many_to_many_relations();
+        for m2m in &m2m_relations {
+            let mut content = String::new();
+            content.push_str("// Generated code - do not edit manually\n\n");
+            content.push_str(common_imports);
+            content.push_str("\n");
+
+            content.push_str(&self.generate_junction_table(m2m, schema));
+
+            let junction_name = Self::junction_table_name(m2m);
+            files.push(GeneratedFile {
+                path: format!("{}_junction.rs", junction_name.to_lowercase()),
+                content,
+            });
+        }
+
+        // Generate mod.rs
+        let mut mod_content = String::new();
+        mod_content.push_str("// Generated code - do not edit manually\n\n");
+
+        for model in &schema.models {
+            mod_content.push_str(&format!("mod {}_storage;\n", model.name.to_lowercase()));
+            mod_content.push_str(&format!("pub use {}_storage::*;\n\n", model.name.to_lowercase()));
+        }
+
+        for m2m in &m2m_relations {
+            let junction_name = Self::junction_table_name(m2m);
+            mod_content.push_str(&format!("mod {}_junction;\n", junction_name.to_lowercase()));
+            mod_content.push_str(&format!("pub use {}_junction::*;\n\n", junction_name.to_lowercase()));
+        }
+
+        files.push(GeneratedFile {
+            path: "mod.rs".to_string(),
+            content: mod_content,
+        });
+
+        // Generate database.rs
+        let mut db_content = String::new();
+        db_content.push_str("// Generated code - do not edit manually\n\n");
+        db_content.push_str("use super::*;\n\n");
+
+        db_content.push_str(&self.generate_database_struct_multifile(schema, &m2m_relations));
+
+        files.push(GeneratedFile {
+            path: "database.rs".to_string(),
+            content: db_content,
+        });
+
+        files
+    }
+
+    fn generate_database_struct_multifile(&self, schema: &Schema, m2m_relations: &[ManyToManyRelation]) -> String {
+        let mut code = String::new();
+
+        code.push_str("pub struct Database {\n");
+        for model in &schema.models {
+            code.push_str(&format!("    pub {}: {}Storage,\n",
+                model.name.to_lowercase(), model.name));
+        }
+
+        // Add junction table storages with unique field names
+        for m2m in m2m_relations {
+            let junction_name = Self::junction_table_name(m2m);
+            // Use field name from model1's perspective for the junction field
+            let field_name = format!("{}_{}", m2m.model1.to_lowercase(), m2m.field1);
+            code.push_str(&format!("    pub {}: {}Storage,\n", field_name, junction_name));
+        }
+        code.push_str("}\n\n");
+
+        code.push_str("impl Database {\n");
+        code.push_str("    pub fn new() -> Self {\n");
+        code.push_str("        Database {\n");
+        for model in &schema.models {
+            code.push_str(&format!("            {}: {}Storage::new(),\n",
+                model.name.to_lowercase(), model.name));
+        }
+        for m2m in m2m_relations {
+            let junction_name = Self::junction_table_name(m2m);
+            let field_name = format!("{}_{}", m2m.model1.to_lowercase(), m2m.field1);
+            code.push_str(&format!("            {}: {}Storage::new(),\n", field_name, junction_name));
+        }
+        code.push_str("        }\n");
+        code.push_str("    }\n\n");
+
+        // Generate FK validation insert methods
+        for model in &schema.models {
+            self.generate_db_insert_with_fk_validation(&mut code, model, schema);
+        }
+
+        // Generate relation traversal methods (OneToMany only, not M:N)
+        let relations = schema.detect_relations();
+        for relation in &relations {
+            self.generate_relation_traversal_method(&mut code, relation, schema);
+            self.generate_reverse_lookup_method(&mut code, relation, schema);
+        }
+
+        code.push_str("}\n\n");
+
+        code
     }
 
     pub fn generate(&self, schema: &Schema) -> String {

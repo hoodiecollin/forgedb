@@ -101,6 +101,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
                     sinkdb::ast::RelationType::OneToMany(t) => t,
                     sinkdb::ast::RelationType::RequiredReference(t) => t,
                     sinkdb::ast::RelationType::OptionalReference(t) => t,
+                    sinkdb::ast::RelationType::ManyToMany(t) => t,
                 };
                 if !schema.models.iter().any(|m| &m.name == target) {
                     errors.push(format!(

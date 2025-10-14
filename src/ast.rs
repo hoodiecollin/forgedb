@@ -62,6 +62,8 @@ pub enum RelationType {
     RequiredReference(String),
     /// Optional reference: ?User means this model optionally references a User
     OptionalReference(String),
+    /// Many-to-many: detected from bidirectional OneToMany fields
+    ManyToMany(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +144,87 @@ impl Schema {
 
         relations
     }
+
+    /// Detect many-to-many relationships by finding bidirectional OneToMany fields
+    /// Returns pairs where Model A has [ModelB] and Model B has [ModelA]
+    /// Excludes relationships that are already handled by FK references (1:N)
+    pub fn detect_many_to_many_relations(&self) -> Vec<ManyToManyRelation> {
+        let mut m2m_relations = Vec::new();
+        let mut processed_pairs = std::collections::HashSet::new();
+
+        // First, identify all 1:N relationships (OneToMany with matching FK)
+        // We need to track specific FIELD pairs, not just model pairs
+        let one_to_many_field_pairs: std::collections::HashSet<(String, String, String, String)> = self.detect_relations()
+            .iter()
+            .map(|rel| {
+                // For a 1:N relation, the parent's OneToMany field and child's FK field form a pair
+                // We store both orderings to match against
+                vec![
+                    (rel.parent_model.clone(), rel.parent_field.clone(), rel.child_model.clone(), rel.child_field.clone()),
+                    (rel.child_model.clone(), rel.child_field.clone(), rel.parent_model.clone(), rel.parent_field.clone()),
+                ]
+            })
+            .flatten()
+            .collect();
+
+        for model in &self.models {
+            for field in &model.fields {
+                if let FieldType::Relation(RelationType::OneToMany(target_model)) = &field.field_type {
+                    // Check if target model has a OneToMany field pointing back to this model
+                    if let Some(target) = self.find_model(target_model) {
+                        for target_field in &target.fields {
+                            if let FieldType::Relation(RelationType::OneToMany(back_ref)) = &target_field.field_type {
+                                if back_ref == &model.name {
+                                    // Check if this specific FIELD pair is NOT a 1:N relationship (no FK)
+                                    // by checking if this field pair is in the one_to_many_field_pairs set
+                                    let is_one_to_many = one_to_many_field_pairs.contains(&(
+                                        model.name.clone(),
+                                        field.name.clone(),
+                                        target_model.clone(),
+                                        target_field.name.clone()
+                                    ));
+
+                                    if !is_one_to_many {
+                                        // Found a true M:N relationship
+                                        // Create a consistent ordering to avoid duplicates
+                                        let mut models_fields = vec![
+                                            (model.name.as_str(), field.name.as_str()),
+                                            (target.name.as_str(), target_field.name.as_str())
+                                        ];
+                                        models_fields.sort();
+
+                                        let pair_key = format!("{}:{}:{}:{}",
+                                            models_fields[0].0, models_fields[0].1,
+                                            models_fields[1].0, models_fields[1].1);
+
+                                        if !processed_pairs.contains(&pair_key) {
+                                            processed_pairs.insert(pair_key);
+
+                                            // Always store with consistent ordering
+                                            let (model1, field1, model2, field2) = if model.name < target.name {
+                                                (model.name.clone(), field.name.clone(), target.name.clone(), target_field.name.clone())
+                                            } else {
+                                                (target.name.clone(), target_field.name.clone(), model.name.clone(), field.name.clone())
+                                            };
+
+                                            m2m_relations.push(ManyToManyRelation {
+                                                model1,
+                                                field1,
+                                                model2,
+                                                field2,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        m2m_relations
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +234,15 @@ pub struct RelationPair {
     pub child_model: String,
     pub child_field: String,
     pub is_required: bool,
+}
+
+/// Represents a many-to-many relationship between two models
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManyToManyRelation {
+    pub model1: String,
+    pub field1: String,
+    pub model2: String,
+    pub field2: String,
 }
 
 impl FieldType {
@@ -169,6 +261,7 @@ impl FieldType {
                 RelationType::RequiredReference(model) => format!("uuid::Uuid /* FK to {} */", model),
                 RelationType::OptionalReference(model) => format!("Option<uuid::Uuid> /* FK to {} */", model),
                 RelationType::OneToMany(_) => "/* virtual field - no storage */".to_string(),
+                RelationType::ManyToMany(_) => "/* virtual field - stored in junction table */".to_string(),
             },
         }
     }
@@ -229,6 +322,7 @@ impl RelationType {
             RelationType::OneToMany(model) => model,
             RelationType::RequiredReference(model) => model,
             RelationType::OptionalReference(model) => model,
+            RelationType::ManyToMany(model) => model,
         }
     }
 
@@ -238,5 +332,139 @@ impl RelationType {
 
     pub fn is_reference(&self) -> bool {
         matches!(self, RelationType::RequiredReference(_) | RelationType::OptionalReference(_))
+    }
+
+    pub fn is_many_to_many(&self) -> bool {
+        matches!(self, RelationType::ManyToMany(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_many_to_many() {
+        // Create a simple schema with M:N relations
+        let schema = Schema {
+            models: vec![
+                Model {
+                    name: "Post".to_string(),
+                    fields: vec![
+                        Field {
+                            name: "id".to_string(),
+                            field_type: FieldType::Uuid,
+                            auto_generate: true,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                        Field {
+                            name: "tags".to_string(),
+                            field_type: FieldType::Relation(RelationType::OneToMany("Tag".to_string())),
+                            auto_generate: false,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                    ],
+                    composite_indexes: vec![],
+                },
+                Model {
+                    name: "Tag".to_string(),
+                    fields: vec![
+                        Field {
+                            name: "id".to_string(),
+                            field_type: FieldType::Uuid,
+                            auto_generate: true,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                        Field {
+                            name: "posts".to_string(),
+                            field_type: FieldType::Relation(RelationType::OneToMany("Post".to_string())),
+                            auto_generate: false,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                    ],
+                    composite_indexes: vec![],
+                },
+            ],
+        };
+
+        let m2m = schema.detect_many_to_many_relations();
+        assert_eq!(m2m.len(), 1);
+        assert_eq!(m2m[0].model1, "Post");
+        assert_eq!(m2m[0].field1, "tags");
+        assert_eq!(m2m[0].model2, "Tag");
+        assert_eq!(m2m[0].field2, "posts");
+    }
+
+    #[test]
+    fn test_no_m2m_with_fk() {
+        // Schema with 1:N relationship (should not be detected as M:N)
+        let schema = Schema {
+            models: vec![
+                Model {
+                    name: "User".to_string(),
+                    fields: vec![
+                        Field {
+                            name: "id".to_string(),
+                            field_type: FieldType::Uuid,
+                            auto_generate: true,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                        Field {
+                            name: "posts".to_string(),
+                            field_type: FieldType::Relation(RelationType::OneToMany("Post".to_string())),
+                            auto_generate: false,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                    ],
+                    composite_indexes: vec![],
+                },
+                Model {
+                    name: "Post".to_string(),
+                    fields: vec![
+                        Field {
+                            name: "id".to_string(),
+                            field_type: FieldType::Uuid,
+                            auto_generate: true,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                        Field {
+                            name: "author".to_string(),
+                            field_type: FieldType::Relation(RelationType::RequiredReference("User".to_string())),
+                            auto_generate: false,
+                            unique: false,
+                            indexed: false,
+                            constraints: vec![],
+                            index_type: IndexType::Hash,
+                        },
+                    ],
+                    composite_indexes: vec![],
+                },
+            ],
+        };
+
+        // Should not detect M:N because User.posts has a corresponding FK in Post.author
+        let m2m = schema.detect_many_to_many_relations();
+        assert_eq!(m2m.len(), 0);
     }
 }
