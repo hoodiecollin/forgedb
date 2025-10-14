@@ -5,6 +5,7 @@ members = [
     "crates/types",
     "crates/validation",
     "crates/tests",
+    "crates/cli",
 ]
 resolver = "2"
 
@@ -26,7 +27,7 @@ sinkdb-validation = { path = "crates/validation" }
 
 [lib]
 name = "sinkdb"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 # Sprint 1 MVP Examples
 [[example]]

@@ -540,11 +540,11 @@ Post {
 
 ---
 
-## Sprint 5: CLI & Developer Experience ⏳ TODO
+## Sprint 5: CLI & Developer Experience ✅ PARTIALLY COMPLETE
 
 **Goal**: Usable CLI tool with good DX.
 
-**Status**: ⏳ Not yet implemented
+**Status**: ✅ CLI commands implemented (cli crate complete)
 
 **Orchestration**: ✅ Highly Parallelizable
 ```yaml
@@ -605,27 +605,30 @@ tasks:
 
 ### Tasks
 
-#### CLI Commands
-- [ ] `sinkdb init <project>` - scaffolds new project
-- [ ] `sinkdb generate` - generates code from schema
-- [ ] `sinkdb validate` - validates schema
-- [ ] `sinkdb build` - compiles generated code
+#### CLI Commands (✅ COMPLETE - crates/cli)
+- [x] `sinkdb init <project>` - scaffolds new project
+- [x] `sinkdb generate` - generates code from schema
+- [x] `sinkdb validate` - validates schema
+- [x] `sinkdb build` - compiles generated code
 
-#### Project Structure
-- [ ] Generate standard project layout
-- [ ] Create `schema.lang` file
-- [ ] Create `sinkdb.toml` config
-- [ ] Generate `.gitignore`
+#### Project Structure (✅ COMPLETE)
+- [x] Generate standard project layout
+- [x] Create `schema.sink` file (with templates: blank, blog, ecommerce, todo)
+- [x] Create `sinkdb.toml` config
+- [x] Generate `.gitignore`
+- [x] Generate README.md
+- [x] Generate Cargo.toml and Rust project files
 
-#### File Watching
-- [ ] Watch `schema.lang` for changes
+#### File Watching (⏳ TODO - separate crate)
+- [ ] Watch `schema.sink` for changes
 - [ ] Auto-regenerate on schema change
 - [ ] Clear error display in terminal
 
-#### Documentation
-- [ ] CLI help text
-- [ ] Error messages with suggestions
-- [ ] Getting started guide
+#### Documentation (✅ COMPLETE)
+- [x] CLI help text for all commands
+- [x] Error messages with suggestions
+- [x] Getting started guide (SPRINT5_CLI.md)
+- [x] Example demo script (examples/cli_demo.sh)
 
 **Success Criteria:**
 ```bash
