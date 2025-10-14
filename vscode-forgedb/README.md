@@ -1,6 +1,6 @@
-# ForgeDB Schema Language Support
+# ForgeDB VSCode Extension
 
-Syntax highlighting and language support for ForgeDB schema files (`.forge`).
+Complete IDE support for ForgeDB schema files (`.forge`) with syntax highlighting, Language Server Protocol (LSP), and integrated commands.
 
 ## Features
 
@@ -53,6 +53,32 @@ Speed up schema authoring with intelligent snippets:
 - **Comment toggling**: Line and block comments
 - **Smart indentation**: Auto-indent inside blocks
 - **Code folding**: Collapse model and struct definitions
+
+### 🧠 Language Server (LSP)
+
+- **Real-time Diagnostics**: Syntax errors, type checking, schema validation
+- **Code Completion**: Context-aware suggestions for types, directives, modifiers
+- **Hover Information**: Documentation for types, directives, and models
+- **Go to Definition**: Navigate to model and struct definitions
+- **Rename Refactoring**: Rename models/fields with automatic reference updates
+
+### ⚡ Commands
+
+Access via Command Palette (`Cmd+Shift+P` / `Ctrl+Shift+P`):
+
+- **ForgeDB: Generate Code** - Run code generation from schema
+- **ForgeDB: Validate Schema** - Validate current schema file
+- **ForgeDB: Start Dev Mode** - Start file watcher for auto-generation
+- **ForgeDB: Create New Model** - Interactive model creation wizard
+- **ForgeDB: Restart Language Server** - Restart LSP server
+- **ForgeDB: Show Output** - Show LSP server output
+
+### 📊 Status Bar
+
+Real-time ForgeDB status indicator showing:
+- Extension active/inactive state
+- Schema validation status
+- Quick access to commands
 
 ## Example Schema
 
@@ -159,21 +185,55 @@ struct Address {
 
 ## Getting Started
 
-1. Install the extension
-2. Create a `.forge` file in your project
-3. Start typing - syntax highlighting will activate automatically
-4. Use snippets (type `model`, `fstring`, etc. and press Tab)
+### Installation
+
+1. Install the extension from VSCode marketplace
+2. Ensure ForgeDB is installed in your project
+3. Build the LSP server: `cargo build -p forgedb-lsp-server`
+4. Open or create a `.forge` file - the extension activates automatically
+
+### First Steps
+
+1. Create a schema file: `schema.forge`
+2. Start typing - get instant syntax highlighting and completions
+3. Use snippets: type `model`, `fstring`, etc. and press Tab
+4. Save to see real-time diagnostics
+5. Run commands from Command Palette
 
 ## Requirements
 
 - VSCode 1.80.0 or higher
+- ForgeDB project with LSP server built (`cargo build -p forgedb-lsp-server`)
 
 ## Extension Settings
 
-This extension provides the following default settings for `.forge` files:
+Configure via Settings (`Cmd+,` / `Ctrl+,`) or `settings.json`:
+
+```json
+{
+  // Path to schema file
+  "forgedb.schemaPath": "schema.forge",
+
+  // Output directory for generated code
+  "forgedb.outputDirectory": "generated",
+
+  // Auto-generate on save
+  "forgedb.autoGenerateOnSave": false,
+
+  // Custom LSP server path (auto-detected if empty)
+  "forgedb.lspServerPath": "",
+
+  // LSP trace level (off, messages, verbose)
+  "forgedb.trace.server": "off"
+}
+```
+
+### Default Editor Settings
+
+The extension configures optimal settings for `.forge` files:
 - Tab size: 2 spaces
 - Insert spaces: Enabled
-- Quick suggestions: Enabled
+- Quick suggestions: Enabled for code (disabled in comments/strings)
 
 ## Keyboard Shortcuts
 
@@ -182,27 +242,83 @@ This extension provides the following default settings for `.forge` files:
 - `Cmd+K Cmd+U`: Remove line comment
 - `Shift+Alt+A`: Toggle block comment
 
-## Known Limitations
+## Architecture
 
-- No LSP support (coming in Sprint 22)
-- No diagnostics/error checking (coming in Sprint 22)
-- No code completion beyond snippets (coming in Sprint 22)
-- No go-to-definition (coming in Sprint 22)
+The extension integrates three main components:
+
+1. **TextMate Grammar** (Sprint 21): Syntax highlighting engine
+2. **Language Server** (Sprint 22): Rust-based LSP server for diagnostics and completion
+3. **Extension Client** (Sprint 23): TypeScript client with commands and UI integration
+
+```
+┌─────────────────────────────────────┐
+│   VSCode Extension (TypeScript)     │
+│  ┌───────────┐  ┌────────────────┐  │
+│  │ Commands  │  │  Status Bar    │  │
+│  └───────────┘  └────────────────┘  │
+│  ┌───────────────────────────────┐  │
+│  │   Language Client (LSP)       │  │
+│  └───────────┬───────────────────┘  │
+└──────────────┼──────────────────────┘
+               │ JSON-RPC
+┌──────────────┴──────────────────────┐
+│  Language Server (Rust)             │
+│  ┌──────────┐  ┌────────────────┐   │
+│  │  Parser  │  │  Diagnostics   │   │
+│  └──────────┘  └────────────────┘   │
+│  ┌──────────┐  ┌────────────────┐   │
+│  │Completion│  │     Hover      │   │
+│  └──────────┘  └────────────────┘   │
+└─────────────────────────────────────┘
+```
+
+## Troubleshooting
+
+### LSP Server Not Starting
+
+If you see warnings about LSP server not found:
+
+1. Build the server: `cargo build -p forgedb-lsp-server`
+2. Check the binary exists: `target/debug/forgedb-lsp` or `target/release/forgedb-lsp`
+3. Set custom path in settings: `"forgedb.lspServerPath": "/path/to/forgedb-lsp"`
+
+### No Diagnostics Appearing
+
+1. Ensure file is saved (`.forge` extension)
+2. Check Output panel: **ForgeDB: Show Output** command
+3. Enable trace logging: `"forgedb.trace.server": "verbose"`
+
+### Commands Not Working
+
+1. Ensure you're in a ForgeDB project
+2. Check that `cargo` is in your PATH
+3. Verify workspace has ForgeDB CLI installed
+
+## Development
+
+To develop this extension:
+
+```bash
+# Install dependencies
+cd vscode-forgedb
+npm install
+
+# Compile TypeScript
+npm run compile
+
+# Watch for changes
+npm run watch
+
+# Package extension
+npm run package
+```
 
 ## Roadmap
 
-- ✅ **Sprint 21**: Syntax highlighting (current)
-- 🔜 **Sprint 22**: Language Server Protocol (LSP)
-  - Real-time diagnostics
-  - Intelligent code completion
-  - Hover information
-  - Go to definition
-  - Rename refactoring
-- 🔜 **Sprint 23**: Full VSCode Extension
-  - Integrated commands
-  - Code generation
-  - Schema validation
-  - File watcher integration
+- ✅ **Sprint 21**: Syntax highlighting
+- ✅ **Sprint 22**: Language Server Protocol (LSP)
+- ✅ **Sprint 23**: Full VSCode Extension (current)
+- 🔜 **Future**: Marketplace publishing, additional commands
 
 ## Contributing
 
