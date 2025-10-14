@@ -9,16 +9,22 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 2: Persistence & Basic Types
 - ✅ Sprint 3: Indexing & Queries
 - ✅ Sprint 4: Relations (One-to-Many) + 4.1 (FK Validation & Traversal)
+- ✅ Sprint 5: CLI & Developer Experience (Commands complete)
+- ✅ Sprint 6: Multiple Models & Many-to-Many Relations
+- ✅ Sprint 7: Write-Ahead Log & Durability
+- ✅ Sprint 8: Inline Structs & Fixed Arrays
 - ✅ Sprint 11: Directives & Validation (Constraints)
-- ✅ Sprint 14: Query Optimization - Advanced Indexing (Partial)
+- ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
+
+**Partially Complete:**
+- 🔄 Sprint 5: File watching (watcher crate exists, needs integration)
 
 **In Progress:**
-- ⏳ Sprint 5: CLI & Developer Experience (TODO)
-- ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining)
+- ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 6-10, 12-13, 15-21
+**Not Started:** Sprints 9-10, 12-13, 15-21
 
-**Test Status:** 120/120 tests passing | 12/12 examples working
+**Test Status:** 122/122 tests passing | 15/15 examples working
 
 ---
 
@@ -639,9 +645,11 @@ $ sinkdb dev  # watches and regenerates
 
 ---
 
-## Sprint 6: Multiple Models & Relations
+## Sprint 6: Multiple Models & Relations ✅ COMPLETE
 
 **Goal**: Support complex multi-model schemas.
+
+**Status**: ✅ Completed
 
 ### Tasks
 
@@ -690,9 +698,11 @@ Tag {
 
 ---
 
-## Sprint 7: Write-Ahead Log & Durability
+## Sprint 7: Write-Ahead Log & Durability ✅ COMPLETE
 
 **Goal**: ACID properties and crash recovery.
+
+**Status**: ✅ Completed
 
 **Orchestration**: ⚠️ Serialized (tightly coupled components)
 ```yaml
@@ -750,9 +760,11 @@ prompt: |
 
 ---
 
-## Sprint 8: Inline Structs & Fixed Arrays
+## Sprint 8: Inline Structs & Fixed Arrays ✅ COMPLETE
 
 **Goal**: Support compound fixed-size types.
+
+**Status**: ✅ Completed
 
 ### Tasks
 

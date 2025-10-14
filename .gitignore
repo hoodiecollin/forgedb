@@ -7,8 +7,8 @@ package.json
 turbo.json
 node_modules/
 bun.lockb
-schema.sink
+/*.sink
 !examples/**/schema.sink
 Cargo.lock
 generated/
-generated_watch/
+generated_*/

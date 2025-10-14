@@ -1,5 +1,0 @@
-user_model {
-  id: +u64
-  UserName: string
-  Email: &string
-}
