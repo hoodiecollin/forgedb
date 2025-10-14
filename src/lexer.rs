@@ -24,6 +24,10 @@ pub enum Token {
     TypeString,
     TypeUuid,
     TypeTimestamp,
+    TypeChar,    // char(N) - fixed-size character array
+
+    // Keywords
+    KwStruct,    // struct
 
     // Symbols
     Plus,        // +
@@ -40,6 +44,7 @@ pub enum Token {
     LParen,      // (
     RParen,      // )
     Comma,       // ,
+    Semicolon,   // ;
     Number(i64), // Numeric literal
 
     // Whitespace and EOF
@@ -206,6 +211,10 @@ impl Lexer {
                 self.advance();
                 Ok(Token::Comma)
             }
+            Some(';') => {
+                self.advance();
+                Ok(Token::Semicolon)
+            }
             Some(ch) if ch.is_numeric() => {
                 let num = self.read_number();
                 Ok(Token::Number(num))
@@ -222,6 +231,8 @@ impl Lexer {
                     "string" => Token::TypeString,
                     "uuid" => Token::TypeUuid,
                     "timestamp" => Token::TypeTimestamp,
+                    "char" => Token::TypeChar,
+                    "struct" => Token::KwStruct,
                     _ => Token::Ident(ident),
                 };
                 Ok(token)

@@ -1,4 +1,4 @@
-use crate::ast::{CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema};
+use crate::ast::{CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema, Struct};
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use sinkdb_validation::{validate_field_name, validate_model_name, Position};
 
@@ -118,16 +118,52 @@ impl Parser {
     fn parse_type(&mut self) -> Result<FieldType, String> {
         // Check for relation types first
         match self.current_token() {
-            // One-to-many: [Post]
+            // Fixed array or One-to-many: [type; count] or [Post]
             Token::LBracket => {
                 self.advance();
-                let model_name = match self.current_token() {
-                    Token::Ident(name) => name.clone(),
-                    _ => return Err(format!("Expected model name after '[', found {:?}", self.current_token())),
-                };
-                self.advance();
-                self.expect(Token::RBracket)?;
-                return Ok(FieldType::Relation(RelationType::OneToMany(model_name)));
+
+                // Check if this is a fixed array [type; count] or one-to-many [Model]
+                let first_token = self.current_token().clone();
+
+                match first_token {
+                    Token::Ident(name) => {
+                        self.advance();
+
+                        // Check next token to distinguish [Model] vs [type; count]
+                        match self.current_token() {
+                            Token::Semicolon => {
+                                // This is [Ident; count] - but Ident should be a type or struct
+                                self.advance();
+                                let count = match self.current_token() {
+                                    Token::Number(n) => *n as usize,
+                                    _ => return Err(format!("Expected array count after ';', found {:?}", self.current_token())),
+                                };
+                                self.advance();
+                                self.expect(Token::RBracket)?;
+                                // The Ident could be a struct type
+                                return Ok(FieldType::FixedArray(Box::new(FieldType::StructType(name)), count));
+                            }
+                            Token::RBracket => {
+                                // This is [Model] - one-to-many relation
+                                self.advance();
+                                return Ok(FieldType::Relation(RelationType::OneToMany(name)));
+                            }
+                            _ => return Err(format!("Expected ';' or ']' after type name, found {:?}", self.current_token())),
+                        }
+                    }
+                    _ => {
+                        // Parse base type for fixed array
+                        let inner_type = self.parse_primitive_type()?;
+                        self.expect(Token::Semicolon)?;
+                        let count = match self.current_token() {
+                            Token::Number(n) => *n as usize,
+                            _ => return Err(format!("Expected array count, found {:?}", self.current_token())),
+                        };
+                        self.advance();
+                        self.expect(Token::RBracket)?;
+                        return Ok(FieldType::FixedArray(Box::new(inner_type), count));
+                    }
+                }
             }
             // Required reference: *User
             Token::Asterisk => {
@@ -149,10 +185,21 @@ impl Parser {
                 self.advance();
                 return Ok(FieldType::Relation(RelationType::OptionalReference(model_name)));
             }
+            // Struct types or primitive identifiers
+            Token::Ident(name) => {
+                let type_name = name.clone();
+                self.advance();
+                // This could be a struct type or struct? for optional
+                return Ok(FieldType::StructType(type_name));
+            }
             _ => {}
         }
 
         // Primitive types
+        self.parse_primitive_type()
+    }
+
+    fn parse_primitive_type(&mut self) -> Result<FieldType, String> {
         let field_type = match self.current_token() {
             Token::TypeU32 => FieldType::U32,
             Token::TypeU64 => FieldType::U64,
@@ -163,6 +210,18 @@ impl Parser {
             Token::TypeString => FieldType::String,
             Token::TypeUuid => FieldType::Uuid,
             Token::TypeTimestamp => FieldType::Timestamp,
+            Token::TypeChar => {
+                // char(N) - expect (N)
+                self.advance();
+                self.expect(Token::LParen)?;
+                let size = match self.current_token() {
+                    Token::Number(n) => *n as usize,
+                    _ => return Err(format!("Expected size after 'char(', found {:?}", self.current_token())),
+                };
+                self.advance();
+                self.expect(Token::RParen)?;
+                return Ok(FieldType::Char(size));
+            }
             _ => return Err(format!("Expected type, found {:?}", self.current_token())),
         };
         self.advance();
@@ -267,7 +326,15 @@ impl Parser {
         }
 
         // Parse type
-        let field_type = self.parse_type()?;
+        let mut field_type = self.parse_type()?;
+
+        // Check for optional struct marker (Type?)
+        if matches!(self.current_token(), Token::Question) {
+            if let FieldType::StructType(name) = field_type {
+                self.advance();
+                field_type = FieldType::OptionalStructType(name);
+            }
+        }
 
         // Validate auto-generate is compatible with type
         if auto_generate && !field_type.is_auto_generatable() {
@@ -296,6 +363,59 @@ impl Parser {
             constraints,
             index_type,
         })
+    }
+
+    fn parse_struct(&mut self) -> Result<Struct, String> {
+        self.skip_newlines();
+
+        // Expect 'struct' keyword
+        self.expect(Token::KwStruct)?;
+
+        // Parse struct name
+        let struct_pos = self.get_current_position();
+        let name = match self.current_token() {
+            Token::Ident(s) => s.clone(),
+            _ => return Err(format!("Expected struct name, found {:?}", self.current_token())),
+        };
+        self.advance();
+
+        // Validate struct name
+        if self.use_validation {
+            if let Err(e) = validate_model_name(&name, struct_pos) {
+                return Err(e.to_string());
+            }
+        }
+
+        // Expect opening brace
+        self.skip_newlines();
+        self.expect(Token::LBrace)?;
+
+        // Parse fields
+        let mut fields = Vec::new();
+        let mut field_names = std::collections::HashSet::new();
+        self.skip_newlines();
+
+        while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
+            let field = self.parse_field()?;
+
+            // Check for duplicate field name
+            if field_names.contains(&field.name) {
+                return Err(format!("Duplicate field name '{}' in struct '{}'", field.name, name));
+            }
+            field_names.insert(field.name.clone());
+
+            fields.push(field);
+            self.skip_newlines();
+        }
+
+        // Expect closing brace
+        self.expect(Token::RBrace)?;
+
+        if fields.is_empty() {
+            return Err(format!("Struct '{}' has no fields", name));
+        }
+
+        Ok(Struct { name, fields })
     }
 
     fn parse_model(&mut self) -> Result<Model, String> {
@@ -369,31 +489,48 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Schema, String> {
+        let mut structs = Vec::new();
         let mut models = Vec::new();
+        let mut struct_names = std::collections::HashSet::new();
         let mut model_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::Eof) {
-            let model = self.parse_model()?;
+            // Check if this is a struct or model declaration
+            if matches!(self.current_token(), Token::KwStruct) {
+                let struct_def = self.parse_struct()?;
 
-            // Check for duplicate model name
-            if model_names.contains(&model.name) {
-                return Err(format!("Duplicate model name '{}'", model.name));
+                // Check for duplicate struct name
+                if struct_names.contains(&struct_def.name) {
+                    return Err(format!("Duplicate struct name '{}'", struct_def.name));
+                }
+                struct_names.insert(struct_def.name.clone());
+
+                structs.push(struct_def);
+            } else {
+                let model = self.parse_model()?;
+
+                // Check for duplicate model name
+                if model_names.contains(&model.name) {
+                    return Err(format!("Duplicate model name '{}'", model.name));
+                }
+                model_names.insert(model.name.clone());
+
+                models.push(model);
             }
-            model_names.insert(model.name.clone());
 
-            models.push(model);
             self.skip_newlines();
         }
 
-        if models.is_empty() {
+        if models.is_empty() && structs.is_empty() {
             return Err("Schema is empty".to_string());
         }
 
-        let schema = Schema { models };
+        let schema = Schema { structs, models };
 
-        // Validate relations
+        // Validate relations and struct references
         schema.validate_relations()?;
+        schema.validate_struct_references()?;
 
         Ok(schema)
     }

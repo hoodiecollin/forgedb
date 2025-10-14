@@ -50,6 +50,11 @@ pub enum FieldType {
     String,
     Uuid,
     Timestamp,
+    // Fixed-size types (Sprint 8)
+    Char(usize), // Fixed-size character array: char(N)
+    FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
+    StructType(String), // Reference to a struct by name
+    OptionalStructType(String), // Optional struct reference
     // Relations
     Relation(RelationType),
 }
@@ -77,6 +82,13 @@ pub struct Field {
     pub index_type: IndexType, // Hash or BTree
 }
 
+/// Represents a struct definition (Sprint 8)
+#[derive(Debug, Clone, PartialEq)]
+pub struct Struct {
+    pub name: String,
+    pub fields: Vec<Field>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub name: String,
@@ -86,6 +98,7 @@ pub struct Model {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
+    pub structs: Vec<Struct>, // Struct definitions (Sprint 8)
     pub models: Vec<Model>,
 }
 
@@ -93,6 +106,11 @@ impl Schema {
     /// Find a model by name
     pub fn find_model(&self, name: &str) -> Option<&Model> {
         self.models.iter().find(|m| m.name == name)
+    }
+
+    /// Find a struct by name (Sprint 8)
+    pub fn find_struct(&self, name: &str) -> Option<&Struct> {
+        self.structs.iter().find(|s| s.name == name)
     }
 
     /// Validate all relations in the schema
@@ -106,6 +124,36 @@ impl Schema {
                         return Err(format!(
                             "Model '{}' field '{}' references undefined model '{}'",
                             model.name, field.name, target
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate struct references (Sprint 8)
+    pub fn validate_struct_references(&self) -> Result<(), String> {
+        // Validate structs don't contain variable-length types
+        for struct_def in &self.structs {
+            for field in &struct_def.fields {
+                if !field.field_type.is_fixed_size() {
+                    return Err(format!(
+                        "Struct '{}' field '{}' contains variable-length type. Structs can only contain fixed-size types.",
+                        struct_def.name, field.name
+                    ));
+                }
+            }
+        }
+
+        // Validate struct references in models
+        for model in &self.models {
+            for field in &model.fields {
+                if let Some(struct_name) = field.field_type.struct_name() {
+                    if self.find_struct(struct_name).is_none() {
+                        return Err(format!(
+                            "Model '{}' field '{}' references undefined struct '{}'",
+                            model.name, field.name, struct_name
                         ));
                     }
                 }
@@ -257,6 +305,10 @@ impl FieldType {
             FieldType::String => "String".to_string(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
+            FieldType::Char(size) => format!("[u8; {}]", size),
+            FieldType::FixedArray(inner_type, count) => format!("[{}; {}]", inner_type.to_rust_type(), count),
+            FieldType::StructType(name) => name.clone(),
+            FieldType::OptionalStructType(name) => format!("Option<{}>", name),
             FieldType::Relation(rel) => match rel {
                 RelationType::RequiredReference(model) => format!("uuid::Uuid /* FK to {} */", model),
                 RelationType::OptionalReference(model) => format!("Option<uuid::Uuid> /* FK to {} */", model),
@@ -276,6 +328,84 @@ impl FieldType {
 
     pub fn is_relation(&self) -> bool {
         matches!(self, FieldType::Relation(_))
+    }
+
+    /// Check if this type is fixed-size (Sprint 8)
+    pub fn is_fixed_size(&self) -> bool {
+        match self {
+            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
+            | FieldType::F64 | FieldType::Bool | FieldType::Uuid | FieldType::Timestamp
+            | FieldType::Char(_) => true,
+            FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
+            FieldType::StructType(_) => true, // Structs must be fixed-size
+            FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
+            FieldType::String => false,
+            FieldType::Relation(_) => false, // Relations are virtual or variable
+        }
+    }
+
+    /// Get struct name if this is a struct type (Sprint 8)
+    pub fn struct_name(&self) -> Option<&str> {
+        match self {
+            FieldType::StructType(name) => Some(name),
+            FieldType::OptionalStructType(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Get the size in bytes for fixed-size types (Sprint 8)
+    pub fn size_in_bytes(&self, schema: &Schema) -> usize {
+        match self {
+            FieldType::U32 | FieldType::I32 => 4,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::Bool => 1,
+            FieldType::Uuid => 16,
+            FieldType::Char(size) => *size,
+            FieldType::FixedArray(inner, count) => inner.size_in_bytes(schema) * count,
+            FieldType::StructType(name) => {
+                if let Some(struct_def) = schema.find_struct(name) {
+                    Struct::calculate_size(struct_def, schema)
+                } else {
+                    0
+                }
+            }
+            FieldType::OptionalStructType(name) => {
+                // Option adds 1 byte discriminant + size of struct
+                1 + if let Some(struct_def) = schema.find_struct(name) {
+                    Struct::calculate_size(struct_def, schema)
+                } else {
+                    0
+                }
+            }
+            _ => 0, // Variable-size or virtual
+        }
+    }
+
+    /// Get alignment requirement for this type (Sprint 8)
+    pub fn alignment(&self, schema: &Schema) -> usize {
+        match self {
+            FieldType::U32 | FieldType::I32 => 4,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::Bool => 1,
+            FieldType::Uuid => 16, // UUID is typically 16-byte aligned
+            FieldType::Char(_) => 1,
+            FieldType::FixedArray(inner, _) => inner.alignment(schema),
+            FieldType::StructType(name) => {
+                if let Some(struct_def) = schema.find_struct(name) {
+                    Struct::calculate_alignment(struct_def, schema)
+                } else {
+                    1
+                }
+            }
+            FieldType::OptionalStructType(name) => {
+                if let Some(struct_def) = schema.find_struct(name) {
+                    Struct::calculate_alignment(struct_def, schema)
+                } else {
+                    1
+                }
+            }
+            _ => 1,
+        }
     }
 
     /// Determine if this type supports range queries (ordered)
@@ -298,6 +428,43 @@ impl FieldType {
     }
 }
 
+impl Struct {
+    /// Calculate the total size of a struct with proper padding (Sprint 8)
+    pub fn calculate_size(struct_def: &Struct, schema: &Schema) -> usize {
+        let mut size = 0;
+        let mut max_alignment = 1;
+
+        for field in &struct_def.fields {
+            let field_size = field.field_type.size_in_bytes(schema);
+            let field_align = field.field_type.alignment(schema);
+
+            max_alignment = max_alignment.max(field_align);
+
+            // Add padding before field if needed
+            if size % field_align != 0 {
+                size += field_align - (size % field_align);
+            }
+
+            size += field_size;
+        }
+
+        // Add final padding to make struct size a multiple of its alignment
+        if size % max_alignment != 0 {
+            size += max_alignment - (size % max_alignment);
+        }
+
+        size
+    }
+
+    /// Calculate the alignment requirement for a struct (Sprint 8)
+    pub fn calculate_alignment(struct_def: &Struct, schema: &Schema) -> usize {
+        struct_def.fields.iter()
+            .map(|f| f.field_type.alignment(schema))
+            .max()
+            .unwrap_or(1)
+    }
+}
+
 impl Field {
     /// Check if field has a specific constraint
     pub fn has_constraint(&self, name: &str) -> bool {
@@ -311,8 +478,10 @@ impl Field {
 
     /// Check if field is nullable (no constraint yet, but useful for future)
     pub fn is_nullable(&self) -> bool {
-        // For now, only optional references are nullable
-        matches!(&self.field_type, FieldType::Relation(RelationType::OptionalReference(_)))
+        // For now, only optional references and optional structs are nullable
+        matches!(&self.field_type,
+            FieldType::Relation(RelationType::OptionalReference(_)) |
+            FieldType::OptionalStructType(_))
     }
 }
 
@@ -347,6 +516,7 @@ mod tests {
     fn test_detect_many_to_many() {
         // Create a simple schema with M:N relations
         let schema = Schema {
+            structs: vec![],
             models: vec![
                 Model {
                     name: "Post".to_string(),
@@ -411,6 +581,7 @@ mod tests {
     fn test_no_m2m_with_fk() {
         // Schema with 1:N relationship (should not be detected as M:N)
         let schema = Schema {
+            structs: vec![],
             models: vec![
                 Model {
                     name: "User".to_string(),

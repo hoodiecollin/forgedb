@@ -1,4 +1,4 @@
-use crate::ast::{ConstraintParam, Field, FieldType, IndexType, ManyToManyRelation, Model, RelationType, Schema};
+use crate::ast::{ConstraintParam, Field, FieldType, IndexType, ManyToManyRelation, Model, RelationType, Schema, Struct};
 
 pub struct CodeGenerator;
 
@@ -18,6 +18,44 @@ impl CodeGenerator {
         matches!(&field.field_type,
             FieldType::Relation(RelationType::OneToMany(_)) |
             FieldType::Relation(RelationType::ManyToMany(_)))
+    }
+
+    /// Generate struct definition (Sprint 8)
+    fn generate_struct_definition(&self, struct_def: &Struct) -> String {
+        let mut code = String::new();
+
+        code.push_str(&format!("#[derive(Debug, Clone, Copy, PartialEq)]\n"));
+        code.push_str("#[repr(C)]\n"); // Ensure C layout for predictable memory layout
+        code.push_str(&format!("pub struct {} {{\n", struct_def.name));
+
+        for field in &struct_def.fields {
+            let rust_type = field.field_type.to_rust_type();
+            code.push_str(&format!("    pub {}: {},\n", field.name, rust_type));
+        }
+
+        code.push_str("}\n\n");
+
+        // Generate helper methods for struct
+        code.push_str(&format!("impl {} {{\n", struct_def.name));
+
+        // Generate constructor
+        code.push_str("    pub fn new(");
+        for (i, field) in struct_def.fields.iter().enumerate() {
+            if i > 0 {
+                code.push_str(", ");
+            }
+            code.push_str(&format!("{}: {}", field.name, field.field_type.to_rust_type()));
+        }
+        code.push_str(") -> Self {\n");
+        code.push_str(&format!("        {} {{\n", struct_def.name));
+        for field in &struct_def.fields {
+            code.push_str(&format!("            {},\n", field.name));
+        }
+        code.push_str("        }\n");
+        code.push_str("    }\n");
+        code.push_str("}\n\n");
+
+        code
     }
 
     fn generate_field_declaration(&self, field: &Field) -> String {
@@ -1226,6 +1264,20 @@ impl CodeGenerator {
             String::new()
         };
 
+        // Generate struct definitions file (Sprint 8)
+        if !schema.structs.is_empty() {
+            let mut struct_content = String::new();
+            struct_content.push_str("// Generated code - do not edit manually\n\n");
+            struct_content.push_str("// Struct definitions\n\n");
+            for struct_def in &schema.structs {
+                struct_content.push_str(&self.generate_struct_definition(struct_def));
+            }
+            files.push(GeneratedFile {
+                path: "structs.rs".to_string(),
+                content: struct_content,
+            });
+        }
+
         // Generate one file per model
         for model in &schema.models {
             let mut content = String::new();
@@ -1233,6 +1285,14 @@ impl CodeGenerator {
             content.push_str(common_imports);
             content.push_str(constraint_imports);
             content.push_str("\n");
+
+            // Import structs if this model uses them
+            if !schema.structs.is_empty() {
+                let uses_structs = model.fields.iter().any(|f| f.field_type.struct_name().is_some());
+                if uses_structs {
+                    content.push_str("use super::structs::*;\n\n");
+                }
+            }
 
             if has_constraints && !validation_funcs.is_empty() {
                 content.push_str(&validation_funcs);
@@ -1268,6 +1328,12 @@ impl CodeGenerator {
         // Generate mod.rs
         let mut mod_content = String::new();
         mod_content.push_str("// Generated code - do not edit manually\n\n");
+
+        // Export structs module if it exists
+        if !schema.structs.is_empty() {
+            mod_content.push_str("pub mod structs;\n");
+            mod_content.push_str("pub use structs::*;\n\n");
+        }
 
         for model in &schema.models {
             mod_content.push_str(&format!("mod {}_storage;\n", model.name.to_lowercase()));
@@ -1358,6 +1424,14 @@ impl CodeGenerator {
         code.push_str("use std::collections::HashMap;\n");
         code.push_str("use std::time::{SystemTime, UNIX_EPOCH};\n");
         code.push_str("use uuid::Uuid;\n");
+
+        // Generate struct definitions (Sprint 8)
+        if !schema.structs.is_empty() {
+            code.push_str("\n// Struct Definitions\n\n");
+            for struct_def in &schema.structs {
+                code.push_str(&self.generate_struct_definition(struct_def));
+            }
+        }
 
         // Check if any model uses constraints - if so, add regex import
         let has_constraints = schema.models.iter()
