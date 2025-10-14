@@ -7,6 +7,7 @@ members = [
     "crates/tests",
     "crates/cli",
     "crates/watcher",
+    "crates/wal",
 ]
 resolver = "2"
 
@@ -27,6 +28,7 @@ ordered-float = "4.2"
 sinkdb-validation = { path = "crates/validation" }
 sinkdb-watcher = { path = "crates/watcher" }
 sinkdb-cli = { path = "crates/cli" }
+sinkdb-wal = { path = "crates/wal" }
 
 [lib]
 name = "sinkdb"
@@ -100,3 +102,8 @@ path = "examples/sprint5_watcher.rs"
 [[example]]
 name = "sprint6_many_to_many"
 path = "examples/sprint6_many_to_many.rs"
+
+# Sprint 7: Write-Ahead Log & Durability
+[[example]]
+name = "sprint7_wal"
+path = "examples/sprint7_wal.rs"

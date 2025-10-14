@@ -3,6 +3,9 @@
 pub mod user_storage;
 pub use user_storage::{User, UserStorage};
 
+// Sprint 7: WAL re-exports
+pub use sinkdb_wal::{FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue};
+
 // Sprint 2: Storage Persistence Implementation
 //
 // Architecture:
@@ -31,6 +34,10 @@ pub struct Manifest {
     pub schema_version: u32,
     pub row_count: usize,
     pub columns: Vec<ColumnMetadata>,
+    #[serde(default)]
+    pub wal_enabled: bool,
+    #[serde(default)]
+    pub last_checkpoint: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -243,6 +250,7 @@ impl Tombstones {
 pub struct Database {
     root_path: PathBuf,
     manifest: Manifest,
+    wal_manager: Option<sinkdb_wal::WalManager>,
 }
 
 impl Database {
@@ -260,10 +268,65 @@ impl Database {
                 schema_version: 1,
                 row_count: 0,
                 columns: Vec::new(),
+                wal_enabled: false,
+                last_checkpoint: 0,
             }
         };
 
-        Ok(Database { root_path, manifest })
+        Ok(Database {
+            root_path,
+            manifest,
+            wal_manager: None,
+        })
+    }
+
+    /// Open database with WAL support
+    pub fn open_with_wal(root_path: PathBuf, fsync_policy: sinkdb_wal::FsyncPolicy) -> io::Result<Self> {
+        fs::create_dir_all(&root_path)?;
+
+        let manifest_path = root_path.join("manifest.json");
+        let mut manifest = if manifest_path.exists() {
+            let content = fs::read_to_string(&manifest_path)?;
+            serde_json::from_str(&content)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        } else {
+            // Create default manifest
+            Manifest {
+                schema_version: 1,
+                row_count: 0,
+                columns: Vec::new(),
+                wal_enabled: true,
+                last_checkpoint: 0,
+            }
+        };
+
+        // Mark WAL as enabled
+        manifest.wal_enabled = true;
+
+        // Open WAL
+        let wal_path = root_path.join("wal.log");
+        let wal_manager = sinkdb_wal::WalManager::open(wal_path, fsync_policy)?;
+
+        Ok(Database {
+            root_path,
+            manifest,
+            wal_manager: Some(wal_manager),
+        })
+    }
+
+    /// Get a mutable reference to the WAL manager
+    pub fn wal_mut(&mut self) -> Option<&mut sinkdb_wal::WalManager> {
+        self.wal_manager.as_mut()
+    }
+
+    /// Get a reference to the WAL manager
+    pub fn wal(&self) -> Option<&sinkdb_wal::WalManager> {
+        self.wal_manager.as_ref()
+    }
+
+    /// Check if WAL is enabled
+    pub fn has_wal(&self) -> bool {
+        self.wal_manager.is_some()
     }
 
     pub fn save_manifest(&self) -> io::Result<()> {
