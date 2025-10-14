@@ -11,3 +11,4 @@ schema.sink
 !examples/**/schema.sink
 Cargo.lock
 generated/
+generated_watch/

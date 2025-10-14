@@ -5,6 +5,8 @@ members = [
     "crates/types",
     "crates/validation",
     "crates/tests",
+    "crates/cli",
+    "crates/watcher",
 ]
 resolver = "2"
 
@@ -23,10 +25,12 @@ ordered-float = "4.2"
 
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
+sinkdb-watcher = { path = "crates/watcher" }
+sinkdb-cli = { path = "crates/cli" }
 
 [lib]
 name = "sinkdb"
-path = "src/main.rs"
+path = "src/lib.rs"
 
 # Sprint 1 MVP Examples
 [[example]]
@@ -81,3 +85,13 @@ path = "examples/test_constraint_validation.rs"
 [[example]]
 name = "sprint5_advanced_indexing"
 path = "examples/sprint5_advanced_indexing.rs"
+
+# Sprint 5: Project Scaffolding
+[[example]]
+name = "sprint5_scaffold"
+path = "examples/sprint5_scaffold.rs"
+
+# Sprint 5: File Watcher
+[[example]]
+name = "sprint5_watcher"
+path = "examples/sprint5_watcher.rs"

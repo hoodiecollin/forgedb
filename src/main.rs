@@ -2,6 +2,7 @@ pub mod ast;
 pub mod lexer;
 pub mod parser;
 pub mod codegen;
+pub mod scaffold;
 
 #[cfg(test)]
 mod edge_case_tests;
