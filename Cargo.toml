@@ -26,6 +26,7 @@ sinkdb-validation = { path = "crates/validation" }
 uuid = { version = "1.6", features = ["v4"] }
 regex = "1.10"
 ordered-float = "4.2"
+serde_json = "1.0"
 
 [dev-dependencies]
 sinkdb-validation = { path = "crates/validation" }
@@ -118,3 +119,8 @@ path = "examples/sprint7_wal.rs"
 [[example]]
 name = "sprint9_api"
 path = "examples/sprint9_api.rs"
+
+# Sprint 13: OpenAPI & Documentation
+[[example]]
+name = "sprint13_openapi"
+path = "examples/sprint13_openapi.rs"

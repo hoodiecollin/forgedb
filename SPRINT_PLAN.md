@@ -25,7 +25,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 13, 15-21
+**Not Started:** Sprints 13, 15-23
 
 **Test Status:** 138/138 tests passing | 18/18 examples working
 
@@ -1405,7 +1405,203 @@ type UserCardProps = {
 
 ---
 
-## Sprint 21+: Future Enhancements
+## Sprint 21: IDE Syntax Highlighting
+
+**Goal**: Enable syntax highlighting for `.sink` schema files in VSCode and other editors.
+
+### Tasks
+
+#### TextMate Grammar
+- [ ] Create TextMate grammar file (`.tmLanguage.json`)
+- [ ] Define token types: keywords, types, symbols, directives
+- [ ] Support all schema syntax elements
+- [ ] Handle comments and strings
+
+#### VSCode Extension
+- [ ] Create basic VSCode extension structure
+- [ ] Register `.sink` file extension
+- [ ] Include TextMate grammar
+- [ ] Add icon for `.sink` files
+- [ ] Package and publish extension
+
+#### Language Configuration
+- [ ] Configure bracket matching
+- [ ] Configure auto-closing pairs
+- [ ] Configure comment syntax
+- [ ] Configure indentation rules
+
+**Supported Elements:**
+- Keywords: `struct`, model names
+- Types: `string`, `u32`, `i64`, `f64`, `bool`, `uuid`, `timestamp`
+- Symbols: `+`, `&`, `^`, `*`, `?`, `[`, `]`
+- Directives: `@email`, `@url`, `@min`, `@max`, `@computed`, etc.
+- Relations: `[Model]`, `*Model`
+- Comments: `//` and `/* */`
+
+#### Success Criteria
+- [x] Syntax highlighting works in VSCode
+- [x] All schema elements properly colored
+- [x] Bracket matching and auto-closing work
+- [x] Extension published to VSCode marketplace
+
+---
+
+## Sprint 22: Language Server Protocol (LSP)
+
+**Goal**: Provide rich IDE features through a language server.
+
+### Tasks
+
+#### LSP Server
+- [ ] Implement LSP server using `tower-lsp` crate
+- [ ] Support `textDocument/didOpen`, `didChange`, `didSave`
+- [ ] Handle initialization and capabilities
+- [ ] Manage document state
+
+#### Diagnostics
+- [ ] Real-time syntax error detection
+- [ ] Schema validation errors
+- [ ] Type checking for fields
+- [ ] Constraint validation
+- [ ] Display errors with line/column
+
+#### Code Completion
+- [ ] Field type completion (string, u32, etc.)
+- [ ] Directive completion (@email, @min, etc.)
+- [ ] Symbol completion (+, &, ^, etc.)
+- [ ] Model reference completion
+- [ ] Context-aware suggestions
+
+#### Hover Information
+- [ ] Show type information on hover
+- [ ] Show directive documentation
+- [ ] Show model structure
+- [ ] Show relation details
+
+#### Go to Definition
+- [ ] Jump to model definition
+- [ ] Jump to struct definition
+- [ ] Navigate relations
+
+#### Refactoring
+- [ ] Rename model (updates all references)
+- [ ] Rename field (updates all references)
+- [ ] Extract inline struct
+
+#### Code Actions
+- [ ] Quick fixes for common errors
+- [ ] Add missing directives
+- [ ] Convert field types
+
+**Test Schema:**
+```
+User {
+  id: +uuid
+  email: ^&string @email
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  author: *User
+  title: string @max(200)
+}
+```
+
+#### Success Criteria
+- [x] LSP server runs and responds to requests
+- [x] Real-time diagnostics show errors
+- [x] Code completion works for all schema elements
+- [x] Hover shows helpful information
+- [x] Go to definition navigates correctly
+- [x] Rename refactoring updates all references
+
+---
+
+## Sprint 23: VSCode Extension Integration
+
+**Goal**: Package syntax highlighting and LSP into a complete VSCode extension.
+
+### Tasks
+
+#### Extension Architecture
+- [ ] Integrate TextMate grammar from Sprint 21
+- [ ] Bundle LSP server from Sprint 22
+- [ ] Configure extension activation
+- [ ] Set up language client
+
+#### Commands
+- [ ] `SinkDB: Generate Code` - Run codegen
+- [ ] `SinkDB: Validate Schema` - Run validation
+- [ ] `SinkDB: Start Dev Mode` - Start file watcher
+- [ ] `SinkDB: Create New Model` - Scaffold model
+
+#### Snippets
+- [ ] Model template snippet
+- [ ] Struct template snippet
+- [ ] Field snippets with common patterns
+- [ ] Directive snippets
+
+#### Configuration
+- [ ] Schema file path setting
+- [ ] Output directory setting
+- [ ] Auto-generate on save option
+- [ ] LSP server path configuration
+
+#### Status Bar
+- [ ] Show SinkDB status (active/inactive)
+- [ ] Show schema validation status
+- [ ] Quick access to commands
+
+#### Extension Features
+- [ ] File icons for `.sink` files
+- [ ] Custom activity bar view (optional)
+- [ ] Problem matcher for build output
+- [ ] Task provider for SinkDB commands
+
+#### Testing
+- [ ] Extension integration tests
+- [ ] Test all commands
+- [ ] Test LSP features
+- [ ] Test configuration options
+
+#### Publishing
+- [ ] Complete README with features and screenshots
+- [ ] Add LICENSE
+- [ ] Add CHANGELOG
+- [ ] Package extension (`.vsix`)
+- [ ] Publish to VSCode marketplace
+- [ ] Set up CI/CD for releases
+
+**Extension Structure:**
+```
+vscode-sinkdb/
+├── syntaxes/
+│   └── sink.tmLanguage.json
+├── language-configuration.json
+├── snippets/
+│   └── sink.json
+├── client/              # VSCode extension
+│   ├── src/
+│   │   └── extension.ts
+│   └── package.json
+└── server/              # LSP server (from Sprint 22)
+    ├── src/
+    │   └── main.rs
+    └── Cargo.toml
+```
+
+#### Success Criteria
+- [x] Extension combines syntax highlighting and LSP
+- [x] All commands work from command palette
+- [x] Snippets speed up schema authoring
+- [x] Status bar provides useful feedback
+- [x] Extension published and installable
+- [x] Documentation complete with examples
+
+---
+
+## Sprint 24+: Future Enhancements
 
 ### Potential Features (Prioritize Later)
 

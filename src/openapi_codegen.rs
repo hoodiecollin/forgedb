@@ -1,0 +1,652 @@
+//! OpenAPI 3.0 Specification Generation for Sprint 13
+//!
+//! Generates OpenAPI/Swagger documentation from schema definitions, including:
+//! - Complete API specification in OpenAPI 3.0 format
+//! - Request/Response schemas with validation
+//! - CRUD endpoint definitions
+//! - Query parameter specifications
+//! - Computed field documentation
+
+use crate::ast::{Field, FieldType, Model, RelationType, Schema};
+use crate::codegen::GeneratedFile;
+use serde_json::{json, Value};
+
+pub struct OpenApiGenerator;
+
+impl OpenApiGenerator {
+    /// Generate OpenAPI specification file
+    pub fn generate(schema: &Schema) -> Vec<GeneratedFile> {
+        let mut files = vec![];
+
+        // Generate OpenAPI spec (JSON)
+        files.push(Self::generate_openapi_spec(schema));
+
+        // Generate markdown documentation
+        files.push(Self::generate_markdown_docs(schema));
+
+        files
+    }
+
+    /// Generate the main OpenAPI 3.0 specification
+    fn generate_openapi_spec(schema: &Schema) -> GeneratedFile {
+        let mut spec = json!({
+            "openapi": "3.0.3",
+            "info": {
+                "title": "SinkDB Generated API",
+                "description": "Auto-generated REST API from SinkDB schema",
+                "version": "1.0.0"
+            },
+            "servers": [
+                {
+                    "url": "http://localhost:3000",
+                    "description": "Development server"
+                }
+            ],
+            "paths": {},
+            "components": {
+                "schemas": {}
+            }
+        });
+
+        // Generate schemas for all models
+        for model in &schema.models {
+            Self::add_model_schemas(&mut spec, model);
+        }
+
+        // Generate paths for all models
+        for model in &schema.models {
+            Self::add_model_paths(&mut spec, model);
+        }
+
+        GeneratedFile {
+            path: "generated/openapi/openapi.json".to_string(),
+            content: serde_json::to_string_pretty(&spec).unwrap(),
+        }
+    }
+
+    /// Add schemas for a model (Model, CreateRequest, UpdateRequest)
+    fn add_model_schemas(spec: &mut Value, model: &Model) {
+
+        // Main model schema
+        let model_schema = {
+            let mut properties = serde_json::Map::new();
+            let mut required = Vec::new();
+
+            for field in &model.fields {
+                if Self::is_virtual_field(field) {
+                    continue;
+                }
+
+                let (field_name, field_schema) = Self::field_to_openapi_schema(field);
+                properties.insert(field_name.clone(), field_schema);
+
+                // Required if not optional and not auto-generated
+                if !Self::is_optional_field(field) {
+                    required.push(field_name);
+                }
+            }
+
+            // Add computed fields to model schema
+            for field in &model.fields {
+                if field.is_computed {
+                    let (field_name, field_schema) = Self::field_to_openapi_schema(field);
+                    properties.insert(field_name, field_schema);
+                }
+            }
+
+            json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            })
+        };
+
+        spec["components"]["schemas"].as_object_mut().unwrap()
+            .insert(model.name.clone(), model_schema);
+
+        // CreateRequest schema (no auto-generated or computed fields)
+        let create_schema = {
+            let mut properties = serde_json::Map::new();
+            let mut required = Vec::new();
+
+            for field in &model.fields {
+                if field.auto_generate || field.is_computed || Self::is_virtual_field(field) {
+                    continue;
+                }
+
+                let (field_name, field_schema) = Self::field_to_openapi_schema(field);
+                properties.insert(field_name.clone(), field_schema);
+
+                if !Self::is_optional_field(field) {
+                    required.push(field_name);
+                }
+            }
+
+            json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            })
+        };
+
+        spec["components"]["schemas"].as_object_mut().unwrap()
+            .insert(format!("Create{}Request", model.name), create_schema);
+
+        // UpdateRequest schema (all fields optional except computed)
+        let mut update_schema = json!({
+            "type": "object",
+            "properties": {}
+        });
+
+        let update_props = update_schema["properties"].as_object_mut().unwrap();
+
+        for field in &model.fields {
+            if field.auto_generate || field.is_computed || Self::is_virtual_field(field) {
+                continue;
+            }
+
+            let (field_name, field_schema) = Self::field_to_openapi_schema(field);
+            update_props.insert(field_name, field_schema);
+        }
+
+        spec["components"]["schemas"].as_object_mut().unwrap()
+            .insert(format!("Update{}Request", model.name), update_schema);
+    }
+
+    /// Add API paths for a model
+    fn add_model_paths(spec: &mut Value, model: &Model) {
+        let paths = spec["paths"].as_object_mut().unwrap();
+        let model_lower = model.name.to_lowercase();
+        let model_plural = format!("{}s", model_lower);
+
+        // List endpoint: GET /api/models
+        paths.insert(
+            format!("/api/{}", model_plural),
+            json!({
+                "get": {
+                    "summary": format!("List all {}", model_plural),
+                    "tags": [model.name],
+                    "parameters": [
+                        {
+                            "name": "limit",
+                            "in": "query",
+                            "schema": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                            "description": "Maximum number of items to return"
+                        },
+                        {
+                            "name": "offset",
+                            "in": "query",
+                            "schema": { "type": "integer", "minimum": 0 },
+                            "description": "Number of items to skip"
+                        },
+                        {
+                            "name": "sort",
+                            "in": "query",
+                            "schema": { "type": "string" },
+                            "description": "Field to sort by (prefix with - for descending)"
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Successful response",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "data": {
+                                                "type": "array",
+                                                "items": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                            },
+                                            "total": { "type": "integer" },
+                                            "limit": { "type": "integer" },
+                                            "offset": { "type": "integer" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "post": {
+                    "summary": format!("Create a new {}", model_lower),
+                    "tags": [model.name],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": { "$ref": format!("#/components/schemas/Create{}Request", model.name) }
+                            }
+                        }
+                    },
+                    "responses": {
+                        "201": {
+                            "description": "Created",
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                }
+                            }
+                        },
+                        "400": {
+                            "description": "Validation error",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "error": { "type": "string" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+
+        // Single item endpoints: GET/PUT/DELETE /api/models/:id
+        let id_field = model.fields.iter().find(|f| f.auto_generate);
+        if let Some(id_field) = id_field {
+            paths.insert(
+                format!("/api/{}/{{id}}", model_plural),
+                json!({
+                    "get": {
+                        "summary": format!("Get a {} by ID", model_lower),
+                        "tags": [model.name],
+                        "parameters": [
+                            {
+                                "name": "id",
+                                "in": "path",
+                                "required": true,
+                                "schema": Self::type_to_openapi_type(&id_field.field_type),
+                                "description": format!("{} ID", model.name)
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Successful response",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                    }
+                                }
+                            },
+                            "404": {
+                                "description": "Not found"
+                            }
+                        }
+                    },
+                    "put": {
+                        "summary": format!("Update a {}", model_lower),
+                        "tags": [model.name],
+                        "parameters": [
+                            {
+                                "name": "id",
+                                "in": "path",
+                                "required": true,
+                                "schema": Self::type_to_openapi_type(&id_field.field_type),
+                                "description": format!("{} ID", model.name)
+                            }
+                        ],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": format!("#/components/schemas/Update{}Request", model.name) }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Updated successfully",
+                                "content": {
+                                    "application/json": {
+                                        "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                    }
+                                }
+                            },
+                            "404": {
+                                "description": "Not found"
+                            }
+                        }
+                    },
+                    "delete": {
+                        "summary": format!("Delete a {}", model_lower),
+                        "tags": [model.name],
+                        "parameters": [
+                            {
+                                "name": "id",
+                                "in": "path",
+                                "required": true,
+                                "schema": Self::type_to_openapi_type(&id_field.field_type),
+                                "description": format!("{} ID", model.name)
+                            }
+                        ],
+                        "responses": {
+                            "204": {
+                                "description": "Deleted successfully"
+                            },
+                            "404": {
+                                "description": "Not found"
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+    }
+
+    /// Convert a field to OpenAPI schema
+    fn field_to_openapi_schema(field: &Field) -> (String, Value) {
+        let field_name = match &field.field_type {
+            FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
+            _ => field.name.clone(),
+        };
+
+        let mut schema = Self::type_to_openapi_type(&field.field_type);
+
+        // Add description for computed fields
+        if field.is_computed {
+            schema.as_object_mut().unwrap().insert(
+                "description".to_string(),
+                json!("Computed field (read-only)"),
+            );
+        }
+
+        // Add validation constraints
+        for constraint in &field.constraints {
+            match constraint.name.as_str() {
+                "email" => {
+                    schema.as_object_mut().unwrap().insert(
+                        "format".to_string(),
+                        json!("email"),
+                    );
+                }
+                "url" => {
+                    schema.as_object_mut().unwrap().insert(
+                        "format".to_string(),
+                        json!("uri"),
+                    );
+                }
+                "min" => {
+                    if let Some(crate::ast::ConstraintParam::Number(min_val)) = constraint.params.first() {
+                        schema.as_object_mut().unwrap().insert(
+                            "minimum".to_string(),
+                            json!(min_val),
+                        );
+                    }
+                }
+                "max" => {
+                    if let Some(crate::ast::ConstraintParam::Number(max_val)) = constraint.params.first() {
+                        schema.as_object_mut().unwrap().insert(
+                            "maximum".to_string(),
+                            json!(max_val),
+                        );
+                    }
+                }
+                "pattern" => {
+                    if let Some(crate::ast::ConstraintParam::String(pattern)) = constraint.params.first() {
+                        schema.as_object_mut().unwrap().insert(
+                            "pattern".to_string(),
+                            json!(pattern),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (field_name, schema)
+    }
+
+    /// Convert FieldType to OpenAPI type specification
+    fn type_to_openapi_type(field_type: &FieldType) -> Value {
+        match field_type {
+            FieldType::String => json!({ "type": "string" }),
+            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => {
+                json!({ "type": "integer" })
+            }
+            FieldType::F64 => json!({ "type": "number", "format": "double" }),
+            FieldType::Bool => json!({ "type": "boolean" }),
+            FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
+            FieldType::Timestamp => json!({ "type": "string", "format": "date-time" }),
+            FieldType::Char(_) => json!({ "type": "string" }),
+            FieldType::FixedArray(inner, _) => {
+                json!({
+                    "type": "array",
+                    "items": Self::type_to_openapi_type(inner)
+                })
+            }
+            FieldType::StructType(name) | FieldType::OptionalStructType(name) => {
+                json!({ "$ref": format!("#/components/schemas/{}", name) })
+            }
+            FieldType::Relation(rel) => match rel {
+                RelationType::RequiredReference(_) => json!({ "type": "string", "format": "uuid" }),
+                RelationType::OptionalReference(_) => {
+                    json!({ "type": "string", "format": "uuid", "nullable": true })
+                }
+                _ => json!({ "type": "string" }), // Virtual fields
+            },
+        }
+    }
+
+    /// Check if field is virtual (OneToMany/ManyToMany)
+    fn is_virtual_field(field: &Field) -> bool {
+        matches!(
+            &field.field_type,
+            FieldType::Relation(RelationType::OneToMany(_))
+                | FieldType::Relation(RelationType::ManyToMany(_))
+        )
+    }
+
+    /// Check if field is optional
+    fn is_optional_field(field: &Field) -> bool {
+        matches!(
+            &field.field_type,
+            FieldType::OptionalStructType(_) | FieldType::Relation(RelationType::OptionalReference(_))
+        )
+    }
+
+    /// Generate markdown documentation
+    fn generate_markdown_docs(schema: &Schema) -> GeneratedFile {
+        let mut content = String::new();
+
+        content.push_str("# API Documentation\n\n");
+        content.push_str("Auto-generated from SinkDB schema.\n\n");
+
+        content.push_str("## Table of Contents\n\n");
+        for model in &schema.models {
+            content.push_str(&format!("- [{}](#{})\n", model.name, model.name.to_lowercase()));
+        }
+        content.push_str("\n---\n\n");
+
+        // Document each model
+        for model in &schema.models {
+            Self::document_model(&mut content, model);
+        }
+
+        GeneratedFile {
+            path: "generated/openapi/API.md".to_string(),
+            content,
+        }
+    }
+
+    /// Document a single model in markdown
+    fn document_model(content: &mut String, model: &Model) {
+        let model_lower = model.name.to_lowercase();
+        let model_plural = format!("{}s", model_lower);
+
+        content.push_str(&format!("## {}\n\n", model.name));
+
+        // Fields table
+        content.push_str("### Fields\n\n");
+        content.push_str("| Field | Type | Constraints | Description |\n");
+        content.push_str("|-------|------|-------------|-------------|\n");
+
+        for field in &model.fields {
+            if Self::is_virtual_field(field) {
+                continue;
+            }
+
+            let field_name = match &field.field_type {
+                FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
+                _ => field.name.clone(),
+            };
+
+            let field_type = Self::type_to_markdown(&field.field_type);
+
+            let mut constraints = Vec::new();
+            if field.auto_generate {
+                constraints.push("auto-generated");
+            }
+            if field.unique {
+                constraints.push("unique");
+            }
+            if field.indexed {
+                constraints.push("indexed");
+            }
+            if field.is_computed {
+                constraints.push("computed");
+            }
+            for constraint in &field.constraints {
+                constraints.push(&constraint.name);
+            }
+            let constraints_str = constraints.join(", ");
+
+            let description = if field.is_computed {
+                "Computed field (read-only)"
+            } else {
+                ""
+            };
+
+            content.push_str(&format!(
+                "| `{}` | `{}` | {} | {} |\n",
+                field_name, field_type, constraints_str, description
+            ));
+        }
+        content.push_str("\n");
+
+        // API Endpoints
+        content.push_str("### Endpoints\n\n");
+
+        content.push_str(&format!("#### List {}\n", model_plural));
+        content.push_str(&format!("```\nGET /api/{}\n```\n\n", model_plural));
+        content.push_str("Query Parameters:\n");
+        content.push_str("- `limit` (integer): Maximum items to return\n");
+        content.push_str("- `offset` (integer): Number of items to skip\n");
+        content.push_str("- `sort` (string): Field to sort by\n\n");
+
+        content.push_str(&format!("#### Create {}\n", model_lower));
+        content.push_str(&format!("```\nPOST /api/{}\n```\n\n", model_plural));
+
+        content.push_str(&format!("#### Get {} by ID\n", model_lower));
+        content.push_str(&format!("```\nGET /api/{}/{{id}}\n```\n\n", model_plural));
+
+        content.push_str(&format!("#### Update {}\n", model_lower));
+        content.push_str(&format!("```\nPUT /api/{}/{{id}}\n```\n\n", model_plural));
+
+        content.push_str(&format!("#### Delete {}\n", model_lower));
+        content.push_str(&format!("```\nDELETE /api/{}/{{id}}\n```\n\n", model_plural));
+
+        content.push_str("---\n\n");
+    }
+
+    /// Convert FieldType to markdown-friendly type string
+    fn type_to_markdown(field_type: &FieldType) -> String {
+        match field_type {
+            FieldType::String => "string".to_string(),
+            FieldType::U32 => "u32".to_string(),
+            FieldType::U64 => "u64".to_string(),
+            FieldType::I32 => "i32".to_string(),
+            FieldType::I64 => "i64".to_string(),
+            FieldType::F64 => "f64".to_string(),
+            FieldType::Bool => "bool".to_string(),
+            FieldType::Uuid => "uuid".to_string(),
+            FieldType::Timestamp => "timestamp".to_string(),
+            FieldType::Char(n) => format!("char[{}]", n),
+            FieldType::FixedArray(inner, n) => format!("[{}; {}]", Self::type_to_markdown(inner), n),
+            FieldType::StructType(name) => name.clone(),
+            FieldType::OptionalStructType(name) => format!("{}?", name),
+            FieldType::Relation(rel) => match rel {
+                RelationType::RequiredReference(target) => format!("*{}", target),
+                RelationType::OptionalReference(target) => format!("?{}", target),
+                RelationType::OneToMany(target) => format!("[{}]", target),
+                RelationType::ManyToMany(target) => format!("[{}]", target),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{IndexType, Model};
+
+    fn create_test_model() -> Model {
+        Model {
+            name: "User".to_string(),
+            fields: vec![
+                Field {
+                    name: "id".to_string(),
+                    field_type: FieldType::Uuid,
+                    unique: false,
+                    indexed: false,
+                    auto_generate: true,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                },
+                Field {
+                    name: "email".to_string(),
+                    field_type: FieldType::String,
+                    unique: true,
+                    indexed: true,
+                    auto_generate: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                },
+            ],
+            composite_indexes: vec![],
+        }
+    }
+
+    #[test]
+    fn test_openapi_generation() {
+        let schema = Schema {
+            structs: vec![],
+            models: vec![create_test_model()],
+        };
+
+        let files = OpenApiGenerator::generate(&schema);
+        assert_eq!(files.len(), 2); // openapi.json and API.md
+
+        // Check OpenAPI file
+        let openapi_file = files.iter().find(|f| f.path.contains("openapi.json")).unwrap();
+        assert!(openapi_file.content.contains("openapi"));
+        assert!(openapi_file.content.contains("User"));
+
+        // Check markdown file
+        let md_file = files.iter().find(|f| f.path.contains("API.md")).unwrap();
+        assert!(md_file.content.contains("# API Documentation"));
+        assert!(md_file.content.contains("## User"));
+    }
+
+    #[test]
+    fn test_type_conversion() {
+        assert_eq!(
+            OpenApiGenerator::type_to_openapi_type(&FieldType::String),
+            json!({ "type": "string" })
+        );
+        assert_eq!(
+            OpenApiGenerator::type_to_openapi_type(&FieldType::U32),
+            json!({ "type": "integer" })
+        );
+        assert_eq!(
+            OpenApiGenerator::type_to_openapi_type(&FieldType::Bool),
+            json!({ "type": "boolean" })
+        );
+    }
+}
