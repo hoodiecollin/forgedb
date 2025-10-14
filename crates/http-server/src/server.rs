@@ -143,7 +143,7 @@ mod tests {
         let server = Server::new();
         let router = Router::new().route("/health", get(health_check));
 
-        let app = server.apply_middleware(router);
+        let _app = server.apply_middleware(router);
         // Just verify it compiles and applies without panic
         assert!(true);
     }

@@ -7,9 +7,16 @@ edition = "2021"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "limit", "timeout"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 http = "1.0"
+uuid = { version = "1.6", features = ["v4"] }
+prometheus = "0.13"
+lazy_static = "1.4"
+dashmap = "5.5"
+rustls = "0.23"
+tokio-rustls = "0.26"
+axum-server = { version = "0.6", features = ["tls-rustls"] }
