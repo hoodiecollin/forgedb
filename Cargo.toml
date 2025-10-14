@@ -95,3 +95,8 @@ path = "examples/sprint5_scaffold.rs"
 [[example]]
 name = "sprint5_watcher"
 path = "examples/sprint5_watcher.rs"
+
+# Sprint 6: Many-to-Many Relations
+[[example]]
+name = "sprint6_many_to_many"
+path = "examples/sprint6_many_to_many.rs"
