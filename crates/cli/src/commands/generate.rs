@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use sinkdb::{codegen::CodeGenerator, parser::Parser};
+use sinkdb::{codegen::CodeGenerator, parser::Parser, TypeScriptGenerator};
 use std::fs;
 use std::path::Path;
 
@@ -48,11 +48,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 
     // Generate code based on target
     match options.target.as_str() {
-        "all" | "rust" => {
+        "all" => {
+            generate_rust_code(&schema, output_dir, options.force)?;
+            generate_typescript_sdk(&schema, output_dir, options.force)?;
+        }
+        "rust" => {
             generate_rust_code(&schema, output_dir, options.force)?;
         }
-        "typescript" => {
-            ui::warning("TypeScript generation not yet implemented");
+        "typescript" | "sdk" => {
+            generate_typescript_sdk(&schema, output_dir, options.force)?;
         }
         "api" => {
             ui::warning("API generation not yet implemented");
@@ -126,6 +130,60 @@ fn generate_rust_code(
         output_path.display(),
         line_count
     ));
+
+    Ok(())
+}
+
+fn generate_typescript_sdk(
+    schema: &sinkdb::ast::Schema,
+    output_dir: &str,
+    force: bool,
+) -> Result<()> {
+    ui::info("Generating TypeScript SDK...");
+
+    // Generate all TypeScript files
+    let files = TypeScriptGenerator::generate(schema);
+
+    let mut files_written = 0;
+    let mut total_lines = 0;
+
+    for file in files {
+        let file_path = Path::new(output_dir).join(&file.path);
+
+        // Create parent directories
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Check if file exists and force is not set
+        if !force && file_path.exists() {
+            continue;
+        }
+
+        // Write file
+        fs::write(&file_path, &file.content)
+            .map_err(|e| CliError::CodeGeneration(format!("Failed to write {}: {}", file.path, e)))?;
+
+        files_written += 1;
+        total_lines += file.content.lines().count();
+    }
+
+    ui::success(&format!(
+        "Generated TypeScript SDK ({} files, {} lines)",
+        files_written, total_lines
+    ));
+
+    println!();
+    println!("SDK structure:");
+    println!("  - {}/sdk/types.ts         - Type definitions", output_dir);
+    println!("  - {}/sdk/*Api.ts          - API client classes", output_dir);
+    println!("  - {}/sdk/index.ts         - Main entry point", output_dir);
+    println!("  - {}/sdk/package.json     - NPM package config", output_dir);
+    println!();
+    println!("To use the SDK:");
+    println!("  cd {}/sdk", output_dir);
+    println!("  npm install");
+    println!("  npm run build");
 
     Ok(())
 }

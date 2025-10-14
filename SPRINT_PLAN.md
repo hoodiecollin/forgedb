@@ -14,6 +14,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 7: Write-Ahead Log & Durability
 - ✅ Sprint 8: Inline Structs & Fixed Arrays
 - ✅ Sprint 9: REST API Generation
+- ✅ Sprint 10: TypeScript SDK Generation
 - ✅ Sprint 11: Directives & Validation (Constraints)
 - ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
 
@@ -23,7 +24,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 10, 12-13, 15-21
+**Not Started:** Sprints 12-13, 15-21
 
 **Test Status:** 122/122 tests passing | 15/15 examples working
 
@@ -930,45 +931,48 @@ tasks:
 
 ---
 
-## Sprint 10: TypeScript SDK Generation
+## Sprint 10: TypeScript SDK Generation ✅ COMPLETE
 
 **Goal**: Type-safe client for generated APIs.
+
+**Status**: ✅ Completed
 
 ### Tasks
 
 #### Type Generation
-- [ ] Generate TypeScript interfaces from schema
-- [ ] Generate API client class
-- [ ] Generate SDK types for relations
+- [x] Generate TypeScript interfaces from schema
+- [x] Generate API client class
+- [x] Generate SDK types for relations
 
 #### API Client
-- [ ] `UserApi.list(params)`
-- [ ] `UserApi.get(id)`
-- [ ] `UserApi.create(data)`
-- [ ] `UserApi.update(id, data)`
-- [ ] `UserApi.delete(id)`
+- [x] `UserApi.list(params)`
+- [x] `UserApi.get(id)`
+- [x] `UserApi.create(data)`
+- [x] `UserApi.update(id, data)`
+- [x] `UserApi.delete(id)`
 
 #### Relations
-- [ ] `UserApi.posts(userId)` - traverse relations
-- [ ] Type-safe relation parameters
+- [x] `UserApi.posts(userId)` - traverse relations
+- [x] Type-safe relation parameters
 
 #### NPM Package
-- [ ] Generate package.json
-- [ ] Bundle with tsup or rollup
-- [ ] Publish-ready structure
+- [x] Generate package.json
+- [x] Bundle with tsup or rollup
+- [x] Publish-ready structure
 
 **Generated Output:**
 ```typescript
-import { UserApi, User } from './generated'
+import { SinkDBClient } from '@sinkdb/client'
 
-const api = new UserApi('http://localhost:3000')
-const users = await api.list({ email: 'test@example.com' })
-const user = await api.get(users[0].id)
+const client = new SinkDBClient('http://localhost:3000')
+const users = await client.user.list({ email: 'test@example.com' })
+const user = await client.user.get(users.data[0].id)
 ```
 
 #### Success Criteria
 - [x] TypeScript types match schema exactly
 - [x] API client is type-safe
+- [x] Complete NPM package with bundling
 - [x] Works with popular frameworks (React, Vue)
 
 ---
