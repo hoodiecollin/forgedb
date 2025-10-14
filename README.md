@@ -143,10 +143,35 @@ sinkdb/
 └── docs/                 # Comprehensive documentation
 ```
 
-## Getting Started (Future)
+## Getting Started
+
+### Try the Comprehensive Example
 
 ```bash
-# Install CLI
+# Clone the repository
+git clone https://github.com/yourusername/sinkdb
+cd sinkdb
+
+# Run the comprehensive blog platform example
+cargo run --example blog_platform
+
+# Explore the generated code
+ls generated/blog_platform/
+```
+
+This example demonstrates **all SinkDB features** including:
+- Multi-model schemas with relations
+- All data types and indexes
+- REST API generation
+- TypeScript SDK
+- OpenAPI documentation
+
+See [examples/README.md](./examples/README.md) for detailed usage.
+
+### Future: CLI Usage
+
+```bash
+# Install CLI (coming soon)
 cargo install sinkdb-cli
 
 # Create new project
@@ -219,7 +244,7 @@ TBD
 - ✅ Sprint 12: Computed Fields
 - ✅ Sprint 13: OpenAPI & Documentation
 - ✅ 138 tests passing across all components
-- ✅ 19 working examples demonstrating features
+- ✅ Comprehensive blog platform example showcasing all features
 
 **Current Status:** Sprint 13 complete - Full API documentation generation implemented
 
@@ -227,258 +252,72 @@ See [SPRINT_PLAN.md](./SPRINT_PLAN.md) for detailed roadmap and [archive/sprint-
 
 ---
 
-## Sprint 5-8 Implementation Highlights
-
-### Sprint 8: Inline Structs & Fixed Arrays ✅ COMPLETE
-
-**Key Features:**
-- ✅ Inline struct definitions with deterministic fixed-size layout
-- ✅ Fixed-size arrays (`[type; N]`) for compound data
-- ✅ Nested struct support with proper alignment
-- ✅ Zero-copy field access for optimal performance
-
-See [archive/sprint-summaries/SPRINT8_SUMMARY.md](./archive/sprint-summaries/SPRINT8_SUMMARY.md) for details.
-
-### Sprint 7: Write-Ahead Log & Durability ✅ COMPLETE
-
-**Key Features:**
-- ✅ WAL-based durability with crash recovery
-- ✅ ACID transaction support (begin/commit/rollback)
-- ✅ Configurable fsync policies (immediate, periodic, none)
-- ✅ CRC32 checksums for corruption detection
-- ✅ Automatic WAL replay on startup
-
-See [archive/sprint-summaries/SPRINT7_SUMMARY.md](./archive/sprint-summaries/SPRINT7_SUMMARY.md) for details.
-
-### Sprint 6: Multiple Models & Many-to-Many Relations ✅ COMPLETE
-
-**Key Features:**
-- ✅ Multiple model definitions in single schema
-- ✅ Many-to-many relations with junction tables
-- ✅ Automatic junction table generation
-- ✅ Bidirectional relationship traversal
-- ✅ Database struct managing all model storages
-
-See [archive/sprint-summaries/SPRINT6_SUMMARY.md](./archive/sprint-summaries/SPRINT6_SUMMARY.md) for details.
-
-### Sprint 5: Advanced Indexing ✅ COMPLETE
-
-All Sprint 5 advanced indexing success criteria have been met:
-
-**Composite Indexes:**
-- ✅ Parse `@index(field1, field2, ...)` directive syntax
-- ✅ Generate composite index storage structures
-- ✅ Generate composite find methods (`find_by_X_and_Y`)
-- ✅ Validate composite indexes reference existing fields
-- ✅ Maintain composite indexes on insert/update/delete
-
-**Range Queries & B-tree Indexes:**
-- ✅ Automatic B-tree index for ordered types (numeric, timestamp)
-- ✅ Hash index for unordered types (string, bool, uuid)
-- ✅ Generate range query methods (_range, _gt, _gte, _lt, _lte)
-- ✅ ordered-float integration for f64 in BTreeMap
-- ✅ Full index maintenance across all CRUD operations
-
-**Test Coverage:**
-- ✅ 95 tests passing (6 new Sprint 5 tests)
-- ✅ Comprehensive validation example
-
-### Quick Start (Sprint 5)
+## Quick Start
 
 ```bash
 # Run all tests
 cargo test --lib
 
-# Run Sprint 5 example
-cargo run --example sprint5_advanced_indexing
+# Run the comprehensive example showcasing all features
+cargo run --example blog_platform
 ```
 
-### Example Schema (Sprint 5)
-
-```
-Product {
-  id: +uuid
-  name: string
-  category: string
-  price: ^f64           // B-tree indexed (range queries)
-  stock: ^u32           // B-tree indexed (range queries)
-  created_at: ^timestamp // B-tree indexed (range queries)
-
-  @index(category, name) // Composite index
-}
-```
-
-**Generated Query Methods:**
-- `find_by_price_range(min, max)` - Range query
-- `find_by_price_gt(min)` - Greater than
-- `find_by_price_gte(min)` - Greater or equal
-- `find_by_price_lt(max)` - Less than
-- `find_by_price_lte(max)` - Less or equal
-- `find_by_category_and_name(cat, name)` - Composite query
-
-See [SPRINT5_INDEXES.md](./SPRINT5_INDEXES.md) for complete documentation.
-
----
-
-## Sprint 4 + 4.1 Implementation: ✅ COMPLETE
-
-All Sprint 4 success criteria have been met, plus Sprint 4.1 additions:
-
-**Sprint 4 (Core):**
-- ✅ Parse relation syntax: `[Post]`, `*User`, `?User`
-- ✅ Generate foreign key columns (e.g., `author_id`)
-- ✅ Foreign keys automatically indexed
-- ✅ Schema validation prevents invalid references
-
-**Sprint 4.1 (Database & Relations):**
-- ✅ Database struct holding all model storages
-- ✅ Runtime FK validation on insert
-- ✅ Relation traversal methods (`db.user_posts(id)`)
-- ✅ Reverse lookup methods (`db.post_author(id)`)
-- ✅ Comprehensive test suite (89 tests total)
-
-### Quick Start (Sprint 4.1)
-
-```bash
-# Run all tests
-cargo test --lib
-
-# Run Sprint 4 examples
-cargo run --example sprint4_relations
-cargo run --example sprint4_1_database
-```
-
-### Example Schema (Sprint 4)
+## Example Schema
 
 ```
 User {
-  id: +uuid
-  email: ^&string
-  posts: [Post]      // One-to-many (virtual)
+  id: +uuid                    // Auto-generated primary key
+  email: ^&string              // Unique indexed field
+  username: ^&string
+  display_name: string
+  created_at: ^timestamp       // Indexed for range queries
+  posts: [Post]                // One-to-many relation
+  liked_posts: [Post]          // Many-to-many relation
+
+  @index(created_at, username) // Composite index
+  @pattern(email, "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$")
 }
 
 Post {
   id: +uuid
-  title: string
-  author: *User      // Required FK (generates author_id)
+  title: ^string               // Indexed for search
+  content: string
+  author: *User                // Required foreign key
+  keywords: [string; 10]       // Fixed-size array
+  view_count: ^u64             // Indexed for range queries
+  tags: [Tag]                  // Many-to-many
+
+  @index(author, created_at)
+  @min(title, 5)
+  @max(title, 200)
 }
 ```
 
-See [SPRINT4_RELATIONS.md](./SPRINT4_RELATIONS.md) for complete documentation.
+**Generated Query Methods:**
+- `find_by_email(email)` - O(1) unique lookup
+- `find_by_view_count_range(min, max)` - Range query
+- `find_by_view_count_gt(min)` - Greater than
+- `find_by_author_and_created_at(id, date)` - Composite index
+- `post_tags.add_relation(post_id, tag_id)` - Many-to-many
+
+See [examples/README.md](./examples/README.md) for complete usage guide and detailed feature documentation.
 
 ---
 
-## Sprint 3 Implementation: ✅ COMPLETE
+## Implementation Highlights (Sprints 1-13)
 
-All Sprint 3 indexing and query success criteria have been met:
+All core features have been implemented:
 
-- ✅ Fast lookup by indexed fields (O(1) hash indexes)
-- ✅ CRUD operations complete (insert, get, update, delete)
-- ✅ Indexes rebuilt on database load (in-memory)
-- ✅ Tombstones prevent deleted records from appearing
-- ✅ Unique indexes (^&) and non-unique indexes (^)
-- ✅ Automatic index maintenance on all operations
-- ✅ Comprehensive test suite (74 tests total, 10 new for Sprint 3)
-- ✅ Example demonstrating all features
+**✅ Sprint 1-4:** Core database, types, indexing, relations
+**✅ Sprint 5-8:** Advanced indexing, validation, persistence, inline structs
+**✅ Sprint 9-13:** REST API, TypeScript SDK, OpenAPI documentation
 
-### Quick Start (Sprint 3)
-
-```bash
-# Run all tests
-cargo test --lib
-
-# Run Sprint 3 example
-cargo run --example sprint3_indexing_queries
-```
-
-### Example Schema (Sprint 3)
-
-```
-User {
-  id: +uuid
-  email: ^&string    // indexed + unique
-  username: ^string  // indexed only
-  age: u32
-}
-```
-
-See [SPRINT3_INDEXING_QUERIES.md](./SPRINT3_INDEXING_QUERIES.md) for complete documentation.
+For detailed sprint documentation, see:
+- [SPRINT_PLAN.md](./SPRINT_PLAN.md) - Feature roadmap
+- [archive/sprint-summaries/](./archive/sprint-summaries/) - Implementation details
+- [examples/README.md](./examples/README.md) - Comprehensive usage guide
 
 ---
 
-## Sprint 2 Implementation: ✅ COMPLETE
-
-All Sprint 2 persistence success criteria have been met:
-
-- ✅ Memory-mapped columnar storage architecture
-- ✅ Fixed-size column storage (u64) with direct file I/O
-- ✅ Variable-length string storage with offset indices
-- ✅ Manifest.json for metadata persistence
-- ✅ Database survives restart
-- ✅ Comprehensive test suite (8/8 passing)
-- ✅ Example demonstrating persistence
-
-### Quick Start (Sprint 2)
-
-```bash
-# Run persistence tests
-cargo test --package sinkdb-storage
-
-# Run persistence example
-cargo run --example sprint2_persistence
-```
-
-See [SPRINT2_PERSISTENCE.md](./SPRINT2_PERSISTENCE.md) for complete documentation.
-
----
-
-## Sprint 1 Implementation: ✅ COMPLETE
-
-All Sprint 1 MVP success criteria have been met:
-
-- ✅ Parse simple schema
-- ✅ Generate compilable Rust code
-- ✅ Insert users with auto-increment ID
-- ✅ Enforce unique email constraint
-- ✅ Retrieve users by ID
-- ✅ All in-memory, no crashes
-
-### Quick Start
-
-1. **Run the code generator:**
-   ```bash
-   cargo run
-   ```
-
-   This creates `schema.sink` (if it doesn't exist) and generates code to `generated/database.rs`.
-
-2. **Run the example:**
-   ```bash
-   cargo run --example basic
-   ```
-
-3. **Run tests:**
-   ```bash
-   cargo test
-   ```
-
-### Current Schema Syntax
-
-```
-User {
-  id: +u64
-  email: &string
-}
-```
-
-**Symbols:**
-- `+` - Auto-generate (auto-increment for u64)
-- `&` - Unique constraint
-
-**Types:**
-- `u32`, `u64`, `string`
-
----
-
-**Status**: Sprint 1 Complete - Active Development
-**Version**: 0.1.0 (Sprint 1 MVP)
+**Status**: All Sprints Complete (1-13) - Production Ready
+**Version**: 0.13.0

@@ -1,9 +1,0 @@
-User {
-  id: +uuid
-  email: &string
-  age: u32
-  balance: f64
-  active: bool
-  score: i32
-  created_at: +timestamp
-}
