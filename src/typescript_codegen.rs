@@ -65,7 +65,11 @@ impl TypeScriptGenerator {
                 // Skip virtual relation fields (OneToMany, ManyToMany)
                 if !Self::is_virtual_field(field) {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if Self::is_optional(&field.field_type) { "?" } else { "" };
+                    let optional = if Self::is_optional(&field.field_type) {
+                        "?"
+                    } else {
+                        ""
+                    };
                     code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
                 }
             }
@@ -83,18 +87,28 @@ impl TypeScriptGenerator {
             code.push_str("}\n\n");
 
             // Generate CreateRequest type (omit auto-generated and computed fields)
-            code.push_str(&format!("export interface Create{}Request {{\n", model.name));
+            code.push_str(&format!(
+                "export interface Create{}Request {{\n",
+                model.name
+            ));
             for field in &model.fields {
                 if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if Self::is_optional(&field.field_type) { "?" } else { "" };
+                    let optional = if Self::is_optional(&field.field_type) {
+                        "?"
+                    } else {
+                        ""
+                    };
                     code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
                 }
             }
             code.push_str("}\n\n");
 
             // Generate UpdateRequest type (all non-computed fields optional)
-            code.push_str(&format!("export interface Update{}Request {{\n", model.name));
+            code.push_str(&format!(
+                "export interface Update{}Request {{\n",
+                model.name
+            ));
             for field in &model.fields {
                 if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
@@ -145,9 +159,15 @@ impl TypeScriptGenerator {
 
         // List method
         code.push_str("  /**\n");
-        code.push_str(&format!("   * List all {} with optional filtering, sorting, and pagination\n", plural));
+        code.push_str(&format!(
+            "   * List all {} with optional filtering, sorting, and pagination\n",
+            plural
+        ));
         code.push_str("   */\n");
-        code.push_str(&format!("  async list(params?: QueryParams): Promise<ListResponse<{}>> {{\n", model.name));
+        code.push_str(&format!(
+            "  async list(params?: QueryParams): Promise<ListResponse<{}>> {{\n",
+            model.name
+        ));
         code.push_str("    const queryString = params ? '?' + new URLSearchParams(params as any).toString() : '';\n");
         code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}${{{{queryString}}}}`);\n", plural));
         code.push_str("    if (!response.ok) {\n");
@@ -160,8 +180,14 @@ impl TypeScriptGenerator {
         code.push_str("  /**\n");
         code.push_str(&format!("   * Get a single {} by ID\n", model_lower));
         code.push_str("   */\n");
-        code.push_str(&format!("  async get(id: string): Promise<{}> {{\n", model.name));
-        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`);\n", plural));
+        code.push_str(&format!(
+            "  async get(id: string): Promise<{}> {{\n",
+            model.name
+        ));
+        code.push_str(&format!(
+            "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`);\n",
+            plural
+        ));
         code.push_str("    if (!response.ok) {\n");
         code.push_str("      throw new Error(`Failed to get {}: ${response.statusText}`);\n");
         code.push_str("    }\n");
@@ -172,8 +198,14 @@ impl TypeScriptGenerator {
         code.push_str("  /**\n");
         code.push_str(&format!("   * Create a new {}\n", model_lower));
         code.push_str("   */\n");
-        code.push_str(&format!("  async create(data: Create{}Request): Promise<{}> {{\n", model.name, model.name));
-        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}`, {{\n", plural));
+        code.push_str(&format!(
+            "  async create(data: Create{}Request): Promise<{}> {{\n",
+            model.name, model.name
+        ));
+        code.push_str(&format!(
+            "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}`, {{\n",
+            plural
+        ));
         code.push_str("      method: 'POST',\n");
         code.push_str("      headers: { 'Content-Type': 'application/json' },\n");
         code.push_str("      body: JSON.stringify(data),\n");
@@ -188,8 +220,14 @@ impl TypeScriptGenerator {
         code.push_str("  /**\n");
         code.push_str(&format!("   * Update an existing {}\n", model_lower));
         code.push_str("   */\n");
-        code.push_str(&format!("  async update(id: string, data: Update{}Request): Promise<{}> {{\n", model.name, model.name));
-        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`, {{\n", plural));
+        code.push_str(&format!(
+            "  async update(id: string, data: Update{}Request): Promise<{}> {{\n",
+            model.name, model.name
+        ));
+        code.push_str(&format!(
+            "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`, {{\n",
+            plural
+        ));
         code.push_str("      method: 'PUT',\n");
         code.push_str("      headers: { 'Content-Type': 'application/json' },\n");
         code.push_str("      body: JSON.stringify(data),\n");
@@ -205,7 +243,10 @@ impl TypeScriptGenerator {
         code.push_str(&format!("   * Delete a {}\n", model_lower));
         code.push_str("   */\n");
         code.push_str("  async delete(id: string): Promise<void> {\n");
-        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`, {{\n", plural));
+        code.push_str(&format!(
+            "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`, {{\n",
+            plural
+        ));
         code.push_str("      method: 'DELETE',\n");
         code.push_str("    });\n");
         code.push_str("    if (!response.ok) {\n");
@@ -222,7 +263,10 @@ impl TypeScriptGenerator {
                         let target_plural = format!("{}s", target_lower);
                         code.push_str("\n");
                         code.push_str("  /**\n");
-                        code.push_str(&format!("   * Get related {} for this {}\n", target_plural, model_lower));
+                        code.push_str(&format!(
+                            "   * Get related {} for this {}\n",
+                            target_plural, model_lower
+                        ));
                         code.push_str("   */\n");
                         code.push_str(&format!("  async {}(id: string, params?: QueryParams): Promise<ListResponse<{}>> {{\n",
                             field.name, target));
@@ -235,19 +279,35 @@ impl TypeScriptGenerator {
                         code.push_str("    }\n");
                         code.push_str("    return response.json();\n");
                         code.push_str("  }\n");
-                    },
-                    RelationType::RequiredReference(target) | RelationType::OptionalReference(target) => {
+                    }
+                    RelationType::RequiredReference(target)
+                    | RelationType::OptionalReference(target) => {
                         code.push_str("\n");
                         code.push_str("  /**\n");
-                        code.push_str(&format!("   * Get the related {} for this {}\n", target, model_lower));
+                        code.push_str(&format!(
+                            "   * Get the related {} for this {}\n",
+                            target, model_lower
+                        ));
                         code.push_str("   */\n");
-                        code.push_str(&format!("  async {}(id: string): Promise<{}> {{\n",
-                            field.name, target));
-                        code.push_str(&format!("    const {} = await this.get(id);\n", model_lower));
-                        code.push_str(&format!("    const {}_id = {}.{};\n",
-                            target.to_lowercase(), model_lower, field.name));
+                        code.push_str(&format!(
+                            "  async {}(id: string): Promise<{}> {{\n",
+                            field.name, target
+                        ));
+                        code.push_str(&format!(
+                            "    const {} = await this.get(id);\n",
+                            model_lower
+                        ));
+                        code.push_str(&format!(
+                            "    const {}_id = {}.{};\n",
+                            target.to_lowercase(),
+                            model_lower,
+                            field.name
+                        ));
                         code.push_str(&format!("    if (!{}_id) {{\n", target.to_lowercase()));
-                        code.push_str(&format!("      throw new Error('No {} reference found');\n", target));
+                        code.push_str(&format!(
+                            "      throw new Error('No {} reference found');\n",
+                            target
+                        ));
                         code.push_str("    }\n");
                         code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}s/${{{{{}_id}}}}`);\n",
                             target.to_lowercase(), target.to_lowercase()));
@@ -256,7 +316,7 @@ impl TypeScriptGenerator {
                         code.push_str("    }\n");
                         code.push_str("    return response.json();\n");
                         code.push_str("  }\n");
-                    },
+                    }
                     _ => {}
                 }
             }
@@ -281,19 +341,29 @@ impl TypeScriptGenerator {
 
         // Export all API clients
         for model in &schema.models {
-            code.push_str(&format!("export {{ {}Api }} from './{}Api';\n", model.name, model.name));
+            code.push_str(&format!(
+                "export {{ {}Api }} from './{}Api';\n",
+                model.name, model.name
+            ));
         }
 
         code.push_str("\n// Main SDK class\n");
         code.push_str("export class SinkDBClient {\n");
         for model in &schema.models {
-            code.push_str(&format!("  public {}: {}Api;\n", model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "  public {}: {}Api;\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
         code.push_str("\n");
         code.push_str("  constructor(baseUrl: string) {\n");
         for model in &schema.models {
-            code.push_str(&format!("    this.{} = new {}Api(baseUrl);\n",
-                model.name.to_lowercase(), model.name));
+            code.push_str(&format!(
+                "    this.{} = new {}Api(baseUrl);\n",
+                model.name.to_lowercase(),
+                model.name
+            ));
         }
         code.push_str("  }\n");
         code.push_str("}\n");
@@ -412,13 +482,22 @@ export default defineConfig({
         if let Some(model) = schema.models.first() {
             let model_lower = model.name.to_lowercase();
             content.push_str(&format!("// List all {}\n", model_lower));
-            content.push_str(&format!("const {{s}} = await client.{}.list();\n\n", model_lower));
+            content.push_str(&format!(
+                "const {{s}} = await client.{}.list();\n\n",
+                model_lower
+            ));
 
             content.push_str(&format!("// Get {} by ID\n", model_lower));
-            content.push_str(&format!("const {} = await client.{}.get('some-uuid');\n\n", model_lower, model_lower));
+            content.push_str(&format!(
+                "const {} = await client.{}.get('some-uuid');\n\n",
+                model_lower, model_lower
+            ));
 
             content.push_str(&format!("// Create new {}\n", model_lower));
-            content.push_str(&format!("const new{} = await client.{}.create({{\n", model.name, model_lower));
+            content.push_str(&format!(
+                "const new{} = await client.{}.create({{\n",
+                model.name, model_lower
+            ));
 
             // Show first non-auto field as example
             for field in &model.fields {
@@ -431,7 +510,10 @@ export default defineConfig({
             content.push_str("});\n\n");
 
             content.push_str(&format!("// Update {}\n", model_lower));
-            content.push_str(&format!("await client.{}.update('some-uuid', {{\n", model_lower));
+            content.push_str(&format!(
+                "await client.{}.update('some-uuid', {{\n",
+                model_lower
+            ));
             for field in &model.fields {
                 if !field.auto_generate && !Self::is_virtual_field(field) {
                     let example_value = Self::example_value_for_type(&field.field_type);
@@ -442,7 +524,10 @@ export default defineConfig({
             content.push_str("});\n\n");
 
             content.push_str(&format!("// Delete {}\n", model_lower));
-            content.push_str(&format!("await client.{}.delete('some-uuid');\n", model_lower));
+            content.push_str(&format!(
+                "await client.{}.delete('some-uuid');\n",
+                model_lower
+            ));
         }
 
         content.push_str("```\n\n");
@@ -450,10 +535,19 @@ export default defineConfig({
         content.push_str("## API Reference\n\n");
         for model in &schema.models {
             content.push_str(&format!("### {}Api\n\n", model.name));
-            content.push_str(&format!("- `list(params?: QueryParams): Promise<ListResponse<{}>>`\n", model.name));
+            content.push_str(&format!(
+                "- `list(params?: QueryParams): Promise<ListResponse<{}>>`\n",
+                model.name
+            ));
             content.push_str(&format!("- `get(id: string): Promise<{}>`\n", model.name));
-            content.push_str(&format!("- `create(data: Create{}Request): Promise<{}>`\n", model.name, model.name));
-            content.push_str(&format!("- `update(id: string, data: Update{}Request): Promise<{}>`\n", model.name, model.name));
+            content.push_str(&format!(
+                "- `create(data: Create{}Request): Promise<{}>`\n",
+                model.name, model.name
+            ));
+            content.push_str(&format!(
+                "- `update(id: string, data: Update{}Request): Promise<{}>`\n",
+                model.name, model.name
+            ));
             content.push_str("- `delete(id: string): Promise<void>`\n");
             content.push_str("\n");
         }
@@ -594,10 +688,22 @@ mod tests {
 
     #[test]
     fn test_map_field_type_to_ts() {
-        assert_eq!(TypeScriptGenerator::map_field_type_to_ts(&FieldType::String), "string");
-        assert_eq!(TypeScriptGenerator::map_field_type_to_ts(&FieldType::U32), "number");
-        assert_eq!(TypeScriptGenerator::map_field_type_to_ts(&FieldType::Bool), "boolean");
-        assert_eq!(TypeScriptGenerator::map_field_type_to_ts(&FieldType::Uuid), "string");
+        assert_eq!(
+            TypeScriptGenerator::map_field_type_to_ts(&FieldType::String),
+            "string"
+        );
+        assert_eq!(
+            TypeScriptGenerator::map_field_type_to_ts(&FieldType::U32),
+            "number"
+        );
+        assert_eq!(
+            TypeScriptGenerator::map_field_type_to_ts(&FieldType::Bool),
+            "boolean"
+        );
+        assert_eq!(
+            TypeScriptGenerator::map_field_type_to_ts(&FieldType::Uuid),
+            "string"
+        );
         assert_eq!(
             TypeScriptGenerator::map_field_type_to_ts(&FieldType::OptionalStructType(
                 "Address".to_string()

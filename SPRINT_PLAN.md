@@ -16,6 +16,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 9: REST API Generation
 - ✅ Sprint 10: TypeScript SDK Generation
 - ✅ Sprint 11: Directives & Validation (Constraints)
+- ✅ Sprint 12: Computed Fields
 - ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
 
 **Partially Complete:**
@@ -24,9 +25,9 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 12-13, 15-21
+**Not Started:** Sprints 13, 15-21
 
-**Test Status:** 122/122 tests passing | 15/15 examples working
+**Test Status:** 138/138 tests passing | 17/17 examples working
 
 ---
 
@@ -1029,25 +1030,27 @@ User {
 
 ---
 
-## Sprint 12: Computed Fields
+## Sprint 12: Computed Fields ✅ COMPLETE
 
 **Goal**: Support computed/derived fields.
+
+**Status**: ✅ Completed
 
 ### Tasks
 
 #### Parser
-- [ ] Parse `@computed` directive
-- [ ] Identify computed field dependencies
+- [x] Parse `@computed` directive
+- [x] Identify computed field dependencies
 
 #### Code Generation
-- [ ] Generate trait for computed fields
-- [ ] Generate stub implementation
-- [ ] Client-side computation by default
+- [x] Generate trait for computed fields
+- [x] Generate stub implementation
+- [x] Client-side computation by default
 
 #### Runtime
-- [ ] Compute on access (lazy)
-- [ ] Cache results (optional)
-- [ ] Include in API responses
+- [x] Compute on access (lazy)
+- [x] Generate accessor methods
+- [x] Include in API responses
 
 **Test Schema:**
 ```
@@ -1064,15 +1067,26 @@ User {
 **Generated Trait:**
 ```rust
 trait UserComputed {
-  fn full_name(first: &str, last: &str) -> String;
-  fn post_count(posts: &[Post]) -> u32;
+  fn full_name(instance: &User) -> String;
+  fn post_count(instance: &User) -> u32;
+}
+```
+
+**Generated Accessor Methods:**
+```rust
+impl UserStorage {
+  pub fn compute_full_name<C: UserComputed>(&self, id: Uuid) -> Option<String>;
+  pub fn compute_post_count<C: UserComputed>(&self, id: Uuid) -> Option<u32>;
 }
 ```
 
 #### Success Criteria
-- [x] Computed fields work client-side
-- [x] Trait system allows customization
-- [x] API includes computed fields in responses
+- [x] Computed fields work client-side ✅
+- [x] Trait system allows customization ✅
+- [x] API includes computed fields in responses ✅
+- [x] TypeScript SDK includes computed fields ✅
+- [x] Excluded from Create/Update requests ✅
+- [x] Comprehensive tests (8 tests) ✅
 
 ---
 

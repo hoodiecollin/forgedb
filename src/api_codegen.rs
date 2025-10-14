@@ -58,7 +58,10 @@ impl ApiCodeGenerator {
         for field in &model.fields {
             if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
                 let field_type = Self::map_field_type_to_rust(&field.field_type, false);
-                code.push_str(&format!("    pub {}: Option<{}>,\n", field.name, field_type));
+                code.push_str(&format!(
+                    "    pub {}: Option<{}>,\n",
+                    field.name, field_type
+                ));
             }
         }
         code.push_str("}\n\n");
@@ -137,7 +140,10 @@ impl ApiCodeGenerator {
         // Create handler
         code.push_str(&format!("/// Create a new {}\n", model.name));
         code.push_str(&format!("pub async fn create_{}(\n", model_lower));
-        code.push_str(&format!("    Json(req): Json<Create{}Request>,\n", model.name));
+        code.push_str(&format!(
+            "    Json(req): Json<Create{}Request>,\n",
+            model.name
+        ));
         code.push_str(") -> impl IntoResponse {\n");
         code.push_str("    // TODO: Implement create logic with storage\n");
         code.push_str("    // Validate request with sinkdb_validation\n");
@@ -151,7 +157,10 @@ impl ApiCodeGenerator {
         code.push_str(&format!("/// Update an existing {}\n", model.name));
         code.push_str(&format!("pub async fn update_{}(\n", model_lower));
         code.push_str("    Path(id): Path<Uuid>,\n");
-        code.push_str(&format!("    Json(req): Json<Update{}Request>,\n", model.name));
+        code.push_str(&format!(
+            "    Json(req): Json<Update{}Request>,\n",
+            model.name
+        ));
         code.push_str(") -> impl IntoResponse {\n");
         code.push_str("    // TODO: Implement update logic with storage\n");
         code.push_str("    (StatusCode::OK, Json(json!({\n");
@@ -290,7 +299,7 @@ impl ApiCodeGenerator {
                 match rel_type {
                     RelationType::RequiredReference(_) => "Uuid".to_string(), // FK stored as UUID
                     RelationType::OptionalReference(_) => "Option<Uuid>".to_string(), // Optional FK
-                    _ => "()".to_string(), // Virtual fields
+                    _ => "()".to_string(),                                    // Virtual fields
                 }
             }
         }
@@ -402,11 +411,23 @@ mod tests {
 
     #[test]
     fn test_map_field_type_to_rust() {
-        assert_eq!(ApiCodeGenerator::map_field_type_to_rust(&FieldType::U32, false), "u32");
-        assert_eq!(ApiCodeGenerator::map_field_type_to_rust(&FieldType::String, false), "String");
-        assert_eq!(ApiCodeGenerator::map_field_type_to_rust(&FieldType::Uuid, false), "Uuid");
         assert_eq!(
-            ApiCodeGenerator::map_field_type_to_rust(&FieldType::OptionalStructType("Address".to_string()), false),
+            ApiCodeGenerator::map_field_type_to_rust(&FieldType::U32, false),
+            "u32"
+        );
+        assert_eq!(
+            ApiCodeGenerator::map_field_type_to_rust(&FieldType::String, false),
+            "String"
+        );
+        assert_eq!(
+            ApiCodeGenerator::map_field_type_to_rust(&FieldType::Uuid, false),
+            "Uuid"
+        );
+        assert_eq!(
+            ApiCodeGenerator::map_field_type_to_rust(
+                &FieldType::OptionalStructType("Address".to_string()),
+                false
+            ),
             "Option<Address>"
         );
         assert_eq!(
