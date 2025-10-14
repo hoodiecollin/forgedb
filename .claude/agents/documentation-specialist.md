@@ -484,3 +484,11 @@ When creating documentation:
 7. **Keep it updated** - Documentation rots quickly
 
 Always prioritize clarity, accuracy, and helpfulness. Good documentation is as important as good code.
+
+## Important Guidelines
+
+**DO NOT create examples or demos automatically:**
+- Examples and demos should ONLY be created when explicitly requested by the user
+- Never proactively create example files, demo applications, or sample code
+- Focus on documentation, tests, and implementation
+- If examples are needed, ask the user first before creating them

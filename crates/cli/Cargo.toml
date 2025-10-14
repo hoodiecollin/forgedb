@@ -12,8 +12,11 @@ clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
 thiserror = "1.0"
 colored = "2.1"
+serde_json = "1.0"
 sinkdb = { path = "../.." }
 sinkdb-watcher = { path = "../watcher" }
+sinkdb-migrations = { path = "../migrations" }
+sinkdb-compaction = { path = "../compaction" }
 
 [dev-dependencies]
 tempfile = "3.8"

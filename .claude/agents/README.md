@@ -141,10 +141,18 @@ All agents have deep knowledge of:
 
 Each agent can:
 - Answer questions in their domain
-- Provide code examples
+- Provide code examples (inline, not as separate files)
 - Suggest optimizations
 - Debug issues
 - Create documentation
+
+## Important Guidelines
+
+**Examples and Demos:**
+- Agents should NOT automatically create example files or demo applications
+- Examples should only be created when explicitly requested by the user
+- Focus on tests, implementation, and documentation instead
+- If examples are needed, ask the user first
 
 ---
 

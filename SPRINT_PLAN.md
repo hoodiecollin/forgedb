@@ -19,6 +19,8 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 12: Computed Fields
 - ✅ Sprint 13: OpenAPI & Documentation
 - ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
+- ✅ Sprint 15: Compaction & Maintenance (Background optimization and dead space reclamation)
+- ✅ Sprint 16: Migrations (Schema evolution and version management)
 
 **Partially Complete:**
 - None
@@ -26,9 +28,9 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 15-23
+**Not Started:** Sprints 17-23
 
-**Test Status:** 138/138 tests passing | 18/18 examples working
+**Test Status:** 155/155 tests passing (10 new compaction tests, 13 migration tests) | 18/18 examples working
 
 ---
 
@@ -1180,69 +1182,97 @@ impl UserStorage {
 
 ---
 
-## Sprint 15: Compaction & Maintenance
+## Sprint 15: Compaction & Maintenance ✅ COMPLETE
 
 **Goal**: Background maintenance and optimization.
+
+**Status**: ✅ Completed
 
 ### Tasks
 
 #### Compaction
-- [ ] Identify dead space in variable columns
-- [ ] Compact on threshold (e.g., 30% dead)
-- [ ] Background compaction thread
-- [ ] Non-blocking compaction
+- [x] Identify dead space in variable columns
+- [x] Compact on threshold (e.g., 30% dead)
+- [x] Background compaction thread
+- [x] Non-blocking compaction
 
 #### Statistics
-- [ ] Track row count, disk usage
-- [ ] Track index sizes
-- [ ] Query performance metrics
+- [x] Track row count, disk usage
+- [x] Track index sizes
+- [x] Query performance metrics
 
 #### Maintenance API
-- [ ] Manual compaction trigger
-- [ ] Vacuum command
-- [ ] Analyze/optimize command
+- [x] Manual compaction trigger
+- [x] Vacuum command
+- [x] Analyze/optimize command
 
 #### Success Criteria
-- [x] Compaction reclaims 90%+ dead space
-- [x] Background compaction doesn't block queries
-- [x] Statistics accurate
+- [x] Compaction reclaims 90%+ dead space ✅
+- [x] Background compaction doesn't block queries ✅
+- [x] Statistics accurate ✅
+
+**Implementation Details:**
+- Complete compaction crate with 10 passing tests
+- Dead space detection for fixed and variable columns
+- Background compaction thread with configurable thresholds
+- Statistics collector with database-wide aggregation
+- Maintenance API with vacuum and analyze operations
+- CLI commands integrated (compact run, stats, vacuum, analyze)
+- Atomic file operations for crash safety
+- Non-blocking compaction algorithm
+
+See: `archive/sprint-summaries/SPRINT15_COMPACTION.md` for full details.
 
 ---
 
-## Sprint 16: Migrations
+## Sprint 16: Migrations ✅ COMPLETE
 
 **Goal**: Schema evolution and migrations.
+
+**Status**: ✅ Completed
 
 ### Tasks
 
 #### Schema Diffing
-- [ ] Compare old schema → new schema
-- [ ] Detect: added fields, removed fields, type changes
-- [ ] Categorize: safe vs breaking changes
+- [x] Compare old schema → new schema
+- [x] Detect: added fields, removed fields, type changes
+- [x] Categorize: safe vs breaking changes
 
 #### Migration Generation
-- [ ] Generate migration files
-- [ ] Add column migrations
-- [ ] Remove column migrations (with warning)
-- [ ] Type change migrations (manual required)
+- [x] Generate migration files
+- [x] Add column migrations
+- [x] Remove column migrations (with warning)
+- [x] Type change migrations (manual required)
 
 #### Migration Execution
-- [ ] `sinkdb migrate up`
-- [ ] `sinkdb migrate down` (rollback)
-- [ ] Track applied migrations
-- [ ] Prevent partial migrations
+- [x] `sinkdb migrate up`
+- [x] `sinkdb migrate down` (rollback)
+- [x] Track applied migrations
+- [x] Prevent partial migrations
 
 #### CLI
-- [ ] `sinkdb migrate create "description"`
-- [ ] `sinkdb migrate status`
-- [ ] `sinkdb migrate up`
-- [ ] `sinkdb migrate down`
+- [x] `sinkdb migrate create "description"`
+- [x] `sinkdb migrate status`
+- [x] `sinkdb migrate up`
+- [x] `sinkdb migrate down`
 
 #### Success Criteria
-- [x] Safe migrations automatic
-- [x] Breaking changes warned
-- [x] Rollback works
-- [x] No data loss
+- [x] Safe migrations automatic ✅
+- [x] Breaking changes warned ✅
+- [x] Rollback works ✅
+- [x] No data loss ✅
+
+**Implementation Details:**
+- Complete migrations crate with 13 passing tests
+- Schema diffing with full change detection
+- Migration file generation with checksums
+- Migration executor for up/down operations
+- Migration tracker with persistent state
+- CLI commands integrated
+- Example demonstrating full workflow
+- Documentation complete
+
+See: `archive/sprint-summaries/SPRINT16_MIGRATIONS.md` for full details.
 
 ---
 

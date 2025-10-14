@@ -11,6 +11,8 @@ members = [
     "crates/http-server",
     "crates/crud-api",
     "crates/query-params",
+    "crates/migrations",
+    "crates/compaction",
 ]
 resolver = "2"
 
@@ -36,6 +38,8 @@ sinkdb-wal = { path = "crates/wal" }
 sinkdb-http-server = { path = "crates/http-server" }
 sinkdb-crud-api = { path = "crates/crud-api" }
 sinkdb-query-params = { path = "crates/query-params" }
+sinkdb-migrations = { path = "crates/migrations" }
+sinkdb-compaction = { path = "crates/compaction" }
 
 [lib]
 name = "sinkdb"

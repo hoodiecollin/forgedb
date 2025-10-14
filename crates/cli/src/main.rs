@@ -124,6 +124,99 @@ enum Commands {
         #[arg(long, default_value = "true")]
         clear: bool,
     },
+
+    /// Database migration commands
+    #[command(subcommand)]
+    Migrate(MigrateCommands),
+
+    /// Database compaction and maintenance commands
+    #[command(subcommand)]
+    Compact(CompactCommands),
+}
+
+#[derive(Subcommand)]
+enum MigrateCommands {
+    /// Create a new migration
+    Create {
+        /// Description of the migration
+        description: String,
+
+        /// Auto-detect schema changes
+        #[arg(short, long)]
+        auto: bool,
+    },
+
+    /// Show migration status
+    Status,
+
+    /// Run pending migrations
+    Up {
+        /// Number of migrations to run (default: all)
+        #[arg(short, long)]
+        steps: Option<usize>,
+    },
+
+    /// Rollback migrations
+    Down {
+        /// Number of migrations to rollback (default: 1)
+        #[arg(short, long)]
+        steps: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CompactCommands {
+    /// Compact database to reclaim dead space
+    Run {
+        /// Data directory (default: ./data)
+        #[arg(short, long, default_value = "data")]
+        data_dir: String,
+
+        /// Compact specific model only
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Compact all models (ignore threshold)
+        #[arg(short, long)]
+        all: bool,
+
+        /// Dead space threshold (0.0-1.0)
+        #[arg(short, long)]
+        threshold: Option<f64>,
+    },
+
+    /// Show database statistics
+    Stats {
+        /// Data directory (default: ./data)
+        #[arg(short, long, default_value = "data")]
+        data_dir: String,
+
+        /// Show stats for specific model only
+        #[arg(short, long)]
+        model: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Vacuum database (compact all models)
+    Vacuum {
+        /// Data directory (default: ./data)
+        #[arg(short, long, default_value = "data")]
+        data_dir: String,
+    },
+
+    /// Analyze database and show recommendations
+    Analyze {
+        /// Data directory (default: ./data)
+        #[arg(short, long, default_value = "data")]
+        data_dir: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -207,5 +300,57 @@ fn main() -> Result<()> {
                 clear,
             })
         }
+
+        Commands::Migrate(migrate_cmd) => match migrate_cmd {
+            MigrateCommands::Create { description, auto } => {
+                commands::migrate::create(commands::migrate::MigrateCreateOptions {
+                    description,
+                    auto,
+                })
+            }
+            MigrateCommands::Status => {
+                commands::migrate::status(commands::migrate::MigrateStatusOptions)
+            }
+            MigrateCommands::Up { steps } => {
+                commands::migrate::up(commands::migrate::MigrateUpOptions { steps })
+            }
+            MigrateCommands::Down { steps } => {
+                commands::migrate::down(commands::migrate::MigrateDownOptions { steps })
+            }
+        },
+
+        Commands::Compact(compact_cmd) => match compact_cmd {
+            CompactCommands::Run {
+                data_dir,
+                model,
+                all,
+                threshold,
+            } => commands::compact::compact(commands::compact::CompactOptions {
+                data_dir: data_dir.into(),
+                model,
+                all,
+                threshold,
+            }),
+            CompactCommands::Stats {
+                data_dir,
+                model,
+                json,
+            } => commands::compact::stats(commands::compact::StatsOptions {
+                data_dir: data_dir.into(),
+                model,
+                json,
+            }),
+            CompactCommands::Vacuum { data_dir } => {
+                commands::compact::vacuum(commands::compact::VacuumOptions {
+                    data_dir: data_dir.into(),
+                })
+            }
+            CompactCommands::Analyze { data_dir, json } => {
+                commands::compact::analyze(commands::compact::AnalyzeOptions {
+                    data_dir: data_dir.into(),
+                    json,
+                })
+            }
+        },
     }
 }
