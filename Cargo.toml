@@ -14,6 +14,7 @@ members = [
     "crates/migrations",
     "crates/compaction",
     "crates/fulltext",
+    "crates/query-optimization",
 ]
 resolver = "2"
 
@@ -42,6 +43,7 @@ forgedb-query-params = { path = "crates/query-params" }
 forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
 forgedb-fulltext = { path = "crates/fulltext" }
+forgedb-query-optimization = { path = "crates/query-optimization" }
 
 [lib]
 name = "forgedb"

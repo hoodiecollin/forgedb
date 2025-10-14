@@ -416,10 +416,9 @@ const dbSync = new DBSync(
 
 await dbSync.connect();
 
-// Create read-only DB client
+// Create DB client (calls Rust API for Sprint 17)
 const db = createDBClient({
-  dataPath: process.env.FORGEDB_DATA || "./data",
-  readOnly: true,
+  apiEndpoint: process.env.RUST_API_URL || "http://localhost:3000",
 });
 
 // Simple in-memory cache
@@ -508,50 +507,50 @@ console.log(`🎨 Bun component server running on port ${process.env.PORT || 300
 console.log(`📊 DB version: ${dbSync.getCurrentVersion()}`);
 ```
 
-### 3. Read-Only Database Client
+### 3. Database Client (Stub for Sprint 17)
+
+**Note**: This is a temporary implementation for Sprint 17. Direct ForgeDB access via FFI will be implemented in Sprint 24.
 
 ```typescript
 // bun-server/src/db-client.ts
 
-import { Database } from "bun:sqlite";
-
 export interface DBClientConfig {
-  dataPath: string;
-  readOnly: boolean;
+  apiEndpoint: string; // Rust API server URL
 }
 
 export function createDBClient(config: DBClientConfig) {
-  // Open SQLite database in read-only mode
-  const db = new Database(`${config.dataPath}/forgedb.db`, {
-    readonly: config.readOnly,
-  });
-  
+  // For Sprint 17: Call Rust API endpoints
+  // For Sprint 24: Direct ForgeDB access via FFI
+
   return {
     async get(model: string, id: string): Promise<any> {
-      const stmt = db.prepare(`
-        SELECT * FROM ${model.toLowerCase()}
-        WHERE id = ?
-      `);
-      
-      return stmt.get(id);
+      const response = await fetch(
+        `${config.apiEndpoint}/api/${model.toLowerCase()}/${id}`
+      );
+
+      if (!response.ok) {
+        throw new Error(`Failed to fetch ${model}:${id}`);
+      }
+
+      return response.json();
     },
-    
+
     async query(model: string, filters: Record<string, any>): Promise<any[]> {
-      const conditions = Object.keys(filters)
-        .map(key => `${key} = ?`)
-        .join(" AND ");
-      
-      const stmt = db.prepare(`
-        SELECT * FROM ${model.toLowerCase()}
-        ${conditions ? `WHERE ${conditions}` : ""}
-      `);
-      
-      return stmt.all(...Object.values(filters));
+      const queryParams = new URLSearchParams(filters as any);
+      const response = await fetch(
+        `${config.apiEndpoint}/api/${model.toLowerCase()}?${queryParams}`
+      );
+
+      if (!response.ok) {
+        throw new Error(`Failed to query ${model}`);
+      }
+
+      return response.json();
     },
-    
-    close() {
-      db.close();
-    },
+
+    // For Sprint 24: Will use FFI to access ForgeDB directly
+    // import { Database } from "./ffi/forgedb";
+    // const db = new Database(config.dataPath, { readOnly: true });
   };
 }
 ```
