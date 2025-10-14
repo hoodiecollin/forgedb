@@ -8,6 +8,9 @@ members = [
     "crates/cli",
     "crates/watcher",
     "crates/wal",
+    "crates/http-server",
+    "crates/crud-api",
+    "crates/query-params",
 ]
 resolver = "2"
 
@@ -29,6 +32,9 @@ sinkdb-validation = { path = "crates/validation" }
 sinkdb-watcher = { path = "crates/watcher" }
 sinkdb-cli = { path = "crates/cli" }
 sinkdb-wal = { path = "crates/wal" }
+sinkdb-http-server = { path = "crates/http-server" }
+sinkdb-crud-api = { path = "crates/crud-api" }
+sinkdb-query-params = { path = "crates/query-params" }
 
 [lib]
 name = "sinkdb"
@@ -107,3 +113,8 @@ path = "examples/sprint6_many_to_many.rs"
 [[example]]
 name = "sprint7_wal"
 path = "examples/sprint7_wal.rs"
+
+# Sprint 9: REST API Generation
+[[example]]
+name = "sprint9_api"
+path = "examples/sprint9_api.rs"

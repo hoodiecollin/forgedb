@@ -1,6 +1,13 @@
 // Schema validation for Sprint 2
+// Extended for HTTP validation in Sprint 9
+
+pub mod http;
+pub mod status;
 
 use std::collections::HashSet;
+
+pub use http::{HttpValidationError, HttpValidator};
+pub use status::StatusCodeMapper;
 
 /// Represents a position in the source code
 #[derive(Debug, Clone, Copy, PartialEq)]
