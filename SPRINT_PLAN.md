@@ -17,6 +17,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 - ✅ Sprint 10: TypeScript SDK Generation
 - ✅ Sprint 11: Directives & Validation (Constraints)
 - ✅ Sprint 12: Computed Fields
+- ✅ Sprint 13: OpenAPI & Documentation
 - ✅ Sprint 14: Query Optimization - Advanced Indexing (B-tree, composite indexes, range queries)
 
 **Partially Complete:**
@@ -25,7 +26,7 @@ Incremental development plan organized into focused sprints. Each sprint builds 
 **In Progress:**
 - ⏳ Sprint 14: Query Optimization - SIMD & Query Planning (Remaining components)
 
-**Not Started:** Sprints 13, 15-23
+**Not Started:** Sprints 15-23
 
 **Test Status:** 138/138 tests passing | 18/18 examples working
 
