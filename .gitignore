@@ -8,8 +8,8 @@ package.json
 turbo.json
 node_modules/
 bun.lockb
-/*.sink
-!examples/**/schema.sink
+/*.forge
+!examples/**/schema.forge
 Cargo.lock
 generated/
 generated_*/

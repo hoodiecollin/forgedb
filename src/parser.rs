@@ -1,6 +1,6 @@
 use crate::ast::{
-    CompositeIndex, Constraint, ConstraintParam, Field, FieldType, Model, RelationType, Schema,
-    Struct,
+    ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, Field,
+    FieldType, Model, RelationInclusion, RelationType, Schema, Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{validate_field_name, validate_model_name, Position};
@@ -60,6 +60,43 @@ impl Parser {
         }
     }
 
+    fn read_component_path(&mut self) -> Result<String, String> {
+        // Read a path like: components/user/card
+        // This is a sequence of identifiers separated by slashes
+        let mut path = String::new();
+
+        loop {
+            match self.current_token() {
+                Token::Ident(name) => {
+                    path.push_str(name);
+                    self.advance();
+
+                    // Check if there's a slash for more path segments
+                    if matches!(self.current_token(), Token::Slash) {
+                        path.push('/');
+                        self.advance();
+                        // Continue to read next segment
+                    } else {
+                        // End of path
+                        break;
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "Expected path component (identifier), found {:?}",
+                        self.current_token()
+                    ))
+                }
+            }
+        }
+
+        if path.is_empty() {
+            return Err("Component path cannot be empty".to_string());
+        }
+
+        Ok(path)
+    }
+
     fn expect(&mut self, expected: Token) -> Result<(), String> {
         if self.current_token() == &expected {
             self.advance();
@@ -104,6 +141,11 @@ impl Parser {
                     }
                     Token::Ident(s) => {
                         constraint = constraint.with_param(ConstraintParam::String(s.clone()));
+                        self.advance();
+                    }
+                    Token::Asterisk => {
+                        // Special case for @relations(*) syntax
+                        constraint = constraint.with_param(ConstraintParam::String("*".to_string()));
                         self.advance();
                     }
                     _ => {
@@ -239,10 +281,40 @@ impl Parser {
                     model_name,
                 )));
             }
-            // Struct types or primitive identifiers
+            // Struct types, component references, or primitive identifiers
             Token::Ident(name) => {
                 let type_name = name.clone();
                 self.advance();
+
+                // Check if this is a component protocol (tsx://, jsx://, api://)
+                if matches!(type_name.as_str(), "tsx" | "jsx" | "api")
+                    && matches!(self.current_token(), Token::Colon) {
+                    // Parse component reference: tsx://path
+                    self.advance(); // skip :
+                    self.skip_newlines(); // Skip any newlines after colon
+
+                    // Expect two slashes
+                    self.expect(Token::Slash)?;
+                    self.expect(Token::Slash)?;
+
+                    // Read the component path
+                    let path = self.read_component_path()?;
+
+                    // Determine protocol
+                    let protocol = match type_name.as_str() {
+                        "tsx" => ComponentProtocol::Tsx,
+                        "jsx" => ComponentProtocol::Jsx,
+                        "api" => ComponentProtocol::Api,
+                        _ => unreachable!(),
+                    };
+
+                    return Ok(FieldType::Component(ComponentReference {
+                        protocol,
+                        path,
+                        relations: RelationInclusion::None,
+                    }));
+                }
+
                 // This could be a struct type or struct? for optional
                 return Ok(FieldType::StructType(type_name));
             }
@@ -430,6 +502,50 @@ impl Parser {
         let mut is_materialized = false;
         while matches!(self.current_token(), Token::At) {
             let constraint = self.parse_constraint()?;
+            // Check if this is the @relations directive (Sprint 17 - for components)
+            if constraint.name == "relations" {
+                if let FieldType::Component(ref mut comp_ref) = field_type {
+                    // Parse the @relations parameters
+                    if constraint.params.is_empty() {
+                        return Err("@relations directive requires parameters".to_string());
+                    }
+
+                    // Check if it's @relations(*)
+                    if constraint.params.len() == 1 {
+                        if let ConstraintParam::String(s) = &constraint.params[0] {
+                            if s == "*" {
+                                comp_ref.relations = RelationInclusion::All;
+                            } else {
+                                // Single relation field
+                                comp_ref.relations =
+                                    RelationInclusion::Specific(vec![s.clone()]);
+                            }
+                        } else {
+                            return Err("@relations parameter must be a field name or *"
+                                .to_string());
+                        }
+                    } else {
+                        // Multiple specific relations
+                        let mut fields = Vec::new();
+                        for param in &constraint.params {
+                            if let ConstraintParam::String(field_name) = param {
+                                fields.push(field_name.clone());
+                            } else {
+                                return Err(
+                                    "@relations parameters must be field names".to_string()
+                                );
+                            }
+                        }
+                        comp_ref.relations = RelationInclusion::Specific(fields);
+                    }
+                    // Don't add @relations to constraints list since we've handled it
+                    continue;
+                } else {
+                    return Err(
+                        "@relations directive can only be used with component fields".to_string()
+                    );
+                }
+            }
             // Check if this is the @computed directive
             if constraint.name == "computed" {
                 is_computed = true;
@@ -1689,5 +1805,99 @@ User {
 
         let min_constraint = age_field.get_constraint("min").unwrap();
         assert_eq!(min_constraint.params.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_component_fields() {
+        let input = "User {
+  id: +uuid
+  email: string
+  card: tsx://components/user/card
+  profile: jsx://components/profile @relations(*)
+  verify: api://routes/user/verify
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}";
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        assert_eq!(schema.models.len(), 2);
+        let user_model = &schema.models[0];
+        assert_eq!(user_model.name, "User");
+        assert_eq!(user_model.fields.len(), 5);
+
+        // Test TSX component
+        let card_field = &user_model.fields[2];
+        assert_eq!(card_field.name, "card");
+        if let FieldType::Component(comp_ref) = &card_field.field_type {
+            assert_eq!(comp_ref.protocol, ComponentProtocol::Tsx);
+            assert_eq!(comp_ref.path, "components/user/card");
+            assert_eq!(comp_ref.relations, RelationInclusion::None);
+        } else {
+            panic!("Expected Component field type");
+        }
+
+        // Test JSX component with @relations(*)
+        let profile_field = &user_model.fields[3];
+        assert_eq!(profile_field.name, "profile");
+        if let FieldType::Component(comp_ref) = &profile_field.field_type {
+            assert_eq!(comp_ref.protocol, ComponentProtocol::Jsx);
+            assert_eq!(comp_ref.path, "components/profile");
+            assert_eq!(comp_ref.relations, RelationInclusion::All);
+        } else {
+            panic!("Expected Component field type");
+        }
+
+        // Test API component
+        let verify_field = &user_model.fields[4];
+        assert_eq!(verify_field.name, "verify");
+        if let FieldType::Component(comp_ref) = &verify_field.field_type {
+            assert_eq!(comp_ref.protocol, ComponentProtocol::Api);
+            assert_eq!(comp_ref.path, "routes/user/verify");
+        } else {
+            panic!("Expected Component field type");
+        }
+    }
+
+    #[test]
+    fn test_parse_component_with_specific_relations() {
+        let input = "User {
+  id: +uuid
+  posts: [Post]
+  comments: [Comment]
+  card: tsx://components/user/card @relations(posts, comments)
+}
+
+Post {
+  id: +uuid
+  title: string
+}
+
+Comment {
+  id: +uuid
+  text: string
+}";
+        let mut parser = Parser::new(input).unwrap();
+        let schema = parser.parse().unwrap();
+
+        let user_model = &schema.models[0];
+        let card_field = &user_model.fields[3];
+
+        if let FieldType::Component(comp_ref) = &card_field.field_type {
+            assert_eq!(comp_ref.protocol, ComponentProtocol::Tsx);
+            if let RelationInclusion::Specific(fields) = &comp_ref.relations {
+                assert_eq!(fields.len(), 2);
+                assert!(fields.contains(&"posts".to_string()));
+                assert!(fields.contains(&"comments".to_string()));
+            } else {
+                panic!("Expected Specific relation inclusion");
+            }
+        } else {
+            panic!("Expected Component field type");
+        }
     }
 }

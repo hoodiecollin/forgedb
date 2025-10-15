@@ -263,12 +263,13 @@ impl ApiCodeGenerator {
         }
     }
 
-    /// Check if field is virtual (relation that doesn't store data)
+    /// Check if field is virtual (relation or component that doesn't store data)
     fn is_virtual_field(field: &Field) -> bool {
         matches!(
             &field.field_type,
             FieldType::Relation(crate::ast::RelationType::OneToMany(_))
                 | FieldType::Relation(crate::ast::RelationType::ManyToMany(_))
+                | FieldType::Component(_)
         )
     }
 
@@ -302,6 +303,7 @@ impl ApiCodeGenerator {
                     _ => "()".to_string(),                                    // Virtual fields
                 }
             }
+            FieldType::Component(_) => "()".to_string(), // Component references are virtual
         }
     }
 }

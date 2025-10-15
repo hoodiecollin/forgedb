@@ -57,6 +57,32 @@ pub enum FieldType {
     OptionalStructType(String),        // Optional struct reference
     // Relations
     Relation(RelationType),
+    // Component references (Sprint 17)
+    Component(ComponentReference),
+}
+
+/// Component protocol (Sprint 17)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComponentProtocol {
+    Tsx,  // tsx://
+    Jsx,  // jsx://
+    Api,  // api://
+}
+
+/// Relation inclusion for components (Sprint 17)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RelationInclusion {
+    None,
+    All,
+    Specific(Vec<String>),
+}
+
+/// Component reference (Sprint 17)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentReference {
+    pub protocol: ComponentProtocol,
+    pub path: String,
+    pub relations: RelationInclusion,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -362,6 +388,7 @@ impl FieldType {
                     "/* virtual field - stored in junction table */".to_string()
                 }
             },
+            FieldType::Component(_) => "/* component reference - no storage */".to_string(),
         }
     }
 
@@ -397,6 +424,7 @@ impl FieldType {
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
             FieldType::String => false,
             FieldType::Relation(_) => false, // Relations are virtual or variable
+            FieldType::Component(_) => false, // Components are virtual
         }
     }
 

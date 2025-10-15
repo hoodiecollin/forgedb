@@ -45,6 +45,7 @@ pub enum Token {
     RParen,      // )
     Comma,       // ,
     Semicolon,   // ;
+    Slash,       // /
     Number(i64), // Numeric literal
 
     // Whitespace and EOF
@@ -99,6 +100,13 @@ impl Lexer {
         }
     }
 
+    fn skip_whitespace_with_flag(&mut self) -> bool {
+        let start_pos = self.position;
+        self.skip_whitespace();
+        // Return true if we skipped any whitespace, or if we're at the start of a line
+        self.position > start_pos || self.column == 1
+    }
+
     fn skip_comment(&mut self) {
         // Skip until end of line
         while let Some(ch) = self.current_char() {
@@ -136,7 +144,7 @@ impl Lexer {
     }
 
     pub fn next_token(&mut self) -> Result<Token, String> {
-        self.skip_whitespace();
+        let had_whitespace = self.skip_whitespace_with_flag();
 
         match self.current_char() {
             None => Ok(Token::Eof),
@@ -146,17 +154,16 @@ impl Lexer {
             }
             Some('/') => {
                 self.advance();
-                if self.current_char() == Some('/') {
+                // Only treat // as a comment if there was preceding whitespace or we're at line start
+                // This allows tsx://path to work while preserving // comments
+                if self.current_char() == Some('/') && had_whitespace {
                     self.advance();
                     self.skip_comment();
                     // After comment, get next token
                     self.next_token()
                 } else {
-                    Err(format!(
-                        "Unexpected character '/' at line {}, column {}",
-                        self.line,
-                        self.column - 1
-                    ))
+                    // Single slash token (for component paths like tsx://path)
+                    Ok(Token::Slash)
                 }
             }
             Some('+') => {

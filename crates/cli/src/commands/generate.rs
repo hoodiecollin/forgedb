@@ -1,5 +1,8 @@
 use crate::{error::CliError, ui, Result};
-use forgedb::{codegen::CodeGenerator, parser::Parser, TypeScriptGenerator};
+use forgedb::{
+    codegen::CodeGenerator, parser::Parser, ComponentStubGenerator, RouteHandlerGenerator,
+    StubTemplate, TypeScriptGenerator,
+};
 use std::fs;
 use std::path::Path;
 
@@ -47,6 +50,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         "all" => {
             generate_rust_code(&schema, output_dir, options.force)?;
             generate_typescript_sdk(&schema, output_dir, options.force)?;
+            generate_component_stubs(&schema, output_dir, options.force)?;
         }
         "rust" => {
             generate_rust_code(&schema, output_dir, options.force)?;
@@ -61,7 +65,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             ui::warning("OpenAPI generation not yet implemented");
         }
         "stubs" => {
-            ui::warning("Stub generation not yet implemented");
+            generate_component_stubs(&schema, output_dir, options.force)?;
         }
         target => {
             return Err(CliError::Other(format!("Unknown target: {}", target)));
@@ -183,6 +187,61 @@ fn generate_typescript_sdk(
     println!("  cd {}/sdk", output_dir);
     println!("  npm install");
     println!("  npm run build");
+
+    Ok(())
+}
+
+fn generate_component_stubs(
+    schema: &forgedb::ast::Schema,
+    output_dir: &str,
+    force: bool,
+) -> Result<()> {
+    ui::info("Generating component stubs...");
+
+    // Generate React component stubs
+    let component_generator = ComponentStubGenerator::new();
+    let component_files = component_generator.generate_stubs(schema, StubTemplate::Detailed);
+
+    // Generate API route handlers
+    let route_generator = RouteHandlerGenerator::new();
+    let route_files = route_generator.generate_handlers(schema);
+
+    let mut files_written = 0;
+    let mut files_skipped = 0;
+
+    // Write component files
+    for file in component_files.iter().chain(route_files.iter()) {
+        let file_path = Path::new(output_dir).join(&file.path);
+
+        // Create parent directories
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Don't overwrite existing files unless force is set
+        if !force && file_path.exists() {
+            files_skipped += 1;
+            continue;
+        }
+
+        // Write file
+        fs::write(&file_path, &file.content).map_err(|e| {
+            CliError::CodeGeneration(format!("Failed to write {}: {}", file.path, e))
+        })?;
+
+        files_written += 1;
+    }
+
+    ui::success(&format!(
+        "Generated component stubs ({} files written, {} skipped)",
+        files_written, files_skipped
+    ));
+
+    if files_skipped > 0 {
+        println!();
+        println!("  💡 {} existing files were preserved", files_skipped);
+        println!("     Use --force to overwrite existing files");
+    }
 
     Ok(())
 }

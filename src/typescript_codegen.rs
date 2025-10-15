@@ -8,6 +8,7 @@
 
 use crate::ast::{Field, FieldType, Model, RelationType, Schema};
 use crate::codegen::GeneratedFile;
+use crate::typescript_component_props::ComponentPropsGenerator;
 
 pub struct TypeScriptGenerator;
 
@@ -18,6 +19,9 @@ impl TypeScriptGenerator {
 
         // Generate TypeScript types
         files.push(Self::generate_types(schema));
+
+        // Generate component props types (Sprint 17)
+        files.push(Self::generate_component_props(schema));
 
         // Generate API client for each model
         for model in &schema.models {
@@ -135,6 +139,17 @@ impl TypeScriptGenerator {
         GeneratedFile {
             path: "generated/sdk/types.ts".to_string(),
             content: code,
+        }
+    }
+
+    /// Generate component props types (Sprint 17)
+    fn generate_component_props(schema: &Schema) -> GeneratedFile {
+        let generator = ComponentPropsGenerator::new();
+        let content = generator.generate_props_types(schema);
+
+        GeneratedFile {
+            path: "generated/sdk/component-props.ts".to_string(),
+            content,
         }
     }
 
@@ -337,7 +352,8 @@ impl TypeScriptGenerator {
         code.push_str("// Auto-generated SDK entry point\n\n");
 
         // Export all types
-        code.push_str("export * from './types';\n\n");
+        code.push_str("export * from './types';\n");
+        code.push_str("export * from './component-props';\n\n");
 
         // Export all API clients
         for model in &schema.models {
@@ -585,6 +601,7 @@ export default defineConfig({
                 RelationType::OptionalReference(_) => "string | null".to_string(),
                 _ => "any".to_string(), // Virtual fields
             },
+            FieldType::Component(_) => "null".to_string(), // Component references are not stored
         }
     }
 
@@ -594,6 +611,7 @@ export default defineConfig({
             &field.field_type,
             FieldType::Relation(RelationType::OneToMany(_))
                 | FieldType::Relation(RelationType::ManyToMany(_))
+                | FieldType::Component(_)
         )
     }
 

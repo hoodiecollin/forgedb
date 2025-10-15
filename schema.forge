@@ -2,8 +2,3 @@ User {
   id: +u64
   email: &string
 }
-
-Post {
-  id: +uuid
-  title: string
-}

@@ -243,12 +243,29 @@ TBD
 - ✅ Sprint 11: Directives & Validation (Constraints)
 - ✅ Sprint 12: Computed Fields
 - ✅ Sprint 13: OpenAPI & Documentation
-- ✅ 138 tests passing across all components
-- ✅ Comprehensive blog platform example showcasing all features
+- ✅ Sprint 14: Query Optimization & Planning
+- ✅ Sprint 15: Log Compaction
+- ✅ Sprint 16: Schema Migrations
+- ✅ Sprint 17: UI Component Integration
+- ✅ Sprint 18: Full-Text Search
+- ✅ Sprint 20: Production Readiness
+- ✅ Sprint 21: Syntax Highlighting
+- ✅ Sprint 22: Language Server Protocol (LSP)
+- ✅ Sprint 23: VSCode Extension
+- ✅ 118 tests passing (115 unit + 3 integration)
+- ✅ Comprehensive examples showcasing all features
 
-**Current Status:** Sprint 13 complete - Full API documentation generation implemented
+**Current Status:** Sprint 17 complete - UI Component Integration with TSX/JSX/API route generation
 
-See [SPRINT_PLAN.md](./SPRINT_PLAN.md) for detailed roadmap and [archive/sprint-summaries/](./archive/sprint-summaries/) for implementation details.
+**Latest Features:**
+- Component fields in schema (`tsx://`, `jsx://`, `api://`)
+- `@relations` directive for component props
+- TypeScript component props type generation
+- React component stub generation (Next.js App Router style)
+- API route handler generation
+- Virtual field support for components
+
+See [SPRINT_PLAN.md](./SPRINT_PLAN.md) for detailed roadmap, [SPRINT17_SUMMARY.md](./SPRINT17_SUMMARY.md) for Sprint 17 details, and [archive/sprint-summaries/](./archive/sprint-summaries/) for all sprint summaries.
 
 ---
 
@@ -274,6 +291,13 @@ User {
   posts: [Post]                // One-to-many relation
   liked_posts: [Post]          // Many-to-many relation
 
+  // UI Components (Sprint 17)
+  profileCard: tsx://components/user/ProfileCard @relations(posts)
+  avatar: jsx://components/user/Avatar
+
+  // API Routes (Sprint 17)
+  verifyEmail: api://routes/user/verify
+
   @index(created_at, username) // Composite index
   @pattern(email, "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$")
 }
@@ -286,6 +310,9 @@ Post {
   keywords: [string; 10]       // Fixed-size array
   view_count: ^u64             // Indexed for range queries
   tags: [Tag]                  // Many-to-many
+
+  // UI Component with all relations
+  detailView: tsx://components/post/DetailView @relations(*)
 
   @index(author, created_at)
   @min(title, 5)

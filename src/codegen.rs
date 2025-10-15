@@ -16,12 +16,13 @@ impl CodeGenerator {
         CodeGenerator
     }
 
-    /// Check if a field is virtual (OneToMany or ManyToMany) and doesn't need storage
+    /// Check if a field is virtual (OneToMany, ManyToMany, or Component) and doesn't need storage
     fn is_virtual_field(field: &Field) -> bool {
         matches!(
             &field.field_type,
             FieldType::Relation(RelationType::OneToMany(_))
                 | FieldType::Relation(RelationType::ManyToMany(_))
+                | FieldType::Component(_)
         )
     }
 

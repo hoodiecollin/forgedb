@@ -520,15 +520,17 @@ impl OpenApiGenerator {
                 }
                 _ => json!({ "type": "string" }), // Virtual fields
             },
+            FieldType::Component(_) => json!({ "type": "string", "description": "Component reference (virtual)" }),
         }
     }
 
-    /// Check if field is virtual (OneToMany/ManyToMany)
+    /// Check if field is virtual (OneToMany/ManyToMany/Component)
     fn is_virtual_field(field: &Field) -> bool {
         matches!(
             &field.field_type,
             FieldType::Relation(RelationType::OneToMany(_))
                 | FieldType::Relation(RelationType::ManyToMany(_))
+                | FieldType::Component(_)
         )
     }
 
@@ -676,6 +678,15 @@ impl OpenApiGenerator {
                 RelationType::OneToMany(target) => format!("[{}]", target),
                 RelationType::ManyToMany(target) => format!("[{}]", target),
             },
+            FieldType::Component(comp_ref) => {
+                use crate::ast::ComponentProtocol;
+                let protocol = match comp_ref.protocol {
+                    ComponentProtocol::Tsx => "tsx",
+                    ComponentProtocol::Jsx => "jsx",
+                    ComponentProtocol::Api => "api",
+                };
+                format!("{}://{}", protocol, comp_ref.path)
+            }
         }
     }
 }
