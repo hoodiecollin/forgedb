@@ -52,7 +52,8 @@ These are **potential features** to consider for future development. Not priorit
 - Size optimization (WASM binary size)
 - Async I/O in browser environment
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟢 Low
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -93,7 +94,8 @@ async with Database("./data", read_only=True) as db:
     df = await db.to_dataframe("User")
 ```
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -134,7 +136,8 @@ const users = await db.list('User', { verified: true }, 10);
 db.close();
 ```
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -174,7 +177,8 @@ const users = await db.list("User", { verified: true }, 10);
 db.close();
 ```
 
-**Estimated Effort**: 1-2 weeks (leverage Bun FFI work)
+**Effort Level**: 🟢 Low
+**Estimated Time**: 1-2 weeks (leverage Bun FFI work)
 
 ---
 
@@ -206,7 +210,8 @@ db.close();
 - Cryptographic verification overhead
 - Transaction finality
 
-**Estimated Effort**: 6-8 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 6-8 weeks
 
 ---
 
@@ -249,7 +254,8 @@ User {
 }
 ```
 
-**Estimated Effort**: 3-4 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 3-4 weeks
 
 ---
 
@@ -292,7 +298,8 @@ User {
 - Visual query builder
 - Performance charts
 
-**Estimated Effort**: 4-5 weeks
+**Effort Level**: 🔴 High
+**Estimated Time**: 4-5 weeks
 
 ---
 
@@ -328,7 +335,8 @@ User {
 - Query planner integration
 - Memory vs. performance trade-offs
 
-**Estimated Effort**: 2-3 weeks per index type
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks per index type
 
 ---
 
@@ -354,7 +362,8 @@ User {
 - Memory overhead
 - Complexity increase
 
-**Estimated Effort**: 3-4 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 3-4 weeks
 
 ---
 
@@ -402,7 +411,8 @@ User {
 - Customization vs. automation
 - Keeping generated code maintainable
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -428,7 +438,8 @@ User {
 - Scaling subscriptions
 - Query invalidation
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟢 Low
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -455,7 +466,8 @@ User {
 - DataLoader integration
 - GraphQL complexity
 
-**Estimated Effort**: 2 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2 weeks
 
 ---
 
@@ -481,7 +493,8 @@ User {
 - Memory efficiency
 - Retention policies
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -508,7 +521,8 @@ User {
 - Restore speed
 - Cloud API integration
 
-**Estimated Effort**: 1-2 weeks
+**Effort Level**: 🟢 Low
+**Estimated Time**: 1-2 weeks
 
 ---
 
@@ -533,7 +547,8 @@ User {
 - Schema versioning per tenant
 - Resource allocation
 
-**Estimated Effort**: 2-3 weeks
+**Effort Level**: 🟡 Medium
+**Estimated Time**: 2-3 weeks
 
 ---
 
@@ -543,14 +558,19 @@ User {
 
 Features that provide significant value and should be implemented first:
 
-1. **WASM Support** - Browser deployment, offline-first apps
-2. **Database Inspection Tool (Tauri)** - Essential for debugging and development
-3. **Distributed Database / Replication** - High availability and scaling
-4. **Real-time Subscriptions** - Modern app requirement
-5. **Backup & Restore** - Production necessity
-6. **Zero-Knowledge Storage** - Privacy and compliance
+1. **WASM Support** (🟢 Low effort, 2-3 weeks) - Browser deployment, offline-first apps
+2. **Database Inspection Tool (Tauri)** (🔴 High effort, 4-5 weeks) - Essential for debugging and development
+3. **Distributed Database / Replication** (🟡 Medium effort, 6-8 weeks) - High availability and scaling
+4. **Real-time Subscriptions** (🟢 Low effort, 2-3 weeks) - Modern app requirement
+5. **Backup & Restore** (🟢 Low effort, 1-2 weeks) - Production necessity
+6. **Zero-Knowledge Storage** (🟡 Medium effort, 3-4 weeks) - Privacy and compliance
 
-**Estimated Total**: 20-25 weeks
+**Estimated Total**: 19-25 weeks
+
+**Effort Breakdown**:
+- 🟢 Low: 3 features (5-8 weeks)
+- 🟡 Medium: 2 features (9-12 weeks)
+- 🔴 High: 1 feature (4-5 weeks)
 
 ---
 
@@ -558,14 +578,18 @@ Features that provide significant value and should be implemented first:
 
 Valuable features for specific use cases:
 
-1. **Python Runtime (FFI)** - Data science and ML integration
-2. **Node.js Runtime (NAPI-RS)** - Node.js ecosystem support
-3. **Deno Runtime (FFI)** - Modern TypeScript runtime
-4. **MVCC Concurrency Control** - Better write concurrency
-5. **AI-Powered Development** - Developer experience
-6. **Multi-tenancy** - SaaS applications
+1. **Python Runtime (FFI)** (🟡 Medium effort, 2-3 weeks) - Data science and ML integration
+2. **Node.js Runtime (NAPI-RS)** (🟡 Medium effort, 2-3 weeks) - Node.js ecosystem support
+3. **Deno Runtime (FFI)** (🟢 Low effort, 1-2 weeks) - Modern TypeScript runtime
+4. **MVCC Concurrency Control** (🟡 Medium effort, 3-4 weeks) - Better write concurrency
+5. **AI-Powered Development** (🟡 Medium effort, 2-3 weeks) - Developer experience
+6. **Multi-tenancy** (🟡 Medium effort, 2-3 weeks) - SaaS applications
 
-**Estimated Total**: 15-19 weeks
+**Estimated Total**: 13-18 weeks
+
+**Effort Breakdown**:
+- 🟢 Low: 1 feature (1-2 weeks)
+- 🟡 Medium: 5 features (12-16 weeks)
 
 ---
 
@@ -573,45 +597,97 @@ Valuable features for specific use cases:
 
 Nice to have features, can be deferred:
 
-1. **Advanced Indexing** - Specialized use cases
-2. **GraphQL Support** - Alternative API style
-3. **Time-Series Optimization** - Specific workloads
+1. **Advanced Indexing** (🟡 Medium effort, 2-3 weeks per type) - Specialized use cases
+2. **GraphQL Support** (🟡 Medium effort, 2 weeks) - Alternative API style
+3. **Time-Series Optimization** (🟡 Medium effort, 2-3 weeks) - Specific workloads
 
-**Estimated Total**: 6-8 weeks
+**Estimated Total**: 6-8 weeks (or 12-17 weeks if implementing all index types)
+
+**Effort Breakdown**:
+- 🟡 Medium: 3 features (6-8 weeks base, or 12-17 weeks with all index types)
 
 ---
 
 ## Recommended Implementation Order
 
-Based on dependencies and value delivery:
+Based on dependencies, effort level, and value delivery:
 
-### Phase 1: Foundation & Tools (12-14 weeks)
-1. **Database Inspection Tool** (4-5 weeks) - Helps with all other development
-2. **WASM Support** (2-3 weeks) - Unlocks browser deployment
-3. **Backup & Restore** (1-2 weeks) - Production safety net
-4. **Zero-Knowledge Storage** (3-4 weeks) - Privacy foundation
+### Phase 1: Quick Wins & Foundation (6-8 weeks)
+Start with low-effort, high-value features:
 
-### Phase 2: Scalability & Real-time (11-13 weeks)
-5. **Real-time Subscriptions** (2-3 weeks) - Modern app features
-6. **Distributed Database / Replication** (6-8 weeks) - Horizontal scaling
-7. **MVCC Concurrency Control** (3-4 weeks) - Better concurrent writes
+1. **Backup & Restore** (🟢 Low, 1-2 weeks) - Production safety net
+2. **WASM Support** (🟢 Low, 2-3 weeks) - Unlocks browser deployment
+3. **Real-time Subscriptions** (🟢 Low, 2-3 weeks) - Modern app features
 
-### Phase 3: Runtime Expansion (6-8 weeks)
-8. **Python Runtime (FFI)** (2-3 weeks) - Data science market
-9. **Node.js Runtime (NAPI-RS)** (2-3 weeks) - Largest JS runtime
-10. **Deno Runtime (FFI)** (1-2 weeks) - Modern runtime support
+### Phase 2: Medium Effort Features (13-16 weeks)
+Tackle medium-complexity, high-impact features:
 
-### Phase 4: Advanced Features (8-11 weeks)
-11. **AI-Powered Development** (2-3 weeks) - DX improvement
-12. **Multi-tenancy** (2-3 weeks) - SaaS support
-13. **Advanced Indexing** (2-3 weeks) - Specialized queries
-14. **GraphQL Support** (2 weeks) - Alternative API
+4. **Zero-Knowledge Storage** (🟡 Medium, 3-4 weeks) - Privacy foundation
+5. **Distributed Database / Replication** (🟡 Medium, 6-8 weeks) - High availability
+6. **MVCC Concurrency Control** (🟡 Medium, 3-4 weeks) - Better concurrent writes
 
-### Total Estimated Time
-- **All High Priority**: 20-25 weeks
-- **All Medium Priority**: 15-19 weeks
-- **All Low Priority**: 6-8 weeks
-- **Everything**: 41-52 weeks (~10-12 months)
+### Phase 3: Advanced Tooling (4-5 weeks)
+High-effort but essential development tool:
+
+7. **Database Inspection Tool** (🔴 High, 4-5 weeks) - Development and debugging
+
+### Phase 4: Runtime Expansion (6-8 weeks)
+Expand to additional runtimes:
+
+8. **Deno Runtime (FFI)** (🟢 Low, 1-2 weeks) - Modern TypeScript runtime
+9. **Python Runtime (FFI)** (🟡 Medium, 2-3 weeks) - Data science market
+10. **Node.js Runtime (NAPI-RS)** (🟡 Medium, 2-3 weeks) - Largest JS runtime
+
+### Phase 5: Developer Experience (4-6 weeks)
+Enhance developer productivity:
+
+11. **AI-Powered Development** (🟡 Medium, 2-3 weeks) - Code generation
+12. **Multi-tenancy** (🟡 Medium, 2-3 weeks) - SaaS support
+
+### Phase 6: Optional Advanced Features (6-8 weeks)
+Lower priority enhancements:
+
+13. **GraphQL Support** (🟡 Medium, 2 weeks) - Alternative API
+14. **Time-Series Optimization** (🟡 Medium, 2-3 weeks) - Specific workloads
+15. **Advanced Indexing** (🟡 Medium, 2-3 weeks per type) - Specialized queries
+
+---
+
+## Summary by Effort Level
+
+### 🟢 Low Effort (4 features, 6-10 weeks)
+- WASM Support (2-3 weeks)
+- Real-time Subscriptions (2-3 weeks)
+- Backup & Restore (1-2 weeks)
+- Deno Runtime (1-2 weeks)
+
+### 🟡 Medium Effort (10 features, 25-35 weeks)
+- Distributed Database / Replication (6-8 weeks)
+- Zero-Knowledge Storage (3-4 weeks)
+- MVCC Concurrency Control (3-4 weeks)
+- Python Runtime (2-3 weeks)
+- Node.js Runtime (2-3 weeks)
+- AI-Powered Development (2-3 weeks)
+- Multi-tenancy (2-3 weeks)
+- Advanced Indexing (2-3 weeks per type)
+- GraphQL Support (2 weeks)
+- Time-Series Optimization (2-3 weeks)
+
+### 🔴 High Effort (1 feature, 4-5 weeks)
+- Database Inspection Tool (4-5 weeks)
+
+---
+
+## Total Estimated Time
+
+- **All High Priority**: 19-25 weeks (~5-6 months)
+- **High + Medium Priority**: 32-43 weeks (~8-10 months)
+- **Everything**: 38-51 weeks (~9-12 months)
+
+**By Effort Level**:
+- Low effort features: 6-10 weeks
+- Medium effort features: 25-35 weeks
+- High effort features: 4-5 weeks
 
 ---
 
