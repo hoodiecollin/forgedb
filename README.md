@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/tmp-logo.png" alt="ForgeDB Logo" width="200">
+</div>
+
 # ForgeDB - Type-Safe, Schema-First Full-Stack Database Framework
 
 ## Executive Summary
