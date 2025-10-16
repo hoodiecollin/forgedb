@@ -24,7 +24,7 @@ use diagnostics::validate_schema;
 use completion::get_completions;
 use hover::get_hover_info;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Document {
     uri: Url,
     content: String,

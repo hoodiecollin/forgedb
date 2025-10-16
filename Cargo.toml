@@ -16,6 +16,7 @@ members = [
     "crates/fulltext",
     "crates/query-optimization",
     "crates/lsp-server",
+    "crates/ffi",
 ]
 resolver = "2"
 

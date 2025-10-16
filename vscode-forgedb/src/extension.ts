@@ -199,7 +199,7 @@ function setupFileWatcher(context: vscode.ExtensionContext) {
 
     const watcher = vscode.workspace.createFileSystemWatcher('**/*.forge');
 
-    watcher.onDidSave(async (uri) => {
+    watcher.onDidChange(async (uri: vscode.Uri) => {
         if (autoGenerateOnSave) {
             const terminal = vscode.window.createTerminal('ForgeDB Auto-Generate');
             terminal.sendText('cargo run --bin forgedb -- generate');

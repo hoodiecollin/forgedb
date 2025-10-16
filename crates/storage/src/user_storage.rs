@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct User {
     pub id: u64,
     pub email: String,
