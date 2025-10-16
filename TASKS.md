@@ -56,34 +56,247 @@ These are **potential features** to consider for future development. Not priorit
 
 ---
 
-### 2. Distributed Database / Replication
+### 2. Python Runtime (FFI)
+
+**Goal**: Python bindings via FFI (similar to Bun integration)
+
+**Features**:
+- Python FFI bindings using `ctypes` or `cffi`
+- Type-safe Python API with type hints
+- Package manager: `uv` (modern, fast Python package manager)
+- Async/await support with `asyncio`
+- ORM-style query builder
+- NumPy/Pandas integration for data analysis
+
+**Use Cases**:
+- Data science and ML applications
+- Python web frameworks (FastAPI, Django)
+- Scientific computing
+- Backend services in Python
+
+**Technical Challenges**:
+- Python GIL (Global Interpreter Lock)
+- Memory management across FFI boundary
+- Async integration with asyncio
+- Type hint generation
+- PyPI package distribution
+
+**Example API**:
+```python
+from forgedb import Database
+
+async with Database("./data", read_only=True) as db:
+    user = await db.get("User", "123")
+    users = await db.list("User", filters={"verified": True}, limit=10)
+
+    # Pandas integration
+    df = await db.to_dataframe("User")
+```
+
+**Estimated Effort**: 2-3 weeks
+
+---
+
+### 3. Node.js Runtime (NAPI-RS)
+
+**Goal**: Node.js native addon via NAPI-RS
+
+**Features**:
+- Native Node.js addon using `napi-rs`
+- Zero-copy data transfer where possible
+- Promise-based async API
+- TypeScript definitions auto-generated
+- NPM package distribution
+- Compatible with all Node.js versions (N-API)
+
+**Use Cases**:
+- Node.js applications (Express, Nest.js, etc.)
+- Alternative to Bun for teams on Node.js
+- Serverless functions (AWS Lambda, Vercel)
+- Desktop apps (Electron)
+
+**Technical Challenges**:
+- N-API compatibility across Node versions
+- Memory management (JS GC vs Rust)
+- Error handling across FFI
+- Async work scheduling
+- Cross-platform compilation
+
+**Example API**:
+```typescript
+import { Database } from '@forgedb/node';
+
+const db = new Database('./data', { readOnly: true });
+
+const user = await db.get('User', '123');
+const users = await db.list('User', { verified: true }, 10);
+
+db.close();
+```
+
+**Estimated Effort**: 2-3 weeks
+
+---
+
+### 4. Deno Runtime (FFI)
+
+**Goal**: Deno bindings via FFI (similar to Bun)
+
+**Features**:
+- Deno FFI using `Deno.dlopen`
+- TypeScript-first API
+- Zero external dependencies
+- Permission-based security model
+- NPM compatibility via `npm:` specifier
+- WebAssembly fallback option
+
+**Use Cases**:
+- Deno web frameworks (Fresh, Oak)
+- Secure server environments
+- Edge computing (Deno Deploy)
+- TypeScript-native projects
+
+**Technical Challenges**:
+- Deno FFI API differences from Bun
+- Dynamic library loading
+- Permission model integration
+- Cross-platform library discovery
+
+**Example API**:
+```typescript
+import { Database } from "https://deno.land/x/forgedb/mod.ts";
+
+const db = new Database("./data", { readOnly: true });
+
+const user = await db.get("User", "123");
+const users = await db.list("User", { verified: true }, 10);
+
+db.close();
+```
+
+**Estimated Effort**: 1-2 weeks (leverage Bun FFI work)
+
+---
+
+### 5. Distributed Database / Replication
 
 **Goal**: Multi-node support with replication
 
 **Features**:
-- Leader election (Raft or similar)
+- Blockchain-based consensus for atomic changes across network
+- Merkle tree verification for data integrity
 - Write-ahead log replication
 - Read replicas for scaling
 - Automatic failover
-- Conflict resolution
+- Byzantine fault tolerance
+- Cryptographic proof of changes
 
 **Use Cases**:
 - High availability deployments
 - Geographic distribution
 - Read scaling
 - Disaster recovery
+- Trustless multi-party databases
 
 **Technical Challenges**:
-- Consensus protocol implementation
+- Blockchain consensus implementation
 - Network partitioning
 - Data consistency guarantees
 - Replication lag monitoring
+- Cryptographic verification overhead
+- Transaction finality
 
-**Estimated Effort**: 4-6 weeks
+**Estimated Effort**: 6-8 weeks
 
 ---
 
-### 3. Advanced Indexing
+### 6. Zero-Knowledge Storage
+
+**Goal**: Client-side encryption with server storing encrypted blobs
+
+**Features**:
+- End-to-end encryption (E2EE)
+- Client-side encryption/decryption
+- Server stores only encrypted blobs
+- Zero-knowledge proofs for verification
+- Key management (client-side only)
+- Searchable encryption (limited)
+- Encrypted indexes
+
+**Use Cases**:
+- Privacy-focused applications
+- Compliance (HIPAA, GDPR)
+- Untrusted server environments
+- Multi-tenant with data isolation
+- Confidential business data
+
+**Technical Challenges**:
+- Encryption key management
+- Searchable encryption limitations
+- Performance overhead
+- Index encryption
+- Key rotation
+- Backup/recovery with lost keys
+
+**Example Schema**:
+```forge
+@encrypted  // Model-level encryption
+User {
+  id: +uuid
+  email: string @encrypted  // Field-level encryption
+  password_hash: string @encrypted
+  metadata: json @encrypted
+}
+```
+
+**Estimated Effort**: 3-4 weeks
+
+---
+
+### 7. Database Inspection Tool (Tauri)
+
+**Goal**: Native desktop app for database inspection and management
+
+**Features**:
+- **Built with Tauri** (Rust + Web frontend)
+- Browse database files
+- Visual schema explorer
+- Query builder GUI
+- Data viewer/editor
+- Performance monitoring
+- Index visualization
+- Export/import data (JSON, CSV)
+- Schema migration tools
+- Real-time updates
+
+**Use Cases**:
+- Database debugging
+- Development/testing
+- Data exploration
+- Schema design
+- Performance tuning
+- Production monitoring
+
+**Technical Challenges**:
+- Cross-platform UI consistency
+- Large dataset rendering
+- Real-time updates
+- Query performance visualization
+- Schema diff and migration
+
+**UI Features**:
+- Tree view for schema
+- Table view for records
+- Graph view for relations
+- Query editor with syntax highlighting
+- Visual query builder
+- Performance charts
+
+**Estimated Effort**: 4-5 weeks
+
+---
+
+### 8. Advanced Indexing
 
 **Goal**: Specialized index types for specific use cases
 
@@ -119,7 +332,7 @@ These are **potential features** to consider for future development. Not priorit
 
 ---
 
-### 4. MVCC Concurrency Control
+### 9. MVCC Concurrency Control
 
 **Goal**: Better write concurrency with snapshot isolation
 
@@ -145,7 +358,7 @@ These are **potential features** to consider for future development. Not priorit
 
 ---
 
-### 5. AI-Powered Development
+### 10. AI-Powered Development
 
 **Goal**: Automatic code generation from schema
 
@@ -193,7 +406,7 @@ User {
 
 ---
 
-### 6. Real-time Subscriptions
+### 11. Real-time Subscriptions
 
 **Goal**: WebSocket-based real-time data updates
 
@@ -219,7 +432,7 @@ User {
 
 ---
 
-### 7. GraphQL Support
+### 12. GraphQL Support
 
 **Goal**: Generate GraphQL API from schema
 
@@ -246,7 +459,7 @@ User {
 
 ---
 
-### 8. Time-Series Optimization
+### 13. Time-Series Optimization
 
 **Goal**: Optimize for time-series data
 
@@ -272,7 +485,7 @@ User {
 
 ---
 
-### 9. Backup & Restore
+### 14. Backup & Restore
 
 **Goal**: Robust backup and recovery
 
@@ -299,7 +512,7 @@ User {
 
 ---
 
-### 10. Multi-tenancy
+### 15. Multi-tenancy
 
 **Goal**: Built-in tenant isolation
 
