@@ -42,7 +42,8 @@ pub fn run(options: InitOptions) -> Result<()> {
     ui::success("Done! Run the following to get started:");
     println!();
     println!("  cd {}", options.project_name);
-    println!("  cargo run");
+    println!("  forgedb generate rust");
+    println!("  forgedb build");
     println!();
 
     Ok(())
@@ -108,7 +109,7 @@ fn create_readme(options: &InitOptions) -> Result<()> {
 }
 
 fn create_rust_files(options: &InitOptions) -> Result<()> {
-    // Create Cargo.toml
+    // Create Cargo.toml (without dependencies for now - user will run forgedb generate first)
     let cargo_toml = format!(
         r#"[package]
 name = "{}"
@@ -116,13 +117,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-forgedb-storage = {{ path = "../../crates/storage" }}
-forgedb-types = {{ path = "../../crates/types" }}
-uuid = {{ version = "1.6", features = ["v4"] }}
+# Dependencies will be added when you run: forgedb generate --rust
 
-[[example]]
-name = "basic"
-path = "examples/basic.rs"
 "#,
         options.project_name
     );
@@ -130,15 +126,9 @@ path = "examples/basic.rs"
     let cargo_path = Path::new(&options.project_name).join("Cargo.toml");
     fs::write(cargo_path, cargo_toml)?;
 
-    // Create src/main.rs
-    let main_rs_path = Path::new(&options.project_name).join("src").join("main.rs");
-    fs::write(main_rs_path, templates::rust_main_template())?;
-
-    // Create examples directory and basic example
-    let examples_dir = Path::new(&options.project_name).join("examples");
-    fs::create_dir_all(&examples_dir)?;
-
-    let basic_example = r#"mod generated {
+    // Create src/main.rs that uses generated code
+    let main_rs = r#"// Include generated database code
+mod generated {
     include!("../generated/database.rs");
 }
 
@@ -146,20 +136,27 @@ use generated::*;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Running basic example...");
+    println!("🚀 Starting ForgeDB application...");
+    println!();
 
-    let db_path = Path::new("./data/db");
-    let mut db = Database::new(db_path)?;
+    // Initialize database
+    let mut db = Database::new();
 
-    println!("Database initialized successfully!");
+    println!("✅ Database initialized successfully!");
+    println!();
+    println!("You can now:");
+    println!("  - Add data operations in src/main.rs");
+    println!("  - Update schema.forge and regenerate with: forgedb generate rust");
+    println!();
 
     Ok(())
 }
 "#;
 
-    let basic_example_path = examples_dir.join("basic.rs");
-    fs::write(basic_example_path, basic_example)?;
+    let main_rs_path = Path::new(&options.project_name).join("src").join("main.rs");
+    fs::write(main_rs_path, main_rs)?;
 
     ui::step("🦀", "Created Rust project files");
+    ui::info("Run 'forgedb generate --rust' to generate the database code");
     Ok(())
 }

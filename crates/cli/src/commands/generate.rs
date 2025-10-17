@@ -51,12 +51,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generate_rust_code(&schema, output_dir, options.force)?;
             generate_typescript_sdk(&schema, output_dir, options.force)?;
             generate_component_stubs(&schema, output_dir, options.force)?;
+            generate_bun_server(output_dir, options.force)?;
         }
         "rust" => {
             generate_rust_code(&schema, output_dir, options.force)?;
+            generate_bun_server(output_dir, options.force)?;
         }
         "typescript" | "sdk" => {
             generate_typescript_sdk(&schema, output_dir, options.force)?;
+            generate_bun_server(output_dir, options.force)?;
         }
         "api" => {
             ui::warning("API generation not yet implemented");
@@ -126,6 +129,63 @@ fn generate_rust_code(schema: &forgedb::ast::Schema, output_dir: &str, force: bo
         output_path.display(),
         line_count
     ));
+
+    // Update Cargo.toml with required dependencies
+    update_cargo_toml()?;
+
+    Ok(())
+}
+
+fn update_cargo_toml() -> Result<()> {
+    let cargo_path = Path::new("Cargo.toml");
+
+    if !cargo_path.exists() {
+        ui::warning("Cargo.toml not found, skipping dependency update");
+        return Ok(());
+    }
+
+    let cargo_content = fs::read_to_string(cargo_path)?;
+
+    // Check if dependencies are already present
+    if cargo_content.contains("forgedb-storage") && cargo_content.contains("forgedb-types") {
+        return Ok(());
+    }
+
+    // Find the [dependencies] section or add it
+    let updated_content = if let Some(deps_idx) = cargo_content.find("[dependencies]") {
+        // Check if deps are already there
+        if cargo_content[deps_idx..].contains("forgedb-storage") {
+            return Ok(());
+        }
+
+        // Find the end of the line after [dependencies]
+        let after_deps = &cargo_content[deps_idx..];
+        if let Some(newline_idx) = after_deps.find('\n') {
+            let insert_pos = deps_idx + newline_idx + 1;
+            let mut new_content = String::new();
+            new_content.push_str(&cargo_content[..insert_pos]);
+            new_content.push_str("forgedb-storage = \"0.1\"\n");
+            new_content.push_str("forgedb-types = \"0.1\"\n");
+            new_content.push_str("uuid = { version = \"1.6\", features = [\"v4\"] }\n");
+            new_content.push_str("regex = \"1.10\"\n");
+            new_content.push_str(&cargo_content[insert_pos..]);
+            new_content
+        } else {
+            cargo_content
+        }
+    } else {
+        // No [dependencies] section, add it
+        let mut new_content = cargo_content.clone();
+        new_content.push_str("\n[dependencies]\n");
+        new_content.push_str("forgedb-storage = \"0.1\"\n");
+        new_content.push_str("forgedb-types = \"0.1\"\n");
+        new_content.push_str("uuid = { version = \"1.6\", features = [\"v4\"] }\n");
+        new_content.push_str("regex = \"1.10\"\n");
+        new_content
+    };
+
+    fs::write(cargo_path, updated_content)?;
+    ui::step("📦", "Updated Cargo.toml with ForgeDB dependencies");
 
     Ok(())
 }
@@ -273,5 +333,28 @@ fn check_generation_needed(schema: &forgedb::ast::Schema, output_dir: &str) -> R
     }
 
     ui::success("Generated code is up to date");
+    Ok(())
+}
+
+fn generate_bun_server(output_dir: &str, force: bool) -> Result<()> {
+    let server_path = Path::new(output_dir).join("server.ts");
+    let db_client_path = Path::new(output_dir).join("db-client.ts");
+
+    // Check if files exist and force is not set
+    if !force && server_path.exists() && db_client_path.exists() {
+        ui::info("Bun server files already exist (use --force to regenerate)");
+        return Ok(());
+    }
+
+    // Bundled server.ts and db-client.ts content
+    let server_ts = include_str!("../../../../runtime/bun/src/server.ts");
+    let db_client_ts = include_str!("../../../../runtime/bun/src/db-client.ts");
+
+    fs::write(&server_path, server_ts)
+        .map_err(|e| CliError::CodeGeneration(format!("Failed to write server.ts: {}", e)))?;
+    fs::write(&db_client_path, db_client_ts)
+        .map_err(|e| CliError::CodeGeneration(format!("Failed to write db-client.ts: {}", e)))?;
+
+    ui::success("Generated Bun server files (server.ts, db-client.ts)");
     Ok(())
 }

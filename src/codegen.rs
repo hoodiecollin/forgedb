@@ -1477,7 +1477,19 @@ impl CodeGenerator {
         if let Some(id_field) = id_field {
             // Generate batch insert
             code.push_str("    /// Batch insert multiple records\n");
-            code.push_str("    pub fn insert_batch(&mut self, records: Vec<(");
+
+            // Count non-auto-generated fields
+            let non_auto_fields: Vec<_> = model.fields.iter()
+                .filter(|f| !Self::is_virtual_field(f) && !f.auto_generate)
+                .collect();
+
+            let use_tuple = non_auto_fields.len() > 1;
+
+            if use_tuple {
+                code.push_str("    pub fn insert_batch(&mut self, records: Vec<(");
+            } else {
+                code.push_str("    pub fn insert_batch(&mut self, records: Vec<");
+            }
 
             let mut first = true;
             for field in &model.fields {
@@ -1485,7 +1497,7 @@ impl CodeGenerator {
                     continue;
                 }
                 if !field.auto_generate {
-                    if !first {
+                    if !first && use_tuple {
                         code.push_str(", ");
                     }
                     code.push_str(&self.get_field_param_type(field));
@@ -1493,10 +1505,16 @@ impl CodeGenerator {
                 }
             }
 
-            code.push_str(&format!(")>) -> Result<Vec<{}>, String> {{\n", model.name));
+            if use_tuple {
+                code.push_str(")");
+            }
+            code.push_str(&format!(">) -> Result<Vec<{}>, String> {{\n", model.name));
             code.push_str("        let mut results = Vec::new();\n");
             code.push_str("        for record in records {\n");
-            code.push_str("            // Unpack tuple\n");
+
+            if use_tuple {
+                code.push_str("            // Unpack tuple\n");
+            }
 
             let mut tuple_index = 0;
             let mut param_names = Vec::new();
@@ -1507,10 +1525,15 @@ impl CodeGenerator {
                 if !field.auto_generate {
                     let param_name = self.get_field_param_name(field);
                     param_names.push(param_name.clone());
-                    code.push_str(&format!(
-                        "            let {} = record.{};\n",
-                        param_name, tuple_index
-                    ));
+                    if use_tuple {
+                        code.push_str(&format!(
+                            "            let {} = record.{};\n",
+                            param_name, tuple_index
+                        ));
+                    } else {
+                        // For single field, record IS the value
+                        code.push_str(&format!("            let {} = record;\n", param_name));
+                    }
                     tuple_index += 1;
                 }
             }

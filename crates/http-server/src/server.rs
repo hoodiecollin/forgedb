@@ -33,6 +33,7 @@ impl Default for ServerConfig {
 /// HTTP server
 pub struct Server {
     config: ServerConfig,
+    socket_path: Option<std::path::PathBuf>,
 }
 
 impl Server {
@@ -40,12 +41,22 @@ impl Server {
     pub fn new() -> Self {
         Self {
             config: ServerConfig::default(),
+            socket_path: None,
         }
     }
 
     /// Create a server with custom configuration
     pub fn with_config(config: ServerConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            socket_path: None,
+        }
+    }
+
+    /// Set Unix socket path
+    pub fn with_socket(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.socket_path = Some(path.into());
+        self
     }
 
     /// Initialize tracing/logging
@@ -85,16 +96,28 @@ impl Server {
         // Apply middleware
         let app = self.apply_middleware(router);
 
-        // Build address
-        let addr = format!("{}:{}", self.config.host, self.config.port).parse::<SocketAddr>()?;
+        if let Some(socket_path) = &self.socket_path {
+            // Unix socket mode
+            use tokio::net::UnixListener;
 
-        tracing::info!("Server listening on http://{}", addr);
+            // Remove old socket if exists
+            if socket_path.exists() {
+                std::fs::remove_file(socket_path)?;
+            }
 
-        // Create TCP listener
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!("Server listening on Unix socket: {}", socket_path.display());
 
-        // Serve
-        axum::serve(listener, app).await?;
+            let listener = UnixListener::bind(socket_path)?;
+            axum::serve(listener, app).await?;
+        } else {
+            // TCP mode
+            let addr = format!("{}:{}", self.config.host, self.config.port).parse::<SocketAddr>()?;
+
+            tracing::info!("Server listening on http://{}", addr);
+
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, app).await?;
+        }
 
         Ok(())
     }

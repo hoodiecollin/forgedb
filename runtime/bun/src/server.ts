@@ -46,10 +46,11 @@ async function loadComponents() {
   }
 }
 
-// Server
-const server = Bun.serve({
-  port: process.env.PORT || 3001,
+// Server configuration
+const socketPath = process.env.SOCKET_PATH;
+const port = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 
+const serverConfig: any = {
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
 
@@ -76,7 +77,16 @@ const server = Bun.serve({
 
     return new Response("Not Found", { status: 404 });
   },
-});
+};
+
+// Use Unix socket if SOCKET_PATH is set, otherwise use TCP port
+if (socketPath) {
+  serverConfig.unix = socketPath;
+} else {
+  serverConfig.port = port;
+}
+
+const server = Bun.serve(serverConfig);
 
 /**
  * Handle component rendering
@@ -196,7 +206,11 @@ console.log("[Server] Loading components...");
 await loadComponents();
 console.log(`[Server] Registered ${Object.keys(components).length} components`);
 
-console.log(`[Server] Listening on http://localhost:${server.port}`);
+if (socketPath) {
+  console.log(`[Server] Listening on Unix socket: ${socketPath}`);
+} else {
+  console.log(`[Server] Listening on http://localhost:${server.port || port}`);
+}
 console.log(`[Server] DB Mode: ${process.env.DB_MODE || "auto (FFI)"}`);
 
 // Cleanup on shutdown

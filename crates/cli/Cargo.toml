@@ -13,6 +13,8 @@ anyhow = "1.0"
 thiserror = "1.0"
 colored = "2.1"
 serde_json = "1.0"
+ctrlc = "3.4"
+which = "6.0"
 forgedb = { path = "../.." }
 forgedb-watcher = { path = "../watcher" }
 forgedb-migrations = { path = "../migrations" }

@@ -132,6 +132,33 @@ enum Commands {
     /// Database compaction and maintenance commands
     #[command(subcommand)]
     Compact(CompactCommands),
+
+    /// Start ForgeDB server (Rust API + Bun Runtime + nginx)
+    Serve {
+        /// Host address
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+
+        /// Rust API Unix socket path
+        #[arg(long)]
+        rust_socket: Option<String>,
+
+        /// Bun runtime Unix socket path
+        #[arg(long)]
+        bun_socket: Option<String>,
+
+        /// Skip nginx (expose services directly)
+        #[arg(long)]
+        no_nginx: bool,
+
+        /// Skip Bun runtime server
+        #[arg(long)]
+        no_bun: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -308,6 +335,22 @@ fn main() -> Result<()> {
                 commands::migrate::down(commands::migrate::MigrateDownOptions { steps })
             }
         },
+
+        Commands::Serve {
+            host,
+            port,
+            rust_socket,
+            bun_socket,
+            no_nginx,
+            no_bun,
+        } => commands::serve::run(commands::serve::ServeOptions {
+            host,
+            port,
+            rust_socket: rust_socket.map(std::path::PathBuf::from),
+            bun_socket: bun_socket.map(std::path::PathBuf::from),
+            no_nginx,
+            no_bun,
+        }),
 
         Commands::Compact(compact_cmd) => match compact_cmd {
             CompactCommands::Run {
