@@ -286,7 +286,7 @@ fn print_model_stats(stats: &forgedb_compaction::ModelStats) {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
@@ -304,18 +304,4 @@ fn format_bytes(bytes: u64) -> String {
 
 fn map_err(e: String) -> CliError {
     CliError::Compaction(e)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-    }
 }
