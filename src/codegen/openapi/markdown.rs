@@ -50,11 +50,7 @@ fn document_model(content: &mut String, model: &Model) {
             continue;
         }
 
-        let field_name = match &field.field_type {
-            FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
-            _ => field.name.clone(),
-        };
-
+        let field_name = semantics::relation_field_name(field);
         let field_type = type_to_markdown(&field.field_type);
 
         let mut constraints = Vec::new();

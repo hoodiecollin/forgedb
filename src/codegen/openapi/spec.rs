@@ -241,7 +241,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
     );
 
     // Single item endpoints: GET/PUT/DELETE /api/models/:id
-    let id_field = model.fields.iter().find(|f| f.auto_generate);
+    let id_field = model.fields.iter().find(|f| f.auto_generate && matches!(f.field_type, FieldType::Uuid));
     if let Some(id_field) = id_field {
         paths.insert(
             format!("/api/{}/{{id}}", model_plural),
@@ -401,10 +401,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
 
 /// Convert a field to OpenAPI schema
 fn field_to_openapi_schema(field: &Field) -> (String, Value) {
-    let field_name = match &field.field_type {
-        FieldType::Relation(rel) if rel.is_reference() => format!("{}_id", field.name),
-        _ => field.name.clone(),
-    };
+    let field_name = semantics::relation_field_name(field);
 
     let mut schema = type_to_openapi_type(&field.field_type);
 
