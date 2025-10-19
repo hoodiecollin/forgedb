@@ -47,7 +47,7 @@ impl TypeScriptGenerator {
     }
 
     /// Generate TypeScript interfaces for all models
-    fn generate_types(schema: &Schema) -> GeneratedFile {
+    pub fn generate_types(schema: &Schema) -> GeneratedFile {
         let mut code = String::new();
 
         code.push_str("// Auto-generated TypeScript types\n\n");
@@ -154,7 +154,7 @@ impl TypeScriptGenerator {
     }
 
     /// Generate API client for a model
-    fn generate_api_client(model: &Model, schema: &Schema) -> GeneratedFile {
+    pub fn generate_api_client(model: &Model, schema: &Schema) -> GeneratedFile {
         let model_lower = model.name.to_lowercase();
         let plural = format!("{}s", model_lower); // Simple pluralization
         let mut code = String::new();
@@ -583,7 +583,7 @@ export default defineConfig({
     }
 
     /// Map FieldType to TypeScript type
-    fn map_field_type_to_ts(field_type: &FieldType) -> String {
+    pub fn map_field_type_to_ts(field_type: &FieldType) -> String {
         match field_type {
             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 | FieldType::F64 => {
                 "number".to_string()
@@ -639,99 +639,3 @@ export default defineConfig({
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ast::{IndexType, Model};
-
-    fn create_test_schema() -> Schema {
-        Schema {
-            structs: vec![],
-            models: vec![Model {
-                name: "User".to_string(),
-                fields: vec![
-                    Field {
-                        name: "id".to_string(),
-                        field_type: FieldType::Uuid,
-                        unique: false,
-                        indexed: false,
-                        auto_generate: true,
-                        constraints: vec![],
-                        index_type: IndexType::Hash,
-                        is_computed: false,
-                        fulltext_indexed: false,
-                        is_materialized: false,
-                    },
-                    Field {
-                        name: "email".to_string(),
-                        field_type: FieldType::String,
-                        unique: true,
-                        indexed: true,
-                        auto_generate: false,
-                        constraints: vec![],
-                        index_type: IndexType::Hash,
-                        is_computed: false,
-                        fulltext_indexed: false,
-                        is_materialized: false,
-                    },
-                ],
-                composite_indexes: vec![],
-                soft_delete: false,
-            }],
-        }
-    }
-
-    #[test]
-    fn test_generate_types() {
-        let schema = create_test_schema();
-        let file = TypeScriptGenerator::generate_types(&schema);
-
-        assert_eq!(file.path, "generated/sdk/types.ts");
-        assert!(file.content.contains("export interface User"));
-        assert!(file.content.contains("export interface CreateUserRequest"));
-        assert!(file.content.contains("export interface UpdateUserRequest"));
-        assert!(file.content.contains("id: string"));
-        assert!(file.content.contains("email: string"));
-    }
-
-    #[test]
-    fn test_generate_api_client() {
-        let schema = create_test_schema();
-        let model = &schema.models[0];
-        let file = TypeScriptGenerator::generate_api_client(model, &schema);
-
-        assert_eq!(file.path, "generated/sdk/UserApi.ts");
-        assert!(file.content.contains("export class UserApi"));
-        assert!(file.content.contains("async list("));
-        assert!(file.content.contains("async get("));
-        assert!(file.content.contains("async create("));
-        assert!(file.content.contains("async update("));
-        assert!(file.content.contains("async delete("));
-    }
-
-    #[test]
-    fn test_map_field_type_to_ts() {
-        assert_eq!(
-            TypeScriptGenerator::map_field_type_to_ts(&FieldType::String),
-            "string"
-        );
-        assert_eq!(
-            TypeScriptGenerator::map_field_type_to_ts(&FieldType::U32),
-            "number"
-        );
-        assert_eq!(
-            TypeScriptGenerator::map_field_type_to_ts(&FieldType::Bool),
-            "boolean"
-        );
-        assert_eq!(
-            TypeScriptGenerator::map_field_type_to_ts(&FieldType::Uuid),
-            "string"
-        );
-        assert_eq!(
-            TypeScriptGenerator::map_field_type_to_ts(&FieldType::OptionalStructType(
-                "Address".to_string()
-            )),
-            "Address | null"
-        );
-    }
-}
