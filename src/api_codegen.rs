@@ -6,6 +6,9 @@
 //! - Router setup with Axum
 //! - Query parameter integration
 //! - Validation logic
+//!
+//! NOTE: This module now delegates to codegen::api for the actual implementation.
+//! It maintains backward compatibility with existing tests and code.
 
 use crate::ast::{Field, FieldType, Model, Schema};
 use crate::codegen::GeneratedFile;
@@ -15,229 +18,22 @@ pub struct ApiCodeGenerator;
 impl ApiCodeGenerator {
     /// Generate all API files for a schema
     pub fn generate(schema: &Schema) -> Vec<GeneratedFile> {
-        let mut files = vec![];
-
-        // Generate request/response types for each model
-        for model in &schema.models {
-            files.push(Self::generate_api_types(model));
-            files.push(Self::generate_handlers(model));
-        }
-
-        // Generate main router
-        files.push(Self::generate_router(schema));
-
-        // Generate main API module
-        files.push(Self::generate_api_mod(schema));
-
-        files
+        crate::codegen::api::ApiCodeGenerator::generate(schema)
     }
 
     /// Generate request/response types for a model
-    pub fn generate_api_types(model: &Model) -> GeneratedFile {
-        let model_lower = model.name.to_lowercase();
-        let mut code = String::new();
-
-        // Imports
-        code.push_str("use serde::{Deserialize, Serialize};\n");
-        code.push_str("use uuid::Uuid;\n\n");
-
-        // CreateRequest type (fields without auto-generated or computed ones)
-        code.push_str(&format!("#[derive(Debug, Deserialize)]\n"));
-        code.push_str(&format!("pub struct Create{}Request {{\n", model.name));
-        for field in &model.fields {
-            if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
-                let field_type = Self::map_field_type_to_rust(&field.field_type, false);
-                code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
-            }
-        }
-        code.push_str("}\n\n");
-
-        // UpdateRequest type (all non-auto, non-computed fields are optional)
-        code.push_str(&format!("#[derive(Debug, Deserialize)]\n"));
-        code.push_str(&format!("pub struct Update{}Request {{\n", model.name));
-        for field in &model.fields {
-            if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
-                let field_type = Self::map_field_type_to_rust(&field.field_type, false);
-                code.push_str(&format!(
-                    "    pub {}: Option<{}>,\n",
-                    field.name, field_type
-                ));
-            }
-        }
-        code.push_str("}\n\n");
-
-        // Response type (reuse the model struct with Serialize)
-        code.push_str(&format!("#[derive(Debug, Serialize)]\n"));
-        code.push_str(&format!("pub struct {}Response {{\n", model.name));
-        for field in &model.fields {
-            if !Self::is_virtual_field(field) {
-                let field_type = Self::map_field_type_to_rust(&field.field_type, true);
-                code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
-            }
-        }
-
-        // Add computed fields to response (Sprint 12)
-        let computed_fields: Vec<_> = model.fields.iter().filter(|f| f.is_computed).collect();
-        if !computed_fields.is_empty() {
-            code.push_str("\n    // Computed fields\n");
-            for field in computed_fields {
-                let field_type = Self::map_field_type_to_rust(&field.field_type, true);
-                code.push_str(&format!("    pub {}: {},\n", field.name, field_type));
-            }
-        }
-
-        code.push_str("}\n");
-
-        GeneratedFile {
-            path: format!("generated/api/{}_types.rs", model_lower),
-            content: code,
-        }
+    fn generate_api_types(model: &Model) -> GeneratedFile {
+        crate::codegen::api::types::generate_api_types(model)
     }
 
     /// Generate handler functions for a model
-    pub fn generate_handlers(model: &Model) -> GeneratedFile {
-        let model_lower = model.name.to_lowercase();
-        let mut code = String::new();
-
-        // Imports
-        code.push_str("use axum::{\n");
-        code.push_str("    extract::{Path, Query, State},\n");
-        code.push_str("    http::StatusCode,\n");
-        code.push_str("    response::{IntoResponse, Json},\n");
-        code.push_str("};\n");
-        code.push_str("use serde_json::json;\n");
-        code.push_str("use std::sync::Arc;\n");
-        code.push_str("use uuid::Uuid;\n\n");
-        code.push_str(&format!("use super::{}_types::*;\n", model_lower));
-        code.push_str("use forgedb_query_params::QueryParams;\n\n");
-
-        // List handler
-        code.push_str(&format!("/// List all {}\n", model.name));
-        code.push_str(&format!("pub async fn list_{}(\n", model_lower));
-        code.push_str("    Query(params): Query<QueryParams>,\n");
-        code.push_str(") -> impl IntoResponse {\n");
-        code.push_str("    // TODO: Implement list logic with storage\n");
-        code.push_str("    // Apply filters from params.filters\n");
-        code.push_str("    // Apply sort from params.sort\n");
-        code.push_str("    // Apply pagination from params.pagination\n");
-        code.push_str("    Json(json!({\n");
-        code.push_str(&format!("        \"data\": [],\n"));
-        code.push_str("        \"count\": 0\n");
-        code.push_str("    }))\n");
-        code.push_str("}\n\n");
-
-        // Get by ID handler
-        code.push_str(&format!("/// Get {} by ID\n", model.name));
-        code.push_str(&format!("pub async fn get_{}(\n", model_lower));
-        code.push_str("    Path(id): Path<Uuid>,\n");
-        code.push_str(") -> impl IntoResponse {\n");
-        code.push_str("    // TODO: Implement get logic with storage\n");
-        code.push_str("    (StatusCode::NOT_FOUND, Json(json!({\n");
-        code.push_str("        \"error\": \"Not found\"\n");
-        code.push_str("    })))\n");
-        code.push_str("}\n\n");
-
-        // Create handler
-        code.push_str(&format!("/// Create a new {}\n", model.name));
-        code.push_str(&format!("pub async fn create_{}(\n", model_lower));
-        code.push_str(&format!(
-            "    Json(req): Json<Create{}Request>,\n",
-            model.name
-        ));
-        code.push_str(") -> impl IntoResponse {\n");
-        code.push_str("    // TODO: Implement create logic with storage\n");
-        code.push_str("    // Validate request with forgedb_validation\n");
-        code.push_str("    // Call storage.insert()\n");
-        code.push_str("    (StatusCode::CREATED, Json(json!({\n");
-        code.push_str("        \"id\": Uuid::new_v4()\n");
-        code.push_str("    })))\n");
-        code.push_str("}\n\n");
-
-        // Update handler
-        code.push_str(&format!("/// Update an existing {}\n", model.name));
-        code.push_str(&format!("pub async fn update_{}(\n", model_lower));
-        code.push_str("    Path(id): Path<Uuid>,\n");
-        code.push_str(&format!(
-            "    Json(req): Json<Update{}Request>,\n",
-            model.name
-        ));
-        code.push_str(") -> impl IntoResponse {\n");
-        code.push_str("    // TODO: Implement update logic with storage\n");
-        code.push_str("    (StatusCode::OK, Json(json!({\n");
-        code.push_str("        \"id\": id\n");
-        code.push_str("    })))\n");
-        code.push_str("}\n\n");
-
-        // Delete handler
-        code.push_str(&format!("/// Delete a {}\n", model.name));
-        code.push_str(&format!("pub async fn delete_{}(\n", model_lower));
-        code.push_str("    Path(id): Path<Uuid>,\n");
-        code.push_str(") -> impl IntoResponse {\n");
-        code.push_str("    // TODO: Implement delete logic with storage\n");
-        code.push_str("    StatusCode::NO_CONTENT\n");
-        code.push_str("}\n");
-
-        GeneratedFile {
-            path: format!("generated/api/{}_handlers.rs", model_lower),
-            content: code,
-        }
+    fn generate_handlers(model: &Model) -> GeneratedFile {
+        crate::codegen::api::handlers::generate_handlers(model)
     }
 
     /// Generate router setup
-    pub fn generate_router(schema: &Schema) -> GeneratedFile {
-        let mut code = String::new();
-
-        // Imports
-        code.push_str("use axum::{\n");
-        code.push_str("    routing::{delete, get, post, put},\n");
-        code.push_str("    Router,\n");
-        code.push_str("};\n\n");
-
-        // Import all handlers
-        for model in &schema.models {
-            let model_lower = model.name.to_lowercase();
-            code.push_str(&format!("use super::{}_handlers;\n", model_lower));
-        }
-        code.push_str("\n");
-
-        // Router creation function
-        code.push_str("/// Create the API router with all endpoints\n");
-        code.push_str("pub fn create_router() -> Router {\n");
-        code.push_str("    Router::new()\n");
-
-        // Add routes for each model
-        for model in &schema.models {
-            let model_lower = model.name.to_lowercase();
-            let plural = format!("{}s", model_lower); // Simple pluralization
-
-            code.push_str(&format!(
-                "        .route(\"/api/{}\", get({}_handlers::list_{}))\n",
-                plural, model_lower, model_lower
-            ));
-            code.push_str(&format!(
-                "        .route(\"/api/{}\", post({}_handlers::create_{}))\n",
-                plural, model_lower, model_lower
-            ));
-            code.push_str(&format!(
-                "        .route(\"/api/{}/:id\", get({}_handlers::get_{}))\n",
-                plural, model_lower, model_lower
-            ));
-            code.push_str(&format!(
-                "        .route(\"/api/{}/:id\", put({}_handlers::update_{}))\n",
-                plural, model_lower, model_lower
-            ));
-            code.push_str(&format!(
-                "        .route(\"/api/{}/:id\", delete({}_handlers::delete_{}))\n",
-                plural, model_lower, model_lower
-            ));
-        }
-
-        code.push_str("}\n");
-
-        GeneratedFile {
-            path: "generated/api/router.rs".to_string(),
-            content: code,
-        }
+    fn generate_router(schema: &Schema) -> GeneratedFile {
+        crate::codegen::api::router::generate_router(schema)
     }
 
     /// Generate API module file
@@ -265,45 +61,13 @@ impl ApiCodeGenerator {
 
     /// Check if field is virtual (relation or component that doesn't store data)
     fn is_virtual_field(field: &Field) -> bool {
-        matches!(
-            &field.field_type,
-            FieldType::Relation(crate::ast::RelationType::OneToMany(_))
-                | FieldType::Relation(crate::ast::RelationType::ManyToMany(_))
-                | FieldType::Component(_)
-        )
+        crate::codegen::semantics::is_virtual_field(field)
     }
 
     /// Map FieldType to Rust type for API
-    pub fn map_field_type_to_rust(field_type: &FieldType, for_response: bool) -> String {
-        match field_type {
-            FieldType::U32 => "u32".to_string(),
-            FieldType::U64 => "u64".to_string(),
-            FieldType::I32 => "i32".to_string(),
-            FieldType::I64 => "i64".to_string(),
-            FieldType::F64 => "f64".to_string(),
-            FieldType::Bool => "bool".to_string(),
-            FieldType::String => "String".to_string(),
-            FieldType::Uuid => "Uuid".to_string(),
-            FieldType::Timestamp => "i64".to_string(), // Unix timestamp
-            FieldType::Char(size) => format!("[u8; {}]", size),
-            FieldType::FixedArray(inner, count) => {
-                format!(
-                    "[{}; {}]",
-                    Self::map_field_type_to_rust(inner, for_response),
-                    count
-                )
-            }
-            FieldType::StructType(name) => name.clone(),
-            FieldType::OptionalStructType(name) => format!("Option<{}>", name),
-            FieldType::Relation(rel_type) => {
-                use crate::ast::RelationType;
-                match rel_type {
-                    RelationType::RequiredReference(_) => "Uuid".to_string(), // FK stored as UUID
-                    RelationType::OptionalReference(_) => "Option<Uuid>".to_string(), // Optional FK
-                    _ => "()".to_string(),                                    // Virtual fields
-                }
-            }
-            FieldType::Component(_) => "()".to_string(), // Component references are virtual
-        }
+    fn map_field_type_to_rust(field_type: &FieldType, for_response: bool) -> String {
+        let tokens = crate::codegen::semantics::map_field_type_to_rust_tokens(field_type, for_response);
+        // Convert tokens to string - spaces are kept around ; in arrays
+        tokens.to_string().replace(" ", "").replace(";", "; ")
     }
 }
