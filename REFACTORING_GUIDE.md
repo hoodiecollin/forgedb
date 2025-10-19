@@ -15,7 +15,7 @@ This document describes the pattern for moving unit tests from source files to d
   - `src/parser/mod.rs` → Already separated in `src/parser/tests.rs`
 
 ### Remaining 📋
-- **Crate modules** (48 files across 14 crates):
+**Crate modules** (47 files across 14 crates):
   - cli: 2 files
   - compaction: 4 files
   - crud-api: 3 files
@@ -25,7 +25,7 @@ This document describes the pattern for moving unit tests from source files to d
   - lsp-server: 1 file
   - migrations: 4 files
   - query-optimization: 3 files
-  - query-params: 4 files
+  - query-params: 3 files
   - storage: 2 files
   - validation: 3 files
   - wal: 5 files

@@ -23,7 +23,8 @@ Successfully refactored **7 modules**, moving tests to the root `tests/` directo
 
 **Total: 79 unit tests successfully refactored and verified**
 
-### Crates (`crates/*/`)
+**Crates** (`crates/*/`)
+
 Started refactoring crate modules with example implementation:
 
 | Crate | Module | Test File | Tests Moved |
@@ -54,7 +55,7 @@ Started refactoring crate modules with example implementation:
 
 ## Remaining Work 📋
 
-### Crates to Refactor (47 files remaining)
+**Crates to Refactor** (47 files remaining)
 
 The following crates still have embedded unit tests that should be moved to dedicated test files:
 
