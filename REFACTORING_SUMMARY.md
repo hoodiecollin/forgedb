@@ -25,39 +25,71 @@ Successfully refactored **7 modules**, moving tests to the root `tests/` directo
 
 **Crates** (`crates/*/`)
 
-Started refactoring crate modules with example implementation:
+Successfully refactored **4 crate packages** with comprehensive test coverage:
 
-| Crate | Module | Test File | Tests Moved |
-|-------|--------|-----------|-------------|
-| `query-params` | `filter.rs` | `tests/filter_tests.rs` | 5 tests |
+| Crate | Files Refactored | Test Files Created | Total Tests |
+|-------|------------------|-------------------|-------------|
+| `validation` | 3 files | 3 test files | 38 tests |
+| `storage` | 2 files | 2 test files | 23 tests |
+| `query-params` | 4 files | 4 test files | 31 tests |
+| `cli` | 2 files | 2 test files | 2 tests |
+
+**Total from completed crates: 11 source files refactored, 11 test files created, 94 tests migrated** ✅
+
+#### Detailed Breakdown
+
+**validation crate** (3/3 files):
+- `src/lib.rs` → `tests/lib_tests.rs` (24 tests)
+- `src/http.rs` → `tests/http_tests.rs` (9 tests)
+- `src/status.rs` → `tests/status_tests.rs` (5 tests)
+
+**storage crate** (2/2 files):
+- `src/lib.rs` → `tests/lib_tests.rs` (12 tests)
+- `src/user_storage.rs` → `tests/user_storage_tests.rs` (11 tests)
+
+**query-params crate** (4/4 files):
+- `src/filter.rs` → `tests/filter_tests.rs` (5 tests - from PR #1)
+- `src/pagination.rs` → `tests/pagination_tests.rs` (13 tests)
+- `src/parser.rs` → `tests/parser_tests.rs` (7 tests)
+- `src/sort.rs` → `tests/sort_tests.rs` (6 tests)
+
+**cli crate** (2/2 files):
+- `src/commands/compact.rs` → `tests/compact_tests.rs` (1 test)
+- `src/commands/migrate.rs` → `tests/migrate_tests.rs` (1 test)
 
 ### Changes Made
 
 1. **Test Extraction**: Removed `#[cfg(test)]` modules from source files
 2. **Test File Creation**: Created dedicated test files with clear naming convention
 3. **Import Updates**: Changed `use super::*;` to proper crate imports
-4. **Visibility Updates**: Made necessary private methods public for testing:
-   - `ApiCodeGenerator::generate_api_types()` → `pub`
-   - `ApiCodeGenerator::generate_handlers()` → `pub`
-   - `ApiCodeGenerator::generate_router()` → `pub`
-   - `ApiCodeGenerator::generate_api_mod()` → `pub`
-   - `ApiCodeGenerator::map_field_type_to_rust()` → `pub`
-   - `OpenApiGenerator::type_to_openapi_type()` → `pub`
-   - `TypeScriptGenerator::generate_types()` → `pub`
-   - `TypeScriptGenerator::generate_api_client()` → `pub`
-   - `TypeScriptGenerator::map_field_type_to_ts()` → `pub`
+4. **Visibility Updates**: Made necessary private methods/functions public for testing:
+   - **Main src/**: 
+     - `ApiCodeGenerator::generate_api_types()` → `pub`
+     - `ApiCodeGenerator::generate_handlers()` → `pub`
+     - `ApiCodeGenerator::generate_router()` → `pub`
+     - `ApiCodeGenerator::generate_api_mod()` → `pub`
+     - `ApiCodeGenerator::map_field_type_to_rust()` → `pub`
+     - `OpenApiGenerator::type_to_openapi_type()` → `pub`
+     - `TypeScriptGenerator::generate_types()` → `pub`
+     - `TypeScriptGenerator::generate_api_client()` → `pub`
+     - `TypeScriptGenerator::map_field_type_to_ts()` → `pub`
+   - **CLI crate**:
+     - `format_bytes()` in `commands/compact.rs` → `pub`
 
 ## Test Results
-- **Before refactoring**: 79 tests passing
-- **After refactoring**: 79 tests passing ✅
-- **New external tests**: All passing ✅
+- **Before refactoring**: 79 tests passing (main src/)
+- **After main src/ refactoring**: 79 tests passing ✅
+- **After crate refactoring**: 94 additional tests passing ✅
+- **Total tests migrated**: 173 tests (79 + 94)
 - **Build status**: Clean with no errors ✅
 
 ## Remaining Work 📋
 
-**Crates to Refactor** (47 files remaining)
+**Crates to Refactor** (41 files remaining across 10 crates)
 
 The following crates still have embedded unit tests that should be moved to dedicated test files:
+
+#### High Priority (Large test modules) - ~2,200 test lines remaining
 
 #### High Priority (Large test modules)
 1. **storage** (2 files)
@@ -148,9 +180,16 @@ All refactored tests verified with:
 cargo test
 ```
 
-Result: **All 124 tests passing** (79 from refactored modules + 45 from other sources)
+Result: **All tests passing** ✅
+- **Main src/** tests: 79 passing
+- **Refactored crate** tests: 94 passing (validation: 38, storage: 23, query-params: 31, cli: 2)
+- **Remaining embedded** tests: Still in source files
+- **Other tests**: Integration tests, etc.
 
 ---
 
 **Last Updated**: 2025-10-19
-**Status**: In Progress (main src/ complete, crates/ partially complete)
+**Status**: In Progress
+- ✅ **Main src/ complete** (7 files refactored, 79 tests migrated)
+- ✅ **4 crates complete** (11 files refactored, 94 tests migrated)
+- 📋 **10 crates remaining** (41 files with embedded tests)
