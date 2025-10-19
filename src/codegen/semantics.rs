@@ -60,7 +60,11 @@ pub fn map_field_type_to_rust_tokens(field_type: &FieldType, for_response: bool)
         FieldType::F64 => quote! { f64 },
         FieldType::Bool => quote! { bool },
         FieldType::String => quote! { String },
-        FieldType::Uuid => quote! { uuid::Uuid },
+        FieldType::Uuid => {
+            // Use just Uuid since we import it
+            let ident = syn::Ident::new("Uuid", proc_macro2::Span::call_site());
+            quote! { #ident }
+        }
         FieldType::Timestamp => quote! { i64 }, // Unix timestamp
         FieldType::Char(size) => {
             let size_lit = proc_macro2::Literal::usize_unsuffixed(*size);
@@ -80,8 +84,14 @@ pub fn map_field_type_to_rust_tokens(field_type: &FieldType, for_response: bool)
             quote! { Option<#ident> }
         }
         FieldType::Relation(rel_type) => match rel_type {
-            RelationType::RequiredReference(_) => quote! { uuid::Uuid },
-            RelationType::OptionalReference(_) => quote! { Option<uuid::Uuid> },
+            RelationType::RequiredReference(_) => {
+                let ident = syn::Ident::new("Uuid", proc_macro2::Span::call_site());
+                quote! { #ident }
+            }
+            RelationType::OptionalReference(_) => {
+                let ident = syn::Ident::new("Uuid", proc_macro2::Span::call_site());
+                quote! { Option<#ident> }
+            }
             _ => quote! { () }, // Virtual fields
         },
         FieldType::Component(_) => quote! { () }, // Component references are virtual
@@ -208,7 +218,7 @@ mod tests {
         assert_eq!(tokens.to_string(), "String");
 
         let tokens = map_field_type_to_rust_tokens(&FieldType::Uuid, false);
-        assert_eq!(tokens.to_string(), "uuid :: Uuid");
+        assert_eq!(tokens.to_string(), "Uuid");
 
         let tokens = map_field_type_to_rust_tokens(&FieldType::U32, false);
         assert_eq!(tokens.to_string(), "u32");

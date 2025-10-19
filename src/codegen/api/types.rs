@@ -188,7 +188,7 @@ mod tests {
         assert!(file.content.contains("pub email: String"));
         // CreateRequest shouldn't have auto-generated fields
         assert!(!file.content.contains("CreateUserRequest {\n    pub id:"));
-        // But UserResponse should have all fields including id
-        assert!(file.content.contains("pub id: uuid::Uuid"));
+        // But UserResponse should have all fields including id (now without uuid:: prefix)
+        assert!(file.content.contains("pub id: Uuid"));
     }
 }

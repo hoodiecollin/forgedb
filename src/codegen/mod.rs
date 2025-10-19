@@ -5,6 +5,7 @@ pub mod generator;
 pub mod ir;
 pub mod model_gen;
 pub mod naming;
+pub mod openapi;
 pub mod output;
 pub mod query;
 pub mod relations;
