@@ -220,7 +220,9 @@ pub async fn list_user(
     // Apply pagination from params.pagination
     Json(json!({
         "data": [],
-        "count": 0
+        "total": 0,
+        "limit": 100,
+        "offset": 0
     }))
 }
 

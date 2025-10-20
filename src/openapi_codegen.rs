@@ -8,7 +8,7 @@
 //! - Computed field documentation
 
 use crate::ast::{Field, FieldType, Model, RelationType, Schema};
-use crate::codegen::GeneratedFile;
+use crate::codegen::{naming, GeneratedFile};
 use serde_json::{json, Value};
 
 pub struct OpenApiGenerator;
@@ -162,7 +162,7 @@ impl OpenApiGenerator {
     fn add_model_paths(spec: &mut Value, model: &Model) {
         let paths = spec["paths"].as_object_mut().unwrap();
         let model_lower = model.name.to_lowercase();
-        let model_plural = format!("{}s", model_lower);
+        let model_plural = naming::pluralize(&model_lower);
 
         // List endpoint: GET /api/models
         paths.insert(
@@ -574,7 +574,7 @@ impl OpenApiGenerator {
     /// Document a single model in markdown
     fn document_model(content: &mut String, model: &Model) {
         let model_lower = model.name.to_lowercase();
-        let model_plural = format!("{}s", model_lower);
+        let model_plural = naming::pluralize(&model_lower);
 
         content.push_str(&format!("## {}\n\n", model.name));
 
