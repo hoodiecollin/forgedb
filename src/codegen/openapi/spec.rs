@@ -194,8 +194,11 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                                             "type": "array",
                                             "items": { "$ref": format!("#/components/schemas/{}", model.name) }
                                         },
-                                        "count": { "type": "integer" }
-                                    }
+                                        "total": { "type": "integer", "description": "Total count of items matching the query" },
+                                        "limit": { "type": "integer", "description": "Maximum number of items returned" },
+                                        "offset": { "type": "integer", "description": "Number of items skipped" }
+                                    },
+                                    "required": ["data", "total", "limit", "offset"]
                                 }
                             }
                         }

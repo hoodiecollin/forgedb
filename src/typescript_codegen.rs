@@ -133,7 +133,9 @@ impl TypeScriptGenerator {
 
         code.push_str("export interface ListResponse<T> {\n");
         code.push_str("  data: T[];\n");
-        code.push_str("  count: number;\n");
+        code.push_str("  total: number;\n");
+        code.push_str("  limit: number;\n");
+        code.push_str("  offset: number;\n");
         code.push_str("}\n");
 
         GeneratedFile {
