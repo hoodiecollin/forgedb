@@ -182,10 +182,7 @@ User {
         types_file.content.contains("pub struct UserResponse"),
         "Should generate UserResponse struct"
     );
-    assert!(
-        types_file.content.contains("// Computed fields"),
-        "Should have computed fields comment"
-    );
+    // The new quote-based generator includes computed fields without a comment
     assert!(
         types_file.content.contains("pub full_name: String"),
         "Response should include full_name computed field"

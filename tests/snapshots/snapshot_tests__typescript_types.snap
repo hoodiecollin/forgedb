@@ -1,0 +1,55 @@
+---
+source: tests/snapshot_tests.rs
+expression: file.content
+---
+// Auto-generated TypeScript types
+
+export interface User {
+  id: string;
+  email: string;
+  name: string;
+}
+
+export interface CreateUserRequest {
+  email: string;
+  name: string;
+}
+
+export interface UpdateUserRequest {
+  email?: string;
+  name?: string;
+}
+
+export interface Post {
+  id: string;
+  title: string;
+  content: string;
+  author_id: string;
+}
+
+export interface CreatePostRequest {
+  title: string;
+  content: string;
+  author_id: string;
+}
+
+export interface UpdatePostRequest {
+  title?: string;
+  content?: string;
+  author_id?: string;
+}
+
+export interface QueryParams {
+  limit?: number;
+  offset?: number;
+  sort?: string;
+  order?: 'asc' | 'desc';
+  [key: string]: any; // Filter params
+}
+
+export interface ListResponse<T> {
+  data: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}

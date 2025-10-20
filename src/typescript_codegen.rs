@@ -7,7 +7,7 @@
 //! - NPM package structure with bundling config
 
 use crate::ast::{Field, FieldType, Model, RelationType, Schema};
-use crate::codegen::GeneratedFile;
+use crate::codegen::{naming, semantics, GeneratedFile};
 use crate::typescript_component_props::ComponentPropsGenerator;
 
 pub struct TypeScriptGenerator;
@@ -67,9 +67,9 @@ impl TypeScriptGenerator {
             code.push_str(&format!("export interface {} {{\n", model.name));
             for field in &model.fields {
                 // Skip virtual relation fields (OneToMany, ManyToMany)
-                if !Self::is_virtual_field(field) {
+                if !semantics::is_virtual_field(field) {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if Self::is_optional(&field.field_type) {
+                    let optional = if semantics::is_optional_field(field) {
                         "?"
                     } else {
                         ""
@@ -96,9 +96,9 @@ impl TypeScriptGenerator {
                 model.name
             ));
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
+                if !field.auto_generate && !semantics::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if Self::is_optional(&field.field_type) {
+                    let optional = if semantics::is_optional_field(field) {
                         "?"
                     } else {
                         ""
@@ -114,7 +114,7 @@ impl TypeScriptGenerator {
                 model.name
             ));
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) && !field.is_computed {
+                if !field.auto_generate && !semantics::is_virtual_field(field) && !field.is_computed {
                     let ts_type = Self::map_field_type_to_ts(&field.field_type);
                     code.push_str(&format!("  {}?: {};\n", field.name, ts_type));
                 }
@@ -156,9 +156,9 @@ impl TypeScriptGenerator {
     }
 
     /// Generate API client for a model
-    pub fn generate_api_client(model: &Model, schema: &Schema) -> GeneratedFile {
+    pub fn generate_api_client(model: &Model, _schema: &Schema) -> GeneratedFile {
         let model_lower = model.name.to_lowercase();
-        let plural = format!("{}s", model_lower); // Simple pluralization
+        let plural = naming::pluralize(&model_lower);
         let mut code = String::new();
 
         // Imports
@@ -519,7 +519,7 @@ export default defineConfig({
 
             // Show first non-auto field as example
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) {
+                if !field.auto_generate && !semantics::is_virtual_field(field) {
                     let example_value = Self::example_value_for_type(&field.field_type);
                     content.push_str(&format!("  {}: {},\n", field.name, example_value));
                     break;
@@ -533,7 +533,7 @@ export default defineConfig({
                 model_lower
             ));
             for field in &model.fields {
-                if !field.auto_generate && !Self::is_virtual_field(field) {
+                if !field.auto_generate && !semantics::is_virtual_field(field) {
                     let example_value = Self::example_value_for_type(&field.field_type);
                     content.push_str(&format!("  {}: {},\n", field.name, example_value));
                     break;
@@ -605,25 +605,6 @@ export default defineConfig({
             },
             FieldType::Component(_) => "null".to_string(), // Component references are not stored
         }
-    }
-
-    /// Check if field is virtual (doesn't store data)
-    fn is_virtual_field(field: &Field) -> bool {
-        matches!(
-            &field.field_type,
-            FieldType::Relation(RelationType::OneToMany(_))
-                | FieldType::Relation(RelationType::ManyToMany(_))
-                | FieldType::Component(_)
-        )
-    }
-
-    /// Check if type is optional
-    fn is_optional(field_type: &FieldType) -> bool {
-        matches!(
-            field_type,
-            FieldType::OptionalStructType(_)
-                | FieldType::Relation(RelationType::OptionalReference(_))
-        )
     }
 
     /// Generate example value for documentation

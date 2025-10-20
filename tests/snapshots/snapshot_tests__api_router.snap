@@ -1,0 +1,24 @@
+---
+source: tests/snapshot_tests.rs
+expression: file.content
+---
+use axum::{
+    routing::{delete, get, post, put},
+    Router,
+};
+use super::user_handlers;
+use super::post_handlers;
+/// Create the API router with all endpoints
+pub fn create_router() -> Router {
+    Router::new()
+        .route("/api/users", get(user_handlers::list_user))
+        .route("/api/users", post(user_handlers::create_user))
+        .route("/api/users/:id", get(user_handlers::get_user))
+        .route("/api/users/:id", put(user_handlers::update_user))
+        .route("/api/users/:id", delete(user_handlers::delete_user))
+        .route("/api/posts", get(post_handlers::list_post))
+        .route("/api/posts", post(post_handlers::create_post))
+        .route("/api/posts/:id", get(post_handlers::get_post))
+        .route("/api/posts/:id", put(post_handlers::update_post))
+        .route("/api/posts/:id", delete(post_handlers::delete_post))
+}
