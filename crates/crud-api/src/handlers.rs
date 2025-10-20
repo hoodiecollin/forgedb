@@ -98,17 +98,33 @@ impl<T: CrudOperations> CrudHandlers<T> {
     }
 }
 
-/// Response wrapper for list operations with metadata
+/// Response wrapper for list operations with pagination metadata
 #[derive(Debug, Serialize)]
 pub struct ListResponse<T: Serialize> {
     pub data: Vec<T>,
-    pub count: usize,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
 }
 
 impl<T: Serialize> ListResponse<T> {
     pub fn new(data: Vec<T>) -> Self {
-        let count = data.len();
-        Self { data, count }
+        let total = data.len();
+        Self {
+            data,
+            total,
+            limit: 100,
+            offset: 0,
+        }
+    }
+    
+    pub fn with_pagination(data: Vec<T>, total: usize, limit: usize, offset: usize) -> Self {
+        Self {
+            data,
+            total,
+            limit,
+            offset,
+        }
     }
 }
 

@@ -162,5 +162,7 @@ fn test_list_response() {
         name: "Test".to_string(),
     }];
     let response = ListResponse::new(data);
-    assert_eq!(response.count, 1);
+    assert_eq!(response.total, 1);
+    assert_eq!(response.limit, 100);
+    assert_eq!(response.offset, 0);
 }

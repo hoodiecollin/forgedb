@@ -50,6 +50,7 @@ forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
 forgedb-fulltext = { path = "crates/fulltext" }
 forgedb-query-optimization = { path = "crates/query-optimization" }
+insta = { version = "1.34", features = ["yaml"] }
 
 [lib]
 name = "forgedb"

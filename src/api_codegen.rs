@@ -22,17 +22,17 @@ impl ApiCodeGenerator {
     }
 
     /// Generate request/response types for a model
-    fn generate_api_types(model: &Model) -> GeneratedFile {
+    pub fn generate_api_types(model: &Model) -> GeneratedFile {
         crate::codegen::api::types::generate_api_types(model)
     }
 
     /// Generate handler functions for a model
-    fn generate_handlers(model: &Model) -> GeneratedFile {
+    pub fn generate_handlers(model: &Model) -> GeneratedFile {
         crate::codegen::api::handlers::generate_handlers(model)
     }
 
     /// Generate router setup
-    fn generate_router(schema: &Schema) -> GeneratedFile {
+    pub fn generate_router(schema: &Schema) -> GeneratedFile {
         crate::codegen::api::router::generate_router(schema)
     }
 
@@ -60,12 +60,12 @@ impl ApiCodeGenerator {
     }
 
     /// Check if field is virtual (relation or component that doesn't store data)
-    fn is_virtual_field(field: &Field) -> bool {
+    pub fn is_virtual_field(field: &Field) -> bool {
         crate::codegen::semantics::is_virtual_field(field)
     }
 
     /// Map FieldType to Rust type for API
-    fn map_field_type_to_rust(field_type: &FieldType, for_response: bool) -> String {
+    pub fn map_field_type_to_rust(field_type: &FieldType, for_response: bool) -> String {
         let tokens = crate::codegen::semantics::map_field_type_to_rust_tokens(field_type, for_response);
         // Convert tokens to string - spaces are kept around ; in arrays
         tokens.to_string().replace(" ", "").replace(";", "; ")
