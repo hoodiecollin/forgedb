@@ -1,8 +1,3 @@
-// Sprint 2: Storage Persistence Implementation
-
-pub mod user_storage;
-pub use user_storage::{User, UserStorage};
-
 // Sprint 7: WAL re-exports
 pub use forgedb_wal::{
     FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue,
@@ -382,4 +377,3 @@ impl Database {
         self.root_path.join("tombstones.bin")
     }
 }
-
