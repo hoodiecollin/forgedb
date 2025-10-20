@@ -1,4 +1,5 @@
 pub mod api;
+pub mod code_writer;
 pub mod computed;
 pub mod config;
 pub mod constraints;
@@ -17,6 +18,7 @@ pub mod storage_gen;
 pub mod utils;
 pub mod validation_gen;
 
+pub use code_writer::CodeWriter;
 pub use config::CodegenConfig;
 pub use generator::CodeGenerator;
 
