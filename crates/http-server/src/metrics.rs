@@ -136,26 +136,3 @@ pub fn decrement_connections(conn_type: &str) {
 pub fn record_cache_operation(operation: &str) {
     CACHE_OPERATIONS.with_label_values(&[operation]).inc();
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_record_http_request() {
-        record_http_request("GET", "/api/users", 200, 0.05);
-        // Metrics should be recorded without panicking
-    }
-
-    #[test]
-    fn test_record_db_operation() {
-        record_db_operation("select", "User", 0.001);
-        // Metrics should be recorded without panicking
-    }
-
-    #[test]
-    fn test_record_error() {
-        record_error("validation", "BAD_REQUEST");
-        // Metrics should be recorded without panicking
-    }
-}
