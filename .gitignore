@@ -13,3 +13,4 @@ bun.lockb
 Cargo.lock
 generated/
 generated_*/
+.envrc
