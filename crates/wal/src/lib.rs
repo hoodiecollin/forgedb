@@ -19,7 +19,7 @@ mod writer;
 
 pub use entry::{WalEntry, WalOperation, WalValue};
 pub use reader::WalReader;
-pub use transaction::{Transaction, TransactionId};
+pub use transaction::{Transaction, TransactionId, TransactionReplay};
 pub use writer::{FsyncPolicy, WalWriter};
 
 /// WAL file format:
