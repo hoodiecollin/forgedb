@@ -1,7 +1,7 @@
 use crate::ast::{
-    ComponentProtocol, ComponentReference, Field, FieldType, Model, RelationInclusion, Schema,
+    ComponentProtocol, ComponentReference, FieldType, RelationInclusion, Schema,
 };
-use crate::codegen::GeneratedFile;
+use crate::codegen::{ir::IrSchema, GeneratedFile};
 
 pub struct ComponentStubGenerator;
 
@@ -16,24 +16,25 @@ impl ComponentStubGenerator {
         ComponentStubGenerator
     }
 
-    /// Generate component stubs for all component fields in the schema
+    /// Generate component stubs for all component fields in the schema using IR
     pub fn generate_stubs(
         &self,
         schema: &Schema,
         template: StubTemplate,
     ) -> Vec<GeneratedFile> {
+        let ir_schema = IrSchema::from_ast(schema.clone());
         let mut files = vec![];
 
-        for model in &schema.models {
-            for field in &model.fields {
-                if let FieldType::Component(component_ref) = &field.field_type {
+        for ir_model in &ir_schema.models {
+            for ir_field in &ir_model.fields {
+                if let FieldType::Component(component_ref) = &ir_field.field_type {
                     match component_ref.protocol {
                         ComponentProtocol::Tsx | ComponentProtocol::Jsx => {
                             files.push(self.generate_react_component_stub(
-                                &model.name,
-                                &field.name,
+                                &ir_model.name,
+                                &ir_field.name,
                                 component_ref,
-                                &model.fields,
+                                ir_model,
                                 template,
                             ));
                         }
@@ -48,13 +49,13 @@ impl ComponentStubGenerator {
         files
     }
 
-    /// Generate a React/TSX component stub
+    /// Generate a React/TSX component stub using IR
     fn generate_react_component_stub(
         &self,
         model_name: &str,
         field_name: &str,
         component_ref: &ComponentReference,
-        model_fields: &[Field],
+        ir_model: &crate::codegen::ir::IrModel,
         template: StubTemplate,
     ) -> GeneratedFile {
         let mut code = String::new();
@@ -82,7 +83,7 @@ impl ComponentStubGenerator {
                     &component_name,
                     &props_type,
                     model_name,
-                    model_fields,
+                    ir_model,
                     component_ref,
                 );
             }
@@ -115,14 +116,14 @@ impl ComponentStubGenerator {
         code.push_str("}\n");
     }
 
-    /// Generate detailed component stub with all fields rendered
+    /// Generate detailed component stub with all fields rendered using IR
     fn generate_detailed_component(
         &self,
         code: &mut String,
         component_name: &str,
         props_type: &str,
-        model_name: &str,
-        model_fields: &[Field],
+        _model_name: &str,
+        ir_model: &crate::codegen::ir::IrModel,
         component_ref: &ComponentReference,
     ) {
         code.push_str(&format!(
@@ -135,45 +136,42 @@ impl ComponentStubGenerator {
             Self::kebab_case(component_name)
         ));
 
-        // Render data fields
+        // Render data fields using IR stored fields
         code.push_str("      <div className=\"data\">\n");
-        for field in model_fields {
-            if !field.field_type.is_relation() && !matches!(field.field_type, FieldType::Component(_)) {
-                code.push_str(&format!(
-                    "        <div className=\"field\">\n          <label>{}</label>\n          <span>{{data.{}}}</span>\n        </div>\n",
-                    Self::humanize(&field.name),
-                    field.name
-                ));
-            }
+        for ir_field in &ir_model.stored_fields {
+            code.push_str(&format!(
+                "        <div className=\"field\">\n          <label>{}</label>\n          <span>{{data.{}}}</span>\n        </div>\n",
+                Self::humanize(&ir_field.name),
+                ir_field.name
+            ));
         }
         code.push_str("      </div>\n");
 
-        // Render computed fields if any
-        let computed_fields: Vec<_> = model_fields.iter().filter(|f| f.is_computed).collect();
-        if !computed_fields.is_empty() {
+        // Render computed fields using IR
+        if !ir_model.computed_fields.is_empty() {
             code.push_str("\n      {computed && (\n");
             code.push_str("        <div className=\"computed\">\n");
-            for field in computed_fields {
+            for ir_field in &ir_model.computed_fields {
                 code.push_str(&format!(
                     "          <div className=\"field\">\n            <label>{}</label>\n            <span>{{computed.{}}}</span>\n          </div>\n",
-                    Self::humanize(&field.name),
-                    field.name
+                    Self::humanize(&ir_field.name),
+                    ir_field.name
                 ));
             }
             code.push_str("        </div>\n");
             code.push_str("      )}\n");
         }
 
-        // Render relations based on @relations directive
+        // Render relations based on @relations directive using IR
         if !matches!(component_ref.relations, RelationInclusion::None) {
             code.push_str("\n      {relations && (\n");
             code.push_str("        <div className=\"relations\">\n");
 
             let relation_fields: Vec<_> = match &component_ref.relations {
                 RelationInclusion::All => {
-                    model_fields.iter().filter(|f| f.field_type.is_relation()).collect()
+                    ir_model.virtual_fields.iter().filter(|f| f.field_type.is_relation()).collect()
                 }
-                RelationInclusion::Specific(names) => model_fields
+                RelationInclusion::Specific(names) => ir_model.fields
                     .iter()
                     .filter(|f| names.contains(&f.name))
                     .collect(),
