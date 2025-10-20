@@ -9,6 +9,9 @@
 pub mod markdown;
 pub mod spec;
 
+#[cfg(test)]
+mod tests;
+
 use crate::ast::Schema;
 use crate::codegen::GeneratedFile;
 
