@@ -4,7 +4,6 @@ members = [
     "crates/storage",
     "crates/types",
     "crates/validation",
-    "crates/tests",
     "crates/cli",
     "crates/watcher",
     "crates/wal",

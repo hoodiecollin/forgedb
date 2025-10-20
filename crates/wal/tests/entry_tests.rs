@@ -1,4 +1,5 @@
 use forgedb_wal::*;
+use std::collections::HashMap;
 
 #[test]
 fn test_wal_value_u64() {
