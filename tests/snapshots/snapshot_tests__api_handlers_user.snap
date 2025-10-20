@@ -1,0 +1,42 @@
+---
+source: tests/snapshot_tests.rs
+expression: file.content
+---
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode, response::{IntoResponse, Json},
+};
+use serde_json::json;
+use std::sync::Arc;
+use uuid::Uuid;
+use forgedb_query_params::QueryParams;
+use super::user_types::*;
+///List all users
+pub async fn list_user(Query(params): Query<QueryParams>) -> impl IntoResponse {
+    Json(
+        json!(
+            { "data" : [], "total" : 0, "limit" : params.pagination.as_ref().map(| p | p
+            .limit).unwrap_or(100), "offset" : params.pagination.as_ref().map(| p | p
+            .offset).unwrap_or(0) }
+        ),
+    )
+}
+///Get User by ID
+pub async fn get_user(Path(id): Path<Uuid>) -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Json(json!({ "error" : "Not found" })))
+}
+///Create a new User
+pub async fn create_user(Json(req): Json<CreateUserRequest>) -> impl IntoResponse {
+    (StatusCode::CREATED, Json(json!({ "id" : Uuid::new_v4() })))
+}
+///Update an existing User
+pub async fn update_user(
+    Path(id): Path<Uuid>,
+    Json(req): Json<UpdateUserRequest>,
+) -> impl IntoResponse {
+    (StatusCode::OK, Json(json!({ "id" : id })))
+}
+///Delete a User
+pub async fn delete_user(Path(id): Path<Uuid>) -> impl IntoResponse {
+    StatusCode::NO_CONTENT
+}

@@ -1,0 +1,90 @@
+---
+source: tests/snapshot_tests.rs
+expression: file.content
+---
+import type { User, CreateUserRequest, UpdateUserRequest, QueryParams, ListResponse } from './types';
+
+export class UserApi {
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+
+  /**
+   * List all users with optional filtering, sorting, and pagination
+   */
+  async list(params?: QueryParams): Promise<ListResponse<User>> {
+    const queryString = params ? '?' + new URLSearchParams(params as any).toString() : '';
+    const response = await fetch(`${{this.baseUrl}}/api/users${{queryString}}`);
+    if (!response.ok) {
+      throw new Error(`Failed to list {}: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Get a single user by ID
+   */
+  async get(id: string): Promise<User> {
+    const response = await fetch(`${{this.baseUrl}}/api/users/${{id}}`);
+    if (!response.ok) {
+      throw new Error(`Failed to get {}: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Create a new user
+   */
+  async create(data: CreateUserRequest): Promise<User> {
+    const response = await fetch(`${{this.baseUrl}}/api/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to create {}: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Update an existing user
+   */
+  async update(id: string, data: UpdateUserRequest): Promise<User> {
+    const response = await fetch(`${{this.baseUrl}}/api/users/${{id}}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to update {}: ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  /**
+   * Delete a user
+   */
+  async delete(id: string): Promise<void> {
+    const response = await fetch(`${{this.baseUrl}}/api/users/${{id}}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to delete {}: ${response.statusText}`);
+    }
+  }
+
+  /**
+   * Get related posts for this user
+   */
+  async posts(id: string, params?: QueryParams): Promise<ListResponse<Post>> {
+    const queryString = params ? '?' + new URLSearchParams(params as any).toString() : '';
+    const response = await fetch(`${{this.baseUrl}}/api/users/${{id}}/posts${{queryString}}`);
+    if (!response.ok) {
+      throw new Error(`Failed to get posts for user: ${response.statusText}`);
+    }
+    return response.json();
+  }
+}
