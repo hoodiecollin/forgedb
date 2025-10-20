@@ -1,6 +1,7 @@
 use crate::ast::{
-    ComponentProtocol, ComponentReference, Field, FieldType, Model, RelationInclusion, Schema,
+    ComponentProtocol, ComponentReference, Field, FieldType, RelationInclusion, Schema,
 };
+use crate::codegen::ir::IrSchema;
 
 pub struct ComponentPropsGenerator;
 
@@ -9,27 +10,28 @@ impl ComponentPropsGenerator {
         ComponentPropsGenerator
     }
 
-    /// Generate component props types for all component fields in the schema
+    /// Generate component props types for all component fields in the schema using IR
     pub fn generate_props_types(&self, schema: &Schema) -> String {
+        let ir_schema = IrSchema::from_ast(schema.clone());
         let mut content = String::new();
 
         content.push_str("// Auto-generated TypeScript component props types\n");
         content.push_str("// DO NOT EDIT - This file is generated from your schema\n\n");
 
-        // Generate props for each model's component fields
-        for model in &schema.models {
-            for field in &model.fields {
-                if let FieldType::Component(component_ref) = &field.field_type {
+        // Generate props for each model's component fields using IR
+        for ir_model in &ir_schema.models {
+            for ir_field in &ir_model.fields {
+                if let FieldType::Component(component_ref) = &ir_field.field_type {
                     // Only generate props for TSX/JSX components (not API routes)
                     if matches!(
                         component_ref.protocol,
                         ComponentProtocol::Tsx | ComponentProtocol::Jsx
                     ) {
                         content.push_str(&self.generate_component_props(
-                            &model.name,
-                            &field.name,
+                            &ir_model.name,
+                            &ir_field.name,
                             component_ref,
-                            &model.fields,
+                            &ir_model,
                             schema,
                         ));
                         content.push('\n');
@@ -41,13 +43,13 @@ impl ComponentPropsGenerator {
         content
     }
 
-    /// Generate props type for a single component
+    /// Generate props type for a single component using IR
     fn generate_component_props(
         &self,
         model_name: &str,
         field_name: &str,
         component_ref: &ComponentReference,
-        model_fields: &[Field],
+        ir_model: &crate::codegen::ir::IrModel,
         schema: &Schema,
     ) -> String {
         let mut content = String::new();
@@ -56,7 +58,7 @@ impl ComponentPropsGenerator {
         let type_name = format!(
             "{}{}Props",
             model_name,
-            Self::capitalize_first(&field_name)
+            Self::capitalize_first(field_name)
         );
 
         content.push_str(&format!("export type {} = {{\n", type_name));
@@ -64,19 +66,19 @@ impl ComponentPropsGenerator {
         // Always include the data field with the model type
         content.push_str(&format!("  data: {};\n", model_name));
 
-        // Check if model has computed fields
-        if model_fields.iter().any(|f| f.is_computed) {
+        // Check if model has computed fields using IR
+        if !ir_model.computed_fields.is_empty() {
             content.push_str(&format!("  computed?: {}Computed;\n", model_name));
         }
 
-        // Add relations based on the @relations directive
+        // Add relations based on the @relations directive using IR
         match &component_ref.relations {
             RelationInclusion::None => {
                 // No relations included
             }
             RelationInclusion::All => {
-                // Include all relation fields
-                let relation_fields: Vec<_> = model_fields
+                // Include all relation fields using IR's virtual_fields
+                let relation_fields: Vec<_> = ir_model.virtual_fields
                     .iter()
                     .filter(|f| f.field_type.is_relation())
                     .collect();
@@ -91,17 +93,17 @@ impl ComponentPropsGenerator {
                 }
             }
             RelationInclusion::Specific(fields) => {
-                // Include specific relation fields
+                // Include specific relation fields using IR
                 if !fields.is_empty() {
                     content.push_str("  relations?: {\n");
                     for field_name in fields {
-                        // Find the field in the model
-                        if let Some(field) = model_fields.iter().find(|f| &f.name == field_name) {
-                            if field.field_type.is_relation() {
+                        // Find the field in IR's fields
+                        if let Some(ir_field) = ir_model.fields.iter().find(|f| &f.name == field_name) {
+                            if ir_field.field_type.is_relation() {
                                 let rel_type =
-                                    self.get_relation_type_name(&field.field_type, schema);
+                                    self.get_relation_type_name(&ir_field.field_type, schema);
                                 content
-                                    .push_str(&format!("    {}?: {};\n", field.name, rel_type));
+                                    .push_str(&format!("    {}?: {};\n", ir_field.name, rel_type));
                             }
                         }
                     }
