@@ -19,17 +19,24 @@ Successfully refactored **7 modules**, moving tests to the root `tests/` directo
 | `src/openapi_codegen.rs` | `tests/openapi_codegen_tests.rs` | 2 tests |
 | `src/typescript_codegen.rs` | `tests/typescript_codegen_tests.rs` | 3 tests |
 | `src/typescript_component_props.rs` | `tests/typescript_component_props_tests.rs` | 2 tests |
-| `src/parser/mod.rs` | `src/parser/tests.rs` | 54 tests (already separated) |
+| `src/parser/tests.rs` | `tests/parser_tests.rs` | 54 tests |
 
 **Total: 79 unit tests successfully refactored and verified**
 
-**Crates** (`crates/*/`)
+### Crate Modules (`crates/*/`)
 
-Started refactoring crate modules with example implementation:
+Successfully refactored **high-priority crates** with largest test modules:
 
-| Crate | Module | Test File | Tests Moved |
-|-------|--------|-----------|-------------|
+| Crate | Modules Refactored | Test Files Created | Tests Moved |
+|-------|-------------------|-------------------|-------------|
 | `query-params` | `filter.rs` | `tests/filter_tests.rs` | 5 tests |
+| `validation` | `lib.rs`, `http.rs`, `status.rs` | `tests/lib_tests.rs`, `tests/http_tests.rs`, `tests/status_tests.rs` | 38 tests |
+| `storage` | `lib.rs`, `user_storage.rs` | `tests/lib_tests.rs`, `tests/user_storage_tests.rs` | 23 tests |
+| `query-optimization` | `planner.rs`, `scan.rs`, `statistics.rs` | `tests/planner_tests.rs`, `tests/scan_tests.rs`, `tests/statistics_tests.rs` | 22 tests |
+| `compaction` | `compactor.rs`, `stats.rs`, `background.rs`, `lib.rs` | `tests/compactor_tests.rs`, `tests/stats_tests.rs`, `tests/background_tests.rs`, `tests/lib_tests.rs` | 10 tests |
+| `crud-api` | `handlers.rs`, `operations.rs`, `lib.rs` | `tests/handlers_tests.rs`, `tests/operations_tests.rs`, `tests/lib_tests.rs` | 13 tests |
+
+**Crates Total: 111 tests migrated from 17 source files**
 
 ### Changes Made
 
@@ -46,10 +53,16 @@ Started refactoring crate modules with example implementation:
    - `TypeScriptGenerator::generate_types()` → `pub`
    - `TypeScriptGenerator::generate_api_client()` → `pub`
    - `TypeScriptGenerator::map_field_type_to_ts()` → `pub`
+   - `Compactor::compact_variable_column()` → `pub`
+   - `Compactor::compact_fixed_column()` → `pub`
+5. **Module Exports**: Updated public API exports:
+   - `crud-api`: Exported `CrudError`, `ListResponse` for testing
+   - `compaction`: Exported `CompactionConfig`, `CompactionStatus`, `ColumnType` for testing
 
 ## Test Results
-- **Before refactoring**: 79 tests passing
-- **After refactoring**: 79 tests passing ✅
+- **Before refactoring**: 79 tests passing (main src/)
+- **After Phase 1**: 79 tests passing ✅
+- **After Phase 2**: 190 tests passing ✅ (79 main + 111 crates)
 - **New external tests**: All passing ✅
 - **Build status**: Clean with no errors ✅
 
