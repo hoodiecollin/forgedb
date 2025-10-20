@@ -112,6 +112,13 @@ impl IrModel {
         }
     }
     
+    /// Get the API resource name (pluralized, lowercase)
+    pub fn relation_name_for_api(&self) -> String {
+        use crate::codegen::naming;
+        let lower = self.name.to_lowercase();
+        naming::pluralize(&lower)
+    }
+    
     /// Get fields that should appear in Create requests
     pub fn create_request_fields(&self) -> Vec<&IrField> {
         self.fields

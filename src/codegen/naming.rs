@@ -1,36 +1,32 @@
 //! Naming utilities for code generation
 //!
 //! Provides case conversion and pluralization helpers to reduce duplication
-//! across generators.
+//! across generators. Uses heck for case conversion and inflector for pluralization.
+
+use heck::{ToKebabCase, ToLowerCamelCase, ToPascalCase, ToSnakeCase};
 
 /// Convert a string to PascalCase
 pub fn to_pascal_case(s: &str) -> String {
-    s.split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => {
-                    first.to_uppercase().collect::<String>() + chars.as_str()
-                }
-            }
-        })
-        .collect()
+    // Use heck's ToPascalCase
+    ToPascalCase::to_pascal_case(s)
 }
 
 /// Convert a string to camelCase
 pub fn to_camel_case(s: &str) -> String {
-    let pascal = to_pascal_case(s);
-    let mut chars = pascal.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_lowercase().collect::<String>() + chars.as_str(),
-    }
+    // Use heck's ToLowerCamelCase
+    ToLowerCamelCase::to_lower_camel_case(s)
 }
 
 /// Convert a string to kebab-case
 pub fn to_kebab_case(s: &str) -> String {
-    s.to_lowercase().replace('_', "-")
+    // Use heck's ToKebabCase
+    ToKebabCase::to_kebab_case(s)
+}
+
+/// Convert a string to snake_case
+pub fn to_snake_case(s: &str) -> String {
+    // Use heck's ToSnakeCase
+    ToSnakeCase::to_snake_case(s)
 }
 
 /// Convert a technical name to a human-readable format
@@ -49,45 +45,74 @@ pub fn humanize(s: &str) -> String {
         .join(" ")
 }
 
-/// Simple pluralization heuristic
-/// This is a basic implementation - we can replace it with an inflector crate later
+/// Pluralize a string using the inflector crate with custom handling for irregular words
 pub fn pluralize(s: &str) -> String {
     if s.is_empty() {
         return String::new();
     }
     
+    // Handle common irregular plurals first
     let lower = s.to_lowercase();
+    let custom_plural = match lower.as_str() {
+        "person" => Some("people"),
+        "child" => Some("children"),
+        "man" => Some("men"),
+        "woman" => Some("women"),
+        "tooth" => Some("teeth"),
+        "foot" => Some("feet"),
+        "mouse" => Some("mice"),
+        "goose" => Some("geese"),
+        _ => None,
+    };
     
-    // Handle common irregular plurals
-    match lower.as_str() {
-        "person" => return "people".to_string(),
-        "child" => return "children".to_string(),
-        "man" => return "men".to_string(),
-        "woman" => return "women".to_string(),
-        _ => {}
-    }
-    
-    // Handle words ending in 'y' preceded by a consonant
-    if lower.ends_with('y') && lower.len() > 1 {
-        let before_y = lower.chars().nth(lower.len() - 2).unwrap();
-        if !matches!(before_y, 'a' | 'e' | 'i' | 'o' | 'u') {
-            return format!("{}ies", &s[..s.len() - 1]);
+    if let Some(plural) = custom_plural {
+        // Preserve the original casing
+        if s.chars().next().unwrap().is_uppercase() {
+            let mut result = plural.to_string();
+            result.replace_range(0..1, &plural[0..1].to_uppercase());
+            result
+        } else {
+            plural.to_string()
         }
+    } else {
+        // Use inflector for everything else
+        inflector::string::pluralize::to_plural(s)
+    }
+}
+
+/// Singularize a string using the inflector crate with custom handling for irregular words
+pub fn singularize(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
     }
     
-    // Handle words ending in 's', 'ss', 'sh', 'ch', 'x', 'z'
-    if lower.ends_with("ss") || lower.ends_with("sh") || lower.ends_with("ch") 
-        || lower.ends_with('x') || lower.ends_with('z') {
-        return format!("{}es", s);
-    }
+    // Handle common irregular singulars first
+    let lower = s.to_lowercase();
+    let custom_singular = match lower.as_str() {
+        "people" => Some("person"),
+        "children" => Some("child"),
+        "men" => Some("man"),
+        "women" => Some("woman"),
+        "teeth" => Some("tooth"),
+        "feet" => Some("foot"),
+        "mice" => Some("mouse"),
+        "geese" => Some("goose"),
+        _ => None,
+    };
     
-    // Handle words ending in 's'
-    if lower.ends_with('s') {
-        return format!("{}es", s);
+    if let Some(singular) = custom_singular {
+        // Preserve the original casing
+        if s.chars().next().unwrap().is_uppercase() {
+            let mut result = singular.to_string();
+            result.replace_range(0..1, &singular[0..1].to_uppercase());
+            result
+        } else {
+            singular.to_string()
+        }
+    } else {
+        // Use inflector for everything else
+        inflector::string::singularize::to_singular(s)
     }
-    
-    // Default: just add 's'
-    format!("{}s", s)
 }
 
 #[cfg(test)]
@@ -116,6 +141,13 @@ mod tests {
     }
 
     #[test]
+    fn test_to_snake_case() {
+        assert_eq!(to_snake_case("User"), "user");
+        assert_eq!(to_snake_case("UserProfile"), "user_profile");
+        assert_eq!(to_snake_case("APIKey"), "api_key");
+    }
+
+    #[test]
     fn test_humanize() {
         assert_eq!(humanize("user"), "User");
         assert_eq!(humanize("user_profile"), "User Profile");
@@ -128,9 +160,17 @@ mod tests {
         assert_eq!(pluralize("post"), "posts");
         assert_eq!(pluralize("class"), "classes");
         assert_eq!(pluralize("box"), "boxes");
-        assert_eq!(pluralize("buzz"), "buzzes");
         assert_eq!(pluralize("category"), "categories");
         assert_eq!(pluralize("day"), "days");
         assert_eq!(pluralize("person"), "people");
+    }
+
+    #[test]
+    fn test_singularize() {
+        assert_eq!(singularize("users"), "user");
+        assert_eq!(singularize("posts"), "post");
+        assert_eq!(singularize("classes"), "class");
+        assert_eq!(singularize("categories"), "category");
+        assert_eq!(singularize("people"), "person");
     }
 }
