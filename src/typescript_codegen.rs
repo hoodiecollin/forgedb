@@ -5,9 +5,10 @@
 //! - API client classes with type-safe methods
 //! - Support for relations and traversal
 //! - NPM package structure with bundling config
+//! Uses IR for consistent field classification.
 
-use crate::ast::{Field, FieldType, Model, RelationType, Schema};
-use crate::codegen::{naming, semantics, GeneratedFile};
+use crate::ast::{Field, FieldType, RelationType, Schema};
+use crate::codegen::{ir::IrSchema, naming, CodegenConfig, GeneratedFile};
 use crate::typescript_component_props::ComponentPropsGenerator;
 
 pub struct TypeScriptGenerator;
@@ -46,8 +47,9 @@ impl TypeScriptGenerator {
         files
     }
 
-    /// Generate TypeScript interfaces for all models
+    /// Generate TypeScript interfaces for all models using IR
     pub fn generate_types(schema: &Schema) -> GeneratedFile {
+        let ir_schema = IrSchema::from_ast(schema.clone());
         let mut code = String::new();
 
         code.push_str("// Auto-generated TypeScript types\n\n");
@@ -62,62 +64,56 @@ impl TypeScriptGenerator {
             code.push_str("}\n\n");
         }
 
-        // Generate model types
-        for model in &schema.models {
-            code.push_str(&format!("export interface {} {{\n", model.name));
-            for field in &model.fields {
-                // Skip virtual relation fields (OneToMany, ManyToMany)
-                if !semantics::is_virtual_field(field) {
-                    let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if semantics::is_optional_field(field) {
-                        "?"
-                    } else {
-                        ""
-                    };
-                    code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
-                }
+        // Generate model types using IR
+        for ir_model in &ir_schema.models {
+            code.push_str(&format!("export interface {} {{\n", ir_model.name));
+            
+            // Add stored fields from IR
+            for ir_field in &ir_model.stored_fields {
+                let ts_type = Self::map_field_type_to_ts(&ir_field.field_type);
+                let optional = if ir_field.is_optional {
+                    "?"
+                } else {
+                    ""
+                };
+                code.push_str(&format!("  {}{}: {};\n", ir_field.name, optional, ts_type));
             }
 
-            // Add computed fields to model interface (Sprint 12)
-            let computed_fields: Vec<_> = model.fields.iter().filter(|f| f.is_computed).collect();
-            if !computed_fields.is_empty() {
+            // Add computed fields using IR
+            if !ir_model.computed_fields.is_empty() {
                 code.push_str("\n  // Computed fields\n");
-                for field in computed_fields {
-                    let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    code.push_str(&format!("  {}: {};\n", field.name, ts_type));
+                for ir_field in &ir_model.computed_fields {
+                    let ts_type = Self::map_field_type_to_ts(&ir_field.field_type);
+                    code.push_str(&format!("  {}: {};\n", ir_field.name, ts_type));
                 }
             }
 
             code.push_str("}\n\n");
 
-            // Generate CreateRequest type (omit auto-generated and computed fields)
+            // Generate CreateRequest type using IR's create_request_fields
             code.push_str(&format!(
                 "export interface Create{}Request {{\n",
-                model.name
+                ir_model.name
             ));
-            for field in &model.fields {
-                if !field.auto_generate && !semantics::is_virtual_field(field) && !field.is_computed {
-                    let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    let optional = if semantics::is_optional_field(field) {
-                        "?"
-                    } else {
-                        ""
-                    };
-                    code.push_str(&format!("  {}{}: {};\n", field.name, optional, ts_type));
-                }
+            for ir_field in ir_model.create_request_fields() {
+                let ts_type = Self::map_field_type_to_ts(&ir_field.field_type);
+                let optional = if ir_field.is_optional {
+                    "?"
+                } else {
+                    ""
+                };
+                code.push_str(&format!("  {}{}: {};\n", ir_field.name, optional, ts_type));
             }
             code.push_str("}\n\n");
 
-            // Generate UpdateRequest type (all non-computed fields optional)
+            // Generate UpdateRequest type using IR's update_request_fields (all optional)
             code.push_str(&format!(
                 "export interface Update{}Request {{\n",
-                model.name
+                ir_model.name
             ));
-            for field in &model.fields {
-                if !field.auto_generate && !semantics::is_virtual_field(field) && !field.is_computed {
-                    let ts_type = Self::map_field_type_to_ts(&field.field_type);
-                    code.push_str(&format!("  {}?: {};\n", field.name, ts_type));
-                }
+            for ir_field in ir_model.update_request_fields() {
+                let ts_type = Self::map_field_type_to_ts(&ir_field.field_type);
+                code.push_str(&format!("  {}?: {};\n", ir_field.name, ts_type));
             }
             code.push_str("}\n\n");
         }
@@ -131,11 +127,12 @@ impl TypeScriptGenerator {
         code.push_str("  [key: string]: any; // Filter params\n");
         code.push_str("}\n\n");
 
+        // Standardized ListResponse format
         code.push_str("export interface ListResponse<T> {\n");
         code.push_str("  data: T[];\n");
         code.push_str("  total: number;\n");
-        code.push_str("  limit: number;\n");
-        code.push_str("  offset: number;\n");
+        code.push_str("  limit?: number;\n");
+        code.push_str("  offset?: number;\n");
         code.push_str("}\n");
 
         GeneratedFile {
@@ -155,18 +152,19 @@ impl TypeScriptGenerator {
         }
     }
 
-    /// Generate API client for a model
-    pub fn generate_api_client(model: &Model, _schema: &Schema) -> GeneratedFile {
-        let model_lower = model.name.to_lowercase();
-        let plural = naming::pluralize(&model_lower);
+    /// Generate API client for a model using IR
+    pub fn generate_api_client(model: &crate::ast::Model, _schema: &Schema) -> GeneratedFile {
+        let ir_model = crate::codegen::ir::IrModel::from_ast(model.clone());
+        let model_lower = ir_model.name.to_lowercase();
+        let plural = ir_model.relation_name_for_api();
         let mut code = String::new();
 
         // Imports
         code.push_str(&format!("import type {{ {}, Create{}Request, Update{}Request, QueryParams, ListResponse }} from './types';\n\n",
-            model.name, model.name, model.name));
+            ir_model.name, ir_model.name, ir_model.name));
 
         // API Client class
-        code.push_str(&format!("export class {}Api {{\n", model.name));
+        code.push_str(&format!("export class {}Api {{\n", ir_model.name));
         code.push_str("  private baseUrl: string;\n\n");
 
         // Constructor
@@ -199,7 +197,7 @@ impl TypeScriptGenerator {
         code.push_str("   */\n");
         code.push_str(&format!(
             "  async get(id: string): Promise<{}> {{\n",
-            model.name
+            ir_model.name
         ));
         code.push_str(&format!(
             "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`);\n",
@@ -217,7 +215,7 @@ impl TypeScriptGenerator {
         code.push_str("   */\n");
         code.push_str(&format!(
             "  async create(data: Create{}Request): Promise<{}> {{\n",
-            model.name, model.name
+            ir_model.name, ir_model.name
         ));
         code.push_str(&format!(
             "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}`, {{\n",
@@ -239,7 +237,7 @@ impl TypeScriptGenerator {
         code.push_str("   */\n");
         code.push_str(&format!(
             "  async update(id: string, data: Update{}Request): Promise<{}> {{\n",
-            model.name, model.name
+            ir_model.name, ir_model.name
         ));
         code.push_str(&format!(
             "    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}`, {{\n",
@@ -271,13 +269,13 @@ impl TypeScriptGenerator {
         code.push_str("    }\n");
         code.push_str("  }\n");
 
-        // Generate relation methods
-        for field in &model.fields {
-            if let FieldType::Relation(rel_type) = &field.field_type {
+        // Generate relation methods using IR
+        for ir_field in &ir_model.virtual_fields {
+            if let FieldType::Relation(rel_type) = &ir_field.field_type {
                 match rel_type {
                     RelationType::OneToMany(target) => {
                         let target_lower = target.to_lowercase();
-                        let target_plural = format!("{}s", target_lower);
+                        let target_plural = naming::pluralize(&target_lower);
                         code.push_str("\n");
                         code.push_str("  /**\n");
                         code.push_str(&format!(
@@ -286,10 +284,10 @@ impl TypeScriptGenerator {
                         ));
                         code.push_str("   */\n");
                         code.push_str(&format!("  async {}(id: string, params?: QueryParams): Promise<ListResponse<{}>> {{\n",
-                            field.name, target));
+                            ir_field.name, target));
                         code.push_str("    const queryString = params ? '?' + new URLSearchParams(params as any).toString() : '';\n");
                         code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/${{{{id}}}}/{}${{{{queryString}}}}`);\n",
-                            plural, field.name));
+                            plural, ir_field.name));
                         code.push_str("    if (!response.ok) {\n");
                         code.push_str(&format!("      throw new Error(`Failed to get {} for {}: ${{response.statusText}}`);\n",
                             target_plural, model_lower));
@@ -308,7 +306,7 @@ impl TypeScriptGenerator {
                         code.push_str("   */\n");
                         code.push_str(&format!(
                             "  async {}(id: string): Promise<{}> {{\n",
-                            field.name, target
+                            ir_field.name, target
                         ));
                         code.push_str(&format!(
                             "    const {} = await this.get(id);\n",
@@ -318,7 +316,7 @@ impl TypeScriptGenerator {
                             "    const {}_id = {}.{};\n",
                             target.to_lowercase(),
                             model_lower,
-                            field.name
+                            ir_field.name
                         ));
                         code.push_str(&format!("    if (!{}_id) {{\n", target.to_lowercase()));
                         code.push_str(&format!(
@@ -326,8 +324,9 @@ impl TypeScriptGenerator {
                             target
                         ));
                         code.push_str("    }\n");
-                        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}s/${{{{{}_id}}}}`);\n",
-                            target.to_lowercase(), target.to_lowercase()));
+                        let target_plural = naming::pluralize(&target.to_lowercase());
+                        code.push_str(&format!("    const response = await fetch(`${{{{this.baseUrl}}}}/api/{}/{{{{{}_id}}}}`);\n",
+                            target_plural, target.to_lowercase()));
                         code.push_str("    if (!response.ok) {\n");
                         code.push_str(&format!("      throw new Error(`Failed to get {}: ${{response.statusText}}`);\n", target));
                         code.push_str("    }\n");
@@ -342,7 +341,7 @@ impl TypeScriptGenerator {
         code.push_str("}\n");
 
         GeneratedFile {
-            path: format!("generated/sdk/{}Api.ts", model.name),
+            path: format!("generated/sdk/{}Api.ts", ir_model.name),
             content: code,
         }
     }
@@ -519,7 +518,7 @@ export default defineConfig({
 
             // Show first non-auto field as example
             for field in &model.fields {
-                if !field.auto_generate && !semantics::is_virtual_field(field) {
+                if !field.auto_generate && !Self::is_virtual_field(field) {
                     let example_value = Self::example_value_for_type(&field.field_type);
                     content.push_str(&format!("  {}: {},\n", field.name, example_value));
                     break;
@@ -533,7 +532,7 @@ export default defineConfig({
                 model_lower
             ));
             for field in &model.fields {
-                if !field.auto_generate && !semantics::is_virtual_field(field) {
+                if !field.auto_generate && !Self::is_virtual_field(field) {
                     let example_value = Self::example_value_for_type(&field.field_type);
                     content.push_str(&format!("  {}: {},\n", field.name, example_value));
                     break;
@@ -605,6 +604,25 @@ export default defineConfig({
             },
             FieldType::Component(_) => "null".to_string(), // Component references are not stored
         }
+    }
+
+    /// Check if field is virtual (doesn't store data)
+    fn is_virtual_field(field: &Field) -> bool {
+        matches!(
+            &field.field_type,
+            FieldType::Relation(RelationType::OneToMany(_))
+                | FieldType::Relation(RelationType::ManyToMany(_))
+                | FieldType::Component(_)
+        )
+    }
+
+    /// Check if type is optional
+    fn is_optional(field_type: &FieldType) -> bool {
+        matches!(
+            field_type,
+            FieldType::OptionalStructType(_)
+                | FieldType::Relation(RelationType::OptionalReference(_))
+        )
     }
 
     /// Generate example value for documentation
