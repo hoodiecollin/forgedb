@@ -19,9 +19,17 @@ Successfully refactored **7 modules**, moving tests to the root `tests/` directo
 | `src/openapi_codegen.rs` | `tests/openapi_codegen_tests.rs` | 2 tests |
 | `src/typescript_codegen.rs` | `tests/typescript_codegen_tests.rs` | 3 tests |
 | `src/typescript_component_props.rs` | `tests/typescript_component_props_tests.rs` | 2 tests |
+
+**Subtotal: 25 tests from main src/ modules**
+
+**Parser Module** (migrated in Phase 2):
+| Source File | Test File | Tests Moved |
+|------------|-----------|-------------|
 | `src/parser/tests.rs` | `tests/parser_tests.rs` | 54 tests |
 
-**Total: 79 unit tests successfully refactored and verified**
+Note: Parser tests were already in a separate `tests.rs` file but still used `#[cfg(test)]` wrapper and were in the src/ directory. Phase 2 moved them to the root tests/ directory.
+
+**Total Main Directory: 79 unit tests successfully refactored and verified**
 
 ### Crate Modules (`crates/*/`)
 
@@ -68,42 +76,20 @@ Successfully refactored **high-priority crates** with largest test modules:
 
 ## Remaining Work 📋
 
-**Crates to Refactor** (47 files remaining)
+**Crates to Refactor** (~30 files remaining across 9 crates)
 
 The following crates still have embedded unit tests that should be moved to dedicated test files:
 
-#### High Priority (Large test modules)
-1. **storage** (2 files)
-   - `lib.rs` (289 test lines)
-   - `user_storage.rs` (265 test lines)
-
-2. **compaction** (4 files)
-   - `compactor.rs` (171 test lines)
-   - `stats.rs` (85 test lines)
-   - `background.rs` (73 test lines)
-   - `lib.rs` (73 test lines)
-
-3. **query-optimization** (3 files)
-   - `statistics.rs` (210 test lines)
-   - `planner.rs` (126 test lines)
-   - `scan.rs` (68 test lines)
-
-4. **crud-api** (3 files)
-   - `handlers.rs` (168 test lines)
-   - `operations.rs` (150 test lines)
-   - `lib.rs` (143 test lines)
-
 #### Medium Priority
-5. **fulltext** (1 file) - 142 test lines
-6. **ffi** (4 files) - 121, 106, 105, 83 test lines
-7. **migrations** (4 files) - 104, 65, 62 test lines
-8. **http-server** (8 files) - 85, 82, 55, 47, 47, 31, 24, 21 test lines
-9. **query-params** (3 remaining files) - 106, 104, 55 test lines
-10. **wal** (5 files) - Various sizes
-11. **validation** (3 files) - Various sizes
-12. **watcher** (2 files) - Various sizes
-13. **cli** (2 files) - 12, 9 test lines
-14. **lsp-server** (1 file) - 48 test lines
+1. **fulltext** (1 file) - 142 test lines
+2. **ffi** (4 files) - 121, 106, 105, 83 test lines
+3. **migrations** (4 files) - 104, 65, 62 test lines
+4. **http-server** (8 files) - 85, 82, 55, 47, 47, 31, 24, 21 test lines
+5. **query-params** (2 remaining files) - `parser.rs`, `pagination.rs`
+6. **wal** (5 files) - Various sizes
+7. **watcher** (2 files) - Various sizes
+8. **cli** (2 files) - 12, 9 test lines
+9. **lsp-server** (1 file) - 48 test lines
 
 ## Implementation Pattern
 
