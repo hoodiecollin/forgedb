@@ -37,6 +37,9 @@ quote = "1"
 proc-macro2 = "1"
 syn = { version = "2", features = ["full", "extra-traits"] }
 prettyplease = "0.2"
+Inflector = "0.11"
+heck = "0.5"
+serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
 forgedb-validation = { path = "crates/validation" }
@@ -50,7 +53,7 @@ forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
 forgedb-fulltext = { path = "crates/fulltext" }
 forgedb-query-optimization = { path = "crates/query-optimization" }
-insta = { version = "1.34", features = ["yaml"] }
+insta = { version = "1.40", features = ["yaml"] }
 
 [lib]
 name = "forgedb"
