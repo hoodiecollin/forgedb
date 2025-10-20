@@ -1,5 +1,7 @@
 use forgedb_compaction::compactor::*;
+use forgedb_compaction::stats::StatsCollector;
 use forgedb_compaction::types::*;
+use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
 

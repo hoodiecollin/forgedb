@@ -1,5 +1,5 @@
 use forgedb_compaction::background::*;
-use forgedb_compaction::types::CompactionStatus;
+use forgedb_compaction::types::{CompactionConfig, CompactionStatus};
 use std::fs;
 use std::io::Write;
 use std::thread;

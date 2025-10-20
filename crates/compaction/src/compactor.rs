@@ -181,7 +181,7 @@ impl Compactor {
     }
 
     /// Compact a single variable column
-    fn compact_variable_column(
+    pub fn compact_variable_column(
         &self,
         data_path: &Path,
         offset_path: &Path,
@@ -259,7 +259,7 @@ impl Compactor {
     }
 
     /// Compact a single fixed-size column
-    fn compact_fixed_column(&self, column_path: &Path, tombstones: &[bool]) -> Result<(), String> {
+    pub fn compact_fixed_column(&self, column_path: &Path, tombstones: &[bool]) -> Result<(), String> {
         // Read existing data
         let mut data = Vec::new();
         fs::File::open(column_path)
