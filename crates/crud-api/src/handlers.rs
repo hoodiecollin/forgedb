@@ -98,32 +98,47 @@ impl<T: CrudOperations> CrudHandlers<T> {
     }
 }
 
-/// Response wrapper for list operations with pagination metadata
+/// Response wrapper for list operations with metadata
+/// Standardized format: {data, total, limit, offset}
 #[derive(Debug, Serialize)]
 pub struct ListResponse<T: Serialize> {
     pub data: Vec<T>,
     pub total: usize,
-    pub limit: usize,
-    pub offset: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
 }
 
 impl<T: Serialize> ListResponse<T> {
+    /// Create a new list response with just data (no pagination info)
     pub fn new(data: Vec<T>) -> Self {
         let total = data.len();
         Self {
             data,
             total,
-            limit: 100,
-            offset: 0,
+            limit: None,
+            offset: None,
         }
     }
-    
+
+    /// Create a new list response with pagination info
     pub fn with_pagination(data: Vec<T>, total: usize, limit: usize, offset: usize) -> Self {
         Self {
             data,
             total,
-            limit,
-            offset,
+            limit: Some(limit),
+            offset: Some(offset),
+        }
+    }
+
+    /// Create from data with explicit total count (for when total differs from data.len())
+    pub fn with_total(data: Vec<T>, total: usize) -> Self {
+        Self {
+            data,
+            total,
+            limit: None,
+            offset: None,
         }
     }
 }

@@ -1,13 +1,20 @@
 //! OpenAPI specification generation
 //!
 //! Generates OpenAPI 3.0 specification from schema definitions.
+//! Uses IR for consistent field classification and constraints module for validation mapping.
 
-use crate::ast::{Field, FieldType, Model, RelationType, Schema};
-use crate::codegen::{naming, semantics, GeneratedFile};
+use crate::ast::{Field, FieldType, RelationType, Schema};
+use crate::codegen::{constraints, ir::IrSchema, naming, CodegenConfig, GeneratedFile};
 use serde_json::{json, Value};
 
 /// Generate the main OpenAPI 3.0 specification
 pub fn generate_openapi_spec(schema: &Schema) -> GeneratedFile {
+    generate_openapi_spec_with_config(schema, &CodegenConfig::default())
+}
+
+/// Generate the main OpenAPI 3.0 specification with custom config
+pub fn generate_openapi_spec_with_config(schema: &Schema, config: &CodegenConfig) -> GeneratedFile {
+    let ir_schema = IrSchema::from_ast(schema.clone());
     let mut spec = json!({
         "openapi": "3.0.3",
         "info": {
@@ -27,49 +34,44 @@ pub fn generate_openapi_spec(schema: &Schema) -> GeneratedFile {
         }
     });
 
-    // Generate schemas for all models
-    for model in &schema.models {
-        add_model_schemas(&mut spec, model);
+    // Generate schemas for all models using IR
+    for ir_model in &ir_schema.models {
+        add_model_schemas_from_ir(&mut spec, ir_model);
     }
 
-    // Generate paths for all models
-    for model in &schema.models {
-        add_model_paths(&mut spec, model);
+    // Generate paths for all models using IR
+    for ir_model in &ir_schema.models {
+        add_model_paths_from_ir(&mut spec, ir_model, config);
     }
 
     GeneratedFile {
-        path: "generated/openapi/openapi.json".to_string(),
+        path: format!("{}/openapi.json", config.paths.openapi),
         content: serde_json::to_string_pretty(&spec).unwrap(),
     }
 }
 
-/// Add schemas for a model (Model, CreateRequest, UpdateRequest)
-fn add_model_schemas(spec: &mut Value, model: &Model) {
-    // Main model schema
+/// Add schemas for a model using IR (Model, CreateRequest, UpdateRequest)
+fn add_model_schemas_from_ir(spec: &mut Value, ir_model: &crate::codegen::ir::IrModel) {
+    // Main model schema - includes stored fields and computed fields
     let model_schema = {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
 
-        for field in &model.fields {
-            if semantics::is_virtual_field(field) {
-                continue;
-            }
-
-            let (field_name, field_schema) = field_to_openapi_schema(field);
+        // Add stored fields
+        for ir_field in &ir_model.stored_fields {
+            let (field_name, field_schema) = field_to_openapi_schema(&ir_field.original);
             properties.insert(field_name.clone(), field_schema);
 
             // Required if not optional and not auto-generated
-            if !semantics::is_optional_field(field) {
+            if !ir_field.is_optional && !ir_field.is_auto_generate {
                 required.push(field_name);
             }
         }
 
         // Add computed fields to model schema
-        for field in &model.fields {
-            if field.is_computed {
-                let (field_name, field_schema) = field_to_openapi_schema(field);
-                properties.insert(field_name, field_schema);
-            }
+        for ir_field in &ir_model.computed_fields {
+            let (field_name, field_schema) = field_to_openapi_schema(&ir_field.original);
+            properties.insert(field_name, field_schema);
         }
 
         json!({
@@ -82,22 +84,18 @@ fn add_model_schemas(spec: &mut Value, model: &Model) {
     spec["components"]["schemas"]
         .as_object_mut()
         .unwrap()
-        .insert(model.name.clone(), model_schema);
+        .insert(ir_model.name.clone(), model_schema);
 
-    // CreateRequest schema (no auto-generated or computed fields)
+    // CreateRequest schema - uses IR's create_request_fields
     let create_schema = {
         let mut properties = serde_json::Map::new();
         let mut required = Vec::new();
 
-        for field in &model.fields {
-            if field.auto_generate || field.is_computed || semantics::is_virtual_field(field) {
-                continue;
-            }
-
-            let (field_name, field_schema) = field_to_openapi_schema(field);
+        for ir_field in ir_model.create_request_fields() {
+            let (field_name, field_schema) = field_to_openapi_schema(&ir_field.original);
             properties.insert(field_name.clone(), field_schema);
 
-            if !semantics::is_optional_field(field) {
+            if !ir_field.is_optional {
                 required.push(field_name);
             }
         }
@@ -112,9 +110,9 @@ fn add_model_schemas(spec: &mut Value, model: &Model) {
     spec["components"]["schemas"]
         .as_object_mut()
         .unwrap()
-        .insert(format!("Create{}Request", model.name), create_schema);
+        .insert(format!("Create{}Request", ir_model.name), create_schema);
 
-    // UpdateRequest schema (all fields optional except computed)
+    // UpdateRequest schema - uses IR's update_request_fields (all optional)
     let mut update_schema = json!({
         "type": "object",
         "properties": {}
@@ -122,34 +120,30 @@ fn add_model_schemas(spec: &mut Value, model: &Model) {
 
     let update_props = update_schema["properties"].as_object_mut().unwrap();
 
-    for field in &model.fields {
-        if field.auto_generate || field.is_computed || semantics::is_virtual_field(field) {
-            continue;
-        }
-
-        let (field_name, field_schema) = field_to_openapi_schema(field);
+    for ir_field in ir_model.update_request_fields() {
+        let (field_name, field_schema) = field_to_openapi_schema(&ir_field.original);
         update_props.insert(field_name, field_schema);
     }
 
     spec["components"]["schemas"]
         .as_object_mut()
         .unwrap()
-        .insert(format!("Update{}Request", model.name), update_schema);
+        .insert(format!("Update{}Request", ir_model.name), update_schema);
 }
 
-/// Add API paths for a model
-fn add_model_paths(spec: &mut Value, model: &Model) {
+/// Add API paths for a model using IR
+fn add_model_paths_from_ir(spec: &mut Value, ir_model: &crate::codegen::ir::IrModel, config: &CodegenConfig) {
     let paths = spec["paths"].as_object_mut().unwrap();
-    let model_lower = model.name.to_lowercase();
-    let model_plural = naming::pluralize(&model_lower);
+    let model_lower = ir_model.name.to_lowercase();
+    let model_plural = ir_model.relation_name_for_api();
 
     // List endpoint: GET /api/models
     paths.insert(
-        format!("/api/{}", model_plural),
+        format!("{}/{}", config.api_base, model_plural),
         json!({
             "get": {
                 "summary": format!("List all {}", model_plural),
-                "tags": [model.name],
+                "tags": [ir_model.name],
                 "parameters": [
                     {
                         "name": "limit",
@@ -192,13 +186,22 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                                     "properties": {
                                         "data": {
                                             "type": "array",
-                                            "items": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                            "items": { "$ref": format!("#/components/schemas/{}", ir_model.name) }
                                         },
-                                        "total": { "type": "integer", "description": "Total count of items matching the query" },
-                                        "limit": { "type": "integer", "description": "Maximum number of items returned" },
-                                        "offset": { "type": "integer", "description": "Number of items skipped" }
+                                        "total": {
+                                            "type": "integer",
+                                            "description": "Total number of items matching the query"
+                                        },
+                                        "limit": {
+                                            "type": "integer",
+                                            "description": "Maximum number of items returned"
+                                        },
+                                        "offset": {
+                                            "type": "integer",
+                                            "description": "Number of items skipped"
+                                        }
                                     },
-                                    "required": ["data", "total", "limit", "offset"]
+                                    "required": ["data", "total"]
                                 }
                             }
                         }
@@ -207,12 +210,12 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
             },
             "post": {
                 "summary": format!("Create a new {}", model_lower),
-                "tags": [model.name],
+                "tags": [ir_model.name],
                 "requestBody": {
                     "required": true,
                     "content": {
                         "application/json": {
-                            "schema": { "$ref": format!("#/components/schemas/Create{}Request", model.name) }
+                            "schema": { "$ref": format!("#/components/schemas/Create{}Request", ir_model.name) }
                         }
                     }
                 },
@@ -221,7 +224,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                         "description": "Created",
                         "content": {
                             "application/json": {
-                                "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                "schema": { "$ref": format!("#/components/schemas/{}", ir_model.name) }
                             }
                         }
                     },
@@ -244,21 +247,20 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
     );
 
     // Single item endpoints: GET/PUT/DELETE /api/models/:id
-    let id_field = model.fields.iter().find(|f| f.auto_generate && matches!(f.field_type, FieldType::Uuid));
-    if let Some(id_field) = id_field {
+    if let Some(_id_field) = &ir_model.id_field {
         paths.insert(
-            format!("/api/{}/{{id}}", model_plural),
+            format!("{}/{}/{{id}}", config.api_base, model_plural),
             json!({
                 "get": {
                     "summary": format!("Get a {} by ID", model_lower),
-                    "tags": [model.name],
+                    "tags": [ir_model.name],
                     "parameters": [
                         {
                             "name": "id",
                             "in": "path",
                             "required": true,
-                            "schema": type_to_openapi_type(&id_field.field_type),
-                            "description": format!("{} ID", model.name)
+                            "schema": { "type": "string", "format": "uuid" },
+                            "description": format!("{} ID", ir_model.name)
                         }
                     ],
                     "responses": {
@@ -266,7 +268,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                             "description": "Successful response",
                             "content": {
                                 "application/json": {
-                                    "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                    "schema": { "$ref": format!("#/components/schemas/{}", ir_model.name) }
                                 }
                             }
                         },
@@ -277,21 +279,21 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                 },
                 "put": {
                     "summary": format!("Update a {}", model_lower),
-                    "tags": [model.name],
+                    "tags": [ir_model.name],
                     "parameters": [
                         {
                             "name": "id",
                             "in": "path",
                             "required": true,
-                            "schema": type_to_openapi_type(&id_field.field_type),
-                            "description": format!("{} ID", model.name)
+                            "schema": { "type": "string", "format": "uuid" },
+                            "description": format!("{} ID", ir_model.name)
                         }
                     ],
                     "requestBody": {
                         "required": true,
                         "content": {
                             "application/json": {
-                                "schema": { "$ref": format!("#/components/schemas/Update{}Request", model.name) }
+                                "schema": { "$ref": format!("#/components/schemas/Update{}Request", ir_model.name) }
                             }
                         }
                     },
@@ -300,25 +302,28 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                             "description": "Updated successfully",
                             "content": {
                                 "application/json": {
-                                    "schema": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                    "schema": { "$ref": format!("#/components/schemas/{}", ir_model.name) }
                                 }
                             }
                         },
                         "404": {
                             "description": "Not found"
+                        },
+                        "400": {
+                            "description": "Validation error"
                         }
                     }
                 },
                 "delete": {
                     "summary": format!("Delete a {}", model_lower),
-                    "tags": [model.name],
+                    "tags": [ir_model.name],
                     "parameters": [
                         {
                             "name": "id",
                             "in": "path",
                             "required": true,
-                            "schema": type_to_openapi_type(&id_field.field_type),
-                            "description": format!("{} ID", model.name)
+                            "schema": { "type": "string", "format": "uuid" },
+                            "description": format!("{} ID", ir_model.name)
                         }
                     ],
                     "responses": {
@@ -335,18 +340,18 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
 
         // Batch operations endpoints
         paths.insert(
-            format!("/api/{}/batch", model_plural),
+            format!("{}/{}/batch", config.api_base, model_plural),
             json!({
                 "post": {
                     "summary": format!("Batch create {} records", model_plural),
-                    "tags": [model.name],
+                    "tags": [ir_model.name],
                     "requestBody": {
                         "required": true,
                         "content": {
                             "application/json": {
                                 "schema": {
                                     "type": "array",
-                                    "items": { "$ref": format!("#/components/schemas/Create{}Request", model.name) }
+                                    "items": { "$ref": format!("#/components/schemas/Create{}Request", ir_model.name) }
                                 }
                             }
                         }
@@ -358,7 +363,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                                 "application/json": {
                                     "schema": {
                                         "type": "array",
-                                        "items": { "$ref": format!("#/components/schemas/{}", model.name) }
+                                        "items": { "$ref": format!("#/components/schemas/{}", ir_model.name) }
                                     }
                                 }
                             }
@@ -370,7 +375,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                 },
                 "delete": {
                     "summary": format!("Batch delete {} records", model_plural),
-                    "tags": [model.name],
+                    "tags": [ir_model.name],
                     "requestBody": {
                         "required": true,
                         "content": {
@@ -380,7 +385,7 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
                                     "properties": {
                                         "ids": {
                                             "type": "array",
-                                            "items": type_to_openapi_type(&id_field.field_type)
+                                            "items": { "type": "string", "format": "uuid" }
                                         }
                                     },
                                     "required": ["ids"]
@@ -402,8 +407,10 @@ fn add_model_paths(spec: &mut Value, model: &Model) {
     }
 }
 
-/// Convert a field to OpenAPI schema
+/// Convert a field to OpenAPI schema using centralized constraints mapping
 fn field_to_openapi_schema(field: &Field) -> (String, Value) {
+    use crate::codegen::semantics;
+    
     let field_name = semantics::relation_field_name(field);
 
     let mut schema = type_to_openapi_type(&field.field_type);
@@ -416,52 +423,11 @@ fn field_to_openapi_schema(field: &Field) -> (String, Value) {
         );
     }
 
-    // Add validation constraints
-    for constraint in &field.constraints {
-        match constraint.name.as_str() {
-            "email" => {
-                schema
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("format".to_string(), json!("email"));
-            }
-            "url" => {
-                schema
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("format".to_string(), json!("uri"));
-            }
-            "min" => {
-                if let Some(crate::ast::ConstraintParam::Number(min_val)) =
-                    constraint.params.first()
-                {
-                    schema
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("minimum".to_string(), json!(min_val));
-                }
-            }
-            "max" => {
-                if let Some(crate::ast::ConstraintParam::Number(max_val)) =
-                    constraint.params.first()
-                {
-                    schema
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("maximum".to_string(), json!(max_val));
-                }
-            }
-            "pattern" => {
-                if let Some(crate::ast::ConstraintParam::String(pattern)) =
-                    constraint.params.first()
-                {
-                    schema
-                        .as_object_mut()
-                        .unwrap()
-                        .insert("pattern".to_string(), json!(pattern));
-                }
-            }
-            _ => {}
+    // Add validation constraints using centralized mapping
+    let constraint_props = constraints::get_openapi_properties(&field.constraints, &field.field_type);
+    if let Some(schema_obj) = schema.as_object_mut() {
+        for (key, value) in constraint_props {
+            schema_obj.insert(key, value);
         }
     }
 
