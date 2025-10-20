@@ -286,13 +286,4 @@ fn detect_schema_changes() -> Result<Vec<SchemaChange>> {
     Ok(vec![])
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_migration_commands_compile() {
-        // Just ensure the code compiles
-        assert!(true);
-    }
-}
