@@ -1,6 +1,6 @@
 use forgedb_wal::*;
-use crate::entry::WalValue;
-use crate::writer::FsyncPolicy;
+use forgedb_wal::WalValue;
+use forgedb_wal::FsyncPolicy;
 use std::collections::HashMap;
 
 #[test]
@@ -27,7 +27,7 @@ fn test_transaction_commit() {
     std::fs::create_dir_all(&temp_dir).unwrap();
 
     let wal_path = temp_dir.join("test.wal");
-    let mut wal = crate::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
+    let mut wal = forgedb_wal::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
 
     let mut txn = Transaction::begin();
     let txn_id = txn.id();
@@ -48,19 +48,19 @@ fn test_transaction_commit() {
     assert_eq!(entries.len(), 3); // BEGIN + INSERT + COMMIT
 
     match &entries[0].operation {
-        crate::entry::WalOperation::BeginTransaction { txn_id: id } => {
+        forgedb_wal::WalOperation::BeginTransaction { txn_id: id } => {
             assert_eq!(*id, txn_id);
         }
         _ => panic!("Expected BeginTransaction"),
     }
 
     match &entries[1].operation {
-        crate::entry::WalOperation::Insert { .. } => {}
+        forgedb_wal::WalOperation::Insert { .. } => {}
         _ => panic!("Expected Insert"),
     }
 
     match &entries[2].operation {
-        crate::entry::WalOperation::CommitTransaction { txn_id: id } => {
+        forgedb_wal::WalOperation::CommitTransaction { txn_id: id } => {
             assert_eq!(*id, txn_id);
         }
         _ => panic!("Expected CommitTransaction"),
@@ -76,7 +76,7 @@ fn test_transaction_rollback() {
     std::fs::create_dir_all(&temp_dir).unwrap();
 
     let wal_path = temp_dir.join("test.wal");
-    let mut wal = crate::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
+    let mut wal = forgedb_wal::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
 
     let mut txn = Transaction::begin();
     let txn_id = txn.id();
@@ -97,14 +97,14 @@ fn test_transaction_rollback() {
     assert_eq!(entries.len(), 2); // BEGIN + ROLLBACK
 
     match &entries[0].operation {
-        crate::entry::WalOperation::BeginTransaction { txn_id: id } => {
+        forgedb_wal::WalOperation::BeginTransaction { txn_id: id } => {
             assert_eq!(*id, txn_id);
         }
         _ => panic!("Expected BeginTransaction"),
     }
 
     match &entries[1].operation {
-        crate::entry::WalOperation::RollbackTransaction { txn_id: id } => {
+        forgedb_wal::WalOperation::RollbackTransaction { txn_id: id } => {
             assert_eq!(*id, txn_id);
         }
         _ => panic!("Expected RollbackTransaction"),
@@ -138,7 +138,7 @@ fn test_transaction_empty_rollback() {
     std::fs::create_dir_all(&temp_dir).unwrap();
 
     let wal_path = temp_dir.join("test.wal");
-    let mut wal = crate::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
+    let mut wal = forgedb_wal::WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
 
     let txn = Transaction::begin();
     assert!(txn.is_empty());

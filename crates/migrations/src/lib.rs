@@ -4,7 +4,7 @@ mod generator;
 mod tracker;
 mod types;
 
-pub use diff::SchemaDiffer;
+pub use diff::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
 pub use executor::MigrationExecutor;
 pub use generator::MigrationGenerator;
 pub use tracker::MigrationTracker;
