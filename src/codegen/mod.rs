@@ -11,6 +11,7 @@ pub mod openapi;
 pub mod output;
 pub mod query;
 pub mod relations;
+pub mod request_validation;
 pub mod semantics;
 pub mod storage_gen;
 pub mod utils;
