@@ -136,15 +136,22 @@ Timeline: TBD (experimental)
 
 ```
 forgedb/
-├── schema-lang/          # DSL parser and AST
-├── transpiler/           # Code generation engine
-├── runtime/              # Rust runtime library
-│   ├── storage/          # Columnar storage implementation
-│   ├── query/            # Query execution
-│   └── api/              # REST API framework
-├── cli/                  # Developer tooling
+├── crates/               # 15 focused crates (public + internal)
+│   ├── storage/          # Columnar storage engine
+│   ├── wal/              # Write-Ahead Log
+│   ├── http-server/      # HTTP server infrastructure
+│   ├── parser/           # Schema parser
+│   └── ...               # See docs/ARCHITECTURE.md
+├── docs/                 # Comprehensive documentation
+│   ├── ARCHITECTURE.md   # System design
+│   ├── PUBLIC_CRATES.md  # Runtime library guide
+│   ├── INTERNAL_CRATES.md # Tooling guide
+│   ├── CONTRIBUTING.md   # Contribution guidelines
+│   ├── DEVELOPMENT.md    # Development setup
+│   └── PUBLISHING.md     # Release process
+├── cli/                  # Developer tooling (src/main.rs)
 ├── examples/             # Example applications
-└── docs/                 # Comprehensive documentation
+└── tests/                # Integration tests
 ```
 
 ## Getting Started
@@ -229,13 +236,31 @@ forgedb dev
 
 TBD
 
+## Documentation
+
+Comprehensive documentation is available in the [`docs/`](./docs/) directory:
+
+- **[Architecture](./docs/ARCHITECTURE.md)** - System design, component architecture, and design decisions
+- **[Public Crates](./docs/PUBLIC_CRATES.md)** - Runtime library guide and API documentation
+- **[Internal Crates](./docs/INTERNAL_CRATES.md)** - Tooling and code generation pipeline
+- **[Contributing](./docs/CONTRIBUTING.md)** - Contribution guidelines and code of conduct
+- **[Development](./docs/DEVELOPMENT.md)** - Development environment setup and workflow
+- **[Publishing](./docs/PUBLISHING.md)** - Release process and version management
+
 ## Contributing
 
-TBD - Project in design phase
+We welcome contributions! Please read our [Contributing Guide](./docs/CONTRIBUTING.md) to get started.
+
+Key areas where we need help:
+- Bug fixes and testing
+- Documentation improvements
+- Code examples
+- Performance optimization
 
 ## Contact
 
-TBD
+- **GitHub Issues**: [Report bugs or request features](https://github.com/hoodiecollin/forgedb/issues)
+- **GitHub Discussions**: [Ask questions or share ideas](https://github.com/hoodiecollin/forgedb/discussions)
 
 ---
 

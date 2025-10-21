@@ -1353,13 +1353,24 @@ RUSTFLAGS="-Z sanitizer=address" cargo build -p forgedb-ffi
 - Review the test suite in `tests/` for examples
 - Open an issue on GitHub with minimal reproduction
 
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+- **[Contributing Guide](../../docs/CONTRIBUTING.md)** - Contribution guidelines
+
 ## License
 
 This crate is part of the ForgeDB project. See the repository root for license information.
 
 ## Contributing
 
-Contributions are welcome! When contributing FFI bindings:
+Contributions are welcome! See [Contributing Guide](../../docs/CONTRIBUTING.md) for general guidelines.
+
+When contributing FFI bindings:
 
 1. Maintain memory safety guarantees
 2. Document all public functions thoroughly

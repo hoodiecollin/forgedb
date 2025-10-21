@@ -1003,6 +1003,15 @@ let app = Router::new()
     .route("/api/data", get(handler));
 ```
 
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+- **[Contributing Guide](../../docs/CONTRIBUTING.md)** - How to contribute to ForgeDB
+
 ## License
 
 Part of the ForgeDB project.

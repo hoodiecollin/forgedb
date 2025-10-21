@@ -223,7 +223,16 @@ Dev dependencies:
 
 ## Contributing
 
-This crate is part of the ForgeDB project. For contribution guidelines, see the main repository.
+This crate is part of the ForgeDB project.
+
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+- **[Contributing Guide](../../docs/CONTRIBUTING.md)** - How to contribute
 
 ## License
 
