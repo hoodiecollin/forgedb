@@ -1,25 +1,150 @@
+//! ForgeDB Storage Engine
+//!
+//! High-performance columnar storage engine for ForgeDB with memory-mapped file access,
+//! WAL integration, and tombstone-based deletion tracking.
+//!
+//! # Overview
+//!
+//! `forgedb-storage` is the core storage engine for ForgeDB, implementing a columnar storage
+//! architecture optimized for both read and write performance. The crate provides:
+//!
+//! - **Columnar storage format** - Fixed-size and variable-length columns stored separately
+//! - **Memory-mapped file access** - Direct file I/O with plans for true memory mapping
+//! - **WAL integration** - Write-Ahead Log support for ACID properties and crash recovery
+//! - **Tombstone tracking** - Efficient soft-delete mechanism without data movement
+//! - **Type-safe API** - Strong typing for columns and database operations
+//!
+//! # Architecture
+//!
+//! ## Columnar Storage Format
+//!
+//! The storage engine uses a columnar layout where each column is stored in separate files:
+//!
+//! ```text
+//! data/
+//! ├── manifest.json              # Database metadata
+//! ├── tombstones.bin            # Deletion bitmap
+//! ├── fixed/
+//! │   └── u64_0.bin            # Fixed-size column (8 bytes per row)
+//! └── variable/
+//!     ├── string_data_0.bin    # Variable-length data
+//!     └── string_offsets_0.bin # (offset, length) pairs
+//! ```
+//!
+//! ## Fixed-Size vs Variable-Length Columns
+//!
+//! **Fixed-Size Columns** (u64, i64, f64, uuid):
+//! - Storage: `fixed/{type}_{index}.bin`
+//! - Layout: Sequential values with no overhead
+//! - Access: O(1) random access via `offset = index * value_size`
+//!
+//! **Variable-Length Columns** (strings):
+//! - Data file: `variable/string_data_{index}.bin` (append-only)
+//! - Offsets file: `variable/string_offsets_{index}.bin` (offset, length pairs)
+//! - Access: O(1) random access (read offset pair, then read string)
+//!
+//! ## Tombstone Bitmap
+//!
+//! Deletions are tracked using a tombstone bitmap:
+//! - Storage: `tombstones.bin` (1 byte per row)
+//! - Format: 0 = active, 1 = deleted
+//! - Benefits: No data movement, fast deletes, preserves row IDs
+//!
+//! # Examples
+//!
+//! ## Creating a Database
+//!
+//! ```rust,no_run
+//! use forgedb_storage::{Database, ColumnMetadata, ColumnType};
+//! use std::path::PathBuf;
+//!
+//! // Create or open a database
+//! let mut db = Database::open(PathBuf::from("./mydb"))?;
+//!
+//! // Define schema
+//! let columns = vec![
+//!     ColumnMetadata {
+//!         name: "id".to_string(),
+//!         column_type: ColumnType::U64,
+//!         column_index: 0,
+//!     },
+//!     ColumnMetadata {
+//!         name: "email".to_string(),
+//!         column_type: ColumnType::String,
+//!         column_index: 0,
+//!     },
+//! ];
+//!
+//! db.set_columns(columns);
+//! db.save_manifest()?;
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! ## Working with Columns
+//!
+//! ```rust,no_run
+//! use forgedb_storage::FixedColumn;
+//! use std::path::PathBuf;
+//!
+//! // Fixed-size column
+//! let mut id_column = FixedColumn::new(PathBuf::from("./data/fixed/u64_0.bin"), 8)?;
+//! id_column.append_u64(1001)?;
+//! let id = id_column.read_u64(0)?;
+//! assert_eq!(id, 1001);
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! ## Transaction Support via WAL
+//!
+//! ```rust,no_run
+//! use forgedb_storage::{Database, FsyncPolicy};
+//! use std::path::PathBuf;
+//!
+//! // Open database with WAL enabled
+//! let mut db = Database::open_with_wal(
+//!     PathBuf::from("./mydb"),
+//!     FsyncPolicy::EveryWrite
+//! )?;
+//!
+//! // Check if WAL is enabled
+//! assert!(db.has_wal());
+//! # Ok::<(), std::io::Error>(())
+//! ```
+//!
+//! # Public API
+//!
+//! ## Core Types
+//!
+//! - [`Database`] - Main entry point for storage operations
+//! - [`Manifest`] - Database metadata stored in manifest.json
+//! - [`FixedColumn`] - Storage for fixed-size column data
+//! - [`VariableColumn`] - Storage for variable-length column data
+//! - [`Tombstones`] - Deletion tracking bitmap
+//!
+//! ## WAL Re-exports
+//!
+//! Types from [`forgedb-wal`](../forgedb_wal) for convenience:
+//! - [`FsyncPolicy`] - Controls when WAL is fsynced to disk
+//! - [`Transaction`] - Groups WAL operations with atomic commit
+//! - [`WalManager`] - High-level WAL interface
+//!
+//! # Related Crates
+//!
+//! - [`forgedb-wal`](../forgedb_wal) - Write-Ahead Log for ACID properties
+//! - [`forgedb-compaction`](../forgedb_compaction) - Background compaction for space reclamation
+//! - [`forgedb-query-optimization`](../forgedb_query_optimization) - SIMD-optimized query execution
+//! - [`forgedb-crud-api`](../forgedb_crud_api) - High-level CRUD operations
+//!
+//! # See Also
+//!
+//! - [README](./README.md) for detailed documentation and examples
+//! - [SPRINT2_PERSISTENCE.md](../../archive/sprint-summaries/SPRINT2_PERSISTENCE.md) - Original implementation
+//! - [SPRINT7_SUMMARY.md](../../archive/sprint-summaries/SPRINT7_SUMMARY.md) - WAL integration
+
 // Sprint 7: WAL re-exports
 pub use forgedb_wal::{
     FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue,
 };
-
-// Sprint 2: Storage Persistence Implementation
-//
-// Architecture:
-// - Fixed-size columns: Memory-mapped files (fixed/u64_0.bin, fixed/u64_1.bin, etc.)
-// - Variable-length columns: Append-only data file + offset index (variable/string_data.bin + variable/string_offsets.bin)
-// - Metadata: manifest.json (stores schema info, column mappings, row count, etc.)
-// - Tombstones: Bitmap for deleted records (tombstones.bin)
-//
-// Layout example for User { id: +u64, email: &string }:
-//   data/
-//     manifest.json          # Metadata
-//     tombstones.bin         # Deletion bitmap
-//     fixed/
-//       u64_0.bin           # id column (8 bytes per record)
-//     variable/
-//       string_data_0.bin   # email strings (append-only)
-//       string_offsets_0.bin # (offset, length) pairs (16 bytes per record)
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

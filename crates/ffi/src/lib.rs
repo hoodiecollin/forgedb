@@ -1,7 +1,183 @@
 //! ForgeDB FFI Bindings
 //!
-//! This crate provides C-compatible FFI bindings for ForgeDB,
-//! enabling direct database access from Bun and other runtimes.
+//! C-compatible FFI bindings for ForgeDB, enabling direct database access from
+//! Bun, Node.js, and other runtimes.
+//!
+//! # Overview
+//!
+//! This crate provides a C-compatible Foreign Function Interface (FFI) for ForgeDB,
+//! allowing integration with:
+//!
+//! - **Bun** - Direct FFI calls using Bun's native FFI support
+//! - **Node.js** - Through native addons or ffi-napi
+//! - **Python** - Via ctypes or cffi
+//! - **Other languages** - Any language with C FFI support
+//!
+//! # Architecture
+//!
+//! The FFI layer provides:
+//!
+//! - **Opaque handles** - Safe pointer management for Rust objects
+//! - **C-compatible types** - All types are C-ABI compatible
+//! - **Error handling** - Error codes and message passing
+//! - **Memory safety** - Explicit allocation/deallocation functions
+//!
+//! ## Safety Guarantees
+//!
+//! - All `unsafe` operations are properly documented
+//! - Null pointer checks on all public APIs
+//! - Opaque handles prevent direct memory access
+//! - Explicit memory management (no hidden allocations)
+//!
+//! # Examples
+//!
+//! ## C Usage
+//!
+//! ```c
+//! #include <forgedb.h>
+//!
+//! int main() {
+//!     ForgeDBError* error = NULL;
+//!     
+//!     // Open database
+//!     ForgeDB* db = forgedb_open("./data", FORGEDB_OPEN_CREATE, &error);
+//!     if (!db) {
+//!         printf("Error: %s\n", forgedb_error_message(error));
+//!         forgedb_error_free(error);
+//!         return 1;
+//!     }
+//!     
+//!     // Use database...
+//!     
+//!     // Close database
+//!     forgedb_close(db);
+//!     return 0;
+//! }
+//! ```
+//!
+//! ## Bun FFI Usage
+//!
+//! ```typescript
+//! import { dlopen, FFIType, suffix } from "bun:ffi";
+//!
+//! const lib = dlopen(`libforgedb.${suffix}`, {
+//!   forgedb_version: {
+//!     returns: FFIType.cstring,
+//!   },
+//!   forgedb_open: {
+//!     args: [FFIType.cstring, FFIType.i32, FFIType.ptr],
+//!     returns: FFIType.ptr,
+//!   },
+//!   forgedb_close: {
+//!     args: [FFIType.ptr],
+//!     returns: FFIType.void,
+//!   },
+//! });
+//!
+//! // Get version
+//! console.log(lib.symbols.forgedb_version());
+//!
+//! // Open database
+//! const db = lib.symbols.forgedb_open("./data", 0x02, null);
+//! if (!db) {
+//!   console.error("Failed to open database");
+//! }
+//!
+//! // Close database
+//! lib.symbols.forgedb_close(db);
+//! ```
+//!
+//! ## Python Usage (ctypes)
+//!
+//! ```python
+//! from ctypes import *
+//!
+//! # Load library
+//! lib = CDLL("./libforgedb.so")
+//!
+//! # Define function signatures
+//! lib.forgedb_version.restype = c_char_p
+//! lib.forgedb_open.argtypes = [c_char_p, c_int, POINTER(c_void_p)]
+//! lib.forgedb_open.restype = c_void_p
+//!
+//! # Use library
+//! version = lib.forgedb_version()
+//! print(f"ForgeDB version: {version.decode('utf-8')}")
+//!
+//! error = c_void_p()
+//! db = lib.forgedb_open(b"./data", 0x02, byref(error))
+//! if not db:
+//!     print("Failed to open database")
+//! ```
+//!
+//! # Public API
+//!
+//! ## Core Functions
+//!
+//! - `forgedb_version()` - Get library version string
+//! - `forgedb_open()` - Open a database
+//! - `forgedb_close()` - Close a database
+//!
+//! ## Error Handling
+//!
+//! - `forgedb_error_message()` - Get error message
+//! - `forgedb_error_code()` - Get error code
+//! - `forgedb_error_free()` - Free error handle
+//!
+//! ## Constants
+//!
+//! - `FORGEDB_OPEN_READONLY` (0x01) - Open in read-only mode
+//! - `FORGEDB_OPEN_CREATE` (0x02) - Create database if it doesn't exist
+//!
+//! ## Error Codes
+//!
+//! - `FORGEDB_ERR_INVALID` (1) - Invalid parameter
+//! - `FORGEDB_ERR_IO` (2) - I/O error
+//! - `FORGEDB_ERR_NOT_FOUND` (3) - Resource not found
+//!
+//! # Memory Management
+//!
+//! ## Ownership Rules
+//!
+//! - **Database handles**: Caller owns, must call `forgedb_close()`
+//! - **Error handles**: Caller owns, must call `forgedb_error_free()`
+//! - **String returns**: Library owns, do not free
+//!
+//! ## Lifetime Guarantees
+//!
+//! - Database handles remain valid until `forgedb_close()` is called
+//! - Error handles remain valid until `forgedb_error_free()` is called
+//! - Returned strings remain valid for the lifetime of their parent object
+//!
+//! # Building
+//!
+//! ## Dynamic Library
+//!
+//! ```bash
+//! cargo build --release --package forgedb-ffi
+//! ```
+//!
+//! This produces:
+//! - Linux: `libforgedb.so`
+//! - macOS: `libforgedb.dylib`
+//! - Windows: `forgedb.dll`
+//!
+//! ## Static Library
+//!
+//! ```bash
+//! cargo build --release --package forgedb-ffi --features static
+//! ```
+//!
+//! # Related Crates
+//!
+//! - [`forgedb-storage`](../forgedb_storage) - Underlying storage engine
+//! - [`forgedb-crud-api`](../forgedb_crud_api) - CRUD operations exposed via FFI
+//!
+//! # See Also
+//!
+//! - [README](./README.md) for detailed documentation and examples
+//! - [examples/](./examples/) for complete example programs
+//! - [SPRINT15_FFI.md](../../archive/sprint-summaries/SPRINT15_FFI.md) - FFI implementation
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
