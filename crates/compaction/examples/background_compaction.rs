@@ -32,32 +32,23 @@ fn main() -> Result<(), String> {
 
     // Configure compaction
     let config = CompactionConfig {
-        tombstone_threshold: 0.05, // Compact when 5% of records are deleted
-        min_file_size: 5000,        // Only compact files larger than 5KB
-        enabled: true,
+        dead_space_threshold: 0.05, // Compact when 5% of space is dead
+        auto_compact: true,
+        check_interval_secs: 10,   // Check every 10 seconds
+        max_compaction_time_secs: 60, // Max 60 seconds per compaction
     };
     
     println!("✓ Compaction configuration:");
-    println!("  Tombstone threshold: {}%", config.tombstone_threshold * 100.0);
-    println!("  Min file size: {} bytes", config.min_file_size);
-    println!("  Enabled: {}\n", config.enabled);
+    println!("  Dead space threshold: {}%", config.dead_space_threshold * 100.0);
+    println!("  Check interval: {} seconds", config.check_interval_secs);
+    println!("  Max compaction time: {} seconds\n", config.max_compaction_time_secs);
 
-    // Create background compactor
-    let schedule = CompactionSchedule {
-        interval: Duration::from_secs(10), // Run every 10 seconds
-        max_duration: Duration::from_secs(60), // Max 60 seconds per run
-    };
-
-    println!("✓ Compaction schedule:");
-    println!("  Interval: {:?}", schedule.interval);
-    println!("  Max duration: {:?}\n", schedule.max_duration);
-
-    let compactor = BackgroundCompactor::new(&data_dir, config, schedule);
+    let compactor = BackgroundCompactor::new(&data_dir, config.clone());
     println!("✓ Background compactor created\n");
 
     // Start the background compactor
     println!("--- Starting Background Compactor ---");
-    println!("The compactor will run every {:?}", schedule.interval);
+    println!("The compactor will run every {} seconds", config.check_interval_secs);
     println!("Simulating 30 seconds of operation...\n");
 
     compactor.start();
@@ -68,21 +59,19 @@ fn main() -> Result<(), String> {
         println!("\n[Tick {}] Main application running...", i);
         
         // Check compaction status
-        if let Some(last_run) = compactor.last_run() {
-            println!("  Last compaction: {:?}", last_run.elapsed());
-        } else {
-            println!("  No compactions run yet");
-        }
-
-        // Get compaction stats
-        match compactor.stats() {
-            Ok(stats) => {
-                println!("  Database stats:");
-                println!("    Total size: {} bytes", stats.total_size);
-                println!("    Total tombstones: {}", stats.total_tombstones);
-                println!("    Models: {}", stats.models.len());
+        let status = compactor.status();
+        println!("  Compaction status: {:?}", status);
+        
+        // Get last results
+        let last_results = compactor.last_results();
+        if !last_results.is_empty() {
+            println!("  Last compaction results:");
+            for result in &last_results {
+                if result.success {
+                    println!("    - {}: reclaimed {} bytes", 
+                        result.model_name, result.bytes_reclaimed);
+                }
             }
-            Err(e) => println!("  Error getting stats: {}", e),
         }
 
         // Sleep to simulate work
@@ -94,24 +83,20 @@ fn main() -> Result<(), String> {
     compactor.stop();
     println!("✓ Background compactor stopped");
 
-    // Get final statistics
+    // Get final results
     println!("\n--- Final Statistics ---");
-    match compactor.stats() {
-        Ok(stats) => {
-            println!("Total size: {} bytes", stats.total_size);
-            println!("Total tombstones: {}", stats.total_tombstones);
-            println!("Models: {}", stats.models.len());
-            
-            for model in &stats.models {
-                println!("\n  {}:", model.model_name);
-                println!("    Size: {} bytes", model.size);
-                println!("    Tombstones: {}", model.tombstone_count);
-                if let Some(ratio) = model.fragmentation_ratio {
-                    println!("    Fragmentation: {:.2}%", ratio * 100.0);
-                }
-            }
+    let final_results = compactor.last_results();
+    println!("Total compactions performed: {}", final_results.len());
+    
+    for result in &final_results {
+        if result.success {
+            println!("\n  {}:", result.model_name);
+            println!("    Bytes before: {}", result.bytes_before);
+            println!("    Bytes after: {}", result.bytes_after);
+            println!("    Reclaimed: {} bytes ({:.1}%)",
+                result.bytes_reclaimed, result.reclaim_percentage());
+            println!("    Duration: {} ms", result.duration_ms);
         }
-        Err(e) => println!("Error getting final stats: {}", e),
     }
 
     println!("\n✓ Example completed successfully!");
