@@ -1,5 +1,147 @@
-// Schema validation for Sprint 2
-// Extended for HTTP validation in Sprint 9
+//! ForgeDB Validation
+//!
+//! Schema and data validation for ForgeDB with support for constraints, HTTP validation,
+//! and error reporting.
+//!
+//! # Overview
+//!
+//! This crate provides comprehensive validation capabilities for ForgeDB, including:
+//!
+//! - **Schema validation** - Validate schema definitions for correctness
+//! - **Constraint validation** - Enforce field constraints (@unique, @email, @min, etc.)
+//! - **HTTP validation** - Validate HTTP endpoint definitions and status codes
+//! - **Error reporting** - Detailed validation errors with position information
+//!
+//! # Architecture
+//!
+//! The validation system is organized into several modules:
+//!
+//! - **Core validation** - Basic validation types and error reporting
+//! - **HTTP validation** - Validates HTTP-specific constructs (endpoints, status codes)
+//! - **Status code mapping** - Maps database operations to appropriate HTTP status codes
+//!
+//! ## Validation Pipeline
+//!
+//! 1. **Schema Parsing** - Parse schema into AST (handled by forgedb-parser)
+//! 2. **Schema Validation** - Validate schema structure and semantics
+//! 3. **Constraint Validation** - Check constraint parameters and applicability
+//! 4. **HTTP Validation** - Validate HTTP endpoints and status codes (if applicable)
+//!
+//! # Examples
+//!
+//! ## Schema Validation
+//!
+//! ```rust
+//! use forgedb_validation::{ValidationError, Position};
+//!
+//! // Create a validation error with position
+//! let error = ValidationError::new("Field 'email' must have @email constraint")
+//!     .with_position(Position::new(5, 12))
+//!     .with_suggestion("Add @email constraint: email: string @email");
+//!
+//! println!("Error at {}:{}: {}",
+//!     error.position.unwrap().line,
+//!     error.position.unwrap().column,
+//!     error.message
+//! );
+//! ```
+//!
+//! ## HTTP Validation
+//!
+//! ```rust
+//! use forgedb_validation::HttpValidator;
+//!
+//! let validator = HttpValidator::new();
+//!
+//! // Validate endpoint path
+//! match validator.validate_endpoint_path("/api/users/:id") {
+//!     Ok(_) => println!("Valid endpoint"),
+//!     Err(errors) => {
+//!         for error in errors {
+//!             eprintln!("Validation error: {}", error.message);
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! ## Status Code Mapping
+//!
+//! ```rust
+//! use forgedb_validation::StatusCodeMapper;
+//!
+//! let mapper = StatusCodeMapper::new();
+//!
+//! // Map operation to status code
+//! let status = mapper.get_status_code("create", true);
+//! assert_eq!(status, 201); // Created
+//!
+//! let status = mapper.get_status_code("get", false);
+//! assert_eq!(status, 404); // Not Found
+//! ```
+//!
+//! # Public API
+//!
+//! ## Core Types
+//!
+//! - [`ValidationError`] - Validation error with position and suggestion
+//! - [`Position`] - Line and column position in source code
+//! - [`HttpValidator`] - HTTP-specific validation
+//! - [`StatusCodeMapper`] - Maps operations to HTTP status codes
+//!
+//! ## Key Methods
+//!
+//! - `ValidationError::new()` - Create a validation error
+//! - `ValidationError::with_position()` - Add position information
+//! - `ValidationError::with_suggestion()` - Add a suggestion for fixing the error
+//! - `HttpValidator::validate_endpoint_path()` - Validate HTTP endpoint path
+//! - `StatusCodeMapper::get_status_code()` - Get appropriate status code
+//!
+//! # Validation Rules
+//!
+//! ## Schema Validation
+//!
+//! - **Unique names**: Model and struct names must be unique
+//! - **Field types**: Field types must be valid ForgeDB types
+//! - **Primary keys**: Each model must have exactly one primary key
+//! - **Relations**: Relation targets must reference existing models
+//!
+//! ## Constraint Validation
+//!
+//! - **@unique**: Can be applied to any field type
+//! - **@email**: Only for string fields
+//! - **@min/@max**: Only for numeric fields
+//! - **@length**: Only for string fields
+//! - **@pattern**: Only for string fields (regex validation)
+//!
+//! ## HTTP Validation
+//!
+//! - **Endpoint paths**: Must start with '/', valid parameter syntax
+//! - **Status codes**: Must be valid HTTP status codes (200-599)
+//! - **HTTP methods**: Must be valid (GET, POST, PUT, DELETE, PATCH)
+//!
+//! # Error Reporting
+//!
+//! Validation errors include:
+//! - **Message**: Clear description of the error
+//! - **Position**: Line and column where error occurred
+//! - **Suggestion**: Helpful suggestion for fixing the error
+//!
+//! Example error output:
+//! ```text
+//! Error at line 5, column 12: Field 'email' must have @email constraint
+//! Suggestion: Add @email constraint: email: string @email
+//! ```
+//!
+//! # Related Crates
+//!
+//! - [`forgedb-parser`](../forgedb_parser) - Parses schemas before validation
+//! - [`forgedb-http-server`](../forgedb_http_server) - Uses HTTP validation
+//! - [`forgedb-crud-api`](../forgedb_crud_api) - Uses constraint validation
+//!
+//! # See Also
+//!
+//! - [SPRINT2_VALIDATION.md](../../archive/sprint-summaries/SPRINT2_VALIDATION.md) - Schema validation
+//! - [SPRINT9_SUMMARY.md](../../archive/sprint-summaries/SPRINT9_SUMMARY.md) - HTTP validation
 
 pub mod http;
 pub mod status;

@@ -1,31 +1,97 @@
-//! # ForgeDB Types
+//! ForgeDB Types
 //!
 //! Core type definitions for ForgeDB schemas and generated code.
 //!
+//! # Overview
+//!
 //! This crate provides type definitions that match ForgeDB's schema language types,
-//! enabling type-safe serialization, validation, and storage operations.
+//! enabling type-safe serialization, validation, and storage operations. It is a
+//! foundational crate used by generated code and other ForgeDB runtime libraries.
 //!
-//! ## Supported Types
+//! # Architecture
 //!
-//! - **Integers**: `i32`, `i64` - Signed integers
-//! - **Floating Point**: `f64` - 64-bit floating point numbers
-//! - **Boolean**: `bool` - Boolean values
-//! - **UUID**: [`Uuid`] - Universally unique identifiers
-//! - **Timestamp**: `i64` - Unix timestamps (seconds since epoch)
-//! - **String**: [`String`] - UTF-8 encoded text
+//! The crate is designed around two key concepts:
 //!
-//! ## Examples
+//! - **Primitive Types**: Direct mappings of ForgeDB schema types to Rust types
+//! - **Generic Value Enum**: Runtime type information for heterogeneous data
+//!
+//! All types are designed for zero or minimal overhead with `#[repr(transparent)]`
+//! for wrapper types and efficient serialization using Serde derive macros.
+//!
+//! # Supported Types
+//!
+//! | ForgeDB Type | Rust Type | Description |
+//! |--------------|-----------|-------------|
+//! | `i32` | `i32` | 32-bit signed integer |
+//! | `i64` | `i64` | 64-bit signed integer |
+//! | `f64` | `f64` | 64-bit floating point |
+//! | `bool` | `bool` | Boolean value |
+//! | `string` | `String` | UTF-8 encoded text |
+//! | `uuid` | [`Uuid`] | Universally unique identifier |
+//! | `timestamp` | [`Timestamp`] | Unix timestamp (seconds since epoch) |
+//!
+//! # Examples
+//!
+//! ## Basic Usage
 //!
 //! ```rust
-//! use forgedb_types::{Value, Timestamp};
+//! use forgedb_types::{Value, Timestamp, Uuid};
 //!
 //! // Create a timestamp from the current time
 //! let ts = Timestamp::now();
+//! println!("Current timestamp: {}", ts.as_seconds());
 //!
 //! // Work with generic values
-//! let value = Value::I32(42);
-//! let json = serde_json::to_string(&value).unwrap();
+//! let values = vec![
+//!     Value::I32(42),
+//!     Value::String("hello".to_string()),
+//!     Value::Uuid(Uuid::new_v4()),
+//! ];
+//!
+//! // Serialize to JSON
+//! let json = serde_json::to_string(&values[0]).unwrap();
 //! ```
+//!
+//! ## Type Conversions
+//!
+//! ```rust
+//! use forgedb_types::Value;
+//!
+//! // Convenient From implementations
+//! let val: Value = 42_i32.into();
+//! let val: Value = "hello".into();
+//!
+//! // Type checking
+//! if val.is_numeric() {
+//!     println!("This is a numeric value");
+//! }
+//! ```
+//!
+//! # Public API
+//!
+//! ## Core Types
+//!
+//! - [`Timestamp`] - Wrapper around `i64` for Unix timestamps
+//! - [`Value`] - Enum that can hold any ForgeDB primitive type
+//! - [`Uuid`] - Re-exported from the `uuid` crate
+//!
+//! ## Key Methods
+//!
+//! - `Timestamp::now()` - Get current timestamp
+//! - `Timestamp::from_seconds(i64)` - Create from seconds since epoch
+//! - `Value::type_name()` - Get type name string
+//! - `Value::is_numeric()` - Check if numeric type
+//!
+//! # Related Crates
+//!
+//! - [`forgedb-storage`](../forgedb_storage) - Uses these types for columnar storage
+//! - [`forgedb-crud-api`](../forgedb_crud_api) - Generic CRUD operations
+//! - [`forgedb-parser`](../forgedb_parser) - Parses schemas into these types
+//!
+//! # See Also
+//!
+//! - [README](./README.md) for detailed documentation and usage examples
+//! - [uuid crate documentation](https://docs.rs/uuid) for UUID operations
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
