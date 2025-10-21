@@ -1,4 +1,4 @@
-use crate::{ui, CliError, Result};
+use crate::{error::CliError, ui, Result};
 use colored::Colorize;
 use forgedb_migrations::{MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange};
 use std::path::PathBuf;

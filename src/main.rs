@@ -1,5 +1,11 @@
 use clap::{Parser, Subcommand};
-use forgedb_cli::{commands, Result};
+
+mod commands;
+mod error;
+mod templates;
+mod ui;
+
+use error::Result;
 
 #[derive(Parser)]
 #[command(name = "forgedb")]

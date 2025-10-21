@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 notify = "6.1"
 crossbeam-channel = "0.5"
-forgedb = { path = "../.." }
+forgedb-parser = { path = "../parser" }

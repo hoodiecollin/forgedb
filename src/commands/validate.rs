@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use forgedb::parser::Parser;
+use forgedb_parser::{FieldType, Parser, RelationType};
 use std::fs;
 
 pub struct ValidateOptions {
@@ -38,7 +38,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         .map(|m| {
             m.fields
                 .iter()
-                .filter(|f| matches!(f.field_type, forgedb::ast::FieldType::Relation { .. }))
+                .filter(|f| matches!(f.field_type, FieldType::Relation { .. }))
                 .count()
         })
         .sum();
@@ -96,12 +96,12 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // Validate relations reference existing models
     for model in &schema.models {
         for field in &model.fields {
-            if let forgedb::ast::FieldType::Relation(rel_type) = &field.field_type {
+            if let FieldType::Relation(rel_type) = &field.field_type {
                 let target = match rel_type {
-                    forgedb::ast::RelationType::OneToMany(t) => t,
-                    forgedb::ast::RelationType::RequiredReference(t) => t,
-                    forgedb::ast::RelationType::OptionalReference(t) => t,
-                    forgedb::ast::RelationType::ManyToMany(t) => t,
+                    RelationType::OneToMany(t) => t,
+                    RelationType::RequiredReference(t) => t,
+                    RelationType::OptionalReference(t) => t,
+                    RelationType::ManyToMany(t) => t,
                 };
                 if !schema.models.iter().any(|m| &m.name == target) {
                     errors.push(format!(
@@ -132,7 +132,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         let has_timestamp = model
             .fields
             .iter()
-            .any(|f| matches!(f.field_type, forgedb::ast::FieldType::Timestamp));
+            .any(|f| matches!(f.field_type, FieldType::Timestamp));
 
         if !has_timestamp {
             warnings.push(format!(

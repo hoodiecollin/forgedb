@@ -115,18 +115,17 @@ impl SchemaRegenerator {
     /// Internal regeneration logic
     fn regenerate_internal(&self, schema_content: &str) -> Result<String, RegenerateError> {
         // Parse the schema using forgedb parser
-        let mut parser = forgedb::parser::Parser::new(schema_content)
+        let mut parser = forgedb_parser::parser::Parser::new(schema_content)
             .map_err(|e| RegenerateError::ParseError(format!("Lexer error: {}", e)))?;
 
-        let schema = parser
+        let _schema = parser
             .parse()
             .map_err(|e| RegenerateError::ParseError(format!("Parser error: {}", e)))?;
 
-        // Generate code using forgedb codegen
-        let generator = forgedb::codegen::CodeGenerator::new();
-        let generated_code = generator.generate(&schema);
-
-        Ok(generated_code)
+        // Code generation has been temporarily removed during refactoring
+        Err(RegenerateError::GenerationError(
+            "Code generation temporarily unavailable - being refactored".to_string(),
+        ))
     }
 
     /// Get the schema file path

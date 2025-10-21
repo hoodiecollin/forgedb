@@ -1,5 +1,5 @@
-use forgedb::ast::*;
-use forgedb::parser::Parser;
+use forgedb_parser::ast::*;
+use forgedb_parser::parser::Parser;
 
 #[test]
 fn test_parse_simple_model() {
@@ -947,7 +947,6 @@ Product {
 
     let model = &schema.models[0];
     // Check that ordered types get BTree index type
-    use forgedb::ast::IndexType;
     assert_eq!(model.fields[1].index_type, IndexType::BTree); // price: f64
     assert_eq!(model.fields[2].index_type, IndexType::BTree); // stock: u32
     assert_eq!(model.fields[3].index_type, IndexType::BTree); // created_at: timestamp
@@ -967,7 +966,6 @@ User {
 
     let model = &schema.models[0];
     // Check that unordered types get Hash index type
-    use forgedb::ast::IndexType;
     assert_eq!(model.fields[1].index_type, IndexType::Hash); // email: string
     assert_eq!(model.fields[2].index_type, IndexType::Hash); // active: bool
 }

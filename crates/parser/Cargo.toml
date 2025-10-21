@@ -1,0 +1,12 @@
+[package]
+name = "forgedb-parser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Parser for ForgeDB schema language"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "parser", "forgedb"]
+categories = ["database", "parser-implementations"]
+
+[dependencies]
+forgedb-validation = { path = "../validation", version = "0.1.0" }

@@ -1,4 +1,4 @@
-use forgedb::ast::*;
+use forgedb_parser::ast::*;
 
 #[test]
 fn test_detect_many_to_many() {

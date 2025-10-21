@@ -1,4 +1,4 @@
-use forgedb::lexer::*;
+use forgedb_parser::lexer::*;
 
 #[test]
 fn test_basic_tokens() {
