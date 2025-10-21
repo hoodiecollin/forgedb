@@ -169,8 +169,7 @@ pub enum WalValue {
 // Durability control
 pub enum FsyncPolicy {
     Never,
-    EveryWrite,
-    EveryCommit,
+    Always,
     Periodic(Duration),
 }
 ```
@@ -183,7 +182,7 @@ use forgedb_wal::{Transaction, WalValue};
 // Open database with WAL
 let mut db = Database::open_with_wal(
     PathBuf::from("./data"),
-    FsyncPolicy::EveryCommit
+    FsyncPolicy::Always
 )?;
 
 // Create transaction

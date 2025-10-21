@@ -1,4 +1,4 @@
-use forgedb_cli::commands::compact::format_bytes;
+use forgedb::commands::compact::format_bytes;
 
 #[test]
 fn test_format_bytes() {

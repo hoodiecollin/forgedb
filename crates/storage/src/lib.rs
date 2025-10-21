@@ -103,7 +103,7 @@
 //! // Open database with WAL enabled
 //! let mut db = Database::open_with_wal(
 //!     PathBuf::from("./mydb"),
-//!     FsyncPolicy::EveryWrite
+//!     FsyncPolicy::Always
 //! )?;
 //!
 //! // Check if WAL is enabled

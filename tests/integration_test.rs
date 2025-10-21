@@ -20,7 +20,7 @@ fn create_test_schema(dir: &Path) {
 
 #[test]
 fn test_init_command_creates_project_structure() {
-    use forgedb_cli::commands::init::{run, InitOptions};
+    use forgedb::commands::init::{run, InitOptions};
 
     let temp_dir = setup_test_dir();
     let project_name = "test_project";
@@ -54,7 +54,7 @@ fn test_init_command_creates_project_structure() {
 
 #[test]
 fn test_init_with_blog_template() {
-    use forgedb_cli::commands::init::{run, InitOptions};
+    use forgedb::commands::init::{run, InitOptions};
 
     let temp_dir = setup_test_dir();
     let project_name = "blog_project";
@@ -80,7 +80,7 @@ fn test_init_with_blog_template() {
 
 #[test]
 fn test_generate_command_creates_rust_code() {
-    use forgedb_cli::commands::generate::{run, GenerateOptions};
+    use forgedb::commands::generate::{run, GenerateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -114,7 +114,7 @@ fn test_generate_command_creates_rust_code() {
 
 #[test]
 fn test_validate_command_detects_errors() {
-    use forgedb_cli::commands::validate::{run, ValidateOptions};
+    use forgedb::commands::validate::{run, ValidateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -142,7 +142,7 @@ fn test_validate_command_detects_errors() {
 
 #[test]
 fn test_validate_command_passes_valid_schema() {
-    use forgedb_cli::commands::validate::{run, ValidateOptions};
+    use forgedb::commands::validate::{run, ValidateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
@@ -162,7 +162,7 @@ fn test_validate_command_passes_valid_schema() {
 
 #[test]
 fn test_generate_check_mode() {
-    use forgedb_cli::commands::generate::{run, GenerateOptions};
+    use forgedb::commands::generate::{run, GenerateOptions};
 
     let temp_dir = setup_test_dir();
     std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");

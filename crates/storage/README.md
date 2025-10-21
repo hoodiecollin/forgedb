@@ -176,7 +176,7 @@ use forgedb_storage::{Database, FsyncPolicy};
 // Open database with WAL enabled
 let mut db = Database::open_with_wal(
     PathBuf::from("./mydb"),
-    FsyncPolicy::EveryWrite
+    FsyncPolicy::Always
 )?;
 
 // Check if WAL is enabled
@@ -200,7 +200,7 @@ use forgedb_storage::{
 // Open database with WAL
 let mut db = Database::open_with_wal(
     PathBuf::from("./mydb"),
-    FsyncPolicy::EveryCommit
+    FsyncPolicy::Always
 )?;
 
 // Create a transaction
