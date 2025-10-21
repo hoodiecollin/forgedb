@@ -1,12 +1,11 @@
 //! Intermediate example for forgedb-crud-api
 //!
-//! This example demonstrates using CrudHandlers to create
-//! a type-safe API handler with proper error responses.
+//! This example demonstrates error handling and ListResponse formatting
+//! for CRUD operations.
 
 use forgedb_crud_api::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 // Define a Product model
@@ -35,16 +34,15 @@ struct UpdateProduct {
     in_stock: Option<bool>,
 }
 
-// Thread-safe product storage
-#[derive(Clone)]
+// Simple product storage
 struct ProductStorage {
-    products: Arc<RwLock<HashMap<Uuid, Product>>>,
+    products: HashMap<Uuid, Product>,
 }
 
 impl ProductStorage {
     fn new() -> Self {
         Self {
-            products: Arc::new(RwLock::new(HashMap::new())),
+            products: HashMap::new(),
         }
     }
 }
@@ -55,17 +53,11 @@ impl CrudOperations for ProductStorage {
     type UpdateInput = UpdateProduct;
 
     fn list(&self) -> CrudResult<Vec<Self::Model>> {
-        let products = self.products.read().map_err(|e| {
-            CrudError::InternalError(format!("Failed to acquire read lock: {}", e))
-        })?;
-        Ok(products.values().cloned().collect())
+        Ok(self.products.values().cloned().collect())
     }
 
     fn get(&self, id: &Uuid) -> CrudResult<Option<Self::Model>> {
-        let products = self.products.read().map_err(|e| {
-            CrudError::InternalError(format!("Failed to acquire read lock: {}", e))
-        })?;
-        Ok(products.get(id).cloned())
+        Ok(self.products.get(id).cloned())
     }
 
     fn create(&mut self, input: Self::CreateInput) -> CrudResult<Self::Model> {
@@ -73,6 +65,12 @@ impl CrudOperations for ProductStorage {
         if input.price < 0.0 {
             return Err(CrudError::ValidationError(
                 "Price cannot be negative".to_string(),
+            ));
+        }
+        
+        if input.name.is_empty() {
+            return Err(CrudError::ValidationError(
+                "Name cannot be empty".to_string(),
             ));
         }
 
@@ -84,21 +82,18 @@ impl CrudOperations for ProductStorage {
             in_stock: input.in_stock,
         };
 
-        let mut products = self.products.write().map_err(|e| {
-            CrudError::InternalError(format!("Failed to acquire write lock: {}", e))
-        })?;
-        
-        products.insert(product.id, product.clone());
+        self.products.insert(product.id, product.clone());
         Ok(product)
     }
 
     fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> CrudResult<Option<Self::Model>> {
-        let mut products = self.products.write().map_err(|e| {
-            CrudError::InternalError(format!("Failed to acquire write lock: {}", e))
-        })?;
-
-        if let Some(product) = products.get_mut(id) {
+        if let Some(product) = self.products.get_mut(id) {
             if let Some(name) = input.name {
+                if name.is_empty() {
+                    return Err(CrudError::ValidationError(
+                        "Name cannot be empty".to_string(),
+                    ));
+                }
                 product.name = name;
             }
             if let Some(description) = input.description {
@@ -122,29 +117,23 @@ impl CrudOperations for ProductStorage {
     }
 
     fn delete(&mut self, id: &Uuid) -> CrudResult<bool> {
-        let mut products = self.products.write().map_err(|e| {
-            CrudError::InternalError(format!("Failed to acquire write lock: {}", e))
-        })?;
-        Ok(products.remove(id).is_some())
+        Ok(self.products.remove(id).is_some())
     }
 }
 
 fn main() {
-    println!("=== ForgeDB CRUD API - With Handlers ===\n");
+    println!("=== ForgeDB CRUD API - With Error Handling ===\n");
 
     // Create storage
     let mut storage = ProductStorage::new();
-    println!("✓ Created product storage with thread-safe access\n");
+    println!("✓ Created product storage\n");
 
-    // Create handlers (wraps CRUD operations with error handling)
-    let handlers = CrudHandlers::new();
-    println!("✓ Created CRUD handlers\n");
-
-    // Demonstrate list operation
+    // Demonstrate list operation with ListResponse
     println!("--- List Products (Empty) ---");
-    match handlers.list(&storage) {
-        Ok(ListResponse { items, total }) => {
-            println!("Found {} products", total);
+    match storage.list() {
+        Ok(products) => {
+            let response = ListResponse::new(products);
+            println!("Found {} products", response.total);
         }
         Err(e) => println!("Error: {:?}", e),
     }
@@ -160,11 +149,11 @@ fn main() {
         in_stock: true,
     };
 
-    match handlers.create(&mut storage, product1_input) {
+    match storage.create(product1_input) {
         Ok(product) => {
             println!("✓ Created: {} (${:.2}) - ID: {}", product.name, product.price, product.id);
         }
-        Err(e) => println!("Error: {:?}", e),
+        Err(e) => println!("Error: {}", e),
     }
 
     let product2_input = CreateProduct {
@@ -174,16 +163,16 @@ fn main() {
         in_stock: true,
     };
 
-    match handlers.create(&mut storage, product2_input) {
+    match storage.create(product2_input) {
         Ok(product) => {
             println!("✓ Created: {} (${:.2}) - ID: {}", product.name, product.price, product.id);
         }
-        Err(e) => println!("Error: {:?}", e),
+        Err(e) => println!("Error: {}", e),
     }
     println!();
 
     // Try to create an invalid product (negative price)
-    println!("--- Attempting Invalid Create ---");
+    println!("--- Attempting Invalid Create (negative price) ---");
     let invalid_input = CreateProduct {
         name: "Invalid Product".to_string(),
         description: "This should fail".to_string(),
@@ -191,20 +180,46 @@ fn main() {
         in_stock: true,
     };
 
-    match handlers.create(&mut storage, invalid_input) {
+    match storage.create(invalid_input) {
         Ok(_) => println!("Unexpected success"),
-        Err(e) => println!("✓ Expected error: {:?}", e),
+        Err(e) => println!("✓ Expected error: {}", e),
     }
     println!();
 
-    // List all products
+    // Try to create with empty name
+    println!("--- Attempting Invalid Create (empty name) ---");
+    let invalid_input2 = CreateProduct {
+        name: "".to_string(),
+        description: "This should also fail".to_string(),
+        price: 10.0,
+        in_stock: true,
+    };
+
+    match storage.create(invalid_input2) {
+        Ok(_) => println!("Unexpected success"),
+        Err(e) => println!("✓ Expected error: {}", e),
+    }
+    println!();
+
+    // List all products with pagination info
     println!("--- List All Products ---");
-    match handlers.list(&storage) {
-        Ok(ListResponse { items, total }) => {
-            println!("Found {} products:", total);
-            for product in items {
+    match storage.list() {
+        Ok(products) => {
+            let response = ListResponse::with_pagination(
+                products.clone(),
+                products.len(),
+                10, // limit
+                0,  // offset
+            );
+            
+            println!("Response with pagination:");
+            println!("  Total: {}", response.total);
+            println!("  Limit: {:?}", response.limit);
+            println!("  Offset: {:?}", response.offset);
+            println!("  Products:");
+            for product in &response.data {
                 println!(
-                    "  - {} (${:.2}) - {} - ID: {}",
+                    "    - {} (${:.2}) - {} - ID: {}",
                     product.name,
                     product.price,
                     if product.in_stock { "In Stock" } else { "Out of Stock" },
@@ -212,7 +227,7 @@ fn main() {
                 );
             }
         }
-        Err(e) => println!("Error: {:?}", e),
+        Err(e) => println!("Error: {}", e),
     }
 
     println!("\n✓ Example completed successfully!");
