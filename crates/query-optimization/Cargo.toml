@@ -2,6 +2,11 @@
 name = "forgedb-query-optimization"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SIMD-accelerated query optimization and columnar scanning for ForgeDB"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "query", "optimization", "simd", "forgedb"]
+categories = ["database"]
 
 [dependencies]
 forgedb-storage = { path = "../storage" }

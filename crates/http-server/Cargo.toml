@@ -2,6 +2,11 @@
   edition = "2021"
   name    = "forgedb-http-server"
   version = "0.1.0"
+  license = "MIT OR Apache-2.0"
+  description = "Production-ready HTTP server infrastructure for ForgeDB REST API"
+  repository = "https://github.com/hoodiecollin/forgedb"
+  keywords = ["database", "http", "server", "api", "forgedb"]
+  categories = ["database", "web-programming::http-server"]
 
 [dependencies]
   axum               = "0.8"

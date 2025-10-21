@@ -2,6 +2,11 @@
 name = "forgedb-compaction"
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Database compaction and maintenance operations for ForgeDB"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "compaction", "maintenance", "forgedb"]
+categories = ["database"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
