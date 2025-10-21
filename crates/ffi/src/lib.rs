@@ -29,28 +29,35 @@
 //! - Opaque handles prevent direct memory access
 //! - Explicit memory management (no hidden allocations)
 //!
+//! # Status
+//!
+//! This crate is currently in early development. Most functionality is planned
+//! but not yet implemented.
+//!
+//! ## Currently Available
+//!
+//! - `forgedb_version()` - Get ForgeDB version string
+//!
+//! ## Planned
+//!
+//! - Database open/close operations
+//! - CRUD operations
+//! - Query interface
+//! - Transaction support
+//! - Error handling infrastructure
+//!
 //! # Examples
 //!
 //! ## C Usage
 //!
 //! ```c
 //! #include <forgedb.h>
+//! #include <stdio.h>
 //!
 //! int main() {
-//!     ForgeDBError* error = NULL;
-//!     
-//!     // Open database
-//!     ForgeDB* db = forgedb_open("./data", FORGEDB_OPEN_CREATE, &error);
-//!     if (!db) {
-//!         printf("Error: %s\n", forgedb_error_message(error));
-//!         forgedb_error_free(error);
-//!         return 1;
-//!     }
-//!     
-//!     // Use database...
-//!     
-//!     // Close database
-//!     forgedb_close(db);
+//!     // Get version
+//!     const char* version = forgedb_version();
+//!     printf("ForgeDB version: %s\n", version);
 //!     return 0;
 //! }
 //! ```
@@ -64,27 +71,10 @@
 //!   forgedb_version: {
 //!     returns: FFIType.cstring,
 //!   },
-//!   forgedb_open: {
-//!     args: [FFIType.cstring, FFIType.i32, FFIType.ptr],
-//!     returns: FFIType.ptr,
-//!   },
-//!   forgedb_close: {
-//!     args: [FFIType.ptr],
-//!     returns: FFIType.void,
-//!   },
 //! });
 //!
 //! // Get version
 //! console.log(lib.symbols.forgedb_version());
-//!
-//! // Open database
-//! const db = lib.symbols.forgedb_open("./data", 0x02, null);
-//! if (!db) {
-//!   console.error("Failed to open database");
-//! }
-//!
-//! // Close database
-//! lib.symbols.forgedb_close(db);
 //! ```
 //!
 //! ## Python Usage (ctypes)
@@ -97,380 +87,61 @@
 //!
 //! # Define function signatures
 //! lib.forgedb_version.restype = c_char_p
-//! lib.forgedb_open.argtypes = [c_char_p, c_int, POINTER(c_void_p)]
-//! lib.forgedb_open.restype = c_void_p
 //!
-//! # Use library
+//! # Get version
 //! version = lib.forgedb_version()
 //! print(f"ForgeDB version: {version.decode('utf-8')}")
-//!
-//! error = c_void_p()
-//! db = lib.forgedb_open(b"./data", 0x02, byref(error))
-//! if not db:
-//!     print("Failed to open database")
 //! ```
-//!
-//! # Public API
-//!
-//! ## Core Functions
-//!
-//! - `forgedb_version()` - Get library version string
-//! - `forgedb_open()` - Open a database
-//! - `forgedb_close()` - Close a database
-//!
-//! ## Error Handling
-//!
-//! - `forgedb_error_message()` - Get error message
-//! - `forgedb_error_code()` - Get error code
-//! - `forgedb_error_free()` - Free error handle
-//!
-//! ## Constants
-//!
-//! - `FORGEDB_OPEN_READONLY` (0x01) - Open in read-only mode
-//! - `FORGEDB_OPEN_CREATE` (0x02) - Create database if it doesn't exist
-//!
-//! ## Error Codes
-//!
-//! - `FORGEDB_ERR_INVALID` (1) - Invalid parameter
-//! - `FORGEDB_ERR_IO` (2) - I/O error
-//! - `FORGEDB_ERR_NOT_FOUND` (3) - Resource not found
-//!
-//! # Memory Management
-//!
-//! ## Ownership Rules
-//!
-//! - **Database handles**: Caller owns, must call `forgedb_close()`
-//! - **Error handles**: Caller owns, must call `forgedb_error_free()`
-//! - **String returns**: Library owns, do not free
-//!
-//! ## Lifetime Guarantees
-//!
-//! - Database handles remain valid until `forgedb_close()` is called
-//! - Error handles remain valid until `forgedb_error_free()` is called
-//! - Returned strings remain valid for the lifetime of their parent object
 //!
 //! # Building
 //!
-//! ## Dynamic Library
+//! To build the FFI library:
 //!
 //! ```bash
-//! cargo build --release --package forgedb-ffi
+//! cargo build --release -p forgedb-ffi
 //! ```
 //!
 //! This produces:
-//! - Linux: `libforgedb.so`
-//! - macOS: `libforgedb.dylib`
-//! - Windows: `forgedb.dll`
-//!
-//! ## Static Library
-//!
-//! ```bash
-//! cargo build --release --package forgedb-ffi --features static
-//! ```
-//!
-//! # Related Crates
-//!
-//! - [`forgedb-storage`](../forgedb_storage) - Underlying storage engine
-//! - [`forgedb-crud-api`](../forgedb_crud_api) - CRUD operations exposed via FFI
-//!
-//! # See Also
-//!
-//! - [README](./README.md) for detailed documentation and examples
-//! - [examples/](./examples/) for complete example programs
-//! - [SPRINT15_FFI.md](../../archive/sprint-summaries/SPRINT15_FFI.md) - FFI implementation
+//! - **Linux**: `libforgedb.so`
+//! - **macOS**: `libforgedb.dylib`
+//! - **Windows**: `forgedb.dll`
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
-mod handles;
-mod errors;
-mod conversions;
-
-pub use handles::*;
-pub use errors::*;
-pub use conversions::*;
-
-use libc::{c_char, c_int};
-use std::path::PathBuf;
-use std::ptr;
-
-/// Opaque database handle
-#[repr(C)]
-pub struct ForgeDB {
-    _private: [u8; 0],
-}
-
-/// Opaque error handle
-#[repr(C)]
-pub struct ForgeDBError {
-    _private: [u8; 0],
-}
-
-// Flags
-pub const FORGEDB_OPEN_READONLY: c_int = 0x01;
-pub const FORGEDB_OPEN_CREATE: c_int = 0x02;
+use std::os::raw::c_char;
 
 /// Get ForgeDB version string
 ///
 /// Returns a static string with the version number.
 /// No need to free (static storage).
+///
+/// # Safety
+///
+/// This function is safe to call from any thread. The returned pointer
+/// points to static storage and must not be freed.
+///
+/// # Returns
+///
+/// Pointer to null-terminated version string (e.g., "0.1.0")
 #[no_mangle]
 pub extern "C" fn forgedb_version() -> *const c_char {
     static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr() as *const c_char
 }
 
-/// Open a ForgeDB database
-///
-/// # Parameters
-/// - `path`: Path to database directory (null-terminated C string)
-/// - `flags`: Bitwise OR of FORGEDB_OPEN_* flags
-/// - `error`: Output parameter for error (can be NULL)
-///
-/// # Returns
-/// - Non-NULL handle on success
-/// - NULL on error (check error parameter)
-#[no_mangle]
-pub extern "C" fn forgedb_open(
-    path: *const c_char,
-    flags: c_int,
-    error: *mut *mut ForgeDBError,
-) -> *mut ForgeDB {
-    // Convert path
-    let path_str = match c_str_to_rust(path) {
-        Some(s) => s,
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                "Invalid path".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CStr;
 
-    // Parse flags (currently only READONLY is meaningful for our use case)
-    let _readonly = (flags & FORGEDB_OPEN_READONLY) != 0;
-    let _create = (flags & FORGEDB_OPEN_CREATE) != 0;
+    #[test]
+    fn test_version() {
+        let version_ptr = forgedb_version();
+        assert!(!version_ptr.is_null());
 
-    // Open database
-    let storage = ffi_try!(
-        forgedb_storage::UserStorage::new(PathBuf::from(&path_str)),
-        error
-    );
+        let version = unsafe { CStr::from_ptr(version_ptr) };
+        let version_str = version.to_str().unwrap();
 
-    // Create handle
-    let handle = DatabaseHandle {
-        storage: std::sync::Arc::new(parking_lot::RwLock::new(storage)),
-        path: path_str,
-    };
-
-    DB_HANDLES.insert(handle) as *mut ForgeDB
-}
-
-/// Close a ForgeDB database
-///
-/// After this call, the handle is invalid and must not be used.
-/// Safe to call with NULL or already-closed handle.
-#[no_mangle]
-pub extern "C" fn forgedb_close(db: *mut ForgeDB) {
-    if !db.is_null() {
-        DB_HANDLES.remove(db as *mut DatabaseHandle);
+        // Should be a valid semver-ish string
+        assert!(!version_str.is_empty());
+        assert!(version_str.contains('.'));
     }
-}
-
-/// Get a single record by ID
-///
-/// # Parameters
-/// - `db`: Database handle
-/// - `model`: Model name (currently ignored, only "User" supported)
-/// - `id`: Record ID as string
-/// - `error`: Output parameter for error (can be NULL)
-///
-/// # Returns
-/// - JSON string on success (must be freed with forgedb_free_string)
-/// - NULL on error or not found
-#[no_mangle]
-pub extern "C" fn forgedb_get(
-    db: *mut ForgeDB,
-    _model: *const c_char,
-    id: *const c_char,
-    error: *mut *mut ForgeDBError,
-) -> *mut c_char {
-    // Validate handle
-    let db_handle = match DB_HANDLES.get(db as *mut DatabaseHandle) {
-        Some(h) => h,
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                "Invalid database handle".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    // Convert ID parameter
-    let id_str = match c_str_to_rust(id) {
-        Some(s) => s,
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                "Invalid id".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    // Parse ID as u64
-    let id_u64 = match id_str.parse::<u64>() {
-        Ok(id) => id,
-        Err(_) => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                format!("Invalid id format: {}", id_str),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    // Get from database
-    let mut storage = db_handle.storage.write();
-    let result = ffi_try!(storage.get(id_u64), error);
-
-    match result {
-        Some(user) => to_json_string(&user),
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_NOT_FOUND,
-                format!("Record not found: {}", id_str),
-            );
-            ptr::null_mut()
-        }
-    }
-}
-
-/// List records with optional filtering
-///
-/// # Parameters
-/// - `db`: Database handle
-/// - `model`: Model name (currently ignored)
-/// - `filter_json`: JSON object with filters (currently ignored, returns all)
-/// - `limit`: Maximum number of records (0 for all)
-/// - `offset`: Number of records to skip (0 for none)
-/// - `error`: Output parameter for error
-///
-/// # Returns
-/// - JSON array string on success (must be freed)
-/// - NULL on error
-#[no_mangle]
-pub extern "C" fn forgedb_list(
-    db: *mut ForgeDB,
-    _model: *const c_char,
-    _filter_json: *const c_char,
-    limit: i32,
-    offset: i32,
-    error: *mut *mut ForgeDBError,
-) -> *mut c_char {
-    // Validate handle
-    let db_handle = match DB_HANDLES.get(db as *mut DatabaseHandle) {
-        Some(h) => h,
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                "Invalid database handle".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    // Get all users
-    let mut storage = db_handle.storage.write();
-    let all_users = ffi_try!(storage.list_all(), error);
-
-    // Apply pagination
-    let offset_usize = if offset > 0 { offset as usize } else { 0 };
-    let results: Vec<_> = all_users
-        .into_iter()
-        .skip(offset_usize)
-        .take(if limit > 0 {
-            limit as usize
-        } else {
-            usize::MAX
-        })
-        .collect();
-
-    // Serialize to JSON array
-    to_json_string(&results)
-}
-
-/// Execute complex query (simplified version)
-///
-/// Currently just delegates to list with limit/offset from query JSON
-#[no_mangle]
-pub extern "C" fn forgedb_query(
-    db: *mut ForgeDB,
-    model: *const c_char,
-    query_json: *const c_char,
-    error: *mut *mut ForgeDBError,
-) -> *mut c_char {
-    // Parse query JSON for limit/offset
-    #[derive(serde::Deserialize)]
-    struct Query {
-        #[serde(default)]
-        limit: Option<i32>,
-        #[serde(default)]
-        offset: Option<i32>,
-    }
-
-    let query: Query = match from_json_string(query_json) {
-        Some(q) => q,
-        None => {
-            set_error(
-                error,
-                FORGEDB_ERR_INVALID,
-                "Invalid query JSON".to_string(),
-            );
-            return ptr::null_mut();
-        }
-    };
-
-    // Delegate to list
-    forgedb_list(
-        db,
-        model,
-        ptr::null(),
-        query.limit.unwrap_or(0),
-        query.offset.unwrap_or(0),
-        error,
-    )
-}
-
-/// Get related records (not implemented yet for simple User model)
-///
-/// Returns empty array for now
-#[no_mangle]
-pub extern "C" fn forgedb_get_relations(
-    db: *mut ForgeDB,
-    _model: *const c_char,
-    _id: *const c_char,
-    _relation_name: *const c_char,
-    error: *mut *mut ForgeDBError,
-) -> *mut c_char {
-    // Validate handle
-    if DB_HANDLES.get(db as *mut DatabaseHandle).is_none() {
-        set_error(
-            error,
-            FORGEDB_ERR_INVALID,
-            "Invalid database handle".to_string(),
-        );
-        return ptr::null_mut();
-    }
-
-    // Return empty array (no relations in simple User model)
-    let empty: Vec<serde_json::Value> = vec![];
-    to_json_string(&empty)
 }
