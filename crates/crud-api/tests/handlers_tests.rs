@@ -163,6 +163,6 @@ fn test_list_response() {
     }];
     let response = ListResponse::new(data);
     assert_eq!(response.total, 1);
-    assert_eq!(response.limit, 100);
-    assert_eq!(response.offset, 0);
+    assert_eq!(response.limit, None);
+    assert_eq!(response.offset, None);
 }
