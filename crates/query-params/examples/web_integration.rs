@@ -1,0 +1,200 @@
+//! Intermediate example for forgedb-query-params
+//!
+//! This example demonstrates integrating query params
+//! with a web API for database queries.
+
+use forgedb_query_params::*;
+use serde::{Deserialize, Serialize};
+
+// Example data model
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct User {
+    id: u64,
+    name: String,
+    email: String,
+    status: String,
+    created_at: u64,
+}
+
+// Simulated database
+struct Database {
+    users: Vec<User>,
+}
+
+impl Database {
+    fn new() -> Self {
+        Self {
+            users: vec![
+                User {
+                    id: 1,
+                    name: "Alice".to_string(),
+                    email: "alice@example.com".to_string(),
+                    status: "active".to_string(),
+                    created_at: 1000000,
+                },
+                User {
+                    id: 2,
+                    name: "Bob".to_string(),
+                    email: "bob@example.com".to_string(),
+                    status: "inactive".to_string(),
+                    created_at: 2000000,
+                },
+                User {
+                    id: 3,
+                    name: "Charlie".to_string(),
+                    email: "charlie@example.com".to_string(),
+                    status: "active".to_string(),
+                    created_at: 3000000,
+                },
+                User {
+                    id: 4,
+                    name: "Diana".to_string(),
+                    email: "diana@example.com".to_string(),
+                    status: "active".to_string(),
+                    created_at: 4000000,
+                },
+                User {
+                    id: 5,
+                    name: "Eve".to_string(),
+                    email: "eve@example.com".to_string(),
+                    status: "inactive".to_string(),
+                    created_at: 5000000,
+                },
+            ],
+        }
+    }
+
+    fn query(&self, params: &QueryParams) -> (Vec<User>, usize) {
+        let mut results = self.users.clone();
+
+        // Apply filter if present
+        if let Some(filter) = &params.filter {
+            results.retain(|user| {
+                match filter.field.as_str() {
+                    "status" => {
+                        if let FilterValue::String(val) = &filter.value {
+                            &user.status == val
+                        } else {
+                            true
+                        }
+                    }
+                    "name" => {
+                        if let FilterValue::String(val) = &filter.value {
+                            user.name.contains(val)
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true,
+                }
+            });
+        }
+
+        let total = results.len();
+
+        // Apply sorting if present
+        if let Some(sort) = &params.sort {
+            match sort.field.as_str() {
+                "name" => {
+                    results.sort_by(|a, b| match sort.order {
+                        SortOrder::Asc => a.name.cmp(&b.name),
+                        SortOrder::Desc => b.name.cmp(&a.name),
+                    });
+                }
+                "created_at" => {
+                    results.sort_by(|a, b| match sort.order {
+                        SortOrder::Asc => a.created_at.cmp(&b.created_at),
+                        SortOrder::Desc => b.created_at.cmp(&a.created_at),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Apply pagination
+        let offset = params.pagination.offset();
+        let limit = params.pagination.limit;
+        
+        results = results
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect();
+
+        (results, total)
+    }
+}
+
+fn main() {
+    println!("=== ForgeDB Query Params - Web Integration ===\n");
+
+    let db = Database::new();
+    println!("✓ Database initialized with {} users\n", db.users.len());
+
+    // Example 1: List all users with default pagination
+    println!("--- Query 1: Default (all active users, first page) ---");
+    let query1 = "page=1&limit=10";
+    let params1: QueryParams = serde_urlencoded::from_str(query1).unwrap();
+    let (results1, total1) = db.query(&params1);
+    
+    println!("Query: {}", query1);
+    println!("Results: {} of {} total", results1.len(), total1);
+    for user in results1 {
+        println!("  - {} ({}) - {}", user.name, user.email, user.status);
+    }
+    println!();
+
+    // Example 2: Filter by status
+    println!("--- Query 2: Filter by status=active ---");
+    let query2 = "filter=status:active&page=1&limit=10";
+    let params2: QueryParams = serde_urlencoded::from_str(query2).unwrap();
+    let (results2, total2) = db.query(&params2);
+    
+    println!("Query: {}", query2);
+    println!("Results: {} of {} matching", results2.len(), total2);
+    for user in results2 {
+        println!("  - {} ({}) - {}", user.name, user.email, user.status);
+    }
+    println!();
+
+    // Example 3: Sort by name ascending
+    println!("--- Query 3: Sort by name (ascending) ---");
+    let query3 = "sort=name&order=asc&page=1&limit=10";
+    let params3: QueryParams = serde_urlencoded::from_str(query3).unwrap();
+    let (results3, total3) = db.query(&params3);
+    
+    println!("Query: {}", query3);
+    println!("Results: {} of {} total", results3.len(), total3);
+    for user in results3 {
+        println!("  - {} ({}) - {}", user.name, user.email, user.status);
+    }
+    println!();
+
+    // Example 4: Sort by created_at descending
+    println!("--- Query 4: Sort by created_at (descending) ---");
+    let query4 = "sort=created_at&order=desc&page=1&limit=3";
+    let params4: QueryParams = serde_urlencoded::from_str(query4).unwrap();
+    let (results4, total4) = db.query(&params4);
+    
+    println!("Query: {}", query4);
+    println!("Results: {} of {} total", results4.len(), total4);
+    for user in results4 {
+        println!("  - {} (created: {}) - {}", user.name, user.created_at, user.status);
+    }
+    println!();
+
+    // Example 5: Combined filter and sort with pagination
+    println!("--- Query 5: Filter + Sort + Pagination ---");
+    let query5 = "filter=status:active&sort=name&order=asc&page=1&limit=2";
+    let params5: QueryParams = serde_urlencoded::from_str(query5).unwrap();
+    let (results5, total5) = db.query(&params5);
+    
+    println!("Query: {}", query5);
+    println!("Results: {} of {} matching (page {}, limit {})",
+        results5.len(), total5, params5.pagination.page, params5.pagination.limit);
+    for user in results5 {
+        println!("  - {} ({}) - {}", user.name, user.email, user.status);
+    }
+
+    println!("\n✓ Example completed successfully!");
+}
