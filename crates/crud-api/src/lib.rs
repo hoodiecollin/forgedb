@@ -1,7 +1,261 @@
 //! ForgeDB CRUD API
 //!
-//! Generic CRUD operation handlers for database models.
-//! Provides traits and implementations for list, get, create, update, and delete operations.
+//! Generic CRUD operation handlers for database models with type-safe operations
+//! and HTTP integration.
+//!
+//! # Overview
+//!
+//! This crate provides generic CRUD (Create, Read, Update, Delete) operation handlers
+//! for ForgeDB models, offering:
+//!
+//! - **Generic operations** - Type-safe CRUD operations for any model
+//! - **HTTP handlers** - Ready-to-use HTTP endpoint handlers
+//! - **List operations** - Paginated list endpoints with filtering
+//! - **Error handling** - Comprehensive error types and responses
+//! - **Type safety** - Full type safety for model operations
+//!
+//! # Architecture
+//!
+//! The CRUD API is built around two main concepts:
+//!
+//! 1. **CrudOperations Trait** - Generic trait for storage implementations
+//! 2. **CrudHandlers** - HTTP handlers that use CrudOperations
+//!
+//! ## Operation Flow
+//!
+//! ```text
+//! HTTP Request
+//!     ↓
+//! CrudHandlers (parse, validate)
+//!     ↓
+//! CrudOperations (execute on storage)
+//!     ↓
+//! Storage Layer
+//!     ↓
+//! HTTP Response (JSON)
+//! ```
+//!
+//! # Examples
+//!
+//! ## Implementing CrudOperations
+//!
+//! ```rust
+//! use forgedb_crud_api::{CrudOperations, CrudResult};
+//! use uuid::Uuid;
+//! use serde::{Deserialize, Serialize};
+//!
+//! #[derive(Clone, Debug, Serialize, Deserialize)]
+//! struct User {
+//!     id: Uuid,
+//!     email: String,
+//!     name: String,
+//! }
+//!
+//! #[derive(Debug, Deserialize)]
+//! struct CreateUser {
+//!     email: String,
+//!     name: String,
+//! }
+//!
+//! #[derive(Debug, Deserialize)]
+//! struct UpdateUser {
+//!     email: Option<String>,
+//!     name: Option<String>,
+//! }
+//!
+//! struct UserStorage {
+//!     users: Vec<User>,
+//! }
+//!
+//! impl CrudOperations for UserStorage {
+//!     type Model = User;
+//!     type CreateInput = CreateUser;
+//!     type UpdateInput = UpdateUser;
+//!
+//!     fn list(&self) -> CrudResult<Vec<Self::Model>> {
+//!         Ok(self.users.clone())
+//!     }
+//!
+//!     fn get(&self, id: &Uuid) -> CrudResult<Option<Self::Model>> {
+//!         Ok(self.users.iter().find(|u| u.id == *id).cloned())
+//!     }
+//!
+//!     fn create(&mut self, input: Self::CreateInput) -> CrudResult<Self::Model> {
+//!         let user = User {
+//!             id: Uuid::new_v4(),
+//!             email: input.email,
+//!             name: input.name,
+//!         };
+//!         self.users.push(user.clone());
+//!         Ok(user)
+//!     }
+//!
+//!     fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> CrudResult<Option<Self::Model>> {
+//!         if let Some(user) = self.users.iter_mut().find(|u| u.id == *id) {
+//!             if let Some(email) = input.email {
+//!                 user.email = email;
+//!             }
+//!             if let Some(name) = input.name {
+//!                 user.name = name;
+//!             }
+//!             Ok(Some(user.clone()))
+//!         } else {
+//!             Ok(None)
+//!         }
+//!     }
+//!
+//!     fn delete(&mut self, id: &Uuid) -> CrudResult<bool> {
+//!         let before_len = self.users.len();
+//!         self.users.retain(|u| u.id != *id);
+//!         Ok(self.users.len() < before_len)
+//!     }
+//! }
+//! ```
+//!
+//! ## Using CRUD Handlers with HTTP
+//!
+//! ```rust,no_run
+//! use forgedb_crud_api::{CrudHandlers, CrudOperations};
+//! use axum::{Router, routing::{get, post, put, delete}};
+//!
+//! # use uuid::Uuid;
+//! # use serde::{Deserialize, Serialize};
+//! # #[derive(Clone, Debug, Serialize, Deserialize)]
+//! # struct User { id: Uuid, email: String }
+//! # #[derive(Debug, Deserialize)]
+//! # struct CreateUser { email: String }
+//! # #[derive(Debug, Deserialize)]
+//! # struct UpdateUser { email: Option<String> }
+//! # struct UserStorage;
+//! # impl CrudOperations for UserStorage {
+//! #     type Model = User;
+//! #     type CreateInput = CreateUser;
+//! #     type UpdateInput = UpdateUser;
+//! #     fn list(&self) -> forgedb_crud_api::CrudResult<Vec<Self::Model>> { Ok(vec![]) }
+//! #     fn get(&self, id: &Uuid) -> forgedb_crud_api::CrudResult<Option<Self::Model>> { Ok(None) }
+//! #     fn create(&mut self, input: Self::CreateInput) -> forgedb_crud_api::CrudResult<Self::Model> {
+//! #         Ok(User { id: Uuid::new_v4(), email: input.email })
+//! #     }
+//! #     fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> forgedb_crud_api::CrudResult<Option<Self::Model>> { Ok(None) }
+//! #     fn delete(&mut self, id: &Uuid) -> forgedb_crud_api::CrudResult<bool> { Ok(false) }
+//! # }
+//!
+//! let storage = UserStorage;
+//! let handlers = CrudHandlers::new(storage);
+//!
+//! let router = Router::new()
+//!     .route("/users", get(handlers.list))
+//!     .route("/users/:id", get(handlers.get))
+//!     .route("/users", post(handlers.create))
+//!     .route("/users/:id", put(handlers.update))
+//!     .route("/users/:id", delete(handlers.delete));
+//! ```
+//!
+//! ## List with Pagination
+//!
+//! ```rust
+//! use forgedb_crud_api::ListResponse;
+//! use serde::Serialize;
+//!
+//! #[derive(Serialize)]
+//! struct User {
+//!     id: String,
+//!     email: String,
+//! }
+//!
+//! let users = vec![
+//!     User { id: "1".to_string(), email: "user1@example.com".to_string() },
+//!     User { id: "2".to_string(), email: "user2@example.com".to_string() },
+//! ];
+//!
+//! let response = ListResponse {
+//!     data: users,
+//!     total: 2,
+//!     page: 1,
+//!     per_page: 10,
+//! };
+//!
+//! let json = serde_json::to_string(&response).unwrap();
+//! ```
+//!
+//! # Public API
+//!
+//! ## Core Traits
+//!
+//! - [`CrudOperations`] - Trait for implementing CRUD operations on storage
+//!
+//! ## HTTP Handlers
+//!
+//! - [`CrudHandlers`] - HTTP handler struct with methods for each operation
+//!
+//! ## Response Types
+//!
+//! - [`ListResponse<T>`] - Paginated list response with metadata
+//! - [`CrudResult<T>`] - Result type for CRUD operations
+//!
+//! ## Error Types
+//!
+//! - [`CrudError`] - Error type for CRUD operations
+//!
+//! # CRUD Operations
+//!
+//! ## List (GET /resource)
+//!
+//! Returns all records (excluding tombstoned):
+//! - Response: `ListResponse<Model>` with pagination info
+//! - Status: 200 OK
+//!
+//! ## Get (GET /resource/:id)
+//!
+//! Returns a single record by ID:
+//! - Response: `Model` if found
+//! - Status: 200 OK or 404 Not Found
+//!
+//! ## Create (POST /resource)
+//!
+//! Creates a new record:
+//! - Request: `CreateInput` (JSON body)
+//! - Response: Created `Model`
+//! - Status: 201 Created
+//!
+//! ## Update (PUT /resource/:id)
+//!
+//! Updates an existing record:
+//! - Request: `UpdateInput` (JSON body)
+//! - Response: Updated `Model` if found
+//! - Status: 200 OK or 404 Not Found
+//!
+//! ## Delete (DELETE /resource/:id)
+//!
+//! Marks a record as deleted (tombstone):
+//! - Response: Empty
+//! - Status: 204 No Content or 404 Not Found
+//!
+//! ## Count (GET /resource/count)
+//!
+//! Returns count of non-tombstoned records:
+//! - Response: `{ "count": number }`
+//! - Status: 200 OK
+//!
+//! # Error Handling
+//!
+//! CRUD operations return errors in these cases:
+//!
+//! - **NotFound**: Resource doesn't exist
+//! - **ValidationError**: Input validation failed
+//! - **DatabaseError**: Storage operation failed
+//! - **Conflict**: Uniqueness constraint violation
+//!
+//! # Related Crates
+//!
+//! - [`forgedb-http-server`](../forgedb_http_server) - HTTP server infrastructure
+//! - [`forgedb-storage`](../forgedb_storage) - Storage layer implementation
+//! - [`forgedb-query-params`](../forgedb_query_params) - Query parameter parsing
+//!
+//! # See Also
+//!
+//! - [README](./README.md) for detailed documentation
+//! - [SPRINT8_CRUD_API.md](../../archive/sprint-summaries/SPRINT8_CRUD_API.md) - CRUD API implementation
 
 mod handlers;
 mod operations;
