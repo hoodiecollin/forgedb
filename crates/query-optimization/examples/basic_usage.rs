@@ -1,159 +1,88 @@
 //! Basic usage example for forgedb-query-optimization
 //!
-//! This example demonstrates columnar scanning and filtering
-//! for efficient query execution.
+//! This example demonstrates efficient columnar scanning with SIMD optimization
+//! for filtering numeric data.
 
 use forgedb_query_optimization::*;
-use forgedb_types::Value;
-use uuid::Uuid;
 
 fn main() {
     println!("=== ForgeDB Query Optimization - Basic Usage ===\n");
 
-    // Create some sample data (columnar format)
+    // Create some sample data (u64 column)
     println!("--- Creating Sample Data ---");
-    
-    // Column 1: User IDs
-    let user_ids: Vec<Value> = (1..=10)
-        .map(|i| Value::I64(i))
-        .collect();
-    
-    // Column 2: Ages
-    let ages: Vec<Value> = vec![
-        Value::I32(25),
-        Value::I32(30),
-        Value::I32(22),
-        Value::I32(35),
-        Value::I32(28),
-        Value::I32(40),
-        Value::I32(19),
-        Value::I32(33),
-        Value::I32(27),
-        Value::I32(31),
+    let ages: Vec<u64> = vec![
+        25, 30, 22, 35, 28, 40, 19, 33, 27, 31,
+        45, 29, 38, 24, 32, 36, 26, 41, 23, 34,
     ];
     
-    // Column 3: Scores
-    let scores: Vec<Value> = vec![
-        Value::F64(85.5),
-        Value::F64(92.0),
-        Value::F64(78.5),
-        Value::F64(95.5),
-        Value::F64(88.0),
-        Value::F64(91.5),
-        Value::F64(76.0),
-        Value::F64(89.5),
-        Value::F64(84.0),
-        Value::F64(93.5),
-    ];
+    println!("✓ Created column with {} rows\n", ages.len());
 
-    println!("✓ Created {} records with 3 columns\n", user_ids.len());
-
-    // Example 1: Scan all records
-    println!("--- Scan All Records ---");
-    let scan1 = ColumnScan::new(vec![
-        ("id".to_string(), user_ids.clone()),
-        ("age".to_string(), ages.clone()),
-        ("score".to_string(), scores.clone()),
-    ]);
-    
-    let result1 = scan1.scan(None);
-    println!("Total records scanned: {}", result1.row_count);
-    println!("Columns scanned: {}", result1.columns_scanned);
+    // Example 1: Filter - Equal to 30
+    println!("--- Filter: age == 30 ---");
+    let filter1 = ScanFilter::Eq(30);
+    let result1 = ColumnScan::scan_u64(&ages, filter1, None);
+    println!("Matching rows: {}", result1.matching_rows.len());
+    println!("Rows scanned: {}", result1.rows_scanned);
+    println!("Matches at indices: {:?}", result1.matching_rows);
     println!();
 
-    // Example 2: Filter by age >= 30
+    // Example 2: Filter - Greater than 35
+    println!("--- Filter: age > 35 ---");
+    let filter2 = ScanFilter::Gt(35);
+    let result2 = ColumnScan::scan_u64(&ages, filter2, None);
+    println!("Matching rows: {}", result2.matching_rows.len());
+    println!("Rows scanned: {}", result2.rows_scanned);
+    for idx in &result2.matching_rows {
+        println!("  Index {}: age = {}", idx, ages[*idx]);
+    }
+    println!();
+
+    // Example 3: Filter - Greater than or equal to 30
     println!("--- Filter: age >= 30 ---");
-    let filter2 = ScanFilter::GreaterThanOrEqual {
-        column: "age".to_string(),
-        value: Value::I32(30),
-    };
-    
-    let scan2 = ColumnScan::new(vec![
-        ("id".to_string(), user_ids.clone()),
-        ("age".to_string(), ages.clone()),
-        ("score".to_string(), scores.clone()),
-    ]);
-    
-    let result2 = scan2.scan(Some(&filter2));
-    println!("Rows matching filter: {}", result2.row_count);
-    println!("Total rows scanned: {}", result2.rows_scanned);
-    println!("Selectivity: {:.2}%", (result2.row_count as f64 / result2.rows_scanned as f64) * 100.0);
+    let filter3 = ScanFilter::Gte(30);
+    let result3 = ColumnScan::scan_u64(&ages, filter3, None);
+    println!("Matching rows: {}", result3.matching_rows.len());
+    println!("Rows scanned: {}", result3.rows_scanned);
+    println!("Selectivity: {:.2}%", 
+        (result3.matching_rows.len() as f64 / result3.rows_scanned as f64) * 100.0);
     println!();
 
-    // Example 3: Filter by score > 90.0
-    println!("--- Filter: score > 90.0 ---");
-    let filter3 = ScanFilter::GreaterThan {
-        column: "score".to_string(),
-        value: Value::F64(90.0),
-    };
-    
-    let scan3 = ColumnScan::new(vec![
-        ("id".to_string(), user_ids.clone()),
-        ("age".to_string(), ages.clone()),
-        ("score".to_string(), scores.clone()),
-    ]);
-    
-    let result3 = scan3.scan(Some(&filter3));
-    println!("High scorers (>90): {}", result3.row_count);
-    println!("Total rows scanned: {}", result3.rows_scanned);
+    // Example 4: Filter with LIMIT
+    println!("--- Filter: age >= 25 (LIMIT 5) ---");
+    let filter4 = ScanFilter::Gte(25);
+    let result4 = ColumnScan::scan_u64(&ages, filter4, Some(5));
+    println!("Matching rows: {} (limited to 5)", result4.matching_rows.len());
+    println!("Rows scanned: {} (early termination: {})", 
+        result4.rows_scanned, result4.early_termination);
+    println!("First 5 matches: {:?}", result4.matching_rows);
     println!();
 
-    // Example 4: Filter by exact value
-    println!("--- Filter: age == 25 ---");
-    let filter4 = ScanFilter::Equals {
-        column: "age".to_string(),
-        value: Value::I32(25),
-    };
-    
-    let scan4 = ColumnScan::new(vec![
-        ("id".to_string(), user_ids.clone()),
-        ("age".to_string(), ages.clone()),
-        ("score".to_string(), scores.clone()),
-    ]);
-    
-    let result4 = scan4.scan(Some(&filter4));
-    println!("Rows with age 25: {}", result4.row_count);
+    // Example 5: Range filter
+    println!("--- Filter: 25 <= age <= 35 ---");
+    let filter5 = ScanFilter::Range(25, 35);
+    let result5 = ColumnScan::scan_u64(&ages, filter5, None);
+    println!("Matching rows in range: {}", result5.matching_rows.len());
+    println!("Values: {:?}", 
+        result5.matching_rows.iter().map(|&i| ages[i]).collect::<Vec<_>>());
     println!();
 
-    // Example 5: Range scan (age between 25 and 30)
-    println!("--- Range: 25 <= age <= 30 ---");
-    let filter5_low = ScanFilter::GreaterThanOrEqual {
-        column: "age".to_string(),
-        value: Value::I32(25),
-    };
-    
-    // Note: For a true range, you'd need to combine filters
-    // This example shows the lower bound filter
-    let scan5 = ColumnScan::new(vec![
-        ("id".to_string(), user_ids.clone()),
-        ("age".to_string(), ages.clone()),
-        ("score".to_string(), scores.clone()),
-    ]);
-    
-    let result5 = scan5.scan(Some(&filter5_low));
-    println!("Rows with age >= 25: {}", result5.row_count);
+    // Example 6: Not equal filter
+    println!("--- Filter: age != 30 ---");
+    let filter6 = ScanFilter::Ne(30);
+    let result6 = ColumnScan::scan_u64(&ages, filter6, None);
+    println!("Matching rows: {}", result6.matching_rows.len());
     println!();
 
-    // Statistics and cost estimation
-    println!("--- Index Statistics ---");
-    let mut stats = IndexStatistics::new();
-    
-    // Record some statistics
-    stats.record_scan("age", result2.rows_scanned, result2.row_count);
-    stats.record_scan("score", result3.rows_scanned, result3.row_count);
-    
-    let age_stats = stats.get_column_stats("age");
-    println!("Age column:");
-    println!("  Total scans: {}", age_stats.scan_count);
-    println!("  Total rows scanned: {}", age_stats.total_rows_scanned);
-    println!("  Avg selectivity: {:.2}%", age_stats.selectivity() * 100.0);
-    println!();
-
-    let score_stats = stats.get_column_stats("score");
-    println!("Score column:");
-    println!("  Total scans: {}", score_stats.scan_count);
-    println!("  Total rows scanned: {}", score_stats.total_rows_scanned);
-    println!("  Avg selectivity: {:.2}%", score_stats.selectivity() * 100.0);
+    // Example 7: Less than filter
+    println!("--- Filter: age < 25 ---");
+    let filter7 = ScanFilter::Lt(25);
+    let result7 = ColumnScan::scan_u64(&ages, filter7, None);
+    println!("Matching rows: {}", result7.matching_rows.len());
+    for idx in &result7.matching_rows {
+        println!("  Index {}: age = {}", idx, ages[*idx]);
+    }
 
     println!("\n✓ Example completed successfully!");
+    println!("\nNote: This crate uses SIMD (AVX2) optimization on x86_64 platforms");
+    println!("      for faster columnar scanning of large datasets.");
 }
