@@ -502,9 +502,11 @@ fn test_fixed_column_u64() {
 
 ## Links to Documentation
 
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - Overall system design and data flow
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete guide to runtime libraries
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Setting up development environment
 - [SPRINT2_PERSISTENCE.md](../../archive/sprint-summaries/SPRINT2_PERSISTENCE.md) - Original storage implementation
 - [SPRINT7_SUMMARY.md](../../archive/sprint-summaries/SPRINT7_SUMMARY.md) - WAL integration
-- [CRATE_ORGANIZATION_PLAN.md](../../CRATE_ORGANIZATION_PLAN.md) - Overall crate organization
 
 ## License
 

@@ -405,6 +405,14 @@ cargo test -p forgedb-query-params --test filter_tests
 - `serde` - Serialization/deserialization support
 - `serde_urlencoded` - URL query string parsing
 
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+
 ## License
 
 Part of the ForgeDB project.

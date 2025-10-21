@@ -307,6 +307,14 @@ The crate includes comprehensive tests for:
 - Incremental index updates
 - Query result highlighting
 
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+
 ## License
 
 Part of the ForgeDB project.

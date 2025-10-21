@@ -59,7 +59,12 @@ cargo bench -p forgedb-query-optimization
 
 ## Documentation
 
-See [`archive/sprint-summaries/SPRINT14_QUERY_OPTIMIZATION.md`](../../archive/sprint-summaries/SPRINT14_QUERY_OPTIMIZATION.md) for complete documentation.
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete runtime library documentation
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+- [SPRINT14_QUERY_OPTIMIZATION.md](../../archive/sprint-summaries/SPRINT14_QUERY_OPTIMIZATION.md) - Original implementation
 
 ## License
 

@@ -115,7 +115,12 @@ cargo test -p forgedb-watcher -- --nocapture
 
 ## Documentation
 
-See [SPRINT5_WATCHER.md](../../SPRINT5_WATCHER.md) for complete documentation.
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Internal Crates Guide](../../docs/INTERNAL_CRATES.md)** - Tooling and file watching
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+- [SPRINT5_WATCHER.md](../../SPRINT5_WATCHER.md) - Original implementation
 
 ## License
 

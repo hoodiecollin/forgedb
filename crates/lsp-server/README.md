@@ -133,3 +133,15 @@ cargo test -p forgedb-lsp-server
 - Incremental parsing
 - Multi-file support
 - Import/export handling
+
+## Documentation
+
+For more information about ForgeDB:
+
+- **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
+- **[Internal Crates Guide](../../docs/INTERNAL_CRATES.md)** - Tooling and LSP integration
+- **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
+
+## License
+
+Part of the ForgeDB project.
