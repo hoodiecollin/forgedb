@@ -7,3 +7,6 @@ edition = "2021"
 forgedb-parser = { path = "../parser" }
 anyhow = "1.0"
 thiserror = "1.0"
+quote = "1.0"
+syn = "2.0"
+proc-macro2 = "1.0"
