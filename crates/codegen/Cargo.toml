@@ -1,0 +1,9 @@
+[package]
+name = "forgedb-codegen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+forgedb-parser = { path = "../parser" }
+anyhow = "1.0"
+thiserror = "1.0"
