@@ -48,8 +48,8 @@ impl RustGenerator {
             #![allow(dead_code, unused_imports)]
 
             use std::collections::HashMap;
-            use std::path::Path;
-            use forgedb_storage::ColumnarStorage;
+            use std::path::{Path, PathBuf};
+            use forgedb_storage::{ColumnarStorage, FixedColumn, VariableColumn, Tombstones};
             use forgedb_types::{Uuid, Timestamp, Value};
             use serde::{Deserialize, Serialize};
             use utoipa::ToSchema;
@@ -96,6 +96,18 @@ impl RustGenerator {
             })
             .collect();
 
+        // Generate columnar storage fields
+        let storage_fields = Self::generate_storage_fields(model);
+
+        // Generate storage initialization
+        let storage_inits = Self::generate_storage_inits(model);
+
+        // Generate insert logic
+        let insert_logic = Self::generate_insert_logic(model);
+
+        // Generate get logic
+        let get_logic = Self::generate_get_logic(model);
+
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
             #[doc = #model_doc]
@@ -106,29 +118,252 @@ impl RustGenerator {
 
             #[doc = #storage_doc]
             pub struct #storage_name {
-                // TODO: Implement columnar storage fields
+                #storage_fields
             }
 
             impl #storage_name {
                 pub fn new() -> Self {
                     Self {
-                        // TODO: Initialize storage
+                        #storage_inits
                     }
                 }
 
                 pub fn insert(&mut self, record: #model_name) -> Uuid {
-                    // TODO: Implement insert
-                    Uuid::new_v4()
+                    #insert_logic
                 }
 
                 pub fn get(&self, id: Uuid) -> Option<#model_name> {
-                    // TODO: Implement get
-                    None
+                    #get_logic
                 }
             }
         };
 
         Ok(tokens)
+    }
+
+    /// Generate storage field declarations for columnar storage
+    fn generate_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
+        let mut column_fields = Vec::new();
+
+        for field in &model.fields {
+            let field_col_name = format_ident!("{}_col", field.name);
+
+            if Self::is_fixed_size_type(&field.field_type) {
+                column_fields.push(quote! {
+                    #field_col_name: FixedColumn
+                });
+            } else if Self::is_string_type(&field.field_type) {
+                column_fields.push(quote! {
+                    #field_col_name: VariableColumn
+                });
+            }
+            // Skip relations and other non-storage types
+        }
+
+        quote! {
+            id_to_row: HashMap<Uuid, usize>,
+            row_count: usize,
+            #(#column_fields,)*
+            tombstones: forgedb_storage::Tombstones,
+        }
+    }
+
+    /// Generate storage initialization code
+    fn generate_storage_inits(model: &forgedb_parser::Model) -> TokenStream {
+        let mut inits = Vec::new();
+        let mut column_index = 0usize;
+
+        for field in &model.fields {
+            let field_col_name = format_ident!("{}_col", field.name);
+
+            if Self::is_fixed_size_type(&field.field_type) {
+                let value_size = Self::get_value_size(&field.field_type);
+                let col_path = format!("fixed/{}_{}.bin", Self::type_name(&field.field_type), column_index);
+
+                inits.push(quote! {
+                    #field_col_name: FixedColumn::new(
+                        PathBuf::from(#col_path),
+                        #value_size
+                    ).expect("Failed to create fixed column")
+                });
+                column_index += 1;
+            } else if Self::is_string_type(&field.field_type) {
+                let data_path = format!("variable/string_data_{}.bin", column_index);
+                let offsets_path = format!("variable/string_offsets_{}.bin", column_index);
+
+                inits.push(quote! {
+                    #field_col_name: VariableColumn::new(
+                        PathBuf::from(#data_path),
+                        PathBuf::from(#offsets_path)
+                    ).expect("Failed to create variable column")
+                });
+                column_index += 1;
+            }
+        }
+
+        quote! {
+            id_to_row: HashMap::new(),
+            row_count: 0,
+            #(#inits,)*
+            tombstones: forgedb_storage::Tombstones::new(
+                PathBuf::from("tombstones.bin")
+            ).expect("Failed to create tombstones"),
+        }
+    }
+
+    /// Generate insert method logic
+    fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
+        let mut append_statements = Vec::new();
+
+        // Find the ID field
+        let id_field = model.fields.iter().find(|f| f.name == "id" || f.auto_generate);
+        let id_field_name = if let Some(f) = id_field {
+            format_ident!("{}", f.name)
+        } else {
+            format_ident!("id")
+        };
+
+        for field in &model.fields {
+            let field_name = format_ident!("{}", field.name);
+            let field_col_name = format_ident!("{}_col", field.name);
+
+            if Self::is_fixed_size_type(&field.field_type) {
+                let append_method = Self::get_append_method(&field.field_type);
+
+                append_statements.push(quote! {
+                    self.#field_col_name.#append_method(record.#field_name)
+                        .expect("Failed to append to column");
+                });
+            } else if Self::is_string_type(&field.field_type) {
+                append_statements.push(quote! {
+                    self.#field_col_name.append_string(&record.#field_name)
+                        .expect("Failed to append string");
+                });
+            }
+        }
+
+        quote! {
+            let row_index = self.row_count;
+            let id = record.#id_field_name;
+
+            // Append all fields to their respective columns
+            #(#append_statements)*
+
+            // Mark as not deleted
+            self.tombstones.append(false).expect("Failed to append tombstone");
+
+            // Store ID mapping
+            self.id_to_row.insert(id, row_index);
+            self.row_count += 1;
+
+            id
+        }
+    }
+
+    /// Generate get method logic
+    fn generate_get_logic(model: &forgedb_parser::Model) -> TokenStream {
+        let mut read_statements = Vec::new();
+        let mut field_values = Vec::new();
+
+        for field in &model.fields {
+            let field_name = format_ident!("{}", field.name);
+            let field_col_name = format_ident!("{}_col", field.name);
+            let field_value_name = format_ident!("{}_value", field.name);
+
+            if Self::is_fixed_size_type(&field.field_type) {
+                let read_method = Self::get_read_method(&field.field_type);
+
+                read_statements.push(quote! {
+                    let #field_value_name = self.#field_col_name.#read_method(row_index)
+                        .expect("Failed to read from column");
+                });
+            } else if Self::is_string_type(&field.field_type) {
+                read_statements.push(quote! {
+                    let #field_value_name = self.#field_col_name.read_string(row_index)
+                        .expect("Failed to read string");
+                });
+            }
+
+            field_values.push(quote! { #field_name: #field_value_name });
+        }
+
+        let model_name = format_ident!("{}", model.name);
+
+        quote! {
+            // Look up row index
+            let row_index = *self.id_to_row.get(&id)?;
+
+            // Check if deleted
+            if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+                return None;
+            }
+
+            // Read all fields
+            #(#read_statements)*
+
+            // Construct model
+            Some(#model_name {
+                #(#field_values),*
+            })
+        }
+    }
+
+    /// Check if a field type is fixed-size
+    fn is_fixed_size_type(field_type: &forgedb_parser::FieldType) -> bool {
+        matches!(
+            field_type,
+            forgedb_parser::FieldType::U32
+                | forgedb_parser::FieldType::U64
+                | forgedb_parser::FieldType::I32
+                | forgedb_parser::FieldType::I64
+                | forgedb_parser::FieldType::F64
+                | forgedb_parser::FieldType::Bool
+                | forgedb_parser::FieldType::Uuid
+                | forgedb_parser::FieldType::Timestamp
+        )
+    }
+
+    /// Check if a field type is a string
+    fn is_string_type(field_type: &forgedb_parser::FieldType) -> bool {
+        matches!(field_type, forgedb_parser::FieldType::String)
+    }
+
+    /// Get the byte size for a fixed-size type
+    fn get_value_size(field_type: &forgedb_parser::FieldType) -> usize {
+        match field_type {
+            forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::I32 => 4,
+            forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
+            forgedb_parser::FieldType::F64 => 8,
+            forgedb_parser::FieldType::Bool => 1,
+            forgedb_parser::FieldType::Uuid => 16,
+            forgedb_parser::FieldType::Timestamp => 8,
+            _ => 8, // Default
+        }
+    }
+
+    /// Get the type name for storage paths
+    fn type_name(field_type: &forgedb_parser::FieldType) -> &'static str {
+        match field_type {
+            forgedb_parser::FieldType::U32 => "u32",
+            forgedb_parser::FieldType::U64 => "u64",
+            forgedb_parser::FieldType::I32 => "i32",
+            forgedb_parser::FieldType::I64 => "i64",
+            forgedb_parser::FieldType::F64 => "f64",
+            forgedb_parser::FieldType::Bool => "bool",
+            forgedb_parser::FieldType::Uuid => "uuid",
+            forgedb_parser::FieldType::Timestamp => "timestamp",
+            _ => "unknown",
+        }
+    }
+
+    /// Get the append method name for a field type
+    fn get_append_method(field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
+        format_ident!("append_{}", Self::type_name(field_type))
+    }
+
+    /// Get the read method name for a field type
+    fn get_read_method(field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
+        format_ident!("read_{}", Self::type_name(field_type))
     }
 
     /// Generate the main database struct
