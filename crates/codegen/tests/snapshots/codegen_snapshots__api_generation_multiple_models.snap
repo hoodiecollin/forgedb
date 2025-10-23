@@ -1,0 +1,126 @@
+---
+source: crates/codegen/tests/codegen_snapshots.rs
+expression: result.code
+---
+//! Generated API server by ForgeDB
+//! DO NOT EDIT - This file is auto-generated
+#![allow(dead_code, unused_imports)]
+use axum::{
+    extract::{Path, State},
+    http::StatusCode, response::Json, routing::{get, post},
+    Router,
+};
+use serde_json::json;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+#[utoipa::path(
+    get,
+    path = "",
+    tag = "User",
+    responses((status = 200, description = "List all User", body = Vec<User>))
+)]
+async fn list_user(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : [] }))
+}
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "User",
+    params(("id" = String, Path, description = "User")),
+    responses(
+        (status = 200, description = "Get User by ID", body = User),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn get_user(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : null }))
+}
+#[utoipa::path(
+    post,
+    path = "",
+    tag = "User",
+    request_body = User,
+    responses((status = 201, description = "Create new User", body = User))
+)]
+async fn create_user(
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : null }))
+}
+#[utoipa::path(
+    get,
+    path = "",
+    tag = "Post",
+    responses((status = 200, description = "List all Post", body = Vec<Post>))
+)]
+async fn list_post(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : [] }))
+}
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Post",
+    params(("id" = String, Path, description = "Post")),
+    responses(
+        (status = 200, description = "Get Post by ID", body = Post),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn get_post(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : null }))
+}
+#[utoipa::path(
+    post,
+    path = "",
+    tag = "Post",
+    request_body = Post,
+    responses((status = 201, description = "Create new Post", body = Post))
+)]
+async fn create_post(
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "data" : null }))
+}
+#[derive(OpenApi)]
+#[openapi(
+    paths(list_user, list_post, get_user, get_post, create_user, create_post),
+    components(schemas(User, Post)),
+    tags(
+        (
+            name = stringify!(User),
+            description = concat!(stringify!(User), " operations")
+        ),
+        (name = stringify!(Post), description = concat!(stringify!(Post), " operations"))
+    )
+)]
+pub struct ApiDoc;
+/// Get OpenAPI specification as JSON
+pub fn openapi_json() -> String {
+    ApiDoc::openapi().to_json().unwrap()
+}
+/// Create the API router with all endpoints
+pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
+    Router::new()
+        .route(concat!("/api/", "user"), get(list_user))
+        .route(concat!("/api/", "user"), post(create_user))
+        .route(concat!("/api/", "user", "/:id"), get(get_user))
+        .route(concat!("/api/", "post"), get(list_post))
+        .route(concat!("/api/", "post"), post(create_post))
+        .route(concat!("/api/", "post", "/:id"), get(get_post))
+        .with_state(db)
+}

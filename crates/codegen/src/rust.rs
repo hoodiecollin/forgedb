@@ -51,6 +51,8 @@ impl RustGenerator {
             use std::path::Path;
             use forgedb_storage::ColumnarStorage;
             use forgedb_types::{Uuid, Timestamp, Value};
+            use serde::{Deserialize, Serialize};
+            use utoipa::ToSchema;
         };
         tokens.extend(imports);
 
@@ -64,7 +66,11 @@ impl RustGenerator {
         let db_tokens = Self::generate_database(schema)?;
         tokens.extend(db_tokens);
 
-        Ok(tokens.to_string())
+        // Parse and format with prettyplease
+        let syntax_tree = syn::parse_file(&tokens.to_string())
+            .map_err(|e| crate::CodegenError::GenerationFailed(format!("Failed to parse generated code: {}", e)))?;
+
+        Ok(prettyplease::unparse(&syntax_tree))
     }
 
     /// Generate a single model struct
@@ -93,7 +99,7 @@ impl RustGenerator {
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
             #[doc = #model_doc]
-            #[derive(Debug, Clone)]
+            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
             pub struct #model_name {
                 #(#fields),*
             }
@@ -277,23 +283,22 @@ mod tests {
         let result = RustGenerator::generate(&schema).unwrap();
         let code = result.code;
 
-        // Verify the generated code contains expected elements
-        // Note: quote! generates tokens without spaces, so we check for the structure
+        // Verify the generated code contains expected elements (formatted by prettyplease)
         assert!(code.contains("pub struct User"));
-        assert!(code.contains("pub id : Uuid"));
-        assert!(code.contains("pub email : String"));
-        assert!(code.contains("pub age : Option < Age >") || code.contains("pub age : Option <Age>") || code.contains("pub age : Option<Age>"));
+        assert!(code.contains("pub id: Uuid"));
+        assert!(code.contains("pub email: String"));
+        assert!(code.contains("pub age: Option<Age>"));
         assert!(code.contains("pub struct UserStorage"));
         assert!(code.contains("pub struct Database"));
-        assert!(code.contains("pub user : UserStorage"));
+        assert!(code.contains("pub user: UserStorage"));
         assert!(code.contains("impl UserStorage"));
         assert!(code.contains("pub fn new"));
         assert!(code.contains("pub fn insert"));
         assert!(code.contains("pub fn get"));
 
         // Verify it compiles as valid Rust (basic syntax check)
-        assert!(code.contains("use std :: collections :: HashMap"));
-        assert!(code.contains("use forgedb_types :: { Uuid , Timestamp , Value }"));
+        assert!(code.contains("use std::collections::HashMap"));
+        assert!(code.contains("use forgedb_types::{Uuid, Timestamp, Value}"));
     }
 
     #[test]
@@ -341,11 +346,12 @@ mod tests {
         let result = RustGenerator::generate(&schema).unwrap();
         let code = result.code;
 
+        // Verify formatted output
         assert!(code.contains("pub struct User"));
         assert!(code.contains("pub struct Post"));
         assert!(code.contains("pub struct UserStorage"));
         assert!(code.contains("pub struct PostStorage"));
-        assert!(code.contains("pub user : UserStorage"));
-        assert!(code.contains("pub post : PostStorage"));
+        assert!(code.contains("pub user: UserStorage"));
+        assert!(code.contains("pub post: PostStorage"));
     }
 }
