@@ -285,3 +285,222 @@ fn test_database_empty() {
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+#[test]
+fn test_fixed_column_u32() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_u32");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_u32.bin");
+    let mut col = FixedColumn::new(path, 4).unwrap();
+
+    col.append_u32(42).unwrap();
+    col.append_u32(100).unwrap();
+    col.append_u32(999).unwrap();
+
+    assert_eq!(col.read_u32(0).unwrap(), 42);
+    assert_eq!(col.read_u32(1).unwrap(), 100);
+    assert_eq!(col.read_u32(2).unwrap(), 999);
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_i32() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_i32");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_i32.bin");
+    let mut col = FixedColumn::new(path, 4).unwrap();
+
+    col.append_i32(-42).unwrap();
+    col.append_i32(100).unwrap();
+    col.append_i32(-999).unwrap();
+
+    assert_eq!(col.read_i32(0).unwrap(), -42);
+    assert_eq!(col.read_i32(1).unwrap(), 100);
+    assert_eq!(col.read_i32(2).unwrap(), -999);
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_i64() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_i64");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_i64.bin");
+    let mut col = FixedColumn::new(path, 8).unwrap();
+
+    col.append_i64(-42000000000).unwrap();
+    col.append_i64(100000000000).unwrap();
+    col.append_i64(-999).unwrap();
+
+    assert_eq!(col.read_i64(0).unwrap(), -42000000000);
+    assert_eq!(col.read_i64(1).unwrap(), 100000000000);
+    assert_eq!(col.read_i64(2).unwrap(), -999);
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_f64() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_f64");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_f64.bin");
+    let mut col = FixedColumn::new(path, 8).unwrap();
+
+    col.append_f64(3.14159).unwrap();
+    col.append_f64(-2.71828).unwrap();
+    col.append_f64(1.41421).unwrap();
+
+    assert!((col.read_f64(0).unwrap() - 3.14159).abs() < 0.00001);
+    assert!((col.read_f64(1).unwrap() - (-2.71828)).abs() < 0.00001);
+    assert!((col.read_f64(2).unwrap() - 1.41421).abs() < 0.00001);
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_bool() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bool");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_bool.bin");
+    let mut col = FixedColumn::new(path, 1).unwrap();
+
+    col.append_bool(true).unwrap();
+    col.append_bool(false).unwrap();
+    col.append_bool(true).unwrap();
+
+    assert_eq!(col.read_bool(0).unwrap(), true);
+    assert_eq!(col.read_bool(1).unwrap(), false);
+    assert_eq!(col.read_bool(2).unwrap(), true);
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_uuid() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_uuid");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_uuid.bin");
+    let mut col = FixedColumn::new(path, 16).unwrap();
+
+    let uuid1 = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+    let uuid2 = [16u8, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+
+    col.append_uuid(uuid1).unwrap();
+    col.append_uuid(uuid2).unwrap();
+
+    assert_eq!(col.read_uuid(0).unwrap(), uuid1);
+    assert_eq!(col.read_uuid(1).unwrap(), uuid2);
+    assert_eq!(col.len(), 2);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_timestamp() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_timestamp");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_timestamp.bin");
+    let mut col = FixedColumn::new(path, 8).unwrap();
+
+    let now = 1704067200i64; // 2024-01-01 00:00:00 UTC
+    let later = now + 3600;
+
+    col.append_timestamp(now).unwrap();
+    col.append_timestamp(later).unwrap();
+
+    assert_eq!(col.read_timestamp(0).unwrap(), now);
+    assert_eq!(col.read_timestamp(1).unwrap(), later);
+    assert_eq!(col.len(), 2);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_bytes() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bytes");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_bytes.bin");
+    let mut col = FixedColumn::new(path, 20).unwrap();
+
+    let bytes1 = [1u8; 20];
+    let bytes2 = [2u8; 20];
+    let bytes3 = [3u8; 20];
+
+    col.append_bytes(&bytes1).unwrap();
+    col.append_bytes(&bytes2).unwrap();
+    col.append_bytes(&bytes3).unwrap();
+
+    assert_eq!(col.read_bytes(0).unwrap(), bytes1.to_vec());
+    assert_eq!(col.read_bytes(1).unwrap(), bytes2.to_vec());
+    assert_eq!(col.read_bytes(2).unwrap(), bytes3.to_vec());
+    assert_eq!(col.len(), 3);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_bytes_wrong_size() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bytes_wrong");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_bytes.bin");
+    let mut col = FixedColumn::new(path, 20).unwrap();
+
+    let bytes_wrong_size = [1u8; 10]; // Wrong size (should be 20)
+
+    let result = col.append_bytes(&bytes_wrong_size);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_char_array() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_char");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_char.bin");
+    let mut col = FixedColumn::new(path, 50).unwrap();
+
+    // Simulate char(50) storage
+    let mut str1 = [0u8; 50];
+    let mut str2 = [0u8; 50];
+    str1[..5].copy_from_slice(b"hello");
+    str2[..5].copy_from_slice(b"world");
+
+    col.append_bytes(&str1).unwrap();
+    col.append_bytes(&str2).unwrap();
+
+    let read1 = col.read_bytes(0).unwrap();
+    let read2 = col.read_bytes(1).unwrap();
+
+    assert_eq!(&read1[..5], b"hello");
+    assert_eq!(&read2[..5], b"world");
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}

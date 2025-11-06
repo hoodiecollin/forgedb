@@ -37,7 +37,9 @@ impl UserStorage {
     pub fn insert(&mut self, record: User) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
-        self.id_col.append_uuid(record.id).expect("Failed to append to column");
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
@@ -48,10 +50,13 @@ impl UserStorage {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
-        let id_value = self
-            .id_col
-            .read_uuid(row_index)
-            .expect("Failed to read from column");
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
         Some(User { id: id_value })
     }
 }
@@ -88,7 +93,9 @@ impl PostStorage {
     pub fn insert(&mut self, record: Post) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
-        self.id_col.append_uuid(record.id).expect("Failed to append to column");
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
         self.title_col.append_string(&record.title).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
@@ -100,10 +107,13 @@ impl PostStorage {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
-        let id_value = self
-            .id_col
-            .read_uuid(row_index)
-            .expect("Failed to read from column");
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
         let title_value = self
             .title_col
             .read_string(row_index)

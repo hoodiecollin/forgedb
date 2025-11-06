@@ -274,3 +274,177 @@ fn test_different_field_types() {
     let result = RustGenerator::generate(&schema).unwrap();
     insta::assert_snapshot!(result.code);
 }
+
+/// Helper to create a schema with complex fixed-size types
+fn complex_types_schema() -> Schema {
+    use forgedb_parser::Struct;
+    
+    Schema {
+        structs: vec![
+            Struct {
+                name: "Address".to_string(),
+                fields: vec![
+                    Field {
+                        name: "street".to_string(),
+                        field_type: FieldType::Char(100),
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                    Field {
+                        name: "city".to_string(),
+                        field_type: FieldType::Char(50),
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                ],
+            },
+            Struct {
+                name: "Location".to_string(),
+                fields: vec![
+                    Field {
+                        name: "lat".to_string(),
+                        field_type: FieldType::F64,
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::BTree,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                    Field {
+                        name: "lon".to_string(),
+                        field_type: FieldType::F64,
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::BTree,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                ],
+            },
+        ],
+        models: vec![Model {
+            name: "Place".to_string(),
+            fields: vec![
+                Field {
+                    name: "id".to_string(),
+                    field_type: FieldType::Uuid,
+                    auto_generate: true,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "name".to_string(),
+                    field_type: FieldType::Char(200),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "address".to_string(),
+                    field_type: FieldType::StructType("Address".to_string()),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "location".to_string(),
+                    field_type: FieldType::OptionalStructType("Location".to_string()),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "tags".to_string(),
+                    field_type: FieldType::FixedArray(Box::new(FieldType::Char(20)), 5),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "scores".to_string(),
+                    field_type: FieldType::FixedArray(Box::new(FieldType::F64), 10),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+            ],
+            composite_indexes: vec![],
+            soft_delete: false,
+        }],
+    }
+}
+
+#[test]
+fn test_rust_generation_with_complex_types() {
+    let schema = complex_types_schema();
+    let result = RustGenerator::generate(&schema);
+
+    assert!(result.is_ok());
+    let code = result.unwrap().code;
+
+    // Print for manual inspection FIRST
+    println!("Generated code:\n{}", code);
+
+    // Verify struct definitions are generated correctly
+    // Note: prettyplease adds 'usize' suffix to array sizes
+    assert!(code.contains("pub name: [u8; 200usize]"), "Missing: pub name: [u8; 200usize]");
+    assert!(code.contains("pub address: Address"), "Missing: pub address: Address");
+    assert!(code.contains("pub location: Option<Location>"), "Missing: pub location: Option<Location>");
+    assert!(code.contains("pub tags: [[u8; 20usize]; 5usize]"), "Missing: pub tags: [[u8; 20usize]; 5usize]");
+    assert!(code.contains("pub scores: [f64; 10usize]"), "Missing: pub scores: [f64; 10usize]");
+
+    // Verify storage columns are created for all fixed-size types
+    assert!(code.contains("name_col"), "Missing: name_col");
+    assert!(code.contains("address_col"), "Missing: address_col");
+    assert!(code.contains("location_col"), "Missing: location_col");
+    assert!(code.contains("tags_col"), "Missing: tags_col");
+    assert!(code.contains("scores_col"), "Missing: scores_col");
+}

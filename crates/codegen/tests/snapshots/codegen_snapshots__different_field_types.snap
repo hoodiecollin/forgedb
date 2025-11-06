@@ -56,7 +56,9 @@ impl ComplexModelStorage {
     pub fn insert(&mut self, record: ComplexModel) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
-        self.id_col.append_uuid(record.id).expect("Failed to append to column");
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
         self.count_col.append_i64(record.count).expect("Failed to append to column");
         self.price_col.append_f64(record.price).expect("Failed to append to column");
         self.active_col.append_bool(record.active).expect("Failed to append to column");
@@ -73,10 +75,13 @@ impl ComplexModelStorage {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
-        let id_value = self
-            .id_col
-            .read_uuid(row_index)
-            .expect("Failed to read from column");
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
         let count_value = self
             .count_col
             .read_i64(row_index)

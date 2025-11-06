@@ -58,7 +58,7 @@ impl RustGenerator {
 
         // Generate models
         for model in &schema.models {
-            let model_tokens = Self::generate_model(model)?;
+            let model_tokens = Self::generate_model(model, schema)?;
             tokens.extend(model_tokens);
         }
 
@@ -74,7 +74,7 @@ impl RustGenerator {
     }
 
     /// Generate a single model struct
-    fn generate_model(model: &forgedb_parser::Model) -> Result<TokenStream> {
+    fn generate_model(model: &forgedb_parser::Model, schema: &Schema) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
         let storage_name = format_ident!("{}Storage", model.name);
         let model_doc = format!("{} model", model.name);
@@ -100,7 +100,7 @@ impl RustGenerator {
         let storage_fields = Self::generate_storage_fields(model);
 
         // Generate storage initialization
-        let storage_inits = Self::generate_storage_inits(model);
+        let storage_inits = Self::generate_storage_inits(model, schema);
 
         // Generate insert logic
         let insert_logic = Self::generate_insert_logic(model);
@@ -169,7 +169,7 @@ impl RustGenerator {
     }
 
     /// Generate storage initialization code
-    fn generate_storage_inits(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_storage_inits(model: &forgedb_parser::Model, schema: &Schema) -> TokenStream {
         let mut inits = Vec::new();
         let mut column_index = 0usize;
 
@@ -177,7 +177,7 @@ impl RustGenerator {
             let field_col_name = format_ident!("{}_col", field.name);
 
             if Self::is_fixed_size_type(&field.field_type) {
-                let value_size = Self::get_value_size(&field.field_type);
+                let value_size = Self::get_value_size(&field.field_type, schema);
                 let col_path = format!("fixed/{}_{}.bin", Self::type_name(&field.field_type), column_index);
 
                 inits.push(quote! {
@@ -227,18 +227,52 @@ impl RustGenerator {
             let field_name = format_ident!("{}", field.name);
             let field_col_name = format_ident!("{}_col", field.name);
 
-            if Self::is_fixed_size_type(&field.field_type) {
-                let append_method = Self::get_append_method(&field.field_type);
-
-                append_statements.push(quote! {
-                    self.#field_col_name.#append_method(record.#field_name)
-                        .expect("Failed to append to column");
-                });
-            } else if Self::is_string_type(&field.field_type) {
+            if Self::is_string_type(&field.field_type) {
                 append_statements.push(quote! {
                     self.#field_col_name.append_string(&record.#field_name)
                         .expect("Failed to append string");
                 });
+            } else if Self::is_fixed_size_type(&field.field_type) {
+                // Check if this is a complex type that needs byte conversion
+                let needs_byte_conversion = matches!(
+                    &field.field_type,
+                    forgedb_parser::FieldType::Char(_)
+                        | forgedb_parser::FieldType::FixedArray(_, _)
+                        | forgedb_parser::FieldType::StructType(_)
+                        | forgedb_parser::FieldType::OptionalStructType(_)
+                );
+
+                if needs_byte_conversion {
+                    // For complex types, convert to bytes
+                    append_statements.push(quote! {
+                        {
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    &record.#field_name as *const _ as *const u8,
+                                    std::mem::size_of_val(&record.#field_name)
+                                )
+                            };
+                            self.#field_col_name.append_bytes(bytes)
+                                .expect("Failed to append to column");
+                        }
+                    });
+                } else {
+                    // For primitives, use typed method
+                    let append_method = Self::get_append_method(&field.field_type);
+
+                    // Special handling for UUID
+                    if matches!(&field.field_type, forgedb_parser::FieldType::Uuid) {
+                        append_statements.push(quote! {
+                            self.#field_col_name.#append_method(*record.#field_name.as_bytes())
+                                .expect("Failed to append to column");
+                        });
+                    } else {
+                        append_statements.push(quote! {
+                            self.#field_col_name.#append_method(record.#field_name)
+                                .expect("Failed to append to column");
+                        });
+                    }
+                }
             }
         }
 
@@ -270,18 +304,53 @@ impl RustGenerator {
             let field_col_name = format_ident!("{}_col", field.name);
             let field_value_name = format_ident!("{}_value", field.name);
 
-            if Self::is_fixed_size_type(&field.field_type) {
-                let read_method = Self::get_read_method(&field.field_type);
-
-                read_statements.push(quote! {
-                    let #field_value_name = self.#field_col_name.#read_method(row_index)
-                        .expect("Failed to read from column");
-                });
-            } else if Self::is_string_type(&field.field_type) {
+            if Self::is_string_type(&field.field_type) {
                 read_statements.push(quote! {
                     let #field_value_name = self.#field_col_name.read_string(row_index)
                         .expect("Failed to read string");
                 });
+            } else if Self::is_fixed_size_type(&field.field_type) {
+                // Check if this is a complex type that needs byte conversion
+                let needs_byte_conversion = matches!(
+                    &field.field_type,
+                    forgedb_parser::FieldType::Char(_)
+                        | forgedb_parser::FieldType::FixedArray(_, _)
+                        | forgedb_parser::FieldType::StructType(_)
+                        | forgedb_parser::FieldType::OptionalStructType(_)
+                );
+
+                if needs_byte_conversion {
+                    // For complex types, read bytes and convert
+                    let field_type_tokens = Self::map_field_type_ident(&field.field_type);
+                    read_statements.push(quote! {
+                        let #field_value_name: #field_type_tokens = {
+                            let bytes = self.#field_col_name.read_bytes(row_index)
+                                .expect("Failed to read from column");
+                            unsafe {
+                                std::ptr::read(bytes.as_ptr() as *const #field_type_tokens)
+                            }
+                        };
+                    });
+                } else {
+                    // For primitives, use typed method
+                    let read_method = Self::get_read_method(&field.field_type);
+
+                    // Special handling for UUID
+                    if matches!(&field.field_type, forgedb_parser::FieldType::Uuid) {
+                        read_statements.push(quote! {
+                            let #field_value_name = {
+                                let bytes = self.#field_col_name.#read_method(row_index)
+                                    .expect("Failed to read from column");
+                                Uuid::from_bytes(bytes)
+                            };
+                        });
+                    } else {
+                        read_statements.push(quote! {
+                            let #field_value_name = self.#field_col_name.#read_method(row_index)
+                                .expect("Failed to read from column");
+                        });
+                    }
+                }
             }
 
             field_values.push(quote! { #field_name: #field_value_name });
@@ -320,6 +389,10 @@ impl RustGenerator {
                 | forgedb_parser::FieldType::Bool
                 | forgedb_parser::FieldType::Uuid
                 | forgedb_parser::FieldType::Timestamp
+                | forgedb_parser::FieldType::Char(_)
+                | forgedb_parser::FieldType::FixedArray(_, _)
+                | forgedb_parser::FieldType::StructType(_)
+                | forgedb_parser::FieldType::OptionalStructType(_)
         )
     }
 
@@ -329,7 +402,7 @@ impl RustGenerator {
     }
 
     /// Get the byte size for a fixed-size type
-    fn get_value_size(field_type: &forgedb_parser::FieldType) -> usize {
+    fn get_value_size(field_type: &forgedb_parser::FieldType, schema: &Schema) -> usize {
         match field_type {
             forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::I32 => 4,
             forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
@@ -337,6 +410,25 @@ impl RustGenerator {
             forgedb_parser::FieldType::Bool => 1,
             forgedb_parser::FieldType::Uuid => 16,
             forgedb_parser::FieldType::Timestamp => 8,
+            forgedb_parser::FieldType::Char(size) => *size,
+            forgedb_parser::FieldType::FixedArray(inner, count) => {
+                Self::get_value_size(inner, schema) * count
+            }
+            forgedb_parser::FieldType::StructType(name) => {
+                if let Some(struct_def) = schema.find_struct(name) {
+                    forgedb_parser::Struct::calculate_size(struct_def, schema)
+                } else {
+                    0
+                }
+            }
+            forgedb_parser::FieldType::OptionalStructType(name) => {
+                // Option adds 1 byte discriminant + size of struct
+                1 + if let Some(struct_def) = schema.find_struct(name) {
+                    forgedb_parser::Struct::calculate_size(struct_def, schema)
+                } else {
+                    0
+                }
+            }
             _ => 8, // Default
         }
     }
@@ -352,6 +444,10 @@ impl RustGenerator {
             forgedb_parser::FieldType::Bool => "bool",
             forgedb_parser::FieldType::Uuid => "uuid",
             forgedb_parser::FieldType::Timestamp => "timestamp",
+            forgedb_parser::FieldType::Char(_) => "bytes",
+            forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
+            forgedb_parser::FieldType::StructType(_) => "bytes",
+            forgedb_parser::FieldType::OptionalStructType(_) => "bytes",
             _ => "unknown",
         }
     }

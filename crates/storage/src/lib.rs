@@ -171,8 +171,17 @@ pub struct ColumnMetadata {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ColumnType {
+    U32,
     U64,
+    I32,
+    I64,
+    F64,
+    Bool,
+    Uuid,
+    Timestamp,
     String,
+    /// Fixed-size byte array (for char(N), structs, fixed arrays)
+    FixedBytes(usize),
 }
 
 /// Fixed-size column storage using memory-mapped files
@@ -204,6 +213,30 @@ impl FixedColumn {
         })
     }
 
+    pub fn append_u32(&mut self, value: u32) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value.to_le_bytes())?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_u32(&mut self, index: usize) -> io::Result<u32> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 4];
+        self.file.read_exact(&mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
     pub fn append_u64(&mut self, value: u64) -> io::Result<()> {
         self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&value.to_le_bytes())?;
@@ -226,6 +259,183 @@ impl FixedColumn {
         let mut buf = [0u8; 8];
         self.file.read_exact(&mut buf)?;
         Ok(u64::from_le_bytes(buf))
+    }
+
+    pub fn append_i32(&mut self, value: i32) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value.to_le_bytes())?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_i32(&mut self, index: usize) -> io::Result<i32> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 4];
+        self.file.read_exact(&mut buf)?;
+        Ok(i32::from_le_bytes(buf))
+    }
+
+    pub fn append_i64(&mut self, value: i64) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value.to_le_bytes())?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_i64(&mut self, index: usize) -> io::Result<i64> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    pub fn append_f64(&mut self, value: f64) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value.to_le_bytes())?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_f64(&mut self, index: usize) -> io::Result<f64> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        Ok(f64::from_le_bytes(buf))
+    }
+
+    pub fn append_bool(&mut self, value: bool) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&[if value { 1u8 } else { 0u8 }])?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_bool(&mut self, index: usize) -> io::Result<bool> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 1];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf[0] != 0)
+    }
+
+    pub fn append_uuid(&mut self, value: [u8; 16]) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value)?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_uuid(&mut self, index: usize) -> io::Result<[u8; 16]> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 16];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn append_timestamp(&mut self, value: i64) -> io::Result<()> {
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&value.to_le_bytes())?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    pub fn read_timestamp(&mut self, index: usize) -> io::Result<i64> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = [0u8; 8];
+        self.file.read_exact(&mut buf)?;
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    /// Append arbitrary bytes for complex fixed-size types (char arrays, structs, fixed arrays)
+    pub fn append_bytes(&mut self, value: &[u8]) -> io::Result<()> {
+        if value.len() != self.value_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Expected {} bytes, got {}", self.value_size, value.len()),
+            ));
+        }
+
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(value)?;
+        self.file.sync_all()?;
+        self.row_count += 1;
+        Ok(())
+    }
+
+    /// Read arbitrary bytes for complex fixed-size types (char arrays, structs, fixed arrays)
+    pub fn read_bytes(&mut self, index: usize) -> io::Result<Vec<u8>> {
+        if index >= self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Index out of bounds",
+            ));
+        }
+
+        let offset = (index * self.value_size) as u64;
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut buf = vec![0u8; self.value_size];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf)
     }
 
     pub fn len(&self) -> usize {

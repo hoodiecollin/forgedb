@@ -24,6 +24,7 @@ pub struct UserStorage {
     row_count: usize,
     id_col: FixedColumn,
     email_col: VariableColumn,
+    age_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
 }
 impl UserStorage {
@@ -38,6 +39,8 @@ impl UserStorage {
                     PathBuf::from("variable/string_offsets_1.bin"),
                 )
                 .expect("Failed to create variable column"),
+            age_col: FixedColumn::new(PathBuf::from("fixed/bytes_2.bin"), 1usize)
+                .expect("Failed to create fixed column"),
             tombstones: forgedb_storage::Tombstones::new(PathBuf::from("tombstones.bin"))
                 .expect("Failed to create tombstones"),
         }
@@ -45,8 +48,19 @@ impl UserStorage {
     pub fn insert(&mut self, record: User) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
-        self.id_col.append_uuid(record.id).expect("Failed to append to column");
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
         self.email_col.append_string(&record.email).expect("Failed to append string");
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &record.age as *const _ as *const u8,
+                    std::mem::size_of_val(&record.age),
+                )
+            };
+            self.age_col.append_bytes(bytes).expect("Failed to append to column");
+        }
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
@@ -57,14 +71,24 @@ impl UserStorage {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
-        let id_value = self
-            .id_col
-            .read_uuid(row_index)
-            .expect("Failed to read from column");
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
         let email_value = self
             .email_col
             .read_string(row_index)
             .expect("Failed to read string");
+        let age_value: u32 = {
+            let bytes = self
+                .age_col
+                .read_bytes(row_index)
+                .expect("Failed to read from column");
+            unsafe { std::ptr::read(bytes.as_ptr() as *const u32) }
+        };
         Some(User {
             id: id_value,
             email: email_value,
