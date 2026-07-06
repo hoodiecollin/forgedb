@@ -37,26 +37,28 @@ cargo clippy --workspace             # lints (9 dead-code warnings remain — se
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `serve`.
 Example: `cargo run -- generate all --output ./generated`.
 
-### Test caveat (important)
+### Test baseline
 
-Run the **non-doctest** suite — this is the green baseline:
+Plain `cargo test --workspace` is **green** — doctests included:
 
 ```bash
-cargo test --workspace --lib --bins --tests --no-fail-fast   # 466 pass, hermetic
+cargo test --workspace --lib --bins --tests --no-fail-fast   # 481 pass (non-doctest)
+cargo test --workspace                                        # + 40 doctests, all pass
 ```
 
 - **`--no-fail-fast`** surfaces all results — cargo halts at the first failing binary
   otherwise.
-- The integration tests (`tests/integration_test.rs`) are now **hermetic** — the
+- The integration tests (`tests/integration_test.rs`) are **hermetic** — the
   CWD-dependent cases invoke the `forgedb` binary as a subprocess with an explicit
   `current_dir`, so they pass in parallel. No `--test-threads=1` workaround needed.
-- **Doctests are broadly stale** and are the reason plain `cargo test --workspace`
-  fails: ~21 doc-comment examples across 7 crates (crud-api, http-server, migrations,
-  parser, query-optimization, validation, watcher) reference drifted/removed APIs. These
-  are a tracked Phase 3 item, fixed per-crate during each crate's review — not
-  regressions. Until then, scope with `--lib --bins --tests` (which excludes doctests).
+- The ~21 stale doctests (Phase 3c) are **fixed** — all doc examples across the workspace
+  now compile and pass against current APIs.
+- **Codegen caveat:** the `crates/codegen` insta snapshot tests only compare generated
+  code as *strings* — they do not compile it. When changing generators, compile the
+  emitted Rust in a throwaway crate (see the memory note); snapshot pass ≠ output compiles.
 
-**Real baseline: 466 tests pass** (hermetically, non-doctest). Ignore doc claims of "241/241".
+**Baseline: 521 tests pass** (481 non-doctest + 40 doctest). Ignore older doc claims of
+"466" or "241/241".
 
 ## Workspace layout
 
@@ -101,21 +103,27 @@ Symbols: `+` auto-generate on create, `~` auto-update on modify, `^` index, `&` 
 `uuid/timestamp/char(n)/text`; `[Model]` one-to-many, `Model` FK, `[type; N]` fixed array,
 inline structs. Component refs: `tsx://`, `jsx://`, `api://`.
 
-## Known issues / Phase 3 backlog
+## Known issues / backlog
 
-- **Stale doctests** across 7 crates (crud-api, http-server, migrations, parser,
-  query-optimization, validation, watcher) — ~21 doc-comment examples reference
-  drifted/removed APIs, so plain `cargo test --workspace` fails on `--doc` targets. Fixed
-  per-crate during each crate's Phase 3 review. See Test caveat.
 - **9 dead-code warnings** — not cruft: unwired-but-live CLI flags (`build --no-api/--no-db`,
   `init --typescript`, `validate --implementations/--components`), an unused error
-  exit-code scheme (`CliError::exit_code`/`Config`), an unwired `rust_main_template`
-  init scaffold, and populated-but-unread LSP fields. Each needs a wire-vs-remove
-  decision during the Phase 3 CLI/LSP review (don't blindly delete).
+  exit-code scheme (`CliError::exit_code`/`Config` + the ignored `--config` flag), an
+  unwired `rust_main_template` init scaffold, and populated-but-unread LSP fields
+  (`Document.uri/version`, `get_document`, `Struct.name/fields/position`). Each needs a
+  **wire-vs-remove product decision** — deliberately deferred out of the 3c bug-fix sweep
+  (don't blindly delete). Tracked separately.
+- **Relation storage is unbuilt.** Generated model structs include FK scalar fields (e.g.
+  `author_id`), but they are not persisted — `get()` returns `Default::default()`/`None`
+  for them. The generated code compiles and round-trips non-relation fields correctly;
+  actually storing/loading FK values is an unimplemented feature (a product-direction item).
+- **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
+  no partition (predicates are unstructured strings), so join predicates are preserved
+  correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
+  Correct results, no pushdown optimization yet.
 - **OpenAPI generation is disabled.** The generator was lost during the crate-extraction
   refactor; `src/commands/generate/mod.rs` skips it with a warning and the `openapi`
-  target errors clearly. Restore = re-implement in `crates/codegen`. **Deferred until
-  after all of Phase 3** — do not fold into any Phase 3 scope.
+  target errors clearly. Restore = re-implement in `crates/codegen`. Deferred (the live
+  `utoipa` derives in `crates/codegen/src/api.rs` are unrelated — leave them).
 
 ## Conventions
 
