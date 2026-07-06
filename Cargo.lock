@@ -663,6 +663,7 @@ name = "forgedb-compaction"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "log",
  "serde",
  "serde_json",
  "tempfile",
@@ -790,8 +791,6 @@ name = "forgedb-wal"
 version = "0.1.1"
 dependencies = [
  "crc32fast",
- "serde",
- "serde_json",
  "tempfile",
  "uuid",
 ]
@@ -801,8 +800,10 @@ name = "forgedb-watcher"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "forgedb-codegen",
  "forgedb-parser",
  "notify",
+ "tracing",
 ]
 
 [[package]]
