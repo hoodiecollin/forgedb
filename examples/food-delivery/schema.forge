@@ -1,0 +1,106 @@
+// Food delivery platform: restaurants, menus, customers, couriers,
+// orders with line items, and a timestamped order-status audit log.
+// Uses a GeoPoint struct (f64 latitude/longitude) for geographic coordinates.
+// Provenance: Synthetic (modeled after the standard food delivery design pattern)
+
+struct GeoPoint {
+  latitude: f64
+  longitude: f64
+}
+
+Restaurant {
+  id: +uuid
+  name: &string @length(1, 200)
+  phone: string?
+  email: string? @email
+  location: GeoPoint
+  rating: f64? @min(0) @max(5)
+  is_active: bool
+  menus: [Menu]
+  orders: [Order]
+  created_at: +timestamp
+}
+
+Menu {
+  id: +uuid
+  restaurant: *Restaurant
+  name: string @length(1, 100)
+  is_active: bool
+  items: [MenuItem]
+  created_at: +timestamp
+}
+
+MenuItem {
+  id: +uuid
+  menu: *Menu
+  name: string @length(1, 100)
+  description: string?
+  // price in minor currency units (cents)
+  price: i64 @min(0)
+  is_available: bool
+  created_at: +timestamp
+}
+
+Customer {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  phone: string?
+  delivery_location: GeoPoint?
+  orders: [Order]
+  created_at: +timestamp
+}
+
+Courier {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  phone: string
+  current_location: GeoPoint?
+  is_available: bool
+  orders: [Order]
+  created_at: +timestamp
+}
+
+// status: placed | confirmed | preparing | ready | picked_up | delivered | cancelled
+// courier is optional — assigned after placement
+Order {
+  id: +uuid
+  customer: *Customer
+  restaurant: *Restaurant
+  courier: ?Courier
+  status: string @length(1, 20)
+  placed_at: +timestamp
+  delivery_location: GeoPoint?
+  // total_amount in minor currency units (cents)
+  total_amount: i64 @min(0)
+  items: [OrderItem]
+  status_events: [OrderStatusEvent]
+  created_at: +timestamp
+  @index(customer, placed_at)
+  @index(restaurant, placed_at)
+}
+
+// Explicit join model: Order <-> MenuItem with quantity and price-at-order-time.
+OrderItem {
+  id: +uuid
+  order: *Order
+  menu_item: *MenuItem
+  quantity: u32 @min(1)
+  // unit_price captured at order time (immutable snapshot)
+  unit_price: i64 @min(0)
+  created_at: +timestamp
+  @index(order, menu_item)
+}
+
+// Append-only audit log for order lifecycle transitions.
+OrderStatusEvent {
+  id: +uuid
+  order: *Order
+  status: string @length(1, 20)
+  note: string?
+  changed_at: +timestamp
+  @index(order, changed_at)
+}

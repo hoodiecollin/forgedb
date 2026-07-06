@@ -1,0 +1,104 @@
+// Publishing CMS + membership platform — adapted from Ghost (MIT)
+// Source: https://github.com/TryGhost/Ghost
+
+// Staff users who author content; distinct from audience Members
+Author {
+  id: +uuid
+  name: string @length(1, 150)
+  slug: &^string @length(1, 191)
+  email: &string @email
+  bio: string?
+  website: string? @url
+  profile_image: string? @url
+  status: string @default(active)
+  created_at: +timestamp
+  updated_at: timestamp?
+  posts: [Post]
+  roles: [Role]
+}
+
+// M2M: Role.authors <-> Author.roles — no FK between Role and Author
+Role {
+  id: +uuid
+  name: &string @length(1, 50)
+  description: string?
+  created_at: +timestamp
+  authors: [Author]
+}
+
+// Primary content entity: soft-deleted, fulltext-indexed content, multi-state status
+Post {
+  id: +uuid
+  title: string @length(1, 255)
+  slug: &^string @length(1, 191)
+  excerpt: string?
+  content: string @fulltext
+  status: string @default(draft)
+  visibility: string @default(public)
+  featured: bool @default(false)
+  published_at: timestamp?
+  created_at: +timestamp
+  updated_at: timestamp?
+  authors: [Author]
+  tags: [Tag]
+  @soft_delete
+  @index(status, published_at)
+}
+
+// M2M: Tag.posts <-> Post.tags — no FK between Tag and Post
+Tag {
+  id: +uuid
+  name: string @length(1, 191)
+  slug: &^string @length(1, 191)
+  description: string?
+  visibility: string @default(public)
+  created_at: +timestamp
+  posts: [Post]
+}
+
+// Audience members; distinct from staff Authors
+Member {
+  id: +uuid
+  email: &string @email
+  name: string?
+  status: string @default(free)
+  email_disabled: bool @default(false)
+  last_seen_at: timestamp?
+  created_at: +timestamp
+  updated_at: timestamp?
+  subscriptions: [Subscription]
+}
+
+// Paid membership tiers; prices stored as minor currency units (cents)
+Tier {
+  id: +uuid
+  name: string @length(1, 191)
+  slug: &^string @length(1, 191)
+  description: string?
+  tier_type: string @default(paid)
+  monthly_price: i64?
+  yearly_price: i64?
+  currency: char(3)?
+  trial_days: u32 @default(0)
+  active: bool @default(true)
+  created_at: +timestamp
+  updated_at: timestamp?
+  subscriptions: [Subscription]
+}
+
+// Explicit join model with billing payload: member + tier + billing state
+Subscription {
+  id: +uuid
+  status: string @default(active)
+  cadence: string @default(monthly)
+  amount: i64
+  currency: char(3)
+  current_period_start: timestamp?
+  current_period_end: timestamp?
+  cancel_at_period_end: bool @default(false)
+  created_at: +timestamp
+  updated_at: timestamp?
+  member: *Member
+  tier: *Tier
+  @index(member, status)
+}

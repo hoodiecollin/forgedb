@@ -1,0 +1,67 @@
+// Blog CMS — users, posts, comments, categories, tags
+// Showcases: @fulltext, @soft_delete, self-ref relations, bidirectional M2M,
+// and CORRECT snake_case component-reference field names.
+
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  username: ^&string @length(1, 50)
+  bio: string?
+  avatar_url: string? @url
+  created_at: +timestamp
+  updated_at: timestamp?
+  posts: [Post]
+  comments: [Comment]
+  profile_card: tsx://components/user/ProfileCard @relations(posts, comments)
+  update_endpoint: api://routes/user/update
+}
+
+Post {
+  id: +uuid
+  title: string @length(1, 200)
+  slug: ^&string @length(1, 200)
+  content: string @fulltext
+  excerpt: string?
+  status: string @default(draft)
+  published_at: timestamp?
+  created_at: +timestamp
+  updated_at: timestamp?
+  author: *User
+  category: ?Category
+  comments: [Comment]
+  tags: [Tag]
+  post_editor: jsx://components/post/Editor @relations(author, category)
+  publish_endpoint: api://routes/post/publish
+  @soft_delete
+  @index(status, created_at)
+}
+
+Comment {
+  id: +uuid
+  body: string @length(1, 2000)
+  created_at: +timestamp
+  updated_at: timestamp?
+  author: *User
+  post: *Post
+  parent: ?Comment
+}
+
+Category {
+  id: +uuid
+  name: string @length(1, 100)
+  slug: ^&string @length(1, 100)
+  description: string?
+  created_at: +timestamp
+  parent: ?Category
+  posts: [Post]
+}
+
+Tag {
+  id: +uuid
+  name: ^&string @length(1, 50)
+  slug: ^&string @length(1, 50)
+  color: string?
+  created_at: +timestamp
+  posts: [Post]
+}

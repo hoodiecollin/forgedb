@@ -1,0 +1,91 @@
+// Project Management — Linear/Jira-style issue tracker
+// Showcases: org/team/project hierarchy, self-ref issues, M2M labels,
+// optional FK assignee, composite @index, status/priority string fields.
+
+Organization {
+  id: +uuid
+  name: string @length(1, 100)
+  slug: ^&string @length(1, 50)
+  created_at: +timestamp
+  teams: [Team]
+  users: [User]
+}
+
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  created_at: +timestamp
+  org: ?Organization
+  assigned_issues: [Issue]
+  comments: [IssueComment]
+}
+
+Team {
+  id: +uuid
+  name: string @length(1, 100)
+  created_at: +timestamp
+  org: *Organization
+  projects: [Project]
+}
+
+Project {
+  id: +uuid
+  name: string @length(1, 100)
+  description: string?
+  status: string @default(active)
+  created_at: +timestamp
+  updated_at: timestamp?
+  team: *Team
+  issues: [Issue]
+  sprints: [Sprint]
+  labels: [Label]
+}
+
+Issue {
+  id: +uuid
+  title: string @length(1, 255)
+  description: string?
+  status: string @default(backlog)
+  priority: string @default(medium)
+  created_at: +timestamp
+  updated_at: timestamp?
+  project: *Project
+  assignee: ?User
+  reporter: *User
+  sprint: ?Sprint
+  parent: ?Issue
+  labels: [Label]
+  comments: [IssueComment]
+  @index(status, created_at)
+  @index(status, priority)
+}
+
+Sprint {
+  id: +uuid
+  name: string @length(1, 100)
+  start_at: timestamp
+  end_at: timestamp
+  is_active: bool @default(false)
+  created_at: +timestamp
+  project: *Project
+  issues: [Issue]
+}
+
+Label {
+  id: +uuid
+  name: string @length(1, 50)
+  color: string
+  created_at: +timestamp
+  project: *Project
+  issues: [Issue]
+}
+
+IssueComment {
+  id: +uuid
+  body: string @length(1, 5000)
+  created_at: +timestamp
+  updated_at: timestamp?
+  issue: *Issue
+  author: *User
+}

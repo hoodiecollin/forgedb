@@ -1,0 +1,90 @@
+// Airline reservation system: airports, aircraft, flights (origin + destination
+// FKs to the same Airport — dual-FK self-referential pattern), seats, passengers,
+// bookings, and tickets.
+// Composite @index on Seat(aircraft, seat_number) enforces unique seat per aircraft.
+// Composite @index on Booking(flight, seat) prevents double-booking.
+// Provenance: Synthetic (modeled after the standard airline reservation design pattern)
+
+Airport {
+  id: +uuid
+  // IATA 3-letter code, e.g. "SFO" — unique, fixed-size char(3)
+  iata_code: ^&char(3)
+  name: string
+  city: string
+  country: string
+  created_at: +timestamp
+}
+
+Aircraft {
+  id: +uuid
+  tail_number: &string @length(2, 10)
+  model: string @length(1, 100)
+  capacity: u32 @min(1)
+  seats: [Seat]
+  flights: [Flight]
+  created_at: +timestamp
+}
+
+// A flight references Airport twice — origin and destination.
+// status: scheduled | boarding | departed | arrived | cancelled | delayed
+Flight {
+  id: +uuid
+  flight_number: &string @length(2, 10)
+  aircraft: *Aircraft
+  origin_airport: *Airport
+  destination_airport: *Airport
+  departs_at: timestamp
+  arrives_at: timestamp
+  status: string @length(1, 20)
+  bookings: [Booking]
+  created_at: +timestamp
+  @index(origin_airport, departs_at)
+}
+
+// Composite index ensures uniqueness of seat_number within an aircraft.
+// seat_class: economy | business | first
+Seat {
+  id: +uuid
+  aircraft: *Aircraft
+  seat_number: string @length(1, 5)
+  seat_class: string @length(1, 20)
+  created_at: +timestamp
+  @index(aircraft, seat_number)
+}
+
+Passenger {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  passport_number: string?
+  date_of_birth: timestamp?
+  bookings: [Booking]
+  created_at: +timestamp
+}
+
+// @index(flight, seat) is the unique seat-lock constraint (no double-booking).
+// status: confirmed | checked_in | boarded | no_show | cancelled
+Booking {
+  id: +uuid
+  passenger: *Passenger
+  flight: *Flight
+  seat: *Seat
+  status: string @length(1, 20)
+  booked_at: +timestamp
+  tickets: [Ticket]
+  created_at: +timestamp
+  @index(flight, seat)
+  @index(passenger, booked_at)
+}
+
+Ticket {
+  id: +uuid
+  booking: *Booking
+  ticket_number: &string @length(1, 20)
+  // price in minor currency units (cents)
+  price: i64 @min(0)
+  fare_class: string?
+  issued_at: +timestamp
+  created_at: +timestamp
+}

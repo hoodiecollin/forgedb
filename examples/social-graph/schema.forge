@@ -1,0 +1,103 @@
+// Federated social network — inspired by Mastodon (AGPL-3.0)
+// Source: https://github.com/mastodon/mastodon
+// Provenance: Data model inspiration only; no verbatim structure copied.
+
+Account {
+  id: +uuid
+  username: ^string @length(1, 30)
+  domain: string?
+  display_name: string?
+  bio: string?
+  avatar_url: string? @url
+  header_url: string? @url
+  uri: string? @url
+  is_local: bool @default(true)
+  followers_count: u32 @default(0)
+  following_count: u32 @default(0)
+  statuses_count: u32 @default(0)
+  suspended_at: timestamp?
+  silenced_at: timestamp?
+  created_at: +timestamp
+  updated_at: timestamp?
+  statuses: [Status]
+  media_attachments: [MediaAttachment]
+  favourites: [Favourite]
+}
+
+// in_reply_to is a self-referential optional FK linking replies in a thread
+Status {
+  id: +uuid
+  content: string @fulltext
+  visibility: string @default(public)
+  sensitive: bool @default(false)
+  language: char(2)?
+  uri: string? @url
+  in_reply_to: ?Status
+  reply_count: u32 @default(0)
+  reblog_count: u32 @default(0)
+  favourite_count: u32 @default(0)
+  edited_at: timestamp?
+  created_at: +timestamp
+  account: *Account
+  media_attachments: [MediaAttachment]
+  favourites: [Favourite]
+  @soft_delete
+  @index(account, created_at)
+}
+
+// Explicit join model: follower->followed account graph; two FKs to Account
+Follow {
+  id: +uuid
+  show_reblogs: bool @default(true)
+  notify: bool @default(false)
+  created_at: +timestamp
+  follower: *Account
+  followed: *Account
+  @index(follower, followed)
+}
+
+// Explicit join model: blocker->blocked account graph
+Block {
+  id: +uuid
+  created_at: +timestamp
+  blocker: *Account
+  blocked: *Account
+  @index(blocker, blocked)
+}
+
+// Explicit join model: account favourites a status
+Favourite {
+  id: +uuid
+  created_at: +timestamp
+  account: *Account
+  status: *Status
+  @index(account, status)
+}
+
+// account = recipient, from_account = sender; status is optional target
+Notification {
+  id: +uuid
+  notification_type: string
+  read: bool @default(false)
+  created_at: +timestamp
+  account: *Account
+  from_account: *Account
+  status: ?Status
+  @index(account, read)
+}
+
+MediaAttachment {
+  id: +uuid
+  media_type: string @default(unknown)
+  url: string @url
+  remote_url: string? @url
+  preview_url: string? @url
+  description: string?
+  blurhash: string?
+  width: u32?
+  height: u32?
+  created_at: +timestamp
+  account: *Account
+  status: ?Status
+  @index(status, created_at)
+}

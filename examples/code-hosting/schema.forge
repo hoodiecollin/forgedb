@@ -1,0 +1,150 @@
+// Git hosting platform — adapted from Gitea (MIT)
+// Source: https://github.com/go-gitea/gitea
+
+User {
+  id: +uuid
+  username: &^string @length(1, 40)
+  email: &string @email
+  bio: string?
+  is_admin: bool @default(false)
+  avatar_url: string? @url
+  created_at: +timestamp
+  updated_at: timestamp?
+  repositories: [Repository]
+  org_memberships: [OrgMember]
+  stars: [Star]
+  comments: [Comment]
+  teams: [Team]
+}
+
+Organization {
+  id: +uuid
+  name: &^string @length(1, 40)
+  display_name: string?
+  description: string?
+  website: string? @url
+  created_at: +timestamp
+  updated_at: timestamp?
+  org_members: [OrgMember]
+  repositories: [Repository]
+  teams: [Team]
+}
+
+// Explicit join model: org membership carries a role and visibility flag
+OrgMember {
+  id: +uuid
+  role: string @default(member)
+  is_public: bool @default(true)
+  created_at: +timestamp
+  user: *User
+  org: *Organization
+  @index(user, org)
+}
+
+// fork_parent is a self-referential optional FK capturing fork lineage
+Repository {
+  id: +uuid
+  name: ^string @length(1, 100)
+  description: string?
+  is_private: bool @default(false)
+  is_archived: bool @default(false)
+  is_fork: bool @default(false)
+  fork_parent: ?Repository
+  owner: *User
+  org: ?Organization
+  default_branch: string @default(main)
+  star_count: u32 @default(0)
+  fork_count: u32 @default(0)
+  created_at: +timestamp
+  updated_at: timestamp?
+  issues: [Issue]
+  milestones: [Milestone]
+  labels: [Label]
+  stars: [Star]
+}
+
+// M2M: Team.members <-> User.teams — no FK between User and Team
+Team {
+  id: +uuid
+  name: string @length(1, 255)
+  description: string?
+  access_mode: string @default(read)
+  created_at: +timestamp
+  org: *Organization
+  members: [User]
+}
+
+// Explicit star join: carries created_at for star history; replaces simple M2M
+Star {
+  id: +uuid
+  created_at: +timestamp
+  user: *User
+  repo: *Repository
+  @index(user, repo)
+}
+
+// is_pull=true means the issue row also has a matching PullRequest row
+Issue {
+  id: +uuid
+  index_num: ^u32
+  title: string @length(1, 255)
+  content: string?
+  is_closed: bool @default(false)
+  is_pull: bool @default(false)
+  created_at: +timestamp
+  updated_at: timestamp?
+  closed_at: timestamp?
+  repo: *Repository
+  poster: *User
+  milestone: ?Milestone
+  comments: [Comment]
+  labels: [Label]
+  @index(repo, is_closed)
+}
+
+// 1:1 extension of Issue — two FKs to Repository for head/base branches
+PullRequest {
+  id: +uuid
+  head_branch: string
+  base_branch: string
+  has_merged: bool @default(false)
+  merged_at: timestamp?
+  status: string @default(checking)
+  created_at: +timestamp
+  issue: *Issue
+  head_repo: *Repository
+  base_repo: *Repository
+}
+
+Comment {
+  id: +uuid
+  content: string @length(1, 65535)
+  created_at: +timestamp
+  updated_at: timestamp?
+  issue: *Issue
+  poster: *User
+  @index(issue, created_at)
+}
+
+// M2M: Label.issues <-> Issue.labels — no FK between Label and Issue
+Label {
+  id: +uuid
+  name: string @length(1, 50)
+  color: char(7)
+  description: string?
+  created_at: +timestamp
+  repo: *Repository
+  issues: [Issue]
+}
+
+Milestone {
+  id: +uuid
+  title: string @length(1, 255)
+  description: string?
+  is_closed: bool @default(false)
+  due_at: timestamp?
+  closed_at: timestamp?
+  created_at: +timestamp
+  repo: *Repository
+  issues: [Issue]
+}

@@ -1,0 +1,83 @@
+// Banking ledger: customers, accounts (joint ownership via explicit M2M),
+// transactions (debit/credit), transfers (double-entry style), statements.
+// All monetary amounts stored in minor currency units (cents).
+// Provenance: Synthetic (modeled after the standard banking ledger design pattern)
+
+Customer {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  phone: string?
+  date_of_birth: timestamp?
+  account_owners: [AccountOwner]
+  created_at: +timestamp
+}
+
+// kind: checking | savings | credit | investment
+Account {
+  id: +uuid
+  // human-readable account number, e.g. "1234567890"
+  account_number: &string @length(10, 20)
+  kind: string @length(1, 20)
+  // balance in minor currency units (cents)
+  balance: i64
+  // ISO 4217 currency code stored as fixed 3 bytes, e.g. "USD"
+  currency: char(3)
+  opened_at: +timestamp
+  closed_at: timestamp?
+  owners: [AccountOwner]
+  transactions: [Transaction]
+  statements: [Statement]
+  created_at: +timestamp
+}
+
+// Explicit join model enabling joint accounts (Customer <-> Account M2M).
+// role: primary | joint | authorized
+AccountOwner {
+  id: +uuid
+  customer: *Customer
+  account: *Account
+  role: string @length(1, 20)
+  added_at: +timestamp
+  @index(customer, account)
+}
+
+// kind: debit | credit
+Transaction {
+  id: +uuid
+  account: *Account
+  kind: string @length(1, 10)
+  // amount in minor currency units (cents); always positive
+  amount: i64 @min(1)
+  description: string?
+  reference: string?
+  occurred_at: +timestamp
+  created_at: +timestamp
+  @index(account, occurred_at)
+}
+
+// A transfer represents a debit on from_account and a credit on to_account.
+Transfer {
+  id: +uuid
+  from_account: *Account
+  to_account: *Account
+  // amount in minor currency units (cents)
+  amount: i64 @min(1)
+  description: string?
+  occurred_at: +timestamp
+  created_at: +timestamp
+  @index(from_account, occurred_at)
+}
+
+Statement {
+  id: +uuid
+  account: *Account
+  period_start: timestamp
+  period_end: timestamp
+  opening_balance: i64
+  closing_balance: i64
+  generated_at: +timestamp
+  created_at: +timestamp
+  @index(account, period_start)
+}

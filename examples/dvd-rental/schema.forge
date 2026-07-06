@@ -1,0 +1,162 @@
+// dvd-rental: DVD rental store adapted from Sakila/Pagila
+// Source: https://github.com/devrimgunduz/pagila (PostgreSQL License / BSD-style)
+// Money stored as i64 cents. rating modeled as string with @pattern.
+// Mutual FK cycle: Store.manager_staff <-> Staff.store (both optional to allow either
+// record to be inserted first without a constraint violation).
+
+Country {
+  id: +uuid
+  name: &string @length(1, 50)
+  cities: [City]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+City {
+  id: +uuid
+  name: string @length(1, 50)
+  country: *Country
+  addresses: [Address]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Address {
+  id: +uuid
+  address: string @length(1, 50)
+  address2: string?
+  district: string @length(1, 20)
+  city: *City
+  postal_code: string? @length(0, 10)
+  phone: string @length(0, 20)
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Language {
+  id: +uuid
+  name: &string @length(1, 20)
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Category {
+  id: +uuid
+  name: &string @length(1, 25)
+  films: [Film]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Actor {
+  id: +uuid
+  first_name: string @length(1, 45)
+  last_name: string @length(1, 45)
+  films: [Film]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+// Film<->Actor and Film<->Category are many-to-many (bidirectional [..]/[..]).
+// language is the primary dub language; original_language is optional (foreign films).
+// rental_rate and replacement_cost stored as i64 cents.
+// rating uses string + @pattern in place of the original SQL ENUM type.
+Film {
+  id: +uuid
+  title: string @length(1, 255)
+  description: string?
+  language: *Language
+  original_language: ?Language
+  rental_duration: i32 @min(1) @default(3)
+  rental_rate: i64 @min(0)
+  length: i32? @min(1)
+  replacement_cost: i64 @min(0)
+  rating: string?
+  special_features: string?
+  actors: [Actor]
+  categories: [Category]
+  inventory_items: [Inventory]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+// Mutual FK cycle between Store and Staff (manager_staff / store).
+// Both are ?optional to break the insertion-order deadlock.
+Store {
+  id: +uuid
+  manager_staff: ?Staff
+  address: *Address
+  customers: [Customer]
+  staff_members: [Staff]
+  inventory_items: [Inventory]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Staff {
+  id: +uuid
+  first_name: string @length(1, 45)
+  last_name: string @length(1, 45)
+  address: *Address
+  email: string? @email
+  store: ?Store
+  active: bool
+  username: &string @length(1, 16)
+  picture: string?
+  rentals: [Rental]
+  payments: [Payment]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Customer {
+  id: +uuid
+  store: *Store
+  first_name: string @length(1, 45)
+  last_name: string @length(1, 45)
+  email: string? @email
+  address: *Address
+  active: bool
+  rentals: [Rental]
+  payments: [Payment]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Inventory {
+  id: +uuid
+  film: *Film
+  store: *Store
+  rentals: [Rental]
+  created_at: +timestamp
+  updated_at: timestamp?
+
+  @index(film, store)
+}
+
+Rental {
+  id: +uuid
+  rental_date: +timestamp
+  inventory: *Inventory
+  customer: *Customer
+  return_date: timestamp?
+  staff: *Staff
+  payments: [Payment]
+  created_at: +timestamp
+  updated_at: timestamp?
+
+  @index(customer, rental_date)
+  @index(inventory, rental_date)
+}
+
+Payment {
+  id: +uuid
+  customer: *Customer
+  staff: *Staff
+  rental: *Rental
+  amount: i64 @min(0)
+  payment_date: +timestamp
+  created_at: +timestamp
+
+  @index(customer, payment_date)
+}

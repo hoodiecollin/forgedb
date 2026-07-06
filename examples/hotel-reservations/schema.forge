@@ -1,0 +1,81 @@
+// Hotel reservation system: hotels, room types (pricing template),
+// physical rooms, guests, reservations with date-range availability, payments.
+// Provenance: Synthetic (modeled after the standard hotel booking design pattern)
+
+Hotel {
+  id: +uuid
+  name: &string @length(1, 200)
+  address: string
+  city: string
+  country: string
+  stars: u32 @min(1) @max(5)
+  phone: string?
+  email: string? @email
+  room_types: [RoomType]
+  created_at: +timestamp
+}
+
+// RoomType is the pricing/capacity template; Room is the physical unit.
+RoomType {
+  id: +uuid
+  hotel: *Hotel
+  name: string @length(1, 100)
+  // base_price in minor currency units (cents)
+  base_price: i64 @min(0)
+  capacity: u32 @min(1)
+  description: string?
+  rooms: [Room]
+  created_at: +timestamp
+}
+
+// status: available | occupied | maintenance | out_of_service
+Room {
+  id: +uuid
+  room_type: *RoomType
+  room_number: string @length(1, 10)
+  floor: i32?
+  status: string @length(1, 20)
+  reservations: [Reservation]
+  created_at: +timestamp
+}
+
+Guest {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  phone: string?
+  reservations: [Reservation]
+  created_at: +timestamp
+}
+
+// check_in/check_out timestamps define the date-range availability window.
+// status: pending | confirmed | checked_in | checked_out | cancelled
+Reservation {
+  id: +uuid
+  guest: *Guest
+  room: *Room
+  check_in: timestamp
+  check_out: timestamp
+  status: string @length(1, 20)
+  // total_amount in minor currency units (cents)
+  total_amount: i64 @min(0)
+  notes: string?
+  payments: [Payment]
+  created_at: +timestamp
+  @index(room, check_in)
+  @index(guest, check_in)
+}
+
+// method: credit_card | debit_card | cash | bank_transfer
+// status: pending | completed | failed | refunded
+Payment {
+  id: +uuid
+  reservation: *Reservation
+  // amount in minor currency units (cents)
+  amount: i64 @min(1)
+  method: string @length(1, 30)
+  status: string @length(1, 20)
+  paid_at: timestamp?
+  created_at: +timestamp
+}
