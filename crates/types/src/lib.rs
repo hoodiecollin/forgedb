@@ -133,6 +133,7 @@ impl Timestamp {
     /// let ts = Timestamp::from_seconds(1234567890);
     /// assert_eq!(ts.as_seconds(), 1234567890);
     /// ```
+    #[must_use]
     pub fn from_seconds(seconds: i64) -> Self {
         Timestamp(seconds)
     }
@@ -147,11 +148,15 @@ impl Timestamp {
     /// let now = Timestamp::now();
     /// assert!(now.as_seconds() > 0);
     /// ```
+    #[must_use]
     pub fn now() -> Self {
-        let duration = SystemTime::now()
+        // Saturate rather than panic if the system clock is set before the Unix
+        // epoch: a library constructor should not crash on a misconfigured clock.
+        let seconds = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("System time before Unix epoch");
-        Timestamp(duration.as_secs() as i64)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Timestamp(seconds)
     }
 
     /// Returns the timestamp as seconds since Unix epoch
@@ -164,6 +169,7 @@ impl Timestamp {
     /// let ts = Timestamp::from_seconds(1234567890);
     /// assert_eq!(ts.as_seconds(), 1234567890);
     /// ```
+    #[must_use]
     pub fn as_seconds(&self) -> i64 {
         self.0
     }
@@ -228,6 +234,7 @@ impl Value {
     /// let val = Value::I32(42);
     /// assert_eq!(val.type_name(), "i32");
     /// ```
+    #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::I32(_) => "i32",
@@ -251,6 +258,7 @@ impl Value {
     /// assert!(Value::F64(3.14).is_numeric());
     /// assert!(!Value::String("hello".to_string()).is_numeric());
     /// ```
+    #[must_use]
     pub fn is_numeric(&self) -> bool {
         matches!(self, Value::I32(_) | Value::I64(_) | Value::F64(_))
     }
@@ -265,6 +273,7 @@ impl Value {
     /// assert!(Value::String("hello".to_string()).is_string());
     /// assert!(!Value::I32(42).is_string());
     /// ```
+    #[must_use]
     pub fn is_string(&self) -> bool {
         matches!(self, Value::String(_))
     }
