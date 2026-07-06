@@ -621,10 +621,14 @@ fn test_rust_generation_with_fk_fields() {
     assert!(code.contains("pub author_id: Uuid"), "author_id should be Uuid");
     assert!(code.contains("pub editor_id: Option<Uuid>"), "editor_id should be Option<Uuid>");
 
-    // The get method must compile — no unbound {field}_value variables (C1)
-    // We verify by checking that author_id is assigned a default, not a read
-    assert!(code.contains("author_id: Default::default()"), "author_id needs default in get");
-    assert!(code.contains("editor_id: None"), "editor_id needs None default in get");
+    // FK scalars are now PERSISTED — storage columns must exist (Task #25)
+    assert!(code.contains("author_id_col: FixedColumn"), "author_id must have a storage column");
+    assert!(code.contains("editor_id_col: FixedColumn"), "editor_id must have a storage column");
+
+    // FK values must NOT be silently defaulted — they are read from their columns
+    assert!(!code.contains("author_id: Default::default()"), "author_id must not use default (silent data loss)");
+    // editor_id None must not appear as a hardcoded struct-literal value
+    assert!(!code.contains("editor_id: None,"), "editor_id must not use None default (silent data loss)");
 
     // Storage paths namespaced per model (C2)
     assert!(code.contains("\"post/fixed/"), "Post paths not namespaced");

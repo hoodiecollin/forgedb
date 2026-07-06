@@ -48,7 +48,7 @@ impl AuthorStorage {
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<Author> {
+    pub fn get(&self, id: Uuid) -> Option<Author> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -78,6 +78,8 @@ pub struct PostStorage {
     row_count: usize,
     id_col: FixedColumn,
     title_col: VariableColumn,
+    author_id_col: FixedColumn,
+    editor_id_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
 }
 impl PostStorage {
@@ -92,6 +94,16 @@ impl PostStorage {
                     PathBuf::from("post/variable/string_offsets_1.bin"),
                 )
                 .expect("Failed to create variable column"),
+            author_id_col: FixedColumn::new(
+                    PathBuf::from("post/fixed/uuid_2.bin"),
+                    16usize,
+                )
+                .expect("Failed to create fixed column"),
+            editor_id_col: FixedColumn::new(
+                    PathBuf::from("post/fixed/uuid_3.bin"),
+                    std::mem::size_of::<Option<Uuid>>(),
+                )
+                .expect("Failed to create fixed column"),
             tombstones: forgedb_storage::Tombstones::new(
                     PathBuf::from("post/tombstones.bin"),
                 )
@@ -105,12 +117,24 @@ impl PostStorage {
             .append_uuid(*record.id.as_bytes())
             .expect("Failed to append to column");
         self.title_col.append_string(&record.title).expect("Failed to append string");
+        self.author_id_col
+            .append_uuid(*record.author_id.as_bytes())
+            .expect("Failed to append to column");
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &record.editor_id as *const _ as *const u8,
+                    std::mem::size_of_val(&record.editor_id),
+                )
+            };
+            self.editor_id_col.append_bytes(bytes).expect("Failed to append to column");
+        }
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<Post> {
+    pub fn get(&self, id: Uuid) -> Option<Post> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -126,11 +150,25 @@ impl PostStorage {
             .title_col
             .read_string(row_index)
             .expect("Failed to read string");
+        let author_id_value = {
+            let bytes = self
+                .author_id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let editor_id_value: Option<Uuid> = {
+            let bytes = self
+                .editor_id_col
+                .read_bytes(row_index)
+                .expect("Failed to read from column");
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Option<Uuid>) }
+        };
         Some(Post {
             id: id_value,
             title: title_value,
-            author_id: Default::default(),
-            editor_id: None,
+            author_id: author_id_value,
+            editor_id: editor_id_value,
         })
     }
 }

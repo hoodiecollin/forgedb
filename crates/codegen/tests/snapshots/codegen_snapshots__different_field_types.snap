@@ -19,6 +19,7 @@ pub struct ComplexModel {
     pub count: i64,
     pub price: f64,
     pub active: bool,
+    #[schema(value_type = i64)]
     pub created_at: Timestamp,
 }
 ///Storage for ComplexModel model
@@ -78,14 +79,14 @@ impl ComplexModelStorage {
         self.price_col.append_f64(record.price).expect("Failed to append to column");
         self.active_col.append_bool(record.active).expect("Failed to append to column");
         self.created_at_col
-            .append_timestamp(record.created_at)
+            .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<ComplexModel> {
+    pub fn get(&self, id: Uuid) -> Option<ComplexModel> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -109,10 +110,12 @@ impl ComplexModelStorage {
             .active_col
             .read_bool(row_index)
             .expect("Failed to read from column");
-        let created_at_value = self
-            .created_at_col
-            .read_timestamp(row_index)
-            .expect("Failed to read from column");
+        let created_at_value = Timestamp::from(
+            self
+                .created_at_col
+                .read_timestamp(row_index)
+                .expect("Failed to read from column"),
+        );
         Some(ComplexModel {
             id: id_value,
             count: count_value,
