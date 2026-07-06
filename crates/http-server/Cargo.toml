@@ -8,6 +8,11 @@
   keywords = ["database", "http", "server", "api", "forgedb"]
   categories = ["database", "web-programming::http-server"]
 
+[features]
+# Gate the development-only static-token auth stub so it cannot accidentally
+# ship to production.  Default: off.
+dev-auth = []
+
 [dependencies]
   axum               = "0.8"
   axum-server        = { version = "0.8", features = ["tls-rustls"] }

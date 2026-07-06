@@ -112,7 +112,9 @@ async fn main() {
         host: "127.0.0.1".to_string(),
         port: 3000,
         enable_cors: true,
+        cors_allow_any: true, // dev-only: allow all origins for local testing
         enable_tracing: true,
+        ..Default::default()
     };
 
     println!("\n✓ Server starting at http://{}:{}...", config.host, config.port);

@@ -2,7 +2,8 @@
 
 use axum::{http::StatusCode, response::IntoResponse, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Health status
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,29 +60,32 @@ impl HealthChecker for DatabaseHealthChecker {
     }
 }
 
-/// Server start time (set on initialization)
-static mut START_TIME: Option<SystemTime> = None;
+/// Server start time recorded via [`init_health_check`].
+///
+/// Using `OnceLock<Instant>` avoids `static mut` and all associated `unsafe`
+/// blocks; the value is written once (on first call to `init_health_check`) and
+/// is readable from any thread without synchronisation.
+static START_TIME: OnceLock<Instant> = OnceLock::new();
 
-/// Initialize health check system
+/// Initialize health check system.
+///
+/// Should be called once at server startup.  Subsequent calls are silently
+/// ignored (the `OnceLock` value is never overwritten).
 pub fn init_health_check() {
-    unsafe {
-        START_TIME = Some(SystemTime::now());
-    }
+    let _ = START_TIME.set(Instant::now());
 }
 
-/// Get server uptime in seconds
+/// Get server uptime in seconds.
 fn get_uptime_seconds() -> u64 {
-    unsafe {
-        if let Some(start_time) = START_TIME {
-            SystemTime::now()
-                .duration_since(start_time)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        } else {
-            0
-        }
-    }
+    START_TIME
+        .get()
+        .map(|start| {
+            // `Instant::elapsed` is infallible; use it directly.
+            start.elapsed().as_secs()
+        })
+        .unwrap_or(0)
 }
+
 
 /// Liveness probe - always returns 200 OK if server is running
 pub async fn liveness_handler() -> impl IntoResponse {
