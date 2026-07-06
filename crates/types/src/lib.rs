@@ -22,6 +22,8 @@
 //!
 //! | ForgeDB Type | Rust Type | Description |
 //! |--------------|-----------|-------------|
+//! | `u32` | `u32` | 32-bit unsigned integer |
+//! | `u64` | `u64` | 64-bit unsigned integer |
 //! | `i32` | `i32` | 32-bit signed integer |
 //! | `i64` | `i64` | 64-bit signed integer |
 //! | `f64` | `f64` | 64-bit floating point |
@@ -85,7 +87,6 @@
 //! # Related Crates
 //!
 //! - [`forgedb-storage`](../forgedb_storage) - Uses these types for columnar storage
-//! - [`forgedb-crud-api`](../forgedb_crud_api) - Generic CRUD operations
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schemas into these types
 //!
 //! # See Also
@@ -198,6 +199,7 @@ impl From<Timestamp> for i64 {
 /// use forgedb_types::{Value, Uuid};
 ///
 /// let int_val = Value::I32(42);
+/// let uint_val = Value::U64(1_000_000_000_u64);
 /// let str_val = Value::String("hello".to_string());
 /// let uuid_val = Value::Uuid(Uuid::new_v4());
 ///
@@ -207,6 +209,11 @@ impl From<Timestamp> for i64 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum Value {
+    /// 32-bit unsigned integer
+    U32(u32),
+    /// 64-bit unsigned integer — stored losslessly; `u64` values above `i64::MAX`
+    /// cannot be represented by the signed `I64` variant without truncation
+    U64(u64),
     /// 32-bit signed integer
     I32(i32),
     /// 64-bit signed integer
@@ -233,10 +240,15 @@ impl Value {
     ///
     /// let val = Value::I32(42);
     /// assert_eq!(val.type_name(), "i32");
+    ///
+    /// let val = Value::U64(u64::MAX);
+    /// assert_eq!(val.type_name(), "u64");
     /// ```
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
+            Value::U32(_) => "u32",
+            Value::U64(_) => "u64",
             Value::I32(_) => "i32",
             Value::I64(_) => "i64",
             Value::F64(_) => "f64",
@@ -247,20 +259,25 @@ impl Value {
         }
     }
 
-    /// Returns true if this value is a numeric type (i32, i64, or f64)
+    /// Returns true if this value is a numeric type (u32, u64, i32, i64, or f64)
     ///
     /// # Examples
     ///
     /// ```rust
     /// use forgedb_types::Value;
     ///
+    /// assert!(Value::U32(10).is_numeric());
+    /// assert!(Value::U64(u64::MAX).is_numeric());
     /// assert!(Value::I32(42).is_numeric());
     /// assert!(Value::F64(3.14).is_numeric());
     /// assert!(!Value::String("hello".to_string()).is_numeric());
     /// ```
     #[must_use]
     pub fn is_numeric(&self) -> bool {
-        matches!(self, Value::I32(_) | Value::I64(_) | Value::F64(_))
+        matches!(
+            self,
+            Value::U32(_) | Value::U64(_) | Value::I32(_) | Value::I64(_) | Value::F64(_)
+        )
     }
 
     /// Returns true if this value is a string
@@ -280,6 +297,18 @@ impl Value {
 }
 
 // Implement From for convenient value construction
+impl From<u32> for Value {
+    fn from(v: u32) -> Self {
+        Value::U32(v)
+    }
+}
+
+impl From<u64> for Value {
+    fn from(v: u64) -> Self {
+        Value::U64(v)
+    }
+}
+
 impl From<i32> for Value {
     fn from(v: i32) -> Self {
         Value::I32(v)

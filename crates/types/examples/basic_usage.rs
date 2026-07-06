@@ -27,6 +27,8 @@ fn main() {
     // Working with Value enum
     println!("--- Generic Values ---");
     let values = vec![
+        Value::U32(4_294_967_295_u32),
+        Value::U64(u64::MAX),
         Value::I32(42),
         Value::I64(1234567890),
         Value::F64(3.14159),

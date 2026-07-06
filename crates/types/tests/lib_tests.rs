@@ -188,6 +188,63 @@ fn test_value_equality() {
     assert_eq!(Value::Timestamp(ts), Value::Timestamp(ts));
 }
 
+// --- T3: Value::U32 and Value::U64 ---
+
+#[test]
+fn test_value_u32() {
+    let val = Value::U32(42_u32);
+    assert_eq!(val.type_name(), "u32");
+    assert!(val.is_numeric());
+    assert!(!val.is_string());
+}
+
+#[test]
+fn test_value_u64() {
+    // Verify that u64::MAX (above i64::MAX) round-trips losslessly — this was
+    // the correctness gap that motivated adding the U64 variant.
+    let val = Value::U64(u64::MAX);
+    assert_eq!(val.type_name(), "u64");
+    assert!(val.is_numeric());
+    assert!(!val.is_string());
+}
+
+#[test]
+fn test_value_from_u32() {
+    let val: Value = 100_u32.into();
+    assert_eq!(val, Value::U32(100));
+}
+
+#[test]
+fn test_value_from_u64() {
+    let val: Value = u64::MAX.into();
+    assert_eq!(val, Value::U64(u64::MAX));
+}
+
+#[test]
+fn test_value_u32_serialization_roundtrip() {
+    let original = Value::U32(4_294_967_295_u32);
+    let json = serde_json::to_string(&original).unwrap();
+    let deserialized: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, original);
+}
+
+#[test]
+fn test_value_u64_serialization_roundtrip() {
+    // Use a value above i64::MAX to confirm lossless serialization.
+    let original = Value::U64(u64::MAX);
+    let json = serde_json::to_string(&original).unwrap();
+    let deserialized: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, original);
+}
+
+#[test]
+fn test_value_u32_u64_distinct_from_signed() {
+    // U32 and I32 are distinct variants even for the same bit pattern.
+    assert_ne!(Value::U32(42), Value::I32(42));
+    // U64 and I64 are distinct variants.
+    assert_ne!(Value::U64(42), Value::I64(42));
+}
+
 #[test]
 fn test_timestamp_hash() {
     use std::collections::HashSet;
