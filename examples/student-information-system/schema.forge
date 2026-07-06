@@ -1,0 +1,106 @@
+// University Student Information System — synthetic schema
+// Source inspiration: https://creately.com/guides/er-diagrams-for-a-university-management-system/
+// Provenance: Synthetic; adapted from teaching database design examples. No license.
+
+Department {
+  id: +uuid
+  name: &string @length(1, 100)
+  code: &^string @length(2, 10)
+  description: string?
+  building: string?
+  phone: string?
+  created_at: +timestamp
+  updated_at: timestamp?
+  courses: [Course]
+  instructors: [Instructor]
+}
+
+Instructor {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  title: string?
+  phone: string?
+  office: string?
+  hired_at: timestamp?
+  created_at: +timestamp
+  updated_at: timestamp?
+  department: *Department
+  sections: [Section]
+}
+
+Student {
+  id: +uuid
+  student_number: &^string @length(1, 20)
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  email: &string @email
+  date_of_birth: timestamp?
+  gpa: f64? @min(0) @max(4)
+  enrollment_status: string @default(active)
+  admitted_at: +timestamp
+  created_at: +timestamp
+  updated_at: timestamp?
+  major: ?Department
+  enrollments: [Enrollment]
+}
+
+Term {
+  id: +uuid
+  name: &string @length(1, 50)
+  code: &^string @length(2, 20)
+  season: string
+  year: u32 @min(1900) @max(2100)
+  start_date: timestamp
+  end_date: timestamp
+  registration_open_at: timestamp?
+  registration_close_at: timestamp?
+  created_at: +timestamp
+  sections: [Section]
+}
+
+Course {
+  id: +uuid
+  code: &^string @length(1, 20)
+  title: string @length(1, 255)
+  description: string? @fulltext
+  credits: u32 @min(0) @max(12)
+  level: u32 @min(100) @max(999)
+  created_at: +timestamp
+  updated_at: timestamp?
+  department: *Department
+  sections: [Section]
+}
+
+Section {
+  id: +uuid
+  section_number: string @length(1, 10)
+  room: string?
+  schedule: string?
+  max_enrollment: u32 @default(30)
+  current_enrollment: u32 @default(0)
+  is_cancelled: bool @default(false)
+  created_at: +timestamp
+  updated_at: timestamp?
+  course: *Course
+  instructor: *Instructor
+  term: *Term
+  enrollments: [Enrollment]
+  @index(course, term)
+}
+
+// M2M with payload: the textbook association-entity pattern.
+// grade and status are attributes ON the enrollment relationship itself.
+// @index(student, section) mirrors the task-spec intent of @index(student_id, section_id).
+Enrollment {
+  id: +uuid
+  grade: string? @length(1, 2)
+  grade_points: f64? @min(0) @max(4)
+  status: string @default(enrolled)
+  enrolled_at: +timestamp
+  completed_at: timestamp?
+  student: *Student
+  section: *Section
+  @index(student, section)
+}

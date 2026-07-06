@@ -1,0 +1,132 @@
+// wholesale-orders: Northwind trading company — customers, employees, products, orders
+// Adapted from Northwind (PostgreSQL port)
+// Source: https://github.com/pthom/northwind_psql (MIT License)
+// Money fields stored as i64 cents. discount is f64 [0,1] fraction.
+
+Category {
+  id: +uuid
+  name: &string @length(1, 15)
+  description: string?
+  products: [Product]
+  created_at: +timestamp
+}
+
+Supplier {
+  id: +uuid
+  company_name: string @length(1, 40)
+  contact_name: string?
+  contact_title: string?
+  address: string?
+  city: string?
+  region: string?
+  postal_code: string?
+  country: string?
+  phone: string?
+  fax: string?
+  home_page: string? @url
+  products: [Product]
+  created_at: +timestamp
+}
+
+Shipper {
+  id: +uuid
+  company_name: &string @length(1, 40)
+  phone: string?
+  orders: [Order]
+  created_at: +timestamp
+}
+
+// customer_code is the Northwind 5-char natural key (e.g. "ALFKI").
+Customer {
+  id: +uuid
+  customer_code: ^&string @length(5, 5)
+  company_name: string @length(1, 40)
+  contact_name: string?
+  contact_title: string?
+  address: string?
+  city: string?
+  region: string?
+  postal_code: string?
+  country: string?
+  phone: string?
+  fax: string?
+  orders: [Order]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+// Self-referencing org hierarchy via reports_to.
+Employee {
+  id: +uuid
+  last_name: string @length(1, 20)
+  first_name: string @length(1, 10)
+  title: string?
+  title_of_courtesy: string?
+  birth_date: timestamp?
+  hire_date: timestamp?
+  address: string?
+  city: string?
+  region: string?
+  postal_code: string?
+  country: string?
+  home_phone: string?
+  extension: string?
+  notes: string?
+  reports_to: ?Employee
+  subordinates: [Employee]
+  orders: [Order]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Product {
+  id: +uuid
+  name: string @length(1, 40)
+  supplier: ?Supplier
+  category: ?Category
+  quantity_per_unit: string?
+  unit_price: i64 @min(0)
+  units_in_stock: i32 @min(0) @default(0)
+  units_on_order: i32 @min(0) @default(0)
+  reorder_level: i32 @min(0) @default(0)
+  discontinued: bool
+  order_details: [OrderDetail]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Order {
+  id: +uuid
+  customer: ?Customer
+  employee: ?Employee
+  order_date: +timestamp
+  required_date: timestamp?
+  shipped_date: timestamp?
+  shipper: ?Shipper
+  freight: i64 @min(0) @default(0)
+  ship_name: string?
+  ship_address: string?
+  ship_city: string?
+  ship_region: string?
+  ship_postal_code: string?
+  ship_country: string?
+  details: [OrderDetail]
+  created_at: +timestamp
+
+  @index(customer, order_date)
+  @index(employee, order_date)
+}
+
+// Explicit join model: Order<->Product many-to-many WITH payload (price, qty, discount).
+// OrderDetail carries unit_price (snapshot at order time), quantity, and discount fraction.
+OrderDetail {
+  id: +uuid
+  order: *Order
+  product: *Product
+  unit_price: i64 @min(0)
+  quantity: i32 @min(1)
+  discount: f64 @min(0) @max(1)
+  created_at: +timestamp
+
+  @index(order, product)
+}

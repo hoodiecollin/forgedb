@@ -1,0 +1,85 @@
+// hr-directory: Oracle HR sample schema — compact org-chart + geographic hierarchy
+// Adapted from Oracle HR sample schema
+// Source: https://github.com/oracle-samples/db-sample-schemas (UPL License)
+
+Region {
+  id: +uuid
+  name: &string @length(1, 25)
+  countries: [Country]
+  created_at: +timestamp
+}
+
+Country {
+  id: +uuid
+  country_code: &string @length(2, 2)
+  name: string @length(1, 40)
+  region: *Region
+  locations: [Location]
+  created_at: +timestamp
+}
+
+Location {
+  id: +uuid
+  street_address: string? @length(1, 40)
+  postal_code: string? @length(1, 12)
+  city: string @length(1, 30)
+  state_province: string? @length(1, 25)
+  country: *Country
+  departments: [Department]
+  created_at: +timestamp
+}
+
+Job {
+  id: +uuid
+  job_title: &string @length(1, 35)
+  min_salary: i64 @min(0)
+  max_salary: i64 @min(0)
+  employees: [Employee]
+  job_history: [JobHistory]
+  created_at: +timestamp
+}
+
+// Mutual FK cycle: Department.manager -> Employee AND Employee.department -> Department.
+// Both sides are optional to allow either to be inserted first.
+Department {
+  id: +uuid
+  name: string @length(1, 30)
+  manager: ?Employee
+  location: ?Location
+  employees: [Employee]
+  job_history: [JobHistory]
+  created_at: +timestamp
+}
+
+Employee {
+  id: +uuid
+  first_name: string? @length(1, 20)
+  last_name: string @length(1, 25)
+  email: &string @email
+  phone_number: string? @length(1, 20)
+  hire_date: timestamp
+  job: *Job
+  salary: i64 @min(0)
+  commission_pct: f64? @min(0) @max(1)
+  manager: ?Employee
+  department: ?Department
+  subordinates: [Employee]
+  job_history: [JobHistory]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+// Temporal record of an employee's job assignments.
+// Original Oracle HR uses composite PK (employee_id, start_date); ForgeDB uses +uuid PK
+// with a composite index capturing the same query pattern.
+JobHistory {
+  id: +uuid
+  employee: *Employee
+  start_date: timestamp
+  end_date: timestamp?
+  job: *Job
+  department: ?Department
+  created_at: +timestamp
+
+  @index(employee, start_date)
+}

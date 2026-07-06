@@ -1,0 +1,74 @@
+// Healthcare management system: patients, providers (role via kind field),
+// departments, appointments, prescriptions, diagnoses.
+// Provenance: Synthetic (modeled after the standard healthcare design pattern)
+
+Department {
+  id: +uuid
+  name: &string @length(1, 100)
+  description: string?
+  providers: [Provider]
+  created_at: +timestamp
+}
+
+// kind encodes provider role: doctor | nurse | technician
+Provider {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  kind: string @length(1, 20)
+  email: &string @email
+  phone: string?
+  department: *Department
+  appointments: [Appointment]
+  prescriptions: [Prescription]
+  created_at: +timestamp
+}
+
+Patient {
+  id: +uuid
+  first_name: string @length(1, 50)
+  last_name: string @length(1, 50)
+  date_of_birth: timestamp
+  email: &string @email
+  phone: string?
+  appointments: [Appointment]
+  prescriptions: [Prescription]
+  created_at: +timestamp
+}
+
+// status: scheduled | confirmed | completed | cancelled | no_show
+Appointment {
+  id: +uuid
+  patient: *Patient
+  provider: *Provider
+  scheduled_at: timestamp
+  status: string @length(1, 20)
+  notes: string?
+  diagnoses: [Diagnosis]
+  created_at: +timestamp
+  @index(provider, scheduled_at)
+  @index(patient, scheduled_at)
+}
+
+Prescription {
+  id: +uuid
+  patient: *Patient
+  provider: *Provider
+  drug: string @length(1, 200)
+  dosage: string @length(1, 100)
+  quantity: u32 @min(1)
+  refills: u32 @min(0)
+  prescribed_at: +timestamp
+  created_at: +timestamp
+  @index(patient, prescribed_at)
+}
+
+// code is an ICD-style code, e.g. "J06.9"
+Diagnosis {
+  id: +uuid
+  appointment: *Appointment
+  code: ^string @length(1, 20)
+  description: string @length(1, 500)
+  diagnosed_at: +timestamp
+  created_at: +timestamp
+}

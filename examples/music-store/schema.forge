@@ -1,0 +1,127 @@
+// music-store: iTunes-like digital music store adapted from Chinook
+// Source: https://github.com/lerocha/chinook-database (MIT License)
+// Money fields stored as i64 cents (e.g. unit_price 99 = $0.99).
+
+Genre {
+  id: +uuid
+  name: &string @length(1, 120)
+  tracks: [Track]
+  created_at: +timestamp
+}
+
+MediaType {
+  id: +uuid
+  name: &string @length(1, 120)
+  tracks: [Track]
+  created_at: +timestamp
+}
+
+Artist {
+  id: +uuid
+  name: &string @length(1, 120)
+  albums: [Album]
+  created_at: +timestamp
+}
+
+Album {
+  id: +uuid
+  title: string @length(1, 160)
+  artist: *Artist
+  tracks: [Track]
+  created_at: +timestamp
+}
+
+Track {
+  id: +uuid
+  name: string @length(1, 200)
+  album: ?Album
+  media_type: *MediaType
+  genre: ?Genre
+  composer: string?
+  milliseconds: i32 @min(0)
+  bytes: i32? @min(0)
+  unit_price: i64 @min(0)
+  playlists: [Playlist]
+  invoice_lines: [InvoiceLine]
+  created_at: +timestamp
+}
+
+// Playlist<->Track many-to-many: bidirectional [Track]/[Playlist] with no payload.
+// (Chinook's PlaylistTrack join table carries only the composite PK.)
+Playlist {
+  id: +uuid
+  name: string @length(1, 120)
+  tracks: [Track]
+  created_at: +timestamp
+}
+
+// Self-referencing employee org chart via reports_to.
+// support_rep on Customer points here (optional -- not all customers have a rep).
+Employee {
+  id: +uuid
+  last_name: string @length(1, 80)
+  first_name: string @length(1, 80)
+  title: string?
+  reports_to: ?Employee
+  birth_date: timestamp?
+  hire_date: timestamp?
+  address: string?
+  city: string?
+  state: string?
+  country: string?
+  postal_code: string?
+  phone: string?
+  fax: string?
+  email: &string @email
+  subordinates: [Employee]
+  supported_customers: [Customer]
+  created_at: +timestamp
+  updated_at: timestamp?
+}
+
+Customer {
+  id: +uuid
+  first_name: string @length(1, 80)
+  last_name: string @length(1, 80)
+  company: string?
+  address: string?
+  city: string?
+  state: string?
+  country: string?
+  postal_code: string?
+  phone: string?
+  fax: string?
+  email: &string @email
+  support_rep: ?Employee
+  invoices: [Invoice]
+  created_at: +timestamp
+  updated_at: timestamp?
+  @soft_delete
+}
+
+Invoice {
+  id: +uuid
+  customer: *Customer
+  invoice_date: timestamp
+  billing_address: string?
+  billing_city: string?
+  billing_state: string?
+  billing_country: string?
+  billing_postal_code: string?
+  total: i64 @min(0)
+  lines: [InvoiceLine]
+  created_at: +timestamp
+
+  @index(customer, invoice_date)
+}
+
+InvoiceLine {
+  id: +uuid
+  invoice: *Invoice
+  track: *Track
+  unit_price: i64 @min(0)
+  quantity: i32 @min(1)
+  created_at: +timestamp
+
+  @index(invoice, track)
+}

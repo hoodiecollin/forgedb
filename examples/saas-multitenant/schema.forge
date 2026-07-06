@@ -1,0 +1,81 @@
+// SaaS Multi-Tenant Platform — organization-scoped tenancy with RBAC
+// Showcases: tenant root model, explicit join model (Membership) carrying role,
+// api_key unique hash, invitation lifecycle, immutable audit log.
+
+Organization {
+  id: +uuid
+  name: string @length(1, 100)
+  slug: ^&string @length(1, 50)
+  domain: string?
+  plan: string @default(free)
+  created_at: +timestamp
+  updated_at: timestamp?
+  memberships: [Membership]
+  api_keys: [ApiKey]
+  invitations: [Invitation]
+  audit_logs: [AuditLog]
+  roles: [Role]
+}
+
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  created_at: +timestamp
+  updated_at: timestamp?
+  memberships: [Membership]
+  sent_invitations: [Invitation]
+  audit_actions: [AuditLog]
+}
+
+Membership {
+  id: +uuid
+  role: string @default(member)
+  created_at: +timestamp
+  updated_at: timestamp?
+  org: *Organization
+  user: *User
+  @index(org, user)
+}
+
+Role {
+  id: +uuid
+  name: &string @length(1, 50)
+  permissions: string
+  created_at: +timestamp
+  org: *Organization
+}
+
+ApiKey {
+  id: +uuid
+  name: string @length(1, 100)
+  key_hash: &string
+  last_used_at: timestamp?
+  expires_at: timestamp?
+  is_active: bool @default(true)
+  created_at: +timestamp
+  org: *Organization
+  created_by: *User
+}
+
+Invitation {
+  id: +uuid
+  email: string @email
+  role: string @default(member)
+  status: string @default(pending)
+  expires_at: timestamp
+  created_at: +timestamp
+  org: *Organization
+  invited_by: *User
+}
+
+AuditLog {
+  id: +uuid
+  action: string @length(1, 100)
+  resource_type: string @length(1, 50)
+  resource_id: uuid
+  occurred_at: +timestamp
+  org: *Organization
+  actor: *User
+  @index(resource_type, occurred_at)
+}

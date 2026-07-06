@@ -1,0 +1,39 @@
+// IoT Sensor Platform — high-volume telemetry with fixed-array readings
+// Showcases: +u64 PK for append-heavy tables, fixed array [f64; 3] for 3-axis
+// sensor samples, embedded struct (Calibration), composite @index on FK + time.
+
+struct Calibration {
+  offset: f64
+  scale: f64
+}
+
+Device {
+  id: +uuid
+  serial_number: ^&string @length(1, 100)
+  name: string @length(1, 100)
+  model: string @length(1, 100)
+  location_lat: f64?
+  location_lon: f64?
+  calibration: Calibration?
+  registered_at: +timestamp
+  last_seen_at: timestamp?
+  readings: [SensorReading]
+  alerts: [Alert]
+}
+
+SensorReading {
+  id: +u64
+  reading: [f64; 3]
+  recorded_at: +timestamp
+  device: *Device
+  @index(device, recorded_at)
+}
+
+Alert {
+  id: +uuid
+  severity: string
+  message: string @length(1, 500)
+  raised_at: +timestamp
+  resolved_at: timestamp?
+  device: *Device
+}

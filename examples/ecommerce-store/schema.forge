@@ -1,0 +1,97 @@
+// E-Commerce Store — product catalog, cart, orders, payments
+// Showcases: explicit join models (CartItem, OrderItem) with payload fields,
+// money as i64 (cents), unique SKU, status string fields, composite indexes.
+
+Product {
+  id: +uuid
+  name: string @length(1, 200)
+  slug: ^&string @length(1, 200)
+  description: string?
+  category: string @length(1, 100)
+  is_active: bool @default(true)
+  created_at: +timestamp
+  updated_at: timestamp?
+  variants: [ProductVariant]
+}
+
+ProductVariant {
+  id: +uuid
+  sku: ^&string @length(1, 100)
+  name: string @length(1, 200)
+  price: i64 @min(0)
+  weight_grams: i32?
+  is_active: bool @default(true)
+  created_at: +timestamp
+  product: *Product
+  inventory: [Inventory]
+}
+
+Inventory {
+  id: +uuid
+  quantity: u32 @default(0)
+  reserved: u32 @default(0)
+  warehouse: string @length(1, 100)
+  created_at: +timestamp
+  updated_at: timestamp?
+  variant: *ProductVariant
+}
+
+Customer {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  phone: string?
+  created_at: +timestamp
+  updated_at: timestamp?
+  carts: [Cart]
+  orders: [Order]
+}
+
+Cart {
+  id: +uuid
+  created_at: +timestamp
+  updated_at: timestamp?
+  customer: *Customer
+  items: [CartItem]
+}
+
+CartItem {
+  id: +uuid
+  quantity: u32 @min(1)
+  added_at: +timestamp
+  cart: *Cart
+  variant: *ProductVariant
+}
+
+Order {
+  id: +uuid
+  order_number: ^&string
+  status: string @default(pending)
+  total: i64 @min(0)
+  notes: string?
+  created_at: +timestamp
+  updated_at: timestamp?
+  customer: *Customer
+  items: [OrderItem]
+  payments: [Payment]
+  @index(status, created_at)
+}
+
+OrderItem {
+  id: +uuid
+  quantity: u32 @min(1)
+  unit_price: i64 @min(0)
+  created_at: +timestamp
+  order: *Order
+  variant: *ProductVariant
+}
+
+Payment {
+  id: +uuid
+  amount: i64 @min(0)
+  method: string
+  status: string @default(pending)
+  transaction_id: string?
+  created_at: +timestamp
+  order: *Order
+}
