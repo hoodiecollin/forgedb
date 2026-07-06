@@ -6,6 +6,11 @@ use std::path::Path;
 pub struct ValidateOptions {
     pub strict: bool,
     pub schema_only: bool,
+    /// `--implementations`: accepted but not yet enforced. The real check —
+    /// verifying every `@computed` field resolves — lands with the schema-
+    /// expression feature (`@computed(<expr>)`); until then this flag is a
+    /// documented no-op. See task #46.
+    #[allow(dead_code)]
     pub implementations: bool,
     pub components: bool,
     /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).

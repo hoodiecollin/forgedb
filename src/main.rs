@@ -81,7 +81,7 @@ enum Commands {
         #[arg(long)]
         schema_only: bool,
 
-        /// Check computed field implementations
+        /// Check computed field implementations (not yet enforced — see task #46)
         #[arg(long)]
         implementations: bool,
 
