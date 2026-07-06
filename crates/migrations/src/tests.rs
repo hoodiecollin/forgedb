@@ -80,8 +80,9 @@ fn test_breaking_change_detection() {
     let migration = Migration::new("Update User model".to_string(), changes);
 
     assert!(migration.has_breaking_changes());
-    assert_eq!(migration.breaking_changes().len(), 2);
-    assert_eq!(migration.safe_changes().len(), 1);
+    // M4: AddField { nullable: false, default_value: None } is also breaking now
+    assert_eq!(migration.breaking_changes().len(), 3);
+    assert_eq!(migration.safe_changes().len(), 0);
 }
 
 #[test]

@@ -101,6 +101,13 @@ impl SchemaChange {
                 new_nullable: false,
                 ..
             } => true,
+            // M4: Adding a NOT NULL column without a default to a populated table is
+            // breaking — existing rows have no value to fill in.
+            SchemaChange::AddField {
+                nullable: false,
+                default_value: None,
+                ..
+            } => true,
             SchemaChange::RemoveUniqueConstraint { .. } => false, // Safe to remove constraints
             SchemaChange::AddUniqueConstraint { .. } => true,     // May fail if duplicates exist
             _ => false,
