@@ -8,14 +8,24 @@ pub struct GenerateOptions {
     pub target: String,
     pub check: bool,
     pub output: Option<String>,
+    /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).
+    /// When `None`, `find_schema_file()` searches for the default names.
+    pub schema: Option<String>,
+    /// Target list from `[generate].targets` in `forgedb.toml`.
+    /// When present and `target` is `"all"`, only these targets are generated.
+    /// Ignored for explicit single-target invocations.
+    pub config_targets: Option<Vec<String>>,
     pub force: bool,
 }
 
 pub fn run(options: GenerateOptions) -> Result<()> {
     ui::header("🔨", "Generating code from schema");
 
-    // Find schema file
-    let schema_path = find_schema_file()?;
+    // Find schema file — explicit path takes priority over auto-discovery.
+    let schema_path = match options.schema.as_deref() {
+        Some(p) => p.to_string(),
+        None => find_schema_file()?,
+    };
     ui::info(&format!("Using schema: {}", schema_path));
 
     // Read and parse schema
@@ -56,8 +66,10 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 
     match target.as_str() {
         "all" => {
-            // Generate everything
-            generated_files.extend(generate_all(&schema, &output_path, options.force)?);
+            // When config restricts which targets to emit, honour that list;
+            // otherwise generate everything.
+            let allowed = options.config_targets.as_deref();
+            generated_files.extend(generate_all(&schema, &output_path, options.force, allowed)?);
         }
         "rust" => {
             let result = RustGenerator::generate(&schema)
@@ -120,46 +132,66 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     Ok(())
 }
 
+/// Generate all (or a filtered subset of) artifacts.
+///
+/// `target_filter` — when `Some`, only generates targets whose names appear in
+/// the slice; `None` means generate everything.  Valid names: `rust`,
+/// `typescript`, `api`, `stubs`.
 fn generate_all(
     schema: &forgedb_parser::Schema,
     output_path: &PathBuf,
     force: bool,
+    target_filter: Option<&[String]>,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let enabled = |name: &str| -> bool {
+        target_filter.map_or(true, |ts| ts.iter().any(|t| t.as_str() == name))
+    };
+
     let mut files = Vec::new();
 
     // Generate Rust database code
-    let rust_result = RustGenerator::generate(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let rust_path = output_path.join("database.rs");
-    write_file(&rust_path, &rust_result.code, force)?;
-    files.push((rust_path, rust_result));
+    if enabled("rust") {
+        let rust_result = RustGenerator::generate(schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let rust_path = output_path.join("database.rs");
+        write_file(&rust_path, &rust_result.code, force)?;
+        files.push((rust_path, rust_result));
+    }
 
     // Generate TypeScript types
-    let ts_result = TypeScriptGenerator::generate(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let ts_path = output_path.join("types.ts");
-    write_file(&ts_path, &ts_result.code, force)?;
-    files.push((ts_path, ts_result));
+    if enabled("typescript") {
+        let ts_result = TypeScriptGenerator::generate(schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let ts_path = output_path.join("types.ts");
+        write_file(&ts_path, &ts_result.code, force)?;
+        files.push((ts_path, ts_result));
+    }
 
     // Generate API
-    let api_result = ApiGenerator::generate(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let api_path = output_path.join("api.rs");
-    write_file(&api_path, &api_result.code, force)?;
-    files.push((api_path, api_result));
+    if enabled("api") {
+        let api_result = ApiGenerator::generate(schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let api_path = output_path.join("api.rs");
+        write_file(&api_path, &api_result.code, force)?;
+        files.push((api_path, api_result));
+    }
 
     // OpenAPI spec generation was lost during the crate-extraction refactor; skip for now.
     // Tracked for Phase 3 restore (re-implement OpenApiGenerator in forgedb-codegen).
-    ui::warning("Skipping OpenAPI spec (generator pending re-implementation — Phase 3)");
+    if target_filter.is_none() {
+        ui::warning("Skipping OpenAPI spec (generator pending re-implementation — Phase 3)");
+    }
 
     // Generate stubs
-    let stub_result = StubGenerator::generate(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let stubs_dir = output_path.join("stubs");
-    fs::create_dir_all(&stubs_dir)?;
-    let stub_path = stubs_dir.join("README.md");
-    write_file(&stub_path, &stub_result.code, force)?;
-    files.push((stub_path, stub_result));
+    if enabled("stubs") {
+        let stub_result = StubGenerator::generate(schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let stubs_dir = output_path.join("stubs");
+        fs::create_dir_all(&stubs_dir)?;
+        let stub_path = stubs_dir.join("README.md");
+        write_file(&stub_path, &stub_result.code, force)?;
+        files.push((stub_path, stub_result));
+    }
 
     Ok(files)
 }
