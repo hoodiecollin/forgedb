@@ -1,101 +1,22 @@
 //! ForgeDB FFI Bindings
 //!
-//! C-compatible FFI bindings for ForgeDB, enabling direct database access from
-//! Bun, Node.js, and other runtimes.
+//! C-compatible FFI bindings for ForgeDB, intended for direct database access from
+//! Bun, Node.js, and other runtimes. This crate is in early development — only a
+//! single function is currently exported; the full API is planned but not yet built.
 //!
-//! # Overview
+//! # Currently Available
 //!
-//! This crate provides a C-compatible Foreign Function Interface (FFI) for ForgeDB,
-//! allowing integration with:
+//! - [`forgedb_version`] — returns the crate version as a static C string.
 //!
-//! - **Bun** - Direct FFI calls using Bun's native FFI support
-//! - **Node.js** - Through native addons or ffi-napi
-//! - **Python** - Via ctypes or cffi
-//! - **Other languages** - Any language with C FFI support
+//! # Planned (not yet implemented)
 //!
-//! # Architecture
-//!
-//! The FFI layer provides:
-//!
-//! - **Opaque handles** - Safe pointer management for Rust objects
-//! - **C-compatible types** - All types are C-ABI compatible
-//! - **Error handling** - Error codes and message passing
-//! - **Memory safety** - Explicit allocation/deallocation functions
-//!
-//! ## Safety Guarantees
-//!
-//! - All `unsafe` operations are properly documented
-//! - Null pointer checks on all public APIs
-//! - Opaque handles prevent direct memory access
-//! - Explicit memory management (no hidden allocations)
-//!
-//! # Status
-//!
-//! This crate is currently in early development. Most functionality is planned
-//! but not yet implemented.
-//!
-//! ## Currently Available
-//!
-//! - `forgedb_version()` - Get ForgeDB version string
-//!
-//! ## Planned
-//!
-//! - Database open/close operations
+//! - Opaque database handles (open/close)
 //! - CRUD operations
 //! - Query interface
 //! - Transaction support
-//! - Error handling infrastructure
-//!
-//! # Examples
-//!
-//! ## C Usage
-//!
-//! ```c
-//! #include <forgedb.h>
-//! #include <stdio.h>
-//!
-//! int main() {
-//!     // Get version
-//!     const char* version = forgedb_version();
-//!     printf("ForgeDB version: %s\n", version);
-//!     return 0;
-//! }
-//! ```
-//!
-//! ## Bun FFI Usage
-//!
-//! ```typescript
-//! import { dlopen, FFIType, suffix } from "bun:ffi";
-//!
-//! const lib = dlopen(`libforgedb.${suffix}`, {
-//!   forgedb_version: {
-//!     returns: FFIType.cstring,
-//!   },
-//! });
-//!
-//! // Get version
-//! console.log(lib.symbols.forgedb_version());
-//! ```
-//!
-//! ## Python Usage (ctypes)
-//!
-//! ```python
-//! from ctypes import *
-//!
-//! # Load library
-//! lib = CDLL("./libforgedb.so")
-//!
-//! # Define function signatures
-//! lib.forgedb_version.restype = c_char_p
-//!
-//! # Get version
-//! version = lib.forgedb_version()
-//! print(f"ForgeDB version: {version.decode('utf-8')}")
-//! ```
+//! - Error-code infrastructure
 //!
 //! # Building
-//!
-//! To build the FFI library:
 //!
 //! ```bash
 //! cargo build --release -p forgedb-ffi
@@ -105,6 +26,31 @@
 //! - **Linux**: `libforgedb.so`
 //! - **macOS**: `libforgedb.dylib`
 //! - **Windows**: `forgedb.dll`
+//!
+//! # Example (C)
+//!
+//! ```c
+//! #include <stdio.h>
+//! // extern declaration — no forgedb.h yet
+//! extern const char* forgedb_version(void);
+//!
+//! int main() {
+//!     printf("ForgeDB version: %s\n", forgedb_version());
+//!     return 0;
+//! }
+//! ```
+//!
+//! # Example (Bun FFI)
+//!
+//! ```typescript
+//! import { dlopen, FFIType, suffix } from "bun:ffi";
+//!
+//! const lib = dlopen(`libforgedb.${suffix}`, {
+//!   forgedb_version: { returns: FFIType.cstring },
+//! });
+//!
+//! console.log(lib.symbols.forgedb_version());
+//! ```
 
 use std::os::raw::c_char;
 
