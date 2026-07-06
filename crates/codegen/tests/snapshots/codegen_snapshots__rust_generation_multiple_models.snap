@@ -62,6 +62,18 @@ impl UserStorage {
         };
         Some(User { id: id_value })
     }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<User> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
+    }
 }
 ///Post model
 #[repr(C)]
@@ -128,6 +140,18 @@ impl PostStorage {
             id: id_value,
             title: title_value,
         })
+    }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<Post> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
     }
 }
 /// Main database struct

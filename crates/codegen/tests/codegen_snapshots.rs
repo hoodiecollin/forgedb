@@ -495,6 +495,94 @@ Place {
     insta::assert_snapshot!(code);
 }
 
+#[test]
+fn test_rust_generation_relation_traversal() {
+    // A required FK (`author: *User`), an optional FK (`editor: ?User`), a
+    // reverse one-to-many (`User.posts: [Post]` <- `Post.author`), and a
+    // bidirectional many-to-many (`Post.tags` <-> `Tag.posts`) — the four
+    // traversal shapes generated as `Database` helpers + eager-load structs.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  editor: ?User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  label: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // Scan helper backing reverse/M2M lookups.
+    assert!(code.contains("pub fn all(&self) -> Vec<Post>"), "scan helper");
+
+    // A. Forward FK getters (required is a direct get; optional threads through).
+    assert!(
+        code.contains("pub fn post_author(&self, record: &Post) -> Option<User>"),
+        "forward required FK getter"
+    );
+    assert!(
+        code.contains("record.editor.and_then(|fk| self.user.get(fk))"),
+        "forward optional FK getter uses and_then"
+    );
+
+    // B. Reverse one-to-many collection getters. Post has two FKs back to User
+    // (`author` + `editor`), so the single `User.posts` collection disambiguates
+    // by child field rather than emitting two same-named methods.
+    assert!(
+        code.contains("pub fn user_posts_by_author(&self, id: Uuid) -> Vec<Post>"),
+        "reverse getter disambiguated by required FK"
+    );
+    assert!(
+        code.contains("pub fn user_posts_by_editor(&self, id: Uuid) -> Vec<Post>"),
+        "reverse getter disambiguated by optional FK"
+    );
+    assert!(
+        code.contains("record.author == id"),
+        "required-FK reverse getter filters by equality"
+    );
+    assert!(
+        code.contains("record.editor == Some(id)"),
+        "optional-FK reverse getter filters by Some(id)"
+    );
+
+    // C. Many-to-many: a persisted junction struct + link/query helpers.
+    assert!(code.contains("pub struct PostTagLink"), "M2M junction struct");
+    assert!(
+        code.contains("pub fn link_post_tag(&mut self, left: Uuid, right: Uuid)"),
+        "M2M link helper (fixed left/right params)"
+    );
+    assert!(code.contains("pub fn post_tags(&self, id: Uuid) -> Vec<Tag>"), "M2M forward query");
+    assert!(code.contains("pub fn tag_posts(&self, id: Uuid) -> Vec<Post>"), "M2M reverse query");
+    assert!(
+        code.contains("pub post_tag_link: PostTagLink"),
+        "junction is a Database field"
+    );
+
+    // Eager-load struct bundling a record with its resolved forward refs.
+    assert!(code.contains("pub struct PostWithRelations"), "eager-load struct");
+    assert!(
+        code.contains("pub fn post_with_relations(&self, id: Uuid) -> Option<PostWithRelations>"),
+        "eager-load getter"
+    );
+
+    insta::assert_snapshot!(code);
+}
+
 // ---------------------------------------------------------------------------
 // T1: Tests that exercise FK/relation and component fields (C1 regression guard)
 // ---------------------------------------------------------------------------
