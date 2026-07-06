@@ -7,11 +7,12 @@ expression: result.code
 #![allow(dead_code, unused_imports)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use forgedb_storage::{ColumnarStorage, FixedColumn, VariableColumn, Tombstones};
+use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};
 use forgedb_types::{Uuid, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 ///ComplexModel model
+#[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComplexModel {
     pub id: Uuid,
@@ -36,20 +37,34 @@ impl ComplexModelStorage {
         Self {
             id_to_row: HashMap::new(),
             row_count: 0,
-            id_col: FixedColumn::new(PathBuf::from("fixed/uuid_0.bin"), 16usize)
+            id_col: FixedColumn::new(
+                    PathBuf::from("complex_model/fixed/uuid_0.bin"),
+                    16usize,
+                )
                 .expect("Failed to create fixed column"),
-            count_col: FixedColumn::new(PathBuf::from("fixed/i64_1.bin"), 8usize)
-                .expect("Failed to create fixed column"),
-            price_col: FixedColumn::new(PathBuf::from("fixed/f64_2.bin"), 8usize)
-                .expect("Failed to create fixed column"),
-            active_col: FixedColumn::new(PathBuf::from("fixed/bool_3.bin"), 1usize)
-                .expect("Failed to create fixed column"),
-            created_at_col: FixedColumn::new(
-                    PathBuf::from("fixed/timestamp_4.bin"),
+            count_col: FixedColumn::new(
+                    PathBuf::from("complex_model/fixed/i64_1.bin"),
                     8usize,
                 )
                 .expect("Failed to create fixed column"),
-            tombstones: forgedb_storage::Tombstones::new(PathBuf::from("tombstones.bin"))
+            price_col: FixedColumn::new(
+                    PathBuf::from("complex_model/fixed/f64_2.bin"),
+                    8usize,
+                )
+                .expect("Failed to create fixed column"),
+            active_col: FixedColumn::new(
+                    PathBuf::from("complex_model/fixed/bool_3.bin"),
+                    1usize,
+                )
+                .expect("Failed to create fixed column"),
+            created_at_col: FixedColumn::new(
+                    PathBuf::from("complex_model/fixed/timestamp_4.bin"),
+                    8usize,
+                )
+                .expect("Failed to create fixed column"),
+            tombstones: forgedb_storage::Tombstones::new(
+                    PathBuf::from("complex_model/tombstones.bin"),
+                )
                 .expect("Failed to create tombstones"),
         }
     }
@@ -70,7 +85,7 @@ impl ComplexModelStorage {
         self.row_count += 1;
         id
     }
-    pub fn get(&self, id: Uuid) -> Option<ComplexModel> {
+    pub fn get(&mut self, id: Uuid) -> Option<ComplexModel> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;

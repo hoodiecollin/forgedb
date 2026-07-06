@@ -2,9 +2,9 @@
 //!
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
-use forgedb_codegen::{ApiGenerator, RustGenerator};
-use forgedb_parser::ast::IndexType;
-use forgedb_parser::{Field, FieldType, Model, Schema};
+use forgedb_codegen::{ApiGenerator, RustGenerator, TypeScriptGenerator};
+use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
+use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
 
 /// Helper to create a simple test schema with one model
 fn simple_user_schema() -> Schema {
@@ -447,4 +447,302 @@ fn test_rust_generation_with_complex_types() {
     assert!(code.contains("location_col"), "Missing: location_col");
     assert!(code.contains("tags_col"), "Missing: tags_col");
     assert!(code.contains("scores_col"), "Missing: scores_col");
+}
+
+// ---------------------------------------------------------------------------
+// T1: Tests that exercise FK/relation and component fields (C1 regression guard)
+// ---------------------------------------------------------------------------
+
+/// Schema with a FK (RequiredReference), an optional FK (OptionalReference),
+/// and a OneToMany relation — all paths that previously caused C1.
+fn fk_schema() -> Schema {
+    Schema {
+        models: vec![
+            Model {
+                name: "Author".to_string(),
+                fields: vec![Field {
+                    name: "id".to_string(),
+                    field_type: FieldType::Uuid,
+                    auto_generate: true,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                }],
+                composite_indexes: vec![],
+                soft_delete: false,
+            },
+            Model {
+                name: "Post".to_string(),
+                fields: vec![
+                    Field {
+                        name: "id".to_string(),
+                        field_type: FieldType::Uuid,
+                        auto_generate: true,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                    Field {
+                        name: "title".to_string(),
+                        field_type: FieldType::String,
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                    // Required FK reference (no storage column, must default)
+                    Field {
+                        name: "author_id".to_string(),
+                        field_type: FieldType::Relation(RelationType::RequiredReference(
+                            "Author".to_string(),
+                        )),
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                    // Optional FK reference
+                    Field {
+                        name: "editor_id".to_string(),
+                        field_type: FieldType::Relation(RelationType::OptionalReference(
+                            "Author".to_string(),
+                        )),
+                        auto_generate: false,
+                        unique: false,
+                        indexed: false,
+                        constraints: vec![],
+                        index_type: IndexType::Hash,
+                        is_computed: false,
+                        fulltext_indexed: false,
+                        is_materialized: false,
+                    },
+                ],
+                composite_indexes: vec![],
+                soft_delete: false,
+            },
+        ],
+        structs: vec![],
+    }
+}
+
+/// Schema where a model has a OneToMany virtual relation and a Component field.
+fn component_schema() -> Schema {
+    Schema {
+        models: vec![Model {
+            name: "Product".to_string(),
+            fields: vec![
+                Field {
+                    name: "id".to_string(),
+                    field_type: FieldType::Uuid,
+                    auto_generate: true,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "name".to_string(),
+                    field_type: FieldType::String,
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                // OneToMany virtual relation
+                Field {
+                    name: "reviews".to_string(),
+                    field_type: FieldType::Relation(RelationType::OneToMany(
+                        "Review".to_string(),
+                    )),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                // Component reference
+                Field {
+                    name: "card".to_string(),
+                    field_type: FieldType::Component(ComponentReference {
+                        protocol: ComponentProtocol::Tsx,
+                        path: "components/product/card".to_string(),
+                        relations: RelationInclusion::None,
+                    }),
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+            ],
+            composite_indexes: vec![],
+            soft_delete: false,
+        }],
+        structs: vec![],
+    }
+}
+
+#[test]
+fn test_rust_generation_with_fk_fields() {
+    let schema = fk_schema();
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // FK fields appear in the struct
+    assert!(code.contains("pub author_id: Uuid"), "author_id should be Uuid");
+    assert!(code.contains("pub editor_id: Option<Uuid>"), "editor_id should be Option<Uuid>");
+
+    // The get method must compile — no unbound {field}_value variables (C1)
+    // We verify by checking that author_id is assigned a default, not a read
+    assert!(code.contains("author_id: Default::default()"), "author_id needs default in get");
+    assert!(code.contains("editor_id: None"), "editor_id needs None default in get");
+
+    // Storage paths namespaced per model (C2)
+    assert!(code.contains("\"post/fixed/"), "Post paths not namespaced");
+    assert!(code.contains("\"author/fixed/"), "Author paths not namespaced");
+
+    // repr(C) present (C3)
+    assert!(code.contains("#[repr(C)]"), "missing #[repr(C)]");
+
+    // Snapshot for future regression detection
+    insta::assert_snapshot!(code);
+}
+
+#[test]
+fn test_rust_generation_with_component_field() {
+    let schema = component_schema();
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // Virtual fields have defaults, not reads (C1)
+    assert!(code.contains("reviews: ()"), "OneToMany should default to ()");
+    assert!(code.contains("card: Default::default()"), "Component should default");
+
+    // Snapshot for future regression detection
+    insta::assert_snapshot!(code);
+}
+
+#[test]
+fn test_typescript_generation_snapshot() {
+    let schema = fk_schema();
+    let result = TypeScriptGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // H1: URL uses correct template literal with ${id} interpolation
+    assert!(code.contains("${id}"), "id interpolation missing in template literal");
+    // H1: the old malformed pattern "{}" should NOT appear
+    assert!(!code.contains("{}`"), "old malformed URL pattern still present");
+    // H3: kebab-case (for "Post" it's "post"; verify by checking for single-word models)
+    assert!(code.contains("/api/post/${id}"), "get URL for Post should be /api/post/${{id}}");
+    assert!(code.contains("/api/author/${id}"), "get URL for Author should be /api/author/${{id}}");
+    // M1: Uuid maps to string
+    assert!(code.contains("id: string"), "Uuid should be string");
+
+    insta::assert_snapshot!(code);
+}
+
+/// Verify H3 (kebab-case) with a multi-word model name
+#[test]
+fn test_typescript_kebab_case_multi_word() {
+    use forgedb_parser::ast::IndexType;
+
+    let schema = Schema {
+        models: vec![Model {
+            name: "UserProfile".to_string(),
+            fields: vec![Field {
+                name: "id".to_string(),
+                field_type: FieldType::Uuid,
+                auto_generate: true,
+                unique: false,
+                indexed: false,
+                constraints: vec![],
+                index_type: IndexType::Hash,
+                is_computed: false,
+                fulltext_indexed: false,
+                is_materialized: false,
+            }],
+            composite_indexes: vec![],
+            soft_delete: false,
+        }],
+        structs: vec![],
+    };
+
+    let result = TypeScriptGenerator::generate(&schema).unwrap();
+    // H3: "UserProfile" should become "user-profile" not "userprofile"
+    assert!(result.code.contains("/api/user-profile"), "multi-word model should use kebab-case");
+    assert!(!result.code.contains("/api/userprofile"), "must not use plain lowercase");
+}
+
+#[test]
+fn test_typescript_u32_u64_are_number() {
+    use forgedb_parser::ast::IndexType;
+
+    let schema = Schema {
+        models: vec![Model {
+            name: "Counter".to_string(),
+            fields: vec![
+                Field {
+                    name: "count_u32".to_string(),
+                    field_type: FieldType::U32,
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+                Field {
+                    name: "count_u64".to_string(),
+                    field_type: FieldType::U64,
+                    auto_generate: false,
+                    unique: false,
+                    indexed: false,
+                    constraints: vec![],
+                    index_type: IndexType::Hash,
+                    is_computed: false,
+                    fulltext_indexed: false,
+                    is_materialized: false,
+                },
+            ],
+            composite_indexes: vec![],
+            soft_delete: false,
+        }],
+        structs: vec![],
+    };
+
+    let result = TypeScriptGenerator::generate(&schema).unwrap();
+    // M1: u32/u64 must map to `number`, not `any`
+    assert!(result.code.contains("count_u32: number"), "U32 should be number");
+    assert!(result.code.contains("count_u64: number"), "U64 should be number");
 }

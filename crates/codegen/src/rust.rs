@@ -49,7 +49,7 @@ impl RustGenerator {
 
             use std::collections::HashMap;
             use std::path::{Path, PathBuf};
-            use forgedb_storage::{ColumnarStorage, FixedColumn, VariableColumn, Tombstones};
+            use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};
             use forgedb_types::{Uuid, Timestamp, Value};
             use serde::{Deserialize, Serialize};
             use utoipa::ToSchema;
@@ -111,6 +111,7 @@ impl RustGenerator {
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
             #[doc = #model_doc]
+            #[repr(C)]
             #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
             pub struct #model_name {
                 #(#fields),*
@@ -132,7 +133,9 @@ impl RustGenerator {
                     #insert_logic
                 }
 
-                pub fn get(&self, id: Uuid) -> Option<#model_name> {
+                // Takes `&mut self` because the columnar readers seek the
+                // underlying files, which requires mutable access.
+                pub fn get(&mut self, id: Uuid) -> Option<#model_name> {
                     #get_logic
                 }
             }
@@ -169,27 +172,36 @@ impl RustGenerator {
     }
 
     /// Generate storage initialization code
-    fn generate_storage_inits(model: &forgedb_parser::Model, schema: &Schema) -> TokenStream {
+    fn generate_storage_inits(model: &forgedb_parser::Model, _schema: &Schema) -> TokenStream {
         let mut inits = Vec::new();
         let mut column_index = 0usize;
+        // Namespace all storage paths under the model name to prevent collision
+        let model_snake = Self::to_snake_case(&model.name);
 
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
 
             if Self::is_fixed_size_type(&field.field_type) {
-                let value_size = Self::get_value_size(&field.field_type, schema);
-                let col_path = format!("fixed/{}_{}.bin", Self::type_name(&field.field_type), column_index);
+                let col_path = format!(
+                    "{}/fixed/{}_{}.bin",
+                    model_snake,
+                    Self::type_name(&field.field_type),
+                    column_index
+                );
+                // C3: emit size_of in generated code so column size matches the Rust type
+                let value_size_expr =
+                    Self::column_value_size_expr(&field.field_type);
 
                 inits.push(quote! {
                     #field_col_name: FixedColumn::new(
                         PathBuf::from(#col_path),
-                        #value_size
+                        #value_size_expr
                     ).expect("Failed to create fixed column")
                 });
                 column_index += 1;
             } else if Self::is_string_type(&field.field_type) {
-                let data_path = format!("variable/string_data_{}.bin", column_index);
-                let offsets_path = format!("variable/string_offsets_{}.bin", column_index);
+                let data_path = format!("{}/variable/string_data_{}.bin", model_snake, column_index);
+                let offsets_path = format!("{}/variable/string_offsets_{}.bin", model_snake, column_index);
 
                 inits.push(quote! {
                     #field_col_name: VariableColumn::new(
@@ -201,13 +213,53 @@ impl RustGenerator {
             }
         }
 
+        let tombstones_path = format!("{}/tombstones.bin", model_snake);
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
             #(#inits,)*
             tombstones: forgedb_storage::Tombstones::new(
-                PathBuf::from("tombstones.bin")
+                PathBuf::from(#tombstones_path)
             ).expect("Failed to create tombstones"),
+        }
+    }
+
+    /// Emit a `size_of`-based expression for the column's value size so it matches
+    /// the actual Rust type layout (C3).  For complex/struct types we defer to
+    /// `std::mem::size_of::<T>()` evaluated at compile time in the generated code.
+    fn column_value_size_expr(field_type: &forgedb_parser::FieldType) -> TokenStream {
+        match field_type {
+            forgedb_parser::FieldType::StructType(name) => {
+                let ident = format_ident!("{}", name);
+                quote! { std::mem::size_of::<#ident>() }
+            }
+            forgedb_parser::FieldType::OptionalStructType(name) => {
+                let ident = format_ident!("{}", name);
+                quote! { std::mem::size_of::<Option<#ident>>() }
+            }
+            forgedb_parser::FieldType::Nullable(inner) => {
+                let inner_tokens = Self::map_field_type_ident(inner);
+                quote! { std::mem::size_of::<Option<#inner_tokens>>() }
+            }
+            _ => {
+                // For all other fixed-size types the constant is authoritative
+                let size = match field_type {
+                    forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::I32 => 4usize,
+                    forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
+                    forgedb_parser::FieldType::F64 => 8,
+                    forgedb_parser::FieldType::Bool => 1,
+                    forgedb_parser::FieldType::Uuid => 16,
+                    forgedb_parser::FieldType::Timestamp => 8,
+                    forgedb_parser::FieldType::Char(n) => *n,
+                    forgedb_parser::FieldType::FixedArray(inner, count) => {
+                        // Fall back to map_field_type_ident for array sizing
+                        let inner_tokens = Self::map_field_type_ident(inner);
+                        return quote! { std::mem::size_of::<[#inner_tokens; #count]>() };
+                    }
+                    _ => 8, // Default
+                };
+                quote! { #size }
+            }
         }
     }
 
@@ -240,10 +292,11 @@ impl RustGenerator {
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
+                        | forgedb_parser::FieldType::Nullable(_)
                 );
 
                 if needs_byte_conversion {
-                    // For complex types, convert to bytes
+                    // C3: use size_of_val so the byte count matches the column size
                     append_statements.push(quote! {
                         {
                             let bytes = unsafe {
@@ -309,6 +362,8 @@ impl RustGenerator {
                     let #field_value_name = self.#field_col_name.read_string(row_index)
                         .expect("Failed to read string");
                 });
+                // C1: only push to field_values inside the branch that emits a binding
+                field_values.push(quote! { #field_name: #field_value_name });
             } else if Self::is_fixed_size_type(&field.field_type) {
                 // Check if this is a complex type that needs byte conversion
                 let needs_byte_conversion = matches!(
@@ -317,17 +372,19 @@ impl RustGenerator {
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
+                        | forgedb_parser::FieldType::Nullable(_)
                 );
 
                 if needs_byte_conversion {
-                    // For complex types, read bytes and convert
-                    let field_type_tokens = Self::map_field_type_ident(&field.field_type);
+                    // C3: use the actual stored type (Option<T> for nullable/optional) for the
+                    // type annotation and use ptr::read_unaligned to avoid UB on unaligned reads
+                    let stored_type = Self::stored_type_tokens(&field.field_type, field.is_nullable());
                     read_statements.push(quote! {
-                        let #field_value_name: #field_type_tokens = {
+                        let #field_value_name: #stored_type = {
                             let bytes = self.#field_col_name.read_bytes(row_index)
                                 .expect("Failed to read from column");
                             unsafe {
-                                std::ptr::read(bytes.as_ptr() as *const #field_type_tokens)
+                                std::ptr::read_unaligned(bytes.as_ptr() as *const #stored_type)
                             }
                         };
                     });
@@ -351,9 +408,14 @@ impl RustGenerator {
                         });
                     }
                 }
+                // C1: only push inside this branch
+                field_values.push(quote! { #field_name: #field_value_name });
+            } else {
+                // C1: Relation/component fields have no storage column.
+                // Provide a type-appropriate default value so the struct literal compiles.
+                let default_val = Self::default_for_unstored_field(&field.field_type);
+                field_values.push(quote! { #field_name: #default_val });
             }
-
-            field_values.push(quote! { #field_name: #field_value_name });
         }
 
         let model_name = format_ident!("{}", model.name);
@@ -377,59 +439,67 @@ impl RustGenerator {
         }
     }
 
+    /// Return the Rust type tokens used for raw byte storage read/write (C3).
+    /// For `OptionalStructType` and `Nullable` the stored type is `Option<Inner>`.
+    fn stored_type_tokens(
+        field_type: &forgedb_parser::FieldType,
+        is_nullable: bool,
+    ) -> TokenStream {
+        let base = Self::map_field_type_ident(field_type);
+        if is_nullable {
+            quote! { Option<#base> }
+        } else {
+            base
+        }
+    }
+
+    /// Generate a sensible default value for fields that have no storage column
+    /// (relations, components).  Returned tokens are placed directly in the
+    /// struct literal, so they must be valid expressions of the correct type.
+    fn default_for_unstored_field(field_type: &forgedb_parser::FieldType) -> TokenStream {
+        match field_type {
+            forgedb_parser::FieldType::Relation(rel) => match rel {
+                // FK reference fields map to Uuid in the generated struct
+                forgedb_parser::RelationType::RequiredReference(_) => {
+                    quote! { Default::default() }
+                }
+                // Optional FK maps to Option<Uuid>
+                forgedb_parser::RelationType::OptionalReference(_) => quote! { None },
+                // Virtual relation fields (no storage at all) map to ()
+                _ => quote! { () },
+            },
+            // Component fields map to String
+            forgedb_parser::FieldType::Component(_) => quote! { Default::default() },
+            _ => quote! { Default::default() },
+        }
+    }
+
     /// Check if a field type is fixed-size
     fn is_fixed_size_type(field_type: &forgedb_parser::FieldType) -> bool {
-        matches!(
-            field_type,
-            forgedb_parser::FieldType::U32
-                | forgedb_parser::FieldType::U64
-                | forgedb_parser::FieldType::I32
-                | forgedb_parser::FieldType::I64
-                | forgedb_parser::FieldType::F64
-                | forgedb_parser::FieldType::Bool
-                | forgedb_parser::FieldType::Uuid
-                | forgedb_parser::FieldType::Timestamp
-                | forgedb_parser::FieldType::Char(_)
-                | forgedb_parser::FieldType::FixedArray(_, _)
-                | forgedb_parser::FieldType::StructType(_)
-                | forgedb_parser::FieldType::OptionalStructType(_)
-        )
-    }
-
-    /// Check if a field type is a string
-    fn is_string_type(field_type: &forgedb_parser::FieldType) -> bool {
-        matches!(field_type, forgedb_parser::FieldType::String)
-    }
-
-    /// Get the byte size for a fixed-size type
-    fn get_value_size(field_type: &forgedb_parser::FieldType, schema: &Schema) -> usize {
         match field_type {
-            forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::I32 => 4,
-            forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
-            forgedb_parser::FieldType::F64 => 8,
-            forgedb_parser::FieldType::Bool => 1,
-            forgedb_parser::FieldType::Uuid => 16,
-            forgedb_parser::FieldType::Timestamp => 8,
-            forgedb_parser::FieldType::Char(size) => *size,
-            forgedb_parser::FieldType::FixedArray(inner, count) => {
-                Self::get_value_size(inner, schema) * count
-            }
-            forgedb_parser::FieldType::StructType(name) => {
-                if let Some(struct_def) = schema.find_struct(name) {
-                    forgedb_parser::Struct::calculate_size(struct_def, schema)
-                } else {
-                    0
-                }
-            }
-            forgedb_parser::FieldType::OptionalStructType(name) => {
-                // Option adds 1 byte discriminant + size of struct
-                1 + if let Some(struct_def) = schema.find_struct(name) {
-                    forgedb_parser::Struct::calculate_size(struct_def, schema)
-                } else {
-                    0
-                }
-            }
-            _ => 8, // Default
+            forgedb_parser::FieldType::U32
+            | forgedb_parser::FieldType::U64
+            | forgedb_parser::FieldType::I32
+            | forgedb_parser::FieldType::I64
+            | forgedb_parser::FieldType::F64
+            | forgedb_parser::FieldType::Bool
+            | forgedb_parser::FieldType::Uuid
+            | forgedb_parser::FieldType::Timestamp
+            | forgedb_parser::FieldType::Char(_)
+            | forgedb_parser::FieldType::FixedArray(_, _)
+            | forgedb_parser::FieldType::StructType(_)
+            | forgedb_parser::FieldType::OptionalStructType(_) => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_fixed_size_type(inner),
+            _ => false,
+        }
+    }
+
+    /// Check if a field type is a string (variable-length)
+    fn is_string_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::String => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_string_type(inner),
+            _ => false,
         }
     }
 
@@ -448,6 +518,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
             forgedb_parser::FieldType::OptionalStructType(_) => "bytes",
+            forgedb_parser::FieldType::Nullable(inner) => Self::type_name(inner),
             _ => "unknown",
         }
     }
@@ -505,6 +576,9 @@ impl RustGenerator {
     }
 
     /// Map ForgeDB field type to Rust type identifier for use with quote!
+    ///
+    /// Note: for `OptionalStructType` and `Nullable`, this returns the *inner* type
+    /// token.  The `Option<>` wrapper is applied by callers that check `field.is_nullable()`.
     fn map_field_type_ident(field_type: &forgedb_parser::FieldType) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::U32 => quote! { u32 },
@@ -523,6 +597,10 @@ impl RustGenerator {
             forgedb_parser::FieldType::OptionalStructType(name) => {
                 let ident = format_ident!("{}", name);
                 quote! { #ident }
+            }
+            forgedb_parser::FieldType::Nullable(inner) => {
+                // Return the inner type; is_nullable() causes the Option<> wrapper to be added
+                Self::map_field_type_ident(inner)
             }
             forgedb_parser::FieldType::Char(size) => {
                 quote! { [u8; #size] }

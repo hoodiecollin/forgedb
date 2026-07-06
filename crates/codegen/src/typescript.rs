@@ -71,6 +71,19 @@ impl TypeScriptGenerator {
         Ok(code)
     }
 
+    /// Convert PascalCase model name to kebab-case for URL paths.
+    /// Matches the route registered in the Rust API generator.
+    fn to_kebab_case(s: &str) -> String {
+        let mut result = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if c.is_uppercase() && i > 0 {
+                result.push('-');
+            }
+            result.push(c.to_ascii_lowercase());
+        }
+        result
+    }
+
     /// Generate SDK client
     fn generate_sdk_client(schema: &Schema) -> Result<String> {
         let mut code = String::new();
@@ -82,15 +95,16 @@ impl TypeScriptGenerator {
         code.push_str("  }\n\n");
 
         for model in &schema.models {
-            let model_lower = model.name.to_lowercase();
+            // H3: use kebab-case to match the Rust router's route registration
+            let model_kebab = Self::to_kebab_case(&model.name);
 
             code.push_str(&format!(
                 "  async get{}(id: string): Promise<{} | null> {{\n",
                 model.name, model.name
             ));
+            // H1: fix malformed template literal — id must be interpolated correctly
             code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{}/{{}}`id);\n",
-                model_lower
+                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}/${{id}}`);\n"
             ));
             code.push_str("    if (!response.ok) return null;\n");
             code.push_str("    const data = await response.json();\n");
@@ -102,8 +116,7 @@ impl TypeScriptGenerator {
                 model.name, model.name
             ));
             code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{}`);\n",
-                model_lower
+                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}`);\n"
             ));
             code.push_str("    const data = await response.json();\n");
             code.push_str("    return data.data || [];\n");
@@ -114,8 +127,7 @@ impl TypeScriptGenerator {
                 model.name, model.name, model.name
             ));
             code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{}`, {{\n",
-                model_lower
+                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}`, {{\n"
             ));
             code.push_str("      method: 'POST',\n");
             code.push_str("      headers: { 'Content-Type': 'application/json' },\n");
@@ -134,10 +146,17 @@ impl TypeScriptGenerator {
     /// Map ForgeDB field type to TypeScript type
     fn map_field_type(field_type: &forgedb_parser::FieldType) -> &'static str {
         match field_type {
-            forgedb_parser::FieldType::I32 | forgedb_parser::FieldType::I64 | forgedb_parser::FieldType::F64 => "number",
+            // M1: U32/U64 should map to number, not any
+            forgedb_parser::FieldType::U32
+            | forgedb_parser::FieldType::U64
+            | forgedb_parser::FieldType::I32
+            | forgedb_parser::FieldType::I64
+            | forgedb_parser::FieldType::F64
+            | forgedb_parser::FieldType::Timestamp => "number",
             forgedb_parser::FieldType::Bool => "boolean",
             forgedb_parser::FieldType::String | forgedb_parser::FieldType::Uuid => "string",
-            forgedb_parser::FieldType::Timestamp => "number",
+            // Nullable wraps the inner type; the `| null` suffix is added by is_nullable()
+            forgedb_parser::FieldType::Nullable(inner) => Self::map_field_type(inner),
             _ => "any",
         }
     }
