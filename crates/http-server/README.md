@@ -932,7 +932,7 @@ Core dependencies:
 - **tokio** (1.x) - Async runtime
 - **tower** (0.4) - Middleware framework
 - **tower-http** (0.5) - HTTP middleware
-- **prometheus** (0.13) - Metrics collection
+- **prometheus** (0.14) - Metrics collection
 - **rustls** (0.23) - TLS implementation
 - **tracing** (0.1) - Structured logging
 

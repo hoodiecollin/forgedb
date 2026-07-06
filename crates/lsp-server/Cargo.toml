@@ -1,7 +1,7 @@
 [package]
 name = "forgedb-lsp-server"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Language Server Protocol implementation for ForgeDB schema language"
 repository = "https://github.com/hoodiecollin/forgedb"

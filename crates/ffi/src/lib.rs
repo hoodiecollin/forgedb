@@ -121,7 +121,7 @@ use std::os::raw::c_char;
 /// # Returns
 ///
 /// Pointer to null-terminated version string (e.g., "0.1.0")
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn forgedb_version() -> *const c_char {
     static VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
     VERSION.as_ptr() as *const c_char

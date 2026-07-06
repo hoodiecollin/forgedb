@@ -20,10 +20,17 @@ members = [
 ]
 resolver = "2"
 
+# Shared package metadata. `edition` is uniform across the workspace and inherited
+# via `edition.workspace = true`. Versions are intentionally NOT centralized here:
+# public crates (types, storage, wal) are published to crates.io on independent
+# version lines, while internal crates track their own.
+[workspace.package]
+edition = "2024"
+
 [package]
 name = "forgedb"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [[bin]]
 name = "forgedb"
@@ -37,11 +44,11 @@ forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
-thiserror = "1.0"
-colored = "2.1"
+thiserror = "2.0"
+colored = "3.1"
 serde_json = "1.0"
 ctrlc = "3.4"
-which = "6.0"
+which = "8.0"
 
 [dev-dependencies]
 forgedb-parser = { path = "crates/parser" }
