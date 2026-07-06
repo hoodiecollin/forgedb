@@ -319,22 +319,29 @@ http {{
 }
 
 fn find_rust_binary() -> Result<PathBuf> {
+    // Guess the binary name from the CWD directory name; fall back to "app"
+    // if the CWD has no final component (e.g. filesystem root, which is
+    // valid but highly unusual — .unwrap() would panic there).
+    let cwd = std::env::current_dir()?;
+    let bin_name = cwd
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "app".to_string());
+
     // Check target/release first
-    let release_path = PathBuf::from("target/release")
-        .join(std::env::current_dir()?.file_name().unwrap());
+    let release_path = PathBuf::from("target/release").join(&bin_name);
     if release_path.exists() {
         return Ok(release_path);
     }
 
     // Check target/debug
-    let debug_path = PathBuf::from("target/debug")
-        .join(std::env::current_dir()?.file_name().unwrap());
+    let debug_path = PathBuf::from("target/debug").join(&bin_name);
     if debug_path.exists() {
         return Ok(debug_path);
     }
 
     Err(CliError::Other(
-        "Rust binary not found. Run 'cargo build' first.".to_string()
+        "Rust binary not found. Run 'cargo build' first.".to_string(),
     ))
 }
 

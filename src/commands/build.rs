@@ -23,11 +23,13 @@ pub fn run(options: BuildOptions) -> Result<()> {
 
     // Generate code
     ui::info("Generating code...");
+    // Build always regenerates derived artifacts — pass force: true so a
+    // second consecutive `build` does not fail on "File exists".
     crate::commands::generate::run(crate::commands::generate::GenerateOptions {
         target: "all".to_string(),
         check: false,
         output: None,
-        force: false,
+        force: true,
     })?;
 
     // Build based on target

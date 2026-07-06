@@ -109,7 +109,10 @@ fn create_readme(options: &InitOptions) -> Result<()> {
 }
 
 fn create_rust_files(options: &InitOptions) -> Result<()> {
-    // Create Cargo.toml (without dependencies for now - user will run forgedb generate first)
+    // Create Cargo.toml with the dependencies required by the generated database.rs.
+    // The generated code imports forgedb_storage, forgedb_types, derives serde traits,
+    // and uses utoipa::ToSchema on Uuid/Timestamp fields (which requires the "uuid"
+    // feature on utoipa, otherwise ToSchema fails to compile on those types).
     let cargo_toml = format!(
         r#"[package]
 name = "{}"
@@ -117,8 +120,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# Dependencies will be added when you run: forgedb generate --rust
-
+forgedb-storage = "0.1"
+forgedb-types = "0.1"
+serde = {{ version = "1", features = ["derive"] }}
+utoipa = {{ version = "5", features = ["uuid"] }}
 "#,
         options.project_name
     );

@@ -160,6 +160,60 @@ fn test_validate_command_passes_valid_schema() {
     );
 }
 
+/// C1: `forgedb build` must be idempotent — a second consecutive run must not
+/// fail with "File exists" on already-generated output files.
+///
+/// The `build` command internally calls `generate all` with `force: true` so
+/// that generated artifacts are always overwritten rather than erroring on an
+/// existing file.  We verify this by testing the generate layer directly:
+///
+/// - `generate all` without `--force` fails on a second run (baseline for why
+///   the bug existed).
+/// - `generate all --force` succeeds on a second run (proof of the fix, which
+///   is exactly what `build` now does internally).
+///
+/// We cannot run `forgedb build` end-to-end in a hermetic temp dir because
+/// `build` also invokes `cargo build` as a subprocess, which requires a full
+/// Rust workspace — that is separate infrastructure from the C1 fix.
+#[test]
+fn test_generate_all_is_idempotent_with_force() {
+    let temp_dir = setup_test_dir();
+    create_test_schema(temp_dir.path());
+
+    // First run — succeeds unconditionally.
+    let first = forgedb_cmd(temp_dir.path())
+        .args(["generate", "all", "--output", "generated", "--force"])
+        .output()
+        .expect("Failed to run forgedb generate all (first run)");
+    assert!(
+        first.status.success(),
+        "First generate all --force should succeed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    // Second run with --force — must also succeed (files already exist).
+    // This is what `forgedb build` now does internally (force: true).
+    let second = forgedb_cmd(temp_dir.path())
+        .args(["generate", "all", "--output", "generated", "--force"])
+        .output()
+        .expect("Failed to run forgedb generate all (second run)");
+    assert!(
+        second.status.success(),
+        "Second generate all --force should succeed (idempotency — C1 fix): {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // Confirm the failure mode: without --force the second run must fail.
+    let third_no_force = forgedb_cmd(temp_dir.path())
+        .args(["generate", "all", "--output", "generated"])
+        .output()
+        .expect("Failed to run forgedb generate all (no-force third run)");
+    assert!(
+        !third_no_force.status.success(),
+        "generate all without --force should fail when files already exist"
+    );
+}
+
 #[test]
 fn test_generate_check_mode() {
     let temp_dir = setup_test_dir();
