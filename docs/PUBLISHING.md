@@ -450,7 +450,7 @@ forgedb-http-server = "0.2.0"
 
 **CLI:**
 ```bash
-cargo install forgedb-cli --version 0.2.0
+cargo install forgedb --version 0.2.0
 ```
 
 ### Full Changelog
@@ -459,9 +459,9 @@ See [CHANGELOG.md](./CHANGELOG.md) for complete changes.
 
 ### Checksums
 
-- forgedb-cli-linux: `sha256:...`
-- forgedb-cli-macos: `sha256:...`
-- forgedb-cli-windows: `sha256:...`
+- forgedb-linux: `sha256:...`
+- forgedb-macos: `sha256:...`
+- forgedb-windows: `sha256:...`
 ```
 
 **3. Attach Binaries:**
@@ -470,20 +470,20 @@ Build release binaries for each platform:
 ```bash
 # Linux
 cargo build --release --bin forgedb
-tar -czf forgedb-cli-v0.2.0-x86_64-linux.tar.gz -C target/release forgedb
+tar -czf forgedb-v0.2.0-x86_64-linux.tar.gz -C target/release forgedb
 
 # macOS
 cargo build --release --target x86_64-apple-darwin --bin forgedb
-tar -czf forgedb-cli-v0.2.0-x86_64-macos.tar.gz -C target/x86_64-apple-darwin/release forgedb
+tar -czf forgedb-v0.2.0-x86_64-macos.tar.gz -C target/x86_64-apple-darwin/release forgedb
 
 # Windows
 cargo build --release --target x86_64-pc-windows-msvc --bin forgedb
-zip forgedb-cli-v0.2.0-x86_64-windows.zip target/x86_64-pc-windows-msvc/release/forgedb.exe
+zip forgedb-v0.2.0-x86_64-windows.zip target/x86_64-pc-windows-msvc/release/forgedb.exe
 ```
 
 **4. Generate Checksums:**
 ```bash
-sha256sum forgedb-cli-*.tar.gz forgedb-cli-*.zip > checksums.txt
+sha256sum forgedb-*.tar.gz forgedb-*.zip > checksums.txt
 ```
 
 ### Automated Release (GitHub Actions)
@@ -529,16 +529,16 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            7z a ../../../forgedb-cli-${{ github.ref_name }}-${{ matrix.target }}.zip forgedb.exe
+            7z a ../../../forgedb-${{ github.ref_name }}-${{ matrix.target }}.zip forgedb.exe
           else
-            tar czf ../../../forgedb-cli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz forgedb
+            tar czf ../../../forgedb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz forgedb
           fi
       
       - name: Upload Artifact
         uses: actions/upload-artifact@v3
         with:
-          name: forgedb-cli-${{ matrix.target }}
-          path: forgedb-cli-*
+          name: forgedb-${{ matrix.target }}
+          path: forgedb-*
   
   release:
     name: Create Release
@@ -553,7 +553,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: forgedb-cli-*/*
+          files: forgedb-*/*
           body_path: CHANGELOG.md
           draft: false
           prerelease: false

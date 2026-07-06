@@ -952,7 +952,7 @@ cargo doc --open
 
 **Blog Platform** (comprehensive):
 ```bash
-cargo run --example blog_platform
+cargo run -- generate all --output ./generated
 ```
 
 Demonstrates:
