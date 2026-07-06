@@ -1,6 +1,99 @@
 use forgedb_storage::*;
 use std::fs;
 
+// ---------------------------------------------------------------------------
+// S4 durability: flush() tests
+//
+// These tests verify that data written to column files is readable after an
+// explicit flush() call AND after reopening the file (persistent in the OS
+// page cache, flushed to disk by flush()). They document the new contract:
+// per-append fsync has been removed; flush() is the explicit durability point.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_column_explicit_flush_durability() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_flush_fixed");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("test_flush.bin");
+
+    // Write, flush, then re-open to confirm data survived.
+    {
+        let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+        col.append_u64(111).unwrap();
+        col.append_u64(222).unwrap();
+        col.append_u64(333).unwrap();
+        // Explicit flush — this is the durability checkpoint.
+        col.flush().unwrap();
+    }
+
+    {
+        let col = FixedColumn::new(path.clone(), 8).unwrap();
+        assert_eq!(col.len(), 3);
+        // read_u64 takes &self — no &mut borrow needed.
+        assert_eq!(col.read_u64(0).unwrap(), 111);
+        assert_eq!(col.read_u64(1).unwrap(), 222);
+        assert_eq!(col.read_u64(2).unwrap(), 333);
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_variable_column_explicit_flush_durability() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_flush_variable");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+
+    {
+        let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+        col.append_string("alpha").unwrap();
+        col.append_string("beta").unwrap();
+        // Explicit flush for both data and offsets files.
+        col.flush().unwrap();
+    }
+
+    {
+        let col = VariableColumn::new(data_path, offsets_path).unwrap();
+        assert_eq!(col.len(), 2);
+        // read_string takes &self.
+        assert_eq!(col.read_string(0).unwrap(), "alpha");
+        assert_eq!(col.read_string(1).unwrap(), "beta");
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_tombstones_explicit_flush_durability() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_flush_tombstones");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let path = temp_dir.join("tombstones.bin");
+
+    {
+        let mut t = Tombstones::new(path.clone()).unwrap();
+        t.append(false).unwrap();
+        t.append(true).unwrap();
+        t.flush().unwrap();
+    }
+
+    {
+        let t = Tombstones::new(path).unwrap();
+        assert_eq!(t.len(), 2);
+        // is_deleted takes &self.
+        assert!(!t.is_deleted(0).unwrap());
+        assert!(t.is_deleted(1).unwrap());
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
 #[test]
 fn test_fixed_column_u64() {
     let temp_dir = std::env::temp_dir().join("forgedb_test_fixed");
@@ -141,7 +234,7 @@ fn test_fixed_column_persistence() {
 
     // Reopen and verify
     {
-        let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+        let col = FixedColumn::new(path.clone(), 8).unwrap();
         assert_eq!(col.len(), 3);
         assert_eq!(col.read_u64(0).unwrap(), 100);
         assert_eq!(col.read_u64(1).unwrap(), 200);
@@ -224,7 +317,7 @@ fn test_variable_column_persistence() {
 
     // Verify new data persisted
     {
-        let mut col = VariableColumn::new(data_path, offsets_path).unwrap();
+        let col = VariableColumn::new(data_path, offsets_path).unwrap();
         assert_eq!(col.len(), 4);
         assert_eq!(col.read_string(3).unwrap(), "fourth");
     }
