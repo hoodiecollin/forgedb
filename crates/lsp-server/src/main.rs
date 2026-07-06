@@ -122,7 +122,10 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
 
-        if let Some(change) = params.content_changes.into_iter().next() {
+        // Under FULL sync the spec sends exactly one element, but take `.last()`
+        // so that if multiple incremental-style changes are ever batched we apply
+        // the most-recent one rather than an earlier intermediate state.
+        if let Some(change) = params.content_changes.into_iter().last() {
             self.update_document(uri, change.text, version).await;
         }
     }
@@ -270,33 +273,54 @@ fn find_all_references(
     let lines: Vec<&str> = content.lines().collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
-        let mut col = 0;
-        while let Some(pos) = line[col..].find(old_name) {
-            let actual_col = col + pos;
+        // `search_from` is a *byte* offset into `line`.  `str::find` returns byte
+        // offsets, so all arithmetic here is byte-based.  We convert to char counts
+        // only when building LSP `Position` values (which are UTF-16 char-unit based,
+        // but for ASCII schema names char count == byte count == UTF-16 unit count).
+        let mut search_from: usize = 0;
 
-            // Check if it's a whole word match
-            let is_word_start = actual_col == 0 ||
-                !line.chars().nth(actual_col - 1).unwrap().is_alphanumeric();
-            let is_word_end = actual_col + old_name.len() >= line.len() ||
-                !line.chars().nth(actual_col + old_name.len()).unwrap().is_alphanumeric();
+        while search_from <= line.len() {
+            let Some(pos) = line[search_from..].find(old_name) else {
+                break;
+            };
+            let byte_start = search_from + pos;
+            let byte_end = byte_start + old_name.len();
+
+            // Word-boundary checks: inspect the char immediately before/after the
+            // match using byte slices to avoid mixing byte and char indexing.
+            // `.chars().last()` / `.chars().next()` never panic regardless of input.
+            let is_word_start = line[..byte_start]
+                .chars()
+                .last()
+                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+            let is_word_end = line[byte_end..]
+                .chars()
+                .next()
+                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
 
             if is_word_start && is_word_end {
+                // Convert byte offsets to char counts for LSP character positions.
+                let char_start = line[..byte_start].chars().count() as u32;
+                let char_end = char_start + old_name.chars().count() as u32;
+
                 edits.push(TextEdit {
                     range: Range {
                         start: Position {
                             line: line_idx as u32,
-                            character: actual_col as u32,
+                            character: char_start,
                         },
                         end: Position {
                             line: line_idx as u32,
-                            character: (actual_col + old_name.len()) as u32,
+                            character: char_end,
                         },
                     },
                     new_text: new_name.to_string(),
                 });
             }
 
-            col = actual_col + 1;
+            // Advance past the end of the current match to avoid an infinite loop.
+            // `byte_end` is always a valid UTF-8 char boundary (end of `old_name`).
+            search_from = byte_end;
         }
     }
 

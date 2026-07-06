@@ -135,10 +135,12 @@ fn get_directive_info(directive_name: &str) -> Option<String> {
 
 fn get_modifier_info(symbol: &str) -> Option<String> {
     match symbol {
-        "+" => Some("**+** Primary Key\n\nMarks this field as the primary key.\nValue is auto-generated (UUID or auto-increment).\n\n```\nid: +uuid\nid: +u64\n```".to_string()),
-        "&" => Some("**&** Required\n\nMarks this field as required (non-nullable).\nMust have a value.\n\n```\nemail: &string\n```".to_string()),
-        "^" => Some("**^** Unique\n\nAdds a unique constraint.\nNo two records can have the same value.\n\n```\nemail: ^&string\n```".to_string()),
-        "*" => Some("****** Relation\n\nMarks this as a relation to another model.\nUsed for foreign key relationships.\n\n```\nauthor: *User\n```".to_string()),
+        "+" => Some("**+** Auto-generate on create\n\nValue is automatically generated when the record is created (UUID v4 or auto-increment).\n\n```\nid: +uuid\nid: +u64\n```".to_string()),
+        "~" => Some("**~** Auto-update on modify\n\nValue is automatically set to the current timestamp whenever the record is updated.\n\n```\nupdated_at: ~timestamp\n```".to_string()),
+        "^" => Some("**^** Index\n\nCreates a database index on this field for faster lookups.\n\n```\nusername: ^string\n```".to_string()),
+        "&" => Some("**&** Unique\n\nAdds a unique constraint — no two records can share the same value for this field.\n\n```\nemail: ^&string\n```".to_string()),
+        // Use backtick escaping: plain `*` to avoid broken Markdown bold/italic.
+        "*" => Some("`*` Required foreign-key relation\n\nMarks this field as a required foreign-key reference to another model.\n\n```\nauthor: *User\n```".to_string()),
         "?" => Some("**?** Optional\n\nMarks this field as optional (nullable).\nCan be null/empty.\n\n```\nbio: string?\nage: u32?\n```".to_string()),
         _ => None,
     }
