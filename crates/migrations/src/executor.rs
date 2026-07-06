@@ -262,7 +262,7 @@ impl MigrationExecutor {
 
     /// Remove a column from a model
     fn remove_column<P: AsRef<Path>>(
-        data_dir: P,
+        _data_dir: P,
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {

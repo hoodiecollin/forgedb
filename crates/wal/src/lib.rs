@@ -8,8 +8,7 @@
 /// - Checksums detect corruption
 /// - WAL replay on startup ensures durability
 /// - Transactions group operations with atomic commit
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 mod entry;

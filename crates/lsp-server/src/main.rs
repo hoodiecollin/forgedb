@@ -19,7 +19,7 @@ mod diagnostics;
 mod completion;
 mod hover;
 
-use parser::{parse_schema, Schema, Model, Field};
+use parser::{parse_schema, Schema};
 use diagnostics::validate_schema;
 use completion::get_completions;
 use hover::get_hover_info;
@@ -261,7 +261,7 @@ fn find_model_definition(schema: &Schema, model_name: &str) -> Option<Position> 
 }
 
 fn find_all_references(
-    schema: &Schema,
+    _schema: &Schema,
     content: &str,
     old_name: &str,
     new_name: &str,

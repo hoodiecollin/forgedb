@@ -2,7 +2,7 @@
 //
 // Provides documentation and type information on hover
 
-use tower_lsp::lsp_types::{Hover, HoverContents, MarkedString, Position, Range};
+use tower_lsp::lsp_types::{Hover, HoverContents, MarkedString, Position};
 use crate::parser::{Schema, FieldType};
 
 pub fn get_hover_info(

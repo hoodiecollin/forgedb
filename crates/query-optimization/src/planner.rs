@@ -259,7 +259,7 @@ impl QueryPlanner {
     }
 
     /// Partition predicates for left/right sides of join
-    fn partition_predicates_for_join(&self, predicates: &[String]) -> (Vec<String>, Vec<String>) {
+    fn partition_predicates_for_join(&self, _predicates: &[String]) -> (Vec<String>, Vec<String>) {
         // Simple implementation - in reality would parse predicates
         // and determine which side of join they apply to
         let left = Vec::new();

@@ -152,7 +152,7 @@ impl SchemaChange {
             SchemaChange::ChangeFieldNullability {
                 model_name,
                 field_name,
-                old_nullable,
+                old_nullable: _,
                 new_nullable,
             } => {
                 let change = if *new_nullable {

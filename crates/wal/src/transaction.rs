@@ -3,7 +3,6 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::entry::WalEntry;
-use crate::writer::WalWriter;
 
 /// Transaction ID type
 pub type TransactionId = u64;
