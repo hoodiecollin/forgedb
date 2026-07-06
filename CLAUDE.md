@@ -31,7 +31,7 @@ cargo build --workspace              # build everything
 cargo test  --workspace              # NOTE: see caveat below
 cargo run   -- <command>             # run the CLI (binary is `forgedb`)
 cargo run   -- --help                # list commands
-cargo clippy --workspace             # lints (9 dead-code warnings remain — see Known issues)
+cargo clippy --workspace             # lints (1 dead-code warning remains — see Known issues)
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `serve`.
@@ -39,26 +39,28 @@ Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
 
-Plain `cargo test --workspace` is **green** — doctests included:
+Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --lib --bins --tests --no-fail-fast   # 481 pass (non-doctest)
-cargo test --workspace                                        # + 40 doctests, all pass
+cargo test --workspace --no-fail-fast   # 378 pass, 0 fail (incl. doctests)
+cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
 - **`--no-fail-fast`** surfaces all results — cargo halts at the first failing binary
   otherwise.
-- The integration tests (`tests/integration_test.rs`) are **hermetic** — the
-  CWD-dependent cases invoke the `forgedb` binary as a subprocess with an explicit
-  `current_dir`, so they pass in parallel. No `--test-threads=1` workaround needed.
-- The ~21 stale doctests (Phase 3c) are **fixed** — all doc examples across the workspace
-  now compile and pass against current APIs.
-- **Codegen caveat:** the `crates/codegen` insta snapshot tests only compare generated
-  code as *strings* — they do not compile it. When changing generators, compile the
-  emitted Rust in a throwaway crate (see the memory note); snapshot pass ≠ output compiles.
+- The integration tests (`tests/integration_test.rs`) are **hermetic** — CWD-dependent
+  cases invoke the `forgedb` binary as a subprocess with an explicit `current_dir`, so
+  they pass in parallel. No `--test-threads=1` workaround needed.
+- **Compile the examples.** `--lib --bins --tests` and `--doc` both EXCLUDE examples, which
+  silently broke twice; `cargo build --workspace --examples` is part of the baseline.
+- **Codegen caveat (load-bearing):** the `crates/codegen` insta snapshot tests only compare
+  generated code as *strings* — they do NOT compile it. When changing generators, generate
+  for a real multi-model schema and `cargo check` the emitted Rust (`database.rs` +
+  `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
+  3 real codegen bugs during Phase 3b.
 
-**Baseline: 521 tests pass** (481 non-doctest + 40 doctest). Ignore older doc claims of
-"466" or "241/241".
+**Baseline: 378 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466".
 
 ## Workspace layout
 
@@ -68,15 +70,17 @@ in `crates/`:
 
 **Published to crates.io (0.1.1 — independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives)
-- `storage` — columnar storage engine (memory-mapped fixed columns + append-only variable)
+- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable)
 - `wal` — write-ahead log
 
 **Internal (0.1.0):**
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `compaction`, `fulltext`, `query-optimization`,
-  `query-params`, `crud-api`, `http-server` (axum), `watcher`, `lsp-server`, `ffi`
+- `validation`, `migrations`, `compaction`, `query-optimization`, `query-params`,
+  `http-server` (axum), `watcher`, `lsp-server`, `ffi`
+  (`fulltext` + `crud-api` were removed in Phase 3b — orphaned runtime-library crates
+  with zero consumers; the API existence/404 logic now lives in the generated handlers.)
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`, `INTERNAL_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
@@ -97,25 +101,56 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 
 ## Schema language quick reference
 
-Symbols: `+` auto-generate on create, `~` auto-update on modify, `^` index, `&` unique,
-`?` nullable, `*` required foreign key, `@` directive (`@min`, `@max`, `@email`,
-`@pattern`, `@index`, `@relations`). Types: `u32/u64/i32/i64/f64/bool/string`, plus
-`uuid/timestamp/char(n)/text`; `[Model]` one-to-many, `Model` FK, `[type; N]` fixed array,
-inline structs. Component refs: `tsx://`, `jsx://`, `api://`.
+Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case.
+Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only), `&`
+unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
+FK). Types: `u32/u64/i32/i64/f64/bool/string/uuid/timestamp`, `char(N)` — **there is no
+`text`**. Relations: `[Model]` one-to-many, `*Model` required FK, `?Model` optional FK,
+bidirectional `[..]`/`[..]` = many-to-many; `[type; N]` fixed array; inline `struct`
+(fixed-size fields only — no string/relations inside). Directives: `@min @max @length @email
+@url @pattern @regex @default @index @computed @fulltext @materialized` (field-level, mostly
+semantic-only), `@soft_delete` + composite `@index(a,b)` (model-level), `@relations(*|fields)`
+(component fields only). Component refs `tsx:// jsx:// api://`. Only `//` comments. **NOT
+supported despite older docs:** `~` auto-update, `text` type, `@on_delete`, block comments
+`/* */`, quoted-string directive args (`@pattern("…")`, `@default("…")`). Full verified
+reference: `docs/proposals/corpus/forge-grammar-reference.md`. **18 worked example schemas
+across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
 
-- **9 dead-code warnings** — not cruft: unwired-but-live CLI flags (`build --no-api/--no-db`,
-  `init --typescript`, `validate --implementations/--components`), an unused error
-  exit-code scheme (`CliError::exit_code`/`Config` + the ignored `--config` flag), an
-  unwired `rust_main_template` init scaffold, and populated-but-unread LSP fields
-  (`Document.uri/version`, `get_document`, `Struct.name/fields/position`). Each needs a
-  **wire-vs-remove product decision** — deliberately deferred out of the 3c bug-fix sweep
-  (don't blindly delete). Tracked separately.
-- **Relation storage is unbuilt.** Generated model structs include FK scalar fields (e.g.
-  `author_id`), but they are not persisted — `get()` returns `Default::default()`/`None`
-  for them. The generated code compiles and round-trips non-relation fields correctly;
-  actually storing/loading FK values is an unimplemented feature (a product-direction item).
+- **1 dead-code warning** (down from 9 after the Phase 3b tooling sweep): only
+  `validate --implementations` remains — deferred pending a decision on where `@computed`
+  implementations live. The other 8 were resolved — WIRED (`build --no-api`, `validate
+  --components`, the `--config`/`Config`/`CliError::exit_code` config feature, LSP
+  struct-awareness) or REMOVED (`build --no-db`, `init --typescript`, `rust_main_template`,
+  LSP `Document.uri/version` + `get_document`).
+- **`init → build` needs an unpublished release.** Generated projects call storage/types
+  methods (`append_uuid`/`read_uuid`/…) that exist only in the **local** crates; published
+  `forgedb-storage`/`forgedb-types` `0.1.1` on crates.io lack them, so a freshly `init`ed
+  project fails to compile against crates.io (`E0432`/`E0599`). Against local crates via
+  `[patch.crates-io]` it builds cleanly (exit 0). Fix = publish **storage 0.1.2 + types
+  0.2.0** and bump the init-scaffold version pins — deliberately DEFERRED (fix-in-tree,
+  defer-publish). Until then generated projects need a local path/patch dependency.
+- **Generated-code compilation gaps (codegen).** Surfaced by compile-testing the whole
+  `examples/` corpus (18 schemas): the emitted `database.rs` does NOT compile for three
+  common features — nullable variable-length strings (`string?` → `Option<String>`: insert
+  passes `&Option<String>` to `append_string(&str)`, get assigns `String` to
+  `Option<String>`), inline `struct` types (referenced in models but never emitted →
+  `E0425`), and `u64` auto-generate PKs (`id: +u64` → `expected Uuid, found u64`).
+  Schemas parse + `generate` fine; only compiling the output fails. Fix in a dedicated
+  codegen pass, gated on the corpus compiling (repro: `scratchpad/corpus_compile`). This
+  is why **codegen must be compile-tested, not just snapshot-tested.**
+- **No string-literal constraint arguments (lexer).** `@`-directive args accept only
+  numbers and bare identifiers — `@pattern("regex")` and `@default("text")` fail at lex
+  time. Use `@default(identifier)`; model regex/enum intent via `@length` + a comment or a
+  lookup model. (Lower priority; the grammar reference in `docs/proposals/corpus/` is
+  corrected accordingly.)
+- **Relation traversal is unbuilt.** FK scalar fields (`RequiredReference`/`OptionalReference`,
+  e.g. `author_id: Uuid` / `editor_id: Option<Uuid>`) are now persisted and round-trip
+  correctly (Task #25). What remains unbuilt: `OneToMany`/`ManyToMany` back-collections
+  are virtual (stored as `()`, never persisted — intentional), and traversal helpers
+  (join-by-FK at read time, eager-load, M2M junction tables) have not been generated.
+  These are additive generation features, not correctness gaps.
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
