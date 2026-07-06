@@ -67,25 +67,34 @@
 //!
 //! ```rust,no_run
 //! use forgedb_http_server::*;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let auth = JwtAuthHook::new("secret_key");
-//!     
-//!     let router = Router::new()
-//!         .route("/api/users", get(list_users))
-//!         .layer(require_auth_middleware(auth));
+//!     // ApiKeyAuthHook checks the `X-API-Key` header against the allowlist.
+//!     let auth_hook: Arc<dyn AuthHook> = Arc::new(ApiKeyAuthHook::new(vec![
+//!         "secret-api-key".to_string(),
+//!     ]));
 //!
-//!     Server::new()
-//!         .bind("0.0.0.0:3000")
-//!         .serve(router)
-//!         .await
-//!         .expect("Server failed");
+//!     // Protected sub-router: require_auth_middleware rejects unauthenticated
+//!     // requests with 401.  auth_middleware populates the AuthContext extension
+//!     // used by require_auth_middleware.
+//!     let protected = Router::new()
+//!         .route("/api/users", get(list_users))
+//!         .layer(middleware::from_fn(require_auth_middleware));
+//!
+//!     let app = Router::new()
+//!         .merge(protected)
+//!         .layer(middleware::from_fn(move |req, next| {
+//!             let auth_hook = auth_hook.clone();
+//!             async move { auth_middleware(auth_hook, req, next).await }
+//!         }));
+//!
+//!     Server::new().serve(app).await.expect("Server failed");
 //! }
 //!
-//! async fn list_users(auth: AuthContext) -> Json<Vec<String>> {
-//!     // Access user info from auth context
-//!     Json(vec!["user1".to_string()])
+//! async fn list_users() -> Json<serde_json::Value> {
+//!     Json(serde_json::json!(["user1", "user2"]))
 //! }
 //! ```
 //!
@@ -93,19 +102,26 @@
 //!
 //! ```rust,no_run
 //! use forgedb_http_server::*;
+//! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let rate_limit_config = RateLimitConfig {
-//!         requests_per_second: 10.0,
-//!         burst_size: 20,
-//!     };
-//!     
-//!     let router = Router::new()
-//!         .route("/api/data", get(get_data))
-//!         .layer(rate_limit_middleware(rate_limit_config));
+//!     let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
+//!         max_requests: 100,
+//!         window_secs: 60,
+//!         enabled: true,
+//!         trust_proxy: false,
+//!         max_entries: 10_000,
+//!     }));
 //!
-//!     Server::new().serve(router).await.unwrap();
+//!     let app = Router::new()
+//!         .route("/api/data", get(get_data))
+//!         .layer(middleware::from_fn(move |req, next| {
+//!             let limiter = limiter.clone();
+//!             async move { rate_limit_middleware(limiter, req, next).await }
+//!         }));
+//!
+//!     Server::new().serve(app).await.unwrap();
 //! }
 //!
 //! async fn get_data() -> &'static str {
@@ -120,19 +136,15 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     // Initialize health checker
+//!     // Record the start time for uptime reporting.
 //!     init_health_check();
-//!     
+//!
 //!     let router = Router::new()
 //!         .route("/api/data", get(get_data))
 //!         .merge(health_router())
 //!         .merge(metrics_router());
 //!
-//!     Server::new()
-//!         .bind("0.0.0.0:3000")
-//!         .serve(router)
-//!         .await
-//!         .unwrap();
+//!     Server::new().serve(router).await.unwrap();
 //! }
 //!
 //! async fn get_data() -> &'static str {
@@ -144,18 +156,17 @@
 //!
 //! ```rust,no_run
 //! use forgedb_http_server::*;
+//! use std::net::SocketAddr;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let tls_config = TlsConfig {
-//!         cert_path: "./cert.pem".into(),
-//!         key_path: "./key.pem".into(),
-//!     };
-//!     
+//!     let tls_config = TlsConfig::new("./cert.pem", "./key.pem");
+//!
 //!     let router = Router::new()
 //!         .route("/", get(|| async { "Secure Hello!" }));
 //!
-//!     serve_https(router, "0.0.0.0:443", tls_config)
+//!     let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+//!     serve_https(router, addr, tls_config)
 //!         .await
 //!         .unwrap();
 //! }
@@ -259,8 +270,11 @@ pub use metrics::{metrics_router, record_db_operation, record_error, record_http
 // Security & Performance
 pub use auth::{
     auth_middleware, require_auth_middleware, require_role_middleware, ApiKeyAuthHook, AuthContext,
-    AuthHook, JwtAuthHook, NoAuthHook,
+    AuthHook, NoAuthHook,
 };
+/// Development-only static-token bearer stub.  Gated behind `feature = "dev-auth"`.
+#[cfg(feature = "dev-auth")]
+pub use auth::JwtAuthHook;
 pub use cache::{CacheConfig, CacheKey, ResponseCache};
 pub use rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 pub use tls::{serve_https, TlsConfig, TlsServer};

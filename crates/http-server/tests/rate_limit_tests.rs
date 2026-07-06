@@ -36,6 +36,7 @@ fn test_rate_limiter() {
         max_requests: 3,
         window_secs: 60,
         enabled: true,
+        ..Default::default()
     };
     let limiter = RateLimiter::new(config);
 
@@ -54,6 +55,7 @@ fn test_rate_limiter_disabled() {
         max_requests: 1,
         window_secs: 60,
         enabled: false,
+        ..Default::default()
     };
     let limiter = RateLimiter::new(config);
 
@@ -69,6 +71,7 @@ fn test_rate_limiter_per_client() {
         max_requests: 2,
         window_secs: 60,
         enabled: true,
+        ..Default::default()
     };
     let limiter = RateLimiter::new(config);
 

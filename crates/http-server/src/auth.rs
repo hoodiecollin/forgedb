@@ -71,20 +71,33 @@ pub trait AuthHook: Send + Sync {
     fn authenticate(&self, req: &Request<Body>) -> Result<AuthContext, Response>;
 }
 
-/// JWT authentication hook (example implementation)
+/// Development-only bearer-token stub.
+///
+/// **Not a real JWT implementation.**  This hook accepts any request whose
+/// `Authorization: Bearer <token>` value equals the `secret` string passed at
+/// construction time.  It is intentionally gated behind the `dev-auth` Cargo
+/// feature so it cannot be compiled into production builds without an explicit
+/// opt-in.
+///
+/// For production use, implement [`AuthHook`] with a proper JWT library such as
+/// `jsonwebtoken`.
+#[cfg(feature = "dev-auth")]
 pub struct JwtAuthHook {
-    _secret: String,
+    secret: String,
 }
 
+#[cfg(feature = "dev-auth")]
 impl JwtAuthHook {
+    /// Create the hook.  `secret` is the bearer token value that will be
+    /// accepted; it is NOT a signing key.
     pub fn new(secret: String) -> Self {
-        Self { _secret: secret }
+        Self { secret }
     }
 }
 
+#[cfg(feature = "dev-auth")]
 impl AuthHook for JwtAuthHook {
     fn authenticate(&self, req: &Request<Body>) -> Result<AuthContext, Response> {
-        // Extract Authorization header
         let auth_header = req
             .headers()
             .get("authorization")
@@ -92,21 +105,58 @@ impl AuthHook for JwtAuthHook {
 
         if let Some(auth_str) = auth_header {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                // TODO: Implement actual JWT validation
-                // For now, this is a placeholder
-
-                // Example: parse token and extract user info
-                if token == "valid_token" {
+                // Compare against the configured secret — never a compiled-in literal.
+                if token == self.secret {
                     return Ok(AuthContext::authenticated(
-                        "user123".to_string(),
+                        "dev-user".to_string(),
                         vec!["user".to_string()],
                     ));
                 }
             }
         }
 
-        // No valid authentication found
         Ok(AuthContext::unauthenticated())
+    }
+}
+
+#[cfg(all(test, feature = "dev-auth"))]
+mod jwt_dev_tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+
+    #[test]
+    fn rejects_old_hardcoded_literal_token() {
+        // The old "valid_token" literal must NEVER authenticate regardless of
+        // what secret is configured.
+        let req = Request::builder()
+            .header("authorization", "Bearer valid_token")
+            .body(Body::empty())
+            .unwrap();
+        let hook = JwtAuthHook::new("my-actual-secret".to_string());
+        let ctx = hook.authenticate(&req).unwrap();
+        assert!(
+            !ctx.is_authenticated,
+            "hardcoded literal 'valid_token' must not authenticate when secret differs"
+        );
+    }
+
+    #[test]
+    fn accepts_configured_secret() {
+        let req = Request::builder()
+            .header("authorization", "Bearer correct-secret")
+            .body(Body::empty())
+            .unwrap();
+        let hook = JwtAuthHook::new("correct-secret".to_string());
+        let ctx = hook.authenticate(&req).unwrap();
+        assert!(ctx.is_authenticated);
+    }
+
+    #[test]
+    fn rejects_no_header() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let hook = JwtAuthHook::new("secret".to_string());
+        let ctx = hook.authenticate(&req).unwrap();
+        assert!(!ctx.is_authenticated);
     }
 }
 
