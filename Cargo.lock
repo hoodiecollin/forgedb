@@ -746,7 +746,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forgedb-wal",
  "serde",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-types"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
