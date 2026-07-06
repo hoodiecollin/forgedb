@@ -1,15 +1,30 @@
 //! Intermediate example for forgedb-http-server
 //!
-//! This example demonstrates using authentication, rate limiting,
-//! and response caching middleware.
+//! This example demonstrates composing authentication and rate-limiting
+//! middleware around a small set of public and protected routes.
 
 use forgedb_http_server::*;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Simple shared state for the example
 #[derive(Clone)]
 struct AppState {
-    counter: Arc<std::sync::atomic::AtomicU64>,
+    counter: Arc<AtomicU64>,
+}
+
+// Protected handler: reads shared state.
+async fn counter_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let count = state.counter.fetch_add(1, Ordering::SeqCst);
+    Json(serde_json::json!({ "count": count + 1 }))
+}
+
+// Protected handler: echoes a path parameter.
+async fn data_handler(Path(id): Path<String>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "id": id,
+        "data": "example data",
+    }))
 }
 
 #[tokio::main]
@@ -26,31 +41,33 @@ async fn main() {
 
     // Create shared state
     let state = AppState {
-        counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        counter: Arc::new(AtomicU64::new(0)),
     };
 
     // Create rate limiter (100 requests per minute)
-    let rate_limiter = RateLimiter::new(RateLimitConfig {
+    let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig {
         max_requests: 100,
-        window: std::time::Duration::from_secs(60),
-    });
+        window_secs: 60,
+        enabled: true,
+    }));
     println!("✓ Rate limiter configured (100 req/min)");
 
-    // Create response cache
-    let cache = ResponseCache::new(CacheConfig {
-        max_entries: 1000,
-        ttl: std::time::Duration::from_secs(300), // 5 minutes
-    });
-    println!("✓ Response cache configured (5 min TTL)");
-
     // Create API key auth hook
-    let auth_hook = ApiKeyAuthHook::new(vec![
+    let auth_hook: Arc<dyn AuthHook> = Arc::new(ApiKeyAuthHook::new(vec![
         "secret-key-1".to_string(),
         "secret-key-2".to_string(),
-    ]);
+    ]));
     println!("✓ API key authentication configured");
 
-    // Create router with middleware
+    // Protected routes carry AppState; `.with_state` resolves the state type
+    // so the sub-router can be merged into the stateless top-level router.
+    let protected = Router::new()
+        .route("/api/counter", get(counter_handler))
+        .route("/api/data/{id}", get(data_handler))
+        .layer(middleware::from_fn(require_auth_middleware))
+        .with_state(state);
+
+    // Build the application router.
     let app = Router::new()
         // Public endpoints (no auth required)
         .route("/", get(|| async { "Welcome to ForgeDB API!" }))
@@ -63,49 +80,30 @@ async fn main() {
                 }))
             }),
         )
-        // Protected endpoints (requires API key)
-        .route(
-            "/api/counter",
-            get({
-                let state = state.clone();
-                move |State(state): State<AppState>| async move {
-                    let count = state
-                        .counter
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Json(serde_json::json!({
-                        "count": count + 1,
-                    }))
-                }
-            })
-            .layer(middleware::from_fn(require_auth_middleware)),
-        )
-        .route(
-            "/api/data/:id",
-            get(|Path(id): Path<String>| async move {
-                // Simulate fetching data
-                Json(serde_json::json!({
-                    "id": id,
-                    "data": "example data",
-                    "cached": true,
-                }))
-            })
-            .layer(middleware::from_fn(require_auth_middleware)),
-        )
-        // Add health and metrics endpoints
+        // Protected endpoints (require an API key)
+        .merge(protected)
+        // Health and metrics endpoints
         .merge(health_router())
         .merge(metrics_router())
-        // Apply rate limiting to all routes
-        .layer(middleware::from_fn(rate_limit_middleware))
-        // Apply authentication context
-        .layer(middleware::from_fn(auth_middleware))
-        // Add shared state
-        .with_state(state);
+        // Rate limiting applied to every route (adapts the stateful middleware).
+        .layer(middleware::from_fn({
+            let rate_limiter = rate_limiter.clone();
+            move |req, next| {
+                let rate_limiter = rate_limiter.clone();
+                async move { rate_limit_middleware(rate_limiter, req, next).await }
+            }
+        }))
+        // Authentication context populated for every route.
+        .layer(middleware::from_fn(move |req, next| {
+            let auth_hook = auth_hook.clone();
+            async move { auth_middleware(auth_hook, req, next).await }
+        }));
 
     println!("\n✓ Routes configured:");
     println!("  GET  /                   - Public root");
     println!("  GET  /public/status      - Public status");
     println!("  GET  /api/counter        - Protected counter (requires auth)");
-    println!("  GET  /api/data/:id       - Protected data (requires auth)");
+    println!("  GET  /api/data/{{id}}       - Protected data (requires auth)");
     println!("  GET  /health             - Health check");
     println!("  GET  /metrics            - Prometheus metrics");
 
