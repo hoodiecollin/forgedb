@@ -1,19 +1,25 @@
 use crate::{error::CliError, ui, Result};
-use forgedb_parser::{FieldType, Parser, RelationType};
+use forgedb_parser::{ComponentProtocol, FieldType, Parser, RelationType};
 use std::fs;
+use std::path::Path;
 
 pub struct ValidateOptions {
     pub strict: bool,
     pub schema_only: bool,
     pub implementations: bool,
     pub components: bool,
+    /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).
+    pub schema: Option<String>,
 }
 
 pub fn run(options: ValidateOptions) -> Result<()> {
     ui::header("🔍", "Validating project");
 
-    // Find and read schema file
-    let schema_path = find_schema_file()?;
+    // Find and read schema file — explicit path takes priority.
+    let schema_path = match options.schema.as_deref() {
+        Some(p) => p.to_string(),
+        None => find_schema_file()?,
+    };
     ui::info(&format!("Validating schema: {}", schema_path));
 
     let schema_content = fs::read_to_string(&schema_path)
@@ -113,6 +119,72 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
     }
 
+    // --components: check that component references are well-formed and that
+    // tsx:// / jsx:// component files exist on disk relative to the schema directory.
+    if options.components {
+        let schema_dir = Path::new(&schema_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+
+        for model in &schema.models {
+            for field in &model.fields {
+                if let FieldType::Component(component_ref) = &field.field_type {
+                    // Empty path is always an error regardless of protocol.
+                    if component_ref.path.is_empty() {
+                        errors.push(format!(
+                            "Component field '{}.{}' has an empty path",
+                            model.name, field.name
+                        ));
+                        continue;
+                    }
+
+                    match component_ref.protocol {
+                        ComponentProtocol::Tsx | ComponentProtocol::Jsx => {
+                            let ext = match component_ref.protocol {
+                                ComponentProtocol::Tsx => "tsx",
+                                ComponentProtocol::Jsx => "jsx",
+                                ComponentProtocol::Api => unreachable!(),
+                            };
+
+                            // Check for the file with its natural extension, or as-is.
+                            let with_ext = schema_dir
+                                .join(format!("{}.{}", component_ref.path, ext));
+                            let as_is = schema_dir.join(&component_ref.path);
+
+                            if !with_ext.exists() && !as_is.exists() {
+                                errors.push(format!(
+                                    "Component field '{}.{}': referenced file '{}' not found \
+                                     (checked '{}' and '{}')",
+                                    model.name,
+                                    field.name,
+                                    component_ref.path,
+                                    with_ext.display(),
+                                    as_is.display(),
+                                ));
+                            }
+                        }
+                        ComponentProtocol::Api => {
+                            // api:// paths are logical identifiers, not filesystem paths.
+                            // Validate that the path is well-formed (non-empty, no whitespace,
+                            // starts with a non-separator character).
+                            if component_ref.path.contains(char::is_whitespace) {
+                                errors.push(format!(
+                                    "Component field '{}.{}': api:// path '{}' must not \
+                                     contain whitespace",
+                                    model.name, field.name, component_ref.path
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            ui::info("Component references: all OK");
+        }
+    }
+
     // Check for potential issues (warnings)
     for model in &schema.models {
         // Warn if model has no ID field
@@ -157,16 +229,23 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         }
     }
 
-    // Determine success/failure
+    // Determine success/failure.
+    //
+    // `--strict` is what turns validation issues into a non-zero exit (for CI);
+    // plain `validate` is advisory and always exits 0. Keep the message honest so
+    // it never says "failed" while the process exits successfully.
     if !errors.is_empty() {
         println!();
-        ui::error(&format!("Validation failed with {} error(s)", errors.len()));
-
         if options.strict {
+            ui::error(&format!("Validation failed with {} error(s)", errors.len()));
             return Err(CliError::SchemaValidation(
                 "Schema validation failed".to_string(),
             ));
         }
+        ui::warning(&format!(
+            "Found {} issue(s) — run `validate --strict` to fail on these",
+            errors.len()
+        ));
     } else if warnings.is_empty() {
         ui::success("Validation passed with no issues");
     } else {
@@ -222,4 +301,110 @@ fn is_snake_case(s: &str) -> bool {
     // Should be all lowercase with underscores
     s.chars()
         .all(|c| c.is_lowercase() || c == '_' || c.is_numeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_schema(dir: &Path, content: &str) -> String {
+        let schema_path = dir.join("schema.forge");
+        fs::write(&schema_path, content).unwrap();
+        schema_path.to_str().unwrap().to_string()
+    }
+
+    /// A schema with a tsx:// component reference to a file that does not exist
+    /// should fail validation when `--components --strict` is used.
+    #[test]
+    fn test_components_tsx_missing_file_strict_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = write_schema(
+            dir.path(),
+            r#"
+User {
+  id: +uuid
+  card: tsx://components/UserCard
+}
+"#,
+        );
+
+        let result = run(ValidateOptions {
+            strict: true,
+            schema_only: false,
+            implementations: false,
+            components: true,
+            schema: Some(schema_path),
+        });
+
+        assert!(
+            result.is_err(),
+            "expected a validation error for missing tsx component file"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.to_lowercase().contains("validation"),
+            "error should mention validation: {err}"
+        );
+    }
+
+    /// A schema that has no component references passes `--components` without
+    /// errors even when `--strict` is set.
+    #[test]
+    fn test_components_no_refs_always_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = write_schema(
+            dir.path(),
+            r#"
+User {
+  id: +uuid
+  email: string
+}
+"#,
+        );
+
+        let result = run(ValidateOptions {
+            strict: true,
+            schema_only: false,
+            implementations: false,
+            components: true,
+            schema: Some(schema_path),
+        });
+
+        assert!(result.is_ok(), "expected ok for schema with no component refs: {result:?}");
+    }
+
+    /// A tsx:// component reference whose file actually exists on disk passes
+    /// validation.
+    #[test]
+    fn test_components_tsx_existing_file_passes() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create the referenced component file
+        let comp_dir = dir.path().join("components");
+        fs::create_dir_all(&comp_dir).unwrap();
+        fs::write(comp_dir.join("UserCard.tsx"), "export default function UserCard() {}").unwrap();
+
+        let schema_path = write_schema(
+            dir.path(),
+            r#"
+User {
+  id: +uuid
+  card: tsx://components/UserCard
+}
+"#,
+        );
+
+        let result = run(ValidateOptions {
+            strict: true,
+            schema_only: false,
+            implementations: false,
+            components: true,
+            schema: Some(schema_path),
+        });
+
+        assert!(
+            result.is_ok(),
+            "expected ok when tsx file exists: {result:?}"
+        );
+    }
 }

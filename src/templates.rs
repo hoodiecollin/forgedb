@@ -139,6 +139,14 @@ rust_output = "./generated"
 typescript_output = "./generated"
 format_rust = true
 format_typescript = false
+
+# Generator configuration — consumed by the forgedb CLI.
+# Precedence: explicit CLI flag > values below > built-in defaults.
+[generate]
+schema = "schema.forge"
+output = "./generated"
+# Uncomment to restrict which targets are generated:
+# targets = ["rust", "typescript", "api", "stubs"]
 "#,
         project_name
     )
@@ -174,31 +182,6 @@ dist/
 # OS
 .DS_Store
 Thumbs.db
-"#
-}
-
-/// Example main.rs for Rust backend
-pub fn rust_main_template() -> &'static str {
-    r#"use std::path::Path;
-
-mod generated {
-    include!("../generated/database.rs");
-}
-
-use generated::*;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting ForgeDB application...");
-
-    // Initialize database
-    let db_path = Path::new("./data/db");
-    let mut db = Database::new(db_path)?;
-
-    println!("✓ Database initialized");
-    println!("✓ Ready to use!");
-
-    Ok(())
-}
 "#
 }
 
