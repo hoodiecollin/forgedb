@@ -1,0 +1,5 @@
+# Pins the Rust toolchain for reproducible builds across contributors and CI.
+# Edition 2024 (used workspace-wide) requires Rust >= 1.85.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]
