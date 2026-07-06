@@ -132,13 +132,19 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` needs an unpublished release.** Generated projects call storage/types
-  methods (`append_uuid`/`read_uuid`/…) that exist only in the **local** crates; published
-  `forgedb-storage`/`forgedb-types` `0.1.1` on crates.io lack them, so a freshly `init`ed
-  project fails to compile against crates.io (`E0432`/`E0599`). Against local crates via
-  `[patch.crates-io]` it builds cleanly (exit 0). Fix = publish **storage 0.1.2 + types
-  0.2.0** and bump the init-scaffold version pins — deliberately DEFERRED (fix-in-tree,
-  defer-publish). Until then generated projects need a local path/patch dependency.
+- **`init → build` — in-tree bumps done; awaiting the actual crates.io publish.** Generated
+  projects call storage/types methods (`append_uuid`/`read_uuid`/…) and use `Value::U32/U64`
+  that exist only in the **local** crates; published `forgedb-storage`/`forgedb-types` `0.1.1`
+  on crates.io lack them, so a freshly `init`ed project fails to compile against crates.io
+  (`E0432`/`E0599`). The in-tree half is now COMPLETE: `crates/storage` is bumped to **0.1.2**
+  (additive methods) and `crates/types` to **0.2.0** (breaking — new `Value::U32/U64`
+  variants), the init-scaffold pins are `forgedb-storage = "0.1.2"` / `forgedb-types = "0.2"`,
+  and both crates pass `cargo publish --dry-run` (storage 0.1.2 verifies against the
+  already-published `wal 0.1.1`). What remains is the **outward-facing, irreversible** publish
+  itself (crates.io versions can't be deleted, only yanked), which must be run with crates.io
+  credentials: `cargo publish -p forgedb-types` then `cargo publish -p forgedb-storage` (order
+  is free — storage does not depend on types; `wal` is unchanged at 0.1.1 and is NOT
+  republished). Until published, generated projects still need a local path/patch dependency.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
