@@ -196,7 +196,7 @@ cargo test --features "full-text-search"
 ls examples/
 
 # Run example
-cargo run --example blog_platform
+cargo run -- generate all --output ./generated
 ```
 
 ### Development Tools

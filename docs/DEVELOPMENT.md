@@ -431,7 +431,7 @@ cargo build
 **Start Test Server:**
 ```bash
 # Build and run example
-cargo run --example blog_platform
+cargo run -- generate all --output ./generated
 
 # Or use CLI
 cd /tmp/test-forgedb
