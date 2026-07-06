@@ -15,6 +15,9 @@ pub struct BackgroundCompactor {
     running: Arc<AtomicBool>,
     status: Arc<Mutex<CompactionStatus>>,
     last_results: Arc<Mutex<Vec<CompactionResult>>>,
+    /// C5: store the background thread handle so `Drop` can join it instead of
+    /// sleeping and hoping.
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl BackgroundCompactor {
@@ -27,13 +30,16 @@ impl BackgroundCompactor {
             running: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new(CompactionStatus::Idle)),
             last_results: Arc::new(Mutex::new(Vec::new())),
+            handle: Mutex::new(None),
         }
     }
 
-    /// Start background compaction thread
+    /// Start the background compaction thread.
+    ///
+    /// No-op if already running.
     pub fn start(&self) {
         if self.running.load(Ordering::SeqCst) {
-            return; // Already running
+            return;
         }
 
         self.running.store(true, Ordering::SeqCst);
@@ -44,22 +50,19 @@ impl BackgroundCompactor {
         let status = Arc::clone(&self.status);
         let last_results = Arc::clone(&self.last_results);
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             while running.load(Ordering::SeqCst) {
-                // Wait for check interval
                 thread::sleep(Duration::from_secs(config.check_interval_secs));
 
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Update status
                 {
                     let mut s = status.lock().unwrap();
                     *s = CompactionStatus::Running;
                 }
 
-                // Perform compaction
                 let results = {
                     let compactor = compactor.lock().unwrap();
                     compactor.compact_needed()
@@ -67,46 +70,43 @@ impl BackgroundCompactor {
 
                 match results {
                     Ok(results) => {
+                        // C4: use log facade instead of println!/eprintln!
                         if !results.is_empty() {
-                            println!("Background compaction completed:");
+                            log::info!(
+                                "Background compaction completed for {} model(s)",
+                                results.len()
+                            );
                             for result in &results {
                                 if result.success {
-                                    println!(
-                                        "  {} - Reclaimed {} bytes ({:.1}%) in {}ms",
+                                    log::info!(
+                                        "  {} — reclaimed {} bytes ({:.1}%) in {}ms",
                                         result.model_name,
                                         result.bytes_reclaimed,
                                         result.reclaim_percentage(),
                                         result.duration_ms
                                     );
                                 } else {
-                                    eprintln!(
-                                        "  {} - Failed: {}",
+                                    log::error!(
+                                        "  {} — compaction failed: {}",
                                         result.model_name,
-                                        result
-                                            .error
-                                            .as_ref()
-                                            .unwrap_or(&"Unknown error".to_string())
+                                        result.error.as_deref().unwrap_or("unknown error")
                                     );
                                 }
                             }
                         }
 
-                        // Store results
                         {
                             let mut lr = last_results.lock().unwrap();
                             *lr = results;
                         }
-
-                        // Update status
                         {
                             let mut s = status.lock().unwrap();
                             *s = CompactionStatus::Completed;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Background compaction error: {}", e);
-
-                        // Update status
+                        // C4: use log facade
+                        log::error!("Background compaction error: {}", e);
                         {
                             let mut s = status.lock().unwrap();
                             *s = CompactionStatus::Failed;
@@ -115,38 +115,56 @@ impl BackgroundCompactor {
                 }
             }
 
-            // Set status to idle when thread exits
             let mut s = status.lock().unwrap();
             *s = CompactionStatus::Idle;
         });
+
+        // C5: store handle so Drop can join it
+        *self.handle.lock().unwrap() = Some(handle);
     }
 
-    /// Stop background compaction thread
+    /// Signal the background thread to stop.
+    ///
+    /// Does not block; use `Drop` (or explicitly drop this struct) to wait for
+    /// the thread to fully exit.
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
     }
 
-    /// Check if background compaction is running
+    /// Check whether the background thread is still running.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
 
-    /// Get current compaction status
+    /// Get current compaction status.
     pub fn status(&self) -> CompactionStatus {
         let status = self.status.lock().unwrap();
         status.clone()
     }
 
-    /// Get results from last compaction run
+    /// Get results from the last compaction run.
     pub fn last_results(&self) -> Vec<CompactionResult> {
         let results = self.last_results.lock().unwrap();
         results.clone()
     }
 
-    /// Trigger manual compaction (non-blocking)
+    /// Trigger a one-shot manual compaction in a new thread (non-blocking).
+    ///
+    /// # C6 fix
+    ///
+    /// The previous implementation checked status then spawned in separate steps,
+    /// creating a TOCTOU race where two concurrent callers could both observe
+    /// `!Running` and both spawn compaction threads.  Now the check and the
+    /// `Running` transition happen inside a single mutex critical section.
     pub fn trigger_manual(&self) -> Result<(), String> {
-        if self.status() == CompactionStatus::Running {
-            return Err("Compaction already running".to_string());
+        // Hold the lock while checking AND transitioning to Running so that
+        // two concurrent callers cannot both pass the guard.
+        {
+            let mut s = self.status.lock().unwrap();
+            if *s == CompactionStatus::Running {
+                return Err("Compaction already running".to_string());
+            }
+            *s = CompactionStatus::Running;
         }
 
         let compactor = Arc::clone(&self.compactor);
@@ -154,13 +172,7 @@ impl BackgroundCompactor {
         let last_results = Arc::clone(&self.last_results);
 
         thread::spawn(move || {
-            // Update status
-            {
-                let mut s = status.lock().unwrap();
-                *s = CompactionStatus::Running;
-            }
-
-            // Perform compaction
+            // Status is already set to Running by the caller; perform compaction.
             let results = {
                 let compactor = compactor.lock().unwrap();
                 compactor.compact_needed()
@@ -168,11 +180,15 @@ impl BackgroundCompactor {
 
             match results {
                 Ok(results) => {
-                    println!("Manual compaction completed:");
+                    // C4: use log facade
+                    log::info!(
+                        "Manual compaction completed for {} model(s)",
+                        results.len()
+                    );
                     for result in &results {
                         if result.success {
-                            println!(
-                                "  {} - Reclaimed {} bytes ({:.1}%) in {}ms",
+                            log::info!(
+                                "  {} — reclaimed {} bytes ({:.1}%) in {}ms",
                                 result.model_name,
                                 result.bytes_reclaimed,
                                 result.reclaim_percentage(),
@@ -181,22 +197,18 @@ impl BackgroundCompactor {
                         }
                     }
 
-                    // Store results
                     {
                         let mut lr = last_results.lock().unwrap();
                         *lr = results;
                     }
-
-                    // Update status
                     {
                         let mut s = status.lock().unwrap();
                         *s = CompactionStatus::Completed;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Manual compaction error: {}", e);
-
-                    // Update status
+                    // C4: use log facade
+                    log::error!("Manual compaction error: {}", e);
                     {
                         let mut s = status.lock().unwrap();
                         *s = CompactionStatus::Failed;
@@ -211,9 +223,15 @@ impl BackgroundCompactor {
 
 impl Drop for BackgroundCompactor {
     fn drop(&mut self) {
-        self.stop();
-        // Give thread time to exit gracefully
-        thread::sleep(Duration::from_millis(100));
+        // Signal the background thread to stop
+        self.running.store(false, Ordering::SeqCst);
+
+        // C5: join the background thread so we don't race on shutdown.
+        // The previous implementation did `thread::sleep(100ms)` which was
+        // racy.  Joining blocks until the thread actually exits.
+        if let Some(handle) = self.handle.lock().unwrap().take() {
+            // Ignore join errors (the thread may have panicked)
+            let _ = handle.join();
+        }
     }
 }
-

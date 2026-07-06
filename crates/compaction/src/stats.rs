@@ -16,6 +16,34 @@ impl StatsCollector {
         }
     }
 
+    /// Read the authoritative row count from the model's `manifest.json`.
+    ///
+    /// Returns an error when the manifest is absent or does not contain
+    /// `row_count`.  Used instead of the previous size-guessing heuristic
+    /// that failed for models with mixed column widths.
+    fn read_manifest_row_count(model_dir: &Path) -> Result<usize, String> {
+        let manifest_path = model_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Err(format!(
+                "manifest.json not found in {:?}; cannot determine row count",
+                model_dir
+            ));
+        }
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read manifest {:?}: {}", manifest_path, e))?;
+        let value: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse manifest {:?}: {}", manifest_path, e))?;
+        value["row_count"]
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| {
+                format!(
+                    "manifest.json at {:?} is missing the 'row_count' field",
+                    manifest_path
+                )
+            })
+    }
+
     /// Collect statistics for a specific model
     pub fn collect_model_stats(&self, model_name: &str) -> Result<ModelStats, String> {
         let model_dir = self.data_dir.join(model_name);
@@ -23,6 +51,9 @@ impl StatsCollector {
         if !model_dir.exists() {
             return Err(format!("Model directory not found: {:?}", model_dir));
         }
+
+        // C1: use authoritative row count from manifest
+        let row_count = Self::read_manifest_row_count(&model_dir)?;
 
         let mut stats = ModelStats {
             name: model_name.to_string(),
@@ -38,9 +69,9 @@ impl StatsCollector {
             last_compaction: None,
         };
 
-        // Read tombstone bitmap to determine deleted rows
+        // Read tombstone bitmap using manifest row_count
         let tombstone_path = model_dir.join("tombstones.bin");
-        let tombstones = self.read_tombstone_bitmap(&tombstone_path)?;
+        let tombstones = self.read_tombstone_bitmap(&tombstone_path, row_count)?;
         stats.total_rows = tombstones.len();
         stats.deleted_rows = tombstones.iter().filter(|&&t| t).count();
         stats.active_rows = stats.total_rows - stats.deleted_rows;
@@ -104,7 +135,6 @@ impl StatsCollector {
             collected_at: Utc::now(),
         };
 
-        // Iterate through all subdirectories (each is a model)
         let entries = fs::read_dir(&self.data_dir).map_err(|e| e.to_string())?;
 
         for entry in entries {
@@ -113,7 +143,6 @@ impl StatsCollector {
 
             if path.is_dir() {
                 if let Some(model_name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Skip hidden directories
                     if !model_name.starts_with('.') {
                         match self.collect_model_stats(model_name) {
                             Ok(model_stats) => {
@@ -123,9 +152,11 @@ impl StatsCollector {
                                 db_stats.models.push(model_stats);
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "Warning: Failed to collect stats for {}: {}",
-                                    model_name, e
+                                // C4: use log facade instead of eprintln! in library code
+                                log::warn!(
+                                    "Failed to collect stats for model '{}': {}",
+                                    model_name,
+                                    e
                                 );
                             }
                         }
@@ -139,53 +170,32 @@ impl StatsCollector {
         Ok(db_stats)
     }
 
-    /// Read tombstone bitmap from file
-    /// Note: Returns all bits, need to trim based on actual row count
-    fn read_tombstone_bitmap(&self, path: &Path) -> Result<Vec<bool>, String> {
+    /// Read the tombstone file and return exactly `row_count` booleans.
+    ///
+    /// The storage layer (`forgedb_storage::Tombstones`) writes one byte per row:
+    /// `0x00` = alive, any non-zero value = deleted.  Reads exactly `row_count`
+    /// bytes and maps each to a bool.  Pads with `false` if the file is shorter
+    /// than `row_count` (defensively handles partially-written files).
+    ///
+    /// The previous heuristic that inferred row count by trying element sizes
+    /// [16,8,4,1] against the first fixed column file has been removed; it picked
+    /// the wrong row count for models with mixed column widths, propagating wrong
+    /// `tombstones.len()` into every downstream element_size calculation.
+    fn read_tombstone_bitmap(
+        &self,
+        path: &Path,
+        row_count: usize,
+    ) -> Result<Vec<bool>, String> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(vec![false; row_count]);
         }
 
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
-        let mut tombstones = Vec::new();
-
-        for byte in bytes {
-            for i in 0..8 {
-                tombstones.push((byte & (1 << i)) != 0);
-            }
-        }
-
-        // Determine actual row count by checking fixed column file size
-        // This is a heuristic - in production we'd store row count in manifest
-        let model_dir = path.parent().ok_or_else(|| "Invalid path".to_string())?;
-        let fixed_dir = model_dir.join("fixed");
-
-        if fixed_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&fixed_dir) {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    if entry_path.is_file()
-                        && entry_path.extension().and_then(|s| s.to_str()) == Some("bin")
-                    {
-                        if let Ok(metadata) = fs::metadata(&entry_path) {
-                            let file_size = metadata.len();
-                            // Common fixed sizes: uuid=16, timestamp=8, u64=8, etc.
-                            // Try common element sizes
-                            for element_size in &[16u64, 8, 4, 1] {
-                                if file_size % element_size == 0 {
-                                    let row_count = (file_size / element_size) as usize;
-                                    if row_count <= tombstones.len() {
-                                        tombstones.truncate(row_count);
-                                        return Ok(tombstones);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        // One byte per row: 0x00 = alive, non-zero = deleted.
+        let mut tombstones: Vec<bool> =
+            bytes.iter().take(row_count).map(|&b| b != 0).collect();
+        // Pad with false if the file is shorter than expected.
+        tombstones.resize(row_count, false);
         Ok(tombstones)
     }
 
@@ -215,7 +225,8 @@ impl StatsCollector {
                 let active_rows = tombstones.iter().filter(|&&t| !t).count();
                 let deleted_rows = tombstones.iter().filter(|&&t| t).count();
 
-                // For fixed columns, calculate element size
+                // tombstones.len() == row_count (guaranteed by manifest-based
+                // read_tombstone_bitmap), so element_size is always correct.
                 let element_size = if tombstones.is_empty() {
                     0
                 } else {
@@ -258,7 +269,6 @@ impl StatsCollector {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
 
-            // Look for data files
             if path.is_file()
                 && path
                     .file_name()
@@ -275,7 +285,6 @@ impl StatsCollector {
                     .ok_or_else(|| "Invalid column name".to_string())?
                     .to_string();
 
-                // Read offset file to calculate dead space
                 let offset_path = variable_dir.join(format!("{}_offsets.bin", column_name));
                 let offsets = if offset_path.exists() {
                     self.read_offsets(&offset_path)?
@@ -286,11 +295,9 @@ impl StatsCollector {
                 let active_rows = tombstones.iter().filter(|&&t| !t).count();
                 let deleted_rows = tombstones.iter().filter(|&&t| t).count();
 
-                // Calculate used vs dead space
                 let (used_bytes, dead_bytes) =
                     self.calculate_variable_column_usage(&offsets, tombstones);
 
-                // Total includes offset file
                 let offset_size = if offset_path.exists() {
                     fs::metadata(&offset_path).map_err(|e| e.to_string())?.len()
                 } else {
@@ -356,15 +363,7 @@ impl StatsCollector {
 
     /// Collect index statistics
     fn collect_index_stats(&self, _model_dir: &Path) -> Result<HashMap<String, u64>, String> {
-        let index_sizes = HashMap::new();
-
         // In-memory indexes don't have disk representation in current implementation
-        // This is a placeholder for future index persistence
-
-        // We could estimate based on row count and index type, but for now
-        // we'll return empty map since indexes are rebuilt on load
-
-        Ok(index_sizes)
+        Ok(HashMap::new())
     }
 }
-
