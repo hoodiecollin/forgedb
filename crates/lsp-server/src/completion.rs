@@ -138,7 +138,7 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
         ..Default::default()
     });
 
-    // Model references (if schema is available)
+    // Model and struct references (if schema is available)
     if let Some(schema) = schema {
         for model in &schema.models {
             completions.push(CompletionItem {
@@ -156,9 +156,69 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
                 ..Default::default()
             });
         }
+
+        // Struct types — inline struct names are valid field types.
+        for s in &schema.structs {
+            let field_summary: String = s
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            completions.push(CompletionItem {
+                label: s.name.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: Some(format!("Struct type ({} fields)", s.fields.len())),
+                documentation: if field_summary.is_empty() {
+                    None
+                } else {
+                    Some(tower_lsp::lsp_types::Documentation::String(format!(
+                        "Fields: {}",
+                        field_summary
+                    )))
+                },
+                ..Default::default()
+            });
+        }
     }
 
     completions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_schema;
+
+    /// Struct names appear in type-position completions.
+    #[test]
+    fn test_struct_completions_included() {
+        let schema = parse_schema("struct Address {\n  street: string\n}\n");
+        let content = "User {\n  home: ";
+        let position = Position { line: 1, character: 8 };
+        let items = get_completions(content, position, &schema);
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Address"),
+            "expected Address in completions, got: {labels:?}"
+        );
+    }
+
+    /// Struct completions carry STRUCT kind.
+    #[test]
+    fn test_struct_completion_kind() {
+        let schema = parse_schema("struct Point {\n  x: f64\n  y: f64\n}\n");
+        let content = "Shape {\n  center: ";
+        let position = Position { line: 1, character: 10 };
+        let items = get_completions(content, position, &schema);
+        let point_item = items.iter().find(|i| i.label == "Point");
+        assert!(point_item.is_some(), "Point completion must be present");
+        assert_eq!(
+            point_item.unwrap().kind,
+            Some(CompletionItemKind::STRUCT),
+            "struct completion must have STRUCT kind"
+        );
+    }
 }
 
 fn get_directive_completions() -> Vec<CompletionItem> {

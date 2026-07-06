@@ -26,10 +26,8 @@ use hover::get_hover_info;
 
 #[derive(Debug, Clone)]
 struct Document {
-    uri: Url,
     content: String,
     schema: Option<Schema>,
-    version: i32,
 }
 
 struct Backend {
@@ -45,18 +43,11 @@ impl Backend {
         }
     }
 
-    async fn get_document(&self, uri: &Url) -> Option<Document> {
-        let docs = self.documents.read().await;
-        docs.get(&uri.to_string()).cloned()
-    }
-
     async fn update_document(&self, uri: Url, content: String, version: i32) {
         let schema = parse_schema(&content);
         let doc = Document {
-            uri: uri.clone(),
             content: content.clone(),
             schema: schema.clone(),
-            version,
         };
 
         let mut docs = self.documents.write().await;
@@ -173,15 +164,18 @@ impl LanguageServer for Backend {
             if let Some(schema) = &doc.schema {
                 // Find word at position
                 if let Some(word) = get_word_at_position(&doc.content, position) {
-                    // Search for model definition
-                    if let Some(model_pos) = find_model_definition(schema, &word) {
+                    // Search models first, then struct definitions.
+                    let def_pos = find_model_definition(schema, &word)
+                        .or_else(|| find_struct_definition(schema, &word));
+
+                    if let Some(def_pos) = def_pos {
                         let location = Location {
                             uri: uri.clone(),
                             range: Range {
-                                start: model_pos,
+                                start: def_pos,
                                 end: Position {
-                                    line: model_pos.line,
-                                    character: model_pos.character + word.len() as u32,
+                                    line: def_pos.line,
+                                    character: def_pos.character + word.len() as u32,
                                 },
                             },
                         };
@@ -263,6 +257,13 @@ fn find_model_definition(schema: &Schema, model_name: &str) -> Option<Position> 
         .map(|m| m.position)
 }
 
+/// Find the definition position of a struct by name.
+fn find_struct_definition(schema: &Schema, struct_name: &str) -> Option<Position> {
+    schema.structs.iter()
+        .find(|s| s.name == struct_name)
+        .map(|s| s.position)
+}
+
 fn find_all_references(
     _schema: &Schema,
     content: &str,
@@ -334,4 +335,44 @@ async fn main() {
 
     let (service, socket) = LspService::new(|client| Backend::new(client));
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_schema;
+
+    /// goto_definition finds a model definition by name.
+    #[test]
+    fn test_find_model_definition_returns_position() {
+        let schema = parse_schema("User {\n  id: +uuid\n}\n").unwrap();
+        let pos = find_model_definition(&schema, "User");
+        assert!(pos.is_some(), "should find User model definition");
+        assert_eq!(pos.unwrap().line, 0);
+    }
+
+    /// goto_definition returns None for an unknown model.
+    #[test]
+    fn test_find_model_definition_unknown_returns_none() {
+        let schema = parse_schema("User {\n  id: +uuid\n}\n").unwrap();
+        assert!(find_model_definition(&schema, "Post").is_none());
+    }
+
+    /// goto_definition finds a struct definition by name.
+    #[test]
+    fn test_find_struct_definition_returns_position() {
+        let schema =
+            parse_schema("struct Address {\n  street: string\n}\n").unwrap();
+        let pos = find_struct_definition(&schema, "Address");
+        assert!(pos.is_some(), "should find Address struct definition");
+        assert_eq!(pos.unwrap().line, 0);
+    }
+
+    /// goto_definition falls back to structs when a word is not a model name.
+    #[test]
+    fn test_find_struct_definition_unknown_returns_none() {
+        let schema =
+            parse_schema("struct Address {\n  street: string\n}\n").unwrap();
+        assert!(find_struct_definition(&schema, "Location").is_none());
+    }
 }

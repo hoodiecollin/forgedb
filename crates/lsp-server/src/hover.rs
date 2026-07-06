@@ -37,12 +37,29 @@ pub fn get_hover_info(
         }
     }
 
-    // Check if it's a model reference
+    // Check if it's a model or struct reference
     if let Some(schema) = schema {
         if let Some(model) = schema.models.iter().find(|m| m.name == word) {
             let mut info = format!("## Model: {}\n\n", model.name);
             info.push_str("### Fields:\n");
             for field in &model.fields {
+                info.push_str(&format!(
+                    "- **{}**: {}\n",
+                    field.name,
+                    format_field_type(&field.field_type)
+                ));
+            }
+            return Some(Hover {
+                contents: HoverContents::Scalar(MarkedString::String(info)),
+                range: None,
+            });
+        }
+
+        if let Some(s) = schema.structs.iter().find(|s| s.name == word) {
+            let mut info = format!("## Struct: {}\n\n", s.name);
+            info.push_str("Inline struct type. Fields are stored inline in the parent model.\n\n");
+            info.push_str("### Fields:\n");
+            for field in &s.fields {
                 info.push_str(&format!(
                     "- **{}**: {}\n",
                     field.name,
@@ -167,5 +184,57 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Array(inner) => format!("[{}]", format_field_type(inner)),
         FieldType::FixedArray(inner, size) => format!("[{}; {}]", format_field_type(inner), size),
         FieldType::Optional(inner) => format!("{}?", format_field_type(inner)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::parse_schema;
+
+    /// Hovering over a struct name produces hover info that mentions "Struct".
+    #[test]
+    fn test_hover_struct_name_shows_struct_info() {
+        let content = "struct Address {\n  street: string\n}\n\nUser {\n  home: Address\n}\n";
+        let schema = parse_schema(content);
+        // Position of "Address" on the `home: Address` line (line 5, char 8)
+        let position = Position { line: 5, character: 8 };
+        let result = get_hover_info(content, position, &schema);
+        assert!(result.is_some(), "expected hover info for struct reference");
+        if let Some(hover) = result {
+            let text = match hover.contents {
+                HoverContents::Scalar(MarkedString::String(s)) => s,
+                _ => panic!("unexpected hover content type"),
+            };
+            assert!(
+                text.contains("Struct"),
+                "hover info should mention 'Struct': {text}"
+            );
+            assert!(
+                text.contains("street"),
+                "hover info should list fields: {text}"
+            );
+        }
+    }
+
+    /// Hovering over a model name still works after adding struct support.
+    #[test]
+    fn test_hover_model_name_still_works() {
+        let content = "User {\n  id: +uuid\n}\n\nPost {\n  author: User\n}\n";
+        let schema = parse_schema(content);
+        // Position of "User" on the `author: User` line (line 5, char 10)
+        let position = Position { line: 5, character: 10 };
+        let result = get_hover_info(content, position, &schema);
+        assert!(result.is_some(), "expected hover info for model reference");
+        if let Some(hover) = result {
+            let text = match hover.contents {
+                HoverContents::Scalar(MarkedString::String(s)) => s,
+                _ => panic!("unexpected hover content type"),
+            };
+            assert!(
+                text.contains("Model"),
+                "hover info should mention 'Model': {text}"
+            );
+        }
     }
 }
