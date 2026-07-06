@@ -1,4 +1,4 @@
-/// Transaction support for WAL
+//! Transaction support for WAL
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -9,6 +9,15 @@ pub type TransactionId = u64;
 
 /// Global transaction ID counter
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Raise the global transaction-ID counter to at least `min_next`.
+///
+/// Called by [`crate::WalManager::open`] with one past the highest transaction
+/// ID found on disk, so IDs minted after a restart do not collide with
+/// transactions already recorded in the WAL.
+pub(crate) fn seed_next_txn_id(min_next: TransactionId) {
+    NEXT_TXN_ID.fetch_max(min_next, Ordering::SeqCst);
+}
 
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

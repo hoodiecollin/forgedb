@@ -1,4 +1,4 @@
-/// WAL Reader and replay logic
+//! WAL Reader and replay logic
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -35,9 +35,12 @@ impl WalReader {
                     entries.push(entry);
                     offset += size;
                 }
-                Err(e) => {
-                    // Stop at first corrupted/incomplete entry
-                    eprintln!("WAL read stopped at offset {}: {}", offset, e);
+                Err(_) => {
+                    // Stop at the first corrupted/incomplete entry. A truncated
+                    // tail is the common, benign case (a crash mid-write); we
+                    // return the entries recovered so far rather than erroring.
+                    // Callers needing to distinguish tail-truncation from
+                    // mid-file corruption should use `read_with_validation`.
                     break;
                 }
             }
@@ -103,6 +106,18 @@ impl WalReader {
         }
 
         let length = u32::from_le_bytes(buffer.try_into().unwrap()) as usize;
+
+        // Guard against a corrupt length prefix triggering a huge allocation:
+        // the entry body cannot exceed the bytes remaining in the file.
+        let position = self.file.stream_position()?;
+        let file_len = self.file.metadata()?.len();
+        let remaining = file_len.saturating_sub(position);
+        if length as u64 > remaining {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL entry length exceeds remaining file size",
+            ));
+        }
 
         // Read the rest of the entry
         let mut entry_buffer = vec![0u8; length];

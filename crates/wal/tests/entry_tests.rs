@@ -2,6 +2,21 @@ use forgedb_wal::*;
 use std::collections::HashMap;
 
 #[test]
+fn test_entry_from_bytes_rejects_short_length_prefix() {
+    // A length prefix smaller than the mandatory 4-byte checksum must be
+    // rejected with an error, not panic on an underflowing slice range.
+    for total_length in 0u32..4 {
+        let mut bytes = total_length.to_le_bytes().to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, total_length as usize));
+        let result = WalEntry::from_bytes(&bytes);
+        assert!(
+            result.is_err(),
+            "length prefix {total_length} should be rejected, not parsed"
+        );
+    }
+}
+
+#[test]
 fn test_wal_value_u64() {
     let val = WalValue::U64(12345);
     let bytes = val.to_bytes();

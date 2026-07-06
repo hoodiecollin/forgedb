@@ -1,4 +1,4 @@
-/// WAL Entry types and serialization
+//! WAL Entry types and serialization
 use std::collections::HashMap;
 
 /// A value that can be stored in the WAL
@@ -598,6 +598,16 @@ impl WalEntry {
         }
 
         let total_length = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+
+        // A valid entry always carries at least a 4-byte trailing checksum. A
+        // corrupt length prefix reporting fewer than 4 bytes would otherwise
+        // underflow `entry_bytes.len() - 4` below and panic.
+        if total_length < 4 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Entry length too short to contain a checksum",
+            ));
+        }
 
         if bytes.len() < 4 + total_length {
             return Err(Error::new(ErrorKind::UnexpectedEof, "Incomplete entry"));
