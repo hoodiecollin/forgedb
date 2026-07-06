@@ -1,5 +1,42 @@
 use forgedb_query_optimization::scan::*;
 
+/// Verify that `Gt` on u64 values straddling 2^63 agrees with the scalar path.
+///
+/// The AVX2 path previously used `_mm256_cmpgt_epi64` (signed) directly on raw
+/// u64 bits, which flips the ordering for values ≥ 2^63.  The fix XOR-biases
+/// both operands by `1<<63` so that unsigned ordering maps to signed ordering.
+#[test]
+fn test_scan_u64_gt_high_values_agree_with_scalar() {
+    // Threshold straddles 2^63 so any bug in signed-vs-unsigned compare is visible.
+    let threshold: u64 = (1u64 << 63) - 1; // i64::MAX as u64
+    let data: Vec<u64> = vec![
+        0,                    // low value      → no match
+        threshold - 1,        // just below     → no match
+        threshold,            // equal          → no match (Gt, not Gte)
+        threshold + 1,        // just above     → match
+        u64::MAX,             // max u64        → match
+        u64::MAX - 1,         // near max       → match
+    ];
+
+    let result = ColumnScan::scan_u64(&data, ScanFilter::Gt(threshold), None);
+    let mut got = result.matching_rows.clone();
+    got.sort_unstable();
+
+    // Scalar reference (always correct):
+    let mut expected: Vec<usize> = data
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &v)| if v > threshold { Some(i) } else { None })
+        .collect();
+    expected.sort_unstable();
+
+    assert_eq!(
+        got, expected,
+        "SIMD Gt({}) disagrees with scalar for data {:?}",
+        threshold, data
+    );
+}
+
 #[test]
 fn test_scan_u64_eq() {
     let data: Vec<u64> = (0..100).collect();
