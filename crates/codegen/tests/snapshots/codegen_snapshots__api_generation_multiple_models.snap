@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 152
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -118,9 +119,9 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
         .route(concat!("/api/", "user"), post(create_user))
-        .route(concat!("/api/", "user", "/:id"), get(get_user))
+        .route(concat!("/api/", "user", "/{id}"), get(get_user))
         .route(concat!("/api/", "post"), get(list_post))
         .route(concat!("/api/", "post"), post(create_post))
-        .route(concat!("/api/", "post", "/:id"), get(get_post))
+        .route(concat!("/api/", "post", "/{id}"), get(get_post))
         .with_state(db)
 }

@@ -218,7 +218,7 @@ impl ApiGenerator {
                 quote! {
                     .route(concat!("/api/", #route_path), get(#list_fn))
                     .route(concat!("/api/", #route_path), post(#create_fn))
-                    .route(concat!("/api/", #route_path, "/:id"), get(#get_fn))
+                    .route(concat!("/api/", #route_path, "/{id}"), get(#get_fn))
                 }
             })
             .collect();
