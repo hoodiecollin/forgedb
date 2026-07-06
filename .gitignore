@@ -10,7 +10,6 @@ node_modules/
 bun.lockb
 /*.forge
 !examples/**/schema.forge
-Cargo.lock
 generated/
 generated_*/
 .envrc
