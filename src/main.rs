@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod config;
 mod error;
 mod templates;
 mod ui;
@@ -42,10 +43,6 @@ enum Commands {
         #[arg(long)]
         rust: bool,
 
-        /// Include TypeScript frontend
-        #[arg(long, default_value = "true")]
-        typescript: bool,
-
         /// Generate API only
         #[arg(long)]
         api_only: bool,
@@ -64,6 +61,10 @@ enum Commands {
         /// Output directory
         #[arg(short, long)]
         output: Option<String>,
+
+        /// Schema file path
+        #[arg(short, long)]
+        schema: Option<String>,
 
         /// Force regeneration even if up-to-date
         #[arg(short, long)]
@@ -84,9 +85,13 @@ enum Commands {
         #[arg(long)]
         implementations: bool,
 
-        /// Check UI component files
+        /// Check UI component files (tsx://, jsx://, api:// references)
         #[arg(long)]
         components: bool,
+
+        /// Schema file path
+        #[arg(short, long)]
+        schema: Option<String>,
     },
 
     /// Build production-ready artifacts
@@ -103,13 +108,13 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
 
+        /// Schema file path
+        #[arg(long)]
+        schema: Option<String>,
+
         /// Skip API server build
         #[arg(long)]
         no_api: bool,
-
-        /// Skip database build
-        #[arg(long)]
-        no_db: bool,
     },
 
     /// Watch schema file and auto-regenerate on changes
@@ -252,25 +257,25 @@ enum CompactCommands {
     },
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> Result<()> {
     // Set up logging/verbosity based on flags
     let _verbose = cli.verbose;
     let _quiet = cli.quiet;
+
+    // Load generator config (--config path or auto-discover forgedb.toml).
+    // Commands that need config-derived defaults pull from this.
+    let forge_config = config::load_config(cli.config.as_deref())?;
 
     match cli.command {
         Commands::Init {
             project_name,
             template,
             rust,
-            typescript,
             api_only,
         } => commands::init::run(commands::init::InitOptions {
             project_name,
             template,
             rust,
-            typescript,
             api_only,
         }),
 
@@ -278,39 +283,56 @@ fn main() -> Result<()> {
             target,
             check,
             output,
+            schema,
             force,
-        } => commands::generate::run(commands::generate::GenerateOptions {
-            target,
-            check,
-            output,
-            force,
-        }),
+        } => {
+            // Precedence: CLI flag > config > built-in default
+            let resolved_output = output.or_else(|| forge_config.generate.output.clone());
+            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            commands::generate::run(commands::generate::GenerateOptions {
+                target,
+                check,
+                output: resolved_output,
+                schema: resolved_schema,
+                config_targets: forge_config.generate.targets.clone(),
+                force,
+            })
+        }
 
         Commands::Validate {
             strict,
             schema_only,
             implementations,
             components,
-        } => commands::validate::run(commands::validate::ValidateOptions {
-            strict,
-            schema_only,
-            implementations,
-            components,
-        }),
+            schema,
+        } => {
+            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            commands::validate::run(commands::validate::ValidateOptions {
+                strict,
+                schema_only,
+                implementations,
+                components,
+                schema: resolved_schema,
+            })
+        }
 
         Commands::Build {
             release,
             target,
             output,
+            schema,
             no_api,
-            no_db,
-        } => commands::build::run(commands::build::BuildOptions {
-            release,
-            target,
-            output,
-            no_api,
-            no_db,
-        }),
+        } => {
+            let resolved_output = output.or_else(|| forge_config.generate.output.clone());
+            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            commands::build::run(commands::build::BuildOptions {
+                release,
+                target,
+                output: resolved_output,
+                schema: resolved_schema,
+                no_api,
+            })
+        }
 
         Commands::Dev {
             schema,
@@ -391,5 +413,13 @@ fn main() -> Result<()> {
                 })
             }
         },
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
+        eprintln!("error: {e}");
+        std::process::exit(e.exit_code());
     }
 }
