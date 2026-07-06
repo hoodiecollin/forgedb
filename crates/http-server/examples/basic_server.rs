@@ -49,6 +49,7 @@ async fn main() {
         port: 3000,
         enable_cors: true,
         enable_tracing: true,
+        ..Default::default()
     };
 
     println!("\n✓ Server configured:");
