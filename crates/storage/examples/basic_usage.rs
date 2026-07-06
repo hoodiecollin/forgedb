@@ -42,7 +42,7 @@ fn main() -> std::io::Result<()> {
 
     // Working with fixed-size column (u64)
     println!("--- Working with Fixed Column (u64) ---");
-    let mut id_column = FixedColumn::new(db.fixed_column_path(0), 8)?;
+    let mut id_column = FixedColumn::new(db.fixed_column_path_typed(0, &ColumnType::U64), 8)?;
     
     // Insert some IDs
     id_column.append_u64(1001)?;
@@ -50,11 +50,13 @@ fn main() -> std::io::Result<()> {
     id_column.append_u64(1003)?;
     println!("Inserted 3 IDs");
 
-    // Read them back
+    // Read them back (read_u64 now takes &self — concurrent reads are safe)
     for i in 0..id_column.len() {
         let id = id_column.read_u64(i)?;
         println!("ID at index {}: {}", i, id);
     }
+    // Explicit flush at commit boundary
+    id_column.flush()?;
     println!();
 
     // Working with variable-length column (string)
@@ -70,11 +72,13 @@ fn main() -> std::io::Result<()> {
     email_column.append_string("charlie@example.com")?;
     println!("Inserted 3 emails");
 
-    // Read them back
+    // Read them back (read_string now takes &self)
     for i in 0..email_column.len() {
         let email = email_column.read_string(i)?;
         println!("Email at index {}: {}", i, email);
     }
+    // Explicit flush at commit boundary
+    email_column.flush()?;
     println!();
 
     // Update row count and save manifest
