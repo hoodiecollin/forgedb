@@ -267,23 +267,15 @@ pub fn down(opts: MigrateDownOptions) -> Result<()> {
 }
 
 /// Detect schema changes by comparing schemas
+///
+/// Auto-diff is not yet implemented; callers must check for this error rather than
+/// treating an empty result as "no changes detected".
 fn detect_schema_changes() -> Result<Vec<SchemaChange>> {
-    // For this to work properly, we'd need to:
-    // 1. Parse the current schema.forge file
-    // 2. Load the last schema snapshot (stored when last migration was created)
-    // 3. Diff them using SchemaDiffer
-
-    // For now, return a placeholder
-    // In a real implementation, this would:
-    // - Read schema.forge
-    // - Parse it into SimpleSchema
-    // - Load .last_schema.json
-    // - Call SchemaDiffer::diff()
-
-    ui::warning("Auto-detection requires schema parsing (not yet implemented in CLI)");
-    ui::info("For now, you can create a manual migration and edit it");
-
-    Ok(vec![])
+    Err(CliError::Migration(
+        "--auto schema-diff detection is not yet implemented. \
+         Create a manual migration instead: forgedb migrate create <description>"
+            .to_string(),
+    ))
 }
 
 
