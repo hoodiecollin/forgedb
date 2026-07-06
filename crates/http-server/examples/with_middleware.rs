@@ -49,6 +49,7 @@ async fn main() {
         max_requests: 100,
         window_secs: 60,
         enabled: true,
+        ..Default::default()
     }));
     println!("✓ Rate limiter configured (100 req/min)");
 
