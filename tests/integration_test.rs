@@ -1,10 +1,23 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use tempfile::TempDir;
 
 /// Helper to create a temporary directory for testing
 fn setup_test_dir() -> TempDir {
     TempDir::new().expect("Failed to create temp dir")
+}
+
+/// Build a `forgedb` CLI invocation scoped to `dir`.
+///
+/// Commands that auto-discover `schema.forge` do so from the process working
+/// directory. Running the real binary as a subprocess with an explicit
+/// `current_dir` gives each test its own working directory, so these tests are
+/// hermetic and safe to run in parallel (no process-global `set_current_dir`).
+fn forgedb_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
+    cmd.current_dir(dir);
+    cmd
 }
 
 /// Helper to create a basic schema file
@@ -80,23 +93,18 @@ fn test_init_with_blog_template() {
 
 #[test]
 fn test_generate_command_creates_rust_code() {
-    use forgedb::commands::generate::{run, GenerateOptions};
-
     let temp_dir = setup_test_dir();
-    std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
-
-    // Create a schema file
     create_test_schema(temp_dir.path());
 
-    let options = GenerateOptions {
-        target: "rust".to_string(),
-        check: false,
-        output: Some("generated".to_string()),
-        force: true,
-    };
-
-    let result = run(options);
-    assert!(result.is_ok(), "Generate command should succeed");
+    let output = forgedb_cmd(temp_dir.path())
+        .args(["generate", "rust", "--output", "generated", "--force"])
+        .output()
+        .expect("Failed to run forgedb generate");
+    assert!(
+        output.status.success(),
+        "Generate command should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     // Check that generated code exists
     let generated_file = temp_dir.path().join("generated/database.rs");
@@ -114,10 +122,7 @@ fn test_generate_command_creates_rust_code() {
 
 #[test]
 fn test_validate_command_detects_errors() {
-    use forgedb::commands::validate::{run, ValidateOptions};
-
     let temp_dir = setup_test_dir();
-    std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
 
     // Create an invalid schema (model name not PascalCase)
     let invalid_schema = r#"user {
@@ -128,64 +133,57 @@ fn test_validate_command_detects_errors() {
     fs::write(temp_dir.path().join("schema.forge"), invalid_schema)
         .expect("Failed to write schema");
 
-    let options = ValidateOptions {
-        strict: false,
-        schema_only: false,
-        implementations: false,
-        components: false,
-    };
-
-    let result = run(options);
-    // Should fail due to validation errors in parsing phase
-    assert!(result.is_err(), "Invalid schema should fail validation");
+    let output = forgedb_cmd(temp_dir.path())
+        .arg("validate")
+        .output()
+        .expect("Failed to run forgedb validate");
+    // Should fail due to validation errors in the parsing phase
+    assert!(
+        !output.status.success(),
+        "Invalid schema should fail validation"
+    );
 }
 
 #[test]
 fn test_validate_command_passes_valid_schema() {
-    use forgedb::commands::validate::{run, ValidateOptions};
-
     let temp_dir = setup_test_dir();
-    std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
-
     create_test_schema(temp_dir.path());
 
-    let options = ValidateOptions {
-        strict: false,
-        schema_only: true,
-        implementations: false,
-        components: false,
-    };
-
-    let result = run(options);
-    assert!(result.is_ok(), "Valid schema should pass validation");
+    let output = forgedb_cmd(temp_dir.path())
+        .args(["validate", "--schema-only"])
+        .output()
+        .expect("Failed to run forgedb validate");
+    assert!(
+        output.status.success(),
+        "Valid schema should pass validation: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
 fn test_generate_check_mode() {
-    use forgedb::commands::generate::{run, GenerateOptions};
-
     let temp_dir = setup_test_dir();
-    std::env::set_current_dir(temp_dir.path()).expect("Failed to change directory");
-
     create_test_schema(temp_dir.path());
 
     // First generate code
-    let gen_options = GenerateOptions {
-        target: "rust".to_string(),
-        check: false,
-        output: Some("generated".to_string()),
-        force: true,
-    };
-    run(gen_options).expect("Generate should succeed");
+    let output = forgedb_cmd(temp_dir.path())
+        .args(["generate", "rust", "--output", "generated", "--force"])
+        .output()
+        .expect("Failed to run forgedb generate");
+    assert!(
+        output.status.success(),
+        "Generate should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    // Now check mode should pass
-    let check_options = GenerateOptions {
-        target: "rust".to_string(),
-        check: true,
-        output: Some("generated".to_string()),
-        force: false,
-    };
-
-    let result = run(check_options);
-    assert!(result.is_ok(), "Check mode should pass for up-to-date code");
+    // Now check mode should pass for up-to-date code
+    let output = forgedb_cmd(temp_dir.path())
+        .args(["generate", "rust", "--output", "generated", "--check"])
+        .output()
+        .expect("Failed to run forgedb generate --check");
+    assert!(
+        output.status.success(),
+        "Check mode should pass for up-to-date code: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
