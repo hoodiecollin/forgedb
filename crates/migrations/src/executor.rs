@@ -159,8 +159,12 @@ impl MigrationExecutor {
             }
 
             _ => {
-                // Other changes don't require immediate storage operations
-                println!("Skipping change: {}", change.description());
+                // M5: all unhandled operations now return Err so callers know the
+                // migration was not actually applied, rather than silently succeeding.
+                return Err(format!(
+                    "operation not yet supported: {}",
+                    change.description()
+                ));
             }
         }
 
@@ -266,10 +270,12 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        // In a real implementation, this would remove column files
-        // For now, just log the operation
-        println!("✓ Removed column '{}.{}'", model_name, field_name);
-        Ok(())
+        // M5: column removal from live storage is not yet implemented; returning Err
+        // prevents silent false success.
+        Err(format!(
+            "operation not yet supported: remove column '{}.{}'",
+            model_name, field_name
+        ))
     }
 
     /// Change column type
@@ -277,16 +283,14 @@ impl MigrationExecutor {
         _data_dir: P,
         model_name: &str,
         field_name: &str,
-        _from_type: &str,
-        _to_type: &str,
+        from_type: &str,
+        to_type: &str,
     ) -> Result<(), String> {
-        // Type changes require data migration
-        // This would need to read all rows, convert values, and rewrite
-        println!(
-            "⚠️  Type change for '{}.{}' requires manual data migration",
-            model_name, field_name
-        );
-        Ok(())
+        // M5: type changes require data migration which is not yet implemented.
+        Err(format!(
+            "operation not yet supported: change column type '{}.{}' from {} to {}",
+            model_name, field_name, from_type, to_type
+        ))
     }
 
     /// Create an index
@@ -296,11 +300,11 @@ impl MigrationExecutor {
         field_name: &str,
         index_type: &str,
     ) -> Result<(), String> {
-        println!(
-            "✓ Created {} index on '{}.{}'",
+        // M5: index creation on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: create {} index on '{}.{}'",
             index_type, model_name, field_name
-        );
-        Ok(())
+        ))
     }
 
     /// Drop an index
@@ -309,8 +313,11 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        println!("✓ Dropped index on '{}.{}'", model_name, field_name);
-        Ok(())
+        // M5: index removal on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: drop index on '{}.{}'",
+            model_name, field_name
+        ))
     }
 
     /// Add unique constraint
@@ -319,12 +326,11 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        println!(
-            "✓ Added unique constraint to '{}.{}'",
+        // M5: unique constraint enforcement on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: add unique constraint to '{}.{}'",
             model_name, field_name
-        );
-        // In real implementation, would check for duplicates first
-        Ok(())
+        ))
     }
 
     /// Remove unique constraint
@@ -333,11 +339,11 @@ impl MigrationExecutor {
         model_name: &str,
         field_name: &str,
     ) -> Result<(), String> {
-        println!(
-            "✓ Removed unique constraint from '{}.{}'",
+        // M5: unique constraint removal on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: remove unique constraint from '{}.{}'",
             model_name, field_name
-        );
-        Ok(())
+        ))
     }
 
     /// Create composite index
@@ -346,12 +352,12 @@ impl MigrationExecutor {
         model_name: &str,
         fields: &[String],
     ) -> Result<(), String> {
-        println!(
-            "✓ Created composite index on '{}.{}'",
+        // M5: composite index creation on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: create composite index on '{}.{}'",
             model_name,
             fields.join(", ")
-        );
-        Ok(())
+        ))
     }
 
     /// Drop composite index
@@ -360,12 +366,12 @@ impl MigrationExecutor {
         model_name: &str,
         fields: &[String],
     ) -> Result<(), String> {
-        println!(
-            "✓ Dropped composite index from '{}.{}'",
+        // M5: composite index removal on live storage is not yet implemented.
+        Err(format!(
+            "operation not yet supported: drop composite index from '{}.{}'",
             model_name,
             fields.join(", ")
-        );
-        Ok(())
+        ))
     }
 
     /// Check if a type is fixed size

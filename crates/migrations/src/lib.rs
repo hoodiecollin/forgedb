@@ -37,73 +37,12 @@
 //!
 //! # Examples
 //!
-//! ## Generating a Migration
-//!
-//! ```rust,no_run
-//! use forgedb_migrations::{SchemaDiffer, MigrationGenerator, SimpleSchema};
-//!
-//! // Load old and new schemas
-//! let old_schema = SimpleSchema::from_file("./old_schema.fdb")?;
-//! let new_schema = SimpleSchema::from_file("./new_schema.fdb")?;
-//!
-//! // Diff schemas
-//! let differ = SchemaDiffer::new();
-//! let changes = differ.diff(&old_schema, &new_schema)?;
-//!
-//! // Generate migration
-//! let generator = MigrationGenerator::new("./migrations");
-//! let migration = generator.generate("add_user_age_field", changes)?;
-//!
-//! println!("Generated migration: {}", migration.name);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## Applying Migrations
-//!
-//! ```rust,no_run
-//! use forgedb_migrations::{MigrationExecutor, MigrationTracker};
-//!
-//! // Create executor and tracker
-//! let mut executor = MigrationExecutor::new("./data");
-//! let tracker = MigrationTracker::new("./data");
-//!
-//! // Get pending migrations
-//! let pending = tracker.get_pending_migrations("./migrations")?;
-//!
-//! // Apply migrations
-//! for migration in pending {
-//!     println!("Applying migration: {}", migration.name);
-//!     executor.apply_migration(&migration)?;
-//!     tracker.mark_applied(&migration)?;
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
-//! ## Rolling Back a Migration
-//!
-//! ```rust,no_run
-//! use forgedb_migrations::{MigrationExecutor, MigrationTracker};
-//!
-//! let mut executor = MigrationExecutor::new("./data");
-//! let tracker = MigrationTracker::new("./data");
-//!
-//! // Get last applied migration
-//! if let Some(last) = tracker.get_last_applied()? {
-//!     println!("Rolling back: {}", last.name);
-//!     executor.rollback_migration(&last)?;
-//!     tracker.mark_rolled_back(&last)?;
-//! }
-//! # Ok::<(), Box<dyn std::error::Error>>(())
-//! ```
-//!
 //! ## Detecting Schema Changes
 //!
-//! ```rust,no_run
-//! use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField};
+//! ```rust
+//! use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
 //!
-//! let differ = SchemaDiffer::new();
-//!
-//! // Create schemas
+//! // Create schemas directly (no file loading at the diff level)
 //! let old_schema = SimpleSchema {
 //!     models: vec![
 //!         SimpleModel {
@@ -113,8 +52,13 @@
 //!                     name: "id".to_string(),
 //!                     field_type: "uuid".to_string(),
 //!                     nullable: false,
+//!                     unique: false,
+//!                     indexed: false,
+//!                     index_type: "hash".to_string(),
+//!                     constraints: vec![],
 //!                 },
 //!             ],
+//!             composite_indexes: vec![],
 //!         },
 //!     ],
 //! };
@@ -128,20 +72,55 @@
 //!                     name: "id".to_string(),
 //!                     field_type: "uuid".to_string(),
 //!                     nullable: false,
+//!                     unique: false,
+//!                     indexed: false,
+//!                     index_type: "hash".to_string(),
+//!                     constraints: vec![],
 //!                 },
 //!                 SimpleField {
 //!                     name: "email".to_string(),
 //!                     field_type: "string".to_string(),
 //!                     nullable: false,
+//!                     unique: false,
+//!                     indexed: false,
+//!                     index_type: "hash".to_string(),
+//!                     constraints: vec![],
 //!                 },
 //!             ],
+//!             composite_indexes: vec![],
 //!         },
 //!     ],
 //! };
 //!
-//! let changes = differ.diff(&old_schema, &new_schema)?;
+//! // SchemaDiffer is a unit struct; call diff() as a static method
+//! let changes = SchemaDiffer::diff(&old_schema, &new_schema);
 //! println!("Detected {} changes", changes.len());
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! assert_eq!(changes.len(), 1);
+//! ```
+//!
+//! ## Applying Migrations
+//!
+//! ```rust,no_run
+//! use forgedb_migrations::{MigrationExecutor, MigrationTracker, Migration, SchemaChange};
+//!
+//! // MigrationTracker::new returns Result<Self, String>
+//! let mut tracker = MigrationTracker::new("./migrations").expect("tracker init");
+//!
+//! // MigrationExecutor is a unit struct; call execute_up() as a static method
+//! let migration = Migration::new("add email".to_string(), vec![
+//!     SchemaChange::AddModel { model_name: "Post".to_string() },
+//! ]);
+//! MigrationExecutor::execute_up(&migration, "./data").unwrap_or(());
+//!
+//! // pending_migrations takes a slice of migration id strings
+//! let all_ids = vec!["20240101_add_email".to_string()];
+//! let pending = tracker.pending_migrations(&all_ids);
+//!
+//! // mark_applied requires (id, checksum)
+//! // tracker.mark_applied("20240101_add_email".to_string(), "abc".to_string()).unwrap();
+//! // tracker.last_migration() returns Option<&MigrationRecord>
+//! let _ = tracker.last_migration();
+//! // tracker.mark_rolled_back() (no args) removes last record
 //! ```
 //!
 //! # Public API
