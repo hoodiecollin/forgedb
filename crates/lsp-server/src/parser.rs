@@ -52,10 +52,11 @@ pub enum FieldType {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldModifier {
-    PrimaryKey,  // +
-    Required,    // &
-    Unique,      // ^
-    Relation,    // *
+    AutoGenerate, // + auto-generate on create
+    AutoUpdate,   // ~ auto-update on modify
+    Index,        // ^ create an index
+    Unique,       // & unique constraint
+    RequiredFk,   // * required foreign-key relation
 }
 
 #[derive(Debug, Clone)]
@@ -210,24 +211,29 @@ fn parse_field_parts(s: &str) -> Option<(Vec<FieldModifier>, FieldType, Vec<Dire
     let mut modifiers = Vec::new();
     let mut rest = s;
 
-    // Parse modifiers (+, &, ^, *)
+    // Parse modifiers: + auto-generate, ~ auto-update, ^ index, & unique, * required FK.
+    // All symbols are ASCII single bytes; advancing by 1 byte is safe.
     while !rest.is_empty() {
         match rest.chars().next()? {
             '+' => {
-                modifiers.push(FieldModifier::PrimaryKey);
-                rest = &rest[1..].trim_start();
+                modifiers.push(FieldModifier::AutoGenerate);
+                rest = rest[1..].trim_start();
             }
-            '&' => {
-                modifiers.push(FieldModifier::Required);
-                rest = &rest[1..].trim_start();
+            '~' => {
+                modifiers.push(FieldModifier::AutoUpdate);
+                rest = rest[1..].trim_start();
             }
             '^' => {
+                modifiers.push(FieldModifier::Index);
+                rest = rest[1..].trim_start();
+            }
+            '&' => {
                 modifiers.push(FieldModifier::Unique);
-                rest = &rest[1..].trim_start();
+                rest = rest[1..].trim_start();
             }
             '*' => {
-                modifiers.push(FieldModifier::Relation);
-                rest = &rest[1..].trim_start();
+                modifiers.push(FieldModifier::RequiredFk);
+                rest = rest[1..].trim_start();
             }
             _ => break,
         }
@@ -325,5 +331,89 @@ fn parse_directive(s: &str) -> Option<Directive> {
         // Directive without arguments
         let name = s.split_whitespace().next()?.to_string();
         Some(Directive { name, args: Vec::new() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L1: `~timestamp` fields must survive parsing and carry the AutoUpdate modifier.
+    ///
+    /// Before the fix, `~` was not recognized as a modifier.  The parser hit
+    /// `_ => break` and then tried to parse `"~timestamp"` as a type, which
+    /// returned `None`, causing `parse_field` to return `None` and silently drop
+    /// the entire field from the model.
+    #[test]
+    fn test_tilde_modifier_field_survives_parsing() {
+        let schema_content = r#"Post {
+  id: +uuid
+  title: string
+  updated_at: ~timestamp
+  email: ^&string
+  author: *User
+}
+"#;
+        let schema = parse_schema(schema_content).expect("schema should parse");
+        assert_eq!(schema.models.len(), 1);
+
+        let model = &schema.models[0];
+        assert_eq!(model.name, "Post");
+
+        // All four fields must be present — none should be silently dropped.
+        assert_eq!(
+            model.fields.len(),
+            5,
+            "expected 5 fields, got {}: {:?}",
+            model.fields.len(),
+            model.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
+
+        // The `updated_at` field must have exactly the AutoUpdate modifier.
+        let updated = model
+            .fields
+            .iter()
+            .find(|f| f.name == "updated_at")
+            .expect("updated_at field must exist");
+        assert_eq!(updated.field_type, FieldType::Timestamp);
+        assert_eq!(updated.modifiers, vec![FieldModifier::AutoUpdate]);
+
+        // Verify ^ and & are mapped correctly (Index and Unique).
+        let email = model
+            .fields
+            .iter()
+            .find(|f| f.name == "email")
+            .expect("email field must exist");
+        assert!(email.modifiers.contains(&FieldModifier::Index), "^ should map to Index");
+        assert!(email.modifiers.contains(&FieldModifier::Unique), "& should map to Unique");
+
+        // Verify * maps to RequiredFk.
+        let author = model
+            .fields
+            .iter()
+            .find(|f| f.name == "author")
+            .expect("author field must exist");
+        assert!(author.modifiers.contains(&FieldModifier::RequiredFk), "* should map to RequiredFk");
+    }
+
+    /// AutoGenerate modifier (+) must be recognized and the field retained.
+    #[test]
+    fn test_auto_generate_modifier() {
+        let schema_content = r#"User {
+  id: +uuid
+  created_at: +timestamp
+}
+"#;
+        let schema = parse_schema(schema_content).expect("schema should parse");
+        let model = &schema.models[0];
+        assert_eq!(model.fields.len(), 2);
+
+        for field in &model.fields {
+            assert!(
+                field.modifiers.contains(&FieldModifier::AutoGenerate),
+                "field {} should have AutoGenerate modifier",
+                field.name
+            );
+        }
     }
 }

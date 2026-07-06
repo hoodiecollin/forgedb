@@ -40,23 +40,23 @@ pub fn get_completions(
 fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
     let mut completions = vec![];
 
-    // Modifiers
+    // Modifiers — order matches schema language reference: + ~ ^ & * ?
     completions.push(CompletionItem {
         label: "+".to_string(),
         kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Primary key".to_string()),
+        detail: Some("Auto-generate on create".to_string()),
         documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Marks this field as the primary key (auto-generated)".to_string()
+            "Value is automatically generated when the record is created (UUID v4 or auto-increment)".to_string()
         )),
         ..Default::default()
     });
 
     completions.push(CompletionItem {
-        label: "&".to_string(),
+        label: "~".to_string(),
         kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Required".to_string()),
+        detail: Some("Auto-update on modify".to_string()),
         documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Marks this field as required (non-nullable)".to_string()
+            "Value is automatically set to the current timestamp whenever the record is updated".to_string()
         )),
         ..Default::default()
     });
@@ -64,9 +64,19 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
     completions.push(CompletionItem {
         label: "^".to_string(),
         kind: Some(CompletionItemKind::OPERATOR),
+        detail: Some("Index".to_string()),
+        documentation: Some(tower_lsp::lsp_types::Documentation::String(
+            "Creates a database index on this field for faster lookups".to_string()
+        )),
+        ..Default::default()
+    });
+
+    completions.push(CompletionItem {
+        label: "&".to_string(),
+        kind: Some(CompletionItemKind::OPERATOR),
         detail: Some("Unique".to_string()),
         documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Adds a unique constraint to this field".to_string()
+            "Adds a unique constraint — no two records can share the same value for this field".to_string()
         )),
         ..Default::default()
     });
@@ -74,9 +84,9 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
     completions.push(CompletionItem {
         label: "*".to_string(),
         kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Relation".to_string()),
+        detail: Some("Required foreign-key relation".to_string()),
         documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Marks this as a relation to another model".to_string()
+            "Marks this field as a required foreign-key reference to another model".to_string()
         )),
         ..Default::default()
     });

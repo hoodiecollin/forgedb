@@ -32,9 +32,9 @@ pub fn validate_schema(schema: &Schema, _content: &str) -> Vec<Diagnostic> {
             validate_field(field, &mut diagnostics);
         }
 
-        // Check for primary key
+        // Check for auto-generated primary key field (+)
         let has_primary_key = model.fields.iter().any(|f| {
-            f.modifiers.contains(&FieldModifier::PrimaryKey)
+            f.modifiers.contains(&FieldModifier::AutoGenerate)
         });
 
         if !has_primary_key {
@@ -69,8 +69,8 @@ pub fn validate_schema(schema: &Schema, _content: &str) -> Vec<Diagnostic> {
 
 fn validate_field(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
     // Check for invalid modifier combinations
-    if field.modifiers.contains(&FieldModifier::PrimaryKey) {
-        // Primary key should not be optional
+    if field.modifiers.contains(&FieldModifier::AutoGenerate) {
+        // Auto-generated fields should not be optional
         if is_optional(&field.field_type) {
             diagnostics.push(Diagnostic {
                 range: Range {
@@ -81,7 +81,7 @@ fn validate_field(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
                     },
                 },
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: "Primary key cannot be optional".to_string(),
+                message: "Auto-generated field (+) cannot be optional".to_string(),
                 ..Default::default()
             });
         }
@@ -160,8 +160,8 @@ fn validate_field(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
                 }
             }
             "on_delete" => {
-                // Should be on relation fields
-                if !field.modifiers.contains(&FieldModifier::Relation) {
+                // Should be on required FK fields (*)
+                if !field.modifiers.contains(&FieldModifier::RequiredFk) {
                     diagnostics.push(Diagnostic {
                         range: Range {
                             start: field.position,
