@@ -1,3 +1,5 @@
+use forgedb_codegen::{ApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator};
+use forgedb_parser::Schema;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -50,10 +52,11 @@ impl SchemaRegenerator {
         }
     }
 
-    /// Regenerate code from the schema file
+    /// Regenerate code from the schema file.
     ///
-    /// This function reads the schema, parses it, generates code, and writes
-    /// the output. It returns detailed information about success or failure.
+    /// Reads the schema, parses it, runs all four generators (Rust, TypeScript,
+    /// API, stubs) and writes the output files to the configured output
+    /// directory.  Returns a [`RegenerateResult`] describing what happened.
     pub fn regenerate(&self) -> RegenerateResult {
         // Verify schema file exists
         if !self.schema_path.exists() {
@@ -76,6 +79,30 @@ impl SchemaRegenerator {
             }
         };
 
+        // Parse the schema
+        let mut parser =
+            match forgedb_parser::parser::Parser::new(&schema_content) {
+                Ok(p) => p,
+                Err(e) => {
+                    return RegenerateResult {
+                        success: false,
+                        message: format!("Lexer error: {}", e),
+                        output_path: None,
+                    }
+                }
+            };
+
+        let schema = match parser.parse() {
+            Ok(s) => s,
+            Err(e) => {
+                return RegenerateResult {
+                    success: false,
+                    message: format!("Parser error: {}", e),
+                    output_path: None,
+                }
+            }
+        };
+
         // Create output directory
         if let Err(e) = fs::create_dir_all(&self.output_dir) {
             return RegenerateResult {
@@ -85,24 +112,11 @@ impl SchemaRegenerator {
             };
         }
 
-        // Call the code generation (this would normally use the forgedb library)
-        // For now, we'll invoke it as a command since we're in a separate crate
-        let output_path = self.output_dir.join("database.rs");
-
-        // Here we use the internal regeneration logic
-        // In production, this would call the parser and codegen directly
-        match self.regenerate_internal(&schema_content) {
-            Ok(code) => match fs::write(&output_path, code) {
-                Ok(_) => RegenerateResult {
-                    success: true,
-                    message: format!("✓ Code regenerated successfully"),
-                    output_path: Some(output_path),
-                },
-                Err(e) => RegenerateResult {
-                    success: false,
-                    message: format!("Failed to write generated code: {}", e),
-                    output_path: None,
-                },
+        match self.regenerate_internal(&schema) {
+            Ok(()) => RegenerateResult {
+                success: true,
+                message: "Code regenerated successfully".to_string(),
+                output_path: Some(self.output_dir.clone()),
             },
             Err(e) => RegenerateResult {
                 success: false,
@@ -112,20 +126,37 @@ impl SchemaRegenerator {
         }
     }
 
-    /// Internal regeneration logic
-    fn regenerate_internal(&self, schema_content: &str) -> Result<String, RegenerateError> {
-        // Parse the schema using forgedb parser
-        let mut parser = forgedb_parser::parser::Parser::new(schema_content)
-            .map_err(|e| RegenerateError::ParseError(format!("Lexer error: {}", e)))?;
+    /// Run all generators and write output files.
+    ///
+    /// Output layout mirrors the CLI `generate all` command:
+    /// - `{output_dir}/database.rs` — Rust database implementation
+    /// - `{output_dir}/types.ts`    — TypeScript types and SDK
+    /// - `{output_dir}/api.rs`      — REST API implementation
+    /// - `{output_dir}/stubs/README.md` — Component stubs index
+    fn regenerate_internal(&self, schema: &Schema) -> Result<(), RegenerateError> {
+        // Rust database code
+        let rust_result = RustGenerator::generate(schema)
+            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
+        fs::write(self.output_dir.join("database.rs"), &rust_result.code)?;
 
-        let _schema = parser
-            .parse()
-            .map_err(|e| RegenerateError::ParseError(format!("Parser error: {}", e)))?;
+        // TypeScript types and SDK
+        let ts_result = TypeScriptGenerator::generate(schema)
+            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
+        fs::write(self.output_dir.join("types.ts"), &ts_result.code)?;
 
-        // Code generation has been temporarily removed during refactoring
-        Err(RegenerateError::GenerationError(
-            "Code generation temporarily unavailable - being refactored".to_string(),
-        ))
+        // REST API implementation
+        let api_result = ApiGenerator::generate(schema)
+            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
+        fs::write(self.output_dir.join("api.rs"), &api_result.code)?;
+
+        // Stubs index
+        let stub_result = StubGenerator::generate(schema)
+            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
+        let stubs_dir = self.output_dir.join("stubs");
+        fs::create_dir_all(&stubs_dir)?;
+        fs::write(stubs_dir.join("README.md"), &stub_result.code)?;
+
+        Ok(())
     }
 
     /// Get the schema file path

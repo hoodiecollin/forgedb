@@ -11,4 +11,6 @@ categories = ["database", "filesystem"]
 [dependencies]
 notify = "8.2"
 crossbeam-channel = "0.5"
+forgedb-codegen = { path = "../codegen" }
 forgedb-parser = { path = "../parser" }
+tracing = "0.1"

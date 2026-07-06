@@ -28,30 +28,20 @@
 //! ## Basic File Watching
 //!
 //! ```rust,no_run
-//! use forgedb_watcher::{SchemaRegenerator, FileChangeEvent, ChangeKind};
+//! use forgedb_watcher::{SchemaRegenerator, SchemaWatcher};
 //! use std::path::Path;
 //!
-//! // Create a regenerator
-//! let regenerator = SchemaRegenerator::new(
-//!     Path::new("./schemas"),
-//!     Path::new("./generated")
-//! );
+//! // Create a watcher and point it at the schema file.
+//! let mut watcher = SchemaWatcher::new(200)?;
+//! watcher.watch(Path::new("./schema.forge"))?;
 //!
-//! // Watch for schema changes
-//! regenerator.watch(|event| {
-//!     match event.kind {
-//!         ChangeKind::Modified => {
-//!             println!("Schema modified: {:?}", event.path);
-//!             // Regeneration happens automatically
-//!         }
-//!         ChangeKind::Created => {
-//!             println!("Schema created: {:?}", event.path);
-//!         }
-//!         ChangeKind::Removed => {
-//!             println!("Schema removed: {:?}", event.path);
-//!         }
-//!     }
-//! })?;
+//! // Run the initial generation before entering the watch loop.
+//! let regenerator = SchemaRegenerator::new(
+//!     Path::new("./schema.forge"),
+//!     Path::new("./generated"),
+//! );
+//! let result = regenerator.regenerate();
+//! println!("Initial generation: success={}, msg={}", result.success, result.message);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
@@ -62,39 +52,38 @@
 //! use std::path::Path;
 //!
 //! let regenerator = SchemaRegenerator::new(
-//!     Path::new("./schemas"),
-//!     Path::new("./generated")
+//!     Path::new("./schema.forge"),
+//!     Path::new("./generated"),
 //! );
 //!
-//! // Trigger regeneration manually
-//! match regenerator.regenerate() {
-//!     Ok(_) => println!("Regeneration successful"),
-//!     Err(e) => eprintln!("Regeneration failed: {}", e),
+//! // regenerate() returns RegenerateResult (not a Result — check the struct fields).
+//! let result = regenerator.regenerate();
+//! if result.success {
+//!     println!("Regeneration successful: {:?}", result.output_path);
+//! } else {
+//!     eprintln!("Regeneration failed: {}", result.message);
 //! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! ## With Custom Callback
+//! ## Watching with a Callback
 //!
 //! ```rust,no_run
-//! use forgedb_watcher::{SchemaRegenerator, FileChangeEvent};
-//! use std::path::Path;
+//! use forgedb_watcher::auto_watch;
 //!
-//! let regenerator = SchemaRegenerator::new(
-//!     Path::new("./schemas"),
-//!     Path::new("./generated")
-//! );
-//!
-//! // Watch with custom callback
-//! regenerator.watch_with_callback(|event: &FileChangeEvent| {
-//!     println!("File changed: {:?} at {:?}",
-//!         event.path,
-//!         event.timestamp
-//!     );
-//!
-//!     // Custom handling logic here
-//!     Ok(())
-//! })?;
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! // auto_watch blocks indefinitely; interrupt with Ctrl-C.
+//! auto_watch(
+//!     "schema.forge",
+//!     "generated",
+//!     200,
+//!     Some(Box::new(|result| {
+//!         if result.success {
+//!             println!("Regenerated: {:?}", result.output_path);
+//!         } else {
+//!             eprintln!("Error: {}", result.message);
+//!         }
+//!     })),
+//! ).expect("Failed to start watcher");
 //! ```
 //!
 //! # Public API
@@ -109,14 +98,14 @@
 //!
 //! - [`WatchError`] - Errors during file watching
 //! - [`RegenerateError`] - Errors during schema regeneration
-//! - [`RegenerateResult`] - Result type for regeneration operations
+//! - [`RegenerateResult`] - Result of a regeneration attempt
 //!
-//! ## Key Methods
+//! ## Key Functions / Methods
 //!
-//! - `SchemaRegenerator::new()` - Create a new regenerator
-//! - `SchemaRegenerator::watch()` - Start watching for changes
-//! - `SchemaRegenerator::regenerate()` - Manually trigger regeneration
-//! - `SchemaRegenerator::stop()` - Stop watching
+//! - [`auto_watch`] - High-level convenience: watch + regenerate loop
+//! - [`SchemaWatcher::new`] - Create a low-level watcher
+//! - [`SchemaRegenerator::new`] - Create a regenerator
+//! - [`SchemaRegenerator::regenerate`] - Manually trigger regeneration
 //!
 //! # Debouncing
 //!
@@ -158,17 +147,12 @@
 //! # Related Crates
 //!
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schema files
-//! - [`forgedb-validation`](../forgedb_validation) - Validates schemas before regeneration
+//! - [`forgedb-codegen`](../forgedb_codegen) - Code generators wired by this crate
 //! - [`forgedb`](../../) - Main CLI that uses this watcher
 //!
 //! # Dependencies
 //!
 //! - [`notify`](https://docs.rs/notify) - Cross-platform file system watching
-//!
-//! # See Also
-//!
-//! - [README](./README.md) for detailed documentation
-//! - [SPRINT3_WATCH_MODE.md](../../archive/sprint-summaries/SPRINT3_WATCH_MODE.md) - Watch mode implementation
 
 pub mod regenerator;
 
@@ -179,7 +163,7 @@ use std::path::Path;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
-pub use regenerator::{RegenerateError, RegenerateResult, SchemaRegenerator};
+pub use regenerator::{RegenerateCallback, RegenerateError, RegenerateResult, SchemaRegenerator};
 
 /// Error types for the watcher
 #[derive(Debug)]
@@ -234,8 +218,9 @@ impl SchemaWatcher {
 
         let watcher = RecommendedWatcher::new(
             move |res| {
-                if let Err(_) = tx.send(res) {
-                    // Receiver dropped, watcher should stop
+                if tx.send(res).is_err() {
+                    // Receiver was dropped — the watcher should stop soon.
+                    tracing::debug!("Watcher event channel closed; stopping event forwarding.");
                 }
             },
             Config::default(),
@@ -306,11 +291,11 @@ impl SchemaWatcher {
                 match self.receiver.recv_timeout(timeout) {
                     Ok(Ok(evt)) => {
                         // Got another event, update timestamp and possibly kind
-                        if let Some((evt_path, evt_kind)) = self.extract_event_info(&evt) {
-                            if evt_path == path {
-                                last_event_time = Instant::now();
-                                latest_kind = evt_kind;
-                            }
+                        if let Some((evt_path, evt_kind)) = self.extract_event_info(&evt)
+                            && evt_path == path
+                        {
+                            last_event_time = Instant::now();
+                            latest_kind = evt_kind;
                         }
                     }
                     Ok(Err(_)) => continue,
@@ -363,10 +348,19 @@ impl SchemaWatcher {
     }
 }
 
-/// Auto-watch a schema file and regenerate on changes
+/// Auto-watch a schema file and regenerate on changes.
 ///
-/// This is a convenience function that sets up watching and automatic regeneration.
-/// It will block indefinitely, regenerating code every time the schema changes.
+/// This is a convenience function that sets up watching and automatic
+/// regeneration.  It blocks indefinitely, regenerating code every time the
+/// schema file changes.
+///
+/// ## Path matching
+///
+/// On macOS, `notify` emits canonicalized absolute paths while the caller
+/// often passes a relative path.  This function canonicalizes both sides
+/// before comparing, and additionally watches the parent directory (rather than
+/// the file directly) to handle atomic-save-rename patterns used by most
+/// text editors.
 ///
 /// # Arguments
 /// * `schema_path` - Path to the schema file to watch
@@ -395,15 +389,37 @@ pub fn auto_watch<P: AsRef<Path>, Q: AsRef<Path>>(
     schema_path: P,
     output_dir: Q,
     debounce_ms: u64,
-    callback: Option<Box<dyn Fn(&RegenerateResult) + Send>>,
+    callback: Option<RegenerateCallback>,
 ) -> Result<(), WatchError> {
     let schema_path = schema_path.as_ref();
     let regenerator = SchemaRegenerator::new(schema_path, output_dir.as_ref());
 
-    let mut watcher = SchemaWatcher::new(debounce_ms)?;
-    watcher.watch(schema_path)?;
+    // Canonicalize the schema path once for reliable comparison.
+    // On macOS, notify emits absolute canonicalized paths; without this the
+    // simple equality check `event.path == schema_path` never matches when
+    // schema_path is relative (W2 fix).
+    let schema_canon = schema_path
+        .canonicalize()
+        .unwrap_or_else(|_| schema_path.to_path_buf());
 
-    println!("👁  Watching {} for changes...", schema_path.display());
+    // Watch the parent directory rather than the file directly.  This catches
+    // atomic-save-rename events that most editors emit: they write to a temp
+    // file and rename it into place, which produces a Created event on the
+    // target rather than a Modified event.
+    let watch_dir = schema_canon
+        .parent()
+        .unwrap_or(schema_canon.as_path());
+    let schema_file_name = schema_canon.file_name();
+
+    let mut watcher = SchemaWatcher::new(debounce_ms)?;
+
+    if watch_dir.exists() {
+        watcher.watch(watch_dir)?;
+    } else {
+        watcher.watch(schema_path)?;
+    }
+
+    println!("Watching {} for changes...", schema_path.display());
     println!("   Press Ctrl+C to stop\n");
 
     // Do initial generation
@@ -416,9 +432,20 @@ pub fn auto_watch<P: AsRef<Path>, Q: AsRef<Path>>(
     loop {
         match watcher.next_event() {
             Ok(event) => {
-                // Only regenerate if the event is for our schema file
-                if event.path == schema_path {
-                    println!("\n📝 Schema changed, regenerating...");
+                // Match by canonicalized path AND by file name (handles
+                // atomic-save-rename where the event path differs).
+                let event_canon = event
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| event.path.clone());
+
+                let matches = event_canon == schema_canon
+                    || schema_file_name
+                        .map(|name| event.path.file_name() == Some(name))
+                        .unwrap_or(false);
+
+                if matches {
+                    println!("\nSchema changed, regenerating...");
                     let result = regenerator.regenerate();
 
                     if let Some(ref cb) = callback {
