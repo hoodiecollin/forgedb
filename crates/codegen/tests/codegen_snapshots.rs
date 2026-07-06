@@ -450,6 +450,52 @@ fn test_rust_generation_with_complex_types() {
 }
 
 // ---------------------------------------------------------------------------
+// Task #45: the three codegen compilation gaps surfaced by the examples corpus.
+// The examples corpus compile-harness proves the emitted Rust compiles AND
+// round-trips; this snapshot guards the emitted shape.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_rust_generation_codegen_gaps() {
+    // Nullable variable-length string (`string?`), an embedded `struct`, and an
+    // integer (`+u64`) primary key — each previously made `database.rs` fail to
+    // compile.
+    let src = r#"
+struct GeoPoint {
+  latitude: f64
+  longitude: f64
+}
+
+Place {
+  id: +u64
+  name: string
+  description: string?
+  location: GeoPoint
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // Gap 2: the embedded struct is emitted as a real #[repr(C)] type.
+    assert!(code.contains("pub struct GeoPoint"), "struct definition must be emitted");
+    assert!(code.contains("pub latitude: f64"), "struct fields must be emitted");
+
+    // Gap 3: integer PK — identity type is u64 across map key + insert/get.
+    assert!(code.contains("id_to_row: HashMap<u64, usize>"), "id map must be keyed by u64");
+    assert!(code.contains("-> u64"), "insert must return the u64 PK");
+    assert!(code.contains("id: u64"), "get must take the u64 PK");
+
+    // Gap 1: nullable string field renders as Option<String> and is encoded
+    // with a presence tag (so None and Some(\"\") stay distinct).
+    assert!(code.contains("pub description: Option<String>"), "nullable string field");
+    assert!(code.contains(r"String::from('\u{0}')"), "None must encode to a presence tag");
+
+    insta::assert_snapshot!(code);
+}
+
+// ---------------------------------------------------------------------------
 // T1: Tests that exercise FK/relation and component fields (C1 regression guard)
 // ---------------------------------------------------------------------------
 
