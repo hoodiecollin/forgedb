@@ -1,6 +1,6 @@
 //! ForgeDB Storage Engine
 //!
-//! High-performance columnar storage engine for ForgeDB with memory-mapped file access,
+//! High-performance columnar storage engine for ForgeDB with seek-based file access,
 //! WAL integration, and tombstone-based deletion tracking.
 //!
 //! # Overview
@@ -184,7 +184,7 @@ pub enum ColumnType {
     FixedBytes(usize),
 }
 
-/// Fixed-size column storage using memory-mapped files
+/// Fixed-size column storage backed by a seek-based file
 pub struct FixedColumn {
     file: File,
     row_count: usize,
@@ -193,6 +193,15 @@ pub struct FixedColumn {
 
 impl FixedColumn {
     pub fn new(path: PathBuf, value_size: usize) -> io::Result<Self> {
+        // A zero value_size would divide-by-zero when deriving row_count below,
+        // and makes every offset computation meaningless.
+        if value_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "FixedColumn value_size must be non-zero",
+            ));
+        }
+
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -202,6 +211,7 @@ impl FixedColumn {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
 
         let row_count = file.metadata()?.len() as usize / value_size;
@@ -438,8 +448,14 @@ impl FixedColumn {
         Ok(buf)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
     }
 }
 
@@ -463,12 +479,14 @@ impl VariableColumn {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&data_path)?;
 
         let offsets_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&offsets_path)?;
 
         let current_data_offset = data_file.metadata()?.len();
@@ -532,8 +550,14 @@ impl VariableColumn {
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
     }
 }
 
@@ -553,6 +577,7 @@ impl Tombstones {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
 
         let count = file.metadata()?.len() as usize;
@@ -582,8 +607,14 @@ impl Tombstones {
         Ok(buf[0] != 0)
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
@@ -621,7 +652,14 @@ impl Database {
         })
     }
 
-    /// Open database with WAL support
+    /// Open database with WAL support.
+    ///
+    /// This attaches a [`WalManager`] but does **not** itself replay outstanding
+    /// WAL entries into the columnar files: the storage layer has no knowledge of
+    /// how logged operations map onto column writes. Crash recovery is the
+    /// caller's responsibility — after opening, drive
+    /// [`WalManager::replay_committed`] (via [`Database::wal_mut`]) and apply each
+    /// committed entry before serving reads.
     pub fn open_with_wal(
         root_path: PathBuf,
         fsync_policy: forgedb_wal::FsyncPolicy,
@@ -677,7 +715,21 @@ impl Database {
         let manifest_path = self.root_path.join("manifest.json");
         let content = serde_json::to_string_pretty(&self.manifest)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(manifest_path, content)?;
+
+        // Write to a temp file, fsync, then atomically rename over the target.
+        // A crash mid-write leaves the intact previous manifest rather than a
+        // truncated/garbage one that would fail to parse on the next open.
+        let tmp_path = self.root_path.join("manifest.json.tmp");
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(content.as_bytes())?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &manifest_path)?;
         Ok(())
     }
 
