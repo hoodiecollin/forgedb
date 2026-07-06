@@ -160,12 +160,24 @@ across many domains live in `examples/` — see `examples/README.md`.**
   time. Use `@default(identifier)`; model regex/enum intent via `@length` + a comment or a
   lookup model. (Lower priority; the grammar reference in `docs/proposals/corpus/` is
   corrected accordingly.)
-- **Relation traversal is unbuilt.** FK scalar fields (`RequiredReference`/`OptionalReference`,
-  e.g. `author_id: Uuid` / `editor_id: Option<Uuid>`) are now persisted and round-trip
-  correctly (Task #25). What remains unbuilt: `OneToMany`/`ManyToMany` back-collections
-  are virtual (stored as `()`, never persisted — intentional), and traversal helpers
-  (join-by-FK at read time, eager-load, M2M junction tables) have not been generated.
-  These are additive generation features, not correctness gaps.
+- **Relation traversal is generated** (forward + reverse + M2M + eager-load). FK scalars
+  (`RequiredReference`/`OptionalReference`) persist and round-trip (Task #25); on top of that
+  the `RustGenerator` now emits, on `Database`: **forward FK getters** (`post_author(&post)
+  -> Option<User>`, optional FKs thread through `and_then`), **reverse one-to-many** getters
+  (`user_posts(id) -> Vec<Post>`, a linear scan via a generated `Storage::all()`; when a child
+  has multiple FKs back to one parent collection the getter disambiguates by child field, e.g.
+  `user_posts_by_author`), **many-to-many** persisted junction structs (`PostTagLink` with
+  `left`/`right` UUID columns) plus `link_post_tag` / `post_tags` / `tag_posts`, and
+  **eager-load** structs (`PostWithRelations { post, author: Option<User>, … }` +
+  `post_with_relations(id)`). Honest limits: traversal is generated only between **UUID-keyed**
+  models (FK scalars are always `Uuid`, so integer-PK targets are skipped with a comment);
+  reverse/M2M lookups are **linear scans**, not indexed; there is **no M2M `unlink`** (storage
+  is append-only — `Tombstones` has no in-place setter, the same reason generated models have
+  no `delete`); and the `OneToMany`/`ManyToMany` fields *inside* the model struct remain virtual
+  `()` (the collection lives in the traversal helpers / junction table, not the record).
+  Proven compile-clean + insert→link→traverse across the whole `examples/` corpus by the
+  `scratchpad/corpus_compile` harness, and snapshot+assertion-tested by
+  `test_rust_generation_relation_traversal`.
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.

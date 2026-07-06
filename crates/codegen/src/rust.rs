@@ -71,9 +71,25 @@ impl RustGenerator {
             tokens.extend(model_tokens);
         }
 
+        // Generate M2M junction storage structs (referenced by the Database
+        // struct fields, so emitted before it).
+        let junction_tokens = Self::generate_junction_structs(schema);
+        tokens.extend(junction_tokens);
+
         // Generate database struct
         let db_tokens = Self::generate_database(schema)?;
         tokens.extend(db_tokens);
+
+        // Generate relation-traversal helpers (forward FK getters, reverse
+        // one-to-many collections, and many-to-many link/query methods) as a
+        // second `impl Database` block.
+        let traversal_tokens = Self::generate_traversal_impl(schema);
+        tokens.extend(traversal_tokens);
+
+        // Generate eager-load typed structs (`<Model>WithRelations`) plus their
+        // Database getters, which resolve a record's forward references in one call.
+        let eager_tokens = Self::generate_eager_load(schema);
+        tokens.extend(eager_tokens);
 
         // Parse and format with prettyplease
         let syntax_tree = syn::parse_file(&tokens.to_string())
@@ -161,10 +177,70 @@ impl RustGenerator {
                 pub fn get(&self, id: #id_type) -> Option<#model_name> {
                     #get_logic
                 }
+
+                /// Return every live (non-deleted) record.  Used by generated
+                /// reverse-relation traversal helpers, which filter this by a
+                /// foreign key.  Order is unspecified (follows the id map).
+                pub fn all(&self) -> Vec<#model_name> {
+                    let mut records = Vec::new();
+                    for id in self.id_to_row.keys() {
+                        if let Some(record) = self.get(*id) {
+                            records.push(record);
+                        }
+                    }
+                    records
+                }
             }
         };
 
         Ok(tokens)
+    }
+
+    /// Whether a model's primary key is a `Uuid` (vs an integer PK).
+    ///
+    /// Relation traversal is generated only between UUID-keyed models: FK scalar
+    /// fields are always emitted as `Uuid` (see `map_field_type_ident`), so a
+    /// forward getter `target.get(record.fk)` or a reverse filter `r.fk == id`
+    /// only type-checks when the referenced key is also `Uuid`.  Integer-PK
+    /// models are skipped (with a comment) rather than emitting code that won't
+    /// compile.
+    fn is_uuid_pk(model: &forgedb_parser::Model) -> bool {
+        match model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+        {
+            Some(f) => matches!(f.field_type, forgedb_parser::FieldType::Uuid),
+            None => true,
+        }
+    }
+
+    /// Many-to-many relations that can be safely generated: both endpoints must
+    /// be UUID-keyed (the junction stores two `Uuid` columns).
+    fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
+        schema
+            .detect_many_to_many_relations()
+            .into_iter()
+            .filter(|m| {
+                schema.find_model(&m.model1).is_some_and(Self::is_uuid_pk)
+                    && schema.find_model(&m.model2).is_some_and(Self::is_uuid_pk)
+            })
+            .collect()
+    }
+
+    /// Junction struct identifier for an M2M pair, e.g. `AuthorBookLink`.
+    fn junction_struct_ident(m: &forgedb_parser::ast::ManyToManyRelation) -> proc_macro2::Ident {
+        format_ident!("{}{}Link", m.model1, m.model2)
+    }
+
+    /// Database field / storage-path name for an M2M junction, e.g.
+    /// `author_book_link`.
+    fn junction_field_ident(m: &forgedb_parser::ast::ManyToManyRelation) -> proc_macro2::Ident {
+        format_ident!(
+            "{}_{}_link",
+            Self::to_snake_case(&m.model1),
+            Self::to_snake_case(&m.model2)
+        )
     }
 
     /// The Rust type used as a model's primary-key / identity type.
@@ -762,22 +838,430 @@ impl RustGenerator {
             })
             .collect();
 
+        // M2M junction storage: one persisted junction table per many-to-many
+        // pair, added as a Database field + initializer.
+        let m2m = Self::valid_m2m(schema);
+        let junction_fields: Vec<_> = m2m
+            .iter()
+            .map(|m| {
+                let field = Self::junction_field_ident(m);
+                let ty = Self::junction_struct_ident(m);
+                quote! { pub #field: #ty }
+            })
+            .collect();
+        let junction_inits: Vec<_> = m2m
+            .iter()
+            .map(|m| {
+                let field = Self::junction_field_ident(m);
+                let ty = Self::junction_struct_ident(m);
+                quote! { #field: #ty::new() }
+            })
+            .collect();
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
-                #(#db_fields),*
+                #(#db_fields,)*
+                #(#junction_fields,)*
             }
 
             impl Database {
                 pub fn new() -> Self {
                     Self {
-                        #(#db_inits),*
+                        #(#db_inits,)*
+                        #(#junction_inits,)*
                     }
                 }
             }
         };
 
         Ok(tokens)
+    }
+
+    /// Generate the persisted junction storage struct for each M2M relation.
+    ///
+    /// Each junction stores two `Uuid` columns (`left` = model1 id, `right` =
+    /// model2 id).  `link` appends a pair; `pairs` reads them all back.  Storage
+    /// is append-only, matching the model columns — there is no `unlink`, for the
+    /// same reason generated models have no `delete`: the storage engine exposes
+    /// no in-place retraction (`Tombstones` is append-only).
+    fn generate_junction_structs(schema: &Schema) -> TokenStream {
+        let mut structs = Vec::new();
+
+        for m in Self::valid_m2m(schema) {
+            let struct_ident = Self::junction_struct_ident(&m);
+            let field_snake = Self::to_snake_case(&m.model1);
+            let field_snake2 = Self::to_snake_case(&m.model2);
+            let struct_doc = format!(
+                "Junction table for the {}.{} <-> {}.{} many-to-many relation",
+                m.model1, m.field1, m.model2, m.field2
+            );
+            let base = format!("{}_{}_link", field_snake, field_snake2);
+            let left_path = format!("{}/fixed/left.bin", base);
+            let right_path = format!("{}/fixed/right.bin", base);
+
+            structs.push(quote! {
+                #[doc = #struct_doc]
+                pub struct #struct_ident {
+                    left_col: FixedColumn,
+                    right_col: FixedColumn,
+                    row_count: usize,
+                }
+
+                impl #struct_ident {
+                    pub fn new() -> Self {
+                        Self {
+                            left_col: FixedColumn::new(
+                                PathBuf::from(#left_path),
+                                16usize,
+                            ).expect("Failed to create junction column"),
+                            right_col: FixedColumn::new(
+                                PathBuf::from(#right_path),
+                                16usize,
+                            ).expect("Failed to create junction column"),
+                            row_count: 0,
+                        }
+                    }
+
+                    /// Record a link between a `left` (model1) id and a `right`
+                    /// (model2) id.
+                    pub fn link(&mut self, left: Uuid, right: Uuid) {
+                        self.left_col.append_uuid(*left.as_bytes())
+                            .expect("Failed to append link");
+                        self.right_col.append_uuid(*right.as_bytes())
+                            .expect("Failed to append link");
+                        self.row_count += 1;
+                    }
+
+                    /// Every recorded (left, right) id pair.
+                    pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
+                        (0..self.row_count)
+                            .map(|i| {
+                                let left = Uuid::from_bytes(
+                                    self.left_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                let right = Uuid::from_bytes(
+                                    self.right_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                (left, right)
+                            })
+                            .collect()
+                    }
+                }
+            });
+        }
+
+        quote! { #(#structs)* }
+    }
+
+    /// Generate the relation-traversal `impl Database` block: forward FK getters,
+    /// reverse one-to-many collection getters, and M2M link/query helpers.
+    ///
+    /// All generated method names are pushed through a single `seen` set so a
+    /// pathological schema can never produce two methods with the same name
+    /// (which would fail to compile); a collision is skipped rather than emitted.
+    fn generate_traversal_impl(schema: &Schema) -> TokenStream {
+        use std::collections::{HashMap, HashSet};
+
+        let mut methods = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
+        for model in &schema.models {
+            let model_snake = Self::to_snake_case(&model.name);
+            for field in &model.fields {
+                let (target_name, optional) = match &field.field_type {
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(t),
+                    ) => (t, false),
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::OptionalReference(t),
+                    ) => (t, true),
+                    _ => continue,
+                };
+                // Only when the target exists and is UUID-keyed.
+                let Some(target) = schema.find_model(target_name) else {
+                    continue;
+                };
+                if !Self::is_uuid_pk(target) {
+                    continue;
+                }
+
+                let method_name = format!("{}_{}", model_snake, field.name);
+                if !seen.insert(method_name.clone()) {
+                    continue;
+                }
+                let method_ident = format_ident!("{}", method_name);
+                let model_ident = format_ident!("{}", model.name);
+                let target_ident = format_ident!("{}", target.name);
+                let target_field = format_ident!("{}", Self::to_snake_case(&target.name));
+                let fk_field = format_ident!("{}", field.name);
+
+                if optional {
+                    methods.push(quote! {
+                        #[doc = "Resolve the optional foreign key to its record."]
+                        pub fn #method_ident(&self, record: &#model_ident) -> Option<#target_ident> {
+                            record.#fk_field.and_then(|fk| self.#target_field.get(fk))
+                        }
+                    });
+                } else {
+                    methods.push(quote! {
+                        #[doc = "Resolve the foreign key to its record."]
+                        pub fn #method_ident(&self, record: &#model_ident) -> Option<#target_ident> {
+                            self.#target_field.get(record.#fk_field)
+                        }
+                    });
+                }
+            }
+        }
+
+        // --- B. Reverse one-to-many collection getters ------------------------
+        // Group by (parent_model, parent_field) so that a parent whose child has
+        // multiple FKs back to it disambiguates by child field name.
+        let pairs = schema.detect_relations();
+        let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
+        for p in &pairs {
+            *group_counts
+                .entry((p.parent_model.clone(), p.parent_field.clone()))
+                .or_default() += 1;
+        }
+        for p in &pairs {
+            let Some(parent) = schema.find_model(&p.parent_model) else {
+                continue;
+            };
+            if !Self::is_uuid_pk(parent) {
+                continue;
+            }
+
+            let ambiguous = group_counts
+                .get(&(p.parent_model.clone(), p.parent_field.clone()))
+                .is_some_and(|&c| c > 1);
+            let method_name = if ambiguous {
+                format!(
+                    "{}_{}_by_{}",
+                    Self::to_snake_case(&p.parent_model),
+                    p.parent_field,
+                    p.child_field
+                )
+            } else {
+                format!("{}_{}", Self::to_snake_case(&p.parent_model), p.parent_field)
+            };
+            if !seen.insert(method_name.clone()) {
+                continue;
+            }
+            let method_ident = format_ident!("{}", method_name);
+            let child_ident = format_ident!("{}", p.child_model);
+            let child_field = format_ident!("{}", Self::to_snake_case(&p.child_model));
+            let fk_field = format_ident!("{}", p.child_field);
+            let doc = format!("All {} whose {} references the given id.", p.child_model, p.child_field);
+
+            let predicate = if p.is_required {
+                quote! { record.#fk_field == id }
+            } else {
+                quote! { record.#fk_field == Some(id) }
+            };
+
+            methods.push(quote! {
+                #[doc = #doc]
+                pub fn #method_ident(&self, id: Uuid) -> Vec<#child_ident> {
+                    self.#child_field
+                        .all()
+                        .into_iter()
+                        .filter(|record| #predicate)
+                        .collect()
+                }
+            });
+        }
+
+        // --- C. Many-to-many link + query helpers -----------------------------
+        for m in Self::valid_m2m(schema) {
+            let junction_field = Self::junction_field_ident(&m);
+            let model1_ident = format_ident!("{}", m.model1);
+            let model2_ident = format_ident!("{}", m.model2);
+            let model1_storage = format_ident!("{}", Self::to_snake_case(&m.model1));
+            let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+
+            // link_<a>_<b>
+            let link_name = format!(
+                "link_{}_{}",
+                Self::to_snake_case(&m.model1),
+                Self::to_snake_case(&m.model2)
+            );
+            if seen.insert(link_name.clone()) {
+                let link_ident = format_ident!("{}", link_name);
+                let doc = format!(
+                    "Link a {} (left) and a {} (right) in the junction table.",
+                    m.model1, m.model2
+                );
+                // Fixed `left`/`right` param names — model-derived names would
+                // collide for a self-referential M2M (model1 == model2).
+                methods.push(quote! {
+                    #[doc = #doc]
+                    pub fn #link_ident(&mut self, left: Uuid, right: Uuid) {
+                        self.#junction_field.link(left, right);
+                    }
+                });
+            }
+
+            // model1.field1 -> Vec<model2>
+            let fwd_name = format!("{}_{}", Self::to_snake_case(&m.model1), m.field1);
+            if seen.insert(fwd_name.clone()) {
+                let fwd_ident = format_ident!("{}", fwd_name);
+                let doc = format!("All linked {} for the given {} id.", m.model2, m.model1);
+                methods.push(quote! {
+                    #[doc = #doc]
+                    pub fn #fwd_ident(&self, id: Uuid) -> Vec<#model2_ident> {
+                        self.#junction_field
+                            .pairs()
+                            .into_iter()
+                            .filter(|(left, _)| *left == id)
+                            .filter_map(|(_, right)| self.#model2_storage.get(right))
+                            .collect()
+                    }
+                });
+            }
+
+            // model2.field2 -> Vec<model1>
+            let rev_name = format!("{}_{}", Self::to_snake_case(&m.model2), m.field2);
+            if seen.insert(rev_name.clone()) {
+                let rev_ident = format_ident!("{}", rev_name);
+                let doc = format!("All linked {} for the given {} id.", m.model1, m.model2);
+                methods.push(quote! {
+                    #[doc = #doc]
+                    pub fn #rev_ident(&self, id: Uuid) -> Vec<#model1_ident> {
+                        self.#junction_field
+                            .pairs()
+                            .into_iter()
+                            .filter(|(_, right)| *right == id)
+                            .filter_map(|(left, _)| self.#model1_storage.get(left))
+                            .collect()
+                    }
+                });
+            }
+        }
+
+        if methods.is_empty() {
+            return quote! {};
+        }
+
+        quote! {
+            impl Database {
+                #(#methods)*
+            }
+        }
+    }
+
+    /// Generate `<Model>WithRelations` structs and their eager-load getters.
+    ///
+    /// For every model with at least one forward foreign key to a UUID-keyed
+    /// target, emit a struct bundling the base record with each resolved
+    /// reference (`Option<Target>`, since the referent may be missing), and a
+    /// `<model>_with_relations(id)` getter that populates them in one call.  The
+    /// getter's `id` parameter uses the model's own PK type, so integer-PK models
+    /// are supported as long as their FK *targets* are UUID-keyed.
+    fn generate_eager_load(schema: &Schema) -> TokenStream {
+        let mut items = Vec::new();
+
+        for model in &schema.models {
+            // Collect forward FKs to UUID-keyed targets, preserving field order.
+            let fks: Vec<(&forgedb_parser::Field, &str, bool)> = model
+                .fields
+                .iter()
+                .filter_map(|field| match &field.field_type {
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(t),
+                    ) => Some((field, t.as_str(), false)),
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::OptionalReference(t),
+                    ) => Some((field, t.as_str(), true)),
+                    _ => None,
+                })
+                .filter(|(_, target, _)| {
+                    schema.find_model(target).is_some_and(Self::is_uuid_pk)
+                })
+                .collect();
+
+            if fks.is_empty() {
+                continue;
+            }
+
+            let model_ident = format_ident!("{}", model.name);
+            let base_field = Self::to_snake_case(&model.name);
+            let base_ident = format_ident!("{}", base_field);
+            let struct_ident = format_ident!("{}WithRelations", model.name);
+            let getter_ident = format_ident!("{}_with_relations", base_field);
+            let id_type = Self::id_type_tokens(model);
+            let struct_doc = format!("{} with its forward references resolved", model.name);
+
+            // Choose a non-colliding field name for each resolved reference:
+            // strip a trailing `_id`, falling back to the raw FK name on clash.
+            let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+            used.insert(base_field.clone());
+
+            let mut struct_fields = Vec::new();
+            let mut resolvers = Vec::new();
+            let mut resolved_idents = Vec::new();
+
+            for (field, target, optional) in fks {
+                let stripped = field
+                    .name
+                    .strip_suffix("_id")
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&field.name)
+                    .to_string();
+                let resolved_name = if used.contains(&stripped) {
+                    field.name.clone()
+                } else {
+                    stripped
+                };
+                // If even the raw name collides, skip this reference rather than
+                // emit a duplicate struct field.
+                if !used.insert(resolved_name.clone()) {
+                    continue;
+                }
+
+                let resolved_ident = format_ident!("{}", resolved_name);
+                let target_ident = format_ident!("{}", target);
+                let target_storage = format_ident!("{}", Self::to_snake_case(target));
+                let fk_ident = format_ident!("{}", field.name);
+
+                struct_fields.push(quote! {
+                    pub #resolved_ident: Option<#target_ident>
+                });
+
+                if optional {
+                    resolvers.push(quote! {
+                        let #resolved_ident = #base_ident.#fk_ident
+                            .and_then(|fk| self.#target_storage.get(fk));
+                    });
+                } else {
+                    resolvers.push(quote! {
+                        let #resolved_ident = self.#target_storage.get(#base_ident.#fk_ident);
+                    });
+                }
+                resolved_idents.push(resolved_ident);
+            }
+
+            items.push(quote! {
+                #[doc = #struct_doc]
+                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                pub struct #struct_ident {
+                    pub #base_ident: #model_ident,
+                    #(#struct_fields,)*
+                }
+
+                impl Database {
+                    #[doc = "Load a record together with its forward references."]
+                    pub fn #getter_ident(&self, id: #id_type) -> Option<#struct_ident> {
+                        let #base_ident = self.#base_ident.get(id)?;
+                        #(#resolvers)*
+                        Some(#struct_ident { #base_ident, #(#resolved_idents),* })
+                    }
+                }
+            });
+        }
+
+        quote! { #(#items)* }
     }
 
     /// Map ForgeDB field type to Rust type identifier for use with quote!
