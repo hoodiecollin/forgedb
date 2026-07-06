@@ -88,10 +88,23 @@ impl RustGenerator {
                 let field_name = format_ident!("{}", field.name);
                 let field_type = Self::map_field_type_ident(&field.field_type);
 
-                if field.is_nullable() {
-                    quote! { pub #field_name: Option<#field_type> }
+                // forgedb_types::Timestamp is a newtype over i64 and does not implement
+                // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
+                // schema while the struct field keeps the semantic Timestamp type.
+                let schema_attr = if Self::is_timestamp_type(&field.field_type) {
+                    if field.is_nullable() {
+                        quote! { #[schema(value_type = Option<i64>)] }
+                    } else {
+                        quote! { #[schema(value_type = i64)] }
+                    }
                 } else {
-                    quote! { pub #field_name: #field_type }
+                    quote! {}
+                };
+
+                if field.is_nullable() {
+                    quote! { #schema_attr pub #field_name: Option<#field_type> }
+                } else {
+                    quote! { #schema_attr pub #field_name: #field_type }
                 }
             })
             .collect();
@@ -133,9 +146,7 @@ impl RustGenerator {
                     #insert_logic
                 }
 
-                // Takes `&mut self` because the columnar readers seek the
-                // underlying files, which requires mutable access.
-                pub fn get(&mut self, id: Uuid) -> Option<#model_name> {
+                pub fn get(&self, id: Uuid) -> Option<#model_name> {
                     #get_logic
                 }
             }
@@ -241,6 +252,18 @@ impl RustGenerator {
                 let inner_tokens = Self::map_field_type_ident(inner);
                 quote! { std::mem::size_of::<Option<#inner_tokens>>() }
             }
+            // RequiredReference behaves exactly like Uuid (16-byte fixed column)
+            forgedb_parser::FieldType::Relation(
+                forgedb_parser::RelationType::RequiredReference(_),
+            ) => {
+                quote! { 16usize }
+            }
+            // OptionalReference behaves exactly like Nullable(Uuid) — Option<Uuid> bytes
+            forgedb_parser::FieldType::Relation(
+                forgedb_parser::RelationType::OptionalReference(_),
+            ) => {
+                quote! { std::mem::size_of::<Option<Uuid>>() }
+            }
             _ => {
                 // For all other fixed-size types the constant is authoritative
                 let size = match field_type {
@@ -285,7 +308,8 @@ impl RustGenerator {
                         .expect("Failed to append string");
                 });
             } else if Self::is_fixed_size_type(&field.field_type) {
-                // Check if this is a complex type that needs byte conversion
+                // Check if this is a complex type that needs byte conversion.
+                // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
                 let needs_byte_conversion = matches!(
                     &field.field_type,
                     forgedb_parser::FieldType::Char(_)
@@ -293,6 +317,9 @@ impl RustGenerator {
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
                         | forgedb_parser::FieldType::Nullable(_)
+                        | forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(_),
+                        )
                 );
 
                 if needs_byte_conversion {
@@ -313,10 +340,26 @@ impl RustGenerator {
                     // For primitives, use typed method
                     let append_method = Self::get_append_method(&field.field_type);
 
-                    // Special handling for UUID
-                    if matches!(&field.field_type, forgedb_parser::FieldType::Uuid) {
+                    // UUID and RequiredReference (FK scalar) both store a raw [u8; 16]
+                    let is_uuid_like = matches!(
+                        &field.field_type,
+                        forgedb_parser::FieldType::Uuid
+                            | forgedb_parser::FieldType::Relation(
+                                forgedb_parser::RelationType::RequiredReference(_),
+                            )
+                    );
+                    // Timestamp is a newtype over i64; append_timestamp expects i64
+                    let is_timestamp =
+                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+
+                    if is_uuid_like {
                         append_statements.push(quote! {
                             self.#field_col_name.#append_method(*record.#field_name.as_bytes())
+                                .expect("Failed to append to column");
+                        });
+                    } else if is_timestamp {
+                        append_statements.push(quote! {
+                            self.#field_col_name.#append_method(i64::from(record.#field_name))
                                 .expect("Failed to append to column");
                         });
                     } else {
@@ -365,7 +408,8 @@ impl RustGenerator {
                 // C1: only push to field_values inside the branch that emits a binding
                 field_values.push(quote! { #field_name: #field_value_name });
             } else if Self::is_fixed_size_type(&field.field_type) {
-                // Check if this is a complex type that needs byte conversion
+                // Check if this is a complex type that needs byte conversion.
+                // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
                 let needs_byte_conversion = matches!(
                     &field.field_type,
                     forgedb_parser::FieldType::Char(_)
@@ -373,6 +417,9 @@ impl RustGenerator {
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
                         | forgedb_parser::FieldType::Nullable(_)
+                        | forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(_),
+                        )
                 );
 
                 if needs_byte_conversion {
@@ -392,14 +439,32 @@ impl RustGenerator {
                     // For primitives, use typed method
                     let read_method = Self::get_read_method(&field.field_type);
 
-                    // Special handling for UUID
-                    if matches!(&field.field_type, forgedb_parser::FieldType::Uuid) {
+                    // UUID and RequiredReference (FK scalar) both read raw [u8; 16]
+                    let is_uuid_like = matches!(
+                        &field.field_type,
+                        forgedb_parser::FieldType::Uuid
+                            | forgedb_parser::FieldType::Relation(
+                                forgedb_parser::RelationType::RequiredReference(_),
+                            )
+                    );
+                    // read_timestamp returns i64; the struct field is Timestamp
+                    let is_timestamp =
+                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+
+                    if is_uuid_like {
                         read_statements.push(quote! {
                             let #field_value_name = {
                                 let bytes = self.#field_col_name.#read_method(row_index)
                                     .expect("Failed to read from column");
                                 Uuid::from_bytes(bytes)
                             };
+                        });
+                    } else if is_timestamp {
+                        read_statements.push(quote! {
+                            let #field_value_name = Timestamp::from(
+                                self.#field_col_name.#read_method(row_index)
+                                    .expect("Failed to read from column"),
+                            );
                         });
                     } else {
                         read_statements.push(quote! {
@@ -454,20 +519,16 @@ impl RustGenerator {
     }
 
     /// Generate a sensible default value for fields that have no storage column
-    /// (relations, components).  Returned tokens are placed directly in the
+    /// (virtual relations, components).  Returned tokens are placed directly in the
     /// struct literal, so they must be valid expressions of the correct type.
+    ///
+    /// NOTE: `RequiredReference` and `OptionalReference` are FK scalars — they now
+    /// have storage columns and never reach this function.  Only `OneToMany` /
+    /// `ManyToMany` (virtual, no column) and `Component` (no column) are handled here.
     fn default_for_unstored_field(field_type: &forgedb_parser::FieldType) -> TokenStream {
         match field_type {
-            forgedb_parser::FieldType::Relation(rel) => match rel {
-                // FK reference fields map to Uuid in the generated struct
-                forgedb_parser::RelationType::RequiredReference(_) => {
-                    quote! { Default::default() }
-                }
-                // Optional FK maps to Option<Uuid>
-                forgedb_parser::RelationType::OptionalReference(_) => quote! { None },
-                // Virtual relation fields (no storage at all) map to ()
-                _ => quote! { () },
-            },
+            // Virtual relation fields (no storage column) map to ()
+            forgedb_parser::FieldType::Relation(_) => quote! { () },
             // Component fields map to String
             forgedb_parser::FieldType::Component(_) => quote! { Default::default() },
             _ => quote! { Default::default() },
@@ -490,6 +551,15 @@ impl RustGenerator {
             | forgedb_parser::FieldType::StructType(_)
             | forgedb_parser::FieldType::OptionalStructType(_) => true,
             forgedb_parser::FieldType::Nullable(inner) => Self::is_fixed_size_type(inner),
+            // FK scalar references are fixed-size UUID columns (16 bytes for required,
+            // size_of::<Option<Uuid>>() for optional).  This is the load-bearing entry
+            // point that causes generate_storage_fields, generate_storage_inits,
+            // generate_insert_logic, and generate_get_logic to all agree that FK fields
+            // have a column — keeping column_index consistent across all four helpers.
+            forgedb_parser::FieldType::Relation(
+                forgedb_parser::RelationType::RequiredReference(_)
+                | forgedb_parser::RelationType::OptionalReference(_),
+            ) => true,
             _ => false,
         }
     }
@@ -499,6 +569,20 @@ impl RustGenerator {
         match field_type {
             forgedb_parser::FieldType::String => true,
             forgedb_parser::FieldType::Nullable(inner) => Self::is_string_type(inner),
+            _ => false,
+        }
+    }
+
+    /// Check if a field type is (or wraps) a `Timestamp`.
+    ///
+    /// `forgedb_types::Timestamp` is a newtype over `i64` but does not implement
+    /// `utoipa::ToSchema`.  The generator uses this to decide whether to emit a
+    /// `#[schema(value_type = …)]` annotation and to use `i64::from` / `Timestamp::from`
+    /// in the insert / get helpers respectively.
+    fn is_timestamp_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::Timestamp => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_timestamp_type(inner),
             _ => false,
         }
     }
@@ -519,6 +603,12 @@ impl RustGenerator {
             forgedb_parser::FieldType::StructType(_) => "bytes",
             forgedb_parser::FieldType::OptionalStructType(_) => "bytes",
             forgedb_parser::FieldType::Nullable(inner) => Self::type_name(inner),
+            // Both FK reference types store UUID bytes — required as 16 raw bytes,
+            // optional as Option<Uuid> bytes; the path label is "uuid" for both.
+            forgedb_parser::FieldType::Relation(
+                forgedb_parser::RelationType::RequiredReference(_)
+                | forgedb_parser::RelationType::OptionalReference(_),
+            ) => "uuid",
             _ => "unknown",
         }
     }

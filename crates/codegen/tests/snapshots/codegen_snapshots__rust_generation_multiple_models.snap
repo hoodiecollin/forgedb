@@ -48,7 +48,7 @@ impl UserStorage {
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<User> {
+    pub fn get(&self, id: Uuid) -> Option<User> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -108,7 +108,7 @@ impl PostStorage {
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<Post> {
+    pub fn get(&self, id: Uuid) -> Option<Post> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;

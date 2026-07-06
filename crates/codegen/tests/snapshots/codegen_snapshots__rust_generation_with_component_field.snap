@@ -58,7 +58,7 @@ impl ProductStorage {
         self.row_count += 1;
         id
     }
-    pub fn get(&mut self, id: Uuid) -> Option<Product> {
+    pub fn get(&self, id: Uuid) -> Option<Product> {
         let row_index = *self.id_to_row.get(&id)?;
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
