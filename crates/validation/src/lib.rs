@@ -51,17 +51,12 @@
 //! ```rust
 //! use forgedb_validation::HttpValidator;
 //!
-//! let validator = HttpValidator::new();
+//! // HttpValidator is a unit struct — call methods directly (no constructor)
+//! let result = HttpValidator::validate_email("user@example.com");
+//! assert!(result.is_ok());
 //!
-//! // Validate endpoint path
-//! match validator.validate_endpoint_path("/api/users/:id") {
-//!     Ok(_) => println!("Valid endpoint"),
-//!     Err(errors) => {
-//!         for error in errors {
-//!             eprintln!("Validation error: {}", error.message);
-//!         }
-//!     }
-//! }
+//! let result = HttpValidator::validate_length("name", "hi", 1, 10);
+//! assert!(result.is_ok());
 //! ```
 //!
 //! ## Status Code Mapping
@@ -69,14 +64,13 @@
 //! ```rust
 //! use forgedb_validation::StatusCodeMapper;
 //!
-//! let mapper = StatusCodeMapper::new();
+//! // StatusCodeMapper is a unit struct — call methods as associated functions
+//! let code = StatusCodeMapper::for_validation_error("not_found");
+//! assert_eq!(code, 404);
 //!
-//! // Map operation to status code
-//! let status = mapper.get_status_code("create", true);
-//! assert_eq!(status, 201); // Created
-//!
-//! let status = mapper.get_status_code("get", false);
-//! assert_eq!(status, 404); // Not Found
+//! assert!(StatusCodeMapper::is_success(200));
+//! assert!(StatusCodeMapper::is_client_error(404));
+//! assert!(StatusCodeMapper::is_server_error(500));
 //! ```
 //!
 //! # Public API
