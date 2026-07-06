@@ -2,6 +2,9 @@
 //!
 //! This example demonstrates integrating query params
 //! with a web API for database queries.
+//!
+//! Query-string convention: `sort`, `order`, `limit`, and `offset` are
+//! reserved; every other `field=value` pair is treated as a filter.
 
 use forgedb_query_params::*;
 use serde::{Deserialize, Serialize};
@@ -67,26 +70,18 @@ impl Database {
     fn query(&self, params: &QueryParams) -> (Vec<User>, usize) {
         let mut results = self.users.clone();
 
-        // Apply filter if present
-        if let Some(filter) = &params.filter {
-            results.retain(|user| {
-                match filter.field.as_str() {
-                    "status" => {
-                        if let FilterValue::String(val) = &filter.value {
-                            &user.status == val
-                        } else {
-                            true
-                        }
-                    }
-                    "name" => {
-                        if let FilterValue::String(val) = &filter.value {
-                            user.name.contains(val)
-                        } else {
-                            true
-                        }
-                    }
+        // Apply every filter (AND semantics).
+        for filter in &params.filters {
+            results.retain(|user| match filter.field.as_str() {
+                "status" => match &filter.value {
+                    FilterValue::String(val) => &user.status == val,
                     _ => true,
-                }
+                },
+                "name" => match &filter.value {
+                    FilterValue::String(val) => user.name.contains(val),
+                    _ => true,
+                },
+                _ => true,
             });
         }
 
@@ -112,16 +107,9 @@ impl Database {
         }
 
         // Apply pagination
-        let offset = params.pagination.offset();
-        let limit = params.pagination.limit;
-        
-        results = results
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let paged = params.pagination.apply(&results).to_vec();
 
-        (results, total)
+        (paged, total)
     }
 }
 
@@ -132,11 +120,11 @@ fn main() {
     println!("✓ Database initialized with {} users\n", db.users.len());
 
     // Example 1: List all users with default pagination
-    println!("--- Query 1: Default (all active users, first page) ---");
-    let query1 = "page=1&limit=10";
-    let params1: QueryParams = serde_urlencoded::from_str(query1).unwrap();
+    println!("--- Query 1: Default (all users, first page) ---");
+    let query1 = "limit=10";
+    let params1 = QueryParams::from_query_string(query1).unwrap();
     let (results1, total1) = db.query(&params1);
-    
+
     println!("Query: {}", query1);
     println!("Results: {} of {} total", results1.len(), total1);
     for user in results1 {
@@ -146,10 +134,10 @@ fn main() {
 
     // Example 2: Filter by status
     println!("--- Query 2: Filter by status=active ---");
-    let query2 = "filter=status:active&page=1&limit=10";
-    let params2: QueryParams = serde_urlencoded::from_str(query2).unwrap();
+    let query2 = "status=active&limit=10";
+    let params2 = QueryParams::from_query_string(query2).unwrap();
     let (results2, total2) = db.query(&params2);
-    
+
     println!("Query: {}", query2);
     println!("Results: {} of {} matching", results2.len(), total2);
     for user in results2 {
@@ -159,10 +147,10 @@ fn main() {
 
     // Example 3: Sort by name ascending
     println!("--- Query 3: Sort by name (ascending) ---");
-    let query3 = "sort=name&order=asc&page=1&limit=10";
-    let params3: QueryParams = serde_urlencoded::from_str(query3).unwrap();
+    let query3 = "sort=name&order=asc&limit=10";
+    let params3 = QueryParams::from_query_string(query3).unwrap();
     let (results3, total3) = db.query(&params3);
-    
+
     println!("Query: {}", query3);
     println!("Results: {} of {} total", results3.len(), total3);
     for user in results3 {
@@ -172,10 +160,10 @@ fn main() {
 
     // Example 4: Sort by created_at descending
     println!("--- Query 4: Sort by created_at (descending) ---");
-    let query4 = "sort=created_at&order=desc&page=1&limit=3";
-    let params4: QueryParams = serde_urlencoded::from_str(query4).unwrap();
+    let query4 = "sort=created_at&order=desc&limit=3";
+    let params4 = QueryParams::from_query_string(query4).unwrap();
     let (results4, total4) = db.query(&params4);
-    
+
     println!("Query: {}", query4);
     println!("Results: {} of {} total", results4.len(), total4);
     for user in results4 {
@@ -185,13 +173,18 @@ fn main() {
 
     // Example 5: Combined filter and sort with pagination
     println!("--- Query 5: Filter + Sort + Pagination ---");
-    let query5 = "filter=status:active&sort=name&order=asc&page=1&limit=2";
-    let params5: QueryParams = serde_urlencoded::from_str(query5).unwrap();
+    let query5 = "status=active&sort=name&order=asc&limit=2";
+    let params5 = QueryParams::from_query_string(query5).unwrap();
     let (results5, total5) = db.query(&params5);
-    
+
     println!("Query: {}", query5);
-    println!("Results: {} of {} matching (page {}, limit {})",
-        results5.len(), total5, params5.pagination.page, params5.pagination.limit);
+    println!(
+        "Results: {} of {} matching (offset {}, limit {})",
+        results5.len(),
+        total5,
+        params5.pagination.offset,
+        params5.pagination.limit
+    );
     for user in results5 {
         println!("  - {} ({}) - {}", user.name, user.email, user.status);
     }
