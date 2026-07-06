@@ -265,22 +265,35 @@ impl Parser {
                     model_name,
                 )));
             }
-            // Optional reference: ?User
+            // Optional reference or nullable primitive: ?User  or  ?i32
             Token::Question => {
                 self.advance();
-                let model_name = match self.current_token() {
-                    Token::Ident(name) => name.clone(),
+                match self.current_token().clone() {
+                    Token::Ident(name) => {
+                        self.advance();
+                        return Ok(FieldType::Relation(RelationType::OptionalReference(name)));
+                    }
+                    // Nullable primitive types: ?i32, ?string, ?bool, etc.
+                    Token::TypeU32
+                    | Token::TypeU64
+                    | Token::TypeI32
+                    | Token::TypeI64
+                    | Token::TypeF64
+                    | Token::TypeBool
+                    | Token::TypeString
+                    | Token::TypeUuid
+                    | Token::TypeTimestamp
+                    | Token::TypeChar => {
+                        let inner = self.parse_primitive_type()?;
+                        return Ok(FieldType::Nullable(Box::new(inner)));
+                    }
                     _ => {
                         return Err(format!(
-                            "Expected model name after '?', found {:?}",
+                            "Expected model name or primitive type after '?', found {:?}",
                             self.current_token()
                         ))
                     }
-                };
-                self.advance();
-                return Ok(FieldType::Relation(RelationType::OptionalReference(
-                    model_name,
-                )));
+                }
             }
             // Struct types, component references, or primitive identifiers
             Token::Ident(name) => {
@@ -481,11 +494,31 @@ impl Parser {
         // Parse type
         let mut field_type = self.parse_type()?;
 
-        // Check for optional struct marker (Type?)
+        // Check for postfix nullable marker (Type?)
         if matches!(self.current_token(), Token::Question) {
-            if let FieldType::StructType(name) = field_type {
-                self.advance();
-                field_type = FieldType::OptionalStructType(name);
+            match field_type {
+                FieldType::StructType(ref name) => {
+                    let name = name.clone();
+                    self.advance();
+                    field_type = FieldType::OptionalStructType(name);
+                }
+                // Nullable primitives with postfix `?`: e.g. `age: i32?`
+                FieldType::U32
+                | FieldType::U64
+                | FieldType::I32
+                | FieldType::I64
+                | FieldType::F64
+                | FieldType::Bool
+                | FieldType::String
+                | FieldType::Uuid
+                | FieldType::Timestamp
+                | FieldType::Char(_)
+                | FieldType::FixedArray(_, _) => {
+                    let inner = field_type.clone();
+                    self.advance();
+                    field_type = FieldType::Nullable(Box::new(inner));
+                }
+                _ => {} // Don't consume `?` for relations or other types
             }
         }
 
