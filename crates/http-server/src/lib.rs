@@ -10,7 +10,7 @@
 //! - **Type-safe routing** - Built on Axum's type-safe routing system
 //! - **Error handling** - Comprehensive error types with structured responses
 //! - **Observability** - Prometheus metrics, structured logging, health checks
-//! - **Performance** - Rate limiting, response caching, connection management
+//! - **Performance** - Rate limiting, connection management
 //! - **Security** - TLS/SSL support, authentication hooks, input validation
 //!
 //! # Architecture
@@ -21,7 +21,6 @@
 //! - **Error Handling** - Structured error types and API responses
 //! - **Authentication** - JWT, API key, and custom auth strategies
 //! - **Rate Limiting** - Token bucket rate limiting per client
-//! - **Caching** - Response caching with TTL
 //! - **Health Checks** - Readiness and liveness probes
 //! - **Metrics** - Prometheus metrics collection
 //! - **TLS** - HTTPS support with certificate management
@@ -38,8 +37,6 @@
 //! Router (match endpoint)
 //!     ↓
 //! Handler (process request)
-//!     ↓
-//! Cache (optional caching)
 //!     ↓
 //! Response
 //! ```
@@ -198,8 +195,6 @@
 //!
 //! - [`RateLimiter`] - Token bucket rate limiter
 //! - [`RateLimitConfig`] - Rate limiting configuration
-//! - [`ResponseCache`] - Response caching layer
-//! - [`CacheConfig`] - Cache configuration
 //!
 //! ## Observability
 //!
@@ -240,7 +235,6 @@
 //!
 //! # Related Crates
 //!
-//! - [`forgedb-crud-api`](../forgedb_crud_api) - CRUD handlers using this server
 //! - [`forgedb-query-params`](../forgedb_query_params) - Query parameter parsing
 //! - [`forgedb-validation`](../forgedb_validation) - Input validation
 //!
@@ -253,7 +247,6 @@
 mod error;
 mod server;
 pub mod auth;
-pub mod cache;
 pub mod health;
 pub mod metrics;
 pub mod rate_limit;
@@ -275,7 +268,6 @@ pub use auth::{
 /// Development-only static-token bearer stub.  Gated behind `feature = "dev-auth"`.
 #[cfg(feature = "dev-auth")]
 pub use auth::JwtAuthHook;
-pub use cache::{CacheConfig, CacheKey, ResponseCache};
 pub use rate_limit::{rate_limit_middleware, RateLimitConfig, RateLimiter};
 pub use tls::{serve_https, TlsConfig, TlsServer};
 

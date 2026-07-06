@@ -374,7 +374,6 @@ User {
 use uuid::Uuid;
 use serde::{Serialize, Deserialize};
 use forgedb_storage::*;
-use forgedb_crud_api::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
