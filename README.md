@@ -83,7 +83,7 @@ ForgeDB is a revolutionary database system that uses a declarative schema langua
 ## Architecture Overview
 
 ```
-schema.lang (declarative)
+schema.forge (declarative)
     ↓
 Transpiler (parser + code generator)
     ↓
@@ -120,17 +120,14 @@ Transpiler (parser + code generator)
 
 ## Development Phases
 
-### Phase 1: Core Database (v1.0)
-Foundation: Storage, types, basic queries, transpiler
-Timeline: 6-8 months
+### Phase 1: Core Database
+Foundation: storage engine, type system, basic queries, transpiler.
 
-### Phase 2: Full-Stack Integration (v2.0)
-Developer experience: CLI, API generation, hot reload
-Timeline: 4-6 months after v1
+### Phase 2: Full-Stack Integration
+Developer experience: CLI, API generation, hot reload, TypeScript SDK.
 
-### Phase 3: AI-Powered Development (v3.0)
-Future: AI agents implement components from schema annotations
-Timeline: TBD (experimental)
+### Phase 3: AI-Powered Development (experimental)
+Future: AI agents implement components from schema annotations.
 
 ## Project Structure
 
@@ -156,41 +153,39 @@ forgedb/
 
 ## Getting Started
 
-### Try the Comprehensive Example
+### Build and generate from a schema
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/forgedb
+git clone https://github.com/hoodiecollin/forgedb
 cd forgedb
 
-# Run the comprehensive blog platform example
-cargo run --example blog_platform
+# Build the workspace
+cargo build --workspace
+
+# Generate code from a schema (Rust, TypeScript, API, and stubs).
+# `generate` auto-discovers `schema.forge` in the current directory.
+cargo run -- generate all --output ./generated
 
 # Explore the generated code
-ls generated/blog_platform/
+ls ./generated
 ```
 
-This example demonstrates **all ForgeDB features** including:
-- Multi-model schemas with relations
-- All data types and indexes
-- REST API generation
-- TypeScript SDK
-- OpenAPI documentation
-
-See [examples/README.md](./examples/README.md) for detailed usage.
+See [examples/component-integration/](./examples/component-integration/) for a schema that
+exercises models, relations, indexes, and UI component integration.
 
 ### Future: CLI Usage
 
 ```bash
 # Install CLI (coming soon)
-cargo install forgedb-cli
+cargo install forgedb
 
 # Create new project
 forgedb init my-app
 cd my-app
 
 # Define schema
-cat > schema.lang << EOF
+cat > schema.forge << EOF
 User {
   id: +uuid
   email: ^&string
@@ -234,7 +229,7 @@ forgedb dev
 
 ## License
 
-TBD
+Dual-licensed under either [MIT](./LICENSE-MIT) or [Apache 2.0](./LICENSE-APACHE) at your option.
 
 ## Documentation
 
@@ -264,37 +259,23 @@ Key areas where we need help:
 
 ---
 
-## Latest Progress Summary
+## Status
 
-**Recent Completions:**
-- ✅ Sprint 9: REST API Generation with full CRUD endpoints
-- ✅ Sprint 10: TypeScript SDK Generation
-- ✅ Sprint 11: Directives & Validation (Constraints)
-- ✅ Sprint 12: Computed Fields
-- ✅ Sprint 13: OpenAPI & Documentation
-- ✅ Sprint 14: Query Optimization & Planning
-- ✅ Sprint 15: Log Compaction
-- ✅ Sprint 16: Schema Migrations
-- ✅ Sprint 17: UI Component Integration
-- ✅ Sprint 18: Full-Text Search
-- ✅ Sprint 20: Production Readiness
-- ✅ Sprint 21: Syntax Highlighting
-- ✅ Sprint 22: Language Server Protocol (LSP)
-- ✅ Sprint 23: VSCode Extension
-- ✅ 118 tests passing (115 unit + 3 integration)
-- ✅ Comprehensive examples showcasing all features
+ForgeDB is in **early development (0.1.x)** and not yet production-ready. The workspace
+builds on Rust 2024 (pinned via `rust-toolchain.toml`) with 466 passing tests.
 
-**Current Status:** Sprint 17 complete - UI Component Integration with TSX/JSX/API route generation
+Implemented and working:
+- Schema parser (lexer → AST) and validation
+- Columnar storage engine, WAL, compaction
+- Code generation: Rust database, TypeScript SDK, REST API, React/route stubs
+- Migrations, full-text search, query optimization
+- HTTP server (axum), FFI for Bun, LSP server + VSCode extension
 
-**Latest Features:**
-- Component fields in schema (`tsx://`, `jsx://`, `api://`)
-- `@relations` directive for component props
-- TypeScript component props type generation
-- React component stub generation (Next.js App Router style)
-- API route handler generation
-- Virtual field support for components
+Known gaps (see [CLAUDE.md](./CLAUDE.md) → Known issues):
+- OpenAPI generation is temporarily disabled (lost in a refactor; slated for restore)
+- A few non-hermetic integration tests and one stale example need cleanup
 
-See [SPRINT_PLAN.md](./SPRINT_PLAN.md) for detailed roadmap, [SPRINT17_SUMMARY.md](./SPRINT17_SUMMARY.md) for Sprint 17 details, and [archive/sprint-summaries/](./archive/sprint-summaries/) for all sprint summaries.
+Historical per-sprint notes live in [archive/sprint-summaries/](./archive/sprint-summaries/).
 
 ---
 
@@ -302,10 +283,10 @@ See [SPRINT_PLAN.md](./SPRINT_PLAN.md) for detailed roadmap, [SPRINT17_SUMMARY.m
 
 ```bash
 # Run all tests
-cargo test --lib
+cargo test --workspace
 
-# Run the comprehensive example showcasing all features
-cargo run --example blog_platform
+# Generate all outputs from the schema in the current directory
+cargo run -- generate all --output ./generated
 ```
 
 ## Example Schema
@@ -320,11 +301,11 @@ User {
   posts: [Post]                // One-to-many relation
   liked_posts: [Post]          // Many-to-many relation
 
-  // UI Components (Sprint 17)
+  // UI components
   profileCard: tsx://components/user/ProfileCard @relations(posts)
   avatar: jsx://components/user/Avatar
 
-  // API Routes (Sprint 17)
+  // API routes
   verifyEmail: api://routes/user/verify
 
   @index(created_at, username) // Composite index
@@ -356,24 +337,9 @@ Post {
 - `find_by_author_and_created_at(id, date)` - Composite index
 - `post_tags.add_relation(post_id, tag_id)` - Many-to-many
 
-See [examples/README.md](./examples/README.md) for complete usage guide and detailed feature documentation.
+See [examples/component-integration/](./examples/component-integration/) for a working schema.
 
 ---
 
-## Implementation Highlights (Sprints 1-13)
-
-All core features have been implemented:
-
-**✅ Sprint 1-4:** Core database, types, indexing, relations
-**✅ Sprint 5-8:** Advanced indexing, validation, persistence, inline structs
-**✅ Sprint 9-13:** REST API, TypeScript SDK, OpenAPI documentation
-
-For detailed sprint documentation, see:
-- [SPRINT_PLAN.md](./SPRINT_PLAN.md) - Feature roadmap
-- [archive/sprint-summaries/](./archive/sprint-summaries/) - Implementation details
-- [examples/README.md](./examples/README.md) - Comprehensive usage guide
-
----
-
-**Status**: All Sprints Complete (1-13) - Production Ready
-**Version**: 0.13.0
+**Status**: Early development — see [Status](#status) above.
+**Version**: 0.1.x
