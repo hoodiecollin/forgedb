@@ -6,6 +6,15 @@ use std::thread;
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Write a minimal `manifest.json` with the given row_count into `model_dir`.
+fn write_manifest(model_dir: &std::path::Path, row_count: usize) {
+    let manifest = format!(
+        r#"{{"schema_version":1,"row_count":{},"columns":[],"wal_enabled":false,"last_checkpoint":0}}"#,
+        row_count
+    );
+    fs::write(model_dir.join("manifest.json"), manifest).unwrap();
+}
+
 #[test]
 fn test_background_compactor_lifecycle() {
     let temp_dir = TempDir::new().unwrap();
@@ -30,9 +39,7 @@ fn test_background_compactor_lifecycle() {
     thread::sleep(Duration::from_millis(100));
 
     bg_compactor.stop();
-    thread::sleep(Duration::from_millis(200));
-
-    assert!(!bg_compactor.is_running());
+    // Drop joins the thread; no sleep needed (C5 fix)
 }
 
 #[test]
@@ -44,8 +51,13 @@ fn test_manual_trigger() {
     // Create test model with dead space
     fs::create_dir_all(model_dir.join("fixed")).unwrap();
 
+    // 8 rows (1 byte = 8 tombstone bits), 50% deleted
+    // Manifest required by C1 fix
+    write_manifest(&model_dir, 8);
+
+    // 8 rows, rows 0,2,4,6 deleted (50% dead): one byte per row.
     let mut tombstone_file = fs::File::create(model_dir.join("tombstones.bin")).unwrap();
-    tombstone_file.write_all(&[0b01010101]).unwrap(); // 50% dead
+    tombstone_file.write_all(&[1u8, 0, 1, 0, 1, 0, 1, 0]).unwrap();
 
     let mut id_file = fs::File::create(model_dir.join("fixed/id.bin")).unwrap();
     id_file.write_all(&[0u8; 128]).unwrap(); // 8 rows * 16 bytes

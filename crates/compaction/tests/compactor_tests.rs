@@ -5,6 +5,15 @@ use std::fs;
 use std::io::Write;
 use tempfile::TempDir;
 
+/// Write a minimal `manifest.json` with the given row_count into `model_dir`.
+fn write_manifest(model_dir: &std::path::Path, row_count: usize) {
+    let manifest = format!(
+        r#"{{"schema_version":1,"row_count":{},"columns":[],"wal_enabled":false,"last_checkpoint":0}}"#,
+        row_count
+    );
+    fs::write(model_dir.join("manifest.json"), manifest).unwrap();
+}
+
 #[test]
 fn test_compact_variable_column() {
     let temp_dir = TempDir::new().unwrap();
@@ -90,9 +99,13 @@ fn test_compact_model() {
     fs::create_dir_all(model_dir.join("fixed")).unwrap();
     fs::create_dir_all(model_dir.join("variable")).unwrap();
 
-    // Create tombstone file (3 rows, middle row deleted)
+    // Write manifest with row_count=3 (required by C1 fix)
+    write_manifest(&model_dir, 3);
+
+    // Create tombstone file (3 rows, middle row deleted): one byte per row.
+    // 0x00 = alive, 0x01 = deleted.
     let mut tombstone_file = fs::File::create(model_dir.join("tombstones.bin")).unwrap();
-    tombstone_file.write_all(&[0b00000010]).unwrap(); // Second bit set
+    tombstone_file.write_all(&[0x00, 0x01, 0x00]).unwrap(); // Row 1 deleted
 
     // Create fixed column
     let mut id_file = fs::File::create(model_dir.join("fixed/id.bin")).unwrap();
@@ -129,9 +142,9 @@ fn test_compact_model() {
     let email_data = fs::read(model_dir.join("variable/email_data.bin")).unwrap();
     assert_eq!(email_data, b"alice@example.comcharlie@example.com");
 
-    // Verify tombstone bitmap reset
+    // Verify tombstone file reset: one byte per surviving row, all 0x00.
     let tombstones = fs::read(model_dir.join("tombstones.bin")).unwrap();
-    assert_eq!(tombstones, vec![0u8]); // All clear (2 active rows fit in 1 byte)
+    assert_eq!(tombstones, vec![0u8, 0u8]); // 2 active rows, 1 byte each
 }
 
 #[test]
@@ -142,11 +155,12 @@ fn test_compact_reclaims_space() {
 
     fs::create_dir_all(model_dir.join("fixed")).unwrap();
 
-    // Create 10 rows with 5 deleted (50% dead space)
-    let mut tombstone_bytes = vec![0u8; 2]; // 10 rows needs 2 bytes
-    tombstone_bytes[0] = 0b01010101; // Alternating pattern
-    tombstone_bytes[1] = 0b00000001; // One more deleted
+    // Write manifest with row_count=10 (required by C1 fix)
+    write_manifest(&model_dir, 10);
 
+    // Create 10 rows with 5 deleted (50% dead space): one byte per row.
+    // Rows 0,2,4,6,8 deleted (0x01); rows 1,3,5,7,9 alive (0x00).
+    let tombstone_bytes: [u8; 10] = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0];
     let mut tombstone_file = fs::File::create(model_dir.join("tombstones.bin")).unwrap();
     tombstone_file.write_all(&tombstone_bytes).unwrap();
 
@@ -166,7 +180,86 @@ fn test_compact_reclaims_space() {
     let reclaim_pct = result.reclaim_percentage();
     assert!(reclaim_pct > 40.0 && reclaim_pct < 60.0);
 
-    // Active rows should be preserved
+    // Active rows should be preserved (manifest updated to active_count)
     assert_eq!(stats_after.active_rows, 5);
     assert_eq!(stats_after.deleted_rows, 0);
+}
+
+/// C1 regression test: mixed-width fixed columns (u32 + uuid) with tombstoned rows.
+///
+/// Before the fix, `read_tombstone_bitmap` guessed the row count by trying element
+/// sizes [16,8,4,1] on the first fixed column file.  When the first file was a u32
+/// column (4 bytes/row), the heuristic could pick element_size=8 → row_count=5 instead
+/// of 10, then `compact_fixed_column` computed element_size=160/5=32 for the uuid
+/// column — corrupting every row.
+///
+/// After the fix the row count comes exclusively from `manifest.json`, so both columns
+/// get the correct element size regardless of file ordering.
+#[test]
+fn test_compact_mixed_width_columns_preserves_data() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_dir = temp_dir.path();
+    let model_dir = data_dir.join("TestModel");
+
+    fs::create_dir_all(model_dir.join("fixed")).unwrap();
+
+    // 10 rows, rows 1,3,5,7,9 deleted (even-indexed rows are active: 0,2,4,6,8).
+    // One byte per row: 0x00 = alive, 0x01 = deleted.
+    let tombstone_bytes: [u8; 10] = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+    fs::write(model_dir.join("tombstones.bin"), tombstone_bytes).unwrap();
+
+    // Manifest with row_count=10
+    write_manifest(&model_dir, 10);
+
+    // u32 column (4 bytes/row): values [0, 1, 2, ..., 9]
+    // Use an alphabetically-early name so the directory iterator is likely to
+    // visit this file before the uuid column — the heuristic path that the fix
+    // replaces would mis-derive row_count from this 40-byte file.
+    let mut score_file =
+        fs::File::create(model_dir.join("fixed/aa_score.bin")).unwrap();
+    for v in 0u32..10 {
+        score_file.write_all(&v.to_le_bytes()).unwrap();
+    }
+
+    // uuid column (16 bytes/row): row N is [N as u8; 16]
+    let mut id_file =
+        fs::File::create(model_dir.join("fixed/zz_id.bin")).unwrap();
+    for n in 0u8..10 {
+        id_file.write_all(&[n; 16]).unwrap();
+    }
+
+    let compactor = Compactor::new(data_dir, CompactionConfig::default());
+    compactor.compact_model("TestModel").unwrap();
+
+    // --- Verify u32 column ---
+    // Active rows: 0,2,4,6,8 → values [0,2,4,6,8]
+    let score_data = fs::read(model_dir.join("fixed/aa_score.bin")).unwrap();
+    assert_eq!(
+        score_data.len(),
+        5 * 4,
+        "u32 column: expected 5 rows × 4 bytes = 20 bytes after compaction"
+    );
+    let score_vals: Vec<u32> = score_data
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        score_vals,
+        vec![0u32, 2, 4, 6, 8],
+        "u32 active rows must be preserved in order"
+    );
+
+    // --- Verify uuid column ---
+    // Active rows: 0,2,4,6,8 → [0;16], [2;16], [4;16], [6;16], [8;16]
+    let id_data = fs::read(model_dir.join("fixed/zz_id.bin")).unwrap();
+    assert_eq!(
+        id_data.len(),
+        5 * 16,
+        "uuid column: expected 5 rows × 16 bytes = 80 bytes after compaction"
+    );
+    assert_eq!(&id_data[0..16], &[0u8; 16], "Row 0 UUID preserved");
+    assert_eq!(&id_data[16..32], &[2u8; 16], "Row 2 UUID preserved");
+    assert_eq!(&id_data[32..48], &[4u8; 16], "Row 4 UUID preserved");
+    assert_eq!(&id_data[48..64], &[6u8; 16], "Row 6 UUID preserved");
+    assert_eq!(&id_data[64..80], &[8u8; 16], "Row 8 UUID preserved");
 }
