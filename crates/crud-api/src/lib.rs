@@ -112,70 +112,90 @@
 //! }
 //! ```
 //!
-//! ## Using CRUD Handlers with HTTP
+//! ## Using CRUD Handlers
 //!
-//! ```rust,no_run
-//! use forgedb_crud_api::{CrudHandlers, CrudOperations};
-//! use axum::{Router, routing::{get, post, put, delete}};
+//! [`CrudHandlers`] wraps a storage that implements [`CrudOperations`] and
+//! provides typed list / get / create / update / delete methods.  HTTP wiring
+//! (axum routes, etc.) is intentionally left to the caller so the crate stays
+//! free of an axum dependency.
 //!
-//! # use uuid::Uuid;
-//! # use serde::{Deserialize, Serialize};
-//! # #[derive(Clone, Debug, Serialize, Deserialize)]
-//! # struct User { id: Uuid, email: String }
-//! # #[derive(Debug, Deserialize)]
-//! # struct CreateUser { email: String }
-//! # #[derive(Debug, Deserialize)]
-//! # struct UpdateUser { email: Option<String> }
-//! # struct UserStorage;
-//! # impl CrudOperations for UserStorage {
-//! #     type Model = User;
-//! #     type CreateInput = CreateUser;
-//! #     type UpdateInput = UpdateUser;
-//! #     fn list(&self) -> forgedb_crud_api::CrudResult<Vec<Self::Model>> { Ok(vec![]) }
-//! #     fn get(&self, id: &Uuid) -> forgedb_crud_api::CrudResult<Option<Self::Model>> { Ok(None) }
-//! #     fn create(&mut self, input: Self::CreateInput) -> forgedb_crud_api::CrudResult<Self::Model> {
-//! #         Ok(User { id: Uuid::new_v4(), email: input.email })
-//! #     }
-//! #     fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> forgedb_crud_api::CrudResult<Option<Self::Model>> { Ok(None) }
-//! #     fn delete(&mut self, id: &Uuid) -> forgedb_crud_api::CrudResult<bool> { Ok(false) }
-//! # }
+//! ```rust
+//! use forgedb_crud_api::{CrudHandlers, CrudOperations, CrudResult};
+//! use uuid::Uuid;
+//! use serde::{Deserialize, Serialize};
 //!
-//! let storage = UserStorage;
-//! let handlers = CrudHandlers::new(storage);
+//! #[derive(Clone, Debug, Serialize, Deserialize)]
+//! struct User { id: Uuid, email: String }
 //!
-//! let router = Router::new()
-//!     .route("/users", get(handlers.list))
-//!     .route("/users/:id", get(handlers.get))
-//!     .route("/users", post(handlers.create))
-//!     .route("/users/:id", put(handlers.update))
-//!     .route("/users/:id", delete(handlers.delete));
+//! #[derive(Debug, Deserialize)]
+//! struct CreateUser { email: String }
+//!
+//! #[derive(Debug, Deserialize)]
+//! struct UpdateUser { email: Option<String> }
+//!
+//! struct UserStorage { users: Vec<User> }
+//!
+//! impl CrudOperations for UserStorage {
+//!     type Model = User;
+//!     type CreateInput = CreateUser;
+//!     type UpdateInput = UpdateUser;
+//!     fn list(&self) -> CrudResult<Vec<Self::Model>> { Ok(self.users.clone()) }
+//!     fn get(&self, id: &Uuid) -> CrudResult<Option<Self::Model>> {
+//!         Ok(self.users.iter().find(|u| u.id == *id).cloned())
+//!     }
+//!     fn create(&mut self, input: Self::CreateInput) -> CrudResult<Self::Model> {
+//!         let u = User { id: Uuid::new_v4(), email: input.email };
+//!         self.users.push(u.clone());
+//!         Ok(u)
+//!     }
+//!     fn update(&mut self, id: &Uuid, input: Self::UpdateInput) -> CrudResult<Option<Self::Model>> {
+//!         if let Some(u) = self.users.iter_mut().find(|u| u.id == *id) {
+//!             if let Some(email) = input.email { u.email = email; }
+//!             Ok(Some(u.clone()))
+//!         } else { Ok(None) }
+//!     }
+//!     fn delete(&mut self, id: &Uuid) -> CrudResult<bool> {
+//!         let before = self.users.len();
+//!         self.users.retain(|u| u.id != *id);
+//!         Ok(self.users.len() < before)
+//!     }
+//! }
+//!
+//! let mut handlers = CrudHandlers::new(UserStorage { users: vec![] });
+//!
+//! // Create a record, then list it back.
+//! let user = handlers.create(CreateUser { email: "alice@example.com".to_string() }).unwrap();
+//! assert_eq!(user.email, "alice@example.com");
+//!
+//! let users = handlers.list().unwrap();
+//! assert_eq!(users.len(), 1);
 //! ```
 //!
 //! ## List with Pagination
+//!
+//! The real fields are `data`, `total`, `limit`, and `offset`
+//! (not `page` / `per_page`).  Use the constructors to set them correctly.
 //!
 //! ```rust
 //! use forgedb_crud_api::ListResponse;
 //! use serde::Serialize;
 //!
 //! #[derive(Serialize)]
-//! struct User {
-//!     id: String,
-//!     email: String,
-//! }
+//! struct User { id: String, email: String }
 //!
 //! let users = vec![
 //!     User { id: "1".to_string(), email: "user1@example.com".to_string() },
 //!     User { id: "2".to_string(), email: "user2@example.com".to_string() },
 //! ];
 //!
-//! let response = ListResponse {
-//!     data: users,
-//!     total: 2,
-//!     page: 1,
-//!     per_page: 10,
-//! };
+//! // with_pagination(data, total, limit, offset)
+//! let response = ListResponse::with_pagination(users, 2, 10, 0);
+//! assert_eq!(response.total, 2);
+//! assert_eq!(response.limit, Some(10));
+//! assert_eq!(response.offset, Some(0));
 //!
 //! let json = serde_json::to_string(&response).unwrap();
+//! assert!(json.contains("user1@example.com"));
 //! ```
 //!
 //! # Public API
