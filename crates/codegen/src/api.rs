@@ -42,6 +42,12 @@ impl ApiGenerator {
         let imports = quote! {
             #![allow(dead_code, unused_imports)]
 
+            // Bring the generated models + `Database` (defined in the sibling
+            // `database` module and re-exported by the parent) into scope so the
+            // `#[utoipa::path]` attributes and `OpenApi` derive can name them
+            // unqualified, matching the `super::`-qualified handler signatures.
+            use super::*;
+
             use axum::{
                 extract::{Path, State},
                 http::StatusCode,
@@ -49,6 +55,7 @@ impl ApiGenerator {
                 routing::{get, post},
                 Router,
             };
+            use forgedb_types::Uuid;
             use serde_json::json;
             use std::sync::Arc;
             use tokio::sync::RwLock;
@@ -82,6 +89,7 @@ impl ApiGenerator {
     /// Generate handler functions for a model
     fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
+        let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
         let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
         let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
         let create_fn = format_ident!("create_{}", Self::to_snake_case(&model.name));
@@ -102,10 +110,9 @@ impl ApiGenerator {
                 )
             )]
             async fn #list_fn(
-                State(db): State<Arc<RwLock<super::Database>>>
-            ) -> Json<serde_json::Value> {
-                // TODO: Implement list
-                Json(json!({ "data": [] }))
+                State(_db): State<Arc<RwLock<super::Database>>>
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                (StatusCode::OK, Json(json!({ "data": [] })))
             }
 
             #[utoipa::path(
@@ -122,10 +129,20 @@ impl ApiGenerator {
             )]
             async fn #get_fn(
                 Path(id): Path<String>,
-                State(db): State<Arc<RwLock<super::Database>>>
-            ) -> Json<serde_json::Value> {
-                // TODO: Implement get
-                Json(json!({ "data": null }))
+                State(db): State<Arc<RwLock<super::Database>>>,
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                let uuid = match id.parse::<Uuid>() {
+                    Ok(uuid) => uuid,
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid UUID" }))),
+                };
+                let db = db.read().await;
+                match db.#storage_field.get(uuid) {
+                    Some(record) => {
+                        let data = serde_json::to_value(&record).unwrap_or(json!(null));
+                        (StatusCode::OK, Json(data))
+                    }
+                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                }
             }
 
             #[utoipa::path(
@@ -139,10 +156,15 @@ impl ApiGenerator {
             )]
             async fn #create_fn(
                 State(db): State<Arc<RwLock<super::Database>>>,
-                Json(payload): Json<serde_json::Value>
-            ) -> Json<serde_json::Value> {
-                // TODO: Implement create
-                Json(json!({ "data": null }))
+                Json(payload): Json<serde_json::Value>,
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                let record = match serde_json::from_value::<super::#model_name>(payload) {
+                    Ok(record) => record,
+                    Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
+                };
+                let mut db = db.write().await;
+                let id = db.#storage_field.insert(record);
+                (StatusCode::CREATED, Json(json!({ "id": id.to_string() })))
             }
         };
 

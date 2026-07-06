@@ -1,16 +1,17 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 152
 expression: result.code
 ---
 //! Generated API server by ForgeDB
 //! DO NOT EDIT - This file is auto-generated
 #![allow(dead_code, unused_imports)]
+use super::*;
 use axum::{
     extract::{Path, State},
     http::StatusCode, response::Json, routing::{get, post},
     Router,
 };
+use forgedb_types::Uuid;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -24,9 +25,9 @@ use utoipa_axum::routes;
     responses((status = 200, description = "List all User", body = Vec<User>))
 )]
 async fn list_user(
-    State(db): State<Arc<RwLock<super::Database>>>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : [] }))
+    State(_db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "data" : [] })))
 }
 #[utoipa::path(
     get,
@@ -41,8 +42,21 @@ async fn list_user(
 async fn get_user(
     Path(id): Path<String>,
     State(db): State<Arc<RwLock<super::Database>>>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : null }))
+) -> (StatusCode, Json<serde_json::Value>) {
+    let uuid = match id.parse::<Uuid>() {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid UUID" })));
+        }
+    };
+    let db = db.read().await;
+    match db.user.get(uuid) {
+        Some(record) => {
+            let data = serde_json::to_value(&record).unwrap_or(json!(null));
+            (StatusCode::OK, Json(data))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+    }
 }
 #[utoipa::path(
     post,
@@ -54,8 +68,19 @@ async fn get_user(
 async fn create_user(
     State(db): State<Arc<RwLock<super::Database>>>,
     Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : null }))
+) -> (StatusCode, Json<serde_json::Value>) {
+    let record = match serde_json::from_value::<super::User>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    let id = db.user.insert(record);
+    (StatusCode::CREATED, Json(json!({ "id" : id.to_string() })))
 }
 #[utoipa::path(
     get,
@@ -64,9 +89,9 @@ async fn create_user(
     responses((status = 200, description = "List all Post", body = Vec<Post>))
 )]
 async fn list_post(
-    State(db): State<Arc<RwLock<super::Database>>>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : [] }))
+    State(_db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "data" : [] })))
 }
 #[utoipa::path(
     get,
@@ -81,8 +106,21 @@ async fn list_post(
 async fn get_post(
     Path(id): Path<String>,
     State(db): State<Arc<RwLock<super::Database>>>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : null }))
+) -> (StatusCode, Json<serde_json::Value>) {
+    let uuid = match id.parse::<Uuid>() {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid UUID" })));
+        }
+    };
+    let db = db.read().await;
+    match db.post.get(uuid) {
+        Some(record) => {
+            let data = serde_json::to_value(&record).unwrap_or(json!(null));
+            (StatusCode::OK, Json(data))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+    }
 }
 #[utoipa::path(
     post,
@@ -94,8 +132,19 @@ async fn get_post(
 async fn create_post(
     State(db): State<Arc<RwLock<super::Database>>>,
     Json(payload): Json<serde_json::Value>,
-) -> Json<serde_json::Value> {
-    Json(json!({ "data" : null }))
+) -> (StatusCode, Json<serde_json::Value>) {
+    let record = match serde_json::from_value::<super::Post>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    let id = db.post.insert(record);
+    (StatusCode::CREATED, Json(json!({ "id" : id.to_string() })))
 }
 #[derive(OpenApi)]
 #[openapi(
