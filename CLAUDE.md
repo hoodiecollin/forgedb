@@ -31,7 +31,7 @@ cargo build --workspace              # build everything
 cargo test  --workspace              # NOTE: see caveat below
 cargo run   -- <command>             # run the CLI (binary is `forgedb`)
 cargo run   -- --help                # list commands
-cargo clippy --workspace             # lints (1 dead-code warning remains — see Known issues)
+cargo clippy --workspace             # no dead-code warnings (style lints remain, pre-existing)
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `serve`.
@@ -42,7 +42,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 378 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 379 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -59,7 +59,7 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 378 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+**Baseline: 379 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
 `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466".
 
 ## Workspace layout
@@ -118,12 +118,20 @@ across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
 
-- **1 dead-code warning** (down from 9 after the Phase 3b tooling sweep): only
-  `validate --implementations` remains — deferred pending a decision on where `@computed`
-  implementations live. The other 8 were resolved — WIRED (`build --no-api`, `validate
-  --components`, the `--config`/`Config`/`CliError::exit_code` config feature, LSP
-  struct-awareness) or REMOVED (`build --no-db`, `init --typescript`, `rust_main_template`,
-  LSP `Document.uri/version` + `get_document`).
+- **Dead-code warnings: 0** (all 9 from the Phase 3b sweep resolved). Eight were WIRED
+  (`build --no-api`, `validate --components`, the `--config`/`Config`/`CliError::exit_code`
+  config feature, LSP struct-awareness) or REMOVED (`build --no-db`, `init --typescript`,
+  `rust_main_template`, LSP `Document.uri/version` + `get_document`). The ninth,
+  `validate --implementations`, is **kept but `#[allow(dead_code)]`-annotated**: the flag is
+  accepted as a documented no-op until the `@computed` convention lands.
+- **`@computed` convention = schema expressions (deferred).** The chosen design is
+  `@computed(<expr>)` — the field carries an expression the generator compiles into a getter
+  (skipping storage), and `validate --implementations` then checks the expression parses and
+  its field refs resolve. Blocked on expanding the lexer beyond number/bare-ident directive
+  args to a real expression grammar (string literals + operators). Until then `@computed` is a
+  parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
+  backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
+  `api://` refs) — it would be torn out when expressions land.
 - **`init → build` needs an unpublished release.** Generated projects call storage/types
   methods (`append_uuid`/`read_uuid`/…) that exist only in the **local** crates; published
   `forgedb-storage`/`forgedb-types` `0.1.1` on crates.io lack them, so a freshly `init`ed
@@ -131,15 +139,16 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `[patch.crates-io]` it builds cleanly (exit 0). Fix = publish **storage 0.1.2 + types
   0.2.0** and bump the init-scaffold version pins — deliberately DEFERRED (fix-in-tree,
   defer-publish). Until then generated projects need a local path/patch dependency.
-- **Generated-code compilation gaps (codegen).** Surfaced by compile-testing the whole
-  `examples/` corpus (18 schemas): the emitted `database.rs` does NOT compile for three
-  common features — nullable variable-length strings (`string?` → `Option<String>`: insert
-  passes `&Option<String>` to `append_string(&str)`, get assigns `String` to
-  `Option<String>`), inline `struct` types (referenced in models but never emitted →
-  `E0425`), and `u64` auto-generate PKs (`id: +u64` → `expected Uuid, found u64`).
-  Schemas parse + `generate` fine; only compiling the output fails. Fix in a dedicated
-  codegen pass, gated on the corpus compiling (repro: `scratchpad/corpus_compile`). This
-  is why **codegen must be compile-tested, not just snapshot-tested.**
+- **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
+  that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
+  (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
+  round-trip distinctly), inline `struct` types (now emitted as `#[repr(C)]` definitions),
+  and integer (`+u64`/`+u32`) primary keys (the identity type now threads through the
+  `id_to_row` key, `insert` return, `get` param, and the generated API path parse). Proven by
+  a build-time compile harness + insert→get round-trip test (repro: `scratchpad/corpus_compile`,
+  regen through the *current* codegen on every `cargo build`). **The discipline stands:
+  codegen must be compile-tested, not just snapshot-tested** — snapshot pass ≠ output compiles,
+  which is exactly how these three gaps hid.
 - **No string-literal constraint arguments (lexer).** `@`-directive args accept only
   numbers and bare identifiers — `@pattern("regex")` and `@default("text")` fail at lex
   time. Use `@default(identifier)`; model regex/enum intent via `@length` + a comment or a
