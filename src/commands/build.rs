@@ -5,8 +5,8 @@ pub struct BuildOptions {
     pub release: bool,
     pub target: String,
     pub output: Option<String>,
+    pub schema: Option<String>,
     pub no_api: bool,
-    pub no_db: bool,
 }
 
 pub fn run(options: BuildOptions) -> Result<()> {
@@ -19,18 +19,35 @@ pub fn run(options: BuildOptions) -> Result<()> {
         schema_only: true,
         implementations: false,
         components: false,
+        schema: options.schema.clone(),
     })?;
 
-    // Generate code
+    // Generate code — respect the --no-api flag by running only the targets we want.
     ui::info("Generating code...");
-    // Build always regenerates derived artifacts — pass force: true so a
-    // second consecutive `build` does not fail on "File exists".
-    crate::commands::generate::run(crate::commands::generate::GenerateOptions {
-        target: "all".to_string(),
-        check: false,
-        output: None,
-        force: true,
-    })?;
+    if options.no_api {
+        ui::info("Skipping API generation (--no-api)");
+        for target in &["rust", "typescript", "stubs"] {
+            crate::commands::generate::run(crate::commands::generate::GenerateOptions {
+                target: target.to_string(),
+                check: false,
+                output: options.output.clone(),
+                schema: options.schema.clone(),
+                config_targets: None,
+                force: true,
+            })?;
+        }
+    } else {
+        // Build always regenerates derived artifacts — pass force: true so a
+        // second consecutive `build` does not fail on "File exists".
+        crate::commands::generate::run(crate::commands::generate::GenerateOptions {
+            target: "all".to_string(),
+            check: false,
+            output: options.output.clone(),
+            schema: options.schema.clone(),
+            config_targets: None,
+            force: true,
+        })?;
+    }
 
     // Build based on target
     match options.target.as_str() {

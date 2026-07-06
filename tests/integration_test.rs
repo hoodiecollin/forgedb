@@ -43,7 +43,6 @@ fn test_init_command_creates_project_structure() {
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
         rust: true,
-        typescript: false,
         api_only: false,
     };
 
@@ -77,7 +76,6 @@ fn test_init_with_blog_template() {
         project_name: project_path.to_string_lossy().to_string(),
         template: Some("blog".to_string()),
         rust: true,
-        typescript: false,
         api_only: false,
     };
 

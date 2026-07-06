@@ -6,7 +6,6 @@ pub struct InitOptions {
     pub project_name: String,
     pub template: Option<String>,
     pub rust: bool,
-    pub typescript: bool,
     pub api_only: bool,
 }
 
@@ -109,10 +108,12 @@ fn create_readme(options: &InitOptions) -> Result<()> {
 }
 
 fn create_rust_files(options: &InitOptions) -> Result<()> {
-    // Create Cargo.toml with the dependencies required by the generated database.rs.
-    // The generated code imports forgedb_storage, forgedb_types, derives serde traits,
-    // and uses utoipa::ToSchema on Uuid/Timestamp fields (which requires the "uuid"
-    // feature on utoipa, otherwise ToSchema fails to compile on those types).
+    // Create Cargo.toml with all dependencies required by generated code.
+    //
+    // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
+    // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields).
+    //
+    // The generated `api.rs` needs: axum, utoipa-axum, tokio (full), serde_json.
     let cargo_toml = format!(
         r#"[package]
 name = "{}"
@@ -123,7 +124,11 @@ edition = "2021"
 forgedb-storage = "0.1"
 forgedb-types = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
+serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
+utoipa-axum = "0.2"
+axum = "0.8"
+tokio = {{ version = "1", features = ["full"] }}
 "#,
         options.project_name
     );
@@ -132,20 +137,21 @@ utoipa = {{ version = "5", features = ["uuid"] }}
     fs::write(cargo_path, cargo_toml)?;
 
     // Create src/main.rs that uses generated code
-    let main_rs = r#"// Include generated database code
-mod generated {
-    include!("../generated/database.rs");
-}
+    let main_rs = r#"// The generated `generated/database.rs` is a module file with its own inner
+// attributes (`#![allow(...)]`) and `//!` docs, so it must be pulled in as a
+// `#[path]` module — NOT via `include!` inside an inline `mod { }`, which
+// rejects inner attributes (E0753).
+#[path = "../generated/database.rs"]
+mod generated;
 
-use generated::*;
-use std::path::Path;
+use generated::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🚀 Starting ForgeDB application...");
     println!();
 
-    // Initialize database
-    let mut db = Database::new();
+    // Initialize the generated database.
+    let _db = Database::new();
 
     println!("✅ Database initialized successfully!");
     println!();
