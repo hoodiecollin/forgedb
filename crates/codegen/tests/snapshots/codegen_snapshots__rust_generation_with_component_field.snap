@@ -81,6 +81,18 @@ impl ProductStorage {
             card: Default::default(),
         })
     }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<Product> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
+    }
 }
 /// Main database struct
 pub struct Database {

@@ -62,6 +62,18 @@ impl AuthorStorage {
         };
         Some(Author { id: id_value })
     }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<Author> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
+    }
 }
 ///Post model
 #[repr(C)]
@@ -171,6 +183,18 @@ impl PostStorage {
             editor_id: editor_id_value,
         })
     }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<Post> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
+    }
 }
 /// Main database struct
 pub struct Database {
@@ -183,5 +207,35 @@ impl Database {
             author: AuthorStorage::new(),
             post: PostStorage::new(),
         }
+    }
+}
+impl Database {
+    ///Resolve the foreign key to its record.
+    pub fn post_author_id(&self, record: &Post) -> Option<Author> {
+        self.author.get(record.author_id)
+    }
+    ///Resolve the optional foreign key to its record.
+    pub fn post_editor_id(&self, record: &Post) -> Option<Author> {
+        record.editor_id.and_then(|fk| self.author.get(fk))
+    }
+}
+///Post with its forward references resolved
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PostWithRelations {
+    pub post: Post,
+    pub author: Option<Author>,
+    pub editor: Option<Author>,
+}
+impl Database {
+    ///Load a record together with its forward references.
+    pub fn post_with_relations(&self, id: Uuid) -> Option<PostWithRelations> {
+        let post = self.post.get(id)?;
+        let author = self.author.get(post.author_id);
+        let editor = post.editor_id.and_then(|fk| self.author.get(fk));
+        Some(PostWithRelations {
+            post,
+            author,
+            editor,
+        })
     }
 }
