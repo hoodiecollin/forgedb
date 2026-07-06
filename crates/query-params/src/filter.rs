@@ -38,9 +38,16 @@ impl Filter {
                     return None;
                 }
 
-                // Try to parse as different types
+                // Try to parse as different types.
+                // Only coerce to Number when the round-trip string form matches the input:
+                // this rejects leading-zero strings ("01234"), "inf", "nan", and scientific
+                // notation ("1e5") that would silently corrupt string identity comparisons.
                 let value = if let Ok(num) = value_str.parse::<f64>() {
-                    FilterValue::Number(num)
+                    if num.is_finite() && num.to_string() == value_str {
+                        FilterValue::Number(num)
+                    } else {
+                        FilterValue::String(value_str)
+                    }
                 } else if let Ok(b) = value_str.parse::<bool>() {
                     FilterValue::Bool(b)
                 } else {
@@ -60,10 +67,15 @@ impl Filter {
         }
     }
 
-    /// Check if this filter matches a number value
+    /// Check if this filter matches a number value.
+    ///
+    /// Uses exact equality. REST filter params represent discrete user-supplied values
+    /// (e.g. `age=30`), where exact bit-level equality is the correct semantic.
+    /// The previous relative-epsilon comparison was wrong for large magnitudes and
+    /// added false positives for nearby-but-distinct values.
     pub fn matches_number(&self, value: f64) -> bool {
         match &self.value {
-            FilterValue::Number(n) => (*n - value).abs() < f64::EPSILON,
+            FilterValue::Number(n) => *n == value,
             _ => false,
         }
     }

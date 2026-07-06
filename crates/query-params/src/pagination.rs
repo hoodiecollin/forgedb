@@ -44,9 +44,12 @@ impl Pagination {
         Self { limit, offset }
     }
 
-    /// Get the end index (offset + limit)
+    /// Get the end index (offset + limit).
+    ///
+    /// Uses saturating addition to avoid overflow when offset is a large
+    /// user-supplied value.
     pub fn end(&self) -> usize {
-        self.offset + self.limit
+        self.offset.saturating_add(self.limit)
     }
 
     /// Check if there's a next page
