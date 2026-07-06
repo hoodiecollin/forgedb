@@ -55,6 +55,8 @@ pub enum FieldType {
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
     StructType(String),                // Reference to a struct by name
     OptionalStructType(String),        // Optional struct reference
+    /// Nullable wrapper for primitive/scalar types (e.g. `age: ?i32` or `age: i32?`)
+    Nullable(Box<FieldType>),
     // Relations
     Relation(RelationType),
     // Component references (Sprint 17)
@@ -376,6 +378,7 @@ impl FieldType {
             }
             FieldType::StructType(name) => name.clone(),
             FieldType::OptionalStructType(name) => format!("Option<{}>", name),
+            FieldType::Nullable(inner) => format!("Option<{}>", inner.to_rust_type()),
             FieldType::Relation(rel) => match rel {
                 RelationType::RequiredReference(model) => {
                     format!("uuid::Uuid /* FK to {} */", model)
@@ -422,6 +425,7 @@ impl FieldType {
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
+            FieldType::Nullable(inner) => inner.is_fixed_size(),
             FieldType::String => false,
             FieldType::Relation(_) => false, // Relations are virtual or variable
             FieldType::Component(_) => false, // Components are virtual
@@ -461,6 +465,8 @@ impl FieldType {
                     0
                 }
             }
+            // Nullable wraps the inner type in Option; use the inner size (discriminant handled by Rust)
+            FieldType::Nullable(inner) => inner.size_in_bytes(schema),
             _ => 0, // Variable-size or virtual
         }
     }
@@ -488,6 +494,7 @@ impl FieldType {
                     1
                 }
             }
+            FieldType::Nullable(inner) => inner.alignment(schema),
             _ => 1,
         }
     }
@@ -565,13 +572,13 @@ impl Field {
         self.constraints.iter().find(|c| c.name == name)
     }
 
-    /// Check if field is nullable (no constraint yet, but useful for future)
+    /// Check if field is nullable (optional references, optional structs, and nullable primitives)
     pub fn is_nullable(&self) -> bool {
-        // For now, only optional references and optional structs are nullable
         matches!(
             &self.field_type,
             FieldType::Relation(RelationType::OptionalReference(_))
                 | FieldType::OptionalStructType(_)
+                | FieldType::Nullable(_)
         )
     }
 }

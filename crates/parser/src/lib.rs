@@ -28,19 +28,19 @@
 //!
 //! ## Parsing a Schema File
 //!
-//! ```rust,no_run
+//! ```rust
 //! use forgedb_parser::Parser;
 //!
 //! let source = r#"
-//!     model User {
-//!         +id: uuid
-//!         email: string @unique @email
+//!     User {
+//!         id: +uuid
+//!         email: &string @email
 //!         age: i32 @min(18)
-//!         createdAt: timestamp
 //!     }
 //! "#;
 //!
-//! let mut parser = Parser::new(source);
+//! // Parser::new returns Result<Parser, String>
+//! let mut parser = Parser::new(source).expect("parse error");
 //! match parser.parse() {
 //!     Ok(schema) => {
 //!         println!("Parsed {} models", schema.models.len());
@@ -48,28 +48,26 @@
 //!             println!("Model: {}", model.name);
 //!         }
 //!     }
-//!     Err(errors) => {
-//!         for error in errors {
-//!             eprintln!("Parse error: {}", error);
-//!         }
+//!     Err(error) => {
+//!         eprintln!("Parse error: {}", error);
 //!     }
 //! }
 //! ```
 //!
 //! ## Working with the AST
 //!
-//! ```rust,no_run
+//! ```rust
 //! use forgedb_parser::{Parser, Model, FieldType};
 //!
 //! let source = r#"
-//!     model Post {
-//!         +id: uuid
+//!     Post {
+//!         id: +uuid
 //!         title: string
 //!         content: string
 //!     }
 //! "#;
 //!
-//! let mut parser = Parser::new(source);
+//! let mut parser = Parser::new(source).expect("parse error");
 //! let schema = parser.parse().unwrap();
 //!
 //! for model in &schema.models {
@@ -85,10 +83,11 @@
 //! ```rust
 //! use forgedb_parser::{Lexer, Token};
 //!
-//! let source = "model User { +id: uuid }";
+//! let source = "User { id: +uuid }";
 //! let mut lexer = Lexer::new(source);
 //!
-//! let tokens: Vec<Token> = lexer.collect();
+//! // Lexer::tokenize() collects all tokens into a Vec
+//! let tokens: Vec<Token> = lexer.tokenize().expect("lex error");
 //! println!("Tokenized into {} tokens", tokens.len());
 //! ```
 //!

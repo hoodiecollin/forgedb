@@ -130,7 +130,7 @@ impl Lexer {
         ident
     }
 
-    fn read_number(&mut self) -> i64 {
+    fn read_number(&mut self) -> Result<i64, String> {
         let mut num_str = String::new();
         while let Some(ch) = self.current_char() {
             if ch.is_numeric() {
@@ -140,7 +140,12 @@ impl Lexer {
                 break;
             }
         }
-        num_str.parse().unwrap_or(0)
+        num_str.parse::<i64>().map_err(|e| {
+            format!(
+                "Numeric literal '{}' is out of range at line {}, column {}: {}",
+                num_str, self.line, self.column, e
+            )
+        })
     }
 
     pub fn next_token(&mut self) -> Result<Token, String> {
@@ -227,7 +232,7 @@ impl Lexer {
                 Ok(Token::Semicolon)
             }
             Some(ch) if ch.is_numeric() => {
-                let num = self.read_number();
+                let num = self.read_number()?;
                 Ok(Token::Number(num))
             }
             Some(ch) if ch.is_alphabetic() || ch == '_' => {
