@@ -1,4 +1,4 @@
-/// WAL Writer with configurable fsync policies
+//! WAL Writer with configurable fsync policies
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;

@@ -1,13 +1,13 @@
-/// Sprint 7: Write-Ahead Log (WAL) Implementation
-///
-/// This module provides ACID properties and crash recovery through a WAL system.
-///
-/// Architecture:
-/// - WAL entries are written before modifying data files
-/// - Each entry has: [length][type][model][data][checksum]
-/// - Checksums detect corruption
-/// - WAL replay on startup ensures durability
-/// - Transactions group operations with atomic commit
+//! Write-Ahead Log (WAL) Implementation
+//!
+//! This module provides ACID properties and crash recovery through a WAL system.
+//!
+//! Architecture:
+//! - WAL entries are written before modifying data files
+//! - Each entry has: [length][type][model][data][checksum]
+//! - Checksums detect corruption
+//! - WAL replay on startup ensures durability
+//! - Transactions group operations with atomic commit
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -21,23 +21,23 @@ pub use reader::WalReader;
 pub use transaction::{Transaction, TransactionId, TransactionReplay};
 pub use writer::{FsyncPolicy, WalWriter};
 
-/// WAL file format:
-///
-/// Each entry:
-/// [4 bytes: total entry length (excluding this field)]
-/// [1 byte: operation type]
-/// [2 bytes: model name length]
-/// [N bytes: model name (UTF-8)]
-/// [M bytes: serialized data (varies by operation)]
-/// [4 bytes: CRC32 checksum]
-///
-/// Operations:
-/// - Insert (0x01): [record_id (16 bytes UUID)] [field_count] [field_data...]
-/// - Update (0x02): [record_id] [field_count] [field_data...]
-/// - Delete (0x03): [record_id]
-/// - BeginTxn (0x10): [txn_id (8 bytes)]
-/// - CommitTxn (0x11): [txn_id]
-/// - RollbackTxn (0x12): [txn_id]
+// WAL file format:
+//
+// Each entry:
+// [4 bytes: total entry length (excluding this field)]
+// [1 byte: operation type]
+// [2 bytes: model name length]
+// [N bytes: model name (UTF-8)]
+// [M bytes: serialized data (varies by operation)]
+// [4 bytes: CRC32 checksum]
+//
+// Operations:
+// - Insert (0x01): [record_id (16 bytes UUID)] [field_count] [field_data...]
+// - Update (0x02): [record_id] [field_count] [field_data...]
+// - Delete (0x03): [record_id]
+// - BeginTxn (0x10): [txn_id (8 bytes)]
+// - CommitTxn (0x11): [txn_id]
+// - RollbackTxn (0x12): [txn_id]
 
 /// WAL Manager - High-level interface for WAL operations
 pub struct WalManager {
@@ -57,7 +57,24 @@ impl WalManager {
         }
 
         let writer = WalWriter::new(&path, fsync_policy)?;
-        let reader = WalReader::new(&path)?;
+        let mut reader = WalReader::new(&path)?;
+
+        // Seed the global transaction-ID counter past any IDs already recorded
+        // on disk, so a restart cannot mint an ID that collides with a
+        // transaction already present in the WAL (which would confuse replay).
+        let max_txn_id = reader
+            .read_all()?
+            .iter()
+            .filter_map(|entry| match &entry.operation {
+                WalOperation::BeginTransaction { txn_id }
+                | WalOperation::CommitTransaction { txn_id }
+                | WalOperation::RollbackTransaction { txn_id } => Some(*txn_id),
+                _ => None,
+            })
+            .max();
+        if let Some(max) = max_txn_id {
+            transaction::seed_next_txn_id(max.saturating_add(1));
+        }
 
         Ok(WalManager {
             writer,
@@ -76,7 +93,12 @@ impl WalManager {
         self.writer.flush()
     }
 
-    /// Replay all entries from the WAL
+    /// Replay every entry from the WAL, in file order.
+    ///
+    /// This is the raw stream: transaction markers are surfaced as-is and no
+    /// commit/rollback filtering is applied, so uncommitted or rolled-back
+    /// operations are included. Use [`WalManager::replay_committed`] when you
+    /// need atomic-commit semantics (skip rolled-back/incomplete transactions).
     pub fn replay<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
     where
         F: FnMut(&WalEntry) -> io::Result<()>,
@@ -90,6 +112,56 @@ impl WalManager {
         Ok(entries)
     }
 
+    /// Replay only the entries that belong to committed transactions, plus all
+    /// non-transactional entries.
+    ///
+    /// Entries recorded between a `BeginTransaction` and its `CommitTransaction`
+    /// are replayed only if that commit is present. Rolled-back transactions and
+    /// transactions left open by a crash (BEGIN with no COMMIT) are skipped, so
+    /// the callback observes exactly the durable, atomically-committed effects.
+    /// Transaction markers themselves are not passed to the callback. Returns the
+    /// entries that were applied.
+    pub fn replay_committed<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
+    where
+        F: FnMut(&WalEntry) -> io::Result<()>,
+    {
+        let entries = self.reader.read_all()?;
+
+        // First pass: learn which transactions reached a commit.
+        let mut replay = TransactionReplay::new();
+        for entry in &entries {
+            replay.process_entry(entry);
+        }
+
+        // Second pass: apply non-transactional entries and entries from
+        // committed transactions only.
+        let mut applied = Vec::new();
+        let mut current_txn: Option<TransactionId> = None;
+        for entry in entries {
+            match &entry.operation {
+                WalOperation::BeginTransaction { txn_id } => {
+                    current_txn = Some(*txn_id);
+                }
+                WalOperation::CommitTransaction { .. }
+                | WalOperation::RollbackTransaction { .. } => {
+                    current_txn = None;
+                }
+                _ => {
+                    let apply = match current_txn {
+                        Some(txn_id) => replay.is_committed(txn_id),
+                        None => true,
+                    };
+                    if apply {
+                        callback(&entry)?;
+                        applied.push(entry);
+                    }
+                }
+            }
+        }
+
+        Ok(applied)
+    }
+
     /// Truncate the WAL (remove all entries)
     pub fn truncate(&mut self) -> io::Result<()> {
         self.writer.truncate()?;
@@ -101,8 +173,8 @@ impl WalManager {
     pub fn rotate(&mut self) -> io::Result<PathBuf> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let archive_path = self.path.with_extension(format!("log.{}", timestamp));
 
