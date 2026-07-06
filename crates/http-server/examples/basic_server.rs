@@ -19,7 +19,7 @@ async fn main() {
         .route("/", get(|| async { "Welcome to ForgeDB!" }))
         // Echo endpoint that returns JSON
         .route(
-            "/echo/:message",
+            "/echo/{message}",
             get(|Path(message): Path<String>| async move {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -39,7 +39,7 @@ async fn main() {
 
     println!("✓ Routes configured:");
     println!("  GET  /              - Root endpoint");
-    println!("  GET  /echo/:message - Echo message");
+    println!("  GET  /echo/{{message}} - Echo message");
     println!("  GET  /health        - Health check");
     println!("  GET  /metrics       - Prometheus metrics");
 
