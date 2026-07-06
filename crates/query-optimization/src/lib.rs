@@ -133,8 +133,6 @@
 //! # Related Crates
 //!
 //! - [`forgedb-storage`](../forgedb_storage) - Columnar storage engine
-//! - [`forgedb-fulltext`](../forgedb_fulltext) - Full-text search capabilities
-//! - [`forgedb-crud-api`](../forgedb_crud_api) - High-level CRUD operations
 //!
 //! # See Also
 //!

@@ -130,7 +130,6 @@
 //!
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schemas before validation
 //! - [`forgedb-http-server`](../forgedb_http_server) - Uses HTTP validation
-//! - [`forgedb-crud-api`](../forgedb_crud_api) - Uses constraint validation
 //!
 //! # See Also
 //!
