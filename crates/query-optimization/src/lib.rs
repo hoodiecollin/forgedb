@@ -34,61 +34,62 @@
 //!
 //! ## Columnar Scanning
 //!
-//! ```rust,no_run
+//! ```rust
 //! use forgedb_query_optimization::{ColumnScan, ScanFilter};
 //!
-//! // Create a column scanner
-//! let scanner = ColumnScan::new("./data/User");
-//!
-//! // Define filter predicate
-//! let filter = ScanFilter::GreaterThan {
-//!     column: "age".to_string(),
-//!     value: 18,
-//! };
-//!
-//! // Execute scan
-//! let results = scanner.scan(&filter)?;
-//! println!("Found {} matching rows", results.len());
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! // Scan a u64 column for values greater than 18
+//! let column_data: Vec<u64> = vec![5, 10, 20, 30, 15, 25];
+//! let filter = ScanFilter::Gt(18u64);
+//! let result = ColumnScan::scan_u64(&column_data, filter, None);
+//! println!("Found {} matching rows", result.matching_rows.len());
+//! assert_eq!(result.matching_rows.len(), 3); // indices 2 (20), 3 (30), 5 (25)
 //! ```
 //!
 //! ## Query Planning
 //!
-//! ```rust,no_run
-//! use forgedb_query_optimization::{QueryPlanner, QueryPlan};
+//! ```rust
+//! use forgedb_query_optimization::{QueryPlanner, planner::TableStats};
 //!
-//! let planner = QueryPlanner::new("./data");
+//! let mut planner = QueryPlanner::new();
 //!
-//! // Analyze query and generate plan
-//! let plan = planner.plan_query(
+//! // Register table statistics
+//! planner.register_table(TableStats {
+//!     name: "User".to_string(),
+//!     row_count: 10_000,
+//!     avg_row_size: 128,
+//! });
+//!
+//! // Create a query plan with filters and a limit
+//! let plan = planner.create_plan(
 //!     "User",
-//!     vec!["age > 18", "email LIKE '%@example.com'"]
-//! )?;
-//!
-//! // Inspect estimated cost
-//! println!("Estimated cost: {}", plan.estimated_cost.total_cost);
-//! println!("Estimated rows: {}", plan.estimated_cost.estimated_rows);
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//!     vec!["age > 18".to_string()],
+//!     Some(100),
+//! );
+//! println!("Estimated cost: {}", plan.total_cost);
+//! assert!(plan.total_cost > 0.0);
 //! ```
 //!
 //! ## Statistics Tracking
 //!
-//! ```rust,no_run
+//! ```rust
 //! use forgedb_query_optimization::IndexStatistics;
 //!
-//! let mut stats = IndexStatistics::new("./data");
+//! let mut stats = IndexStatistics::new();
 //!
-//! // Collect statistics for a model
-//! stats.collect_model_stats("User")?;
-//!
-//! // Query statistics
-//! let age_stats = stats.get_column_stats("User", "age")?;
-//! println!("Min: {}, Max: {}, Distinct: {}",
-//!     age_stats.min_value,
-//!     age_stats.max_value,
-//!     age_stats.distinct_values
+//! // Register an index
+//! stats.register_index(
+//!     "age_idx".to_string(),
+//!     "User".to_string(),
+//!     vec!["age".to_string()],
+//!     false,
 //! );
-//! # Ok::<(), Box<dyn std::error::Error>>(())
+//!
+//! // Update and query statistics
+//! stats.update_index_stats("age_idx", 10_000, 500, 40_960);
+//! if let Some(age_stats) = stats.get_stats("age_idx") {
+//!     println!("Cardinality: {}", age_stats.cardinality);
+//!     assert_eq!(age_stats.cardinality, 500);
+//! }
 //! ```
 //!
 //! # Public API
@@ -138,7 +139,6 @@
 //! # See Also
 //!
 //! - [README](./README.md) for detailed documentation
-//! - [SPRINT14_SUMMARY.md](../../archive/sprint-summaries/SPRINT14_SUMMARY.md) - Original implementation
 
 pub mod scan;
 pub mod planner;

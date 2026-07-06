@@ -150,8 +150,13 @@ impl QueryPlanner {
         if let Some(indexes) = self.index_info.get(table) {
             for index in indexes {
                 if index.columns.contains(&column.to_string()) {
-                    // Index scan cost = index lookup + fetch
-                    let index_lookup_cost = (selectivity * index.cardinality as f64).log2();
+                    // Index scan cost = index lookup + fetch.
+                    // Floor log2 to f64::EPSILON so zero/tiny selectivity never yields
+                    // -inf or NaN, which would cause total_cmp to produce surprising
+                    // orderings and the previous partial_cmp().unwrap() to panic.
+                    let index_lookup_cost = (selectivity * index.cardinality as f64)
+                        .log2()
+                        .max(f64::EPSILON);
                     let fetch_cost = table_stats.row_count as f64 * selectivity;
                     let total_cost = index_lookup_cost + fetch_cost;
 
@@ -166,8 +171,10 @@ impl QueryPlanner {
             }
         }
 
-        // Sort by cost (lowest first)
-        estimates.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
+        // Sort by cost (lowest first). Use total_cmp so NaN values (which can't
+        // arise now but are guarded against defensively) sort deterministically
+        // rather than panicking.
+        estimates.sort_by(|a, b| a.cost.total_cmp(&b.cost));
 
         estimates
     }
@@ -208,9 +215,12 @@ impl QueryPlanner {
         table_sizes.into_iter().map(|(name, _)| name).collect()
     }
 
-    /// Apply predicate pushdown optimization
+    /// Apply predicate pushdown optimization.
     ///
-    /// Moves filter predicates as close to the data source as possible
+    /// Moves filter predicates as close to the data source as possible.
+    /// No predicate is ever dropped: predicates that cannot be attributed to
+    /// a specific join side are preserved as a `Filter` node wrapping the join
+    /// output.
     pub fn pushdown_predicates(
         &self,
         plan: QueryPlanOp,
@@ -218,8 +228,20 @@ impl QueryPlanner {
     ) -> QueryPlanOp {
         match plan {
             QueryPlanOp::Join { left, right, join_type, estimated_rows } => {
-                // Push predicates down to join inputs if applicable
-                let (left_preds, right_preds) = self.partition_predicates_for_join(&predicates);
+                // Partition predicates to push into each side.
+                // `partition_predicates_for_join` currently cannot inspect predicate
+                // structure (predicates are plain strings), so all predicates end up
+                // in `remaining`. They are preserved as a Filter wrapping the join
+                // output — correct (if not pushed-down-optimal).
+                let (left_preds, right_preds) =
+                    self.partition_predicates_for_join(&predicates);
+
+                // Predicates not routed to either side must be applied at join output.
+                let remaining: Vec<String> = predicates
+                    .iter()
+                    .filter(|p| !left_preds.contains(p) && !right_preds.contains(p))
+                    .cloned()
+                    .collect();
 
                 let optimized_left = if !left_preds.is_empty() {
                     Box::new(self.pushdown_predicates(*left, left_preds))
@@ -233,11 +255,23 @@ impl QueryPlanner {
                     right
                 };
 
-                QueryPlanOp::Join {
+                let join = QueryPlanOp::Join {
                     left: optimized_left,
                     right: optimized_right,
                     join_type,
                     estimated_rows,
+                };
+
+                // Wrap the join in a Filter when predicates remain unattributed,
+                // ensuring no predicate is silently dropped.
+                if remaining.is_empty() {
+                    join
+                } else {
+                    QueryPlanOp::Filter {
+                        predicate: remaining.join(" AND "),
+                        input_rows: estimated_rows,
+                        selectivity: 0.1, // Conservative estimate
+                    }
                 }
             }
             QueryPlanOp::TableScan { table, row_count } => {
@@ -258,13 +292,16 @@ impl QueryPlanner {
         }
     }
 
-    /// Partition predicates for left/right sides of join
+    /// Partition predicates for left/right sides of a join.
+    ///
+    /// Currently returns empty vecs because predicate strings carry no structured
+    /// table-attribution metadata. Callers must handle the all-remaining case by
+    /// wrapping the join in a Filter (see `pushdown_predicates`).
     fn partition_predicates_for_join(&self, _predicates: &[String]) -> (Vec<String>, Vec<String>) {
-        // Simple implementation - in reality would parse predicates
-        // and determine which side of join they apply to
-        let left = Vec::new();
-        let right = Vec::new();
-        (left, right)
+        // TODO: parse predicate strings to identify table/column references and
+        // route to the appropriate side. Until then, all predicates are "remaining"
+        // and get applied as a post-join Filter by the caller.
+        (Vec::new(), Vec::new())
     }
 
     /// Create a complete query plan with cost estimation

@@ -141,12 +141,26 @@ impl ColumnScan {
                 }
             }
             ScanFilter::Gt(value) => {
-                let compare_vec = _mm256_set1_epi64x(*value as i64);
+                // _mm256_cmpgt_epi64 performs a SIGNED 64-bit comparison.  For u64
+                // operands, values ≥ 2^63 have their sign bit set and compare as
+                // negative under signed semantics, producing wrong results.
+                //
+                // Fix: XOR both operands with 0x8000_0000_0000_0000 (flip the sign
+                // bit) before comparing.  This maps u64 ordering to i64 ordering:
+                //   u64 min (0)       → i64 min (i64::MIN)
+                //   u64 max (u64::MAX) → i64 max (i64::MAX)
+                // so the signed cmpgt result matches the unsigned ordering.
+                const BIAS: u64 = 1u64 << 63;
+                let biased_value = (*value ^ BIAS) as i64;
+                let compare_vec = _mm256_set1_epi64x(biased_value);
+                let bias_vec = _mm256_set1_epi64x(BIAS as i64);
 
                 let mut i = 0;
                 while i + SIMD_WIDTH <= batch.len() {
                     let data_vec = _mm256_loadu_si256(batch.as_ptr().add(i) as *const __m256i);
-                    let cmp_result = _mm256_cmpgt_epi64(data_vec, compare_vec);
+                    // Bias the data lane to convert unsigned to signed ordering.
+                    let biased_data = _mm256_xor_si256(data_vec, bias_vec);
+                    let cmp_result = _mm256_cmpgt_epi64(biased_data, compare_vec);
                     let mask = _mm256_movemask_pd(_mm256_castsi256_pd(cmp_result));
 
                     for j in 0..SIMD_WIDTH {
