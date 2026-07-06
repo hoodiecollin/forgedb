@@ -56,6 +56,15 @@ impl RustGenerator {
         };
         tokens.extend(imports);
 
+        // Generate embedded struct definitions before the models that reference
+        // them.  Models store structs as raw fixed-size bytes, so the struct
+        // types must exist for the emitted `size_of`/`read_unaligned` code to
+        // compile (without this, struct-typed fields fail with E0425).
+        for struct_def in &schema.structs {
+            let struct_tokens = Self::generate_struct(struct_def);
+            tokens.extend(struct_tokens);
+        }
+
         // Generate models
         for model in &schema.models {
             let model_tokens = Self::generate_model(model, schema)?;
@@ -121,6 +130,9 @@ impl RustGenerator {
         // Generate get logic
         let get_logic = Self::generate_get_logic(model);
 
+        // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
+        let id_type = Self::id_type_tokens(model);
+
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
             #[doc = #model_doc]
@@ -142,17 +154,81 @@ impl RustGenerator {
                     }
                 }
 
-                pub fn insert(&mut self, record: #model_name) -> Uuid {
+                pub fn insert(&mut self, record: #model_name) -> #id_type {
                     #insert_logic
                 }
 
-                pub fn get(&self, id: Uuid) -> Option<#model_name> {
+                pub fn get(&self, id: #id_type) -> Option<#model_name> {
                     #get_logic
                 }
             }
         };
 
         Ok(tokens)
+    }
+
+    /// The Rust type used as a model's primary-key / identity type.
+    ///
+    /// Derived from the `id` field (or the first auto-generate field). UUID PKs
+    /// yield `Uuid`; integer PKs (`id: +u64` / `+u32`) yield the matching integer
+    /// type.  Keeping this in one place makes the `id_to_row` map key, the
+    /// `insert` return type, and the `get` parameter type all agree with
+    /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
+    fn id_type_tokens(model: &forgedb_parser::Model) -> TokenStream {
+        match model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+        {
+            Some(f) => Self::map_field_type_ident(&f.field_type),
+            None => quote! { Uuid },
+        }
+    }
+
+    /// Generate a fixed-size embedded struct definition.
+    ///
+    /// Structs are referenced by models via `StructType` / `OptionalStructType`
+    /// and persisted as raw fixed-size bytes, so they are `#[repr(C)]`.  The
+    /// parser guarantees struct fields are all fixed-size, so the same rendering
+    /// rules as model fields apply: `Timestamp` needs a `#[schema(value_type)]`
+    /// annotation for utoipa, and nullable fields get an `Option<>` wrapper.
+    fn generate_struct(struct_def: &forgedb_parser::Struct) -> TokenStream {
+        let struct_name = format_ident!("{}", struct_def.name);
+        let struct_doc = format!("{} embedded struct", struct_def.name);
+
+        let fields: Vec<_> = struct_def
+            .fields
+            .iter()
+            .map(|field| {
+                let field_name = format_ident!("{}", field.name);
+                let field_type = Self::map_field_type_ident(&field.field_type);
+
+                let schema_attr = if Self::is_timestamp_type(&field.field_type) {
+                    if field.is_nullable() {
+                        quote! { #[schema(value_type = Option<i64>)] }
+                    } else {
+                        quote! { #[schema(value_type = i64)] }
+                    }
+                } else {
+                    quote! {}
+                };
+
+                if field.is_nullable() {
+                    quote! { #schema_attr pub #field_name: Option<#field_type> }
+                } else {
+                    quote! { #schema_attr pub #field_name: #field_type }
+                }
+            })
+            .collect();
+
+        quote! {
+            #[doc = #struct_doc]
+            #[repr(C)]
+            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            pub struct #struct_name {
+                #(#fields),*
+            }
+        }
     }
 
     /// Generate storage field declarations for columnar storage
@@ -174,8 +250,9 @@ impl RustGenerator {
             // Skip relations and other non-storage types
         }
 
+        let id_type = Self::id_type_tokens(model);
         quote! {
-            id_to_row: HashMap<Uuid, usize>,
+            id_to_row: HashMap<#id_type, usize>,
             row_count: usize,
             #(#column_fields,)*
             tombstones: forgedb_storage::Tombstones,
@@ -303,10 +380,32 @@ impl RustGenerator {
             let field_col_name = format_ident!("{}_col", field.name);
 
             if Self::is_string_type(&field.field_type) {
-                append_statements.push(quote! {
-                    self.#field_col_name.append_string(&record.#field_name)
-                        .expect("Failed to append string");
-                });
+                if field.is_nullable() {
+                    // Nullable string (`string?` -> Option<String>).  Encode with a
+                    // 1-byte presence tag so `None` and `Some("")` round-trip
+                    // distinctly (0x00 = None, 0x01 = Some), then store as an
+                    // ordinary variable-length string.
+                    append_statements.push(quote! {
+                        {
+                            let encoded = match &record.#field_name {
+                                Some(s) => {
+                                    let mut e = String::with_capacity(s.len() + 1);
+                                    e.push('\u{1}');
+                                    e.push_str(s);
+                                    e
+                                }
+                                None => String::from('\u{0}'),
+                            };
+                            self.#field_col_name.append_string(&encoded)
+                                .expect("Failed to append string");
+                        }
+                    });
+                } else {
+                    append_statements.push(quote! {
+                        self.#field_col_name.append_string(&record.#field_name)
+                            .expect("Failed to append string");
+                    });
+                }
             } else if Self::is_fixed_size_type(&field.field_type) {
                 // Check if this is a complex type that needs byte conversion.
                 // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
@@ -401,10 +500,26 @@ impl RustGenerator {
             let field_value_name = format_ident!("{}_value", field.name);
 
             if Self::is_string_type(&field.field_type) {
-                read_statements.push(quote! {
-                    let #field_value_name = self.#field_col_name.read_string(row_index)
-                        .expect("Failed to read string");
-                });
+                if field.is_nullable() {
+                    // Decode the 1-byte presence tag written by insert
+                    // (0x01 = Some, anything else = None).
+                    read_statements.push(quote! {
+                        let #field_value_name = {
+                            let raw = self.#field_col_name.read_string(row_index)
+                                .expect("Failed to read string");
+                            if raw.as_bytes().first() == Some(&1u8) {
+                                Some(raw[1..].to_string())
+                            } else {
+                                None
+                            }
+                        };
+                    });
+                } else {
+                    read_statements.push(quote! {
+                        let #field_value_name = self.#field_col_name.read_string(row_index)
+                            .expect("Failed to read string");
+                    });
+                }
                 // C1: only push to field_values inside the branch that emits a binding
                 field_values.push(quote! { #field_name: #field_value_name });
             } else if Self::is_fixed_size_type(&field.field_type) {

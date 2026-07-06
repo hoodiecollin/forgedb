@@ -43,14 +43,14 @@ async fn get_user(
     Path(id): Path<String>,
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let uuid = match id.parse::<Uuid>() {
-        Ok(uuid) => uuid,
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid UUID" })));
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
         }
     };
     let db = db.read().await;
-    match db.user.get(uuid) {
+    match db.user.get(key) {
         Some(record) => {
             let data = serde_json::to_value(&record).unwrap_or(json!(null));
             (StatusCode::OK, Json(data))

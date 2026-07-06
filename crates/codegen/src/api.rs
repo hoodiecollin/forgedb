@@ -86,9 +86,32 @@ impl ApiGenerator {
         Ok(prettyplease::unparse(&syntax_tree))
     }
 
+    /// Rust type a model's primary key parses into (mirrors `RustGenerator`'s
+    /// identity type).  UUID PKs parse as `Uuid`; integer PKs as `u64` / `u32` /
+    /// `i64` / `i32` so the generated `get` handler passes the right key type to
+    /// storage.
+    fn id_parse_type(model: &forgedb_parser::Model) -> TokenStream {
+        match model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+        {
+            Some(f) => match &f.field_type {
+                forgedb_parser::FieldType::U32 => quote! { u32 },
+                forgedb_parser::FieldType::U64 => quote! { u64 },
+                forgedb_parser::FieldType::I32 => quote! { i32 },
+                forgedb_parser::FieldType::I64 => quote! { i64 },
+                forgedb_parser::FieldType::Uuid => quote! { Uuid },
+                _ => quote! { Uuid },
+            },
+            None => quote! { Uuid },
+        }
+    }
+
     /// Generate handler functions for a model
     fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
+        let id_type = Self::id_parse_type(model);
         let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
         let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
         let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
@@ -131,12 +154,12 @@ impl ApiGenerator {
                 Path(id): Path<String>,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
-                let uuid = match id.parse::<Uuid>() {
-                    Ok(uuid) => uuid,
-                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid UUID" }))),
+                let key = match id.parse::<#id_type>() {
+                    Ok(key) => key,
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
                 };
                 let db = db.read().await;
-                match db.#storage_field.get(uuid) {
+                match db.#storage_field.get(key) {
                     Some(record) => {
                         let data = serde_json::to_value(&record).unwrap_or(json!(null));
                         (StatusCode::OK, Json(data))
