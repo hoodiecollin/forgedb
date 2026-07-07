@@ -71,11 +71,13 @@
 //!         name: "id".to_string(),
 //!         column_type: ColumnType::U64,
 //!         column_index: 0,
+//!         ..Default::default()
 //!     },
 //!     ColumnMetadata {
 //!         name: "email".to_string(),
 //!         column_type: ColumnType::String,
 //!         column_index: 0,
+//!         ..Default::default()
 //!     },
 //! ];
 //!
@@ -167,6 +169,12 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+/// Default `format_version` for manifests written before the field existed.
+/// Old on-disk manifests deserialize as v1 (the original layout), not v0.
+fn default_format_version() -> u32 {
+    1
+}
+
 /// Manifest stores metadata about the database
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
@@ -177,17 +185,114 @@ pub struct Manifest {
     pub wal_enabled: bool,
     #[serde(default)]
     pub last_checkpoint: u64,
+    /// Generation counter bumped on every compaction. A byte-watermark
+    /// incremental backup (#57) is valid only within one epoch — compaction
+    /// rewrites files and shifts offsets, so crossing an epoch forces a fresh
+    /// full backup. Additive (`#[serde(default)]`) for on-disk back-compat.
+    #[serde(default)]
+    pub compaction_epoch: u64,
+    /// On-disk layout format version, so a schema-blind reader (backup #57,
+    /// inspector #63) can refuse mismatched bytes instead of misreading them.
+    #[serde(default = "default_format_version")]
+    pub format_version: u32,
+    /// Which file's length authoritatively counts committed rows, and how many
+    /// bytes it spends per row. For a model this is `tombstones.bin` (1 byte/row,
+    /// appended last per insert); for an M2M junction it is `fixed/right.bin`
+    /// (16 bytes/row, appended last per link). A schema-blind reader derives the
+    /// committed row count as `len(anchor) / bytes_per_row` — the live watermark,
+    /// independent of the (possibly stale) `row_count` field above. `None` on
+    /// legacy manifests ⇒ fall back to `tombstones.bin`.
+    #[serde(default)]
+    pub row_anchor: Option<RowAnchor>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Physical descriptor of the file whose length counts committed rows.
+/// Layout fact only — names a file and a per-row byte stride, never a schema
+/// semantic. See [`Manifest::row_anchor`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RowAnchor {
+    /// Anchor file path relative to the model/junction directory.
+    pub relative_path: String,
+    /// Bytes the anchor file spends per committed row (`1` for tombstones,
+    /// `16` for a junction's uuid `right` column).
+    pub bytes_per_row: usize,
+}
+
+impl Manifest {
+    /// Load a manifest from an explicit path (e.g. a per-model
+    /// `<model>/manifest.json`), without opening a full [`Database`]. Used by
+    /// schema-blind ops tooling — `forgedb-backup` (#57), the inspector (#63) —
+    /// that reads layout metadata for one model directory.
+    pub fn load_from(path: &std::path::Path) -> io::Result<Manifest> {
+        let content = fs::read_to_string(path)?;
+        serde_json::from_str(&content)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Atomically write this manifest to `path` via temp-file + `fsync` +
+    /// `rename`. A crash mid-write leaves the intact previous manifest rather
+    /// than a truncated/garbage one that would fail to parse on the next open.
+    /// The temp file is `<path>.tmp`.
+    pub fn save_to(&self, path: &std::path::Path) -> io::Result<()> {
+        let content = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut tmp_path = path.as_os_str().to_owned();
+        tmp_path.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_path);
+        {
+            let mut tmp = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(content.as_bytes())?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+}
+
+/// Whether a column is fixed-width (positional I/O) or variable-length
+/// (offset-indexed data file). Physical-layout fact only — never a schema
+/// semantic. Lets a schema-blind reader bound each file without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ColumnKind {
+    #[default]
+    Fixed,
+    Variable,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ColumnMetadata {
     pub name: String,
     pub column_type: ColumnType,
     pub column_index: usize,
+    /// Bytes per row for a fixed column; `0` for a variable column (its width
+    /// lives in the offsets file). Lets backup compute a fixed column's exact
+    /// committed length as `row_count * value_size` without guessing.
+    #[serde(default)]
+    pub value_size: usize,
+    /// Fixed vs. variable — selects how a reader bounds the column's files.
+    #[serde(default)]
+    pub kind: ColumnKind,
+    /// Column file path relative to the model directory (e.g.
+    /// `fixed/u32_0.bin` or `variable/string_data_1.bin`). For a variable
+    /// column this is the data file; the offsets file is the same path with
+    /// `_data.bin` → `_offsets.bin` (the storage-layout convention `stats.rs`
+    /// already relies on).
+    #[serde(default)]
+    pub relative_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ColumnType {
+    #[default]
     U32,
     U64,
     I32,
@@ -671,6 +776,9 @@ impl Database {
                 columns: Vec::new(),
                 wal_enabled: false,
                 last_checkpoint: 0,
+                compaction_epoch: 0,
+                format_version: default_format_version(),
+                row_anchor: None,
             }
         };
 
@@ -708,6 +816,9 @@ impl Database {
                 columns: Vec::new(),
                 wal_enabled: true,
                 last_checkpoint: 0,
+                compaction_epoch: 0,
+                format_version: default_format_version(),
+                row_anchor: None,
             }
         };
 
@@ -741,25 +852,8 @@ impl Database {
     }
 
     pub fn save_manifest(&self) -> io::Result<()> {
-        let manifest_path = self.root_path.join("manifest.json");
-        let content = serde_json::to_string_pretty(&self.manifest)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-        // Write to a temp file, fsync, then atomically rename over the target.
-        // A crash mid-write leaves the intact previous manifest rather than a
-        // truncated/garbage one that would fail to parse on the next open.
-        let tmp_path = self.root_path.join("manifest.json.tmp");
-        {
-            let mut tmp = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            tmp.write_all(content.as_bytes())?;
-            tmp.sync_all()?;
-        }
-        fs::rename(&tmp_path, &manifest_path)?;
-        Ok(())
+        self.manifest
+            .save_to(&self.root_path.join("manifest.json"))
     }
 
     pub fn get_manifest(&self) -> &Manifest {

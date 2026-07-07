@@ -175,11 +175,13 @@ fn test_database_manifest() {
             name: "id".to_string(),
             column_type: ColumnType::U64,
             column_index: 0,
+            ..Default::default()
         },
         ColumnMetadata {
             name: "email".to_string(),
             column_type: ColumnType::String,
             column_index: 0,
+            ..Default::default()
         },
     ];
 
