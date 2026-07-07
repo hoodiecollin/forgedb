@@ -13,8 +13,7 @@ The backlog now lives in **GitHub Issues**, not this file. This page is just a m
 
 ## Current known gaps (`tech-debt`)
 
-- [#46](https://github.com/hoodiecollin/forgedb/issues/46) — Lexer: string-literal directive arguments (`@pattern("…")`, `@default("…")`)
-- [#47](https://github.com/hoodiecollin/forgedb/issues/47) — `@computed` expression convention + wire `validate --implementations` (blocked on #46)
+- [#47](https://github.com/hoodiecollin/forgedb/issues/47) — `@computed` expression convention + wire `validate --implementations` (string-literal lexing from #46 landed; still needs an expression grammar)
 - [#48](https://github.com/hoodiecollin/forgedb/issues/48) — query-optimization: join predicate pushdown (needs a predicate IR)
 - [#49](https://github.com/hoodiecollin/forgedb/issues/49) — Restore OpenAPI generation
 
