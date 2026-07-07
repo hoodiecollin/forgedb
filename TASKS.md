@@ -19,7 +19,9 @@ The backlog now lives in **GitHub Issues**, not this file. This page is just a m
 
 ## Feature ideas (`idea`)
 
-All unprioritized; each needs a design note first. Grouped by theme:
+Each needs a design note first. The **next stack** is labeled
+[`plan-next`](https://github.com/hoodiecollin/forgedb/issues?q=is%3Aissue+is%3Aopen+label%3Aplan-next)
+(#50–52, #56, #57, #59, #62, #63); everything else is eligible for later priority. Grouped by theme:
 
 - **Runtimes & distribution** — WASM ([#50](https://github.com/hoodiecollin/forgedb/issues/50)),
   Python bindings ([#51](https://github.com/hoodiecollin/forgedb/issues/51)),
