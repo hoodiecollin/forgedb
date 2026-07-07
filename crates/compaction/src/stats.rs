@@ -16,32 +16,25 @@ impl StatsCollector {
         }
     }
 
-    /// Read the authoritative row count from the model's `manifest.json`.
+    /// Read the authoritative row count from the tombstone file length.
     ///
-    /// Returns an error when the manifest is absent or does not contain
-    /// `row_count`.  Used instead of the previous size-guessing heuristic
-    /// that failed for models with mixed column widths.
-    fn read_manifest_row_count(model_dir: &Path) -> Result<usize, String> {
-        let manifest_path = model_dir.join("manifest.json");
-        if !manifest_path.exists() {
+    /// `tombstones.bin` stores 1 byte/row and is appended last in each insert
+    /// (#65), so its byte length is the count of physically-committed rows.
+    /// This is the same anchor generated `open()`/reopen uses — no manifest
+    /// required (generated databases do not write one).  Replaces the previous
+    /// dependency on a `manifest.json` `row_count`, and the size-guessing
+    /// heuristic before that (which failed for mixed column widths).
+    fn read_row_count(model_dir: &Path) -> Result<usize, String> {
+        let tombstone_path = model_dir.join("tombstones.bin");
+        if !tombstone_path.exists() {
             return Err(format!(
-                "manifest.json not found in {:?}; cannot determine row count",
+                "tombstones.bin not found in {:?}; cannot determine row count",
                 model_dir
             ));
         }
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("Failed to read manifest {:?}: {}", manifest_path, e))?;
-        let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse manifest {:?}: {}", manifest_path, e))?;
-        value["row_count"]
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| {
-                format!(
-                    "manifest.json at {:?} is missing the 'row_count' field",
-                    manifest_path
-                )
-            })
+        fs::metadata(&tombstone_path)
+            .map(|m| m.len() as usize)
+            .map_err(|e| format!("Failed to stat {:?}: {}", tombstone_path, e))
     }
 
     /// Collect statistics for a specific model
@@ -52,8 +45,8 @@ impl StatsCollector {
             return Err(format!("Model directory not found: {:?}", model_dir));
         }
 
-        // C1: use authoritative row count from manifest
-        let row_count = Self::read_manifest_row_count(&model_dir)?;
+        // C1: use authoritative row count from the tombstone file length (#65)
+        let row_count = Self::read_row_count(&model_dir)?;
 
         let mut stats = ModelStats {
             name: model_name.to_string(),

@@ -20,41 +20,42 @@ impl Compactor {
         }
     }
 
-    /// Read the authoritative row count from a model's `manifest.json`.
+    /// Read the authoritative row count from the tombstone file length.
     ///
-    /// Compaction must not proceed without this — guessing element sizes from
-    /// the first fixed column file is unreliable and corrupts columns with
-    /// different widths (C1 fix).
-    fn read_manifest_row_count(model_dir: &Path) -> Result<usize, String> {
-        let manifest_path = model_dir.join("manifest.json");
-        if !manifest_path.exists() {
+    /// `tombstones.bin` stores 1 byte/row and is appended last in each insert
+    /// (#65), so its byte length is the count of physically-committed rows — the
+    /// same anchor generated `open()`/reopen uses.  No manifest required
+    /// (generated databases do not write one).  Guessing element sizes from the
+    /// first fixed column file is unreliable and corrupts columns with different
+    /// widths (the original C1 fix), so the tombstone length is authoritative.
+    fn read_row_count(model_dir: &Path) -> Result<usize, String> {
+        let tombstone_path = model_dir.join("tombstones.bin");
+        if !tombstone_path.exists() {
             return Err(format!(
-                "manifest.json not found in {:?}; cannot determine row count for compaction. \
-                 Ensure the model has been initialised via the storage layer before compacting.",
+                "tombstones.bin not found in {:?}; cannot determine row count for compaction. \
+                 Ensure the model has been initialised (inserted at least once) before compacting.",
                 model_dir
             ));
         }
-        let content = fs::read_to_string(&manifest_path)
-            .map_err(|e| format!("Failed to read manifest {:?}: {}", manifest_path, e))?;
-        let value: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse manifest {:?}: {}", manifest_path, e))?;
-        value["row_count"]
-            .as_u64()
-            .map(|n| n as usize)
-            .ok_or_else(|| {
-                format!(
-                    "manifest.json at {:?} is missing the 'row_count' field",
-                    manifest_path
-                )
-            })
+        fs::metadata(&tombstone_path)
+            .map(|m| m.len() as usize)
+            .map_err(|e| format!("Failed to stat {:?}: {}", tombstone_path, e))
     }
 
-    /// Write a new `row_count` back to `manifest.json` after compaction.
+    /// Refresh the per-model `manifest.json` `row_count` after compaction, if a
+    /// manifest exists.
     ///
+    /// Best-effort: generated databases anchor on the tombstone file (which
+    /// compaction already rewrote to the active count), so a missing manifest is
+    /// not an error — there is simply nothing to refresh.  Substrate-`Database`
+    /// dirs that do carry a manifest keep its `row_count` hint current.
     /// Preserves all other fields.  Written via a temp file + rename so a crash
     /// mid-write does not corrupt the manifest.
     fn update_manifest_row_count(model_dir: &Path, new_row_count: usize) -> Result<(), String> {
         let manifest_path = model_dir.join("manifest.json");
+        if !manifest_path.exists() {
+            return Ok(());
+        }
         let content = fs::read_to_string(&manifest_path)
             .map_err(|e| format!("Failed to read manifest for update: {}", e))?;
         let mut value: serde_json::Value = serde_json::from_str(&content)
@@ -92,8 +93,8 @@ impl Compactor {
             return Err(format!("Model directory not found: {:?}", model_dir));
         }
 
-        // --- C1: read row count from manifest; no guessing ---
-        let row_count = Self::read_manifest_row_count(&model_dir)?;
+        // --- C1: read row count from the tombstone file length; no guessing (#65) ---
+        let row_count = Self::read_row_count(&model_dir)?;
 
         // Collect stats before compaction (needs manifest row_count too)
         let collector = StatsCollector::new(&self.data_dir);
