@@ -28,8 +28,17 @@ pub struct UserStorage {
     tombstones: forgedb_storage::Tombstones,
 }
 impl UserStorage {
+    /// Open the model's storage, rehydrating the in-memory identity
+    /// index from disk.  The column files are append-only and persist
+    /// across processes; this reconstructs `row_count` and `id_to_row`
+    /// so a fresh process reads data written by a previous one (#65).
+    ///
+    /// The row-count anchor is the tombstone file length (1 byte/row,
+    /// appended last per insert), so a torn insert (columns written
+    /// but the process died before the tombstone append) is excluded
+    /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
-        Self {
+        let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
             id_col: FixedColumn::new(PathBuf::from("user/fixed/uuid_0.bin"), 16usize)
@@ -43,7 +52,17 @@ impl UserStorage {
                     PathBuf::from("user/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+        };
+        let n = db.tombstones.len();
+        db.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            db.id_to_row.insert(id, i);
         }
+        db
     }
     pub fn insert(&mut self, record: User) -> Uuid {
         let row_index = self.row_count;
@@ -113,8 +132,17 @@ pub struct PostStorage {
     tombstones: forgedb_storage::Tombstones,
 }
 impl PostStorage {
+    /// Open the model's storage, rehydrating the in-memory identity
+    /// index from disk.  The column files are append-only and persist
+    /// across processes; this reconstructs `row_count` and `id_to_row`
+    /// so a fresh process reads data written by a previous one (#65).
+    ///
+    /// The row-count anchor is the tombstone file length (1 byte/row,
+    /// appended last per insert), so a torn insert (columns written
+    /// but the process died before the tombstone append) is excluded
+    /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
-        Self {
+        let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
             id_col: FixedColumn::new(PathBuf::from("post/fixed/uuid_0.bin"), 16usize)
@@ -135,7 +163,17 @@ impl PostStorage {
                     PathBuf::from("post/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+        };
+        let n = db.tombstones.len();
+        db.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            db.id_to_row.insert(id, i);
         }
+        db
     }
     pub fn insert(&mut self, record: Post) -> Uuid {
         let row_index = self.row_count;
@@ -229,8 +267,17 @@ pub struct TagStorage {
     tombstones: forgedb_storage::Tombstones,
 }
 impl TagStorage {
+    /// Open the model's storage, rehydrating the in-memory identity
+    /// index from disk.  The column files are append-only and persist
+    /// across processes; this reconstructs `row_count` and `id_to_row`
+    /// so a fresh process reads data written by a previous one (#65).
+    ///
+    /// The row-count anchor is the tombstone file length (1 byte/row,
+    /// appended last per insert), so a torn insert (columns written
+    /// but the process died before the tombstone append) is excluded
+    /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
-        Self {
+        let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
             id_col: FixedColumn::new(PathBuf::from("tag/fixed/uuid_0.bin"), 16usize)
@@ -244,7 +291,17 @@ impl TagStorage {
                     PathBuf::from("tag/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+        };
+        let n = db.tombstones.len();
+        db.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            db.id_to_row.insert(id, i);
         }
+        db
     }
     pub fn insert(&mut self, record: Tag) -> Uuid {
         let row_index = self.row_count;
@@ -300,19 +357,27 @@ pub struct PostTagLink {
     row_count: usize,
 }
 impl PostTagLink {
+    /// Open the junction storage, rehydrating `row_count` from the
+    /// persisted columns so M2M links survive a process restart
+    /// (#65).  `right_col` is appended last in `link`, so its length
+    /// is the count of fully-committed pairs; a torn link (left
+    /// written, right not) is excluded and overwritten by the next.
     pub fn new() -> Self {
+        let left_col = FixedColumn::new(
+                PathBuf::from("post_tag_link/fixed/left.bin"),
+                16usize,
+            )
+            .expect("Failed to create junction column");
+        let right_col = FixedColumn::new(
+                PathBuf::from("post_tag_link/fixed/right.bin"),
+                16usize,
+            )
+            .expect("Failed to create junction column");
+        let row_count = right_col.len();
         Self {
-            left_col: FixedColumn::new(
-                    PathBuf::from("post_tag_link/fixed/left.bin"),
-                    16usize,
-                )
-                .expect("Failed to create junction column"),
-            right_col: FixedColumn::new(
-                    PathBuf::from("post_tag_link/fixed/right.bin"),
-                    16usize,
-                )
-                .expect("Failed to create junction column"),
-            row_count: 0,
+            left_col,
+            right_col,
+            row_count,
         }
     }
     /// Record a link between a `left` (model1) id and a `right`
