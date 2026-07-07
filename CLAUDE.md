@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 380 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 394 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 380 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466".
+**Baseline: 394 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"380".
 
 ## Workspace layout
 
