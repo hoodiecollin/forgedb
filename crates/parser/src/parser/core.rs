@@ -143,6 +143,10 @@ impl Parser {
                         constraint = constraint.with_param(ConstraintParam::String(s.clone()));
                         self.advance();
                     }
+                    Token::Str(s) => {
+                        constraint = constraint.with_param(ConstraintParam::String(s.clone()));
+                        self.advance();
+                    }
                     Token::Asterisk => {
                         // Special case for @relations(*) syntax
                         constraint =
@@ -834,5 +838,99 @@ impl Parser {
         schema.validate_struct_references()?;
 
         Ok(schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field_constraints<'a>(schema: &'a Schema, model: &str, field: &str) -> &'a [Constraint] {
+        let m = schema
+            .models
+            .iter()
+            .find(|m| m.name == model)
+            .expect("model not found");
+        let f = m
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .expect("field not found");
+        &f.constraints
+    }
+
+    #[test]
+    fn parses_string_literal_directive_arg() {
+        let src = r#"
+            User {
+                id: +uuid
+                phone: string @pattern("^[0-9]+$")
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let cons = field_constraints(&schema, "User", "phone");
+        assert_eq!(cons.len(), 1);
+        assert_eq!(cons[0].name, "pattern");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::String("^[0-9]+$".to_string())]
+        );
+    }
+
+    #[test]
+    fn parses_string_default_on_nullable_string() {
+        let src = r#"
+            Ticket {
+                id: +uuid
+                status: string? @default("pending")
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let cons = field_constraints(&schema, "Ticket", "status");
+        assert_eq!(cons[0].name, "default");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::String("pending".to_string())]
+        );
+    }
+
+    #[test]
+    fn bare_identifier_default_still_parses() {
+        // The prior workaround must keep working — no regression.
+        let src = r#"
+            Ticket {
+                id: +uuid
+                status: string @default(pending)
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let cons = field_constraints(&schema, "Ticket", "status");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::String("pending".to_string())]
+        );
+    }
+
+    #[test]
+    fn string_and_number_args_mix() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                code: string @pattern("[A-Z]{3}") @length(3, 3)
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let cons = field_constraints(&schema, "Thing", "code");
+        assert_eq!(cons.len(), 2);
+        assert_eq!(cons[0].name, "pattern");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::String("[A-Z]{3}".to_string())]
+        );
+        assert_eq!(cons[1].name, "length");
+        assert_eq!(
+            cons[1].params,
+            vec![ConstraintParam::Number(3), ConstraintParam::Number(3)]
+        );
     }
 }
