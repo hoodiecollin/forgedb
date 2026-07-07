@@ -38,8 +38,17 @@ pub struct PlaceStorage {
     tombstones: forgedb_storage::Tombstones,
 }
 impl PlaceStorage {
+    /// Open the model's storage, rehydrating the in-memory identity
+    /// index from disk.  The column files are append-only and persist
+    /// across processes; this reconstructs `row_count` and `id_to_row`
+    /// so a fresh process reads data written by a previous one (#65).
+    ///
+    /// The row-count anchor is the tombstone file length (1 byte/row,
+    /// appended last per insert), so a torn insert (columns written
+    /// but the process died before the tombstone append) is excluded
+    /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
-        Self {
+        let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
             id_col: FixedColumn::new(PathBuf::from("place/fixed/u64_0.bin"), 8usize)
@@ -63,7 +72,14 @@ impl PlaceStorage {
                     PathBuf::from("place/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+        };
+        let n = db.tombstones.len();
+        db.row_count = n;
+        for i in 0..n {
+            let id = db.id_col.read_u64(i).expect("Failed to read id column");
+            db.id_to_row.insert(id, i);
         }
+        db
     }
     pub fn insert(&mut self, record: Place) -> u64 {
         let row_index = self.row_count;

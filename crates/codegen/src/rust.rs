@@ -146,6 +146,11 @@ impl RustGenerator {
         // Generate get logic
         let get_logic = Self::generate_get_logic(model);
 
+        // Generate reopen/rehydration logic (#65): rebuild the in-memory
+        // `row_count` + `id_to_row` index from the persisted columns so a fresh
+        // process can read data written by a previous one.
+        let rehydrate_logic = Self::generate_rehydrate_logic(model);
+
         // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
         let id_type = Self::id_type_tokens(model);
 
@@ -164,10 +169,21 @@ impl RustGenerator {
             }
 
             impl #storage_name {
+                /// Open the model's storage, rehydrating the in-memory identity
+                /// index from disk.  The column files are append-only and persist
+                /// across processes; this reconstructs `row_count` and `id_to_row`
+                /// so a fresh process reads data written by a previous one (#65).
+                ///
+                /// The row-count anchor is the tombstone file length (1 byte/row,
+                /// appended last per insert), so a torn insert (columns written
+                /// but the process died before the tombstone append) is excluded
+                /// and its orphaned column tail is overwritten by the next insert.
                 pub fn new() -> Self {
-                    Self {
+                    let mut db = Self {
                         #storage_inits
-                    }
+                    };
+                    #rehydrate_logic
+                    db
                 }
 
                 pub fn insert(&mut self, record: #model_name) -> #id_type {
@@ -814,6 +830,79 @@ impl RustGenerator {
         format_ident!("read_{}", Self::type_name(field_type))
     }
 
+    /// Generate reopen/rehydration logic for a model storage's `new()` (#65).
+    ///
+    /// Sets `row_count` from the tombstone-file length (the authoritative
+    /// row-count anchor — 1 byte/row, appended last per insert) and rebuilds
+    /// `id_to_row` by reading the id column for every committed row.  Operates on
+    /// a local `db` binding (the just-constructed storage).  Emitted for the id
+    /// field only — reconstructing the identity map is all reopen needs; the
+    /// remaining columns are read on demand by `get`.
+    fn generate_rehydrate_logic(model: &forgedb_parser::Model) -> TokenStream {
+        let id_field = model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate);
+
+        let id_scan = if let Some(f) = id_field {
+            let col = format_ident!("{}_col", f.name);
+
+            // Mirror `get`'s per-type read of the id field, but at loop index `i`
+            // and yielding the id-typed key for `id_to_row`.
+            let is_uuid_like = matches!(
+                &f.field_type,
+                forgedb_parser::FieldType::Uuid
+                    | forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(_),
+                    )
+            );
+            let is_timestamp =
+                matches!(&f.field_type, forgedb_parser::FieldType::Timestamp);
+            let is_string = Self::is_string_type(&f.field_type);
+
+            let read_expr = if is_uuid_like {
+                quote! {
+                    {
+                        let bytes = db.#col.read_uuid(i).expect("Failed to read id column");
+                        Uuid::from_bytes(bytes)
+                    }
+                }
+            } else if is_timestamp {
+                quote! {
+                    Timestamp::from(
+                        db.#col.read_timestamp(i).expect("Failed to read id column"),
+                    )
+                }
+            } else if is_string {
+                quote! {
+                    db.#col.read_string(i).expect("Failed to read id column")
+                }
+            } else {
+                let read_method = Self::get_read_method(&f.field_type);
+                quote! {
+                    db.#col.#read_method(i).expect("Failed to read id column")
+                }
+            };
+
+            quote! {
+                for i in 0..n {
+                    let id = #read_expr;
+                    db.id_to_row.insert(id, i);
+                }
+            }
+        } else {
+            // No id/auto field: nothing to index (such a model cannot `insert`
+            // either — `insert` reads `record.id`).  Row count still recovers.
+            quote! {}
+        };
+
+        quote! {
+            let n = db.tombstones.len();
+            db.row_count = n;
+            #id_scan
+        }
+    }
+
     /// Generate the main database struct
     fn generate_database(schema: &Schema) -> Result<TokenStream> {
         // Generate field definitions for each model storage
@@ -909,17 +998,25 @@ impl RustGenerator {
                 }
 
                 impl #struct_ident {
+                    /// Open the junction storage, rehydrating `row_count` from the
+                    /// persisted columns so M2M links survive a process restart
+                    /// (#65).  `right_col` is appended last in `link`, so its length
+                    /// is the count of fully-committed pairs; a torn link (left
+                    /// written, right not) is excluded and overwritten by the next.
                     pub fn new() -> Self {
+                        let left_col = FixedColumn::new(
+                            PathBuf::from(#left_path),
+                            16usize,
+                        ).expect("Failed to create junction column");
+                        let right_col = FixedColumn::new(
+                            PathBuf::from(#right_path),
+                            16usize,
+                        ).expect("Failed to create junction column");
+                        let row_count = right_col.len();
                         Self {
-                            left_col: FixedColumn::new(
-                                PathBuf::from(#left_path),
-                                16usize,
-                            ).expect("Failed to create junction column"),
-                            right_col: FixedColumn::new(
-                                PathBuf::from(#right_path),
-                                16usize,
-                            ).expect("Failed to create junction column"),
-                            row_count: 0,
+                            left_col,
+                            right_col,
+                            row_count,
                         }
                     }
 

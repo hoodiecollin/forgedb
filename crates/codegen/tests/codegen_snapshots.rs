@@ -884,3 +884,71 @@ fn test_typescript_u32_u64_are_number() {
     assert!(result.code.contains("count_u32: number"), "U32 should be number");
     assert!(result.code.contains("count_u64: number"), "U64 should be number");
 }
+
+// ---------------------------------------------------------------------------
+// #65: Reopen / rehydration regression guard.
+//
+// Generated `*Storage::new()` must rebuild the in-memory identity index from
+// disk so a fresh process reads data written by a previous one — otherwise the
+// database silently loses everything across a restart, and the next insert
+// corrupts the id->row mapping. Snapshot-only coverage lets this get accepted
+// away in an `insta review`; these named assertions make its removal a loud,
+// intention-revealing failure. The runtime proof (insert -> reopen -> read) is
+// the compile-and-run harness in the PR description, per the codegen
+// compile-test discipline.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_rust_generation_reopen_rehydration() {
+    // A uuid-PK model, an integer-PK model, and a bidirectional many-to-many
+    // (whose junction also carries a `row_count` that must be rehydrated).
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  groups: [Group]
+}
+
+Group {
+  id: +uuid
+  name: string
+  members: [User]
+}
+
+Widget {
+  id: +u64
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Row-count anchor = tombstone file length (not a reset-to-zero).
+    assert!(
+        code.contains("let n = db.tombstones.len();"),
+        "reopen must anchor row_count on the tombstone file length"
+    );
+    assert!(code.contains("db.row_count = n;"), "reopen must set row_count");
+
+    // Identity index rebuilt by scanning the id column.
+    assert!(
+        code.contains("db.id_to_row.insert(id, i);"),
+        "reopen must rebuild id_to_row"
+    );
+    // uuid PK is read via read_uuid + from_bytes...
+    assert!(
+        code.contains("db.id_col.read_uuid(i)"),
+        "uuid-PK reopen reads the id column via read_uuid"
+    );
+    // ...and an integer PK via the width-matched typed read (no from_bytes).
+    assert!(
+        code.contains("db.id_col.read_u64(i)"),
+        "integer-PK reopen reads the id column via read_u64"
+    );
+
+    // The M2M junction rehydrates its row_count from the (last-appended) column.
+    assert!(
+        code.contains("let row_count = right_col.len();"),
+        "junction reopen must rehydrate row_count from right_col length"
+    );
+}
