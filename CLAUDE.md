@@ -6,14 +6,39 @@ change the build, layout, or commands, update this file in the same change.
 ## What ForgeDB is
 
 ForgeDB is an **application database generator** — a compile-time code generation tool,
-**not** a runtime library or ORM. A declarative `.forge` schema is transpiled into
-tailored Rust database code plus a TypeScript SDK, a REST API, and React component
-stubs. End users need only: their schema, the `forgedb` CLI, and config. Generated code
-carries **zero ForgeDB runtime dependency**.
+**not** a runtime ORM or query engine. A declarative `.forge` schema is transpiled into
+tailored Rust database code plus a TypeScript SDK, a REST API, and React component stubs.
+End users need only: their schema, the `forgedb` CLI, and config.
 
-Guard this identity when evaluating features (see the `forgedb-product-manager` subagent):
-prefer *better generated code* over *runtime functionality*. Reject anything that turns
-ForgeDB into a library users import at runtime.
+**The invariant:** the app's schema is a *compile-time input to generation*, never a
+*runtime input to a generic engine*. The schema-specific surface — types, tables, queries,
+filters, relations, API routes — is generated and tailored per app. ForgeDB must never ship
+a general-purpose library that reconstructs that surface at runtime by reflecting over a
+schema.
+
+**Publishing runtimes with programmatic APIs is expected, not forbidden** — two kinds, both
+fine:
+1. *Schema-agnostic substrate* the generated code links against: `forgedb-storage`,
+   `forgedb-types`, `forgedb-wal`, and future peers (a stable FFI ABI, a change-feed /
+   subscription transport, a backup format). Real programmatic APIs, but they know nothing
+   about any specific schema.
+2. *Access/transport layers over the generated surface*: language bindings (Python / Node /
+   Deno FFI), a WASM host, a subscription socket. They expose the already-generated,
+   schema-specific API to another language or channel; the tailored logic stays generated.
+
+So generated code is **not** dependency-free — it depends on the schema-agnostic substrate
+crates — but it never depends on a ForgeDB ORM or a runtime that reads the user's schema. A
+generated, schema-tailored query/filter builder is fine (it is just generated code); a
+generic, schema-agnostic query builder / ORM is not.
+
+**Still rejected:** a generic ORM or dynamic query builder that interprets an arbitrary
+schema at runtime; making the schema a runtime input to a general-purpose engine; or
+hollowing out generated code by moving tailored logic into a shipped generic library.
+
+Guard this when evaluating features (see the `forgedb-product-manager` subagent). The test:
+(1) is the app's tailored data logic still **generated per-schema at compile time**, and
+(2) does every published artifact stay **schema-agnostic substrate or transport glue**
+rather than a generic runtime that interprets schemas? If either fails → reject or redesign.
 
 ## Toolchain
 
