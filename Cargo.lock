@@ -621,6 +621,7 @@ dependencies = [
  "clap",
  "colored",
  "ctrlc",
+ "forgedb-backup",
  "forgedb-codegen",
  "forgedb-compaction",
  "forgedb-http-server",
@@ -638,6 +639,18 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "which",
+]
+
+[[package]]
+name = "forgedb-backup"
+version = "0.1.0"
+dependencies = [
+ "forgedb-storage",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -746,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "forgedb-wal",
  "serde",
