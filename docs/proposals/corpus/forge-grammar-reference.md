@@ -181,14 +181,15 @@ status: string? @default("pending")     // nullable string with default
 | `@soft_delete`         | (none)          | Enable soft delete (Sprint 19)                   | `@soft_delete` in model block |
 | `@index`               | `(field1, field2, ...)` | Composite index on multiple fields | `@index(user_id, created_at)` |
 
-> **CORRECTION (verified by compile-testing the example corpus, 2026-07-06):** directive
-> arguments accept ONLY numbers and bare identifiers — the lexer has **no string-literal
-> token**. So `@pattern("regex")`, `@regex("...")`, and `@default("text")` do **NOT** parse
-> (`"` is an unexpected character). Use `@default(bareword)` (e.g. `@default(pending)`);
-> avoid `@pattern`/`@regex` entirely. The quoted examples elsewhere in this doc are wrong on
-> that point.
+> **UPDATE (issue #46, 2026-07-06):** directive arguments now accept **quoted string
+> literals** in addition to numbers and bare identifiers. `@pattern("^[0-9]+$")`,
+> `@regex("...")`, and `@default("text")` parse — the lexer tokenizes `"..."` (escapes
+> `\" \\ \n \t \r`; unterminated/multiline strings are a lex error). Values are still stored
+> as `ConstraintParam::String`, so `@default(pending)` and `@default("pending")` are
+> equivalent; these directives remain **semantic-only markers** (parsed, not enforced).
+> Superseded the earlier limitation note that said `"` was an unexpected character.
 
-**Parser source:** `crates/parser/src/parser/core.rs:113-181` (constraint parsing), `crates/parser/src/parser/core.rs:377-443` (directive parsing)
+**Parser source:** `crates/parser/src/parser/core.rs:113-184` (constraint parsing, incl. the `Token::Str` arm), `crates/parser/src/parser/core.rs:381-447` (directive parsing); string-literal lexing in `crates/parser/src/lexer.rs` (`read_string`)
 
 **Directives NOT in Parser (LSP/Semantic only):**
 - `@on_delete(cascade|set_null|restrict)` — Found in LSP hover/completion (`crates/lsp-server/src/hover.rs:130`, `crates/lsp-server/src/completion.rs:268-274`) but **NOT parsed by core parser**. Example files use it, but it will not parse.

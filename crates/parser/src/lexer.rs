@@ -47,6 +47,7 @@ pub enum Token {
     Semicolon,   // ;
     Slash,       // /
     Number(i64), // Numeric literal
+    Str(String), // String literal: "..." (directive arguments, e.g. @pattern("^[a-z]+$"))
 
     // Whitespace and EOF
     Newline,
@@ -148,6 +149,64 @@ impl Lexer {
         })
     }
 
+    /// Read a double-quoted string literal, consuming the opening and closing quotes.
+    /// Supports the escapes `\"`, `\\`, `\n`, `\t`, `\r`. Called with the cursor on the
+    /// opening `"`.
+    fn read_string(&mut self) -> Result<String, String> {
+        let start_line = self.line;
+        let start_column = self.column;
+        self.advance(); // consume opening quote
+
+        let mut value = String::new();
+        loop {
+            match self.current_char() {
+                None => {
+                    return Err(format!(
+                        "Unterminated string literal starting at line {}, column {}",
+                        start_line, start_column
+                    ));
+                }
+                Some('"') => {
+                    self.advance(); // consume closing quote
+                    return Ok(value);
+                }
+                Some('\\') => {
+                    self.advance();
+                    match self.current_char() {
+                        Some('"') => value.push('"'),
+                        Some('\\') => value.push('\\'),
+                        Some('n') => value.push('\n'),
+                        Some('t') => value.push('\t'),
+                        Some('r') => value.push('\r'),
+                        Some(other) => {
+                            return Err(format!(
+                                "Invalid escape sequence '\\{}' in string literal at line {}, column {}",
+                                other, self.line, self.column
+                            ));
+                        }
+                        None => {
+                            return Err(format!(
+                                "Unterminated string literal starting at line {}, column {}",
+                                start_line, start_column
+                            ));
+                        }
+                    }
+                    self.advance();
+                }
+                Some('\n') => {
+                    return Err(format!(
+                        "Unterminated string literal starting at line {}, column {} (newline before closing quote)",
+                        start_line, start_column
+                    ));
+                }
+                Some(ch) => {
+                    value.push(ch);
+                    self.advance();
+                }
+            }
+        }
+    }
+
     pub fn next_token(&mut self) -> Result<Token, String> {
         let had_whitespace = self.skip_whitespace_with_flag();
 
@@ -231,6 +290,10 @@ impl Lexer {
                 self.advance();
                 Ok(Token::Semicolon)
             }
+            Some('"') => {
+                let s = self.read_string()?;
+                Ok(Token::Str(s))
+            }
             Some(ch) if ch.is_numeric() => {
                 let num = self.read_number()?;
                 Ok(Token::Number(num))
@@ -296,5 +359,84 @@ impl Lexer {
             }
         }
         Ok(tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(input: &str) -> Vec<Token> {
+        Lexer::new(input).tokenize().expect("lex error")
+    }
+
+    #[test]
+    fn lexes_basic_string_literal() {
+        assert_eq!(
+            tokens("\"pending\""),
+            vec![Token::Str("pending".to_string()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_string_with_regex_metacharacters() {
+        // A regex that could never be a bare identifier — the whole point of the feature.
+        assert_eq!(
+            tokens("\"^[a-z]+$\""),
+            vec![Token::Str("^[a-z]+$".to_string()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn lexes_string_escapes() {
+        assert_eq!(
+            tokens(r#""a\"b\\c\n\t\r""#),
+            vec![Token::Str("a\"b\\c\n\t\r".to_string()), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn empty_string_literal() {
+        assert_eq!(tokens("\"\""), vec![Token::Str(String::new()), Token::Eof]);
+    }
+
+    #[test]
+    fn string_literal_in_directive_context() {
+        // @pattern("^[0-9]+$")
+        assert_eq!(
+            tokens("@pattern(\"^[0-9]+$\")"),
+            vec![
+                Token::At,
+                Token::Ident("pattern".to_string()),
+                Token::LParen,
+                Token::Str("^[0-9]+$".to_string()),
+                Token::RParen,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn unterminated_string_is_an_error() {
+        let err = Lexer::new("\"oops").tokenize().unwrap_err();
+        assert!(err.contains("Unterminated string literal"), "got: {err}");
+    }
+
+    #[test]
+    fn newline_before_closing_quote_is_an_error() {
+        let err = Lexer::new("\"oops\n\"").tokenize().unwrap_err();
+        assert!(err.contains("Unterminated string literal"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_escape_is_an_error() {
+        let err = Lexer::new("\"a\\q\"").tokenize().unwrap_err();
+        assert!(err.contains("Invalid escape sequence"), "got: {err}");
+    }
+
+    #[test]
+    fn double_slash_comment_still_works_after_string_support() {
+        // Guards the tsx://path vs // comment disambiguation is unaffected.
+        assert_eq!(tokens("u32 // trailing comment"), vec![Token::TypeU32, Token::Eof]);
     }
 }
