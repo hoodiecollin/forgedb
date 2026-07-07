@@ -33,11 +33,13 @@ fn main() -> std::io::Result<()> {
             name: "user_id".to_string(),
             column_type: ColumnType::U64,
             column_index: 0,
+            ..Default::default()
         },
         ColumnMetadata {
             name: "username".to_string(),
             column_type: ColumnType::String,
             column_index: 1,
+            ..Default::default()
         },
     ];
     db.set_columns(columns);
