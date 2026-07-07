@@ -110,10 +110,11 @@ bidirectional `[..]`/`[..]` = many-to-many; `[type; N]` fixed array; inline `str
 (fixed-size fields only — no string/relations inside). Directives: `@min @max @length @email
 @url @pattern @regex @default @index @computed @fulltext @materialized` (field-level, mostly
 semantic-only), `@soft_delete` + composite `@index(a,b)` (model-level), `@relations(*|fields)`
-(component fields only). Component refs `tsx:// jsx:// api://`. Only `//` comments. **NOT
+(component fields only). Component refs `tsx:// jsx:// api://`. Only `//` comments. Directive
+args accept numbers, bare identifiers, **and quoted string literals** (`@pattern("^[0-9]+$")`,
+`@default("pending")` — escapes `\" \\ \n \t \r`; still semantic-only markers). **NOT
 supported despite older docs:** `~` auto-update, `text` type, `@on_delete`, block comments
-`/* */`, quoted-string directive args (`@pattern("…")`, `@default("…")`). Full verified
-reference: `docs/proposals/corpus/forge-grammar-reference.md`. **18 worked example schemas
+`/* */`. Full verified reference: `docs/proposals/corpus/forge-grammar-reference.md`. **18 worked example schemas
 across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
@@ -152,11 +153,6 @@ across many domains live in `examples/` — see `examples/README.md`.**
   regen through the *current* codegen on every `cargo build`). **The discipline stands:
   codegen must be compile-tested, not just snapshot-tested** — snapshot pass ≠ output compiles,
   which is exactly how these three gaps hid.
-- **No string-literal constraint arguments (lexer).** `@`-directive args accept only
-  numbers and bare identifiers — `@pattern("regex")` and `@default("text")` fail at lex
-  time. Use `@default(identifier)`; model regex/enum intent via `@length` + a comment or a
-  lookup model. (Lower priority; the grammar reference in `docs/proposals/corpus/` is
-  corrected accordingly.)
 - **Relation traversal is generated** (forward + reverse + M2M + eager-load). FK scalars
   (`RequiredReference`/`OptionalReference`) persist and round-trip (Task #25); on top of that
   the `RustGenerator` now emits, on `Database`: **forward FK getters** (`post_author(&post)
