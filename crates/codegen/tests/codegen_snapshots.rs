@@ -952,3 +952,73 @@ Widget {
         "junction reopen must rehydrate row_count from right_col length"
     );
 }
+
+#[test]
+fn test_rust_generation_layout_manifest() {
+    // A uuid-PK model with a variable (string) column plus an M2M junction —
+    // exercises both the model manifest and the junction manifest (#57).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Every storage `new()` refreshes the physical-layout manifest on open.
+    assert!(
+        code.contains("db.write_manifest();"),
+        "model new() must refresh the layout manifest on open"
+    );
+    assert!(
+        code.contains("fn write_manifest(&self)"),
+        "a write_manifest method must be generated"
+    );
+
+    // Manifest is built from the substrate types, layout-only.
+    assert!(
+        code.contains("forgedb_storage :: Manifest") || code.contains("forgedb_storage::Manifest"),
+        "manifest must be the substrate Manifest, not a bespoke type"
+    );
+    assert!(
+        code.contains("forgedb_storage :: ColumnKind :: Variable")
+            || code.contains("forgedb_storage::ColumnKind::Variable"),
+        "a variable (string) column must be described as ColumnKind::Variable"
+    );
+    assert!(
+        code.contains("\"variable/string_data_1.bin\""),
+        "the manifest column path must match the generated storage path exactly"
+    );
+
+    // Model row-count anchor = tombstones.bin, 1 byte/row.
+    assert!(
+        code.contains("\"tombstones.bin\"") && code.contains("bytes_per_row : 1usize")
+            || code.contains("bytes_per_row: 1usize"),
+        "model manifest must anchor row count on tombstones.bin at 1 byte/row"
+    );
+    assert!(
+        code.contains("save_to(std :: path :: Path :: new(\"post/manifest.json\"))")
+            || code.contains("save_to(std::path::Path::new(\"post/manifest.json\"))"),
+        "model manifest must be written under the model directory"
+    );
+
+    // Junction manifest anchors on fixed/right.bin at 16 bytes/row.
+    assert!(
+        code.contains("\"fixed/right.bin\"") && code.contains("bytes_per_row : 16usize")
+            || code.contains("bytes_per_row: 16usize"),
+        "junction manifest must anchor row count on fixed/right.bin at 16 bytes/row"
+    );
+    assert!(
+        code.contains("post_tag_link/manifest.json") || code.contains("tag_post_link/manifest.json"),
+        "junction manifest must be written under the junction directory"
+    );
+}
