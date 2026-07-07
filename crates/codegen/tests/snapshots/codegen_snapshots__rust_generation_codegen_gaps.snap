@@ -79,7 +79,45 @@ impl PlaceStorage {
             let id = db.id_col.read_u64(i).expect("Failed to read id column");
             db.id_to_row.insert(id, i);
         }
+        db.write_manifest();
         db
+    }
+    /// Write the physical-layout manifest for this model (#57).  Layout
+    /// metadata only — schema-blind backup/inspector read it; it carries
+    /// no `.forge` semantics.  Written at open, off the insert hot path.
+    fn write_manifest(&self) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
+            forgedb_storage::ColumnType::U64, column_index : 0usize, value_size : 8usize,
+            kind : forgedb_storage::ColumnKind::Fixed, relative_path : "fixed/u64_0.bin"
+            .to_string(), }, forgedb_storage::ColumnMetadata { name : "name".to_string(),
+            column_type : forgedb_storage::ColumnType::String, column_index : 1usize,
+            value_size : 0usize, kind : forgedb_storage::ColumnKind::Variable,
+            relative_path : "variable/string_data_1.bin".to_string(), },
+            forgedb_storage::ColumnMetadata { name : "description".to_string(),
+            column_type : forgedb_storage::ColumnType::String, column_index : 2usize,
+            value_size : 0usize, kind : forgedb_storage::ColumnKind::Variable,
+            relative_path : "variable/string_data_2.bin".to_string(), },
+            forgedb_storage::ColumnMetadata { name : "location".to_string(), column_type
+            : forgedb_storage::ColumnType::FixedBytes(std::mem::size_of:: < GeoPoint >
+            ()), column_index : 3usize, value_size : std::mem::size_of:: < GeoPoint > (),
+            kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/bytes_3.bin".to_string(), }
+        ];
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: 0,
+            compaction_epoch: 0,
+            format_version: 1,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "tombstones.bin".to_string(),
+                bytes_per_row: 1usize,
+            }),
+        };
+        let _ = manifest.save_to(std::path::Path::new("place/manifest.json"));
     }
     pub fn insert(&mut self, record: Place) -> u64 {
         let row_index = self.row_count;

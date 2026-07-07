@@ -62,7 +62,37 @@ impl UserStorage {
             };
             db.id_to_row.insert(id, i);
         }
+        db.write_manifest();
         db
+    }
+    /// Write the physical-layout manifest for this model (#57).  Layout
+    /// metadata only — schema-blind backup/inspector read it; it carries
+    /// no `.forge` semantics.  Written at open, off the insert hot path.
+    fn write_manifest(&self) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_0.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "name".to_string(), column_type : forgedb_storage::ColumnType::String,
+            column_index : 1usize, value_size : 0usize, kind :
+            forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_1.bin".to_string(), }
+        ];
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: 0,
+            compaction_epoch: 0,
+            format_version: 1,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "tombstones.bin".to_string(),
+                bytes_per_row: 1usize,
+            }),
+        };
+        let _ = manifest.save_to(std::path::Path::new("user/manifest.json"));
     }
     pub fn insert(&mut self, record: User) -> Uuid {
         let row_index = self.row_count;
@@ -173,7 +203,46 @@ impl PostStorage {
             };
             db.id_to_row.insert(id, i);
         }
+        db.write_manifest();
         db
+    }
+    /// Write the physical-layout manifest for this model (#57).  Layout
+    /// metadata only — schema-blind backup/inspector read it; it carries
+    /// no `.forge` semantics.  Written at open, off the insert hot path.
+    fn write_manifest(&self) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_0.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "title".to_string(), column_type : forgedb_storage::ColumnType::String,
+            column_index : 1usize, value_size : 0usize, kind :
+            forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_1.bin".to_string(), }, forgedb_storage::ColumnMetadata
+            { name : "author".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 2usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_2.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "editor".to_string(), column_type :
+            forgedb_storage::ColumnType::FixedBytes(std::mem::size_of:: < Option < Uuid
+            >> ()), column_index : 3usize, value_size : std::mem::size_of:: < Option <
+            Uuid >> (), kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_3.bin".to_string(), }
+        ];
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: 0,
+            compaction_epoch: 0,
+            format_version: 1,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "tombstones.bin".to_string(),
+                bytes_per_row: 1usize,
+            }),
+        };
+        let _ = manifest.save_to(std::path::Path::new("post/manifest.json"));
     }
     pub fn insert(&mut self, record: Post) -> Uuid {
         let row_index = self.row_count;
@@ -301,7 +370,37 @@ impl TagStorage {
             };
             db.id_to_row.insert(id, i);
         }
+        db.write_manifest();
         db
+    }
+    /// Write the physical-layout manifest for this model (#57).  Layout
+    /// metadata only — schema-blind backup/inspector read it; it carries
+    /// no `.forge` semantics.  Written at open, off the insert hot path.
+    fn write_manifest(&self) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_0.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "label".to_string(), column_type : forgedb_storage::ColumnType::String,
+            column_index : 1usize, value_size : 0usize, kind :
+            forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_1.bin".to_string(), }
+        ];
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: 0,
+            compaction_epoch: 0,
+            format_version: 1,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "tombstones.bin".to_string(),
+                bytes_per_row: 1usize,
+            }),
+        };
+        let _ = manifest.save_to(std::path::Path::new("tag/manifest.json"));
     }
     pub fn insert(&mut self, record: Tag) -> Uuid {
         let row_index = self.row_count;
@@ -374,11 +473,44 @@ impl PostTagLink {
             )
             .expect("Failed to create junction column");
         let row_count = right_col.len();
-        Self {
+        let db = Self {
             left_col,
             right_col,
             row_count,
-        }
+        };
+        db.write_manifest();
+        db
+    }
+    /// Write the junction's physical-layout manifest (#57): two
+    /// 16-byte uuid columns and a row-count anchor on `right.bin`
+    /// (appended last per link, 16 bytes/row).  Layout only —
+    /// carries no relation semantics.  Best-effort; reopen anchors
+    /// on the file length regardless.
+    fn write_manifest(&self) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "left".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/left.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "right".to_string(), column_type : forgedb_storage::ColumnType::Uuid,
+            column_index : 1usize, value_size : 16usize, kind :
+            forgedb_storage::ColumnKind::Fixed, relative_path : "fixed/right.bin"
+            .to_string(), },
+        ];
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: 0,
+            compaction_epoch: 0,
+            format_version: 1,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "fixed/right.bin".to_string(),
+                bytes_per_row: 16usize,
+            }),
+        };
+        let _ = manifest.save_to(std::path::Path::new("post_tag_link/manifest.json"));
     }
     /// Record a link between a `left` (model1) id and a `right`
     /// (model2) id.

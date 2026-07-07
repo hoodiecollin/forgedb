@@ -151,6 +151,10 @@ impl RustGenerator {
         // process can read data written by a previous one.
         let rehydrate_logic = Self::generate_rehydrate_logic(model);
 
+        // Generate the per-model layout manifest writer (#57): physical column
+        // layout + row-count anchor, written at open, read by schema-blind backup.
+        let write_manifest = Self::generate_write_manifest(model);
+
         // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
         let id_type = Self::id_type_tokens(model);
 
@@ -183,8 +187,14 @@ impl RustGenerator {
                         #storage_inits
                     };
                     #rehydrate_logic
+                    // Refresh the physical-layout manifest on open (#57): cheap,
+                    // off the insert hot path, gives schema-blind backup/inspector
+                    // a current column map + row-count anchor.
+                    db.write_manifest();
                     db
                 }
+
+                #write_manifest
 
                 pub fn insert(&mut self, record: #model_name) -> #id_type {
                     #insert_logic
@@ -451,6 +461,119 @@ impl RustGenerator {
                     _ => 8, // Default
                 };
                 quote! { #size }
+            }
+        }
+    }
+
+    /// Map a field type to the substrate `ColumnType` for the per-model layout
+    /// manifest (#57).  Primitives map to their exact variant; every other
+    /// fixed-size type (char(N), fixed array, struct, nullable-fixed, optional
+    /// FK) is a `FixedBytes(width)` — a physical byte-width fact, never schema
+    /// semantics.  Variable strings are handled by the caller (`ColumnType::String`).
+    fn storage_column_type_tokens(field_type: &forgedb_parser::FieldType) -> TokenStream {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::U32 => quote! { forgedb_storage::ColumnType::U32 },
+            FieldType::I32 => quote! { forgedb_storage::ColumnType::I32 },
+            FieldType::U64 => quote! { forgedb_storage::ColumnType::U64 },
+            FieldType::I64 => quote! { forgedb_storage::ColumnType::I64 },
+            FieldType::F64 => quote! { forgedb_storage::ColumnType::F64 },
+            FieldType::Bool => quote! { forgedb_storage::ColumnType::Bool },
+            FieldType::Uuid => quote! { forgedb_storage::ColumnType::Uuid },
+            FieldType::Timestamp => quote! { forgedb_storage::ColumnType::Timestamp },
+            // FK scalar persists as a raw [u8; 16], same as Uuid.
+            FieldType::Relation(forgedb_parser::RelationType::RequiredReference(_)) => {
+                quote! { forgedb_storage::ColumnType::Uuid }
+            }
+            // Any remaining fixed-size type is opaque fixed bytes of its width.
+            _ => {
+                let size = Self::column_value_size_expr(field_type);
+                quote! { forgedb_storage::ColumnType::FixedBytes(#size) }
+            }
+        }
+    }
+
+    /// Generate the per-model layout `manifest.json` writer (#57).  Emits a
+    /// `write_manifest` method describing *physical* column layout only —
+    /// index, `ColumnType`, `value_size`, fixed/variable kind, and the file
+    /// path relative to the model dir — plus a `row_anchor` naming the file
+    /// whose length counts committed rows (`tombstones.bin`, 1 byte/row).  It
+    /// carries **no** schema semantics (no relations/directives/validation).
+    /// Called from `new()`, off the insert hot path; the manifest's first
+    /// reader is schema-blind backup (#57) / the inspector (#63).
+    ///
+    /// FUTURE TRAP (incremental backups): this hardcodes `compaction_epoch: 0`
+    /// and runs on every open, so once compaction starts *bumping* the epoch
+    /// (deferred with incrementals), a reopen here would clobber it back to 0
+    /// and silently break an incremental chain. When that lands, make the
+    /// generated writer load any existing manifest and *preserve* its
+    /// `compaction_epoch` instead of overwriting with 0. Harmless today because
+    /// nothing bumps the epoch yet.
+    fn generate_write_manifest(model: &forgedb_parser::Model) -> TokenStream {
+        let model_snake = Self::to_snake_case(&model.name);
+        let manifest_path = format!("{}/manifest.json", model_snake);
+
+        let mut col_entries = Vec::new();
+        let mut column_index = 0usize;
+        for field in &model.fields {
+            let name = &field.name;
+            if Self::is_fixed_size_type(&field.field_type) {
+                let rel_path = format!(
+                    "fixed/{}_{}.bin",
+                    Self::type_name(&field.field_type),
+                    column_index
+                );
+                let col_type = Self::storage_column_type_tokens(&field.field_type);
+                let value_size = Self::column_value_size_expr(&field.field_type);
+                col_entries.push(quote! {
+                    forgedb_storage::ColumnMetadata {
+                        name: #name.to_string(),
+                        column_type: #col_type,
+                        column_index: #column_index,
+                        value_size: #value_size,
+                        kind: forgedb_storage::ColumnKind::Fixed,
+                        relative_path: #rel_path.to_string(),
+                    }
+                });
+                column_index += 1;
+            } else if Self::is_string_type(&field.field_type) {
+                let rel_path = format!("variable/string_data_{}.bin", column_index);
+                col_entries.push(quote! {
+                    forgedb_storage::ColumnMetadata {
+                        name: #name.to_string(),
+                        column_type: forgedb_storage::ColumnType::String,
+                        column_index: #column_index,
+                        value_size: 0usize,
+                        kind: forgedb_storage::ColumnKind::Variable,
+                        relative_path: #rel_path.to_string(),
+                    }
+                });
+                column_index += 1;
+            }
+        }
+
+        quote! {
+            /// Write the physical-layout manifest for this model (#57).  Layout
+            /// metadata only — schema-blind backup/inspector read it; it carries
+            /// no `.forge` semantics.  Written at open, off the insert hot path.
+            fn write_manifest(&self) {
+                let columns = vec![ #(#col_entries),* ];
+                let manifest = forgedb_storage::Manifest {
+                    schema_version: 1,
+                    row_count: self.row_count,
+                    columns,
+                    wal_enabled: false,
+                    last_checkpoint: 0,
+                    compaction_epoch: 0,
+                    format_version: 1,
+                    row_anchor: Some(forgedb_storage::RowAnchor {
+                        relative_path: "tombstones.bin".to_string(),
+                        bytes_per_row: 1usize,
+                    }),
+                };
+                // Best-effort: a failed manifest write must not abort the app;
+                // reopen/compaction anchor on the tombstone file, not this file.
+                let _ = manifest.save_to(std::path::Path::new(#manifest_path));
             }
         }
     }
@@ -988,6 +1111,7 @@ impl RustGenerator {
             let base = format!("{}_{}_link", field_snake, field_snake2);
             let left_path = format!("{}/fixed/left.bin", base);
             let right_path = format!("{}/fixed/right.bin", base);
+            let manifest_path = format!("{}/manifest.json", base);
 
             structs.push(quote! {
                 #[doc = #struct_doc]
@@ -1013,11 +1137,53 @@ impl RustGenerator {
                             16usize,
                         ).expect("Failed to create junction column");
                         let row_count = right_col.len();
-                        Self {
+                        let db = Self {
                             left_col,
                             right_col,
                             row_count,
-                        }
+                        };
+                        db.write_manifest();
+                        db
+                    }
+
+                    /// Write the junction's physical-layout manifest (#57): two
+                    /// 16-byte uuid columns and a row-count anchor on `right.bin`
+                    /// (appended last per link, 16 bytes/row).  Layout only —
+                    /// carries no relation semantics.  Best-effort; reopen anchors
+                    /// on the file length regardless.
+                    fn write_manifest(&self) {
+                        let columns = vec![
+                            forgedb_storage::ColumnMetadata {
+                                name: "left".to_string(),
+                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_index: 0usize,
+                                value_size: 16usize,
+                                kind: forgedb_storage::ColumnKind::Fixed,
+                                relative_path: "fixed/left.bin".to_string(),
+                            },
+                            forgedb_storage::ColumnMetadata {
+                                name: "right".to_string(),
+                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_index: 1usize,
+                                value_size: 16usize,
+                                kind: forgedb_storage::ColumnKind::Fixed,
+                                relative_path: "fixed/right.bin".to_string(),
+                            },
+                        ];
+                        let manifest = forgedb_storage::Manifest {
+                            schema_version: 1,
+                            row_count: self.row_count,
+                            columns,
+                            wal_enabled: false,
+                            last_checkpoint: 0,
+                            compaction_epoch: 0,
+                            format_version: 1,
+                            row_anchor: Some(forgedb_storage::RowAnchor {
+                                relative_path: "fixed/right.bin".to_string(),
+                                bytes_per_row: 16usize,
+                            }),
+                        };
+                        let _ = manifest.save_to(std::path::Path::new(#manifest_path));
                     }
 
                     /// Record a link between a `left` (model1) id and a `right`
