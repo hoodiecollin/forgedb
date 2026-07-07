@@ -1,62 +1,45 @@
 # ForgeDB — Backlog
 
-A living list of potential features and known work. Not a roadmap or commitment; ideas
-are grouped by scope and theme, not scheduled. Add ideas freely; remove them when done or
-abandoned (git history is the record).
+The backlog now lives in **GitHub Issues**, not this file. This page is just a map.
 
-## Near-term cleanup (revival)
+- Browse: https://github.com/hoodiecollin/forgedb/issues
+- Add work as a new issue; close it when done (git history is the record).
 
-Concrete, in-flight work from the current revival pass:
+## Labels
 
-- **Fix ~21 stale doctests** across 7 crates (crud-api, http-server, migrations, parser,
-  query-optimization, validation, watcher) — doc-comment examples reference drifted or
-  removed APIs, so plain `cargo test --workspace` fails on `--doc` targets. Fix each
-  during that crate's review; some (`MigrationExecutor::new`, `SchemaDiffer::new`) may be
-  a lost constructor rather than a stale doc — verify.
-- **Resolve 9 dead-code warnings** — not cruft: unwired-but-live CLI flags
-  (`build --no-api/--no-db`, `init --typescript`, `validate --implementations/--components`),
-  an unused error exit-code scheme, an unwired `rust_main_template`, and populated-but-unread
-  LSP fields. Each needs a wire-vs-remove decision (don't blindly delete).
+- **`tech-debt`** — known gaps or stubs in shipped code. Grounded in the codebase, ready to schedule.
+- **`idea`** — speculative feature directions. Each needs a design note before implementation.
+- **`enhancement`** / **`bug`** / **`documentation`** — standard GitHub labels.
 
-## Feature ideas
+## Current known gaps (`tech-debt`)
 
-Potential directions, unprioritized. Each would need a design note before implementation.
+- [#46](https://github.com/hoodiecollin/forgedb/issues/46) — Lexer: string-literal directive arguments (`@pattern("…")`, `@default("…")`)
+- [#47](https://github.com/hoodiecollin/forgedb/issues/47) — `@computed` expression convention + wire `validate --implementations` (blocked on #46)
+- [#48](https://github.com/hoodiecollin/forgedb/issues/48) — query-optimization: join predicate pushdown (needs a predicate IR)
+- [#49](https://github.com/hoodiecollin/forgedb/issues/49) — Restore OpenAPI generation
 
-### Runtimes & distribution
-- **WASM** — compile the engine to WebAssembly; browser storage over IndexedDB; offline-first.
-- **Python bindings** (FFI via ctypes/cffi) — type-hinted API; asyncio; NumPy/Pandas interop.
-- **Node.js addon** (NAPI-RS) — native addon with auto-generated TypeScript defs.
-- **Deno bindings** (FFI via `Deno.dlopen`) — leverages the existing Bun FFI work.
+## Feature ideas (`idea`)
 
-### Storage & data
-- **Distributed / replication** — WAL replication, read replicas, failover. (Optional
-  consensus/Merkle verification is a separate, heavier line of exploration.)
-- **Zero-knowledge storage** — client-side E2E encryption; server stores encrypted blobs;
-  field- and model-level `@encrypted`.
-- **MVCC concurrency** — snapshot isolation; concurrent readers/writers; version GC.
-- **Backup & restore** — hot backup, point-in-time recovery, incremental, cloud targets.
-- **Time-series optimization** — time partitioning, retention, downsampling.
-- **Multi-tenancy** — tenant isolation, row-level security, per-tenant schemas.
+All unprioritized; each needs a design note first. Grouped by theme:
 
-### Indexing & query
-- **Advanced indexes** — spatial (R-tree), vector/HNSW for semantic search, richer composite/covering indexes.
-- **GraphQL** — generate a GraphQL schema + resolvers; DataLoader for N+1.
-- **Real-time subscriptions** — WebSocket live queries and change notifications.
-
-### Tooling & DX
-- **Database inspection tool** (Tauri) — schema explorer, data viewer/editor, query builder,
-  relation graph, performance views.
-- **AI-powered development** — `@ai-implement` directive to generate components/tests from
-  schema annotations. (Note the maintainability tradeoffs of generated-then-edited code.)
-
-## Deferred
-
-- **Restore OpenAPI generation** (deferred until after the revival refactor). The
-  generator was lost during crate extraction; the CLI `openapi` target and the
-  `generate all` path stay disabled/stubbed for now. Restore = re-implement as a module
-  in `crates/codegen` and re-enable both call sites.
+- **Runtimes & distribution** — WASM ([#50](https://github.com/hoodiecollin/forgedb/issues/50)),
+  Python bindings ([#51](https://github.com/hoodiecollin/forgedb/issues/51)),
+  Node.js addon ([#52](https://github.com/hoodiecollin/forgedb/issues/52)),
+  Deno bindings ([#53](https://github.com/hoodiecollin/forgedb/issues/53))
+- **Storage & data** — replication ([#54](https://github.com/hoodiecollin/forgedb/issues/54)),
+  zero-knowledge storage ([#55](https://github.com/hoodiecollin/forgedb/issues/55)),
+  MVCC ([#56](https://github.com/hoodiecollin/forgedb/issues/56)),
+  backup & restore ([#57](https://github.com/hoodiecollin/forgedb/issues/57)),
+  time-series ([#58](https://github.com/hoodiecollin/forgedb/issues/58)),
+  multi-tenancy ([#59](https://github.com/hoodiecollin/forgedb/issues/59))
+- **Indexing & query** — advanced indexes ([#60](https://github.com/hoodiecollin/forgedb/issues/60)),
+  GraphQL ([#61](https://github.com/hoodiecollin/forgedb/issues/61)),
+  real-time subscriptions ([#62](https://github.com/hoodiecollin/forgedb/issues/62))
+- **Tooling & DX** — database inspector ([#63](https://github.com/hoodiecollin/forgedb/issues/63)),
+  AI-powered development ([#64](https://github.com/hoodiecollin/forgedb/issues/64))
 
 ## Notes
 
-- This is a living document; community feedback drives what actually gets built.
-- Not all ideas will be implemented; favor depth on existing features over breadth.
+- Favor depth on existing features over breadth. Not all ideas will be built.
+- Prefer *better generated code* over *runtime functionality* (guard the generator identity —
+  see the `forgedb-product-manager` subagent).
