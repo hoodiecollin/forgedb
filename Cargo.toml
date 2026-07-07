@@ -12,6 +12,7 @@ members = [
     "crates/query-params",
     "crates/migrations",
     "crates/compaction",
+    "crates/backup",
     "crates/query-optimization",
     "crates/lsp-server",
     "crates/ffi",
@@ -40,6 +41,7 @@ forgedb-codegen = { path = "crates/codegen" }
 forgedb-watcher = { path = "crates/watcher" }
 forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
+forgedb-backup = { path = "crates/backup" }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
 thiserror = "2.0"

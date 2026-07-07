@@ -1,0 +1,19 @@
+[package]
+name = "forgedb-backup"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Lock-free snapshot backup & restore over ForgeDB's append-only storage layout"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "backup", "restore", "snapshot", "forgedb"]
+categories = ["database"]
+
+[dependencies]
+forgedb-storage = { path = "../storage" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.8"
