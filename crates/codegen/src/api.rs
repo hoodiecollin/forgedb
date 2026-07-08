@@ -232,7 +232,9 @@ impl ApiGenerator {
     /// routing is by name and filtering is field-by-field in this generated code.
     fn generate_subscription(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
-        let event_name = format_ident!("{}Inserted", model.name);
+        let inserted_name = format_ident!("{}Inserted", model.name);
+        let updated_name = format_ident!("{}Updated", model.name);
+        let deleted_name = format_ident!("{}Deleted", model.name);
         let snake = Self::to_snake_case(&model.name);
         let storage_field = format_ident!("{}", snake);
         let subscribe_fn = format_ident!("subscribe_{}", snake);
@@ -269,10 +271,10 @@ impl ApiGenerator {
             model.name
         );
         let subscribe_doc = format!(
-            "WebSocket subscription for `{}` inserts (#62 Direction A). Upgrades the \
-             connection and streams a typed `{}Inserted` JSON event per insert, \
-             optionally narrowed by `?field=value`.",
-            model.name, model.name
+            "WebSocket subscription for `{}` changes (#62 Direction A + #66). Upgrades \
+             the connection and streams a typed `{}Inserted` / `{}Updated` / \
+             `{}Deleted` JSON event per change, optionally narrowed by `?field=value`.",
+            model.name, model.name, model.name, model.name
         );
 
         quote! {
@@ -316,17 +318,29 @@ impl ApiGenerator {
                             if event.model != #model_name_str {
                                 continue;
                             }
-                            if event.kind != forgedb_changefeed::ChangeKind::Inserted {
-                                continue;
-                            }
                             // Materialize the typed record from the row index (brief lock).
+                            // Every model-change kind emits a materializable row: Inserted
+                            // / Updated point at the new live version; Deleted carries the
+                            // pre-delete row so the deleted record is still readable.
+                            // `Linked` (M2M) is not a model-row change → skip.
                             let record = { db.read().await.#storage_field.read_at(event.row_index) };
                             let Some(record) = record else { continue; };
                             if !#filter_fn(&record, &params) {
                                 continue;
                             }
-                            let payload = super::#event_name { #storage_field: record };
-                            let Ok(text) = serde_json::to_string(&payload) else { continue; };
+                            let text = match event.kind {
+                                forgedb_changefeed::ChangeKind::Inserted => {
+                                    serde_json::to_string(&super::#inserted_name { #storage_field: record })
+                                }
+                                forgedb_changefeed::ChangeKind::Updated => {
+                                    serde_json::to_string(&super::#updated_name { #storage_field: record })
+                                }
+                                forgedb_changefeed::ChangeKind::Deleted => {
+                                    serde_json::to_string(&super::#deleted_name { #storage_field: record })
+                                }
+                                forgedb_changefeed::ChangeKind::Linked => continue,
+                            };
+                            let Ok(text) = text else { continue; };
                             if socket.send(Message::Text(text.into())).await.is_err() {
                                 break; // client disconnected
                             }
