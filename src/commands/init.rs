@@ -123,7 +123,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-forgedb-storage = "0.1.3"
+forgedb-storage = "0.1.4"
 forgedb-types = "0.2"
 forgedb-changefeed = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
