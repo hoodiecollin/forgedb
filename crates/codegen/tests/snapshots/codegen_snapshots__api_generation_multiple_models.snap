@@ -177,7 +177,7 @@ fn user_event_matches(record: &super::User, params: &HashMap<String, String>) ->
     }
     true
 }
-///WebSocket subscription for `User` inserts (#62 Direction A). Upgrades the connection and streams a typed `UserInserted` JSON event per insert, optionally narrowed by `?field=value`.
+///WebSocket subscription for `User` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `UserInserted` / `UserUpdated` / `UserDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_user(
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
@@ -197,9 +197,6 @@ async fn handle_user_subscription(
                 if event.model != "User" {
                     continue;
                 }
-                if event.kind != forgedb_changefeed::ChangeKind::Inserted {
-                    continue;
-                }
                 let record = { db.read().await.user.read_at(event.row_index) };
                 let Some(record) = record else {
                     continue;
@@ -207,10 +204,23 @@ async fn handle_user_subscription(
                 if !user_event_matches(&record, &params) {
                     continue;
                 }
-                let payload = super::UserInserted {
-                    user: record,
+                let text = match event.kind {
+                    forgedb_changefeed::ChangeKind::Inserted => {
+                        serde_json::to_string(
+                            &super::UserInserted {
+                                user: record,
+                            },
+                        )
+                    }
+                    forgedb_changefeed::ChangeKind::Updated => {
+                        serde_json::to_string(&super::UserUpdated { user: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Deleted => {
+                        serde_json::to_string(&super::UserDeleted { user: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Linked => continue,
                 };
-                let Ok(text) = serde_json::to_string(&payload) else {
+                let Ok(text) = text else {
                     continue;
                 };
                 if socket.send(Message::Text(text.into())).await.is_err() {
@@ -261,7 +271,7 @@ fn post_event_matches(record: &super::Post, params: &HashMap<String, String>) ->
     }
     true
 }
-///WebSocket subscription for `Post` inserts (#62 Direction A). Upgrades the connection and streams a typed `PostInserted` JSON event per insert, optionally narrowed by `?field=value`.
+///WebSocket subscription for `Post` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `PostInserted` / `PostUpdated` / `PostDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_post(
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
@@ -281,9 +291,6 @@ async fn handle_post_subscription(
                 if event.model != "Post" {
                     continue;
                 }
-                if event.kind != forgedb_changefeed::ChangeKind::Inserted {
-                    continue;
-                }
                 let record = { db.read().await.post.read_at(event.row_index) };
                 let Some(record) = record else {
                     continue;
@@ -291,10 +298,23 @@ async fn handle_post_subscription(
                 if !post_event_matches(&record, &params) {
                     continue;
                 }
-                let payload = super::PostInserted {
-                    post: record,
+                let text = match event.kind {
+                    forgedb_changefeed::ChangeKind::Inserted => {
+                        serde_json::to_string(
+                            &super::PostInserted {
+                                post: record,
+                            },
+                        )
+                    }
+                    forgedb_changefeed::ChangeKind::Updated => {
+                        serde_json::to_string(&super::PostUpdated { post: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Deleted => {
+                        serde_json::to_string(&super::PostDeleted { post: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Linked => continue,
                 };
-                let Ok(text) = serde_json::to_string(&payload) else {
+                let Ok(text) = text else {
                     continue;
                 };
                 if socket.send(Message::Text(text.into())).await.is_err() {

@@ -1073,13 +1073,26 @@ Tag {
             || code.contains("pub fn get_at(&self, snap: &forgedb_storage :: Snapshot, id: Uuid) -> Option<Post>"),
         "get_at must be snapshot-scoped and clamp visibility"
     );
+    // #66 mutation surface: for id-bearing models `get_at`/`all_at` resolve the
+    // newest version *within the watermark* per id (not a plain prefix scan), so a
+    // snapshot captured before a later update/delete still sees the version live
+    // as-of capture. Both bind the watermark once and track the newest row.
     assert!(
-        code.contains("if !snap.visible(row_index)"),
-        "get_at must reject rows above the watermark"
+        code.contains("let watermark = snap.watermark();"),
+        "snapshot accessors bind the watermark once"
     );
     assert!(
-        code.contains("for row_index in 0..snap.watermark()"),
-        "all_at must scan exactly the committed prefix"
+        code.contains("let mut newest: Option<usize> = None;"),
+        "get_at must resolve the newest version within the watermark"
+    );
+    assert!(
+        code.contains("let mut newest: HashMap<Uuid, usize> = HashMap::new();"),
+        "all_at must resolve the newest version per id within the watermark"
+    );
+    // The junction still scans exactly the committed prefix (links are add-only).
+    assert!(
+        code.contains("(0..snap.watermark())"),
+        "junction pairs_at must scan exactly the committed prefix"
     );
 
     // Junction snapshot surface.
@@ -1119,6 +1132,72 @@ Tag {
     assert!(
         code.contains("self.tag.get_at(&snap.tag, right)"),
         "post_tags_at must clamp the resolved target to its watermark"
+    );
+}
+
+#[test]
+fn test_rust_generation_mutation_surface() {
+    // Mutation surface (#66): generated superseding-version `update` / `delete`.
+    // update appends a new version and repoints the id; delete appends a tombstoned
+    // version; both preserve append-only (committed bytes never mutated), so backup
+    // and watermark snapshots stay unchanged. Generated per model, for uuid AND
+    // integer PKs.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+}
+
+Counter {
+  id: +u64
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Signatures, per PK type.
+    assert!(
+        code.contains("pub fn update(&mut self, id: Uuid, record: Post) -> bool"),
+        "uuid-PK update signature"
+    );
+    assert!(
+        code.contains("pub fn delete(&mut self, id: Uuid) -> bool"),
+        "uuid-PK delete signature"
+    );
+    assert!(
+        code.contains("pub fn update(&mut self, id: u64, record: Counter) -> bool"),
+        "integer-PK update signature"
+    );
+    assert!(
+        code.contains("pub fn delete(&mut self, id: u64) -> bool"),
+        "integer-PK delete signature"
+    );
+
+    // update: guard on existence, append a live version, repoint the id.
+    assert!(
+        code.contains("if !self.id_to_row.contains_key(&id)"),
+        "update must no-op on an absent id"
+    );
+
+    // delete: materialize via get (also gives values to re-append), remember the
+    // pre-delete live row, then append a TOMBSTONED version and repoint.
+    assert!(
+        code.contains("let record = match self.get(id)"),
+        "delete resolves the current record"
+    );
+    assert!(
+        code.contains("let deleted_row = *self")
+            && code.contains("self.tombstones.append(true)"),
+        "delete appends a tombstoned superseding version"
+    );
+
+    // Append-only red line: update/delete never mutate committed bytes — no
+    // positional writer, only appends.
+    assert!(
+        !code.contains("write_all_at") && !code.contains("write_at"),
+        "mutation must be append-only — no in-place positional writes"
     );
 }
 
@@ -1190,11 +1269,25 @@ Tag {
         "each collection gets a clone of the shared feed"
     );
 
-    // Typed per-model event structs for the WS handler.
+    // Typed per-model event structs for the WS handler (#62 insert + #66 mutation).
     assert!(code.contains("pub struct PostInserted"), "typed insert event struct");
+    assert!(code.contains("pub struct PostUpdated"), "typed update event struct (#66)");
+    assert!(code.contains("pub struct PostDeleted"), "typed delete event struct (#66)");
     assert!(
         code.contains("pub post: Post"),
         "the event struct carries the typed record"
+    );
+
+    // #66: generated update()/delete() emit field-blind Updated/Deleted signals.
+    assert!(
+        code.contains("feed.emit(\"Post\", row_index, forgedb_changefeed::ChangeKind::Updated)")
+            || code.contains("feed.emit(\"Post\", row_index, forgedb_changefeed :: ChangeKind :: Updated)"),
+        "Post update must emit an Updated signal at the new row"
+    );
+    assert!(
+        code.contains("feed.emit(\"Post\", deleted_row, forgedb_changefeed::ChangeKind::Deleted)")
+            || code.contains("feed.emit(\"Post\", deleted_row, forgedb_changefeed :: ChangeKind :: Deleted)"),
+        "Post delete must emit a Deleted signal carrying the pre-delete row"
     );
 
     // read_at is public so the WS handler can materialize by row index.
@@ -1238,14 +1331,19 @@ User {
         "per-model /subscribe route registered"
     );
 
-    // Model routing is by NAME; only Inserted signals are streamed (insert-only).
+    // Model routing is by NAME; the handler now streams Inserted/Updated/Deleted
+    // typed events (#66), skipping only M2M Linked signals.
     assert!(
         code.contains("event.model != \"Post\""),
         "handler routes by model name"
     );
     assert!(
-        code.contains("ChangeKind::Inserted") || code.contains("ChangeKind :: Inserted"),
-        "handler filters to Inserted signals"
+        code.contains("PostInserted") && code.contains("PostUpdated") && code.contains("PostDeleted"),
+        "handler streams typed Inserted/Updated/Deleted events (#66)"
+    );
+    assert!(
+        code.contains("ChangeKind::Linked => continue") || code.contains("ChangeKind :: Linked => continue"),
+        "handler skips M2M Linked signals for a model subscription"
     );
     // Materialize via the public read_at using the broadcast row index.
     assert!(
