@@ -96,8 +96,9 @@ in `crates/`:
 **Published to crates.io (independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
 - `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.3
-  in-workspace, 0.1.2 on crates.io** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from`
-  for #57 backup; NOT YET PUBLISHED — see the reopened publish gap in Known issues)
+  (published 2026-07-07)** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from` +
+  `Snapshot` for #57 backup / #56-A snapshot reads)
+- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.0 (published 2026-07-07)**
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
@@ -113,9 +114,8 @@ in `crates/`:
   files, never the `.forge` schema).
   `changefeed` (#62 Direction A) is a **class-1 substrate** the *generated code links against*
   (like `storage`/`wal`, not like the internal-only crates above): a field-blind
-  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. Publish-intent
-  **0.1.0, NOT YET PUBLISHED** — the scaffold pins `forgedb-changefeed = "0.1"`, so a fresh `init`
-  needs it on crates.io (deepens the publish gap; see Known issues). It never decodes a field;
+  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. **Published
+  0.1.0 (2026-07-07)**; the scaffold pins `forgedb-changefeed = "0.1"`. It never decodes a field;
   generated code routes by model name and materializes typed events.
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`, `INTERNAL_CRATES.md`,
@@ -169,18 +169,16 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap REOPENED — now needs TWO publishes (`forgedb-storage 0.1.3` +
-  `forgedb-changefeed 0.1.0`).** (1) The #57 layout manifest made generated `*Storage::new()` emit a
-  `<model>/manifest.json` built from `forgedb_storage::{Manifest, ColumnMetadata, ColumnKind, RowAnchor}`
-  — fields/types that only exist on the **in-workspace 0.1.3**, not the published **0.1.2**. (2) The #62-A
-  change feed made generated `database.rs`/`api.rs` link **`forgedb-changefeed`** (brand-new crate, `0.1.0`,
-  never published), and the scaffold now pins `forgedb-changefeed = "0.1"`. So a freshly `init`ed project
-  can't resolve/compile against crates.io until BOTH land. **To reclose:** `cargo publish -p forgedb-storage`
-  (additive minor 0.1.2→0.1.3) **and** `cargo publish -p forgedb-changefeed` (new 0.1.0); `wal` 0.1.1 /
-  `types` 0.2.0 unchanged; then re-run the outside-repo `init → generate rust → cargo build` proof.
-  In-workspace everything builds (path deps); the gap is only against crates.io. Prior close (2026-07-06):
-  published **`forgedb-types 0.2.0`** (breaking `Value::U32/U64`) + **`forgedb-storage 0.1.2`** (additive
-  `append_uuid`/`read_uuid`/… methods) and pinned the scaffold to those.
+- **`init → build` publish gap — CLOSED (2026-07-07).** Published **`forgedb-storage 0.1.3`** (additive
+  minor: `Manifest` layout fields + `Snapshot`) **and `forgedb-changefeed 0.1.0`** (new class-1 crate);
+  `wal` 0.1.1 / `types` 0.2.0 unchanged. Reclose PROVEN by the outside-repo proof: a fresh `forgedb init`
+  → `generate rust` → `cargo build` resolves `forgedb-storage 0.1.3` + `forgedb-changefeed 0.1.0` +
+  `forgedb-types 0.2.0` from crates.io and compiles clean. The scaffold pins `forgedb-storage = "0.1.3"`,
+  `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap reopened twice — #57 (storage 0.1.3 `Manifest`
+  fields) and #62-A (new `forgedb-changefeed` dep); both closed here. Prior close (2026-07-06): published
+  `forgedb-types 0.2.0` + `forgedb-storage 0.1.2`. **Next thing that will reopen it:** any new
+  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the
+  scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
