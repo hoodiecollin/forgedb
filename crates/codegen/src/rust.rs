@@ -79,6 +79,14 @@ impl RustGenerator {
             tokens.extend(Self::generate_change_event_structs(model));
         }
 
+        // Generate per-model live-query delta enums (#62 Direction B): the typed,
+        // removal-aware result-set deltas the `/live-query/<model>` WS handler
+        // pushes (`Init` / `Added` / `Removed` / `Updated`).  Typed model records
+        // + the model's own id type — never an arbitrary runtime value.
+        for model in &schema.models {
+            tokens.extend(Self::generate_live_delta_enum(model));
+        }
+
         // Generate M2M junction storage structs (referenced by the Database
         // struct fields, so emitted before it).
         let junction_tokens = Self::generate_junction_structs(schema);
@@ -389,6 +397,42 @@ impl RustGenerator {
         });
 
         quote! { #(#structs)* }
+    }
+
+    /// Generate the typed live-query delta enum for a model (#62 Direction B).
+    ///
+    /// The `/live-query/<model>` WS handler tracks the result set of a generated
+    /// closed-set query and pushes these removal-aware deltas as membership
+    /// changes: `Init` (the full initial set), `Added` / `Updated` (a typed
+    /// record entered or changed within the set), `Removed` (an id left the set —
+    /// now expressible because the mutation surface (#66) makes `all()` exclude
+    /// retracted rows).  Every payload is a *generated* typed record or the
+    /// model's own id type — never an arbitrary runtime value.  Tagged JSON
+    /// (`{"kind":"added","row":{…}}`) so a client can dispatch on `kind`.
+    fn generate_live_delta_enum(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let delta_name = format_ident!("{}LiveDelta", model.name);
+        let id_type = Self::id_type_tokens(model);
+        let doc = format!(
+            "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
+             membership changes over a generated closed-set query.",
+            model.name
+        );
+        quote! {
+            #[doc = #doc]
+            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            #[serde(tag = "kind", rename_all = "lowercase")]
+            pub enum #delta_name {
+                /// The full matching set at subscription time.
+                Init { rows: Vec<#model_name> },
+                /// A record newly entered the matching set.
+                Added { row: #model_name },
+                /// A record already in the set changed.
+                Updated { row: #model_name },
+                /// An id left the matching set (deleted, or no longer matches).
+                Removed { id: #id_type },
+            }
+        }
     }
 
     /// Generate the snapshot-scoped read accessors (`get_at` / `all_at`) for a model
