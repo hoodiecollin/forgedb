@@ -13,8 +13,8 @@ resolved **the retraction-primitive fork** that #56 (MVCC), #57 (backup), #62 (s
 
 - **No `forgedb-storage` change was needed** — the retraction is pure generated code over the
   existing append + `id_to_row` machinery. Only substrate change: `forgedb-changefeed`
-  `ChangeKind` gains `Updated`/`Deleted` (additive, 0.1.0 → **0.1.1** — must be published before
-  the scaffold's `= "0.1"` pin resolves it from crates.io; see the publish-gap note in CLAUDE.md).
+  `ChangeKind` gains `Updated`/`Deleted` (additive, 0.1.0 → **0.1.1**, published 2026-07-08; the
+  scaffold's `= "0.1"` pin resolves it from crates.io — publish gap CLOSED, see CLAUDE.md).
 - **Generated per model:** `update(id, record) -> bool` (append a live superseding version, repoint
   the id; no-op false on an absent id) and `delete(id) -> bool` (append a *tombstoned* superseding
   version; no-op false when already absent). Append-only holds — no committed byte is mutated in

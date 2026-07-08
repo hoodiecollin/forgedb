@@ -98,8 +98,8 @@ in `crates/`:
 - `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.3
   (published 2026-07-07)** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from` +
   `Snapshot` for #57 backup / #56-A snapshot reads)
-- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (0.1.0 published
-  2026-07-07; 0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66 — PUBLISH PENDING)**
+- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
+  0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
@@ -170,17 +170,16 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — REOPENED by #66 (2026-07-07): needs `forgedb-changefeed 0.1.1`.**
-  The mutation surface (#66) added `ChangeKind::Updated`/`Deleted` (additive enum variants), bumping
-  `forgedb-changefeed` **0.1.0 → 0.1.1**. Generated `update`/`delete` now reference those variants, so
-  an outside `cargo build` needs **0.1.1 published** (the scaffold's `forgedb-changefeed = "0.1"` pin
-  already allows it; `forgedb-storage` was NOT touched — no storage change was needed). **ACTION: publish
-  `forgedb-changefeed 0.1.1` before the next outside-repo build.** `storage` 0.1.3 / `wal` 0.1.1 /
-  `types` 0.2.0 unchanged. Prior CLOSE (2026-07-07): published `forgedb-storage 0.1.3` (`Manifest` layout
-  + `Snapshot`) + `forgedb-changefeed 0.1.0`, PROVEN by an outside-repo `init → generate → cargo build`.
-  Scaffold pins `forgedb-storage = "0.1.3"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap
-  reopened for #57, #62-A, and now #66. **Next thing that will reopen it:** any new substrate-crate dep or
-  additive substrate API the generated code starts requiring — publish before the scaffold pins it.
+- **`init → build` publish gap — CLOSED (2026-07-08).** The mutation surface (#66) added
+  `ChangeKind::Updated`/`Deleted` (additive enum variants), bumping `forgedb-changefeed` **0.1.0 →
+  0.1.1**; generated `update`/`delete` reference those variants. **`forgedb-changefeed 0.1.1` is now
+  published**, and the reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust
+  → cargo build` resolving `forgedb-changefeed 0.1.1` + `forgedb-storage 0.1.3` + `forgedb-types 0.2.0`
+  from crates.io and compiling generated code that references the new variants. `forgedb-storage` was NOT
+  touched by #66 (0.1.3 unchanged); `wal` 0.1.1 / `types` 0.2.0 unchanged. Scaffold pins
+  `forgedb-storage = "0.1.3"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap reopened for #57,
+  #62-A, and #66 — all closed. **Next thing that will reopen it:** any new substrate-crate dep or additive
+  substrate API the generated code starts requiring — publish before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -264,8 +263,8 @@ across many domains live in `examples/` — see `examples/README.md`.**
   row version rather than mutating committed bytes, so append-only holds and backup (#57) / watermark
   snapshots (#56-A) / change feed (#62-A) stay unchanged. **No `forgedb-storage` change was needed** —
   the retraction is pure generated code over the existing append + `id_to_row` machinery; the only
-  substrate change is `forgedb-changefeed` `ChangeKind` += `Updated`/`Deleted` (→ **0.1.1**, publish
-  pending — see publish gap). `update(id, record) -> bool` appends a live version and repoints the id
+  substrate change is `forgedb-changefeed` `ChangeKind` += `Updated`/`Deleted` (→ **0.1.1**, published
+  2026-07-08). `update(id, record) -> bool` appends a live version and repoints the id
   (no-op false on absent id); `delete(id) -> bool` appends a **tombstoned** version so `get` reads absent
   (no-op false when already absent). **Snapshot isolation across mutation** falls out of the #56-A
   watermark for free: `get_at`/`all_at` resolve newest-version-*within-the-watermark* per id (read the id
