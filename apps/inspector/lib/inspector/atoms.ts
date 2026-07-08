@@ -5,7 +5,9 @@
  */
 
 import { atom } from "jotai";
-import { DEFAULT_PREDICATES } from "./mock";
+import { DB_NAME, DEFAULT_PREDICATES, MODELS, REL, SCHEMA } from "./mock";
+import type { ProjectStructure } from "./data-source";
+import { loadStartupProject, openProject } from "./data-source";
 import type {
   ConsoleTab,
   Lens,
@@ -17,6 +19,76 @@ import type {
 // ---- navigation / connection ----
 export const screenAtom = atom<Screen>("atlas");
 export const connectedAtom = atom(true);
+/**
+ * Base URL of the running generated API for the Live lens (#13). The generated
+ * `serve` binds `0.0.0.0:3000` by default; the client issues requests over the
+ * Tauri HTTP/WebSocket plugins (CORS-proof).
+ */
+export const apiBaseAtom = atom("http://localhost:3000");
+
+// ---- project structure (Structure lens, #12) --------------------------------
+// The single source screens read schema/model/relation data from. Its default is
+// the mock database, so a browser (web dev / static preview) needs no backend.
+// Inside Tauri, `openProjectAtom` replaces it with a parsed real `.forge`.
+const MOCK_STRUCTURE: ProjectStructure = {
+  dbName: DB_NAME,
+  models: MODELS,
+  rel: REL,
+  schema: SCHEMA,
+  source: "mock",
+  hasStats: false,
+};
+export const structureAtom = atom<ProjectStructure>(MOCK_STRUCTURE);
+export const modelsAtom = atom((get) => get(structureAtom).models);
+export const relAtom = atom((get) => get(structureAtom).rel);
+export const schemaAtom = atom((get) => get(structureAtom).schema);
+export const dbNameAtom = atom((get) => get(structureAtom).dbName);
+export const projectSourceAtom = atom((get) => get(structureAtom).source);
+
+export const projectErrorAtom = atom<string | null>(null);
+export const projectLoadingAtom = atom(false);
+
+/** Open-project flow (Tauri only): pick a `.forge`, load it into `structureAtom`. */
+export const openProjectAtom = atom(null, async (_get, set) => {
+  set(projectLoadingAtom, true);
+  set(projectErrorAtom, null);
+  try {
+    const loaded = await openProject();
+    if (loaded) {
+      const first = loaded.models[0]?.key ?? "";
+      set(structureAtom, loaded);
+      set(selModelAtom, first);
+      set(studioModelAtom, first);
+      set(selectionAtom, {});
+      set(pivotAtom, null);
+      set(predicatesAtom, []); // mock predicates don't apply to a real schema
+    }
+  } catch (e) {
+    set(projectErrorAtom, e instanceof Error ? e.message : String(e));
+  } finally {
+    set(projectLoadingAtom, false);
+  }
+});
+
+/**
+ * Bootstrap on launch (Tauri only): if a startup project is configured
+ * (`FORGEDB_INSPECTOR_PROJECT`), load it; otherwise stay on the mock sample.
+ * Runs once from the shell mount.
+ */
+export const bootstrapProjectAtom = atom(null, async (_get, set) => {
+  try {
+    const loaded = await loadStartupProject();
+    if (loaded) {
+      const first = loaded.models[0]?.key ?? "";
+      set(structureAtom, loaded);
+      set(selModelAtom, first);
+      set(studioModelAtom, first);
+      set(predicatesAtom, []);
+    }
+  } catch (e) {
+    set(projectErrorAtom, e instanceof Error ? e.message : String(e));
+  }
+});
 
 // ---- atlas ----
 export const lensAtom = atom<Lens>("live");

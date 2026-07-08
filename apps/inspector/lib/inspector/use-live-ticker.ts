@@ -2,24 +2,86 @@
 
 import { useEffect } from "react";
 import { useAtomValue, useSetAtom } from "jotai";
-import { isConnectedScreenLiveAtom, streamAtom } from "./atoms";
+import {
+  apiBaseAtom,
+  isConnectedScreenLiveAtom,
+  projectSourceAtom,
+  streamAtom,
+  studioModelAtom,
+} from "./atoms";
+import { isTauri } from "./data-source";
+import { type LiveDelta, type Subscription, liveQuery } from "./live";
 import type { LiveDeltaKind } from "./types";
 
 const KINDS: LiveDeltaKind[] = ["Added", "Added", "Updated", "Removed"];
 const NAMES = ["ada", "lin", "max", "sol", "ivy", "ken", "zoe", "raf"];
 const pick = <T,>(xs: T[]) => xs[Math.floor(Math.random() * xs.length)]!;
 
+/** Best-effort one-line summary of a wire row for the live tail. */
+function summarize(row: Record<string, unknown> | undefined): string {
+  if (!row) return "(row)";
+  const label =
+    (row.title as string) ??
+    (row.name as string) ??
+    (row.body as string) ??
+    (row.email as string) ??
+    (row.id as string) ??
+    "row";
+  return String(label).slice(0, 60);
+}
+
 /**
- * Mock change feed. While a Live surface is on screen (and attached), it appends
- * a typed delta every ~1.8s so the live tail / dashboards visibly stream. The
- * real feed (#13) subscribes to the generated WS endpoint instead.
+ * The live tail feeding `streamAtom` (Console live tab, Dashboards tile).
+ *
+ * When attached to a real project's API inside Tauri, this is a genuine
+ * `/live-query` subscription on the focused model — typed added/updated/removed
+ * deltas. In the browser / mock demo it falls back to a fabricated ticker so the
+ * shell still animates. Either way it only runs while a Live surface is on screen.
  */
 export function useLiveTicker() {
   const live = useAtomValue(isConnectedScreenLiveAtom);
+  const source = useAtomValue(projectSourceAtom);
+  const model = useAtomValue(studioModelAtom);
+  const base = useAtomValue(apiBaseAtom);
   const setStream = useSetAtom(streamAtom);
+
+  const real = isTauri() && source === "project";
 
   useEffect(() => {
     if (!live) return;
+
+    if (real) {
+      let sub: Subscription | null = null;
+      let cancelled = false;
+      const push = (d: LiveDelta) => {
+        if (cancelled || d.kind === "Init") return;
+        const row = d.row;
+        const id = String(row?.id ?? d.id ?? "");
+        const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
+        setStream((s) =>
+          [
+            {
+              kind: d.kind as LiveDeltaKind,
+              id,
+              who: model,
+              text: `${model} ${summarize(row)}`,
+              ts,
+            },
+            ...s,
+          ].slice(0, 7),
+        );
+      };
+      liveQuery(base, model, {}, push).then((s) => {
+        if (cancelled) s.close();
+        else sub = s;
+      });
+      return () => {
+        cancelled = true;
+        sub?.close();
+      };
+    }
+
+    // Mock ticker (browser / demo).
     const iv = setInterval(() => {
       const kind = pick(KINDS);
       const id =
@@ -36,5 +98,5 @@ export function useLiveTicker() {
       );
     }, 1800);
     return () => clearInterval(iv);
-  }, [live, setStream]);
+  }, [live, real, base, model, setStream]);
 }
