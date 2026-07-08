@@ -143,8 +143,8 @@ impl RustGenerator {
         // Generate insert logic
         let insert_logic = Self::generate_insert_logic(model);
 
-        // Generate get logic
-        let get_logic = Self::generate_get_logic(model);
+        // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
+        let read_at_logic = Self::generate_read_at_logic(model);
 
         // Generate reopen/rehydration logic (#65): rebuild the in-memory
         // `row_count` + `id_to_row` index from the persisted columns so a fresh
@@ -200,8 +200,56 @@ impl RustGenerator {
                     #insert_logic
                 }
 
+                /// Materialize the record at a physical row index, or `None` if
+                /// the row is tombstoned.  Shared read path (#56): `get`,
+                /// `get_at`, and `all_at` all funnel through here.
+                fn read_at(&self, row_index: usize) -> Option<#model_name> {
+                    #read_at_logic
+                }
+
                 pub fn get(&self, id: #id_type) -> Option<#model_name> {
-                    #get_logic
+                    let row_index = *self.id_to_row.get(&id)?;
+                    self.read_at(row_index)
+                }
+
+                /// The number of physically committed rows (the snapshot
+                /// watermark).  Append-only storage guarantees a row's index is
+                /// stable for life, so this count fully defines a read view.
+                pub fn row_count(&self) -> usize {
+                    self.row_count
+                }
+
+                /// Capture a read snapshot at the current committed row count
+                /// (#56, Direction A).  Rows appended after this call are
+                /// invisible to accessors passed the returned snapshot.
+                pub fn snapshot(&self) -> forgedb_storage::Snapshot {
+                    forgedb_storage::Snapshot::new(self.row_count)
+                }
+
+                /// Snapshot-scoped point read: like `get`, but a row is only
+                /// visible if it was committed as of `snap` (#56).  A row
+                /// inserted after the snapshot was captured returns `None` even
+                /// though its id is in the live index.
+                pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
+                    let row_index = *self.id_to_row.get(&id)?;
+                    if !snap.visible(row_index) {
+                        return None;
+                    }
+                    self.read_at(row_index)
+                }
+
+                /// Return every live record committed as of `snap` (#56).
+                /// Scans exactly the row prefix `0..snap.watermark()`, so
+                /// concurrent appends past the watermark are excluded and the
+                /// result is a consistent point-in-time view.
+                pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
+                    let mut records = Vec::new();
+                    for row_index in 0..snap.watermark() {
+                        if let Some(record) = self.read_at(row_index) {
+                            records.push(record);
+                        }
+                    }
+                    records
                 }
 
                 /// Return every live (non-deleted) record.  Used by generated
@@ -704,8 +752,14 @@ impl RustGenerator {
         }
     }
 
-    /// Generate get method logic
-    fn generate_get_logic(model: &forgedb_parser::Model) -> TokenStream {
+    /// Generate the body of the shared `read_at(row_index)` accessor.
+    ///
+    /// This is the read path *below* identity resolution: given a physical row
+    /// index, check the tombstone and materialize the record.  Both `get(id)`
+    /// (live index lookup) and the snapshot accessors `get_at`/`all_at` (#56,
+    /// watermark-clamped) funnel through it, so there is exactly one place that
+    /// knows a model's column layout.
+    fn generate_read_at_logic(model: &forgedb_parser::Model) -> TokenStream {
         let mut read_statements = Vec::new();
         let mut field_values = Vec::new();
 
@@ -816,9 +870,7 @@ impl RustGenerator {
         let model_name = format_ident!("{}", model.name);
 
         quote! {
-            // Look up row index
-            let row_index = *self.id_to_row.get(&id)?;
-
+            // `read_at` receives an already-resolved physical row index.
             // Check if deleted
             if self.tombstones.is_deleted(row_index).unwrap_or(true) {
                 return None;
@@ -1070,6 +1122,35 @@ impl RustGenerator {
             })
             .collect();
 
+        // DatabaseSnapshot (#56, Direction A): one row-count watermark per model
+        // and per junction, captured together by `Database::snapshot()`.  Because
+        // storage is append-only, this set of watermarks defines a database-wide
+        // consistent read view — every `*_at` accessor clamps to it.
+        let snapshot_fields: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| {
+                let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
+                quote! { pub #field_name: forgedb_storage::Snapshot }
+            })
+            .chain(m2m.iter().map(|m| {
+                let field = Self::junction_field_ident(m);
+                quote! { pub #field: forgedb_storage::Snapshot }
+            }))
+            .collect();
+        let snapshot_inits: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| {
+                let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
+                quote! { #field_name: self.#field_name.snapshot() }
+            })
+            .chain(m2m.iter().map(|m| {
+                let field = Self::junction_field_ident(m);
+                quote! { #field: self.#field.snapshot() }
+            }))
+            .collect();
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
@@ -1077,11 +1158,31 @@ impl RustGenerator {
                 #(#junction_fields,)*
             }
 
+            /// A database-wide read snapshot (#56, Direction A): a row-count
+            /// watermark for every model and junction, captured atomically by
+            /// `Database::snapshot()`.  Pass a field to that collection's
+            /// `*_at` accessors for reads consistent as of the capture instant.
+            /// Rows appended after capture are invisible; concurrent writers
+            /// cannot make a reader observe a torn row.
+            pub struct DatabaseSnapshot {
+                #(#snapshot_fields,)*
+            }
+
             impl Database {
                 pub fn new() -> Self {
                     Self {
                         #(#db_inits,)*
                         #(#junction_inits,)*
+                    }
+                }
+
+                /// Capture a consistent read snapshot across all collections.
+                /// Single-process, single-thread today, so the captures are
+                /// trivially atomic; the watermarks are what make the read view
+                /// stable against later appends.
+                pub fn snapshot(&self) -> DatabaseSnapshot {
+                    DatabaseSnapshot {
+                        #(#snapshot_inits,)*
                     }
                 }
             }
@@ -1199,6 +1300,33 @@ impl RustGenerator {
                     /// Every recorded (left, right) id pair.
                     pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
                         (0..self.row_count)
+                            .map(|i| {
+                                let left = Uuid::from_bytes(
+                                    self.left_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                let right = Uuid::from_bytes(
+                                    self.right_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                (left, right)
+                            })
+                            .collect()
+                    }
+
+                    /// The number of committed link rows (the snapshot watermark).
+                    pub fn row_count(&self) -> usize {
+                        self.row_count
+                    }
+
+                    /// Capture a read snapshot at the current link count (#56).
+                    pub fn snapshot(&self) -> forgedb_storage::Snapshot {
+                        forgedb_storage::Snapshot::new(self.row_count)
+                    }
+
+                    /// Link pairs committed as of `snap` (#56): scans exactly the
+                    /// prefix `0..snap.watermark()`, excluding links appended after
+                    /// the snapshot was captured.
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                        (0..snap.watermark())
                             .map(|i| {
                                 let left = Uuid::from_bytes(
                                     self.left_col.read_uuid(i).expect("Failed to read link"),
@@ -1382,6 +1510,43 @@ impl RustGenerator {
                             .collect()
                     }
                 });
+
+                // Snapshot-scoped variant of the same forward M2M query (#56,
+                // Direction A milestone).  Demonstrates cross-table snapshot
+                // consistency: the junction is clamped to *its* watermark
+                // (`pairs_at`) and each resolved target to *its* watermark
+                // (`get_at`), so links or target rows appended after the snapshot
+                // was captured are excluded on both sides of the join.
+                let fwd_at_name = format!(
+                    "{}_{}_at",
+                    Self::to_snake_case(&m.model1),
+                    m.field1
+                );
+                if seen.insert(fwd_at_name.clone()) {
+                    let fwd_at_ident = format_ident!("{}", fwd_at_name);
+                    let junction_field2 = junction_field.clone();
+                    let doc = format!(
+                        "All linked {} for the given {} id, consistent as of `snap`.",
+                        m.model2, m.model1
+                    );
+                    methods.push(quote! {
+                        #[doc = #doc]
+                        pub fn #fwd_at_ident(
+                            &self,
+                            snap: &DatabaseSnapshot,
+                            id: Uuid,
+                        ) -> Vec<#model2_ident> {
+                            self.#junction_field2
+                                .pairs_at(&snap.#junction_field2)
+                                .into_iter()
+                                .filter(|(left, _)| *left == id)
+                                .filter_map(|(_, right)| {
+                                    self.#model2_storage.get_at(&snap.#model2_storage, right)
+                                })
+                                .collect()
+                        }
+                    });
+                }
             }
 
             // model2.field2 -> Vec<model1>
