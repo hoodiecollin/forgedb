@@ -1,8 +1,27 @@
 # Proposal: Backup & Restore
 
-**Status:** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints** (2026-07-06). Awaiting maintainer approval to schedule.
+**Status:** FIRST MILESTONE IMPLEMENTED (2026-07-07). Product-gated; `forgedb-product-manager`
+verdict: **aligned-with-constraints** (2026-07-06).
+- **LANDED:** `forgedb-backup` class-1 substrate crate (lock-free full-snapshot create/restore
+  over opaque files, driven entirely by each dir's `manifest.json` `row_anchor` + column layout;
+  never reads `.forge`), `forgedb backup {create,restore,list}` CLI, the per-model layout manifest
+  emitted from generated `*Storage::new()`, and the substrate `Manifest` additive fields
+  (`compaction_epoch`/`format_version`/`row_anchor` + `ColumnMetadata { value_size, kind,
+  relative_path }`). Concurrency proof (`crates/backup/tests/roundtrip.rs`) + E2E CLI proof
+  (generated write → create → restore → reopen) both green. Anchor = tombstone/right-column length
+  (from #65), so backup captures a crash-consistent committed prefix with no lock/MVCC/WAL.
+- **DEFERRED (out of milestone, unchanged):** incremental backups (the `compaction_epoch` field is
+  captured in the archive but **compaction does not yet bump it** and no chain logic exists),
+  WAL-replay PITR, cloud `BackupTarget` impls, compression/encryption.
+  - **Trap to fix when incrementals land:** generated `write_manifest` hardcodes
+    `compaction_epoch: 0` and runs on every open, so once compaction bumps the epoch a reopen
+    would reset it to 0 and break the chain. Fix = have the generated writer *preserve* an
+    existing manifest's `compaction_epoch` (documented at `generate_write_manifest` in
+    `crates/codegen/src/rust.rs`). Harmless today (nothing bumps it).
+- **PUBLISH:** requires `forgedb-storage 0.1.3` on crates.io before a fresh `init` builds against
+  the registry (see CLAUDE.md "publish gap REOPENED").
 **Issue:** [#57](https://github.com/hoodiecollin/forgedb/issues/57) (`idea`, `plan-next`)
-**Date:** 2026-07-06
+**Date:** 2026-07-06 (design) · 2026-07-07 (milestone)
 
 ## Summary
 
