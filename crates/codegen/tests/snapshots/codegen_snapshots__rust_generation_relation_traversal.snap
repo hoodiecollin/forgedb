@@ -27,6 +27,7 @@ pub struct UserStorage {
     id_col: FixedColumn,
     name_col: VariableColumn,
     tombstones: forgedb_storage::Tombstones,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl UserStorage {
     /// Open the model's storage, rehydrating the in-memory identity
@@ -53,6 +54,7 @@ impl UserStorage {
                     PathBuf::from("user/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+            changefeed: None,
         };
         let n = db.tombstones.len();
         db.row_count = n;
@@ -95,6 +97,12 @@ impl UserStorage {
         };
         let _ = manifest.save_to(std::path::Path::new("user/manifest.json"));
     }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
     pub fn insert(&mut self, record: User) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
@@ -105,12 +113,17 @@ impl UserStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
         id
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
-    /// `get_at`, and `all_at` all funnel through here.
-    fn read_at(&self, row_index: usize) -> Option<User> {
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<User> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
@@ -203,6 +216,7 @@ pub struct PostStorage {
     author_col: FixedColumn,
     editor_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PostStorage {
     /// Open the model's storage, rehydrating the in-memory identity
@@ -236,6 +250,7 @@ impl PostStorage {
                     PathBuf::from("post/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+            changefeed: None,
         };
         let n = db.tombstones.len();
         db.row_count = n;
@@ -287,6 +302,12 @@ impl PostStorage {
         };
         let _ = manifest.save_to(std::path::Path::new("post/manifest.json"));
     }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
     pub fn insert(&mut self, record: Post) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
@@ -309,12 +330,17 @@ impl PostStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
         id
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
-    /// `get_at`, and `all_at` all funnel through here.
-    fn read_at(&self, row_index: usize) -> Option<Post> {
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<Post> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
@@ -419,6 +445,7 @@ pub struct TagStorage {
     id_col: FixedColumn,
     label_col: VariableColumn,
     tombstones: forgedb_storage::Tombstones,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl TagStorage {
     /// Open the model's storage, rehydrating the in-memory identity
@@ -445,6 +472,7 @@ impl TagStorage {
                     PathBuf::from("tag/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+            changefeed: None,
         };
         let n = db.tombstones.len();
         db.row_count = n;
@@ -487,6 +515,12 @@ impl TagStorage {
         };
         let _ = manifest.save_to(std::path::Path::new("tag/manifest.json"));
     }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
     pub fn insert(&mut self, record: Tag) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
@@ -497,12 +531,17 @@ impl TagStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
         id
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
-    /// `get_at`, and `all_at` all funnel through here.
-    fn read_at(&self, row_index: usize) -> Option<Tag> {
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<Tag> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
@@ -576,11 +615,27 @@ impl TagStorage {
         records
     }
 }
+///Change-feed event: a `User` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UserInserted {
+    pub user: User,
+}
+///Change-feed event: a `Post` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PostInserted {
+    pub post: Post,
+}
+///Change-feed event: a `Tag` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TagInserted {
+    pub tag: Tag,
+}
 ///Junction table for the Post.tags <-> Tag.posts many-to-many relation
 pub struct PostTagLink {
     left_col: FixedColumn,
     right_col: FixedColumn,
     row_count: usize,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PostTagLink {
     /// Open the junction storage, rehydrating `row_count` from the
@@ -604,9 +659,15 @@ impl PostTagLink {
             left_col,
             right_col,
             row_count,
+            changefeed: None,
         };
         db.write_manifest();
         db
+    }
+    /// Attach a shared change feed (#62): `link` then emits a
+    /// field-blind `(junction_name, row_index)` signal.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
     }
     /// Write the junction's physical-layout manifest (#57): two
     /// 16-byte uuid columns and a row-count anchor on `right.bin`
@@ -642,9 +703,17 @@ impl PostTagLink {
     /// Record a link between a `left` (model1) id and a `right`
     /// (model2) id.
     pub fn link(&mut self, left: Uuid, right: Uuid) {
+        let row_index = self.row_count;
         self.left_col.append_uuid(*left.as_bytes()).expect("Failed to append link");
         self.right_col.append_uuid(*right.as_bytes()).expect("Failed to append link");
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit(
+                "post_tag_link",
+                row_index,
+                forgedb_changefeed::ChangeKind::Linked,
+            );
+        }
     }
     /// Every recorded (left, right) id pair.
     pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
@@ -691,6 +760,11 @@ pub struct Database {
     pub post: PostStorage,
     pub tag: TagStorage,
     pub post_tag_link: PostTagLink,
+    /// Shared change feed (#62 Direction A): every collection emits a
+    /// field-blind `(model, row_index)` signal here on insert/link.
+    /// The generated WS endpoint subscribes to it; standalone callers
+    /// can ignore it.
+    pub changefeed: forgedb_changefeed::ChangeFeed,
 }
 /// A database-wide read snapshot (#56, Direction A): a row-count
 /// watermark for every model and junction, captured atomically by
@@ -706,11 +780,21 @@ pub struct DatabaseSnapshot {
 }
 impl Database {
     pub fn new() -> Self {
+        let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+        let mut user = UserStorage::new();
+        user.attach_changefeed(changefeed.clone());
+        let mut post = PostStorage::new();
+        post.attach_changefeed(changefeed.clone());
+        let mut tag = TagStorage::new();
+        tag.attach_changefeed(changefeed.clone());
+        let mut post_tag_link = PostTagLink::new();
+        post_tag_link.attach_changefeed(changefeed.clone());
         Self {
-            user: UserStorage::new(),
-            post: PostStorage::new(),
-            tag: TagStorage::new(),
-            post_tag_link: PostTagLink::new(),
+            user,
+            post,
+            tag,
+            post_tag_link,
+            changefeed,
         }
     }
     /// Capture a consistent read snapshot across all collections.
