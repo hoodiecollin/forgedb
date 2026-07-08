@@ -1,11 +1,42 @@
 # Proposal: The Generated Mutation Surface (`update` / `delete`)
 
-**Status:** DESIGN NOTE — product-gated. Awaiting `forgedb-product-manager` verdict + maintainer
-approval to schedule. This note exists to resolve **the retraction-primitive fork** that #56
-(MVCC), #57 (backup), #62 (subscriptions), #59 (multi-tenancy L2), and #63 (inspector editor) all
-defer to. Nothing is implemented yet.
-**Issue:** none yet — the shared prerequisite named across the notes above; file one when scheduled.
+**Status:** FIRST MILESTONE LANDED (2026-07-07). Single-process, superseding-version `update` /
+`delete` generated per model; snapshot-isolated reads across mutation; #62 `Updated`/`Deleted`
+events. Deferred items (GC/compaction of superseded versions, M2M `unlink`, concurrent writers,
+version chains, field-level patch, cascade delete) remain out — see "Explicitly out". This note
+resolved **the retraction-primitive fork** that #56 (MVCC), #57 (backup), #62 (subscriptions), #59
+(multi-tenancy L2), and #63 (inspector editor) all defer to.
+**Issue:** [#66](https://github.com/hoodiecollin/forgedb/issues/66).
 **Date:** 2026-07-07
+
+## What landed (milestone 1)
+
+- **No `forgedb-storage` change was needed** — the retraction is pure generated code over the
+  existing append + `id_to_row` machinery. Only substrate change: `forgedb-changefeed`
+  `ChangeKind` gains `Updated`/`Deleted` (additive, 0.1.0 → **0.1.1** — must be published before
+  the scaffold's `= "0.1"` pin resolves it from crates.io; see the publish-gap note in CLAUDE.md).
+- **Generated per model:** `update(id, record) -> bool` (append a live superseding version, repoint
+  the id; no-op false on an absent id) and `delete(id) -> bool` (append a *tombstoned* superseding
+  version; no-op false when already absent). Append-only holds — no committed byte is mutated in
+  place (guarded by a test asserting the generated code contains no `write_at`/`write_all_at`).
+- **Snapshot isolation across mutation** falls out of the #56-A watermark for free: `get_at`/`all_at`
+  resolve newest-version-*within-the-watermark* per id (reading the id column across the committed
+  prefix), so a snapshot captured *before* an update/delete still resolves the old value. No version
+  chains, no `xmin`/`xmax`.
+- **#62 integration:** `ChangeKind::Updated`/`Deleted` emitted by the generated `update`/`delete`;
+  generated `<Model>Updated`/`<Model>Deleted` typed structs; the WS handler branches on kind and
+  streams the matching typed event (a `Deleted` carries the pre-delete row so the deleted record is
+  still materializable). `Linked` is skipped for a model subscription.
+- **Proof:** `scratchpad/mutation_compile` — compile-tests `database.rs` + `api.rs` through the
+  current codegen and runtime-proves: insert→update→get returns the new value; delete→get returns
+  `None`; a snapshot taken before an update/delete still sees the old state; `all_at` yields one
+  newest version per id (no duplicates); reopen resolves newest-version-wins and keeps deletions;
+  integer-PK models get the same surface; and a CLI `backup create → restore → reopen` over a
+  mutated dir restores the exact logical state. Guards: `test_rust_generation_mutation_surface`,
+  extended `test_rust_generation_snapshot_reads` / `test_rust_generation_changefeed_emits` /
+  `test_api_generation_websocket_subscription`, changefeed `mutation_kinds_carry_through_the_feed`.
+
+The original design note follows unchanged.
 
 ## Summary
 

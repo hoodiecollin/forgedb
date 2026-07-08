@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 409 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 411 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 409 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"403"/"399"/"398"/"394"/"380".
+**Baseline: 411 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"409"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -98,7 +98,8 @@ in `crates/`:
 - `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.3
   (published 2026-07-07)** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from` +
   `Snapshot` for #57 backup / #56-A snapshot reads)
-- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.0 (published 2026-07-07)**
+- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (0.1.0 published
+  2026-07-07; 0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66 — PUBLISH PENDING)**
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
@@ -169,16 +170,17 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — CLOSED (2026-07-07).** Published **`forgedb-storage 0.1.3`** (additive
-  minor: `Manifest` layout fields + `Snapshot`) **and `forgedb-changefeed 0.1.0`** (new class-1 crate);
-  `wal` 0.1.1 / `types` 0.2.0 unchanged. Reclose PROVEN by the outside-repo proof: a fresh `forgedb init`
-  → `generate rust` → `cargo build` resolves `forgedb-storage 0.1.3` + `forgedb-changefeed 0.1.0` +
-  `forgedb-types 0.2.0` from crates.io and compiles clean. The scaffold pins `forgedb-storage = "0.1.3"`,
-  `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap reopened twice — #57 (storage 0.1.3 `Manifest`
-  fields) and #62-A (new `forgedb-changefeed` dep); both closed here. Prior close (2026-07-06): published
-  `forgedb-types 0.2.0` + `forgedb-storage 0.1.2`. **Next thing that will reopen it:** any new
-  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the
-  scaffold pins it.
+- **`init → build` publish gap — REOPENED by #66 (2026-07-07): needs `forgedb-changefeed 0.1.1`.**
+  The mutation surface (#66) added `ChangeKind::Updated`/`Deleted` (additive enum variants), bumping
+  `forgedb-changefeed` **0.1.0 → 0.1.1**. Generated `update`/`delete` now reference those variants, so
+  an outside `cargo build` needs **0.1.1 published** (the scaffold's `forgedb-changefeed = "0.1"` pin
+  already allows it; `forgedb-storage` was NOT touched — no storage change was needed). **ACTION: publish
+  `forgedb-changefeed 0.1.1` before the next outside-repo build.** `storage` 0.1.3 / `wal` 0.1.1 /
+  `types` 0.2.0 unchanged. Prior CLOSE (2026-07-07): published `forgedb-storage 0.1.3` (`Manifest` layout
+  + `Snapshot`) + `forgedb-changefeed 0.1.0`, PROVEN by an outside-repo `init → generate → cargo build`.
+  Scaffold pins `forgedb-storage = "0.1.3"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap
+  reopened for #57, #62-A, and now #66. **Next thing that will reopen it:** any new substrate-crate dep or
+  additive substrate API the generated code starts requiring — publish before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -250,13 +252,35 @@ across many domains live in `examples/` — see `examples/README.md`.**
   scalar field checked by name, relations excluded, closed compile-time set), and streams typed JSON;
   nginx `location /` forwards `Upgrade`. PM identity gate PASS (substrate schema-agnostic; all field-aware
   logic generated; no drift vectors). Honest limits: **single-process** only (no cross-process broker);
-  **no Update/Delete events** (gated on the mutation surface — append-only today); the per-model filter
-  compares via `serde_json` stringify (exact-match, fine for common scalars; fragile for some float/bool
-  encodings — typed per-field compare is a future refinement); Direction B (live queries) + C (durable
-  broker) deferred. Guards: substrate `changefeed` unit tests, `test_rust_generation_changefeed_emits`,
+  Update/Delete events now exist via the mutation surface (#66, `ChangeKind::Updated`/`Deleted`); the
+  per-model filter compares via `serde_json` stringify (exact-match, fine for common scalars; fragile for
+  some float/bool encodings — typed per-field compare is a future refinement); Direction B (live queries)
+  + C (durable broker) deferred. Guards: substrate `changefeed` unit tests, `test_rust_generation_changefeed_emits`,
   `test_api_generation_websocket_subscription`; **live WebSocket round-trip** E2E (client receives a
   filtered typed event) compile-tested through current codegen in `scratchpad/changefeed_compile`
   (ephemeral). Requires the `forgedb-changefeed 0.1.0` publish (see the publish gap).
+- **Mutation surface (#66) — first milestone LANDED.** Generated **`update`/`delete`** per model via
+  **superseding-version append** (the retraction primitive the fork resolved to): a mutation appends a new
+  row version rather than mutating committed bytes, so append-only holds and backup (#57) / watermark
+  snapshots (#56-A) / change feed (#62-A) stay unchanged. **No `forgedb-storage` change was needed** —
+  the retraction is pure generated code over the existing append + `id_to_row` machinery; the only
+  substrate change is `forgedb-changefeed` `ChangeKind` += `Updated`/`Deleted` (→ **0.1.1**, publish
+  pending — see publish gap). `update(id, record) -> bool` appends a live version and repoints the id
+  (no-op false on absent id); `delete(id) -> bool` appends a **tombstoned** version so `get` reads absent
+  (no-op false when already absent). **Snapshot isolation across mutation** falls out of the #56-A
+  watermark for free: `get_at`/`all_at` resolve newest-version-*within-the-watermark* per id (read the id
+  column across the committed prefix), so a snapshot captured *before* an update/delete still resolves the
+  old value — no version chains / `xmin`/`xmax`. #62 gains `<Model>Updated`/`<Model>Deleted` typed events
+  (the WS handler branches on kind; a `Deleted` emits the pre-delete row so the record is still
+  materializable). PM identity gate PASS (retraction primitive stays schema-agnostic — row position +
+  per-id pointer, never decodes a field; latest-version resolution is generated per model). **Honest
+  limits / explicitly deferred:** storage **grows** with superseded versions until compaction (GC deferred
+  to the `compaction` crate + reserved `compaction_epoch`; documented, not hidden); **no M2M `unlink`**;
+  **single-process** (no concurrent-writer serialization — Direction B); no version chains / transaction
+  manager (Direction C); no field-level partial update; no cascade delete. Guards:
+  `test_rust_generation_mutation_surface`, extended snapshot-reads / changefeed-emits / websocket tests,
+  changefeed `mutation_kinds_carry_through_the_feed`; **compile + insert→update/delete→snapshot-isolation
+  + reopen + backup-roundtrip** E2E through current codegen in `scratchpad/mutation_compile` (ephemeral).
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
