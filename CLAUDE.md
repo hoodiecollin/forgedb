@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 411 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 417 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 411 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"409"/"403"/"399"/"398"/"394"/"380".
+**Baseline: 417 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -95,9 +95,11 @@ in `crates/`:
 
 **Published to crates.io (independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
-- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.3
-  (published 2026-07-07)** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from` +
-  `Snapshot` for #57 backup / #56-A snapshot reads)
+- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.4
+  (published 2026-07-08)** (0.1.4 adds read-only column reader handles
+  `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
+  many-reader; 0.1.3 added `Manifest` layout fields + `Manifest::save_to/load_from` + `Snapshot` for #57
+  backup / #56-A snapshot reads)
 - `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
   0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
 - `wal` — write-ahead log — **0.1.1**
@@ -170,16 +172,18 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — CLOSED (2026-07-08).** The mutation surface (#66) added
-  `ChangeKind::Updated`/`Deleted` (additive enum variants), bumping `forgedb-changefeed` **0.1.0 →
-  0.1.1**; generated `update`/`delete` reference those variants. **`forgedb-changefeed 0.1.1` is now
-  published**, and the reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust
-  → cargo build` resolving `forgedb-changefeed 0.1.1` + `forgedb-storage 0.1.3` + `forgedb-types 0.2.0`
-  from crates.io and compiling generated code that references the new variants. `forgedb-storage` was NOT
-  touched by #66 (0.1.3 unchanged); `wal` 0.1.1 / `types` 0.2.0 unchanged. Scaffold pins
-  `forgedb-storage = "0.1.3"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap reopened for #57,
-  #62-A, and #66 — all closed. **Next thing that will reopen it:** any new substrate-crate dep or additive
-  substrate API the generated code starts requiring — publish before the scaffold pins it.
+- **`init → build` publish gap — CLOSED (2026-07-08).** #56-B (single-writer/many-reader) added
+  read-only column reader handles to `forgedb-storage` (`FixedColumnReader`/`VariableColumnReader`/
+  `TombstonesReader` + `*::reader()`), bumping it **0.1.3 → 0.1.4**; generated `*StorageReader` /
+  `DatabaseReader` call `col.reader()`. **`forgedb-storage 0.1.4` is now published**, and the reclose is
+  PROVEN by an outside-repo `forgedb init --template blog → generate rust → cargo build` resolving
+  `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` + `forgedb-types 0.2.0` from crates.io and compiling
+  the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
+  carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
+  Scaffold pins `forgedb-storage = "0.1.4"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap
+  reopened for #57, #62-A, #66, and #56-B — all closed. **Next thing that will reopen it:** any new
+  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the
+  scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -280,6 +284,36 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `test_rust_generation_mutation_surface`, extended snapshot-reads / changefeed-emits / websocket tests,
   changefeed `mutation_kinds_carry_through_the_feed`; **compile + insert→update/delete→snapshot-isolation
   + reopen + backup-roundtrip** E2E through current codegen in `scratchpad/mutation_compile` (ephemeral).
+- **Single-writer + concurrent readers (#56 Direction B) — LANDED.** Lock-free concurrent reads under a
+  live single writer, no version machinery. New class-1 substrate: read-only column reader handles
+  (`FixedColumnReader`/`VariableColumnReader`/`TombstonesReader`, shared-fd positional `&self` reads,
+  live length) + `FixedColumn/VariableColumn/Tombstones::reader()` → **`forgedb-storage` 0.1.4
+  (published 2026-07-08)**. Codegen emits, per schema: `*Storage::reader() -> *StorageReader` (reusing the
+  *exact* `read_at`/`get_at`/`all_at` token streams — one decode path), junction `*Reader` + `pairs_at`, a
+  `DatabaseReader` bundle (one **typed named** reader field per model AND junction — never string-keyed
+  dispatch) + `Database::reader()`, and the snapshot-scoped M2M `_at` traversal on `DatabaseReader`.
+  **Cross-model atomicity:** `Database::snapshot()` is captured on the single writer (never mid-mutation),
+  so the `DatabaseSnapshot` is a commit boundary; readers consume it immutably. PM identity gate PASS
+  (reader handles know *less* than any other substrate; single-writer serialization is a runtime
+  discipline, not a shipped engine). Honest limits: single-process/**single-writer** (concurrent writers →
+  Direction C); atomicity holds *because* capture routes through the one writer; fd/page-cache coherence
+  across `try_clone`d fds is a load-bearing substrate invariant (tested). Guards:
+  `test_rust_generation_reader_handles`, substrate `test_reader_*` (incl. a lock-free read-under-live-append
+  stress test); **live concurrent-writer stress test** (writer thread + N reader threads, cross-model
+  atomic, torn-row-free) in `scratchpad/directionb_compile` (ephemeral).
+- **Live queries (#62 Direction B) — LANDED.** Stateful, removal-aware result-set subscriptions.
+  **No substrate change** (the changefeed already carried the coarse `event.model` signal → no
+  `forgedb-changefeed` bump). Codegen emits, per model: a WS handler `GET /live-query/<model>?field=value`
+  that binds params to the **same** generated closed-set filter (`<model>_event_matches`) as REST list /
+  #62-A (**no second predicate parser** — the load-bearing red line), re-runs the generated `all()`+filter
+  query on the **coarse** signal, diffs by id over opaque hashes, and pushes typed `<Model>LiveDelta`
+  (`Init`/`Added`/`Updated`/`Removed`) deltas — `Removed` expressible thanks to #66's tombstone append.
+  PM identity gate PASS (green-with-care): only generated code re-executes generated code on a coarse
+  signal; never resolves `row_index→id` via the substrate. Honest limits: **O(rows) re-run per matched
+  event per connection**, no coalescing/debounce (the scaling cliff); `Updated` uses full-record
+  `serde_json` compare (#62-A fragility inherited); single-process. Guards:
+  `test_api_generation_live_query`, `test_rust_generation_live_delta_enums`; **live WS round-trip**
+  (Init→Added→silent→Updated→Removed) in `scratchpad/directionb_compile` (ephemeral).
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
