@@ -13,3 +13,14 @@ bun.lockb
 generated/
 generated_*/
 .envrc
+
+# The root-level package.json/turbo.json ignores above are for design-sync
+# artifacts. The inspector app is a real tracked JS app — carve it back in.
+!apps/inspector/package.json
+!apps/inspector/**/package.json
+# Inspector build artifacts (Next static export + Tauri target)
+apps/inspector/.next/
+apps/inspector/out/
+apps/inspector/src-tauri/target/
+apps/inspector/next-env.d.ts
+apps/inspector/*.tsbuildinfo
