@@ -79,6 +79,13 @@ impl ApiGenerator {
             tokens.extend(Self::generate_subscription(model));
         }
 
+        // Generate the live-query WebSocket handler for each model (#62 Direction
+        // B): reuses the per-model closed-set filter defined above, so it must be
+        // emitted after the subscription handlers.
+        for model in &schema.models {
+            tokens.extend(Self::generate_live_query(model));
+        }
+
         // Generate OpenAPI doc struct
         let openapi_tokens = Self::generate_openapi_doc(schema)?;
         tokens.extend(openapi_tokens);
@@ -113,6 +120,20 @@ impl ApiGenerator {
                 _ => quote! { Uuid },
             },
             None => quote! { Uuid },
+        }
+    }
+
+    /// The field identifier used as a model's identity (`id`, or the first
+    /// auto-generate field).  Used by the live-query handler (#62 Direction B) to
+    /// key result-set membership by id.  Falls back to `id`.
+    fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
+        match model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+        {
+            Some(f) => format_ident!("{}", f.name),
+            None => format_ident!("id"),
         }
     }
 
@@ -353,6 +374,150 @@ impl ApiGenerator {
         }
     }
 
+    /// Generate the live-query WebSocket handler for a model (#62 Direction B).
+    ///
+    /// A stateful, removal-aware result-set subscription.  On connect it runs a
+    /// **generated closed-set query** — `db.<model>.all()` filtered by the same
+    /// generated per-model `<model>_event_matches` closed-set filter the REST
+    /// `list` endpoint and #62-A use (NO second predicate parser: the filterable
+    /// keys are the finite declared-scalar set, exact-match by name) — sends an
+    /// `Init` delta, and records membership as `id -> opaque hash`.  On every
+    /// change to this model it re-runs that same generated query, diffs by id over
+    /// the opaque hashes, and pushes typed `Added` / `Updated` / `Removed` deltas.
+    ///
+    /// Identity: the substrate feed is consulted **coarsely — only `event.model`**
+    /// (never `row_index`/`kind`), so no logical-row identity is resolved through
+    /// the substrate and no `ChangeEvent` widening is needed.  Re-evaluation runs
+    /// only generated code; the diff/membership plumbing is opaque ids + opaque
+    /// hashes.  This is "generated code re-executing generated code on a coarse
+    /// signal," not a runtime predicate interpreter.
+    ///
+    /// Honest limits: O(rows) full re-run per matched event per connection (no
+    /// coalescing/debounce yet); `Updated` detection uses full-record
+    /// `serde_json` stringify comparison, inheriting #62-A's exact-match
+    /// fragility for some float/bool encodings; single-process.
+    fn generate_live_query(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let delta_name = format_ident!("{}LiveDelta", model.name);
+        let snake = Self::to_snake_case(&model.name);
+        let storage_field = format_ident!("{}", snake);
+        let subscribe_fn = format_ident!("subscribe_live_{}", snake);
+        let handle_fn = format_ident!("handle_{}_live_query", snake);
+        // Reuse the EXACT generated closed-set filter emitted by
+        // `generate_subscription` — do not define a second filtering path.
+        let filter_fn = format_ident!("{}_event_matches", snake);
+        let id_field = Self::id_field_ident(model);
+        let id_type = Self::id_parse_type(model);
+        let model_name_str = &model.name;
+
+        let subscribe_doc = format!(
+            "Live-query WebSocket subscription for `{}` (#62 Direction B). Runs the \
+             generated closed-set query `all()` + `{}_event_matches` (narrow with \
+             `?field=value`), streams an initial `{}LiveDelta::Init`, then pushes \
+             removal-aware `Added` / `Updated` / `Removed` deltas as the matching \
+             set changes.",
+            model.name, snake, model.name
+        );
+
+        quote! {
+            #[doc = #subscribe_doc]
+            async fn #subscribe_fn(
+                Query(params): Query<HashMap<String, String>>,
+                ws: WebSocketUpgrade,
+                State(db): State<Arc<RwLock<super::Database>>>,
+            ) -> Response {
+                ws.on_upgrade(move |socket| #handle_fn(socket, db, params))
+            }
+
+            async fn #handle_fn(
+                mut socket: WebSocket,
+                db: Arc<RwLock<super::Database>>,
+                params: HashMap<String, String>,
+            ) {
+                // Coarse change signal: take a feed receiver (Clone shares the
+                // channel), then release the DB lock.  We consult only event.model.
+                let mut rx = { db.read().await.changefeed.subscribe() };
+
+                // Result-set membership: id -> opaque hash of the record in the set.
+                let mut members: HashMap<#id_type, String> = HashMap::new();
+
+                // Initial matching set via the GENERATED closed-set query.
+                {
+                    let rows: Vec<super::#model_name> = {
+                        let g = db.read().await;
+                        g.#storage_field
+                            .all()
+                            .into_iter()
+                            .filter(|r| #filter_fn(r, &params))
+                            .collect()
+                    };
+                    for r in &rows {
+                        members.insert(r.#id_field, serde_json::to_string(r).unwrap_or_default());
+                    }
+                    let init = super::#delta_name::Init { rows };
+                    if let Ok(text) = serde_json::to_string(&init) {
+                        if socket.send(Message::Text(text.into())).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
+                }
+
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            // COARSE: any change to this model re-runs the query.
+                            // Only the model NAME is read — never row_index/kind.
+                            if event.model != #model_name_str {
+                                continue;
+                            }
+
+                            // Re-run the SAME generated closed-set query.
+                            let current: Vec<super::#model_name> = {
+                                let g = db.read().await;
+                                g.#storage_field
+                                    .all()
+                                    .into_iter()
+                                    .filter(|r| #filter_fn(r, &params))
+                                    .collect()
+                            };
+
+                            // Diff by id over opaque hashes → removal-aware deltas.
+                            let mut next: HashMap<#id_type, String> = HashMap::new();
+                            let mut deltas: Vec<super::#delta_name> = Vec::new();
+                            for r in current {
+                                let id = r.#id_field;
+                                let hash = serde_json::to_string(&r).unwrap_or_default();
+                                match members.get(&id) {
+                                    None => deltas.push(super::#delta_name::Added { row: r.clone() }),
+                                    Some(prev) if *prev != hash => {
+                                        deltas.push(super::#delta_name::Updated { row: r.clone() })
+                                    }
+                                    _ => {}
+                                }
+                                next.insert(id, hash);
+                            }
+                            for id in members.keys() {
+                                if !next.contains_key(id) {
+                                    deltas.push(super::#delta_name::Removed { id: *id });
+                                }
+                            }
+                            members = next;
+
+                            for d in deltas {
+                                let Ok(text) = serde_json::to_string(&d) else { continue; };
+                                if socket.send(Message::Text(text.into())).await.is_err() {
+                                    return; // client disconnected
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    }
+
     /// Generate OpenAPI documentation struct
     fn generate_openapi_doc(schema: &Schema) -> Result<TokenStream> {
         // Collect all handler functions
@@ -420,6 +585,8 @@ impl ApiGenerator {
                 let create_fn = format_ident!("create_{}", Self::to_snake_case(&model.name));
 
                 let subscribe_fn = format_ident!("subscribe_{}", Self::to_snake_case(&model.name));
+                let live_query_fn =
+                    format_ident!("subscribe_live_{}", Self::to_snake_case(&model.name));
 
                 quote! {
                     .route(concat!("/api/", #route_path), get(#list_fn))
@@ -427,6 +594,8 @@ impl ApiGenerator {
                     .route(concat!("/api/", #route_path, "/{id}"), get(#get_fn))
                     // Change-feed WebSocket subscription (#62 Direction A).
                     .route(concat!("/subscribe/", #route_path), get(#subscribe_fn))
+                    // Live-query WebSocket subscription (#62 Direction B).
+                    .route(concat!("/live-query/", #route_path), get(#live_query_fn))
                 }
             })
             .collect();
