@@ -1,6 +1,15 @@
 # Proposal: MVCC / Concurrency
 
-**Status:** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints, but re-sequenced**. Maintainer-blessed direction (2026-07-06): **D-framing — ship A now, mutation surface next, stage B, hold C**; **single-process** scope; **retraction primitive deferred** to the mutation-surface note. Awaiting approval to schedule the A slice.
+**Status:** **Direction A (watermark snapshot reads) — first milestone LANDED (2026-07-07).** The
+rest remains DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints,
+but re-sequenced**. Maintainer-blessed direction (2026-07-06): **D-framing — ship A now, mutation
+surface next, stage B, hold C**; **single-process** scope; **retraction primitive deferred** to the
+mutation-surface note. Direction A shipped: substrate `forgedb_storage::Snapshot` (bare `usize`
+watermark, `new`/`watermark`/`visible`) + generated `*Storage::{read_at,row_count,snapshot,get_at,all_at}`,
+junction `pairs_at`, `DatabaseSnapshot` + `Database::snapshot()`, and one snapshot-scoped M2M traversal
+`post_tags_at`. Proven compile-clean + watermark-isolation E2E (`scratchpad/snapshot_compile`, ephemeral)
+and guarded by `test_rust_generation_snapshot_reads` + substrate `test_snapshot_*`. **Next: the mutation
+surface** (retraction primitive), then Direction B.
 **Issue:** [#56](https://github.com/hoodiecollin/forgedb/issues/56) (`idea`, `plan-next`)
 **Date:** 2026-07-06
 
@@ -146,15 +155,22 @@ violated.
 - **Single-process scope** (blessed). Multi-process concurrency (on-disk locking/visibility) is a
   separately-justified expansion, not a silent scope creep.
 
-## First milestone (Direction A only)
+## First milestone (Direction A only) — LANDED 2026-07-07
 
-**In scope**
-- `Snapshot`/`ReadView` in `forgedb-storage`: capture a per-column `row_count` watermark; clamp
-  reads to `index < N`. Schema-agnostic; no version metadata.
-- Generated `db.snapshot()` + snapshot-scoped `get`/`all`/one traversal in `database.rs`.
-- **Proof:** with a writer appending rows concurrently, a snapshot taken at `row_count=N` returns
-  exactly the N-row prefix for the life of the read — no torn/partial rows from the concurrent
-  appends — across an example schema. Confirms lock-free consistent reads under a live writer.
+**In scope** (all delivered)
+- ✅ `Snapshot` in `forgedb-storage`: captures a `row_count` watermark; clamps reads to `index < N`
+  via `visible(index)`. Schema-agnostic bare `usize`; no version metadata.
+- ✅ Generated `Database::snapshot()` (→ `DatabaseSnapshot`, one watermark per model + junction) +
+  snapshot-scoped `get_at`/`all_at` on each `*Storage`, `pairs_at` on each junction, and one
+  snapshot-scoped traversal `post_tags_at` in `database.rs`. Shared `read_at(row_index)` funnels
+  `get`/`get_at`/`all_at` through a single column-layout-aware read path.
+- **Proof:** `scratchpad/snapshot_compile` (ephemeral) generates through the *current* codegen,
+  compiles it, then captures a `db.snapshot()` after N committed rows, appends more rows + links
+  (including a post-snapshot link on a pre-snapshot post), and asserts the snapshot view returns
+  **exactly** the N-row prefix — across models AND the junction — while the live view sees all
+  writes, and that the snapshot is immutable under further appends. This proves the watermark
+  exclusion deterministically; a live concurrent-writer stress test is deferred to Direction B
+  (single-writer serialization), where cross-process/thread timing is actually in scope.
 
 **Explicitly out**
 - **All mutation** (`update`/`delete`) — the next unit, co-designed with #63; blocked on the
