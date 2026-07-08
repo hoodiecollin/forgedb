@@ -637,3 +637,126 @@ fn test_snapshot_is_copy_and_stable() {
     assert!(snap.visible(1));
     assert!(!snap.visible(2));
 }
+
+// ---------------------------------------------------------------------------
+// #56 Direction B: read-only column reader handles (single writer, many readers)
+//
+// These prove the load-bearing substrate invariants the generated DatabaseReader
+// relies on: (1) a reader opened via `col.reader()` shares the SAME file as the
+// writer, so appends made AFTER the reader was created are visible through the
+// reader's independent fd (POSIX page-cache coherence across try_clone'd fds);
+// (2) positional reads are safe concurrently with a live appending writer and
+// never observe a torn value below the committed watermark; (3) an out-of-range
+// index surfaces as the same InvalidInput error the writer columns return.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_column_reader_sees_writer_appends() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_reader_fixed_sees");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    col.append_u64(10).unwrap();
+
+    // Reader created while the column holds exactly one row...
+    let reader = col.reader().unwrap();
+    assert_eq!(reader.len(), 1);
+    assert_eq!(reader.read_u64(0).unwrap(), 10);
+
+    // ...still sees rows the writer appends AFTERWARD (shared file, live length).
+    col.append_u64(20).unwrap();
+    col.append_u64(30).unwrap();
+    assert_eq!(reader.len(), 3, "reader derives length live from the shared file");
+    assert_eq!(reader.read_u64(1).unwrap(), 20);
+    assert_eq!(reader.read_u64(2).unwrap(), 30);
+
+    // An index past the committed prefix is a bounded InvalidInput, not a panic.
+    let err = reader.read_u64(3).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_variable_and_tombstone_readers_share_writer_file() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_reader_var_tomb");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+    let tomb_path = temp_dir.join("tomb.bin");
+
+    let mut vc = VariableColumn::new(data_path, offsets_path).unwrap();
+    let mut tomb = Tombstones::new(tomb_path).unwrap();
+    vc.append_string("alpha").unwrap();
+    tomb.append(false).unwrap();
+
+    let vc_reader = vc.reader().unwrap();
+    let tomb_reader = tomb.reader().unwrap();
+    assert_eq!(vc_reader.read_string(0).unwrap(), "alpha");
+    assert!(!tomb_reader.is_deleted(0).unwrap());
+
+    // Appends after the readers exist are visible through them.
+    vc.append_string("beta").unwrap();
+    tomb.append(true).unwrap();
+    assert_eq!(vc_reader.len(), 2);
+    assert_eq!(vc_reader.read_string(1).unwrap(), "beta");
+    assert_eq!(tomb_reader.len(), 2);
+    assert!(tomb_reader.is_deleted(1).unwrap());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_reader_lockfree_concurrent_with_live_writer() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = std::env::temp_dir().join("forgedb_test_reader_concurrent");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    // Seed the value at index i as i*2 so a reader can verify no torn value.
+    col.append_u64(0).unwrap();
+
+    // Two reader fds shared across reader threads (pread is thread-safe on &File).
+    let reader = Arc::new(col.reader().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let reader = Arc::clone(&reader);
+        let stop = Arc::clone(&stop);
+        handles.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                // The committed length is the writer's watermark; every index below
+                // it must decode to exactly i*2 — never a torn / half-written value.
+                let n = reader.len();
+                for i in 0..n {
+                    let v = reader.read_u64(i).expect("committed index readable");
+                    assert_eq!(v, (i as u64) * 2, "reader saw a torn value at {i}");
+                }
+            }
+        }));
+    }
+
+    // Single writer appends the rest while readers run — no lock held anywhere.
+    for i in 1u64..5000 {
+        col.append_u64(i * 2).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Final consistency check through the reader.
+    assert_eq!(reader.len(), 5000);
+    assert_eq!(reader.read_u64(4999).unwrap(), 4999 * 2);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
