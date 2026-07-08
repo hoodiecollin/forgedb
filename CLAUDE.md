@@ -59,7 +59,7 @@ cargo run   -- --help                # list commands
 cargo clippy --workspace             # no dead-code warnings (style lints remain, pre-existing)
 ```
 
-CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `serve`.
+CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`, `serve`.
 Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 394 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 399 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 394 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"380".
+**Baseline: 399 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -95,17 +95,22 @@ in `crates/`:
 
 **Published to crates.io (independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
-- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.2**
+- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.3
+  in-workspace, 0.1.2 on crates.io** (0.1.3 adds `Manifest` layout fields + `Manifest::save_to/load_from`
+  for #57 backup; NOT YET PUBLISHED — see the reopened publish gap in Known issues)
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `compaction`, `query-optimization`, `query-params`,
+- `validation`, `migrations`, `compaction`, `backup`, `query-optimization`, `query-params`,
   `http-server` (axum), `watcher`, `lsp-server`, `ffi`
   (`fulltext` + `crud-api` were removed in Phase 3b — orphaned runtime-library crates
   with zero consumers; the API existence/404 logic now lives in the generated handlers.)
+  `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
+  create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
+  files, never the `.forge` schema).
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`, `INTERNAL_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
@@ -158,16 +163,17 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` against crates.io now works (publish gap CLOSED).** Generated projects call
-  storage/types methods (`append_uuid`/`read_uuid`/…) and use `Value::U32/U64` that the old
-  published `0.1.1` line lacked, so a freshly `init`ed project used to fail against crates.io
-  (`E0432`/`E0599`). Fixed by publishing **`forgedb-types 0.2.0`** (breaking — new
-  `Value::U32/U64` variants) and **`forgedb-storage 0.1.2`** (additive methods; `wal` unchanged
-  at 0.1.1), and bumping the init-scaffold pins to `forgedb-storage = "0.1.2"` /
-  `forgedb-types = "0.2"`. **Verified end-to-end:** `forgedb init … && forgedb generate rust &&
-  cargo build` in a throwaway project *outside* the repo downloads both crates from crates.io
-  (`source = registry+…`, no path/patch) and compiles clean — the generated relation-traversal
-  code included.
+- **`init → build` publish gap REOPENED by #57 (needs `forgedb-storage 0.1.3` publish).** The
+  #57 layout manifest made generated `*Storage::new()` emit a `<model>/manifest.json` built from
+  `forgedb_storage::{Manifest, ColumnMetadata, ColumnKind, RowAnchor}` — fields/types that only
+  exist on the **in-workspace 0.1.3**, not the published **0.1.2**. So a freshly `init`ed project
+  (now pinned `forgedb-storage = "0.1.3"`) can't resolve/compile against crates.io until 0.1.3 is
+  published. **To reclose:** `cargo publish -p forgedb-storage` (additive minor, 0.1.2→0.1.3;
+  `wal` 0.1.1 and `types` 0.2.0 unchanged), then re-run the outside-repo `init → generate rust →
+  cargo build` proof. In-workspace everything builds (path deps); the gap is only against
+  crates.io. Prior close (2026-07-06): published **`forgedb-types 0.2.0`** (breaking `Value::U32/U64`)
+  + **`forgedb-storage 0.1.2`** (additive `append_uuid`/`read_uuid`/… methods) and pinned the
+  scaffold to those.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -196,6 +202,23 @@ across many domains live in `examples/` — see `examples/README.md`.**
   Proven compile-clean + insert→link→traverse across the whole `examples/` corpus by the
   `scratchpad/corpus_compile` harness, and snapshot+assertion-tested by
   `test_rust_generation_relation_traversal`.
+- **Backup/restore (#57) — full-snapshot milestone LANDED; incrementals/PITR/cloud deferred.**
+  `forgedb backup {create,restore,list}` over a data dir, backed by the class-1 `forgedb-backup`
+  crate. Lock-free hot snapshot: each model/junction dir's `manifest.json` names a `row_anchor`
+  (`tombstones.bin` @1 B/row for models, `fixed/right.bin` @16 B/row for junctions, both
+  appended-last) → committed `N` = anchor length; every column's committed byte length is a pure
+  function of `N` + layout, so concurrent appends past the watermark are excluded (no torn row) —
+  proven by `crates/backup/tests/roundtrip.rs`. Restore is atomic (temp dir + rename), refuses a
+  non-empty target without `--overwrite`. Codegen now emits the per-model layout manifest from
+  `*Storage::new()` (`generate_write_manifest`, guarded by `test_rust_generation_layout_manifest`);
+  the substrate `Manifest` gained `compaction_epoch`/`format_version`/`row_anchor` +
+  `ColumnMetadata { value_size, kind, relative_path }` + `ColumnKind`/`RowAnchor` +
+  `Manifest::save_to/load_from` (all additive `#[serde(default)]`). Manifest carries **physical
+  layout only** — no relations/directives/routes (identity red line). **Deferred:** incremental
+  backups (the `compaction_epoch` field is captured but compaction does not yet bump it, and no
+  incremental chain logic exists), WAL-replay PITR, cloud `BackupTarget`, compression/encryption.
+  E2E proof (generated write → `backup create` → `restore` → reopen restored dir → rows+M2M+int-PK
+  survive) reproduced in `scratchpad/manifest_compile` (ephemeral).
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
