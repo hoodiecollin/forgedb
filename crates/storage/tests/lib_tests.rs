@@ -599,3 +599,41 @@ fn test_fixed_column_char_array() {
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot: watermark read isolation (mvcc-concurrency, Direction A)
+//
+// A Snapshot is a bare committed-row-count watermark. Because storage is
+// append-only, a row's index is stable for life, so the watermark alone
+// defines a consistent view: index < watermark is visible, everything
+// appended later is not. These tests pin the substrate contract; generated
+// code composes per-model watermarks into its own snapshot struct.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_snapshot_visibility_boundary() {
+    let snap = Snapshot::new(3);
+    assert_eq!(snap.watermark(), 3);
+    assert!(snap.visible(0));
+    assert!(snap.visible(2));
+    // The row at the watermark and beyond was appended after capture.
+    assert!(!snap.visible(3));
+    assert!(!snap.visible(9));
+}
+
+#[test]
+fn test_snapshot_empty_sees_nothing() {
+    let snap = Snapshot::new(0);
+    assert_eq!(snap.watermark(), 0);
+    assert!(!snap.visible(0));
+}
+
+#[test]
+fn test_snapshot_is_copy_and_stable() {
+    // A snapshot is Copy and immutable: capturing does not observe later growth.
+    let snap = Snapshot::new(2);
+    let also = snap; // Copy, not move
+    assert_eq!(snap.watermark(), also.watermark());
+    assert!(snap.visible(1));
+    assert!(!snap.visible(2));
+}
