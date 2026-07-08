@@ -292,13 +292,19 @@ http {{
         }}
 
         # REST API & Database -> Rust
+        # Forwards `Upgrade`/`Connection` so the generated change-feed WebSocket
+        # endpoints (`/subscribe/<model>`, #62 Direction A) can upgrade; plain
+        # HTTP requests are unaffected by these headers.
         location / {{
             proxy_pass http://rust_api;
             proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
             proxy_set_header Host $host;
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_cache_bypass $http_upgrade;
         }}
     }}
 }}

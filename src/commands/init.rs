@@ -111,9 +111,11 @@ fn create_rust_files(options: &InitOptions) -> Result<()> {
     // Create Cargo.toml with all dependencies required by generated code.
     //
     // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
-    // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields).
+    // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields), plus
+    // forgedb-changefeed for the change-feed emits (#62 Direction A).
     //
-    // The generated `api.rs` needs: axum, utoipa-axum, tokio (full), serde_json.
+    // The generated `api.rs` needs: axum (with the `ws` feature for the
+    // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json.
     let cargo_toml = format!(
         r#"[package]
 name = "{}"
@@ -123,11 +125,12 @@ edition = "2021"
 [dependencies]
 forgedb-storage = "0.1.3"
 forgedb-types = "0.2"
+forgedb-changefeed = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
 utoipa-axum = "0.2"
-axum = "0.8"
+axum = {{ version = "0.8", features = ["ws"] }}
 tokio = {{ version = "1", features = ["full"] }}
 "#,
         options.project_name
