@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 399 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 403 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 399 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"398"/"394"/"380".
+**Baseline: 403 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -219,6 +219,21 @@ across many domains live in `examples/` — see `examples/README.md`.**
   incremental chain logic exists), WAL-replay PITR, cloud `BackupTarget`, compression/encryption.
   E2E proof (generated write → `backup create` → `restore` → reopen restored dir → rows+M2M+int-PK
   survive) reproduced in `scratchpad/manifest_compile` (ephemeral).
+- **Watermark snapshot reads (#56 Direction A) — LANDED.** Lock-free read snapshot isolation with
+  **zero version machinery**, purely from the append-only row-count watermark. Substrate
+  `forgedb_storage::Snapshot` is a bare `{ watermark: usize }` (`new`/`watermark`/`visible(index) ->
+  index < watermark`) — schema-agnostic class-1, no relations, no per-row versions. Codegen emits, per
+  schema: a shared `read_at(row_index)` that `get`/`get_at`/`all_at` all funnel through, plus
+  `row_count`/`snapshot`/`get_at(&Snapshot,id)`/`all_at(&Snapshot)` on each `*Storage`, `pairs_at` on
+  each junction, a `DatabaseSnapshot` bundle (one watermark per model + junction) + `Database::snapshot()`,
+  and **one snapshot-scoped M2M traversal** `<left>_<right>s_at(&DatabaseSnapshot,id)` that clamps BOTH
+  the junction (`pairs_at`) and the resolved target (`get_at`) — cross-table consistency. Honest limits:
+  **single-process/single-thread** (captures are trivially atomic today); only **one** traversal is
+  snapshot-scoped (forward M2M) — reverse/eager/FK-forward getters are not yet; and the milestone proof
+  is a **deterministic capture-then-append** test, not a live concurrent-writer stress test (that lands
+  with Direction B). PM identity gate PASS. Guards: substrate `test_snapshot_*`,
+  `test_rust_generation_snapshot_reads`; compile + isolation E2E in `scratchpad/snapshot_compile`
+  (ephemeral). Next per roadmap: **#62 Direction A** (change notifications), then the mutation surface.
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
