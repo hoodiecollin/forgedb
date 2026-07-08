@@ -1,6 +1,17 @@
 # Proposal: Real-time Subscriptions
 
-**Status:** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints** (notifications clean-green; live-queries green-with-care; generic subscription engine rejected). Maintainer-blessed direction (2026-07-07): **Direction A now (change notifications), Direction B (live queries) queued entirely behind the mutation surface, Direction C (durable broker) lowest priority**; delivery = **best-effort in-process**; signal origin = **generated `insert()` emits**. Awaiting approval to schedule A.
+**Status:** **Direction A (change notifications) — first milestone LANDED (2026-07-07).** The rest
+remains DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints**
+(notifications clean-green; live-queries green-with-care; generic subscription engine rejected).
+Maintainer-blessed direction (2026-07-07): **Direction A now (change notifications), Direction B
+(live queries) queued entirely behind the mutation surface, Direction C (durable broker) lowest
+priority**; delivery = **best-effort in-process**; signal origin = **generated `insert()` emits**.
+Direction A shipped: new Class-1 substrate crate **`forgedb-changefeed`** (field-blind
+`(model, row_index)` broadcast) + generated `insert()`/`link_*` emits + generated per-model typed
+event structs + generated axum WS endpoint `GET /subscribe/<model>` with a generated per-model
+filter + nginx `Upgrade` forwarding. Proven by a **live WebSocket round-trip** (client receives a
+filtered typed JSON event) compile-tested through current codegen (`scratchpad/changefeed_compile`,
+ephemeral). **Next: the mutation surface**, which unblocks Direction B.
 **Issue:** [#62](https://github.com/hoodiecollin/forgedb/issues/62) (`idea`, `plan-next`)
 **Date:** 2026-07-07
 
@@ -141,19 +152,26 @@ best-effort in-process streaming has users is the machinery-beyond-consumers fai
 - **Single-process scope** — cross-process fan-out needs a broker and is a separately-justified
   expansion.
 
-## First milestone (Direction A — in-process, insert-only)
+## First milestone (Direction A — in-process, insert-only) — LANDED 2026-07-07
 
-**In scope**
-- Schema-agnostic broadcast primitive (`tokio::sync::broadcast`) carrying `(model_name, row_index)`
-  — field-blind, best-effort, bounded buffer.
-- Generated per-model typed event structs (`UserInserted { user: User }`) + broadcast calls emitted
-  into generated `insert()` and M2M `link_*`.
-- Generated WebSocket endpoint on the rust axum server streaming typed JSON events; optional
-  narrowing via a **generated per-model filter**; nginx `location /` updated to forward `Upgrade`.
-- **Proof:** on an example schema, a WS subscriber to model M receives a typed event for every
-  `insert`/`link` under a concurrent writer, filtered correctly by a generated filter, with no
-  schema decoded in the substrate. **Compile-tested through current codegen** (per the
-  codegen-is-compile-tested discipline).
+**In scope** (all delivered)
+- ✅ Schema-agnostic broadcast primitive — the new **`forgedb-changefeed`** crate (`tokio::sync::broadcast`)
+  carrying `ChangeEvent { model: &'static str, row_index: usize, kind: ChangeKind }`, field-blind,
+  best-effort, bounded buffer. `ChangeKind` is `Inserted | Linked` only — Update/Delete are gated on
+  the mutation surface.
+- ✅ Generated per-model typed event structs (`PostInserted { post: Post }`) + `emit` calls in
+  generated `insert()` (carries the model *name*, never a field) and M2M `link_*`. `Database::new()`
+  owns one shared feed and hands each collection a clone; `read_at(row_index)` made public so the WS
+  handler can materialize a typed record from the broadcast row index.
+- ✅ Generated WebSocket endpoint `GET /subscribe/<model-kebab>` on the axum server streaming typed
+  JSON events; narrowing via a **generated per-model filter** (`<model>_event_matches`, each declared
+  scalar field checked by name — relations excluded, closed per-model set); nginx `location /` now
+  forwards `Upgrade`/`Connection: upgrade`.
+- **Proof:** `scratchpad/changefeed_compile` (ephemeral) generates through the *current* codegen,
+  compiles `database.rs` + `api.rs` together, then runs a **live WebSocket round-trip**: a client
+  connects to `/subscribe/post?title=live`, two rows are inserted (one matching the filter, one not),
+  and the client receives *exactly* the matching `PostInserted` JSON event over the socket. The
+  substrate feed never decodes a field. Substrate unit tests cover the broadcast primitive.
 
 **Explicitly out**
 - **Live queries / result-set re-evaluation** (Direction B) — queued behind the mutation surface.
