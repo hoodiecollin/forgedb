@@ -17,6 +17,7 @@ members = [
     "crates/query-optimization",
     "crates/lsp-server",
     "crates/ffi",
+    "apps/inspector/src-tauri",
 ]
 resolver = "2"
 

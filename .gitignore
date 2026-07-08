@@ -18,9 +18,10 @@ generated_*/
 # artifacts. The inspector app is a real tracked JS app — carve it back in.
 !apps/inspector/package.json
 !apps/inspector/**/package.json
-# Inspector build artifacts (Next static export + Tauri target)
+# Inspector build artifacts (Next static export + Tauri target + codegen)
 apps/inspector/.next/
 apps/inspector/out/
 apps/inspector/src-tauri/target/
+apps/inspector/src-tauri/gen/
 apps/inspector/next-env.d.ts
 apps/inspector/*.tsbuildinfo

@@ -24,10 +24,12 @@ inspector-build:
 inspector-typecheck:
 	cd $(INSPECTOR) && $(BUN) run typecheck
 
-## Run the inspector as a Tauri desktop app (added in the Tauri increment).
+## Run the inspector as a Tauri desktop app. Uses the local `@tauri-apps/cli`
+## devDep (via `bun run tauri`) — no global `cargo install tauri-cli` needed.
+## Tauri runs `beforeDevCommand` (bun run dev) from apps/inspector automatically.
 inspector-app:
-	cargo tauri dev --config $(INSPECTOR)/src-tauri/tauri.conf.json
+	cd $(INSPECTOR) && $(BUN) run tauri dev
 
-## Build the inspector desktop app for release.
+## Build the inspector desktop app for release (bundles the static export).
 inspector-app-build:
-	cargo tauri build --config $(INSPECTOR)/src-tauri/tauri.conf.json
+	cd $(INSPECTOR) && $(BUN) run tauri build
