@@ -34,6 +34,9 @@ pub enum CliError {
     #[error("Compaction error: {0}")]
     Compaction(String),
 
+    #[error("Backup error: {0}")]
+    Backup(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -51,6 +54,7 @@ impl CliError {
             CliError::SchemaNotFound(_) => 11,
             CliError::Migration(_) => 5,
             CliError::Compaction(_) => 6,
+            CliError::Backup(_) => 7,
             CliError::Other(_) => 1,
         }
     }

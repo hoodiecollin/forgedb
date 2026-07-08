@@ -144,6 +144,10 @@ enum Commands {
     #[command(subcommand)]
     Compact(CompactCommands),
 
+    /// Snapshot backup & restore for a database directory
+    #[command(subcommand)]
+    Backup(BackupCommands),
+
     /// Start ForgeDB server (Rust API + Bun Runtime + nginx)
     Serve {
         /// Host address
@@ -250,6 +254,44 @@ enum CompactCommands {
         /// Data directory (default: ./data)
         #[arg(short, long, default_value = "data")]
         data_dir: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Create a lock-free full-snapshot archive of a database directory
+    Create {
+        /// Data directory (default: ./data)
+        #[arg(short, long, default_value = "data")]
+        data_dir: String,
+
+        /// Output archive path
+        #[arg(short, long, default_value = "backup.forgebk")]
+        output: String,
+    },
+
+    /// Restore a snapshot archive into a data directory
+    Restore {
+        /// Archive path to restore from
+        archive: String,
+
+        /// Destination data directory
+        #[arg(short, long, default_value = "data")]
+        output: String,
+
+        /// Replace an existing non-empty destination directory
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// List the contents of a snapshot archive without restoring it
+    List {
+        /// Archive path to inspect
+        archive: String,
 
         /// Output as JSON
         #[arg(long)]
@@ -409,6 +451,30 @@ fn run(cli: Cli) -> Result<()> {
             CompactCommands::Analyze { data_dir, json } => {
                 commands::compact::analyze(commands::compact::AnalyzeOptions {
                     data_dir: data_dir.into(),
+                    json,
+                })
+            }
+        },
+
+        Commands::Backup(backup_cmd) => match backup_cmd {
+            BackupCommands::Create { data_dir, output } => {
+                commands::backup::create(commands::backup::CreateOptions {
+                    data_dir: data_dir.into(),
+                    output: output.into(),
+                })
+            }
+            BackupCommands::Restore {
+                archive,
+                output,
+                overwrite,
+            } => commands::backup::restore(commands::backup::RestoreOptions {
+                archive: archive.into(),
+                output: output.into(),
+                overwrite,
+            }),
+            BackupCommands::List { archive, json } => {
+                commands::backup::list(commands::backup::ListOptions {
+                    archive: archive.into(),
                     json,
                 })
             }
