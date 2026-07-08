@@ -67,7 +67,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 403 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 409 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +84,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 403 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"399"/"398"/"394"/"380".
+**Baseline: 409 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -104,13 +104,19 @@ in `crates/`:
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `compaction`, `backup`, `query-optimization`, `query-params`,
-  `http-server` (axum), `watcher`, `lsp-server`, `ffi`
+- `validation`, `migrations`, `compaction`, `backup`, `changefeed`, `query-optimization`,
+  `query-params`, `http-server` (axum), `watcher`, `lsp-server`, `ffi`
   (`fulltext` + `crud-api` were removed in Phase 3b — orphaned runtime-library crates
   with zero consumers; the API existence/404 logic now lives in the generated handlers.)
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
+  `changefeed` (#62 Direction A) is a **class-1 substrate** the *generated code links against*
+  (like `storage`/`wal`, not like the internal-only crates above): a field-blind
+  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. Publish-intent
+  **0.1.0, NOT YET PUBLISHED** — the scaffold pins `forgedb-changefeed = "0.1"`, so a fresh `init`
+  needs it on crates.io (deepens the publish gap; see Known issues). It never decodes a field;
+  generated code routes by model name and materializes typed events.
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`, `INTERNAL_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
@@ -163,17 +169,18 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap REOPENED by #57 (needs `forgedb-storage 0.1.3` publish).** The
-  #57 layout manifest made generated `*Storage::new()` emit a `<model>/manifest.json` built from
-  `forgedb_storage::{Manifest, ColumnMetadata, ColumnKind, RowAnchor}` — fields/types that only
-  exist on the **in-workspace 0.1.3**, not the published **0.1.2**. So a freshly `init`ed project
-  (now pinned `forgedb-storage = "0.1.3"`) can't resolve/compile against crates.io until 0.1.3 is
-  published. **To reclose:** `cargo publish -p forgedb-storage` (additive minor, 0.1.2→0.1.3;
-  `wal` 0.1.1 and `types` 0.2.0 unchanged), then re-run the outside-repo `init → generate rust →
-  cargo build` proof. In-workspace everything builds (path deps); the gap is only against
-  crates.io. Prior close (2026-07-06): published **`forgedb-types 0.2.0`** (breaking `Value::U32/U64`)
-  + **`forgedb-storage 0.1.2`** (additive `append_uuid`/`read_uuid`/… methods) and pinned the
-  scaffold to those.
+- **`init → build` publish gap REOPENED — now needs TWO publishes (`forgedb-storage 0.1.3` +
+  `forgedb-changefeed 0.1.0`).** (1) The #57 layout manifest made generated `*Storage::new()` emit a
+  `<model>/manifest.json` built from `forgedb_storage::{Manifest, ColumnMetadata, ColumnKind, RowAnchor}`
+  — fields/types that only exist on the **in-workspace 0.1.3**, not the published **0.1.2**. (2) The #62-A
+  change feed made generated `database.rs`/`api.rs` link **`forgedb-changefeed`** (brand-new crate, `0.1.0`,
+  never published), and the scaffold now pins `forgedb-changefeed = "0.1"`. So a freshly `init`ed project
+  can't resolve/compile against crates.io until BOTH land. **To reclose:** `cargo publish -p forgedb-storage`
+  (additive minor 0.1.2→0.1.3) **and** `cargo publish -p forgedb-changefeed` (new 0.1.0); `wal` 0.1.1 /
+  `types` 0.2.0 unchanged; then re-run the outside-repo `init → generate rust → cargo build` proof.
+  In-workspace everything builds (path deps); the gap is only against crates.io. Prior close (2026-07-06):
+  published **`forgedb-types 0.2.0`** (breaking `Value::U32/U64`) + **`forgedb-storage 0.1.2`** (additive
+  `append_uuid`/`read_uuid`/… methods) and pinned the scaffold to those.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -234,6 +241,24 @@ across many domains live in `examples/` — see `examples/README.md`.**
   with Direction B). PM identity gate PASS. Guards: substrate `test_snapshot_*`,
   `test_rust_generation_snapshot_reads`; compile + isolation E2E in `scratchpad/snapshot_compile`
   (ephemeral). Next per roadmap: **#62 Direction A** (change notifications), then the mutation surface.
+- **Change notifications (#62 Direction A) — LANDED.** In-process, best-effort, **insert-only**
+  real-time subscriptions. New **class-1 substrate crate `forgedb-changefeed`** (field-blind
+  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`, `ChangeKind =
+  Inserted | Linked`). Generated `insert()`/`link_*` emit the field-blind `(model, row_index)` signal
+  (carrying the model *name*, never a field); `Database` owns one shared feed + hands each collection a
+  clone; generated per-model typed event structs (`PostInserted { post }`); generated axum WS endpoint
+  `GET /subscribe/<model-kebab>` that routes by model name, materializes via the now-public
+  `read_at(row_index)`, applies a **generated per-model filter** (`<model>_event_matches` — each declared
+  scalar field checked by name, relations excluded, closed compile-time set), and streams typed JSON;
+  nginx `location /` forwards `Upgrade`. PM identity gate PASS (substrate schema-agnostic; all field-aware
+  logic generated; no drift vectors). Honest limits: **single-process** only (no cross-process broker);
+  **no Update/Delete events** (gated on the mutation surface — append-only today); the per-model filter
+  compares via `serde_json` stringify (exact-match, fine for common scalars; fragile for some float/bool
+  encodings — typed per-field compare is a future refinement); Direction B (live queries) + C (durable
+  broker) deferred. Guards: substrate `changefeed` unit tests, `test_rust_generation_changefeed_emits`,
+  `test_api_generation_websocket_subscription`; **live WebSocket round-trip** E2E (client receives a
+  filtered typed event) compile-tested through current codegen in `scratchpad/changefeed_compile`
+  (ephemeral). Requires the `forgedb-changefeed 0.1.0` publish (see the publish gap).
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
