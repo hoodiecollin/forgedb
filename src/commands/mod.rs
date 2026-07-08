@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod build;
 pub mod compact;
 pub mod dev;
