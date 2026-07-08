@@ -27,16 +27,25 @@ use tokio::sync::broadcast;
 
 /// What kind of change a [`ChangeEvent`] describes.
 ///
-/// **Insert-only today**, mirroring the append-only storage engine: a model row
-/// append is `Inserted`, an M2M junction append is `Linked`. `Updated` / `Deleted`
-/// are intentionally absent — they are gated on the generated mutation surface and
-/// retraction primitive (see the `mvcc-concurrency` and `realtime-subscriptions`
-/// proposals). Adding them here before that lands would be faking events the
-/// storage engine cannot yet produce.
+/// Every kind still maps to an **append** — the storage engine is append-only and
+/// this primitive stays a positional signal. A model insert is `Inserted`; an M2M
+/// junction append is `Linked`. The mutation surface (#66, superseding-version
+/// append) adds `Updated` / `Deleted`: both are *also* appends (a new version of a
+/// row, tombstoned for a delete), so `row_index` still points at a committed row —
+/// for `Updated` the new live version, for `Deleted` the pre-delete version that a
+/// subscriber can still materialize (the tombstoned version reads as absent).
+/// Which row a generated emitter passes is its concern; this crate never decodes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     /// A record was appended to a model's storage.
     Inserted,
+    /// A new (superseding) version of an existing record was appended (#66).
+    /// `row_index` is the new live version.
+    Updated,
+    /// A tombstoned superseding version was appended, logically deleting the row
+    /// (#66). Emitters pass the pre-delete version's `row_index` so a subscriber
+    /// can still materialize what was deleted (the tombstoned row reads as absent).
+    Deleted,
     /// A pair was appended to an M2M junction table.
     Linked,
 }
@@ -165,5 +174,19 @@ mod tests {
         feed.emit("User", 42, ChangeKind::Inserted);
         assert_eq!(rx1.recv().await.unwrap().row_index, 42);
         assert_eq!(rx2.recv().await.unwrap().row_index, 42);
+    }
+
+    #[tokio::test]
+    async fn mutation_kinds_carry_through_the_feed() {
+        // The mutation surface (#66) emits Updated/Deleted; the feed stays
+        // field-blind and just carries the (model, row_index, kind) tuple.
+        let feed = ChangeFeed::new(16);
+        let mut rx = feed.subscribe();
+        feed.emit("Post", 7, ChangeKind::Updated);
+        feed.emit("Post", 3, ChangeKind::Deleted);
+        let updated = rx.recv().await.unwrap();
+        let deleted = rx.recv().await.unwrap();
+        assert_eq!(updated, ChangeEvent { model: "Post", row_index: 7, kind: ChangeKind::Updated });
+        assert_eq!(deleted, ChangeEvent { model: "Post", row_index: 3, kind: ChangeKind::Deleted });
     }
 }
