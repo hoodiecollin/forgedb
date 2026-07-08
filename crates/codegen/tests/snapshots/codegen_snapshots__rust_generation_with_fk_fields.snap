@@ -252,6 +252,101 @@ impl AuthorStorage {
         }
         records
     }
+    /// Open a read-only handle over this storage (#56 Direction B).
+    /// The handle shares this storage's column files via independent
+    /// (`try_clone`d) descriptors, so it reads the committed prefix
+    /// lock-free — concurrently with, and never blocking, the single
+    /// `&mut self` writer.  Pair it with a `DatabaseSnapshot` captured
+    /// on the writer for a cross-model-consistent read view.
+    pub fn reader(&self) -> AuthorStorageReader {
+        AuthorStorageReader {
+            id_to_row: self.id_to_row.clone(),
+            id_col: self.id_col.reader().expect("Failed to open column reader"),
+            tombstones: self
+                .tombstones
+                .reader()
+                .expect("Failed to open tombstones reader"),
+        }
+    }
+}
+///Read-only, lock-free reader handle for Author storage (#56 Direction B)
+pub struct AuthorStorageReader {
+    id_to_row: HashMap<Uuid, usize>,
+    id_col: forgedb_storage::FixedColumnReader,
+    tombstones: forgedb_storage::TombstonesReader,
+}
+impl AuthorStorageReader {
+    /// Materialize the record at a physical row index (or `None` if
+    /// tombstoned) — the same shared read path as the writer storage,
+    /// reading through the shared-fd reader columns (#56 Direction B).
+    pub fn read_at(&self, row_index: usize) -> Option<Author> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        Some(Author { id: id_value })
+    }
+    /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+    /// of `id` committed as of `snap`.  A snapshot captured before a later
+    /// update/delete still resolves the version live as-of capture; a
+    /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Author> {
+        let watermark = snap.watermark();
+        let mut newest: Option<usize> = None;
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if row_id == id {
+                newest = Some(row_index);
+            }
+        }
+        self.read_at(newest?)
+    }
+    /// Return every live record committed as of `snap` (#56 + #66).
+    /// Resolves the newest version per id within `0..watermark`, so an
+    /// updated row appears once (its newest version) and a deleted row is
+    /// excluded — no duplicate physical versions leak into the view.
+    pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Author> {
+        let watermark = snap.watermark();
+        let mut newest: HashMap<Uuid, usize> = HashMap::new();
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            newest.insert(row_id, row_index);
+        }
+        let mut records = Vec::new();
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if newest.get(&row_id) == Some(&row_index) {
+                if let Some(record) = self.read_at(row_index) {
+                    records.push(record);
+                }
+            }
+        }
+        records
+    }
 }
 ///Post model
 #[repr(C)]
@@ -589,6 +684,136 @@ impl PostStorage {
         }
         records
     }
+    /// Open a read-only handle over this storage (#56 Direction B).
+    /// The handle shares this storage's column files via independent
+    /// (`try_clone`d) descriptors, so it reads the committed prefix
+    /// lock-free — concurrently with, and never blocking, the single
+    /// `&mut self` writer.  Pair it with a `DatabaseSnapshot` captured
+    /// on the writer for a cross-model-consistent read view.
+    pub fn reader(&self) -> PostStorageReader {
+        PostStorageReader {
+            id_to_row: self.id_to_row.clone(),
+            id_col: self.id_col.reader().expect("Failed to open column reader"),
+            title_col: self.title_col.reader().expect("Failed to open column reader"),
+            author_id_col: self
+                .author_id_col
+                .reader()
+                .expect("Failed to open column reader"),
+            editor_id_col: self
+                .editor_id_col
+                .reader()
+                .expect("Failed to open column reader"),
+            tombstones: self
+                .tombstones
+                .reader()
+                .expect("Failed to open tombstones reader"),
+        }
+    }
+}
+///Read-only, lock-free reader handle for Post storage (#56 Direction B)
+pub struct PostStorageReader {
+    id_to_row: HashMap<Uuid, usize>,
+    id_col: forgedb_storage::FixedColumnReader,
+    title_col: forgedb_storage::VariableColumnReader,
+    author_id_col: forgedb_storage::FixedColumnReader,
+    editor_id_col: forgedb_storage::FixedColumnReader,
+    tombstones: forgedb_storage::TombstonesReader,
+}
+impl PostStorageReader {
+    /// Materialize the record at a physical row index (or `None` if
+    /// tombstoned) — the same shared read path as the writer storage,
+    /// reading through the shared-fd reader columns (#56 Direction B).
+    pub fn read_at(&self, row_index: usize) -> Option<Post> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let title_value = self
+            .title_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let author_id_value = {
+            let bytes = self
+                .author_id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let editor_id_value: Option<Uuid> = {
+            let bytes = self
+                .editor_id_col
+                .read_bytes(row_index)
+                .expect("Failed to read from column");
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const Option<Uuid>) }
+        };
+        Some(Post {
+            id: id_value,
+            title: title_value,
+            author_id: author_id_value,
+            editor_id: editor_id_value,
+        })
+    }
+    /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+    /// of `id` committed as of `snap`.  A snapshot captured before a later
+    /// update/delete still resolves the version live as-of capture; a
+    /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Post> {
+        let watermark = snap.watermark();
+        let mut newest: Option<usize> = None;
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if row_id == id {
+                newest = Some(row_index);
+            }
+        }
+        self.read_at(newest?)
+    }
+    /// Return every live record committed as of `snap` (#56 + #66).
+    /// Resolves the newest version per id within `0..watermark`, so an
+    /// updated row appears once (its newest version) and a deleted row is
+    /// excluded — no duplicate physical versions leak into the view.
+    pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Post> {
+        let watermark = snap.watermark();
+        let mut newest: HashMap<Uuid, usize> = HashMap::new();
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            newest.insert(row_id, row_index);
+        }
+        let mut records = Vec::new();
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if newest.get(&row_id) == Some(&row_index) {
+                if let Some(record) = self.read_at(row_index) {
+                    records.push(record);
+                }
+            }
+        }
+        records
+    }
 }
 ///Change-feed event: a `Author` was inserted (#62).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -620,6 +845,32 @@ pub struct PostUpdated {
 pub struct PostDeleted {
     pub post: Post,
 }
+///Live-query result-set delta for `Author` (#62 Direction B): removal-aware membership changes over a generated closed-set query.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum AuthorLiveDelta {
+    /// The full matching set at subscription time.
+    Init { rows: Vec<Author> },
+    /// A record newly entered the matching set.
+    Added { row: Author },
+    /// A record already in the set changed.
+    Updated { row: Author },
+    /// An id left the matching set (deleted, or no longer matches).
+    Removed { id: Uuid },
+}
+///Live-query result-set delta for `Post` (#62 Direction B): removal-aware membership changes over a generated closed-set query.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum PostLiveDelta {
+    /// The full matching set at subscription time.
+    Init { rows: Vec<Post> },
+    /// A record newly entered the matching set.
+    Added { row: Post },
+    /// A record already in the set changed.
+    Updated { row: Post },
+    /// An id left the matching set (deleted, or no longer matches).
+    Removed { id: Uuid },
+}
 /// Main database struct
 pub struct Database {
     pub author: AuthorStorage,
@@ -629,6 +880,16 @@ pub struct Database {
     /// The generated WS endpoint subscribes to it; standalone callers
     /// can ignore it.
     pub changefeed: forgedb_changefeed::ChangeFeed,
+}
+/// A read-only, lock-free view of the whole database (#56 Direction B).
+/// One per reader thread; each field shares the writer's column files
+/// via independent descriptors.  Read through a `DatabaseSnapshot`
+/// captured on the writer (`Database::snapshot()`) for a cross-model
+/// consistent, torn-row-free view while the single writer keeps
+/// appending.  Exposes only `&self` reads — it cannot mutate.
+pub struct DatabaseReader {
+    pub author: AuthorStorageReader,
+    pub post: PostStorageReader,
 }
 /// A database-wide read snapshot (#56, Direction A): a row-count
 /// watermark for every model and junction, captured atomically by
@@ -650,13 +911,27 @@ impl Database {
         Self { author, post, changefeed }
     }
     /// Capture a consistent read snapshot across all collections.
-    /// Single-process, single-thread today, so the captures are
-    /// trivially atomic; the watermarks are what make the read view
-    /// stable against later appends.
+    /// Called on the single writer, so — because the writer is never
+    /// mid-mutation between calls — the per-collection watermarks are
+    /// captured atomically as of one commit boundary (#56 Direction B).
+    /// Hand the returned snapshot to `DatabaseReader` accessors for a
+    /// cross-model-consistent read view; rows appended after this call
+    /// are invisible and no reader can observe a torn row.
     pub fn snapshot(&self) -> DatabaseSnapshot {
         DatabaseSnapshot {
             author: self.author.snapshot(),
             post: self.post.snapshot(),
+        }
+    }
+    /// Open a read-only handle over the whole database (#56 Direction
+    /// B).  The returned `DatabaseReader` shares every collection's
+    /// files via independent descriptors, so it (and any clones handed
+    /// to reader threads) reads the committed prefix lock-free while
+    /// this writer keeps mutating.
+    pub fn reader(&self) -> DatabaseReader {
+        DatabaseReader {
+            author: self.author.reader(),
+            post: self.post.reader(),
         }
     }
 }

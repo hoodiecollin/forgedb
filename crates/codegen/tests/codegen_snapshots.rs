@@ -1364,3 +1364,220 @@ User {
         "relation field must not be a filter key"
     );
 }
+
+#[test]
+fn test_rust_generation_reader_handles() {
+    // #56 Direction B: read-only reader handles for single-writer/many-reader.
+    // Each model gets a `*StorageReader` (shared-fd column readers) with the SAME
+    // read_at/get_at/all_at surface; the junction gets a `*Reader` with pairs_at;
+    // the Database gets a `DatabaseReader` bundle (one typed reader field per model
+    // AND junction — never a string-keyed dispatch) + `reader()`, plus the
+    // snapshot-scoped M2M traversal on the reader.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Per-model reader struct + shared-fd column reader types.
+    assert!(code.contains("pub struct PostStorageReader"), "per-model reader struct");
+    assert!(
+        code.contains("forgedb_storage::FixedColumnReader")
+            || code.contains("forgedb_storage :: FixedColumnReader"),
+        "reader uses the substrate FixedColumnReader (shared fd)"
+    );
+    assert!(
+        code.contains("forgedb_storage::VariableColumnReader")
+            || code.contains("forgedb_storage :: VariableColumnReader"),
+        "reader uses the substrate VariableColumnReader"
+    );
+    assert!(
+        code.contains("forgedb_storage::TombstonesReader")
+            || code.contains("forgedb_storage :: TombstonesReader"),
+        "reader uses the substrate TombstonesReader"
+    );
+    // `*Storage::reader()` opens the shared-fd handle.
+    assert!(
+        code.contains("pub fn reader(&self) -> PostStorageReader"),
+        "storage exposes a reader() handle"
+    );
+    assert!(
+        code.contains(".reader().expect(\"Failed to open column reader\")"),
+        "reader shares the writer's column fds via col.reader()"
+    );
+
+    // The reader reuses the SAME tailored read surface (no second decode path).
+    assert!(
+        code.contains("impl PostStorageReader"),
+        "reader impl block generated"
+    );
+    // read_at + get_at + all_at appear for BOTH the writer storage and the reader
+    // (i.e. at least twice each in the emitted code).
+    assert!(
+        code.matches("fn read_at(&self, row_index: usize) -> Option<Post>").count() >= 2,
+        "read_at is emitted for both the writer storage and the reader"
+    );
+    assert!(
+        code.matches("pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Post>").count()
+            + code.matches("pub fn all_at(&self, snap: &forgedb_storage :: Snapshot) -> Vec<Post>").count()
+            >= 2,
+        "all_at is emitted for both the writer storage and the reader"
+    );
+
+    // Junction reader with a watermark-clamped pairs_at.
+    assert!(code.contains("pub struct PostTagLinkReader"), "junction reader struct");
+    assert!(
+        code.contains("pub fn reader(&self) -> PostTagLinkReader"),
+        "junction exposes a reader() handle"
+    );
+
+    // DatabaseReader bundle: one typed reader field per model AND junction — the
+    // red line is that these are NAMED generated fields, not a runtime string map.
+    assert!(code.contains("pub struct DatabaseReader"), "DatabaseReader bundle");
+    assert!(code.contains("pub post: PostStorageReader"), "typed per-model reader field");
+    assert!(code.contains("pub tag: TagStorageReader"), "typed per-model reader field");
+    assert!(
+        code.contains("pub post_tag_link: PostTagLinkReader"),
+        "typed per-junction reader field"
+    );
+    assert!(
+        code.contains("pub fn reader(&self) -> DatabaseReader"),
+        "Database::reader() opens the whole-db read handle"
+    );
+    // No string-keyed generic read dispatch anywhere (identity red line).
+    assert!(
+        !code.contains("fn read_at(&self, model: &str") && !code.contains("model_name: &str"),
+        "no runtime model-name-keyed read dispatch"
+    );
+
+    // Snapshot-scoped M2M traversal is generated on the reader too.
+    assert!(
+        code.contains("impl DatabaseReader"),
+        "reader-side traversal impl block generated"
+    );
+    assert!(
+        code.matches("pub fn post_tags_at(&self, snap: &DatabaseSnapshot, id: Uuid) -> Vec<Tag>").count()
+            >= 2,
+        "post_tags_at is generated on both Database and DatabaseReader"
+    );
+}
+
+#[test]
+fn test_rust_generation_live_delta_enums() {
+    // #62 Direction B: per-model typed live-query delta enum (Init/Added/Updated/
+    // Removed), tagged JSON, over generated model records + the model's id type.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+}
+
+Counter {
+  id: +u64
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub enum PostLiveDelta"), "per-model live-delta enum");
+    assert!(
+        code.contains("#[serde(tag = \"kind\", rename_all = \"lowercase\")]"),
+        "tagged JSON so clients dispatch on kind"
+    );
+    assert!(code.contains("Init { rows: Vec<Post> }"), "Init carries the full set");
+    assert!(code.contains("Added { row: Post }"), "Added carries a typed record");
+    assert!(code.contains("Updated { row: Post }"), "Updated carries a typed record");
+    assert!(code.contains("Removed { id: Uuid }"), "Removed carries the uuid id");
+    // Integer-PK model's Removed carries the integer id type.
+    assert!(
+        code.contains("pub enum CounterLiveDelta") && code.contains("Removed { id: u64 }"),
+        "integer-PK Removed carries the u64 id"
+    );
+}
+
+#[test]
+fn test_api_generation_live_query() {
+    // #62 Direction B: the live-query WS handler. THE red line (drift vector #2):
+    // the `?field=value` binding must reuse the SAME generated closed-set filter
+    // (`<model>_event_matches`) as REST list / #62-A — no second predicate parser.
+    // Re-evaluation runs only the GENERATED query (all() + that filter). The feed
+    // is consulted COARSELY (only event.model). Deltas are the generated typed
+    // enum; membership is opaque id -> opaque hash.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+User {
+  id: +uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // Route + handler.
+    assert!(code.contains("/live-query/"), "per-model /live-query route registered");
+    assert!(
+        code.contains("async fn subscribe_live_post"),
+        "per-model live-query handler generated"
+    );
+
+    // RED LINE #1: binds to the SAME generated closed-set filter — no second parser.
+    assert!(
+        code.contains("post_event_matches(r, &params)"),
+        "live-query reuses the generated closed-set filter (no second predicate parser)"
+    );
+    // Re-evaluation runs the GENERATED query (all() + the generated filter).
+    assert!(
+        code.contains(".post.all()") || code.contains(".post\n"),
+        "live-query re-runs the generated all() query"
+    );
+    // No runtime-interpreted query/predicate string parser.
+    assert!(
+        !code.contains("parse_predicate") && !code.contains("__gt") && !code.contains("__like"),
+        "no operator grammar / predicate-as-data parser"
+    );
+
+    // COARSE signal: only event.model is consulted (never row_index/kind) in the
+    // live-query path — so no logical-row identity is resolved via the substrate.
+    assert!(
+        code.contains("if event.model != \"Post\""),
+        "live-query re-runs on the coarse model signal"
+    );
+
+    // Typed deltas + opaque membership.
+    assert!(
+        code.contains("PostLiveDelta::Init") || code.contains("PostLiveDelta :: Init"),
+        "handler streams the generated typed delta enum"
+    );
+    assert!(
+        code.contains("PostLiveDelta::Removed") || code.contains("PostLiveDelta :: Removed"),
+        "handler emits removal-aware deltas"
+    );
+    assert!(
+        code.contains("HashMap<Uuid, String>"),
+        "membership tracks opaque id -> opaque hash"
+    );
+    // The relation field stays non-filterable (inherited from the shared filter).
+    assert!(
+        !code.contains("params.get(\"author\")"),
+        "relation field is not a live-query filter key"
+    );
+}

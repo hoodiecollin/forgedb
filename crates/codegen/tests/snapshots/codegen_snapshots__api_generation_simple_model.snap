@@ -180,6 +180,95 @@ async fn handle_user_subscription(
         }
     }
 }
+///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query `all()` + `user_event_matches` (narrow with `?field=value`), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
+async fn subscribe_live_user(
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_user_live_query(socket, db, params))
+}
+async fn handle_user_live_query(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    let mut members: HashMap<Uuid, String> = HashMap::new();
+    {
+        let rows: Vec<super::User> = {
+            let g = db.read().await;
+            g.user.all().into_iter().filter(|r| user_event_matches(r, &params)).collect()
+        };
+        for r in &rows {
+            members.insert(r.id, serde_json::to_string(r).unwrap_or_default());
+        }
+        let init = super::UserLiveDelta::Init { rows };
+        if let Ok(text) = serde_json::to_string(&init) {
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "User" {
+                    continue;
+                }
+                let current: Vec<super::User> = {
+                    let g = db.read().await;
+                    g.user
+                        .all()
+                        .into_iter()
+                        .filter(|r| user_event_matches(r, &params))
+                        .collect()
+                };
+                let mut next: HashMap<Uuid, String> = HashMap::new();
+                let mut deltas: Vec<super::UserLiveDelta> = Vec::new();
+                for r in current {
+                    let id = r.id;
+                    let hash = serde_json::to_string(&r).unwrap_or_default();
+                    match members.get(&id) {
+                        None => {
+                            deltas
+                                .push(super::UserLiveDelta::Added {
+                                    row: r.clone(),
+                                })
+                        }
+                        Some(prev) if *prev != hash => {
+                            deltas
+                                .push(super::UserLiveDelta::Updated {
+                                    row: r.clone(),
+                                })
+                        }
+                        _ => {}
+                    }
+                    next.insert(id, hash);
+                }
+                for id in members.keys() {
+                    if !next.contains_key(id) {
+                        deltas
+                            .push(super::UserLiveDelta::Removed {
+                                id: *id,
+                            });
+                    }
+                }
+                members = next;
+                for d in deltas {
+                    let Ok(text) = serde_json::to_string(&d) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
 #[derive(OpenApi)]
 #[openapi(
     paths(list_user, get_user, create_user),
@@ -200,5 +289,6 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
         .route(concat!("/api/", "user"), post(create_user))
         .route(concat!("/api/", "user", "/{id}"), get(get_user))
         .route(concat!("/subscribe/", "user"), get(subscribe_user))
+        .route(concat!("/live-query/", "user"), get(subscribe_live_user))
         .with_state(db)
 }
