@@ -71,11 +71,12 @@ impl RustGenerator {
             tokens.extend(model_tokens);
         }
 
-        // Generate per-model change-feed event structs (#62 Direction A): the
-        // typed payloads the WS handler emits.  The substrate feed only carries
-        // (model, row_index); generated code turns that into `<Model>Inserted`.
+        // Generate per-model change-feed event structs (#62 Direction A + #66
+        // mutation surface): the typed payloads the WS handler emits.  The substrate
+        // feed only carries (model, row_index, kind); generated code turns that into
+        // `<Model>Inserted` / `<Model>Updated` / `<Model>Deleted`.
         for model in &schema.models {
-            tokens.extend(Self::generate_insert_event_struct(model));
+            tokens.extend(Self::generate_change_event_structs(model));
         }
 
         // Generate M2M junction storage structs (referenced by the Database
@@ -147,8 +148,57 @@ impl RustGenerator {
         // Generate storage initialization
         let storage_inits = Self::generate_storage_inits(model, schema);
 
+        // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
+        let id_type = Self::id_type_tokens(model);
+
         // Generate insert logic
         let insert_logic = Self::generate_insert_logic(model);
+
+        // Generate mutation surface (#66): superseding-version `update` / `delete`.
+        // `None` (skipped) for a model with no id field, which cannot be mutated by
+        // id (and cannot `insert` either).
+        let mutation_methods = match (
+            Self::generate_update_logic(model),
+            Self::generate_delete_logic(model),
+        ) {
+            (Some(update_logic), Some(delete_logic)) => quote! {
+                /// Append a superseding version of an existing record (#66).
+                /// Reads resolve newest-version-wins; the prior version's bytes are
+                /// never mutated, so append-only (and thus backup / snapshots) hold.
+                /// Returns `false` if `id` is absent.  Storage grows with each
+                /// update until compaction reclaims superseded versions.
+                pub fn update(&mut self, id: #id_type, record: #model_name) -> bool {
+                    #update_logic
+                }
+
+                /// Logically delete a record by appending a tombstoned superseding
+                /// version (#66).  `get` then reads the row as absent.  Returns
+                /// `false` if `id` is already absent.  Prior versions stay committed
+                /// (backup-faithful) until compaction reclaims them.
+                pub fn delete(&mut self, id: #id_type) -> bool {
+                    #delete_logic
+                }
+            },
+            _ => quote! {},
+        };
+
+        // Snapshot-scoped newest-version resolution (#66 + #56): read the id at a
+        // physical row so `get_at` / `all_at` can resolve the newest version
+        // *within a watermark* — a snapshot captured before an update/delete still
+        // sees the version live as-of capture.  Present only for id-bearing models.
+        let row_index_ident = format_ident!("row_index");
+        let id_read_at_row =
+            Self::generate_id_read_expr(model, &quote! { self }, &row_index_ident);
+
+        // Generate the snapshot accessors (`get_at` / `all_at`).  For an id-bearing
+        // model they resolve newest-within-watermark (mutation-aware); a model with
+        // no id keeps the plain prefix scan (it cannot be mutated, so no duplicate
+        // versions ever exist).
+        let snapshot_accessors = Self::generate_snapshot_accessors(
+            &id_type,
+            &model_name,
+            id_read_at_row.as_ref(),
+        );
 
         // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
         let read_at_logic = Self::generate_read_at_logic(model);
@@ -161,9 +211,6 @@ impl RustGenerator {
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
-
-        // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
-        let id_type = Self::id_type_tokens(model);
 
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
@@ -214,6 +261,8 @@ impl RustGenerator {
                     #insert_logic
                 }
 
+                #mutation_methods
+
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
                 /// `get_at`, and `all_at` all funnel through here.  Public so the
@@ -242,31 +291,7 @@ impl RustGenerator {
                     forgedb_storage::Snapshot::new(self.row_count)
                 }
 
-                /// Snapshot-scoped point read: like `get`, but a row is only
-                /// visible if it was committed as of `snap` (#56).  A row
-                /// inserted after the snapshot was captured returns `None` even
-                /// though its id is in the live index.
-                pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
-                    let row_index = *self.id_to_row.get(&id)?;
-                    if !snap.visible(row_index) {
-                        return None;
-                    }
-                    self.read_at(row_index)
-                }
-
-                /// Return every live record committed as of `snap` (#56).
-                /// Scans exactly the row prefix `0..snap.watermark()`, so
-                /// concurrent appends past the watermark are excluded and the
-                /// result is a consistent point-in-time view.
-                pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
-                    let mut records = Vec::new();
-                    for row_index in 0..snap.watermark() {
-                        if let Some(record) = self.read_at(row_index) {
-                            records.push(record);
-                        }
-                    }
-                    records
-                }
+                #snapshot_accessors
 
                 /// Return every live (non-deleted) record.  Used by generated
                 /// reverse-relation traversal helpers, which filter this by a
@@ -286,21 +311,126 @@ impl RustGenerator {
         Ok(tokens)
     }
 
-    /// Generate the typed change-feed event struct for a model (#62 Direction A):
-    /// `<Model>Inserted { <model_snake>: <Model> }`.  The WS handler materializes
-    /// the record from the broadcast row index and serializes this to JSON.  It is
-    /// `Deserialize` too so subscribers/tests can round-trip it.
-    fn generate_insert_event_struct(model: &forgedb_parser::Model) -> TokenStream {
+    /// Generate the typed change-feed event structs for a model: `<Model>Inserted`
+    /// (#62 Direction A) plus `<Model>Updated` / `<Model>Deleted` (#66 mutation
+    /// surface).  Each is `{ <model_snake>: <Model> }` — the WS handler materializes
+    /// the record from the broadcast row index and serializes the matching struct to
+    /// JSON.  All are `Deserialize` too so subscribers/tests can round-trip them.
+    /// A `Deleted` event carries the record as it was *before* the delete (the
+    /// emitter passes the pre-delete row index, which is still materializable).
+    fn generate_change_event_structs(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
-        let event_name = format_ident!("{}Inserted", model.name);
         let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
-        let doc = format!("Change-feed event: a `{}` was inserted (#62).", model.name);
-        quote! {
-            #[doc = #doc]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-            pub struct #event_name {
-                pub #field_name: #model_name,
+
+        let variants = [
+            ("Inserted", format!("Change-feed event: a `{}` was inserted (#62).", model.name)),
+            ("Updated", format!("Change-feed event: a `{}` was updated (#66); carries the new version.", model.name)),
+            ("Deleted", format!("Change-feed event: a `{}` was deleted (#66); carries the record as it was before deletion.", model.name)),
+        ];
+
+        let structs = variants.iter().map(|(suffix, doc)| {
+            let event_name = format_ident!("{}{}", model.name, suffix);
+            quote! {
+                #[doc = #doc]
+                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                pub struct #event_name {
+                    pub #field_name: #model_name,
+                }
             }
+        });
+
+        quote! { #(#structs)* }
+    }
+
+    /// Generate the snapshot-scoped read accessors (`get_at` / `all_at`) for a model
+    /// (#56 watermark reads, made mutation-aware by #66).
+    ///
+    /// - **Id-bearing models** (`id_read` = `Some`) resolve **newest-version-within-
+    ///   the-watermark** per id.  Under superseding-version append an id can have
+    ///   several physical rows; a raw prefix scan would return duplicate versions
+    ///   (`all_at`) or the wrong version relative to the snapshot (`get_at`).  Reading
+    ///   the id at each row and keeping the highest row `< watermark` gives each
+    ///   snapshot the row state as-of capture — so a snapshot taken *before* a later
+    ///   update/delete still sees the old value, the property in-place mutation could
+    ///   not provide.
+    /// - **Models without an id** (`id_read` = `None`) cannot be mutated, so no
+    ///   superseding versions ever exist and the plain prefix scan is already correct.
+    fn generate_snapshot_accessors(
+        id_type: &TokenStream,
+        model_name: &proc_macro2::Ident,
+        id_read: Option<&TokenStream>,
+    ) -> TokenStream {
+        match id_read {
+            Some(id_read) => quote! {
+                /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+                /// of `id` committed as of `snap`.  A snapshot captured before a later
+                /// update/delete still resolves the version live as-of capture; a
+                /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+                pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
+                    let watermark = snap.watermark();
+                    let mut newest: Option<usize> = None;
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        if row_id == id {
+                            newest = Some(row_index);
+                        }
+                    }
+                    self.read_at(newest?)
+                }
+
+                /// Return every live record committed as of `snap` (#56 + #66).
+                /// Resolves the newest version per id within `0..watermark`, so an
+                /// updated row appears once (its newest version) and a deleted row is
+                /// excluded — no duplicate physical versions leak into the view.
+                pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
+                    let watermark = snap.watermark();
+                    // Highest physical row per id within the watermark (ascending scan
+                    // ⇒ last write wins ⇒ newest version).
+                    let mut newest: HashMap<#id_type, usize> = HashMap::new();
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        newest.insert(row_id, row_index);
+                    }
+                    // Second pass in row order for a deterministic result; materialize a
+                    // row only when it is the newest for its id (a tombstoned newest is
+                    // filtered by `read_at`).
+                    let mut records = Vec::new();
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        if newest.get(&row_id) == Some(&row_index) {
+                            if let Some(record) = self.read_at(row_index) {
+                                records.push(record);
+                            }
+                        }
+                    }
+                    records
+                }
+            },
+            None => quote! {
+                /// Snapshot-scoped point read (#56).  This model has no id field and
+                /// so cannot be mutated; a row's index is stable and unique, so the
+                /// live-index lookup clamped to the watermark is correct.
+                pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
+                    let row_index = *self.id_to_row.get(&id)?;
+                    if !snap.visible(row_index) {
+                        return None;
+                    }
+                    self.read_at(row_index)
+                }
+
+                /// Return every live record committed as of `snap` (#56).  With no
+                /// mutation there are no superseding versions, so the plain prefix
+                /// scan `0..watermark` is already a consistent point-in-time view.
+                pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
+                    let mut records = Vec::new();
+                    for row_index in 0..snap.watermark() {
+                        if let Some(record) = self.read_at(row_index) {
+                            records.push(record);
+                        }
+                    }
+                    records
+                }
+            },
         }
     }
 
@@ -665,16 +795,16 @@ impl RustGenerator {
     }
 
     /// Generate insert method logic
-    fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
+    /// Generate the per-field column-append statements for one row.
+    ///
+    /// Reads each stored field from a local `record` binding and appends it to the
+    /// matching column, in declared order.  Shared by `insert` (appends the new
+    /// record), `update` (appends the superseding version), and `delete` (re-appends
+    /// the current values under a tombstone) so all three stay byte-for-byte
+    /// consistent about column encoding — the whole point of the append-only /
+    /// superseding-version model (#66).
+    fn generate_append_statements(model: &forgedb_parser::Model) -> Vec<TokenStream> {
         let mut append_statements = Vec::new();
-
-        // Find the ID field
-        let id_field = model.fields.iter().find(|f| f.name == "id" || f.auto_generate);
-        let id_field_name = if let Some(f) = id_field {
-            format_ident!("{}", f.name)
-        } else {
-            format_ident!("id")
-        };
 
         for field in &model.fields {
             let field_name = format_ident!("{}", field.name);
@@ -772,6 +902,77 @@ impl RustGenerator {
             }
         }
 
+        append_statements
+    }
+
+    /// The field identifier used as a model's identity, e.g. `id`.  Falls back to
+    /// `id` when no explicit id / auto-generate field is present (matching the
+    /// historical `insert` behavior).
+    fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
+        match model.fields.iter().find(|f| f.name == "id" || f.auto_generate) {
+            Some(f) => format_ident!("{}", f.name),
+            None => format_ident!("id"),
+        }
+    }
+
+    /// Generate an expression that reads a model's id at a physical row via
+    /// `#receiver.<id_col>.read_*(#row_var)`, yielding the id-typed value.
+    ///
+    /// `None` when the model has no id / auto-generate field (such a model cannot
+    /// `insert`, `update`, or `delete`).  Used by reopen rehydration (receiver
+    /// `db`, row `i`) and by the snapshot newest-version resolution added for the
+    /// mutation surface (receiver `self`, row `row_index`) so both read the id the
+    /// same way (#66 + #56).
+    fn generate_id_read_expr(
+        model: &forgedb_parser::Model,
+        receiver: &TokenStream,
+        row_var: &proc_macro2::Ident,
+    ) -> Option<TokenStream> {
+        let f = model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)?;
+        let col = format_ident!("{}_col", f.name);
+
+        let is_uuid_like = matches!(
+            &f.field_type,
+            forgedb_parser::FieldType::Uuid
+                | forgedb_parser::FieldType::Relation(
+                    forgedb_parser::RelationType::RequiredReference(_),
+                )
+        );
+        let is_timestamp = matches!(&f.field_type, forgedb_parser::FieldType::Timestamp);
+        let is_string = Self::is_string_type(&f.field_type);
+
+        let expr = if is_uuid_like {
+            quote! {
+                {
+                    let bytes = #receiver.#col.read_uuid(#row_var).expect("Failed to read id column");
+                    Uuid::from_bytes(bytes)
+                }
+            }
+        } else if is_timestamp {
+            quote! {
+                Timestamp::from(
+                    #receiver.#col.read_timestamp(#row_var).expect("Failed to read id column"),
+                )
+            }
+        } else if is_string {
+            quote! {
+                #receiver.#col.read_string(#row_var).expect("Failed to read id column")
+            }
+        } else {
+            let read_method = Self::get_read_method(&f.field_type);
+            quote! {
+                #receiver.#col.#read_method(#row_var).expect("Failed to read id column")
+            }
+        };
+        Some(expr)
+    }
+
+    fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
+        let append_statements = Self::generate_append_statements(model);
+        let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
 
         quote! {
@@ -797,6 +998,91 @@ impl RustGenerator {
 
             id
         }
+    }
+
+    /// Generate the body of `update(id, record)` (#66 mutation surface).
+    ///
+    /// Superseding-version append: the new field values are written at a fresh
+    /// physical row and the id is repointed to it.  Committed bytes are never
+    /// mutated in place, so append-only holds and backup / watermark snapshots
+    /// (#57 / #56) keep working unchanged.  Returns `false` if the id is absent.
+    /// `None` when the model has no id field (cannot be mutated by id).
+    fn generate_update_logic(model: &forgedb_parser::Model) -> Option<TokenStream> {
+        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        let append_statements = Self::generate_append_statements(model);
+        let model_name_str = model.name.clone();
+
+        Some(quote! {
+            if !self.id_to_row.contains_key(&id) {
+                return false;
+            }
+            let row_index = self.row_count;
+
+            // Append the superseding version's columns from `record`.
+            #(#append_statements)*
+
+            // The new version is live (not a tombstone).
+            self.tombstones.append(false).expect("Failed to append tombstone");
+
+            // Repoint the id at its newest physical row; the prior version's bytes
+            // remain committed (backup-faithful) until compaction reclaims them.
+            self.id_to_row.insert(id, row_index);
+            self.row_count += 1;
+
+            // #62: an Updated event carries the new live row index.
+            if let Some(feed) = &self.changefeed {
+                feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Updated);
+            }
+
+            true
+        })
+    }
+
+    /// Generate the body of `delete(id)` (#66 mutation surface).
+    ///
+    /// Appends a *tombstoned* superseding version for the id.  The current values
+    /// are re-appended (their content is irrelevant — the row reads as absent) only
+    /// to keep every column aligned to the row count.  Reads resolve the newest
+    /// version, now tombstoned, so `get` returns `None`.  Returns `false` if the id
+    /// is already absent.  `None` when the model has no id field.
+    fn generate_delete_logic(model: &forgedb_parser::Model) -> Option<TokenStream> {
+        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        let append_statements = Self::generate_append_statements(model);
+        let model_name_str = model.name.clone();
+
+        Some(quote! {
+            // Materialize the current live record; also gives the values to
+            // re-append.  A missing / already-deleted id resolves to `None`.
+            let record = match self.get(id) {
+                Some(r) => r,
+                None => return false,
+            };
+            // The pre-delete live row is still non-tombstoned, so a subscriber can
+            // materialize what was deleted from it (the new tombstoned row cannot).
+            let deleted_row = *self
+                .id_to_row
+                .get(&id)
+                .expect("id present: get succeeded above");
+
+            let row_index = self.row_count;
+
+            // Re-append the current column values under a tombstone.
+            #(#append_statements)*
+
+            self.tombstones.append(true).expect("Failed to append tombstone");
+
+            // Repoint the id at the tombstoned newest row so `get` reads absent.
+            self.id_to_row.insert(id, row_index);
+            self.row_count += 1;
+
+            // #62: a Deleted event carries the pre-delete row so the record is
+            // still materializable by a subscriber.
+            if let Some(feed) = &self.changefeed {
+                feed.emit(#model_name_str, deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+            }
+
+            true
+        })
     }
 
     /// Generate the body of the shared `read_at(row_index)` accessor.
@@ -1061,61 +1347,22 @@ impl RustGenerator {
     /// field only — reconstructing the identity map is all reopen needs; the
     /// remaining columns are read on demand by `get`.
     fn generate_rehydrate_logic(model: &forgedb_parser::Model) -> TokenStream {
-        let id_field = model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate);
-
-        let id_scan = if let Some(f) = id_field {
-            let col = format_ident!("{}_col", f.name);
-
-            // Mirror `get`'s per-type read of the id field, but at loop index `i`
-            // and yielding the id-typed key for `id_to_row`.
-            let is_uuid_like = matches!(
-                &f.field_type,
-                forgedb_parser::FieldType::Uuid
-                    | forgedb_parser::FieldType::Relation(
-                        forgedb_parser::RelationType::RequiredReference(_),
-                    )
-            );
-            let is_timestamp =
-                matches!(&f.field_type, forgedb_parser::FieldType::Timestamp);
-            let is_string = Self::is_string_type(&f.field_type);
-
-            let read_expr = if is_uuid_like {
-                quote! {
-                    {
-                        let bytes = db.#col.read_uuid(i).expect("Failed to read id column");
-                        Uuid::from_bytes(bytes)
-                    }
-                }
-            } else if is_timestamp {
-                quote! {
-                    Timestamp::from(
-                        db.#col.read_timestamp(i).expect("Failed to read id column"),
-                    )
-                }
-            } else if is_string {
-                quote! {
-                    db.#col.read_string(i).expect("Failed to read id column")
-                }
-            } else {
-                let read_method = Self::get_read_method(&f.field_type);
-                quote! {
-                    db.#col.#read_method(i).expect("Failed to read id column")
-                }
-            };
-
-            quote! {
+        // Mirror `get`'s per-type read of the id field, but at loop index `i`, via
+        // the shared id-read helper.  The overwriting insert in ascending physical
+        // order yields last-occurrence-wins, which is exactly the superseding-version
+        // resolution the mutation surface (#66) needs on reopen: the newest version
+        // is the highest physical index for an id, so the reopened index resolves it.
+        let i = format_ident!("i");
+        let id_scan = match Self::generate_id_read_expr(model, &quote! { db }, &i) {
+            Some(read_expr) => quote! {
                 for i in 0..n {
                     let id = #read_expr;
                     db.id_to_row.insert(id, i);
                 }
-            }
-        } else {
+            },
             // No id/auto field: nothing to index (such a model cannot `insert`
             // either — `insert` reads `record.id`).  Row count still recovers.
-            quote! {}
+            None => quote! {},
         };
 
         quote! {
