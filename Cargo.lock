@@ -654,6 +654,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "forgedb-changefeed"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "forgedb-codegen"
 version = "0.1.0"
 dependencies = [

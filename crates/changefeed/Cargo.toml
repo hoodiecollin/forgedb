@@ -1,0 +1,15 @@
+[package]
+name = "forgedb-changefeed"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Schema-agnostic in-process change-feed broadcast primitive for ForgeDB generated servers"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "changefeed", "broadcast", "subscription", "forgedb"]
+categories = ["database", "asynchronous"]
+
+[dependencies]
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
