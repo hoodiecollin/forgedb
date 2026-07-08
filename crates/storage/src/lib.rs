@@ -613,6 +613,18 @@ impl FixedColumn {
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
+
+    /// Open a read-only, positionally-reading view over this column's file
+    /// (#56 Direction B).  The returned [`FixedColumnReader`] shares the file
+    /// via an independent (`try_clone`d) descriptor, so a single `&mut self`
+    /// writer can keep appending while many `&self` readers read concurrently
+    /// without a lock.  See [`FixedColumnReader`] for the full model.
+    pub fn reader(&self) -> io::Result<FixedColumnReader> {
+        Ok(FixedColumnReader {
+            file: self.file.try_clone()?,
+            value_size: self.value_size,
+        })
+    }
 }
 
 /// Variable-length column storage (for strings).
@@ -726,6 +738,18 @@ impl VariableColumn {
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
+
+    /// Open a read-only, positionally-reading view over this column's data +
+    /// offsets files (#56 Direction B).  The returned [`VariableColumnReader`]
+    /// shares both files via independent (`try_clone`d) descriptors, so a single
+    /// `&mut self` writer can keep appending while many `&self` readers read
+    /// concurrently without a lock.  See [`FixedColumnReader`] for the model.
+    pub fn reader(&self) -> io::Result<VariableColumnReader> {
+        Ok(VariableColumnReader {
+            data_file: self.data_file.try_clone()?,
+            offsets_file: self.offsets_file.try_clone()?,
+        })
+    }
 }
 
 /// Tombstone bitmap for tracking deleted records.
@@ -793,6 +817,211 @@ impl Tombstones {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Open a read-only, positionally-reading view over this tombstone file
+    /// (#56 Direction B).  See [`FixedColumn::reader`] for the concurrency model.
+    pub fn reader(&self) -> io::Result<TombstonesReader> {
+        Ok(TombstonesReader {
+            file: self.file.try_clone()?,
+        })
+    }
+}
+
+/// Map a positional read that ran past end-of-file back to the same
+/// out-of-bounds error the cached-count writer columns return (#56 Direction B).
+///
+/// A [`FixedColumnReader`] / [`VariableColumnReader`] / [`TombstonesReader`]
+/// derives length live rather than caching a row count, so an index beyond the
+/// committed prefix surfaces as `UnexpectedEof` from `read_exact_at`; normalize
+/// it to `InvalidInput` for parity with the writer's explicit bound check.
+fn map_out_of_bounds(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds")
+    } else {
+        e
+    }
+}
+
+/// Read-only, positional view over a [`FixedColumn`]'s backing file
+/// (#56 Direction B — single writer, many concurrent readers).
+///
+/// Created by [`FixedColumn::reader`]; holds an independent file descriptor
+/// (`try_clone`) to the **same** file as the writer.  A single `&mut self`
+/// writer can keep appending while any number of `&self` readers positionally
+/// read the committed prefix concurrently, with no lock:
+///
+/// - Reads use `read_exact_at` (positional `pread`) — they never touch a shared
+///   file cursor, so they are safe against a concurrent seek-based append and
+///   against each other across threads.
+/// - The engine is append-only: bytes at an already-committed offset never move,
+///   so a reader observing an offset below the writer's committed length reads
+///   stable bytes (POSIX page-cache coherence makes the writer's not-yet-fsync'd
+///   appends visible through this independent fd).
+/// - Length is derived **live** on every access (never a cached count), so a
+///   reader created before an append still sees rows the writer commits
+///   afterward — once the caller's watermark admits them.
+///
+/// Callers clamp reads to a captured watermark (the row-count anchor); because
+/// the anchor column is appended last per row, a row within the watermark has
+/// all its columns fully written, so a reader never observes a torn row.
+pub struct FixedColumnReader {
+    file: File,
+    value_size: usize,
+}
+
+impl FixedColumnReader {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.file
+            .metadata()
+            .map(|m| m.len() as usize / self.value_size)
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn read_u32(&self, index: usize) -> io::Result<u32> {
+        let mut buf = [0u8; 4];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    pub fn read_u64(&self, index: usize) -> io::Result<u64> {
+        let mut buf = [0u8; 8];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    pub fn read_i32(&self, index: usize) -> io::Result<i32> {
+        let mut buf = [0u8; 4];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(i32::from_le_bytes(buf))
+    }
+
+    pub fn read_i64(&self, index: usize) -> io::Result<i64> {
+        let mut buf = [0u8; 8];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    pub fn read_f64(&self, index: usize) -> io::Result<f64> {
+        let mut buf = [0u8; 8];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(f64::from_le_bytes(buf))
+    }
+
+    pub fn read_bool(&self, index: usize) -> io::Result<bool> {
+        let mut buf = [0u8; 1];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(buf[0] != 0)
+    }
+
+    pub fn read_uuid(&self, index: usize) -> io::Result<[u8; 16]> {
+        let mut buf = [0u8; 16];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(buf)
+    }
+
+    pub fn read_timestamp(&self, index: usize) -> io::Result<i64> {
+        let mut buf = [0u8; 8];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    pub fn read_bytes(&self, index: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; self.value_size];
+        self.file
+            .read_exact_at(&mut buf, (index * self.value_size) as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(buf)
+    }
+}
+
+/// Read-only, positional view over a [`VariableColumn`]'s data + offsets files
+/// (#56 Direction B).  See [`FixedColumnReader`] for the concurrency model.
+pub struct VariableColumnReader {
+    data_file: File,
+    offsets_file: File,
+}
+
+impl VariableColumnReader {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.offsets_file
+            .metadata()
+            .map(|m| m.len() as usize / 16)
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn read_string(&self, index: usize) -> io::Result<String> {
+        let offsets_pos = (index * 16) as u64;
+        let mut offset_buf = [0u8; 8];
+        let mut length_buf = [0u8; 8];
+        self.offsets_file
+            .read_exact_at(&mut offset_buf, offsets_pos)
+            .map_err(map_out_of_bounds)?;
+        self.offsets_file
+            .read_exact_at(&mut length_buf, offsets_pos + 8)
+            .map_err(map_out_of_bounds)?;
+
+        let offset = u64::from_le_bytes(offset_buf);
+        let length = u64::from_le_bytes(length_buf);
+
+        let mut data = vec![0u8; length as usize];
+        self.data_file.read_exact_at(&mut data, offset)?;
+
+        String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Read-only, positional view over a [`Tombstones`] file (#56 Direction B).
+/// See [`FixedColumnReader`] for the concurrency model.
+pub struct TombstonesReader {
+    file: File,
+}
+
+impl TombstonesReader {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.file.metadata().map(|m| m.len() as usize).unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_deleted(&self, index: usize) -> io::Result<bool> {
+        let mut buf = [0u8; 1];
+        self.file
+            .read_exact_at(&mut buf, index as u64)
+            .map_err(map_out_of_bounds)?;
+        Ok(buf[0] != 0)
     }
 }
 
