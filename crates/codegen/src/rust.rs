@@ -94,6 +94,12 @@ impl RustGenerator {
         let traversal_tokens = Self::generate_traversal_impl(schema);
         tokens.extend(traversal_tokens);
 
+        // Generate the snapshot-scoped M2M traversal on the read-only
+        // `DatabaseReader` (#56 Direction B), so a concurrent reader can resolve
+        // cross-table many-to-many links consistently as of its snapshot.
+        let reader_traversal_tokens = Self::generate_reader_traversal_impl(schema);
+        tokens.extend(reader_traversal_tokens);
+
         // Generate eager-load typed structs (`<Model>WithRelations`) plus their
         // Database getters, which resolve a record's forward references in one call.
         let eager_tokens = Self::generate_eager_load(schema);
@@ -212,6 +218,21 @@ impl RustGenerator {
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
 
+        // Read-only reader handle (#56 Direction B): a per-model bundle of
+        // read-only column views sharing the writer's file descriptors, so many
+        // `&self` readers read the committed prefix lock-free while the single
+        // `&mut self` writer keeps appending.  It reuses the *exact* `read_at` /
+        // `get_at` / `all_at` token streams as the writer storage — identical
+        // tailored column-decode, just reading through the shared-fd reader
+        // columns — so there is no second decode path to drift.
+        let reader_name = format_ident!("{}StorageReader", model.name);
+        let reader_fields = Self::generate_reader_storage_fields(model);
+        let reader_inits = Self::generate_reader_inits(model);
+        let reader_doc = format!(
+            "Read-only, lock-free reader handle for {} storage (#56 Direction B)",
+            model.name
+        );
+
         // Generate the model struct, storage struct, and implementation
         let tokens = quote! {
             #[doc = #model_doc]
@@ -305,6 +326,34 @@ impl RustGenerator {
                     }
                     records
                 }
+
+                /// Open a read-only handle over this storage (#56 Direction B).
+                /// The handle shares this storage's column files via independent
+                /// (`try_clone`d) descriptors, so it reads the committed prefix
+                /// lock-free — concurrently with, and never blocking, the single
+                /// `&mut self` writer.  Pair it with a `DatabaseSnapshot` captured
+                /// on the writer for a cross-model-consistent read view.
+                pub fn reader(&self) -> #reader_name {
+                    #reader_name {
+                        #reader_inits
+                    }
+                }
+            }
+
+            #[doc = #reader_doc]
+            pub struct #reader_name {
+                #reader_fields
+            }
+
+            impl #reader_name {
+                /// Materialize the record at a physical row index (or `None` if
+                /// tombstoned) — the same shared read path as the writer storage,
+                /// reading through the shared-fd reader columns (#56 Direction B).
+                pub fn read_at(&self, row_index: usize) -> Option<#model_name> {
+                    #read_at_logic
+                }
+
+                #snapshot_accessors
             }
         };
 
@@ -627,6 +676,59 @@ impl RustGenerator {
                 PathBuf::from(#tombstones_path)
             ).expect("Failed to create tombstones"),
             changefeed: None,
+        }
+    }
+
+    /// Generate the read-only reader column field declarations (#56 Direction B).
+    ///
+    /// Mirrors `generate_storage_fields` field-for-field, but every column is the
+    /// read-only `*Reader` variant sharing the writer's file descriptor.  No
+    /// `row_count` / `changefeed` (a reader never appends and never emits); it
+    /// keeps `id_to_row` only because a no-id model's `get_at` consults it (an
+    /// id-bearing model's snapshot reads scan the id column instead).
+    fn generate_reader_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
+        let mut column_fields = Vec::new();
+        for field in &model.fields {
+            let field_col_name = format_ident!("{}_col", field.name);
+            if Self::is_fixed_size_type(&field.field_type) {
+                column_fields.push(quote! {
+                    #field_col_name: forgedb_storage::FixedColumnReader
+                });
+            } else if Self::is_string_type(&field.field_type) {
+                column_fields.push(quote! {
+                    #field_col_name: forgedb_storage::VariableColumnReader
+                });
+            }
+        }
+        let id_type = Self::id_type_tokens(model);
+        quote! {
+            id_to_row: HashMap<#id_type, usize>,
+            #(#column_fields,)*
+            tombstones: forgedb_storage::TombstonesReader,
+        }
+    }
+
+    /// Build a `*StorageReader` literal from `&self` writer storage (#56
+    /// Direction B): each column shares the writer's fd via `col.reader()`;
+    /// `id_to_row` is cloned so a no-id model's `get_at` still resolves.
+    fn generate_reader_inits(model: &forgedb_parser::Model) -> TokenStream {
+        let mut inits = Vec::new();
+        for field in &model.fields {
+            let field_col_name = format_ident!("{}_col", field.name);
+            if Self::is_fixed_size_type(&field.field_type)
+                || Self::is_string_type(&field.field_type)
+            {
+                inits.push(quote! {
+                    #field_col_name: self.#field_col_name.reader()
+                        .expect("Failed to open column reader")
+                });
+            }
+        }
+        quote! {
+            id_to_row: self.id_to_row.clone(),
+            #(#inits,)*
+            tombstones: self.tombstones.reader()
+                .expect("Failed to open tombstones reader"),
         }
     }
 
@@ -1456,6 +1558,31 @@ impl RustGenerator {
             }))
             .collect();
 
+        // DatabaseReader (#56, Direction B): a read-only bundle of every model's
+        // and junction's shared-fd reader handle.  A reader thread holds one of
+        // these plus a `DatabaseSnapshot` captured on the single writer, and reads
+        // lock-free — never blocking, and never blocked by, the writer's appends.
+        // The `DatabaseSnapshot` capture is routed through the writer (see
+        // `Database::snapshot()`), so it is cross-model atomic by construction.
+        let reader_fields: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| {
+                let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
+                let reader_type = format_ident!("{}StorageReader", model.name);
+                quote! { pub #field_name: #reader_type }
+            })
+            .chain(m2m.iter().map(|m| {
+                let field = Self::junction_field_ident(m);
+                let ty = format_ident!("{}Reader", Self::junction_struct_ident(m));
+                quote! { pub #field: #ty }
+            }))
+            .collect();
+        let reader_inits: Vec<_> = field_idents
+            .iter()
+            .map(|field| quote! { #field: self.#field.reader() })
+            .collect();
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
@@ -1466,6 +1593,16 @@ impl RustGenerator {
                 /// The generated WS endpoint subscribes to it; standalone callers
                 /// can ignore it.
                 pub changefeed: forgedb_changefeed::ChangeFeed,
+            }
+
+            /// A read-only, lock-free view of the whole database (#56 Direction B).
+            /// One per reader thread; each field shares the writer's column files
+            /// via independent descriptors.  Read through a `DatabaseSnapshot`
+            /// captured on the writer (`Database::snapshot()`) for a cross-model
+            /// consistent, torn-row-free view while the single writer keeps
+            /// appending.  Exposes only `&self` reads — it cannot mutate.
+            pub struct DatabaseReader {
+                #(#reader_fields,)*
             }
 
             /// A database-wide read snapshot (#56, Direction A): a row-count
@@ -1489,12 +1626,26 @@ impl RustGenerator {
                 }
 
                 /// Capture a consistent read snapshot across all collections.
-                /// Single-process, single-thread today, so the captures are
-                /// trivially atomic; the watermarks are what make the read view
-                /// stable against later appends.
+                /// Called on the single writer, so — because the writer is never
+                /// mid-mutation between calls — the per-collection watermarks are
+                /// captured atomically as of one commit boundary (#56 Direction B).
+                /// Hand the returned snapshot to `DatabaseReader` accessors for a
+                /// cross-model-consistent read view; rows appended after this call
+                /// are invisible and no reader can observe a torn row.
                 pub fn snapshot(&self) -> DatabaseSnapshot {
                     DatabaseSnapshot {
                         #(#snapshot_inits,)*
+                    }
+                }
+
+                /// Open a read-only handle over the whole database (#56 Direction
+                /// B).  The returned `DatabaseReader` shares every collection's
+                /// files via independent descriptors, so it (and any clones handed
+                /// to reader threads) reads the committed prefix lock-free while
+                /// this writer keeps mutating.
+                pub fn reader(&self) -> DatabaseReader {
+                    DatabaseReader {
+                        #(#reader_inits,)*
                     }
                 }
             }
@@ -1515,6 +1666,11 @@ impl RustGenerator {
 
         for m in Self::valid_m2m(schema) {
             let struct_ident = Self::junction_struct_ident(&m);
+            let reader_ident = format_ident!("{}Reader", struct_ident);
+            let reader_doc = format!(
+                "Read-only, lock-free reader handle for the {}<->{} junction (#56 Direction B)",
+                m.model1, m.model2
+            );
             let field_snake = Self::to_snake_case(&m.model1);
             let field_snake2 = Self::to_snake_case(&m.model2);
             let struct_doc = format!(
@@ -1650,6 +1806,43 @@ impl RustGenerator {
                     /// Link pairs committed as of `snap` (#56): scans exactly the
                     /// prefix `0..snap.watermark()`, excluding links appended after
                     /// the snapshot was captured.
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                        (0..snap.watermark())
+                            .map(|i| {
+                                let left = Uuid::from_bytes(
+                                    self.left_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                let right = Uuid::from_bytes(
+                                    self.right_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                (left, right)
+                            })
+                            .collect()
+                    }
+
+                    /// Open a read-only handle over this junction (#56 Direction B):
+                    /// shares both id columns via independent fds for lock-free
+                    /// snapshot reads concurrent with the writer's `link`.
+                    pub fn reader(&self) -> #reader_ident {
+                        #reader_ident {
+                            left_col: self.left_col.reader()
+                                .expect("Failed to open junction left reader"),
+                            right_col: self.right_col.reader()
+                                .expect("Failed to open junction right reader"),
+                        }
+                    }
+                }
+
+                #[doc = #reader_doc]
+                pub struct #reader_ident {
+                    left_col: forgedb_storage::FixedColumnReader,
+                    right_col: forgedb_storage::FixedColumnReader,
+                }
+
+                impl #reader_ident {
+                    /// Link pairs committed as of `snap` (#56 Direction B): the same
+                    /// prefix scan as the writer junction, reading through the
+                    /// shared-fd reader columns.
                     pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
                         (0..snap.watermark())
                             .map(|i| {
@@ -1899,6 +2092,61 @@ impl RustGenerator {
 
         quote! {
             impl Database {
+                #(#methods)*
+            }
+        }
+    }
+
+    /// Generate the snapshot-scoped forward M2M traversal on `DatabaseReader`
+    /// (#56 Direction B).  Mirrors the `<model1>_<field1>_at` method emitted on
+    /// `Database`, but bound to the read-only reader bundle: `pairs_at` on the
+    /// junction reader + `get_at` on the target model reader, both clamped to the
+    /// same writer-captured `DatabaseSnapshot` for a cross-table-consistent join.
+    /// Only the snapshot-scoped `_at` variant is emitted — a `DatabaseReader`
+    /// never exposes the non-snapshot getters (they consult `get`/`pairs`, which
+    /// a read-only handle intentionally lacks).
+    fn generate_reader_traversal_impl(schema: &Schema) -> TokenStream {
+        let mut methods = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for m in Self::valid_m2m(schema) {
+            let junction_field = Self::junction_field_ident(&m);
+            let model2_ident = format_ident!("{}", m.model2);
+            let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+
+            let fwd_at_name = format!("{}_{}_at", Self::to_snake_case(&m.model1), m.field1);
+            if seen.insert(fwd_at_name.clone()) {
+                let fwd_at_ident = format_ident!("{}", fwd_at_name);
+                let doc = format!(
+                    "All linked {} for the given {} id, consistent as of `snap` (reader).",
+                    m.model2, m.model1
+                );
+                methods.push(quote! {
+                    #[doc = #doc]
+                    pub fn #fwd_at_ident(
+                        &self,
+                        snap: &DatabaseSnapshot,
+                        id: Uuid,
+                    ) -> Vec<#model2_ident> {
+                        self.#junction_field
+                            .pairs_at(&snap.#junction_field)
+                            .into_iter()
+                            .filter(|(left, _)| *left == id)
+                            .filter_map(|(_, right)| {
+                                self.#model2_storage.get_at(&snap.#model2_storage, right)
+                            })
+                            .collect()
+                    }
+                });
+            }
+        }
+
+        if methods.is_empty() {
+            return quote! {};
+        }
+
+        quote! {
+            impl DatabaseReader {
                 #(#methods)*
             }
         }
