@@ -162,6 +162,72 @@ impl ComplexModelStorage {
         }
         id
     }
+    /// Append a superseding version of an existing record (#66).
+    /// Reads resolve newest-version-wins; the prior version's bytes are
+    /// never mutated, so append-only (and thus backup / snapshots) hold.
+    /// Returns `false` if `id` is absent.  Storage grows with each
+    /// update until compaction reclaims superseded versions.
+    pub fn update(&mut self, id: Uuid, record: ComplexModel) -> bool {
+        if !self.id_to_row.contains_key(&id) {
+            return false;
+        }
+        let row_index = self.row_count;
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.count_col.append_i64(record.count).expect("Failed to append to column");
+        self.price_col.append_f64(record.price).expect("Failed to append to column");
+        self.active_col.append_bool(record.active).expect("Failed to append to column");
+        self.created_at_col
+            .append_timestamp(i64::from(record.created_at))
+            .expect("Failed to append to column");
+        self.tombstones.append(false).expect("Failed to append tombstone");
+        self.id_to_row.insert(id, row_index);
+        self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit(
+                "ComplexModel",
+                row_index,
+                forgedb_changefeed::ChangeKind::Updated,
+            );
+        }
+        true
+    }
+    /// Logically delete a record by appending a tombstoned superseding
+    /// version (#66).  `get` then reads the row as absent.  Returns
+    /// `false` if `id` is already absent.  Prior versions stay committed
+    /// (backup-faithful) until compaction reclaims them.
+    pub fn delete(&mut self, id: Uuid) -> bool {
+        let record = match self.get(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        let deleted_row = *self
+            .id_to_row
+            .get(&id)
+            .expect("id present: get succeeded above");
+        let row_index = self.row_count;
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.count_col.append_i64(record.count).expect("Failed to append to column");
+        self.price_col.append_f64(record.price).expect("Failed to append to column");
+        self.active_col.append_bool(record.active).expect("Failed to append to column");
+        self.created_at_col
+            .append_timestamp(i64::from(record.created_at))
+            .expect("Failed to append to column");
+        self.tombstones.append(true).expect("Failed to append tombstone");
+        self.id_to_row.insert(id, row_index);
+        self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit(
+                "ComplexModel",
+                deleted_row,
+                forgedb_changefeed::ChangeKind::Deleted,
+            );
+        }
+        true
+    }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
     /// `get_at`, and `all_at` all funnel through here.  Public so the
@@ -220,30 +286,61 @@ impl ComplexModelStorage {
     pub fn snapshot(&self) -> forgedb_storage::Snapshot {
         forgedb_storage::Snapshot::new(self.row_count)
     }
-    /// Snapshot-scoped point read: like `get`, but a row is only
-    /// visible if it was committed as of `snap` (#56).  A row
-    /// inserted after the snapshot was captured returns `None` even
-    /// though its id is in the live index.
+    /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+    /// of `id` committed as of `snap`.  A snapshot captured before a later
+    /// update/delete still resolves the version live as-of capture; a
+    /// tombstoned newest reads as `None` (deleted as-of the snapshot).
     pub fn get_at(
         &self,
         snap: &forgedb_storage::Snapshot,
         id: Uuid,
     ) -> Option<ComplexModel> {
-        let row_index = *self.id_to_row.get(&id)?;
-        if !snap.visible(row_index) {
-            return None;
+        let watermark = snap.watermark();
+        let mut newest: Option<usize> = None;
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if row_id == id {
+                newest = Some(row_index);
+            }
         }
-        self.read_at(row_index)
+        self.read_at(newest?)
     }
-    /// Return every live record committed as of `snap` (#56).
-    /// Scans exactly the row prefix `0..snap.watermark()`, so
-    /// concurrent appends past the watermark are excluded and the
-    /// result is a consistent point-in-time view.
+    /// Return every live record committed as of `snap` (#56 + #66).
+    /// Resolves the newest version per id within `0..watermark`, so an
+    /// updated row appears once (its newest version) and a deleted row is
+    /// excluded — no duplicate physical versions leak into the view.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<ComplexModel> {
+        let watermark = snap.watermark();
+        let mut newest: HashMap<Uuid, usize> = HashMap::new();
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            newest.insert(row_id, row_index);
+        }
         let mut records = Vec::new();
-        for row_index in 0..snap.watermark() {
-            if let Some(record) = self.read_at(row_index) {
-                records.push(record);
+        for row_index in 0..watermark {
+            let row_id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(row_index)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if newest.get(&row_id) == Some(&row_index) {
+                if let Some(record) = self.read_at(row_index) {
+                    records.push(record);
+                }
             }
         }
         records
@@ -264,6 +361,16 @@ impl ComplexModelStorage {
 ///Change-feed event: a `ComplexModel` was inserted (#62).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ComplexModelInserted {
+    pub complex_model: ComplexModel,
+}
+///Change-feed event: a `ComplexModel` was updated (#66); carries the new version.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComplexModelUpdated {
+    pub complex_model: ComplexModel,
+}
+///Change-feed event: a `ComplexModel` was deleted (#66); carries the record as it was before deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ComplexModelDeleted {
     pub complex_model: ComplexModel,
 }
 /// Main database struct
