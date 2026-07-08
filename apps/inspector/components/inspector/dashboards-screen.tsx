@@ -12,10 +12,11 @@ import { toast } from "sonner";
 import { RefreshCw } from "lucide-react";
 import {
   consoleTabAtom,
+  modelsAtom,
   screenAtom,
   streamAtom,
 } from "@/lib/inspector/atoms";
-import { MODELS, POST_STATUS, SNAPS } from "@/lib/inspector/mock";
+import { POST_STATUS, SNAPS } from "@/lib/inspector/mock";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -24,6 +25,7 @@ const tagColor = (k: string) =>
 
 export function DashboardsScreen() {
   const stream = useAtomValue(streamAtom);
+  const models = useAtomValue(modelsAtom);
   const setScreen = useSetAtom(screenAtom);
   const setConsoleTab = useSetAtom(consoleTabAtom);
 
@@ -94,7 +96,7 @@ export function DashboardsScreen() {
         <Tile>
           <TileHead title="Dead-row ratio" badge="AT-REST" tone="muted" />
           <div className="flex flex-col gap-2">
-            {MODELS.map((m) => {
+            {models.map((m) => {
               const warn = m.deadPct >= 10;
               return (
                 <div

@@ -1,7 +1,9 @@
 "use client";
 
-import { useAtomValue } from "jotai";
-import { screenAtom } from "@/lib/inspector/atoms";
+import { useEffect } from "react";
+import { useAtomValue, useSetAtom } from "jotai";
+import { bootstrapProjectAtom, screenAtom } from "@/lib/inspector/atoms";
+import { isTauri } from "@/lib/inspector/data-source";
 import { useLiveTicker } from "@/lib/inspector/use-live-ticker";
 import { TopBar } from "@/components/inspector/top-bar";
 import { AtlasScreen } from "@/components/inspector/atlas-screen";
@@ -17,7 +19,14 @@ import { RecordEditor } from "@/components/inspector/record-editor";
  */
 export default function InspectorPage() {
   const screen = useAtomValue(screenAtom);
+  const bootstrap = useSetAtom(bootstrapProjectAtom);
   useLiveTicker();
+
+  // In the desktop shell, auto-open a startup project (FORGEDB_INSPECTOR_PROJECT)
+  // if one is configured; otherwise the mock sample stays. Runs once on mount.
+  useEffect(() => {
+    if (isTauri()) bootstrap();
+  }, [bootstrap]);
 
   return (
     <div className="dark flex h-screen flex-col overflow-hidden bg-background text-foreground">
