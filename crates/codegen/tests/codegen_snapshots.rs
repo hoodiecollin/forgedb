@@ -1121,3 +1121,148 @@ Tag {
         "post_tags_at must clamp the resolved target to its watermark"
     );
 }
+
+#[test]
+fn test_rust_generation_changefeed_emits() {
+    // Change notifications (#62 Direction A): generated insert()/link_* emit a
+    // FIELD-BLIND (model, row_index) signal into a shared substrate ChangeFeed;
+    // the Database owns the feed and hands each collection a clone; typed
+    // per-model event structs are generated for the WS handler to materialize.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Each storage holds an optional shared feed, attached by Database::new().
+    assert!(
+        code.contains("changefeed: Option<forgedb_changefeed::ChangeFeed>")
+            || code.contains("changefeed: Option<forgedb_changefeed :: ChangeFeed>"),
+        "each storage must hold an optional change feed"
+    );
+    assert!(
+        code.contains("pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed)")
+            || code.contains("pub fn attach_changefeed(&mut self, feed: forgedb_changefeed :: ChangeFeed)"),
+        "storages must expose attach_changefeed"
+    );
+
+    // insert() emits a field-blind signal carrying the model NAME (a &'static str)
+    // and the row index — never a field value.
+    assert!(
+        code.contains("feed.emit(\"Post\", row_index, forgedb_changefeed::ChangeKind::Inserted)")
+            || code.contains("feed.emit(\"Post\", row_index, forgedb_changefeed :: ChangeKind :: Inserted)"),
+        "Post insert must emit an Inserted signal"
+    );
+    // M2M link emits a Linked signal under the junction name.
+    assert!(
+        code.contains("ChangeKind::Linked") || code.contains("ChangeKind :: Linked"),
+        "M2M link must emit a Linked signal"
+    );
+    assert!(
+        code.contains("\"post_tag_link\""),
+        "the link emit carries the junction name, not a field"
+    );
+
+    // Database owns the shared feed and attaches a clone to every collection.
+    assert!(
+        code.contains("pub changefeed: forgedb_changefeed::ChangeFeed")
+            || code.contains("pub changefeed: forgedb_changefeed :: ChangeFeed"),
+        "Database owns the shared change feed"
+    );
+    assert!(
+        code.contains("forgedb_changefeed::ChangeFeed::new(1024)")
+            || code.contains("forgedb_changefeed :: ChangeFeed :: new(1024)"),
+        "Database::new creates the feed with the default buffer"
+    );
+    assert!(
+        code.contains("post.attach_changefeed(changefeed.clone())"),
+        "each collection gets a clone of the shared feed"
+    );
+
+    // Typed per-model event structs for the WS handler.
+    assert!(code.contains("pub struct PostInserted"), "typed insert event struct");
+    assert!(
+        code.contains("pub post: Post"),
+        "the event struct carries the typed record"
+    );
+
+    // read_at is public so the WS handler can materialize by row index.
+    assert!(
+        code.contains("pub fn read_at(&self, row_index: usize) -> Option<Post>"),
+        "read_at must be public for change-feed materialization"
+    );
+}
+
+#[test]
+fn test_api_generation_websocket_subscription() {
+    // The generated WS endpoint (#62 Direction A): a per-model /subscribe route,
+    // an upgrade handler that routes by model NAME and materializes a typed event
+    // from the row index, and a GENERATED per-model filter (field-by-field, so the
+    // substrate never inspects a field).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  views: u64
+  author: *User
+}
+
+User {
+  id: +uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // WS imports + per-model subscription route.
+    assert!(code.contains("WebSocketUpgrade"), "ws upgrade imported");
+    assert!(
+        code.contains("async fn subscribe_post"),
+        "per-model subscription handler generated"
+    );
+    assert!(
+        code.contains("/subscribe/"),
+        "per-model /subscribe route registered"
+    );
+
+    // Model routing is by NAME; only Inserted signals are streamed (insert-only).
+    assert!(
+        code.contains("event.model != \"Post\""),
+        "handler routes by model name"
+    );
+    assert!(
+        code.contains("ChangeKind::Inserted") || code.contains("ChangeKind :: Inserted"),
+        "handler filters to Inserted signals"
+    );
+    // Materialize via the public read_at using the broadcast row index.
+    assert!(
+        code.contains(".post.read_at(event.row_index)"),
+        "handler materializes the typed record from the row index"
+    );
+
+    // Generated per-model filter names each declared scalar field explicitly —
+    // the relation field (`author`) is NOT filterable and must be absent.
+    assert!(
+        code.contains("fn post_event_matches"),
+        "generated per-model filter"
+    );
+    assert!(code.contains("params.get(\"title\")"), "scalar field is filterable");
+    assert!(code.contains("params.get(\"views\")"), "integer field is filterable");
+    assert!(
+        !code.contains("params.get(\"author\")"),
+        "relation field must not be a filter key"
+    );
+}

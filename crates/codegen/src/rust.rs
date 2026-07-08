@@ -71,6 +71,13 @@ impl RustGenerator {
             tokens.extend(model_tokens);
         }
 
+        // Generate per-model change-feed event structs (#62 Direction A): the
+        // typed payloads the WS handler emits.  The substrate feed only carries
+        // (model, row_index); generated code turns that into `<Model>Inserted`.
+        for model in &schema.models {
+            tokens.extend(Self::generate_insert_event_struct(model));
+        }
+
         // Generate M2M junction storage structs (referenced by the Database
         // struct fields, so emitted before it).
         let junction_tokens = Self::generate_junction_structs(schema);
@@ -196,14 +203,23 @@ impl RustGenerator {
 
                 #write_manifest
 
+                /// Attach a shared change feed (#62 Direction A).  Called by
+                /// `Database::new()`; afterwards each `insert` emits a field-blind
+                /// `(model, row_index)` signal into the feed.
+                pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+                    self.changefeed = Some(feed);
+                }
+
                 pub fn insert(&mut self, record: #model_name) -> #id_type {
                     #insert_logic
                 }
 
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
-                /// `get_at`, and `all_at` all funnel through here.
-                fn read_at(&self, row_index: usize) -> Option<#model_name> {
+                /// `get_at`, and `all_at` all funnel through here.  Public so the
+                /// generated change-feed WS handler (#62) can turn a broadcast
+                /// `(model, row_index)` signal into a typed record.
+                pub fn read_at(&self, row_index: usize) -> Option<#model_name> {
                     #read_at_logic
                 }
 
@@ -268,6 +284,24 @@ impl RustGenerator {
         };
 
         Ok(tokens)
+    }
+
+    /// Generate the typed change-feed event struct for a model (#62 Direction A):
+    /// `<Model>Inserted { <model_snake>: <Model> }`.  The WS handler materializes
+    /// the record from the broadcast row index and serializes this to JSON.  It is
+    /// `Deserialize` too so subscribers/tests can round-trip it.
+    fn generate_insert_event_struct(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let event_name = format_ident!("{}Inserted", model.name);
+        let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
+        let doc = format!("Change-feed event: a `{}` was inserted (#62).", model.name);
+        quote! {
+            #[doc = #doc]
+            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            pub struct #event_name {
+                pub #field_name: #model_name,
+            }
+        }
     }
 
     /// Whether a model's primary key is a `Uuid` (vs an integer PK).
@@ -406,6 +440,9 @@ impl RustGenerator {
             row_count: usize,
             #(#column_fields,)*
             tombstones: forgedb_storage::Tombstones,
+            // Change-feed handle (#62 Direction A): `None` for standalone use;
+            // `Database::new()` attaches a shared feed so `insert` can emit.
+            changefeed: Option<forgedb_changefeed::ChangeFeed>,
         }
     }
 
@@ -459,6 +496,7 @@ impl RustGenerator {
             tombstones: forgedb_storage::Tombstones::new(
                 PathBuf::from(#tombstones_path)
             ).expect("Failed to create tombstones"),
+            changefeed: None,
         }
     }
 
@@ -734,6 +772,8 @@ impl RustGenerator {
             }
         }
 
+        let model_name_str = model.name.clone();
+
         quote! {
             let row_index = self.row_count;
             let id = record.#id_field_name;
@@ -747,6 +787,13 @@ impl RustGenerator {
             // Store ID mapping
             self.id_to_row.insert(id, row_index);
             self.row_count += 1;
+
+            // Change-feed emit (#62 Direction A): this generated method knows a
+            // #model_name_str was inserted; the substrate feed only carries the
+            // field-blind (model, row_index) signal.  Best-effort, never blocks.
+            if let Some(feed) = &self.changefeed {
+                feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Inserted);
+            }
 
             id
         }
@@ -1091,17 +1138,6 @@ impl RustGenerator {
             })
             .collect();
 
-        // Generate field initializers for the new() method
-        let db_inits: Vec<_> = schema
-            .models
-            .iter()
-            .map(|model| {
-                let field_name = format_ident!("{}", Self::to_snake_case(&model.name));
-                let storage_type = format_ident!("{}Storage", model.name);
-                quote! { #field_name: #storage_type::new() }
-            })
-            .collect();
-
         // M2M junction storage: one persisted junction table per many-to-many
         // pair, added as a Database field + initializer.
         let m2m = Self::valid_m2m(schema);
@@ -1113,13 +1149,35 @@ impl RustGenerator {
                 quote! { pub #field: #ty }
             })
             .collect();
-        let junction_inits: Vec<_> = m2m
+
+        // `new()` builds each collection, then hands it a clone of the shared
+        // change feed (#62 Direction A) before assembling `Self`.  Every collection
+        // publishes into the same feed, so one WS subscriber sees all inserts/links.
+        let attach_stmts: Vec<_> = schema
+            .models
             .iter()
-            .map(|m| {
+            .map(|model| {
+                let field = format_ident!("{}", Self::to_snake_case(&model.name));
+                let ty = format_ident!("{}Storage", model.name);
+                quote! {
+                    let mut #field = #ty::new();
+                    #field.attach_changefeed(changefeed.clone());
+                }
+            })
+            .chain(m2m.iter().map(|m| {
                 let field = Self::junction_field_ident(m);
                 let ty = Self::junction_struct_ident(m);
-                quote! { #field: #ty::new() }
-            })
+                quote! {
+                    let mut #field = #ty::new();
+                    #field.attach_changefeed(changefeed.clone());
+                }
+            }))
+            .collect();
+        let field_idents: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| format_ident!("{}", Self::to_snake_case(&model.name)))
+            .chain(m2m.iter().map(Self::junction_field_ident))
             .collect();
 
         // DatabaseSnapshot (#56, Direction A): one row-count watermark per model
@@ -1156,6 +1214,11 @@ impl RustGenerator {
             pub struct Database {
                 #(#db_fields,)*
                 #(#junction_fields,)*
+                /// Shared change feed (#62 Direction A): every collection emits a
+                /// field-blind `(model, row_index)` signal here on insert/link.
+                /// The generated WS endpoint subscribes to it; standalone callers
+                /// can ignore it.
+                pub changefeed: forgedb_changefeed::ChangeFeed,
             }
 
             /// A database-wide read snapshot (#56, Direction A): a row-count
@@ -1170,9 +1233,11 @@ impl RustGenerator {
 
             impl Database {
                 pub fn new() -> Self {
+                    let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+                    #(#attach_stmts)*
                     Self {
-                        #(#db_inits,)*
-                        #(#junction_inits,)*
+                        #(#field_idents,)*
+                        changefeed,
                     }
                 }
 
@@ -1220,6 +1285,7 @@ impl RustGenerator {
                     left_col: FixedColumn,
                     right_col: FixedColumn,
                     row_count: usize,
+                    changefeed: Option<forgedb_changefeed::ChangeFeed>,
                 }
 
                 impl #struct_ident {
@@ -1242,9 +1308,16 @@ impl RustGenerator {
                             left_col,
                             right_col,
                             row_count,
+                            changefeed: None,
                         };
                         db.write_manifest();
                         db
+                    }
+
+                    /// Attach a shared change feed (#62): `link` then emits a
+                    /// field-blind `(junction_name, row_index)` signal.
+                    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+                        self.changefeed = Some(feed);
                     }
 
                     /// Write the junction's physical-layout manifest (#57): two
@@ -1290,11 +1363,16 @@ impl RustGenerator {
                     /// Record a link between a `left` (model1) id and a `right`
                     /// (model2) id.
                     pub fn link(&mut self, left: Uuid, right: Uuid) {
+                        let row_index = self.row_count;
                         self.left_col.append_uuid(*left.as_bytes())
                             .expect("Failed to append link");
                         self.right_col.append_uuid(*right.as_bytes())
                             .expect("Failed to append link");
                         self.row_count += 1;
+                        // Change-feed emit (#62): a link is an M2M junction append.
+                        if let Some(feed) = &self.changefeed {
+                            feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
+                        }
                     }
 
                     /// Every recorded (left, right) id pair.

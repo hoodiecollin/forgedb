@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 145
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -7,12 +8,15 @@ expression: result.code
 #![allow(dead_code, unused_imports)]
 use super::*;
 use axum::{
-    extract::{Path, State},
-    http::StatusCode, response::Json, routing::{get, post},
+    extract::{Path, Query, State},
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::StatusCode, response::{Json, Response},
+    routing::{get, post},
     Router,
 };
 use forgedb_types::Uuid;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::OpenApi;
@@ -82,6 +86,90 @@ async fn create_user(
     let id = db.user.insert(record);
     (StatusCode::CREATED, Json(json!({ "id" : id.to_string() })))
 }
+///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code; the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
+fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    let value = match serde_json::to_value(record) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return true,
+    };
+    if let Some(want) = params.get("id") {
+        let ok = obj
+            .get("id")
+            .map(|v| match v {
+                serde_json::Value::String(s) => s == want,
+                other => other.to_string() == *want,
+            })
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("email") {
+        let ok = obj
+            .get("email")
+            .map(|v| match v {
+                serde_json::Value::String(s) => s == want,
+                other => other.to_string() == *want,
+            })
+            .unwrap_or(false);
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+///WebSocket subscription for `User` inserts (#62 Direction A). Upgrades the connection and streams a typed `UserInserted` JSON event per insert, optionally narrowed by `?field=value`.
+async fn subscribe_user(
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_user_subscription(socket, db, params))
+}
+async fn handle_user_subscription(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "User" {
+                    continue;
+                }
+                if event.kind != forgedb_changefeed::ChangeKind::Inserted {
+                    continue;
+                }
+                let record = { db.read().await.user.read_at(event.row_index) };
+                let Some(record) = record else {
+                    continue;
+                };
+                if !user_event_matches(&record, &params) {
+                    continue;
+                }
+                let payload = super::UserInserted {
+                    user: record,
+                };
+                let Ok(text) = serde_json::to_string(&payload) else {
+                    continue;
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
 #[derive(OpenApi)]
 #[openapi(
     paths(list_user, get_user, create_user),
@@ -101,5 +189,6 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
         .route(concat!("/api/", "user"), get(list_user))
         .route(concat!("/api/", "user"), post(create_user))
         .route(concat!("/api/", "user", "/{id}"), get(get_user))
+        .route(concat!("/subscribe/", "user"), get(subscribe_user))
         .with_state(db)
 }

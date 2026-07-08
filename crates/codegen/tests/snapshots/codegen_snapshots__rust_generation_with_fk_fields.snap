@@ -24,6 +24,7 @@ pub struct AuthorStorage {
     row_count: usize,
     id_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl AuthorStorage {
     /// Open the model's storage, rehydrating the in-memory identity
@@ -45,6 +46,7 @@ impl AuthorStorage {
                     PathBuf::from("author/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+            changefeed: None,
         };
         let n = db.tombstones.len();
         db.row_count = n;
@@ -83,6 +85,12 @@ impl AuthorStorage {
         };
         let _ = manifest.save_to(std::path::Path::new("author/manifest.json"));
     }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
     pub fn insert(&mut self, record: Author) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
@@ -92,12 +100,17 @@ impl AuthorStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Author", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
         id
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
-    /// `get_at`, and `all_at` all funnel through here.
-    fn read_at(&self, row_index: usize) -> Option<Author> {
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<Author> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
@@ -181,6 +194,7 @@ pub struct PostStorage {
     author_id_col: FixedColumn,
     editor_id_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PostStorage {
     /// Open the model's storage, rehydrating the in-memory identity
@@ -217,6 +231,7 @@ impl PostStorage {
                     PathBuf::from("post/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
+            changefeed: None,
         };
         let n = db.tombstones.len();
         db.row_count = n;
@@ -268,6 +283,12 @@ impl PostStorage {
         };
         let _ = manifest.save_to(std::path::Path::new("post/manifest.json"));
     }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
     pub fn insert(&mut self, record: Post) -> Uuid {
         let row_index = self.row_count;
         let id = record.id;
@@ -290,12 +311,17 @@ impl PostStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
         id
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
-    /// `get_at`, and `all_at` all funnel through here.
-    fn read_at(&self, row_index: usize) -> Option<Post> {
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<Post> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
         }
@@ -384,10 +410,25 @@ impl PostStorage {
         records
     }
 }
+///Change-feed event: a `Author` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AuthorInserted {
+    pub author: Author,
+}
+///Change-feed event: a `Post` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PostInserted {
+    pub post: Post,
+}
 /// Main database struct
 pub struct Database {
     pub author: AuthorStorage,
     pub post: PostStorage,
+    /// Shared change feed (#62 Direction A): every collection emits a
+    /// field-blind `(model, row_index)` signal here on insert/link.
+    /// The generated WS endpoint subscribes to it; standalone callers
+    /// can ignore it.
+    pub changefeed: forgedb_changefeed::ChangeFeed,
 }
 /// A database-wide read snapshot (#56, Direction A): a row-count
 /// watermark for every model and junction, captured atomically by
@@ -401,10 +442,12 @@ pub struct DatabaseSnapshot {
 }
 impl Database {
     pub fn new() -> Self {
-        Self {
-            author: AuthorStorage::new(),
-            post: PostStorage::new(),
-        }
+        let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+        let mut author = AuthorStorage::new();
+        author.attach_changefeed(changefeed.clone());
+        let mut post = PostStorage::new();
+        post.attach_changefeed(changefeed.clone());
+        Self { author, post, changefeed }
     }
     /// Capture a consistent read snapshot across all collections.
     /// Single-process, single-thread today, so the captures are
