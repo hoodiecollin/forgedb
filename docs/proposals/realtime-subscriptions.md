@@ -1,17 +1,21 @@
 # Proposal: Real-time Subscriptions
 
-**Status:** **Direction A (change notifications) — first milestone LANDED (2026-07-07).** The rest
-remains DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints**
-(notifications clean-green; live-queries green-with-care; generic subscription engine rejected).
-Maintainer-blessed direction (2026-07-07): **Direction A now (change notifications), Direction B
-(live queries) queued entirely behind the mutation surface, Direction C (durable broker) lowest
-priority**; delivery = **best-effort in-process**; signal origin = **generated `insert()` emits**.
-Direction A shipped: new Class-1 substrate crate **`forgedb-changefeed`** (field-blind
-`(model, row_index)` broadcast) + generated `insert()`/`link_*` emits + generated per-model typed
-event structs + generated axum WS endpoint `GET /subscribe/<model>` with a generated per-model
-filter + nginx `Upgrade` forwarding. Proven by a **live WebSocket round-trip** (client receives a
-filtered typed JSON event) compile-tested through current codegen (`scratchpad/changefeed_compile`,
-ephemeral). **Next: the mutation surface**, which unblocks Direction B.
+**Status:** **Direction A (change notifications) AND Direction B (live queries) — both LANDED.** A
+landed 2026-07-07; **B landed 2026-07-08** (after the mutation surface #66). Direction C (durable
+broker) remains DESIGN NOTE — lowest priority. `forgedb-product-manager` verdict:
+**aligned-with-constraints** (notifications clean-green; live-queries **green-with-care**, PM gate PASS
+conditioned on reusing the closed-set filter; generic subscription engine rejected). Direction A
+shipped: new Class-1 substrate crate **`forgedb-changefeed`** (field-blind `(model, row_index)`
+broadcast) + generated `insert()`/`link_*` emits + generated per-model typed event structs + generated
+axum WS `GET /subscribe/<model>` with a generated per-model filter + nginx `Upgrade` forwarding.
+**Direction B shipped (2026-07-08):** generated per-model live-query WS handler `GET
+/live-query/<model>` that binds `?field=value` to the **same** generated closed-set filter
+(`<model>_event_matches`) as REST list / #62-A (no second parser), re-runs the generated `all()`+filter
+query on the **coarse** `event.model` signal, diffs by id over opaque hashes, and pushes typed
+removal-aware `<Model>LiveDelta` (`Init`/`Added`/`Updated`/`Removed`) deltas. **No substrate change / no
+`forgedb-changefeed` version bump** — the coarse signal was already there. Proven by a **live WebSocket
+round-trip** exercising Init→Added→(non-match silent)→Updated→Removed through insert/update/delete
+(`scratchpad/directionb_compile`, ephemeral). **Next: Direction C is HELD** (on-demand only).
 **Issue:** [#62](https://github.com/hoodiecollin/forgedb/issues/62) (`idea`, `plan-next`)
 **Date:** 2026-07-07
 
@@ -105,7 +109,7 @@ It is the substrate every richer option extends.
 
 **Forecloses.** Nothing structural. No result-set semantics, no durability/replay (those are B/C).
 
-## Direction B — live queries (queued behind the mutation surface)
+## Direction B — live queries — LANDED 2026-07-08
 
 Re-evaluate a query and push updated results when data changes. **Legal only** if: the substrate
 signals coarse **"model M changed"** (field-blind); on that signal, generated code **re-runs a
@@ -114,11 +118,38 @@ GENERATED query** — one of the finite, compile-time, per-model tailored querie
 then diffs and pushes deltas over generated model types. That is "generated code re-executing
 generated code on a coarse signal," and it is the exact place the red line lives.
 
-**Queued entirely behind the mutation surface** (blessed). Full live-query semantics need
-add *and* remove *and* update deltas; without `update`/`delete` a result set can only grow. Rather
-than ship a grow-only partial, B waits so it can be **co-designed with the generated mutation
-surface + retraction primitive** (the shared prerequisite named in the MVCC #56 and inspector #63
-notes). When it lands it's an increment on A, not greenfield.
+**What landed (PM identity gate PASS — green-with-care).**
+- **No substrate change.** The changefeed already carries the coarse `event.model` signal; the
+  handler consults **only** `event.model` (never `row_index`/`kind`), so no logical-row identity is
+  resolved through the substrate and `ChangeEvent` is **not** widened. `forgedb-changefeed` unchanged
+  (no version bump).
+- **Generated code only.** Per model, a WS handler at `GET /live-query/<model-kebab>?field=value`.
+  The `?field=value` params bind to the **exact same** generated closed-set filter
+  (`<model>_event_matches`) used by REST `list` / #62-A — **no second predicate parser** (the single
+  most important red line: filterable keys are the finite declared-scalar set, exact-match by name;
+  no operator grammar, no undeclared fields). On connect it runs the generated `all()`+filter query,
+  sends `<Model>LiveDelta::Init { rows }`, and records membership as `HashMap<Id, opaque-hash>`. On
+  each matching coarse signal it re-runs the same generated query, diffs by id, and pushes typed
+  `Added`/`Updated`/`Removed` deltas. `Removed` is now expressible because #66's superseding-tombstone
+  append makes `all()` exclude retracted rows.
+- **Delta wire type is generated:** per-model `<Model>LiveDelta` enum (`Init`/`Added`/`Updated`/
+  `Removed`), typed records + the model's own id type, tagged JSON. Diff/membership plumbing is
+  opaque ids + opaque hashes, kept **inline in the handler** (no shared live-query crate — that
+  gravity is sidestepped entirely for M1).
+- **Proof:** `scratchpad/directionb_compile` (ephemeral) boots the generated axum server, connects a
+  WS client to `/live-query/post?title=live`, and asserts Init(empty) → Added (matching insert) →
+  *silent* (non-matching insert) → Updated (record changed) → Removed (title change leaves the set)
+  through real insert/update/delete on the shared DB. Guards: `test_api_generation_live_query`
+  (reuses the closed-set filter; coarse `event.model`; no predicate parser),
+  `test_rust_generation_live_delta_enums`.
+
+**Honest limits / deferred.** O(rows) full re-run per matched event per connection — **no
+coalescing/debounce** (open question #3), the real scaling cliff under rapid mutation; documented, not
+hidden. `Updated` detection uses full-record `serde_json` stringify comparison, inheriting #62-A's
+exact-match fragility for some float/bool encodings (typed per-field compare is the future
+refinement). Live-query reads run against the live `Database` under the existing read lock, not a
+`DatabaseReader` snapshot — each re-run is a fresh consistent read, deltas across re-runs are
+eventually-consistent. Single-process; Direction C (durable broker) deferred.
 
 ## Direction C — durable broker (lowest priority)
 

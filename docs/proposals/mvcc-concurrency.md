@@ -1,15 +1,23 @@
 # Proposal: MVCC / Concurrency
 
-**Status:** **Direction A (watermark snapshot reads) — first milestone LANDED (2026-07-07).** The
-rest remains DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints,
-but re-sequenced**. Maintainer-blessed direction (2026-07-06): **D-framing — ship A now, mutation
-surface next, stage B, hold C**; **single-process** scope; **retraction primitive deferred** to the
-mutation-surface note. Direction A shipped: substrate `forgedb_storage::Snapshot` (bare `usize`
-watermark, `new`/`watermark`/`visible`) + generated `*Storage::{read_at,row_count,snapshot,get_at,all_at}`,
-junction `pairs_at`, `DatabaseSnapshot` + `Database::snapshot()`, and one snapshot-scoped M2M traversal
-`post_tags_at`. Proven compile-clean + watermark-isolation E2E (`scratchpad/snapshot_compile`, ephemeral)
-and guarded by `test_rust_generation_snapshot_reads` + substrate `test_snapshot_*`. **Next: the mutation
-surface** (retraction primitive), then Direction B.
+**Status:** **Direction A (watermark snapshot reads) AND Direction B (single-writer + concurrent
+readers) — both LANDED.** A landed 2026-07-07; the mutation surface (#66) landed; **B landed 2026-07-08.**
+The rest (Direction C) remains DESIGN NOTE — product-gated. `forgedb-product-manager` verdict:
+**aligned-with-constraints, but re-sequenced**. Maintainer-blessed direction (2026-07-06): **D-framing —
+ship A now, mutation surface next, stage B, hold C**; **single-process** scope. Direction A shipped:
+substrate `forgedb_storage::Snapshot` (bare `usize` watermark) + generated
+`*Storage::{read_at,row_count,snapshot,get_at,all_at}`, junction `pairs_at`, `DatabaseSnapshot` +
+`Database::snapshot()`, and one snapshot-scoped M2M traversal `post_tags_at`. **Direction B shipped
+(2026-07-08, PM identity gate PASS):** substrate read-only column reader handles
+(`FixedColumnReader`/`VariableColumnReader`/`TombstonesReader`, shared-fd positional `&self` reads →
+`forgedb-storage` **0.1.4**) + generated `*StorageReader` / junction `*Reader` / `DatabaseReader` bundle +
+`Database::reader()`, reusing the *exact* `read_at`/`get_at`/`all_at`/`pairs_at`/M2M-`_at` token streams
+(no second decode path).  `Database::snapshot()` capture is routed through the single writer, so the
+`DatabaseSnapshot` is cross-model atomic.  Proven by a **live concurrent-writer stress test** (the thing A
+deferred): one writer thread running insert/update/delete while N reader threads read via
+`DatabaseReader` + a published snapshot, asserting cross-model atomicity + torn-row-free prefixes
+(`scratchpad/directionb_compile`, ephemeral); guarded by `test_rust_generation_reader_handles` + substrate
+`test_reader_*`. **Next: Direction C is HELD** (on-demand only).
 **Issue:** [#56](https://github.com/hoodiecollin/forgedb/issues/56) (`idea`, `plan-next`)
 **Date:** 2026-07-06
 
@@ -110,16 +118,48 @@ The two candidates, recorded here so the fork is explicit:
 backup (`docs/proposals/backup-restore.md`) and Direction A **in the same change** — do not
 discover the breakage later. (The backup note already flags compaction as exactly this trap.)
 
-## Direction B — single-writer + concurrent snapshot readers (stage after mutation)
+## Direction B — single-writer + concurrent snapshot readers — LANDED 2026-07-08
 
 Serialize writes behind one writer (a lock/writer-handle discipline), keep many `&self` snapshot
 readers (from A). This is SQLite WAL-mode's model — one writer, many readers — well-trodden and
 honest. Readers pinned to a pre-mutation watermark still see old state; new readers see committed
 mutations. Green (substrate + generated calls; the single-writer serialization is a runtime
-discipline of the generated binary, not a generic engine). Medium scope, and *mostly the
-mutation-surface work anyway* with the writer lock as the incremental add. Satisfies the practical
-intent of #56 for single-process deployments. Deliberately forecloses concurrent *writers* — a
-defensible cut most embedded workloads never need.
+discipline of the generated binary, not a generic engine). Deliberately forecloses concurrent
+*writers* — a defensible cut most embedded workloads never need.
+
+**What landed (PM identity gate PASS).**
+- **Substrate (`forgedb-storage` 0.1.4, class-1):** read-only column reader handles
+  `FixedColumnReader` / `VariableColumnReader` / `TombstonesReader`, each holding an independent
+  (`try_clone`d) fd to the *same* file as the writer column, exposing only positional `&self`
+  `read_*`/`len`.  They know strictly *less* than any other substrate (byte offsets + value sizes;
+  no model, no field). `FixedColumn::reader()` / `VariableColumn::reader()` / `Tombstones::reader()`
+  open them.  Length is derived **live** (never a cached count); an out-of-range index maps to the
+  same `InvalidInput` the writer columns return.
+- **Generated code:** each `*Storage` gets `reader() -> *StorageReader` (a struct of shared-fd
+  reader columns) that re-emits the **exact same** `read_at`/`get_at`/`all_at` token streams as the
+  writer storage — one tailored decode path, not two.  Junctions get `*Reader` + `pairs_at`.  The
+  `Database` gets a `DatabaseReader` bundle (one **typed, named** reader field per model AND junction
+  — never a runtime string-keyed dispatch) + `Database::reader()`, plus the snapshot-scoped M2M
+  `_at` traversal on `DatabaseReader`.
+- **Cross-model atomicity (the correctness red line the PM named):** `DatabaseSnapshot` capture is
+  routed through the single writer (`Database::snapshot()` is called on the writer, never
+  mid-mutation), so the per-collection watermarks are captured as of one commit boundary.  Readers
+  consume that immutable snapshot; N independent watermark reads are **not** made atomic on the
+  reader side.
+- **Proof:** `scratchpad/directionb_compile` (ephemeral) — a live concurrent-writer stress test (the
+  thing A explicitly deferred): a single writer thread runs insert/update/delete + M2M link per
+  commit and publishes a fresh `db.snapshot()` between commits; 4 reader threads each hold a
+  `DatabaseReader` and read via the published snapshot, asserting `post==tag==link` counts
+  (cross-model atomicity) and that every decoded row's columns agree (torn-row freedom) — no lock
+  held anywhere.  Plus reader snapshot-isolation-across-update and integer-PK reader reads.  Substrate
+  guards: `test_reader_*` (incl. the load-bearing fd/page-cache coherence invariant + a lock-free
+  read-under-live-append stress test).  Codegen guard: `test_rust_generation_reader_handles`.
+
+**Honest limits / deferred.** Single-process, **single-writer** (concurrent *writers* foreclosed →
+Direction C).  Snapshot atomicity holds *because* capture is serialized through the one writer — it
+is not a multi-writer guarantee.  The fd-duplication + POSIX page-cache-coherence-across-`try_clone`d-fds
+assumption is load-bearing for reader visibility (tested explicitly, documented as a substrate
+invariant).  No version chains / transaction manager (Direction C).
 
 ## Direction C — full version-chain MVCC (held; on demand only)
 
