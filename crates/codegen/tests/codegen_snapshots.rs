@@ -1022,3 +1022,102 @@ Tag {
         "junction manifest must be written under the junction directory"
     );
 }
+
+#[test]
+fn test_rust_generation_snapshot_reads() {
+    // Watermark snapshot reads (#56, Direction A): every model storage gains a
+    // shared `read_at` + `snapshot`/`get_at`/`all_at`/`row_count`; junctions gain
+    // `pairs_at`; the Database gains a `DatabaseSnapshot` bundle + `snapshot()`,
+    // and one M2M forward query (`post_tags_at`) is generated snapshot-scoped to
+    // prove cross-table consistency (junction watermark AND target watermark).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Shared read path: `get` and the snapshot accessors funnel through `read_at`.
+    assert!(
+        code.contains("fn read_at(&self, row_index: usize) -> Option<Post>"),
+        "a shared read_at(row_index) accessor must be generated"
+    );
+    assert!(
+        code.contains("let row_index = *self.id_to_row.get(&id)?;")
+            && code.contains("self.read_at(row_index)"),
+        "get must resolve the id then delegate to read_at"
+    );
+
+    // Per-model snapshot surface.
+    assert!(
+        code.contains("pub fn row_count(&self) -> usize"),
+        "row_count (the watermark) must be exposed"
+    );
+    assert!(
+        code.contains("pub fn snapshot(&self) -> forgedb_storage::Snapshot")
+            || code.contains("pub fn snapshot(&self) -> forgedb_storage :: Snapshot"),
+        "each storage must capture a substrate Snapshot"
+    );
+    assert!(
+        code.contains("pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Post>")
+            || code.contains("pub fn get_at(&self, snap: &forgedb_storage :: Snapshot, id: Uuid) -> Option<Post>"),
+        "get_at must be snapshot-scoped and clamp visibility"
+    );
+    assert!(
+        code.contains("if !snap.visible(row_index)"),
+        "get_at must reject rows above the watermark"
+    );
+    assert!(
+        code.contains("for row_index in 0..snap.watermark()"),
+        "all_at must scan exactly the committed prefix"
+    );
+
+    // Junction snapshot surface.
+    assert!(
+        code.contains("pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)>")
+            || code.contains("pub fn pairs_at(&self, snap: &forgedb_storage :: Snapshot) -> Vec<(Uuid, Uuid)>"),
+        "junction must expose a watermark-clamped pairs_at"
+    );
+
+    // Database-wide snapshot bundle.
+    assert!(code.contains("pub struct DatabaseSnapshot"), "DatabaseSnapshot bundle");
+    assert!(
+        code.contains("pub post: forgedb_storage::Snapshot")
+            || code.contains("pub post: forgedb_storage :: Snapshot"),
+        "DatabaseSnapshot carries a per-model watermark"
+    );
+    assert!(
+        code.contains("pub post_tag_link: forgedb_storage::Snapshot")
+            || code.contains("pub post_tag_link: forgedb_storage :: Snapshot"),
+        "DatabaseSnapshot carries a per-junction watermark"
+    );
+    assert!(
+        code.contains("pub fn snapshot(&self) -> DatabaseSnapshot"),
+        "Database::snapshot() captures all watermarks together"
+    );
+
+    // The one snapshot-scoped traversal: clamps BOTH the junction (pairs_at) and
+    // the resolved target (get_at) to the captured snapshot.
+    assert!(
+        code.contains("pub fn post_tags_at(&self, snap: &DatabaseSnapshot, id: Uuid) -> Vec<Tag>"),
+        "snapshot-scoped M2M forward query must be generated"
+    );
+    assert!(
+        code.contains("pairs_at(&snap.post_tag_link)"),
+        "post_tags_at must clamp the junction to its watermark"
+    );
+    assert!(
+        code.contains("self.tag.get_at(&snap.tag, right)"),
+        "post_tags_at must clamp the resolved target to its watermark"
+    );
+}
