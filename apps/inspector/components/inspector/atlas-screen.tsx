@@ -13,10 +13,14 @@ import {
   browseModelAtom,
   connectedAtom,
   lensAtom,
+  modelsAtom,
+  projectSourceAtom,
+  relAtom,
+  schemaAtom,
   screenAtom,
   selModelAtom,
 } from "@/lib/inspector/atoms";
-import { MODELS, REL, SCHEMA } from "@/lib/inspector/mock";
+import type { Model } from "@/lib/inspector/types";
 import { Button } from "@/components/ui/button";
 import { NotAttached } from "./not-attached";
 import { cn } from "@/lib/utils";
@@ -30,11 +34,30 @@ export function AtlasScreen() {
   const [lens, setLens] = useAtom(lensAtom);
   const [selModel, setSelModel] = useAtom(selModelAtom);
   const connected = useAtomValue(connectedAtom);
+  const models = useAtomValue(modelsAtom);
+  const rel = useAtomValue(relAtom);
+  const source = useAtomValue(projectSourceAtom);
   const browse = useSetAtom(browseModelAtom);
   const setScreen = useSetAtom(screenAtom);
 
-  const sel = MODELS.find((m) => m.key === selModel) ?? MODELS[0]!;
+  const sel = models.find((m) => m.key === selModel) ?? models[0];
   const structure = lens === "structure";
+  // The hand-composed SVG edges match the mock blog schema exactly; for a real
+  // loaded project they'd be wrong, so they show only for the mock. Real relation
+  // edges arrive with the graph lib (#67).
+  const showMockEdges = source === "mock";
+  const relCount = models.reduce((n, m) => n + (rel[m.key]?.length ?? 0), 0);
+
+  if (!sel) {
+    return (
+      <div className="flex h-full items-center justify-center p-8">
+        <NotAttached
+          title="No models"
+          body="This schema has no models to display."
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full min-h-0">
@@ -58,7 +81,7 @@ export function AtlasScreen() {
               <TriangleAlert className="size-3" /> SPIKE · graph lib (#67)
             </span>
             <span className="font-mono text-[12px] text-muted-foreground">
-              5 models · 7 relations
+              {models.length} models · {relCount} relations
             </span>
           </div>
         </div>
@@ -66,24 +89,28 @@ export function AtlasScreen() {
         {/* graph canvas */}
         <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-[radial-gradient(circle_at_1px_1px,color-mix(in_oklab,var(--foreground)_8%,transparent)_1px,transparent_0)] bg-[length:22px_22px]">
           <div className="relative h-[420px] w-[620px] flex-none">
-            <svg
-              className="absolute inset-0 h-[420px] w-[620px]"
-              fill="none"
-              stroke="color-mix(in oklab,var(--muted-foreground) 55%,transparent)"
-              strokeWidth={1.5}
-            >
-              <path d="M250 92 L184 78" />
-              <path d="M386 96 L460 90" />
-              <path d="M528 118 C540 170 540 210 538 252" />
-              <path d="M494 118 C430 210 372 262 340 300" />
-              <path d="M318 300 L318 130" strokeDasharray="5 5" />
-            </svg>
-            <EdgeLabel x={186} y={64} text="org ∗FK" />
-            <EdgeLabel x={398} y={70} text="[posts] 1—∞" />
-            <EdgeLabel x={544} y={176} text="tags ↔ M2M" cls="text-info" />
-            <EdgeLabel x={398} y={216} text="[comments]" />
-            <EdgeLabel x={326} y={206} text="author ?FK" />
-            {MODELS.map((m) => {
+            {showMockEdges ? (
+              <>
+                <svg
+                  className="absolute inset-0 h-[420px] w-[620px]"
+                  fill="none"
+                  stroke="color-mix(in oklab,var(--muted-foreground) 55%,transparent)"
+                  strokeWidth={1.5}
+                >
+                  <path d="M250 92 L184 78" />
+                  <path d="M386 96 L460 90" />
+                  <path d="M528 118 C540 170 540 210 538 252" />
+                  <path d="M494 118 C430 210 372 262 340 300" />
+                  <path d="M318 300 L318 130" strokeDasharray="5 5" />
+                </svg>
+                <EdgeLabel x={186} y={64} text="org ∗FK" />
+                <EdgeLabel x={398} y={70} text="[posts] 1—∞" />
+                <EdgeLabel x={544} y={176} text="tags ↔ M2M" cls="text-info" />
+                <EdgeLabel x={398} y={216} text="[comments]" />
+                <EdgeLabel x={326} y={206} text="author ?FK" />
+              </>
+            ) : null}
+            {models.map((m) => {
               const on = m.key === selModel;
               return (
                 <button
@@ -113,19 +140,23 @@ export function AtlasScreen() {
         </div>
 
         {/* health strip */}
-        <div className="flex flex-none items-center gap-4 border-t border-border px-4 py-2 font-mono text-[12px] text-muted-foreground">
-          <span className="flex items-center gap-1.5 text-ok">
-            <span className="size-1.5 rounded-full bg-ok" />
-            db healthy
-          </span>
-          <span>storage 22.4 MB</span>
-          <span>dead-row 4.1%</span>
-          <span className="flex items-center gap-1.5 text-warn">
-            <span className="size-1.5 rounded-full bg-warn" />
-            Comment · compaction reclaims 7,941 rows
-          </span>
-          <span className="ml-auto">last backup 2h ago</span>
-        </div>
+        {showMockEdges ? (
+          <div className="flex flex-none items-center gap-4 border-t border-border px-4 py-2 font-mono text-[12px] text-muted-foreground">
+            <span className="flex items-center gap-1.5 text-ok">
+              <span className="size-1.5 rounded-full bg-ok" />
+              db healthy
+            </span>
+            <span>storage 22.4 MB</span>
+            <span>dead-row 4.1%</span>
+            <span className="flex items-center gap-1.5 text-warn">
+              <span className="size-1.5 rounded-full bg-warn" />
+              Comment · compaction reclaims 7,941 rows
+            </span>
+            <span className="ml-auto">last backup 2h ago</span>
+          </div>
+        ) : (
+          <ProjectHealthStrip models={models} />
+        )}
       </div>
 
       {/* inspector aside */}
@@ -171,10 +202,11 @@ function StructurePane({
   sel,
   onBrowse,
 }: {
-  sel: (typeof MODELS)[number];
+  sel: Model;
   onBrowse: () => void;
 }) {
-  const fields = SCHEMA[sel.key] ?? [];
+  const schema = useAtomValue(schemaAtom);
+  const fields = schema[sel.key] ?? [];
   const deadWarn = sel.deadPct >= 10;
   return (
     <div>
@@ -241,12 +273,13 @@ function LivePane({
   onQuery,
   onGo,
 }: {
-  sel: (typeof MODELS)[number];
+  sel: Model;
   onBrowse: () => void;
   onQuery: () => void;
   onGo: (to: string, label: string) => void;
 }) {
-  const rels = REL[sel.key] ?? [];
+  const rel = useAtomValue(relAtom);
+  const rels = rel[sel.key] ?? [];
   return (
     <div>
       <div className="mb-3.5 grid grid-cols-2 gap-2">
@@ -293,6 +326,37 @@ function LivePane({
           New query
         </Button>
       </div>
+    </div>
+  );
+}
+
+/** Real at-rest health summary computed from the loaded project's models. */
+function ProjectHealthStrip({ models }: { models: Model[] }) {
+  const withStats = models.filter((m) => m.rows !== "—");
+  const totalMB = withStats.reduce((s, m) => s + (parseFloat(m.dataMB) || 0), 0);
+  const worst = withStats.reduce<Model | null>(
+    (w, m) => (!w || m.deadPct > w.deadPct ? m : w),
+    null,
+  );
+  return (
+    <div className="flex flex-none items-center gap-4 border-t border-border px-4 py-2 font-mono text-[12px] text-muted-foreground">
+      {withStats.length > 0 ? (
+        <>
+          <span className="flex items-center gap-1.5 text-ok">
+            <span className="size-1.5 rounded-full bg-ok" />
+            {withStats.length} models · at rest
+          </span>
+          <span>storage {totalMB.toFixed(1)} MB</span>
+          {worst && worst.deadPct >= 10 ? (
+            <span className="flex items-center gap-1.5 text-warn">
+              <span className="size-1.5 rounded-full bg-warn" />
+              {worst.key} · compaction reclaims {worst.reclaim} rows
+            </span>
+          ) : null}
+        </>
+      ) : (
+        <span>schema only — open a data directory for storage stats</span>
+      )}
     </div>
   );
 }

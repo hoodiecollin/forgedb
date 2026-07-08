@@ -6,19 +6,28 @@
  * attach/detach connection toggle that gates every Live surface.
  */
 
-import { useAtom } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
+import { useEffect } from "react";
 import { toast } from "sonner";
 import {
   ChevronDown,
   Clock,
   Database,
+  FolderOpen,
   LayoutDashboard,
   Network,
   Table2,
   TerminalSquare,
 } from "lucide-react";
-import { connectedAtom, screenAtom } from "@/lib/inspector/atoms";
-import { DB_NAME } from "@/lib/inspector/mock";
+import {
+  apiBaseAtom,
+  connectedAtom,
+  dbNameAtom,
+  openProjectAtom,
+  projectErrorAtom,
+  screenAtom,
+} from "@/lib/inspector/atoms";
+import { isTauri } from "@/lib/inspector/data-source";
 import type { Screen } from "@/lib/inspector/types";
 import { cn } from "@/lib/utils";
 
@@ -32,6 +41,19 @@ const NAV: { screen: Screen; label: string; icon: typeof Network }[] = [
 export function TopBar() {
   const [screen, setScreen] = useAtom(screenAtom);
   const [connected, setConnected] = useAtom(connectedAtom);
+  const dbName = useAtomValue(dbNameAtom);
+  const apiBase = useAtomValue(apiBaseAtom);
+  const openProject = useSetAtom(openProjectAtom);
+  const [projectError, setProjectError] = useAtom(projectErrorAtom);
+  const desktop = isTauri();
+
+  // Surface an open-project failure (parse/read error) as a toast.
+  useEffect(() => {
+    if (projectError) {
+      toast.error(projectError);
+      setProjectError(null);
+    }
+  }, [projectError, setProjectError]);
 
   return (
     <header className="flex h-13 flex-none items-center gap-3.5 border-b border-border bg-card/60 px-3.5">
@@ -43,6 +65,8 @@ export function TopBar() {
         <div className="font-semibold tracking-tight">ForgeDB&nbsp;Inspector</div>
         <button
           type="button"
+          onClick={desktop ? () => openProject() : undefined}
+          title={desktop ? "Open a .forge project" : undefined}
           className="flex items-center gap-1.5 rounded-[7px] border border-border bg-muted px-2.5 py-1 text-[12.5px] hover:bg-muted/70"
         >
           <span
@@ -51,8 +75,12 @@ export function TopBar() {
               connected ? "bg-ok" : "bg-danger",
             )}
           />
-          <span className="font-mono">{DB_NAME}</span>
-          <ChevronDown className="size-3 text-muted-foreground" />
+          <span className="font-mono">{dbName}</span>
+          {desktop ? (
+            <FolderOpen className="size-3 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="size-3 text-muted-foreground" />
+          )}
         </button>
       </div>
 
@@ -88,7 +116,7 @@ export function TopBar() {
           title="Toggle attached database"
           onClick={() => {
             setConnected(!connected);
-            toast(connected ? "Detached from database" : "Attached to dev server :4000");
+            toast(connected ? "Detached from API" : `Attached to ${apiBase}`);
           }}
           className={cn(
             "flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 text-[12.5px]",
@@ -103,7 +131,7 @@ export function TopBar() {
               connected ? "bg-ok ring-ok/30" : "bg-danger ring-danger/30",
             )}
           />
-          {connected ? "attached · dev :4000" : "not attached"}
+          {connected ? `attached · ${apiBase.replace(/^https?:\/\//, "")}` : "not attached"}
         </button>
       </div>
     </header>

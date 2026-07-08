@@ -6,14 +6,17 @@
  * field-level partial update; the footer says so.
  */
 
-import { useAtom, useSetAtom } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { toast } from "sonner";
 import {
   browseModelAtom,
   closeEditorAtom,
+  connectedAtom,
   editorAtom,
+  projectSourceAtom,
+  schemaAtom,
 } from "@/lib/inspector/atoms";
-import { SCHEMA } from "@/lib/inspector/mock";
+import { isTauri } from "@/lib/inspector/data-source";
 import { FieldControl } from "./field-control";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,9 +31,18 @@ export function RecordEditor() {
   const [editor] = useAtom(editorAtom);
   const closeEditor = useSetAtom(closeEditorAtom);
   const browse = useSetAtom(browseModelAtom);
+  const schema = useAtomValue(schemaAtom);
+  const source = useAtomValue(projectSourceAtom);
+  const connected = useAtomValue(connectedAtom);
 
-  const fields = SCHEMA[editor.model] ?? [];
+  const fields = schema[editor.model] ?? [];
   const creating = editor.mode === "create";
+  // Live against a real API: the generated REST surface is insert-only — there is
+  // NO update or delete endpoint (those mutations exist in the DB layer, unexposed).
+  // So editing an existing row is read-only; typed insert submission is the next
+  // slice (the field controls aren't wired to collect values yet).
+  const live = isTauri() && source === "project" && connected;
+  const readOnly = live && !creating;
 
   const followRelation = (target: string, label: string) => {
     closeEditor();
@@ -69,15 +81,21 @@ export function RecordEditor() {
 
         <SheetFooter className="flex-row items-center gap-2.5 border-t border-border p-3.5">
           <span className="text-[11.5px] text-muted-foreground">
-            Update replaces the whole record
+            {readOnly
+              ? "read-only — the generated API is insert-only (no update/delete)"
+              : live && creating
+                ? "typed insert submission is not wired yet — preview only"
+                : "Update replaces the whole record"}
           </span>
           <span className="ml-auto" />
           <Button variant="ghost" size="sm" onClick={() => closeEditor()}>
-            Cancel
+            {readOnly ? "Close" : "Cancel"}
           </Button>
-          <Button size="sm" onClick={save}>
-            {creating ? "Insert record" : "Save (replace)"}
-          </Button>
+          {!readOnly ? (
+            <Button size="sm" onClick={save} disabled={live}>
+              {creating ? "Insert record" : "Save (replace)"}
+            </Button>
+          ) : null}
         </SheetFooter>
       </SheetContent>
     </Sheet>
