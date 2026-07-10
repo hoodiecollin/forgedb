@@ -45,7 +45,11 @@ impl RustGenerator {
 
         // Attributes and imports
         let imports = quote! {
-            #![allow(dead_code, unused_imports)]
+            // `irrefutable_let_patterns`: the WAL recovery path matches
+            // `WalOperation::Raw` via `if let` — currently the only variant, so
+            // the pattern is irrefutable, but the `if let` stays forward-compatible
+            // if the op set ever grows again (#89 durable write path).
+            #![allow(dead_code, unused_imports, irrefutable_let_patterns)]
 
             use std::collections::HashMap;
             use std::path::{Path, PathBuf};
@@ -222,6 +226,11 @@ impl RustGenerator {
         // process can read data written by a previous one.
         let rehydrate_logic = Self::generate_rehydrate_logic(model);
 
+        // Generate crash-recovery (#89): torn-tail repair + WAL replay, run in
+        // `new_at` before the identity-index rebuild so `id_to_row` reflects the
+        // recovered rows.
+        let recover_method = Self::generate_recover_method(model);
+
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
@@ -278,6 +287,10 @@ impl RustGenerator {
                     let mut db = Self {
                         #storage_inits
                     };
+                    // Crash recovery (#89): repair any torn column tail and replay
+                    // the WAL BEFORE rebuilding the identity index, so `row_count`
+                    // and `id_to_row` below reflect the recovered committed rows.
+                    db.recover_from_wal();
                     #rehydrate_logic
                     // Refresh the physical-layout manifest on open (#57): cheap,
                     // off the insert hot path, gives schema-blind backup/inspector
@@ -300,6 +313,8 @@ impl RustGenerator {
                 }
 
                 #mutation_methods
+
+                #recover_method
 
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -672,6 +687,11 @@ impl RustGenerator {
             row_count: usize,
             #(#column_fields,)*
             tombstones: forgedb_storage::Tombstones,
+            // Write-ahead log (#89 durable write path): every mutation records an
+            // opaque row blob here + fsync BEFORE touching columns, so a crash
+            // mid-append is recovered on reopen.  The WAL stores bytes only — it
+            // never decodes a field (identity: schema-agnostic substrate).
+            wal: forgedb_wal::WalManager,
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -726,6 +746,7 @@ impl RustGenerator {
         // process (#59) passes that tenant's dir.  `root` is a plain value threaded
         // through generated code — the substrate never learns the word "tenant".
         let tombstones_path = format!("{}/tombstones.bin", model_snake);
+        let wal_path = format!("{}/wal.log", model_snake);
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
@@ -733,6 +754,13 @@ impl RustGenerator {
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
+            // One WAL per model, namespaced under the same data root (#89).
+            // `FsyncPolicy::Always` makes each commit record durable before the
+            // columns are appended — the crash-durability boundary.
+            wal: forgedb_wal::WalManager::open(
+                root.join(#wal_path),
+                forgedb_wal::FsyncPolicy::Always,
+            ).expect("Failed to open WAL"),
             changefeed: None,
         }
     }
@@ -1130,14 +1158,121 @@ impl RustGenerator {
         Some(expr)
     }
 
+    /// Emit the WAL commit record for one mutation (#89 durable write path).
+    ///
+    /// The generated code serializes the row (`serde_json`) and hands the WAL
+    /// opaque bytes via the schema-agnostic `Raw` op — the WAL never decodes a
+    /// field.  Layout: `[row_index: u64 LE][deleted: u8][serde_json(record)]`.
+    /// The absolute `row_index` makes replay idempotent (recovery skips a record
+    /// whose row is already materialized).  Emitted BEFORE the column appends, so
+    /// with `FsyncPolicy::Always` the row is durable in the WAL before it is
+    /// applied; a crash mid-append is recovered from the WAL on reopen.  Assumes
+    /// a `record` binding (the row's values) is in scope.
+    fn generate_wal_record_write(model: &forgedb_parser::Model, deleted: bool) -> TokenStream {
+        let model_name_str = model.name.clone();
+        let deleted_tok = if deleted {
+            quote! { 1u8 }
+        } else {
+            quote! { 0u8 }
+        };
+        quote! {
+            {
+                let mut __wal_payload = Vec::new();
+                __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+                __wal_payload.push(#deleted_tok);
+                __wal_payload.extend_from_slice(
+                    &serde_json::to_vec(&record).expect("Failed to serialize record for WAL")
+                );
+                self.wal
+                    .write(&forgedb_wal::WalEntry::raw(#model_name_str, __wal_payload))
+                    .expect("Failed to write WAL record");
+            }
+        }
+    }
+
+    /// Emit `recover_from_wal(&mut self)` (#89): torn-tail repair + WAL replay on
+    /// reopen.  Truncates every column + the tombstone file back to the largest
+    /// prefix present in ALL of them (a crash can leave one column ahead of
+    /// another), then replays the WAL, re-driving every record whose absolute row
+    /// index is `>= row_count`.  Because `FsyncPolicy::Always` made each record
+    /// durable before its columns were touched, a row acked to the client survives
+    /// even if its column append was lost to the page cache.  Recovery decode is
+    /// generated per-model here (the columns are baked in) — the WAL crate stays
+    /// field-blind, and there is no runtime `model_name` dispatch.  Emits no
+    /// change-feed events (recovery is not a live mutation).
+    fn generate_recover_method(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let append_statements = Self::generate_append_statements(model);
+        let col_idents: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| {
+                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+            })
+            .map(|f| format_ident!("{}_col", f.name))
+            .collect();
+
+        quote! {
+            fn recover_from_wal(&mut self) {
+                // Largest prefix present in EVERY column + the tombstone file.
+                let __c = self.tombstones.len() #(.min(self.#col_idents.len()))*;
+                // Drop any torn / ahead tail so all columns realign at `__c`.
+                #(
+                    self.#col_idents
+                        .truncate_to_rows(__c)
+                        .expect("Failed to truncate column on recovery");
+                )*
+                self.tombstones
+                    .truncate_to_rows(__c)
+                    .expect("Failed to truncate tombstones on recovery");
+                self.row_count = __c;
+
+                // Replay the WAL, re-driving records the columns don't yet have.
+                let __entries = self
+                    .wal
+                    .replay(|_| -> std::io::Result<()> { Ok(()) })
+                    .expect("Failed to replay WAL on recovery");
+                for __entry in &__entries {
+                    if let forgedb_wal::WalOperation::Raw { payload } = &__entry.operation {
+                        if payload.len() < 9 {
+                            continue;
+                        }
+                        let mut __ri = [0u8; 8];
+                        __ri.copy_from_slice(&payload[0..8]);
+                        let __row_index = u64::from_le_bytes(__ri) as usize;
+                        // Already materialized in the columns — idempotent skip.
+                        if __row_index < self.row_count {
+                            continue;
+                        }
+                        let __deleted = payload[8] != 0;
+                        let record: #model_name = match serde_json::from_slice(&payload[9..]) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        #(#append_statements)*
+                        self.tombstones
+                            .append(__deleted)
+                            .expect("Failed to append tombstone on recovery");
+                        self.row_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
     fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
         let append_statements = Self::generate_append_statements(model);
         let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
+        let wal_write = Self::generate_wal_record_write(model, false);
 
         quote! {
             let row_index = self.row_count;
             let id = record.#id_field_name;
+
+            // Durability boundary (#89): record + fsync the row in the WAL before
+            // any column is touched, so a crash mid-append is recovered on reopen.
+            #wal_write
 
             // Append all fields to their respective columns
             #(#append_statements)*
@@ -1171,12 +1306,16 @@ impl RustGenerator {
         model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
+        let wal_write = Self::generate_wal_record_write(model, false);
 
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
                 return false;
             }
             let row_index = self.row_count;
+
+            // Durability boundary (#89): WAL-record the superseding version first.
+            #wal_write
 
             // Append the superseding version's columns from `record`.
             #(#append_statements)*
@@ -1209,6 +1348,7 @@ impl RustGenerator {
         model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
+        let wal_write = Self::generate_wal_record_write(model, true);
 
         Some(quote! {
             // Materialize the current live record; also gives the values to
@@ -1225,6 +1365,9 @@ impl RustGenerator {
                 .expect("id present: get succeeded above");
 
             let row_index = self.row_count;
+
+            // Durability boundary (#89): WAL-record the tombstoned version first.
+            #wal_write
 
             // Re-append the current column values under a tombstone.
             #(#append_statements)*
@@ -1675,6 +1818,12 @@ impl RustGenerator {
                 /// The generated WS endpoint subscribes to it; standalone callers
                 /// can ignore it.
                 pub changefeed: forgedb_changefeed::ChangeFeed,
+                /// Single-writer guard (#89): `open_at` holds an exclusive advisory
+                /// lock on the data dir, so a second writer process refuses rather
+                /// than corrupting (v1 single-writer-per-process contract — this
+                /// only acquires-or-refuses; it is not a lease broker).  `None` on
+                /// the lock-free `new()` convenience path (standalone / tests).
+                _lock: Option<forgedb_storage::DirLock>,
             }
 
             /// A read-only, lock-free view of the whole database (#56 Direction B).
@@ -1704,6 +1853,7 @@ impl RustGenerator {
                     Self {
                         #(#field_idents,)*
                         changefeed,
+                        _lock: None,
                     }
                 }
 
@@ -1715,11 +1865,21 @@ impl RustGenerator {
                 /// boundary — no query logic, no `.forge` read at runtime.  `new()`
                 /// is exactly `open_at(".")`.
                 pub fn open_at(root: std::path::PathBuf) -> Self {
+                    // Single-writer guard (#89): acquire the data-dir lock BEFORE
+                    // opening any column/WAL file, so a second writer refuses up
+                    // front instead of racing.  Held for the life of the Database.
+                    let _lock = Some(
+                        forgedb_storage::DirLock::acquire(&root).expect(
+                            "another writer already holds this data dir \
+                             (ForgeDB is single-writer-per-process, #89)",
+                        ),
+                    );
                     let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
                     #(#attach_stmts_at)*
                     Self {
                         #(#field_idents,)*
                         changefeed,
+                        _lock,
                     }
                 }
 
