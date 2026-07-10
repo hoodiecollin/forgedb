@@ -85,11 +85,12 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 434 tests pass** (workspace, incl. doctests). 419→432 with #59 multi-tenancy (11
+**Baseline: 447 tests pass** (workspace, incl. doctests). 419→432 with #59 multi-tenancy (11
 `forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
-(1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
-"531"/"521"/"466"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
+(1 codegen guard) + #71 inspector db-name (1 src-tauri test); 434→447 with #48 join predicate
+pushdown (9 planner tests) + #49 restored OpenAPI generation (4 codegen tests). Dropped from 531
+when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
+"531"/"521"/"466"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -348,14 +349,33 @@ across many domains live in `examples/` — see `examples/README.md`.**
   tests, `test_rust_generation_root_threading`, `test_api_generation_tenant_auth_router`; **live e2e**
   (two isolated tenant roots + JWT tenant=A→200 / tenant=B→403 on the generated router) in
   `scratchpad/tenancy_compile` (ephemeral). Requires the `forgedb-auth 0.1.0` publish (see the publish gap).
-- **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
-  no partition (predicates are unstructured strings), so join predicates are preserved
-  correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
-  Correct results, no pushdown optimization yet.
-- **OpenAPI generation is disabled.** The generator was lost during the crate-extraction
-  refactor; `src/commands/generate/mod.rs` skips it with a warning and the `openapi`
-  target errors clearly. Restore = re-implement in `crates/codegen`. Deferred (the live
-  `utoipa` derives in `crates/codegen/src/api.rs` are unrelated — leave them).
+- **`query-optimization` join predicate pushdown — LANDED (#48).** A predicate IR
+  (`Predicate`/`Operand`/`PredicateOp` in `crates/query-optimization/src/planner.rs`) parses plan
+  predicate strings into `table.column <op> operand` and attributes each to a join side by the
+  tables its qualified columns reference. `partition_predicates_for_join` now splits predicates
+  into `(left, right, remaining)`; `pushdown_predicates` pushes single-side predicates into the
+  matching sub-plan (`collect_tables` walks each side for its table set) and keeps genuinely
+  cross-side conditions (join conditions, unqualified columns, or unparseable strings) as the
+  wrapping `Filter`. The `QueryPlanOp::Filter` node gained an `input: Box<QueryPlanOp>` so it
+  actually **wraps** its sub-plan (previously childless → the optimized join was discarded).
+  Honest limits: the crate still has **zero consumers** (speculative infra — not wired into
+  codegen or generated code), predicates are attributed only by qualified `table.column` refs
+  (bare columns stay at the join), and there is no selectivity re-estimation after pushdown.
+  Guards: 9 `planner_tests` (IR parse + pushdown split/preserve/wrap).
+- **OpenAPI generation — RESTORED (#49).** Standalone `OpenApiGenerator` in
+  `crates/codegen/src/openapi.rs` emits an OpenAPI **3.0.3** document (`openapi.json`, pretty JSON
+  via `serde_json`) at schema-compile time — no compiling/running the generated crate. Paths
+  mirror the real generated routes exactly (`/api/<kebab>` list+create, `/api/<kebab>/{id}`
+  get+replace+delete, `{id}` string param); component schemas cover each model + inline struct,
+  map every `.forge` scalar/FK/nullable type, skip virtual collection + component fields, and mark
+  non-nullable fields `required`. Both call sites re-enabled in `src/commands/generate/mod.rs`
+  (the `openapi` single target + the `generate all` path). This is **distinct from** the runtime
+  `utoipa` `ApiDoc`/`openapi_json()` in `crates/codegen/src/api.rs` (left untouched) — that path
+  needs the app built and running; this is the offline artifact. Compile-test analogue for a
+  non-Rust artifact: `test_openapi_generation_is_valid_document` parses the output back and asserts
+  OpenAPI structure + `$ref` resolution. Guards: 2 snapshot + 2 structural codegen tests; e2e
+  proven by `generate openapi`/`generate all` over `examples/ecommerce-store` (9 models → 18 paths,
+  36 `$ref`s all resolved).
 
 ## Conventions
 
