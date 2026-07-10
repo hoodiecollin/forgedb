@@ -1256,6 +1256,84 @@ Counter {
 }
 
 #[test]
+fn test_rust_generation_durable_write_path() {
+    // Durable write path (#89): the WAL is wired into the generated write path as
+    // the crash-durability boundary. Every mutation records an OPAQUE row blob +
+    // fsync (FsyncPolicy::Always) BEFORE any column append; reopen repairs a torn
+    // column tail and replays the WAL; open_at holds a single-writer lock.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Each storage owns a WAL, opened under the data root with Always fsync.
+    assert!(
+        code.contains("wal: forgedb_wal::WalManager"),
+        "storage holds a WAL handle"
+    );
+    assert!(
+        code.contains("forgedb_wal::WalManager::open")
+            && code.contains("forgedb_wal::FsyncPolicy::Always"),
+        "WAL opened with fsync-on-commit durability"
+    );
+
+    // Identity red line: the WAL record is OPAQUE bytes via the Raw op — the crate
+    // never sees a field. NO structured WalEntry::insert / WalValue field maps.
+    assert!(
+        code.contains("forgedb_wal::WalEntry::raw("),
+        "commit uses the opaque Raw record path"
+    );
+    assert!(
+        !code.contains("WalEntry::insert")
+            && !code.contains("WalValue")
+            && !code.contains("WalOperation::Insert"),
+        "must NOT use the field-decoding structured WAL API (identity)"
+    );
+
+    // The WAL write is emitted in the write path (serialize record -> opaque bytes).
+    assert!(
+        code.contains("serde_json::to_vec(&record)") && code.contains(".write(&forgedb_wal::WalEntry::raw"),
+        "mutations serialize the row and write it to the WAL before appends"
+    );
+
+    // Recovery: torn-tail truncation + WAL replay, generated per-model (no runtime
+    // model_name dispatch), decoding into the concrete model type.
+    assert!(
+        code.contains("fn recover_from_wal(&mut self)"),
+        "generated per-model recovery method"
+    );
+    assert!(
+        code.contains("truncate_to_rows(__c)")
+            && code.contains("self.wal") && code.contains(".replay("),
+        "recovery repairs torn tail then replays the WAL"
+    );
+    assert!(
+        code.contains("if let forgedb_wal::WalOperation::Raw { payload }"),
+        "recovery decodes the opaque Raw payload (per-model, columns baked in)"
+    );
+    assert!(
+        code.contains("db.recover_from_wal();"),
+        "new_at runs recovery before rebuilding the identity index"
+    );
+
+    // Single-writer guard: open_at acquires the data-dir lock; new() stays lock-free.
+    assert!(
+        code.contains("forgedb_storage::DirLock::acquire(&root)"),
+        "open_at acquires the single-writer lock"
+    );
+    assert!(
+        code.contains("_lock: Option<forgedb_storage::DirLock>"),
+        "Database holds the lock for its lifetime"
+    );
+}
+
+#[test]
 fn test_rust_generation_changefeed_emits() {
     // Change notifications (#62 Direction A): generated insert()/link_* emit a
     // FIELD-BLIND (model, row_index) signal into a shared substrate ChangeFeed;
