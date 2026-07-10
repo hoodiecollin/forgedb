@@ -105,7 +105,7 @@ in `crates/`:
 **Published to crates.io (independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
 - `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.5
-  (unpublished; 0.1.4 published 2026-07-08)** (0.1.5 adds `truncate_to_rows` on the three column types +
+  (published 2026-07-10; 0.1.4 published 2026-07-08)** (0.1.5 adds `truncate_to_rows` on the three column types +
   `DirLock` single-writer advisory lock, both for #89 durable writes; 0.1.4 adds read-only column reader handles
   `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
   many-reader; 0.1.3 added `Manifest` layout fields + `Manifest::save_to/load_from` + `Snapshot` for #57
@@ -117,7 +117,7 @@ in `crates/`:
   algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
   against the process's tenant → 403, injects an opaque `Principal`. Knows nothing of
   models/rows/schema — same class as `http-server`/`changefeed`.
-- `wal` — write-ahead log — **0.2.0 (unpublished; 0.1.1 published)**. The generated durable write path (#89)
+- `wal` — write-ahead log — **0.2.0 (published 2026-07-10; 0.1.1 published)**. The generated durable write path (#89)
   links only the **opaque `Raw`** record path (schema-agnostic bytes + CRC framing + fsync policy + torn-tail
   `read_all` + `replay`); the pre-existing structured/field-decoding API (`WalValue`, `WalOperation::{Insert,
   Update,Delete}`, `Transaction`/`replay_committed`) was **pruned as a drift vector** (#95, legacy-audit epic
@@ -181,7 +181,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
   The advanced, well-documented features below (live queries, multi-tenancy, snapshots, backup, single-writer/
   many-reader) are real but sit on a **generated core with critical gaps** that the "LANDED" bullets can obscure.
   Verify against code before trusting a maturity claim. As of 2026-07-10, four probes established:
-  - **Generated writes are now crash-safe (v1 Phase 1 step 1 — #89 LANDED, unpublished).** Generated
+  - **Generated writes are now crash-safe (v1 Phase 1 step 1 — #89 LANDED + published).** Generated
     `insert/update/delete` record an **opaque** row blob to a per-model WAL (`forgedb-wal` `Raw` op) + fsync
     (`FsyncPolicy::Always`) BEFORE touching columns; `new_at` runs generated per-model `recover_from_wal`
     (truncates a torn column tail back to the min-consistent prefix, then idempotently replays the WAL tail by
@@ -189,10 +189,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
     corrupts). Substrate: `forgedb-wal` **0.2.0** (opaque `Raw` path; structured/txn API pruned — #95),
     `forgedb-storage` **0.1.5** (`truncate_to_rows` + `DirLock`). Proven E2E (torn-tail repair, lost-committed-row
     recovery, **`kill -9` mid-write → 0 acked rows lost**, second-writer refused) in `scratchpad/durable_compile`
-    through current codegen; guard `test_rust_generation_durable_write_path`. **Honest limits / deferred:**
-    `fsync` policy is fixed (not yet config); requires publishing `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5`
-    (see the publish gap). Single-writer-per-process is the v1 contract; multi-writer (Direction C) stays out.
-  - **The WAL is now bounded (v1 Phase 1 step 2 — #96 LANDED, unpublished).** A generated `checkpoint()` fsyncs
+    through current codegen; guard `test_rust_generation_durable_write_path`. Substrate published 2026-07-10
+    (`forgedb-wal 0.2.0` + `forgedb-storage 0.1.5`); reclose proven outside-repo. **Honest limits / deferred:**
+    `fsync` policy is fixed (not yet config). Single-writer-per-process is the v1 contract; multi-writer
+    (Direction C) stays out.
+  - **The WAL is now bounded (v1 Phase 1 step 2 — #96 LANDED + published).** A generated `checkpoint()` fsyncs
     every column + tombstone **then** truncates the WAL (order load-bearing: columns durable before the WAL is
     discarded), auto-invoked once `writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL` (fixed generated const =
     1000; not config — same posture as the fixed fsync policy); `Database::checkpoint()` forces it across all
@@ -234,12 +235,13 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — REOPENED by #89 (2026-07-10):** the durable write path made generated code
-  require **`forgedb-wal 0.2.0`** (opaque `Raw` path) + **`forgedb-storage 0.1.5`** (`truncate_to_rows` +
-  `DirLock`), neither published yet; the scaffold now pins them (`forgedb-wal = "0.2"`, `forgedb-storage =
-  "0.1.5"`), so `forgedb init → generate → cargo build` against crates.io will not resolve until both are
-  published. Proven in-workspace via path deps (`scratchpad/durable_compile`); publish is the gated follow-up.
-  Prior history below. #56-B (single-writer/many-reader) added
+- **`init → build` publish gap — CLOSED again 2026-07-10 (#89/#96):** the durable write path + WAL checkpoint made
+  generated code require **`forgedb-wal 0.2.0`** (opaque `Raw` path + `truncate`) + **`forgedb-storage 0.1.5`**
+  (`truncate_to_rows` + `DirLock` + column `flush`); **both are now published** (2026-07-10, wal first then
+  storage per the dep order). The reclose is PROVEN by an outside-repo `forgedb init --template blog → generate
+  rust+api → cargo build` resolving `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` + `forgedb-changefeed 0.1.1` +
+  `forgedb-auth 0.1.0` + `forgedb-types 0.2.0` from crates.io and compiling the generated durable-write +
+  checkpoint code (0 errors). Prior history below. #56-B (single-writer/many-reader) added
   read-only column reader handles to `forgedb-storage` (`FixedColumnReader`/`VariableColumnReader`/
   `TombstonesReader` + `*::reader()`), bumping it **0.1.3 → 0.1.4**; generated `*StorageReader` /
   `DatabaseReader` call `col.reader()`. **`forgedb-storage 0.1.4` is now published**, and the reclose is
@@ -249,7 +251,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
   Scaffold pins `forgedb-storage = "0.1.5"`, `forgedb-changefeed = "0.1"`, **`forgedb-wal = "0.2"`** (#89),
   **`forgedb-auth = "0.1"`** (#59), axum `ws`. History: the gap reopened for #57, #62-A, #66, #56-B, #59, and
-  now **#89** (open — pending `wal 0.2.0` + `storage 0.1.5` publish); the earlier reopenings all closed. #59 closed
+  **#89/#96** — **all now closed** (#89/#96 closed 2026-07-10 by the wal 0.2.0 + storage 0.1.5 publish above). #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
