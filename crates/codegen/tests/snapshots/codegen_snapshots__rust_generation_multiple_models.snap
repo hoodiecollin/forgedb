@@ -37,13 +37,21 @@ impl UserStorage {
     /// but the process died before the tombstone append) is excluded
     /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
+        Self::new_at(std::path::Path::new("."))
+    }
+    /// Open the model's storage rooted at `root` (#59): every column
+    /// and the tombstone file is joined under it.  `new()` passes `.`
+    /// (the historical CWD-relative layout); a per-tenant process
+    /// passes that tenant's data dir, so filesystem isolation is the
+    /// directory boundary — no query logic, no schema read at runtime.
+    pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
-            id_col: FixedColumn::new(PathBuf::from("user/fixed/uuid_0.bin"), 16usize)
+            id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
             tombstones: forgedb_storage::Tombstones::new(
-                    PathBuf::from("user/tombstones.bin"),
+                    root.join("user/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
             changefeed: None,
@@ -57,13 +65,13 @@ impl UserStorage {
             };
             db.id_to_row.insert(id, i);
         }
-        db.write_manifest();
+        db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self) {
+    fn write_manifest(&self, root: &std::path::Path) {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -83,7 +91,7 @@ impl UserStorage {
                 bytes_per_row: 1usize,
             }),
         };
-        let _ = manifest.save_to(std::path::Path::new("user/manifest.json"));
+        let _ = manifest.save_to(&root.join("user/manifest.json"));
     }
     /// Attach a shared change feed (#62 Direction A).  Called by
     /// `Database::new()`; afterwards each `insert` emits a field-blind
@@ -375,18 +383,26 @@ impl PostStorage {
     /// but the process died before the tombstone append) is excluded
     /// and its orphaned column tail is overwritten by the next insert.
     pub fn new() -> Self {
+        Self::new_at(std::path::Path::new("."))
+    }
+    /// Open the model's storage rooted at `root` (#59): every column
+    /// and the tombstone file is joined under it.  `new()` passes `.`
+    /// (the historical CWD-relative layout); a per-tenant process
+    /// passes that tenant's data dir, so filesystem isolation is the
+    /// directory boundary — no query logic, no schema read at runtime.
+    pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
             id_to_row: HashMap::new(),
             row_count: 0,
-            id_col: FixedColumn::new(PathBuf::from("post/fixed/uuid_0.bin"), 16usize)
+            id_col: FixedColumn::new(root.join("post/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
             title_col: VariableColumn::new(
-                    PathBuf::from("post/variable/string_data_1.bin"),
-                    PathBuf::from("post/variable/string_offsets_1.bin"),
+                    root.join("post/variable/string_data_1.bin"),
+                    root.join("post/variable/string_offsets_1.bin"),
                 )
                 .expect("Failed to create variable column"),
             tombstones: forgedb_storage::Tombstones::new(
-                    PathBuf::from("post/tombstones.bin"),
+                    root.join("post/tombstones.bin"),
                 )
                 .expect("Failed to create tombstones"),
             changefeed: None,
@@ -400,13 +416,13 @@ impl PostStorage {
             };
             db.id_to_row.insert(id, i);
         }
-        db.write_manifest();
+        db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self) {
+    fn write_manifest(&self, root: &std::path::Path) {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -430,7 +446,7 @@ impl PostStorage {
                 bytes_per_row: 1usize,
             }),
         };
-        let _ = manifest.save_to(std::path::Path::new("post/manifest.json"));
+        let _ = manifest.save_to(&root.join("post/manifest.json"));
     }
     /// Attach a shared change feed (#62 Direction A).  Called by
     /// `Database::new()`; afterwards each `insert` emits a field-blind
@@ -806,6 +822,21 @@ impl Database {
         let mut user = UserStorage::new();
         user.attach_changefeed(changefeed.clone());
         let mut post = PostStorage::new();
+        post.attach_changefeed(changefeed.clone());
+        Self { user, post, changefeed }
+    }
+    /// Open the whole database rooted at `root` (#59): every model and
+    /// junction collection is opened under `root` via `new_at`, so a
+    /// single generated binary serves whichever data dir it is handed.
+    /// A per-tenant process passes that tenant's dir (e.g.
+    /// `<data>/<tenant>`), making tenant isolation the filesystem
+    /// boundary — no query logic, no `.forge` read at runtime.  `new()`
+    /// is exactly `open_at(".")`.
+    pub fn open_at(root: std::path::PathBuf) -> Self {
+        let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+        let mut user = UserStorage::new_at(&root);
+        user.attach_changefeed(changefeed.clone());
+        let mut post = PostStorage::new_at(&root);
         post.attach_changefeed(changefeed.clone());
         Self { user, post, changefeed }
     }
