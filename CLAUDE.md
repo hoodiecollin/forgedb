@@ -85,11 +85,12 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 460 tests pass** (workspace, incl. doctests). 434→447 with #48 join predicate
+**Baseline: 461 tests pass** (workspace, incl. doctests). 434→447 with #48 join predicate
 pushdown (9 planner tests) + #49 restored OpenAPI generation (4 codegen tests); 447→460 with #89
 durable write path + #95 wal prune (net +13: new `forgedb-wal` `Raw`-path + `forgedb-storage`
 `truncate_to_rows`/`DirLock` tests + 1 `test_rust_generation_durable_write_path` codegen guard, minus
-the deleted structured/transaction wal tests). Earlier: 419→432 with #59 multi-tenancy (11
+the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint (1
+`test_rust_generation_wal_checkpoint` codegen guard). Earlier: 419→432 with #59 multi-tenancy (11
 `forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
 (1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531
 when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
@@ -188,11 +189,22 @@ across many domains live in `examples/` — see `examples/README.md`.**
     corrupts). Substrate: `forgedb-wal` **0.2.0** (opaque `Raw` path; structured/txn API pruned — #95),
     `forgedb-storage` **0.1.5** (`truncate_to_rows` + `DirLock`). Proven E2E (torn-tail repair, lost-committed-row
     recovery, **`kill -9` mid-write → 0 acked rows lost**, second-writer refused) in `scratchpad/durable_compile`
-    through current codegen; guard `test_rust_generation_durable_write_path`. **Honest limits / deferred:** no
-    checkpoint yet — the WAL is not truncated and reopen reads the whole WAL to replay the tail (bounded WAL +
-    periodic checkpoint = a Phase 4 follow-up, tracked); `fsync` policy is fixed (not yet config); requires
-    publishing `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` (see the publish gap). Single-writer-per-process is
-    the v1 contract; multi-writer (Direction C) stays out.
+    through current codegen; guard `test_rust_generation_durable_write_path`. **Honest limits / deferred:**
+    `fsync` policy is fixed (not yet config); requires publishing `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5`
+    (see the publish gap). Single-writer-per-process is the v1 contract; multi-writer (Direction C) stays out.
+  - **The WAL is now bounded (v1 Phase 1 step 2 — #96 LANDED, unpublished).** A generated `checkpoint()` fsyncs
+    every column + tombstone **then** truncates the WAL (order load-bearing: columns durable before the WAL is
+    discarded), auto-invoked once `writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL` (fixed generated const =
+    1000; not config — same posture as the fixed fsync policy); `Database::checkpoint()` forces it across all
+    collections (junctions have no WAL — a #89 boundary — but still fsync their id columns). **No new substrate** —
+    reuses `forgedb_storage` column `flush()` + `forgedb_wal::WalManager::truncate()`. Recovery is unchanged and
+    still correct: it derives the durable prefix from the *column file lengths* (self-describing append-only
+    columns), NOT a persisted checkpoint LSN, so no durable marker is load-bearing; the manifest's `last_checkpoint`
+    is now set truthfully (was hardcoded `0`) for observability only. Proven E2E (explicit checkpoint truncates the
+    WAL; auto-checkpoint keeps it bounded/sawtoothed under 2137 rows — final 15 KB < peak 107 KB; a crash after
+    checkpoint recovers 23 rows from a 309-byte WAL, no whole-history replay) in `scratchpad/durable_compile`;
+    guard `test_rust_generation_wal_checkpoint`. **Deferred:** the interval is not yet tunable (a knob rides the
+    Phase 4 bounded-storage follow-up #92); junction (M2M) link *crash recovery* remains a #89 boundary.
   - **The generated REST list endpoint is a stub** returning `{"data":[]}` (`crates/codegen/src/api.rs:168-171`) —
     the generated API can currently only get-by-id. → v1 Phase 2 (#90).
   - **Indexes are decorative.** `^index`/`&unique`/`@index(a,b)` parse but no index structures are generated;
