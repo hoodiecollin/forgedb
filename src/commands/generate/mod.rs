@@ -1,5 +1,7 @@
 use crate::{error::CliError, ui, Result};
-use forgedb_codegen::{ApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator};
+use forgedb_codegen::{
+    ApiGenerator, OpenApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator,
+};
 use forgedb_parser::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,13 +95,11 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.push((path, result));
         }
         "openapi" => {
-            // NOTE: The OpenAPI generator was lost during the crate-extraction refactor and
-            // has not yet been re-implemented in forgedb-codegen. Tracked for Phase 3 restore.
-            return Err(CliError::Other(
-                "OpenAPI generation is temporarily unavailable (pending re-implementation in \
-                 forgedb-codegen). All other targets work."
-                    .to_string(),
-            ));
+            let result = OpenApiGenerator::generate(&schema)
+                .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+            let path = output_path.join("openapi.json");
+            write_file(&path, &result.code, options.force)?;
+            generated_files.push((path, result));
         }
         "stubs" => {
             let result = StubGenerator::generate(&schema)
@@ -136,7 +136,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 ///
 /// `target_filter` — when `Some`, only generates targets whose names appear in
 /// the slice; `None` means generate everything.  Valid names: `rust`,
-/// `typescript`, `api`, `stubs`.
+/// `typescript`, `api`, `openapi`, `stubs`.
 fn generate_all(
     schema: &forgedb_parser::Schema,
     output_path: &PathBuf,
@@ -176,10 +176,13 @@ fn generate_all(
         files.push((api_path, api_result));
     }
 
-    // OpenAPI spec generation was lost during the crate-extraction refactor; skip for now.
-    // Tracked for Phase 3 restore (re-implement OpenApiGenerator in forgedb-codegen).
-    if target_filter.is_none() {
-        ui::warning("Skipping OpenAPI spec (generator pending re-implementation — Phase 3)");
+    // Generate OpenAPI spec
+    if enabled("openapi") {
+        let openapi_result = OpenApiGenerator::generate(schema)
+            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        let openapi_path = output_path.join("openapi.json");
+        write_file(&openapi_path, &openapi_result.code, force)?;
+        files.push((openapi_path, openapi_result));
     }
 
     // Generate stubs
