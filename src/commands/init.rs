@@ -126,6 +126,7 @@ edition = "2021"
 forgedb-storage = "0.1.4"
 forgedb-types = "0.2"
 forgedb-changefeed = "0.1"
+forgedb-auth = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
@@ -139,31 +140,97 @@ tokio = {{ version = "1", features = ["full"] }}
     let cargo_path = Path::new(&options.project_name).join("Cargo.toml");
     fs::write(cargo_path, cargo_toml)?;
 
-    // Create src/main.rs that uses generated code
-    let main_rs = r#"// The generated `generated/database.rs` is a module file with its own inner
-// attributes (`#![allow(...)]`) and `//!` docs, so it must be pulled in as a
-// `#[path]` module — NOT via `include!` inside an inline `mod { }`, which
-// rejects inner attributes (E0753).
-#[path = "../generated/database.rs"]
-mod generated;
+    // Create src/main.rs — a real, env-driven, process-per-tenant server (#59).
+    //
+    // The generated files are `#[path]` modules (they carry inner `#![allow]` /
+    // `//!` docs, illegal inside `include!`ed inline `mod { }`, E0753). `api.rs`
+    // refers to the model types as `super::*`, so the crate root re-exports
+    // `database::*`.
+    let main_rs = r#"#[path = "../generated/database.rs"]
+mod database;
+use database::*;
 
-use generated::Database;
+#[path = "../generated/api.rs"]
+mod api;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Starting ForgeDB application...");
-    println!();
+// Deployment config comes from the environment — one binary, N tenant processes
+// (12-factor). Multi-tenancy (#59) is physical: this process serves ONE tenant,
+// opening its data dir; a front proxy routes each tenant's subdomain/host to its
+// process. Nothing here reads schema.forge at runtime.
+//
+//   FORGEDB_TENANT       the tenant this process serves (selects <data>/<tenant>)
+//   FORGEDB_DATA         tenant root dir (default: data)
+//   FORGEDB_HOST         bind host (default: 127.0.0.1)
+//   FORGEDB_PORT         bind port (default: 3000)
+//
+// Verify-only JWT tenant guard (enabled when FORGEDB_JWT_PUBKEY is set):
+//   FORGEDB_JWT_PUBKEY   path to the IdP's PEM public key (verification key)
+//   FORGEDB_JWT_ALG      signature algorithm (default: RS256; asymmetric only)
+//   FORGEDB_JWT_ISSUER   expected `iss`
+//   FORGEDB_JWT_AUDIENCE expected `aud`
+//   FORGEDB_TENANT_CLAIM claim carrying the tenant id (default: tenant)
+//   FORGEDB_JWT_LEEWAY   clock-skew leeway seconds (default: 60)
+#[tokio::main]
+async fn main() {
+    let tenant = std::env::var("FORGEDB_TENANT").ok();
+    let data_root = std::env::var("FORGEDB_DATA").unwrap_or_else(|_| "data".to_string());
+    let host = std::env::var("FORGEDB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("FORGEDB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
 
-    // Initialize the generated database.
-    let _db = Database::new();
+    // Per-tenant data dir: <data_root>/<tenant> when a tenant is set, else the
+    // root itself (single-tenant / tenancy off).
+    let data_dir = match &tenant {
+        Some(t) => std::path::Path::new(&data_root).join(t),
+        None => std::path::PathBuf::from(&data_root),
+    };
+    let db = std::sync::Arc::new(tokio::sync::RwLock::new(
+        database::Database::open_at(data_dir),
+    ));
 
-    println!("✅ Database initialized successfully!");
-    println!();
-    println!("You can now:");
-    println!("  - Add data operations in src/main.rs");
-    println!("  - Update schema.forge and regenerate with: forgedb generate rust");
-    println!();
+    let router = match build_authenticator(tenant.as_deref()) {
+        Some(auth) => {
+            println!("🔐 JWT tenant guard enabled (tenant = {:?})", tenant);
+            api::create_router_with_auth(db, std::sync::Arc::new(auth))
+        }
+        None => api::create_router(db),
+    };
 
-    Ok(())
+    let addr = format!("{host}:{port}");
+    println!("🚀 ForgeDB serving tenant {:?} from '{}' on http://{}", tenant, data_root, addr);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("bind listener");
+    axum::serve(listener, router).await.expect("serve");
+}
+
+/// Build the verify-only JWT authenticator from env, or `None` to run without a
+/// tenant guard. Requires FORGEDB_JWT_PUBKEY; when set, FORGEDB_TENANT must name
+/// the tenant this process serves (the value the token's tenant claim is
+/// cross-checked against).
+fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticator> {
+    let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok()?;
+    let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
+    let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
+    let alg = std::env::var("FORGEDB_JWT_ALG")
+        .ok()
+        .and_then(|a| forgedb_auth::parse_algorithm(&a))
+        .unwrap_or(forgedb_auth::Algorithm::RS256);
+    let cfg = forgedb_auth::AuthConfig {
+        algorithms: vec![alg],
+        issuer: std::env::var("FORGEDB_JWT_ISSUER").ok(),
+        audience: std::env::var("FORGEDB_JWT_AUDIENCE").ok(),
+        tenant_claim: std::env::var("FORGEDB_TENANT_CLAIM").unwrap_or_else(|_| "tenant".to_string()),
+        leeway_secs: std::env::var("FORGEDB_JWT_LEEWAY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+        required_claims: vec![],
+    };
+    let keys = forgedb_auth::KeySource::static_pem(None, pem, alg);
+    Some(forgedb_auth::Authenticator::new(cfg, keys, tenant))
 }
 "#;
 
