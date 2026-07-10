@@ -53,7 +53,7 @@ impl ApiGenerator {
                 extract::ws::{Message, WebSocket, WebSocketUpgrade},
                 http::StatusCode,
                 response::{Json, Response},
-                routing::{get, post},
+                routing::{delete, get, post, put},
                 Router,
             };
             use forgedb_types::Uuid;
@@ -145,12 +145,16 @@ impl ApiGenerator {
         let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
         let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
         let create_fn = format_ident!("create_{}", Self::to_snake_case(&model.name));
+        let update_fn = format_ident!("update_{}", Self::to_snake_case(&model.name));
+        let delete_fn = format_ident!("delete_{}", Self::to_snake_case(&model.name));
 
         let model_name_str = &model.name;
         let model_tag = &model.name;
         let list_summary = format!("List all {}", model.name);
         let get_summary = format!("Get {} by ID", model.name);
         let create_summary = format!("Create new {}", model.name);
+        let update_summary = format!("Replace {} by ID", model.name);
+        let delete_summary = format!("Delete {} by ID", model.name);
 
         let tokens = quote! {
             #[utoipa::path(
@@ -217,6 +221,72 @@ impl ApiGenerator {
                 let mut db = db.write().await;
                 let id = db.#storage_field.insert(record);
                 (StatusCode::CREATED, Json(json!({ "id": id.to_string() })))
+            }
+
+            #[utoipa::path(
+                put,
+                path = "/{id}",
+                tag = #model_tag,
+                params(
+                    ("id" = String, Path, description = #model_name_str)
+                ),
+                request_body = #model_name,
+                responses(
+                    (status = 200, description = #update_summary, body = #model_name),
+                    (status = 404, description = "Not found")
+                )
+            )]
+            // Whole-record replace over the generated `update` (#66):
+            // superseding-version append + id repoint, not a field-level patch.
+            async fn #update_fn(
+                Path(id): Path<String>,
+                State(db): State<Arc<RwLock<super::Database>>>,
+                Json(payload): Json<serde_json::Value>,
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                let key = match id.parse::<#id_type>() {
+                    Ok(key) => key,
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
+                };
+                let record = match serde_json::from_value::<super::#model_name>(payload) {
+                    Ok(record) => record,
+                    Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
+                };
+                let mut db = db.write().await;
+                if db.#storage_field.update(key, record) {
+                    (StatusCode::OK, Json(json!({ "id": key.to_string() })))
+                } else {
+                    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+                }
+            }
+
+            #[utoipa::path(
+                delete,
+                path = "/{id}",
+                tag = #model_tag,
+                params(
+                    ("id" = String, Path, description = #model_name_str)
+                ),
+                responses(
+                    (status = 204, description = #delete_summary),
+                    (status = 404, description = "Not found")
+                )
+            )]
+            // Tombstoned-version append over the generated `delete` (#66):
+            // `get` then reads the row as absent; append-only storage is preserved.
+            async fn #delete_fn(
+                Path(id): Path<String>,
+                State(db): State<Arc<RwLock<super::Database>>>,
+            ) -> StatusCode {
+                let key = match id.parse::<#id_type>() {
+                    Ok(key) => key,
+                    Err(_) => return StatusCode::BAD_REQUEST,
+                };
+                let mut db = db.write().await;
+                if db.#storage_field.delete(key) {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::NOT_FOUND
+                }
             }
         };
 
@@ -539,6 +609,18 @@ impl ApiGenerator {
             .map(|model| format_ident!("create_{}", Self::to_snake_case(&model.name)))
             .collect();
 
+        let update_handlers: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| format_ident!("update_{}", Self::to_snake_case(&model.name)))
+            .collect();
+
+        let delete_handlers: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| format_ident!("delete_{}", Self::to_snake_case(&model.name)))
+            .collect();
+
         // Collect all model schemas
         let model_schemas: Vec<_> = schema
             .models
@@ -553,6 +635,8 @@ impl ApiGenerator {
                     #(#list_handlers,)*
                     #(#get_handlers,)*
                     #(#create_handlers,)*
+                    #(#update_handlers,)*
+                    #(#delete_handlers,)*
                 ),
                 components(
                     schemas(#(#model_schemas,)*)
@@ -583,6 +667,8 @@ impl ApiGenerator {
                 let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
                 let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
                 let create_fn = format_ident!("create_{}", Self::to_snake_case(&model.name));
+                let update_fn = format_ident!("update_{}", Self::to_snake_case(&model.name));
+                let delete_fn = format_ident!("delete_{}", Self::to_snake_case(&model.name));
 
                 let subscribe_fn = format_ident!("subscribe_{}", Self::to_snake_case(&model.name));
                 let live_query_fn =
@@ -591,7 +677,11 @@ impl ApiGenerator {
                 quote! {
                     .route(concat!("/api/", #route_path), get(#list_fn))
                     .route(concat!("/api/", #route_path), post(#create_fn))
-                    .route(concat!("/api/", #route_path, "/{id}"), get(#get_fn))
+                    // GET/PUT/DELETE by id (#69): PUT = whole-record replace, DELETE = tombstone.
+                    .route(
+                        concat!("/api/", #route_path, "/{id}"),
+                        get(#get_fn).put(#update_fn).delete(#delete_fn),
+                    )
                     // Change-feed WebSocket subscription (#62 Direction A).
                     .route(concat!("/subscribe/", #route_path), get(#subscribe_fn))
                     // Live-query WebSocket subscription (#62 Direction B).

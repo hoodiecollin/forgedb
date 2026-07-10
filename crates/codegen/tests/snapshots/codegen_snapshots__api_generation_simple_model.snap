@@ -11,7 +11,7 @@ use axum::{
     extract::{Path, Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     http::StatusCode, response::{Json, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use forgedb_types::Uuid;
@@ -85,6 +85,65 @@ async fn create_user(
     let mut db = db.write().await;
     let id = db.user.insert(record);
     (StatusCode::CREATED, Json(json!({ "id" : id.to_string() })))
+}
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "User",
+    params(("id" = String, Path, description = "User")),
+    request_body = User,
+    responses(
+        (status = 200, description = "Replace User by ID", body = User),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn update_user(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let record = match serde_json::from_value::<super::User>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    if db.user.update(key, record) {
+        (StatusCode::OK, Json(json!({ "id" : key.to_string() })))
+    } else {
+        (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" })))
+    }
+}
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "User",
+    params(("id" = String, Path, description = "User")),
+    responses(
+        (status = 204, description = "Delete User by ID"),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn delete_user(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> StatusCode {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+    let mut db = db.write().await;
+    if db.user.delete(key) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
 }
 ///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code; the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
@@ -271,7 +330,7 @@ async fn handle_user_live_query(
 }
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_user, get_user, create_user),
+    paths(list_user, get_user, create_user, update_user, delete_user),
     components(schemas(User)),
     tags(
         (name = stringify!(User), description = concat!(stringify!(User), " operations"))
@@ -287,7 +346,10 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
         .route(concat!("/api/", "user"), post(create_user))
-        .route(concat!("/api/", "user", "/{id}"), get(get_user))
+        .route(
+            concat!("/api/", "user", "/{id}"),
+            get(get_user).put(update_user).delete(delete_user),
+        )
         .route(concat!("/subscribe/", "user"), get(subscribe_user))
         .route(concat!("/live-query/", "user"), get(subscribe_live_user))
         .with_state(db)
