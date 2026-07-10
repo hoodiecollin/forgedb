@@ -59,7 +59,8 @@ cargo run   -- --help                # list commands
 cargo clippy --workspace             # no dead-code warnings (style lints remain, pre-existing)
 ```
 
-CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`, `serve`.
+CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`, `serve`,
+`tenant` (`create|list|drop` — #59 multi-tenancy dir management).
 Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
@@ -67,7 +68,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 417 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 432 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -84,8 +85,9 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 417 tests pass** (workspace, incl. doctests). Dropped from 531 when the orphaned
-`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
+**Baseline: 432 tests pass** (workspace, incl. doctests). 419→432 with #59 multi-tenancy (11
+`forgedb-auth` verify tests + 2 codegen guards). Dropped from 531 when the orphaned `fulltext` +
+`crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
@@ -102,6 +104,11 @@ in `crates/`:
   backup / #56-A snapshot reads)
 - `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
   0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
+- `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (NOT yet published; scaffold
+  pins `forgedb-auth = "0.1"`)**. Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT
+  (JWKS or static PEM, algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant
+  claim, cross-checks it against the process's tenant → 403, injects an opaque `Principal`. Knows
+  nothing of models/rows/schema — same class as `http-server`/`changefeed`.
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
@@ -180,10 +187,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` + `forgedb-types 0.2.0` from crates.io and compiling
   the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
-  Scaffold pins `forgedb-storage = "0.1.4"`, `forgedb-changefeed = "0.1"`, axum `ws`. History: the gap
-  reopened for #57, #62-A, #66, and #56-B — all closed. **Next thing that will reopen it:** any new
-  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the
-  scaffold pins it.
+  Scaffold pins `forgedb-storage = "0.1.4"`, `forgedb-changefeed = "0.1"`, **`forgedb-auth = "0.1"`** (#59),
+  axum `ws`. History: the gap reopened for #57, #62-A, #66, #56-B — all closed — and **is REOPEN now for
+  #59: `forgedb-auth 0.1.0` is NOT yet published** but the scaffold pins it and the generated `main.rs`
+  links it. Publish `forgedb-auth 0.1.0` to reclose, then prove with an outside-repo `forgedb init →
+  generate → cargo build`. **Next thing that will reopen it:** any new substrate-crate dep or additive
+  substrate API the generated code starts requiring — publish before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -314,6 +323,28 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `serde_json` compare (#62-A fragility inherited); single-process. Guards:
   `test_api_generation_live_query`, `test_rust_generation_live_delta_enums`; **live WS round-trip**
   (Init→Added→silent→Updated→Removed) in `scratchpad/directionb_compile` (ephemeral).
+- **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
+  tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
+  dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
+  "one-process + registry" plan; the in-process registry = model C = a **deferred strict superset** on the
+  same `Database::open_at` seam. PM re-gated the reversal + the auth layer: **PASS**, strictly stronger on
+  identity — process-per-tenant deletes the multiplexer, generated code is tenant-oblivious.) Pieces:
+  (1) new Class-1 substrate **`forgedb-auth`** (see crate list); (2) generated **`Database::open_at(root)`**
+  + `*Storage::new_at(root)` + junction `new_at` + root-scoped `write_manifest(root)` — threads a data
+  root through every column/tombstone/manifest path (also fixes the CWD-relative wart; `new()` == 
+  `open_at(".")`, byte-identical); (3) generated **`create_router_with_auth(db, auth)`** layering
+  `forgedb_auth::axum_mw::require_tenant` over every REST + WS route (401 no/bad token, 403 wrong tenant,
+  principal injected); (4) config **`[tenant]`/`[auth]`** in `forgedb.toml` (never in `.forge`); (5) the
+  scaffold `main.rs` is now a **real env-driven server** (`FORGEDB_TENANT`/`FORGEDB_DATA`/`FORGEDB_JWT_*`,
+  resolved once → feeds both `open_at` and the auth cross-check); (6) **`forgedb tenant create|list|drop`**
+  CLI. Identity red line held: `forgedb-auth` decodes no field, dispatches on no model, the cross-check is
+  opaque string equality — verify-only (no issuance → #73; RLS-style per-principal authz → #72). Honest
+  limits: **single tenant per process** (cross-tenant reads = fan-out; registry deferred); WS clients must
+  send the token in the `Authorization` header; JWKS-over-HTTP fetch not yet wired in the scaffold (crate
+  parses JWKS offline via `from_jwks_json`; static PEM is the wired path). Guards: 11 `forgedb-auth` verify
+  tests, `test_rust_generation_root_threading`, `test_api_generation_tenant_auth_router`; **live e2e**
+  (two isolated tenant roots + JWT tenant=A→200 / tenant=B→403 on the generated router) in
+  `scratchpad/tenancy_compile` (ephemeral). Requires the `forgedb-auth 0.1.0` publish (see the publish gap).
 - **`query-optimization` join pushdown is a stub.** `partition_predicates_for_join` returns
   no partition (predicates are unstructured strings), so join predicates are preserved
   correctly as a `Filter` wrapping the join output but are **not** pushed into either side.
