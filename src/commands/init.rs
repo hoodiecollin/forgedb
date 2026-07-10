@@ -112,7 +112,8 @@ fn create_rust_files(options: &InitOptions) -> Result<()> {
     //
     // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
     // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields), plus
-    // forgedb-changefeed for the change-feed emits (#62 Direction A).
+    // forgedb-changefeed for the change-feed emits (#62 Direction A) and
+    // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery).
     //
     // The generated `api.rs` needs: axum (with the `ws` feature for the
     // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json.
@@ -123,9 +124,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-forgedb-storage = "0.1.4"
+forgedb-storage = "0.1.5"
 forgedb-types = "0.2"
 forgedb-changefeed = "0.1"
+forgedb-wal = "0.2"
 forgedb-auth = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
