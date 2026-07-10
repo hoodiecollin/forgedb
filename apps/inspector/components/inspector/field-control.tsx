@@ -14,6 +14,7 @@ import {
   editBoolsAtom,
   editNullsAtom,
   editStructsAtom,
+  editValuesAtom,
 } from "@/lib/inspector/atoms";
 import type { Field, Mod } from "@/lib/inspector/types";
 import { Button } from "@/components/ui/button";
@@ -70,6 +71,11 @@ export function FieldControl({
   const [nulls, setNulls] = useAtom(editNullsAtom);
   const [bools, setBools] = useAtom(editBoolsAtom);
   const [structs, setStructs] = useAtom(editStructsAtom);
+  const [values, setValues] = useAtom(editValuesAtom);
+
+  // Controlled scalar value: the edited override, else the seeded/base value.
+  const val = (fallback?: string) => values[field.name] ?? fallback ?? "";
+  const onVal = (v: string) => setValues({ ...values, [field.name]: v });
 
   const nullable = field.mods.includes("?");
   const autoGen = field.mods.includes("+");
@@ -141,17 +147,26 @@ export function FieldControl({
           ) : null}
 
           {c === "string" ? (
-            <Input defaultValue={field.value} placeholder={field.placeholder} />
+            <Input
+              value={val(field.value)}
+              onChange={(e) => onVal(e.target.value)}
+              placeholder={field.placeholder}
+            />
           ) : null}
 
           {c === "text" ? (
-            <Textarea defaultValue={field.value} rows={3} />
+            <Textarea
+              value={val(field.value)}
+              onChange={(e) => onVal(e.target.value)}
+              rows={3}
+            />
           ) : null}
 
           {c === "int" ? (
             <Input
               type="number"
-              defaultValue={field.value}
+              value={val(field.value)}
+              onChange={(e) => onVal(e.target.value)}
               min={field.min}
               max={field.max}
             />
@@ -159,7 +174,7 @@ export function FieldControl({
 
           {c === "bigint" ? (
             <>
-              <Input defaultValue={field.value} />
+              <Input value={val(field.value)} onChange={(e) => onVal(e.target.value)} />
               <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-warn">
                 <span>⚠</span>edited as string — u64 exceeds JS safe-integer
                 precision
@@ -168,14 +183,23 @@ export function FieldControl({
           ) : null}
 
           {c === "float" ? (
-            <Input type="number" step="any" defaultValue={field.value} />
+            <Input
+              type="number"
+              step="any"
+              value={val(field.value)}
+              onChange={(e) => onVal(e.target.value)}
+            />
           ) : null}
 
           {c === "char" ? (
             <div className="relative">
-              <Input defaultValue={field.value} maxLength={field.len} />
+              <Input
+                value={val(field.value)}
+                onChange={(e) => onVal(e.target.value)}
+                maxLength={field.len}
+              />
               <span className="pointer-events-none absolute top-1/2 right-2.5 -translate-y-1/2 font-mono text-[10.5px] text-muted-foreground">
-                {(field.value?.length ?? 0)}/{field.len} bytes
+                {val(field.value).length}/{field.len} bytes
               </span>
             </div>
           ) : null}
@@ -187,7 +211,11 @@ export function FieldControl({
                   <div className="mb-1 font-mono text-[10px] text-muted-foreground">
                     unix ms
                   </div>
-                  <Input defaultValue={field.msVal} disabled={autoGen} />
+                  <Input
+                    value={val(field.msVal)}
+                    onChange={(e) => onVal(e.target.value)}
+                    disabled={autoGen}
+                  />
                 </div>
                 <div>
                   <div className="mb-1 font-mono text-[10px] text-muted-foreground">
@@ -238,7 +266,10 @@ export function FieldControl({
         <div>
           <div className="flex items-center gap-2">
             <div className="flex-1">
-              <Select defaultValue={field.fkCurrent}>
+              <Select
+                value={values[field.name] ?? field.fkCurrent}
+                onValueChange={onVal}
+              >
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder={`pick ${field.fkTarget} row`} />
                 </SelectTrigger>

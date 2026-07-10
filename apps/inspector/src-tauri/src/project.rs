@@ -119,11 +119,21 @@ pub fn load_project(schema_path: &str, data_dir: Option<&str>) -> Result<Project
     let mut parser = Parser::new(&source).map_err(|e| format!("Parse error: {e}"))?;
     let schema = parser.parse().map_err(|e| format!("Parse error: {e}"))?;
 
-    let db_name = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("schema")
-        .to_string();
+    // Display name from the schema file stem — but a *generic* stem carries no
+    // identity, so prefer the parent directory name (e.g. `blog-cms/schema.forge`
+    // reads as `blog-cms`, not `schema`).
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("schema");
+    const GENERIC: [&str; 6] = ["schema", "db", "database", "model", "models", "main"];
+    let db_name = if GENERIC.contains(&stem) {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty() && *s != ".")
+            .unwrap_or(stem)
+            .to_string()
+    } else {
+        stem.to_string()
+    };
 
     // Stats are additive: absent/empty data dir ⇒ schema-only structure view.
     let stats = data_dir
@@ -371,6 +381,21 @@ mod tests {
         assert_eq!(code.char_len, Some(8));
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn generic_stem_uses_parent_dir_for_db_name() {
+        // `<...>/blog-cms/schema.forge` should read as `blog-cms`, not `schema`.
+        let base =
+            std::env::temp_dir().join(format!("fdb-insp-name-{}", std::process::id()));
+        let proj = base.join("blog-cms");
+        std::fs::create_dir_all(&proj).unwrap();
+        let schema = write(&proj, "schema.forge", "User {\n  id: +uuid\n  name: string\n}\n");
+
+        let dto = load_project(&schema, None).expect("load");
+        assert_eq!(dto.db_name, "blog-cms");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

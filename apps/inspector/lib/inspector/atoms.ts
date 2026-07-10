@@ -5,6 +5,7 @@
  */
 
 import { atom } from "jotai";
+import { atomWithStorage } from "jotai/utils";
 import { DB_NAME, DEFAULT_PREDICATES, MODELS, REL, SCHEMA } from "./mock";
 import type { ProjectStructure } from "./data-source";
 import { loadStartupProject, openProject } from "./data-source";
@@ -22,9 +23,13 @@ export const connectedAtom = atom(true);
 /**
  * Base URL of the running generated API for the Live lens (#13). The generated
  * `serve` binds `0.0.0.0:3000` by default; the client issues requests over the
- * Tauri HTTP/WebSocket plugins (CORS-proof).
+ * Tauri HTTP/WebSocket plugins (CORS-proof). User-editable + persisted across
+ * launches (#71) so attaching to a non-default host/port sticks.
  */
-export const apiBaseAtom = atom("http://localhost:3000");
+export const apiBaseAtom = atomWithStorage(
+  "forgedb.inspector.apiBase",
+  "http://localhost:3000",
+);
 
 // ---- project structure (Structure lens, #12) --------------------------------
 // The single source screens read schema/model/relation data from. Its default is
@@ -128,6 +133,12 @@ export const editorAtom = atom<EditorState>({
 export const editNullsAtom = atom<Record<string, boolean>>({});
 export const editBoolsAtom = atom<Record<string, string>>({});
 export const editStructsAtom = atom<Record<string, boolean>>({});
+/** controlled scalar field values (#68); seeded from the live row on edit-open */
+export const editValuesAtom = atom<Record<string, string>>({});
+/** the full live row being edited, so a PUT sends every generated struct field */
+export const editBaseRowAtom = atom<Record<string, unknown>>({});
+/** in-flight state for a mutation submission */
+export const editSubmittingAtom = atom(false);
 
 // ---- live stream (mock ticker) ----
 export interface StreamEvent {
@@ -162,8 +173,55 @@ export const openEditorAtom = atom(
     set(editNullsAtom, {});
     set(editBoolsAtom, {});
     set(editStructsAtom, {});
+    set(editValuesAtom, {});
+    set(editBaseRowAtom, {});
   },
 );
+
+// ---- mutation submission (#68) — create (POST) / replace (PUT) / delete ------
+
+/**
+ * Submit the editor as a create or replace against the live API. Builds the
+ * wire body by overlaying the controlled field values onto the base row (edit)
+ * or an empty template (create), then POSTs (create) or PUTs (edit). Returns the
+ * new/updated id, or throws with a surfaced message.
+ */
+export const submitEditorAtom = atom(null, async (get, set): Promise<string> => {
+  const { buildRecordBody, createRow, updateRow } = await import("./live");
+  const editor = get(editorAtom);
+  const base = get(apiBaseAtom);
+  const fields = get(schemaAtom)[editor.model] ?? [];
+  const body = buildRecordBody(
+    fields.map((f) => ({ name: f.name, control: f.control, mods: f.mods })),
+    get(editBaseRowAtom),
+    get(editValuesAtom),
+    get(editNullsAtom),
+    get(editBoolsAtom),
+  );
+  set(editSubmittingAtom, true);
+  try {
+    if (editor.mode === "create") {
+      return await createRow(base, editor.model, body);
+    }
+    await updateRow(base, editor.model, editor.rowId ?? "", body);
+    return editor.rowId ?? "";
+  } finally {
+    set(editSubmittingAtom, false);
+  }
+});
+
+/** Delete the row currently open in the editor (live mode). */
+export const deleteEditorRowAtom = atom(null, async (get, set): Promise<void> => {
+  const { deleteRow } = await import("./live");
+  const editor = get(editorAtom);
+  if (!editor.rowId) return;
+  set(editSubmittingAtom, true);
+  try {
+    await deleteRow(get(apiBaseAtom), editor.model, editor.rowId);
+  } finally {
+    set(editSubmittingAtom, false);
+  }
+});
 
 export const closeEditorAtom = atom(null, (get, set) => {
   set(editorAtom, { ...get(editorAtom), open: false });

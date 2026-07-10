@@ -7,7 +7,7 @@
  */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import {
   ChevronDown,
@@ -42,10 +42,24 @@ export function TopBar() {
   const [screen, setScreen] = useAtom(screenAtom);
   const [connected, setConnected] = useAtom(connectedAtom);
   const dbName = useAtomValue(dbNameAtom);
-  const apiBase = useAtomValue(apiBaseAtom);
+  const [apiBase, setApiBase] = useAtom(apiBaseAtom);
   const openProject = useSetAtom(openProjectAtom);
   const [projectError, setProjectError] = useAtom(projectErrorAtom);
   const desktop = isTauri();
+
+  // Editable API base (#71): a local draft committed on blur/Enter, validated to
+  // an http(s) URL; an invalid draft reverts to the persisted value.
+  const [draft, setDraft] = useState(apiBase);
+  useEffect(() => setDraft(apiBase), [apiBase]);
+  const commitApiBase = () => {
+    const v = draft.trim().replace(/\/+$/, "");
+    if (/^https?:\/\/.+/.test(v)) {
+      setApiBase(v);
+    } else {
+      setDraft(apiBase);
+      toast.error("API base must be an http(s) URL");
+    }
+  };
 
   // Surface an open-project failure (parse/read error) as a toast.
   useEffect(() => {
@@ -101,8 +115,26 @@ export function TopBar() {
         ))}
       </nav>
 
-      {/* right: snapshot + connection */}
+      {/* right: api base + snapshot + connection */}
       <div className="flex items-center gap-2.5">
+        <div
+          title="Base URL of the running generated API (persisted)"
+          className="flex items-center gap-1.5 rounded-[7px] border border-border bg-muted px-2 py-1 text-[12px]"
+        >
+          <span className="text-muted-foreground">API</span>
+          <input
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commitApiBase}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+              if (e.key === "Escape") setDraft(apiBase);
+            }}
+            spellCheck={false}
+            className="w-40 bg-transparent font-mono text-foreground outline-none placeholder:text-muted-foreground"
+            placeholder="http://localhost:3000"
+          />
+        </div>
         <button
           type="button"
           className="flex items-center gap-1.5 rounded-[7px] border border-dashed border-border px-2.5 py-1 text-[12px] text-muted-foreground hover:bg-muted"
