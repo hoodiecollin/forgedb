@@ -1,8 +1,26 @@
 # Proposal: Multi-tenancy
 
-**Status:** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints** (one of the strongest codegen stories in the backlog). Maintainer-blessed direction (2026-07-06): **layered roadmap — Layer 1 physical isolation first (milestone), Layer 2 row-level `@tenant` scoping next (gated on the mutation surface); per-tenant *schemas* rejected**. Tenant lifecycle = **explicit `forgedb tenant` CLI**; multi-tenant serve = **one process + tenant registry**. Awaiting approval to schedule Layer 1.
+**Status:** LAYER 1 LANDED (2026-07-09) — physical dir-per-tenant isolation + verify-only JWT
+tenant guard shipped e2e (PM identity gate PASS on the refinement). New Class-1 substrate crate
+`forgedb-auth` (verify-only asymmetric JWT via JWKS/static key, algorithm-pinned, tenant-claim
+cross-check → 403, principal injection); generated `Database::open_at(root)` (root-threaded, the
+CWD-wart fix); generated `create_router_with_auth`; `[tenant]`/`[auth]` config; env-driven
+process-per-tenant scaffold `main.rs`; `forgedb tenant create|list|drop` CLI. Proven by
+`forgedb-auth`'s 11 verify tests + codegen guards (`test_rust_generation_root_threading`,
+`test_api_generation_tenant_auth_router`) + a live e2e (`scratchpad/tenancy_compile`: two isolated
+tenant roots, JWT tenant=A → 200 at A's process, tenant=B → 403). Baseline 419 → **432**.
+**Deferred:** Layer 2 row-level `@tenant` (gated on nothing now — mutation surface #66 has landed —
+but scoped separately); model-C in-process registry (strict superset on the same `open_at` seam);
+JWKS-over-HTTP fetch in the scaffold (crate parses JWKS offline; fetch is a follow-up); RLS-style
+per-principal authz (#72); token issuance (#73, future). **Publish gap:** scaffold now pins
+`forgedb-auth = "0.1"` — must publish `forgedb-auth 0.1.0` before an outside-repo `forgedb init →
+build` resolves.
+
+**Original status (design phase):** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints** (one of the strongest codegen stories in the backlog). Maintainer-blessed direction (2026-07-06): **layered roadmap — Layer 1 physical isolation first (milestone), Layer 2 row-level `@tenant` scoping next (gated on the mutation surface); per-tenant *schemas* rejected**. Tenant lifecycle = **explicit `forgedb tenant` CLI**.
+
+**REFINED 2026-07-08 (PM-gated PASS, supersedes the 2026-07-06 topology + adds the auth layer):** multi-tenant serve = **process-per-tenant (model B)** — each `forgedb serve` process serves exactly ONE tenant's data dir, fixed at startup; multi-tenancy = N processes behind a dumb host/subdomain proxy. The in-process **tenant registry (model C)** is **deferred as a strict superset** on the same `Database::open_at(tenant_dir)` seam (the earlier "one process + registry" blessing is *reversed* — the registry was the most drift-prone surface; process-per-tenant deletes the multiplexer and makes the generated code tenant-oblivious, and the #56-B single-writer invariant hold per-process with zero shared state). Access is gated by a **verify-only asymmetric JWT** layer (new Class-1 substrate `forgedb-auth`) that cross-checks a configured tenant claim against the process's tenant → 403 (see "Authentication" below). ForgeDB does **not** issue tokens ([#73], future) and row/field authorization is a separate pillar ([#72]).
 **Issue:** [#59](https://github.com/hoodiecollin/forgedb/issues/59) (`idea`, `plan-next`)
-**Date:** 2026-07-06
+**Date:** 2026-07-06 (refined 2026-07-08)
 
 ## Summary
 
@@ -55,14 +73,48 @@ model, a scoping predicate hardcoded into that model's getters. **Tenant scoping
 compile-time input to generation; the tenant value is a runtime input to generated code — never a
 runtime input to a generic policy interpreter.**
 
+## Authentication (refined 2026-07-08) — verify-only JWT, Class-1 substrate
+
+Physical isolation answers *where* a tenant's data lives; authentication answers *who is
+allowed to reach a given process*. The two compose but stay separate.
+
+**`forgedb-auth` — a new schema-agnostic substrate crate** (an axum extractor/middleware, same
+class as `forgedb-http-server`/`forgedb-changefeed`; it knows *less* about the schema than
+`forgedb-storage` does). It:
+- **verifies an asymmetric JWT** (RS256/ES256) via **JWKS** (`kid`-selected, rotation-aware;
+  static-public-key fallback), **algorithm-pinned** (reject `alg:none`, reject HS\* when
+  expecting RS\*/ES\* — the JWKS confusion attack), with `exp`/`nbf`/`iss`/`aud` + bounded skew;
+- **extracts a configured tenant claim** (claim *name* is config) and **cross-checks it against
+  the process's resolved tenant → 403 on mismatch** — a plain opaque string equality, no model,
+  no row, no dispatcher;
+- **injects the verified principal** (`sub`, roles/scopes) into request extensions as opaque
+  data for handlers.
+
+**Identity:** JWT verification decodes zero schema fields, dispatches on zero model names,
+reconstructs zero schema surface — it is cryptographic transport-layer authentication, not the
+schema-reflecting tenant-resolution engine the red lines forbid. PM-gated **PASS** as Class-1
+substrate. **Verify-only:** ForgeDB never *issues* tokens or stores users — the deployer brings
+an IdP ([#73] records issuance as a deliberate future product decision). **Authentication only:**
+per-principal row/field authorization (RLS-style `@owner`/`@policy`) is a separate pillar
+([#72]) — `forgedb-auth` authenticates; generated code (later, if ever) authorizes. Keep that
+seam bright: the instant `forgedb-auth` grows a per-model map or a `role X may read model Y`
+decision, it has crossed into the forbidden engine.
+
+**Config, never schema.** Issuer(s), audience, JWKS URL / static key, tenant-claim-name,
+algorithm allowlist, skew, required claims all live in `forgedb.toml`; `.forge` gains nothing.
+
 ## The three isolation models
 
 ### Physical / per-tenant-database (Layer 1) — cleanest, strongest
-Each tenant's data lives under `<root>/<tenant>/`; a `Database` per tenant reads/writes there.
-Isolation is **filesystem-enforced, not logic-enforced** — tenants share no columns, so no
-generated query can leak across tenants. No `.forge` change, no directive, no new query
-semantics. Cost: no cross-tenant queries (usually the point), per-tenant resource overhead, and a
-tenant lifecycle to manage (CLI). This is the milestone.
+Each tenant's data lives under `<root>/<tenant>/`; **one process serves one tenant**, opening its
+`Database` at `<root>/<tenant>/` (model B). Isolation is **filesystem-enforced, not
+logic-enforced** — tenants share no columns *and share no process*, so no generated query can leak
+across tenants and a panic/OOM in one tenant kills only that process. No `.forge` change, no
+directive, no new query semantics, and — the topology win — **no in-process multiplexer** (the
+drift-prone surface the earlier "one process + registry" plan carried). Cost: no cross-tenant
+queries (usually the point), per-tenant process overhead, and a tenant lifecycle to manage (CLI).
+The in-process registry (model C) is a **deferred strict superset** on the same `open_at` seam,
+for high tenant cardinality. This is the milestone.
 
 ### Row-level tenancy (Layer 2) — green with discipline, gated on mutation
 Tenant models carry a `tenant_id`; the generator emits scoped `get`/`all`/traversal taking a
@@ -87,15 +139,21 @@ no new feature), or (b) genuinely separate generated apps deployed side by side 
 
 ## Blessed roadmap (layered)
 
-**Layer 1 — Physical (milestone).**
+**Layer 1 — Physical (milestone). Model B, process-per-tenant.**
 - Generated `Database::open_at(root: PathBuf)` — thread `root` through every column/tombstone
-  init (replaces today's hardcoded relative paths).
-- **Tenant registry in `serve`:** map tenant identifier → `Database::open_at(root.join(tenant))`;
-  a single process holds the registry (natural step from today's one `Arc<RwLock<Database>>`
-  state, `crates/codegen/src/api.rs:273`).
-- **Tenant resolution:** an axum extractor derives the tenant from the request
-  (header/subdomain/claim) — **transport glue** (Class-2) — and dispatches to that tenant's
-  `Database`. Filtering/isolation is the directory boundary, not query logic.
+  init (replaces today's hardcoded relative paths). Independently useful; fixes the CWD wart.
+- **One tenant per process:** the process's tenant identity is resolved once at startup from
+  config (`forgedb.toml`) with an **env override (`FORGEDB_TENANT`)**; `serve` opens the single
+  `Database::open_at(root.join(tenant))`. No in-process registry, no dispatch-by-tenant extractor
+  (model C's superset carries those, later).
+- **`forgedb-auth` middleware in the generated router:** verify the JWT, **cross-check its tenant
+  claim against the process's resolved tenant → 403**, inject the principal. Routing to the right
+  process is a dumb host/subdomain proxy (transport glue, kept outside the artifact); the auth
+  cross-check is the independent second layer, so a spoofed header, a misroute, and a
+  valid-token-for-the-wrong-tenant are all rejected.
+- **Single resolution point:** the resolved tenant feeds *both* `open_at` and the auth cross-check
+  so they can't drift (a process serving dir `acme` but checking claims against `beta` is a silent
+  isolation hole).
 - **`forgedb tenant create | list | drop <name>` CLI** — makes/lists/removes tenant dirs; a peer
   to `migrate`/`compact`. Tenant existence is explicit and auditable (blessed over
   dir-on-first-write).
@@ -140,12 +198,15 @@ Layer 2 is a well-motivated increment once mutation exists.
 - **Parameterize the generated `Database` root:** `Database::open_at(root: PathBuf)` threading
   `root` through every column/tombstone init (replacing hardcoded relative paths). Independently
   useful; fixes the CWD-relative wart.
-- **Per-tenant instantiation in `serve` + tenant registry:** tenant identifier →
-  `Database::open_at(root.join(tenant))`; a request extractor resolves the tenant and dispatches.
+- **Process-per-tenant instantiation in `serve`:** resolve the process's tenant once (config +
+  `FORGEDB_TENANT` override) → `Database::open_at(root.join(tenant))`. No in-process registry.
+- **`forgedb-auth` substrate crate** + generated middleware: verify-only asymmetric JWT (JWKS,
+  alg-pinned), tenant-claim cross-check → 403, principal injection. Config-driven (`forgedb.toml`).
 - **`forgedb tenant create | list | drop <name>` CLI** (a `migrate`/`compact` peer).
-- **Identity proof:** two tenants, one running app; tenant A's requests observe only A's dir; no
-  generated query code references `.forge` at runtime; the only substrate call is `Database::open`
-  per tenant; the generated app links no tenancy crate.
+- **Identity proof:** two tenant processes; a token whose tenant claim = A is accepted at A's
+  process and 403'd at B's; no generated query code references `.forge` at runtime; the only
+  substrate calls are `Database::open_at` + `forgedb-auth` verification; the generated app links no
+  schema-reflecting tenancy crate.
 
 **Explicitly out**
 - **Row-level tenancy / `@tenant` / any `.forge` change** (Layer 2) — deferred until the generated
