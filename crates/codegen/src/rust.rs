@@ -60,6 +60,16 @@ impl RustGenerator {
         };
         tokens.extend(imports);
 
+        // WAL checkpoint interval (#89 step 2 — bound the WAL).  After this many
+        // WAL-recorded mutations a storage fsyncs its columns and truncates its
+        // WAL, so the WAL never grows without limit and reopen never replays a
+        // huge WAL.  Fixed for v1 (not yet configurable — the same posture as the
+        // fixed `FsyncPolicy::Always`).  Bounds the WAL to ~this many records
+        // between checkpoints (bytes are bounded by interval × max row size).
+        tokens.extend(quote! {
+            const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
+        });
+
         // Generate embedded struct definitions before the models that reference
         // them.  Models store structs as raw fixed-size bytes, so the struct
         // types must exist for the emitted `size_of`/`read_unaligned` code to
@@ -231,6 +241,10 @@ impl RustGenerator {
         // recovered rows.
         let recover_method = Self::generate_recover_method(model);
 
+        // Generate the WAL checkpoint (#89 step 2): fsync columns + truncate the
+        // WAL so it stays bounded and reopen replays only the post-checkpoint tail.
+        let checkpoint_method = Self::generate_checkpoint_method(model);
+
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
@@ -315,6 +329,8 @@ impl RustGenerator {
                 #mutation_methods
 
                 #recover_method
+
+                #checkpoint_method
 
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -692,6 +708,10 @@ impl RustGenerator {
             // mid-append is recovered on reopen.  The WAL stores bytes only — it
             // never decodes a field (identity: schema-agnostic substrate).
             wal: forgedb_wal::WalManager,
+            // Mutations recorded to the WAL since the last checkpoint (#89 step
+            // 2).  When it reaches `WAL_CHECKPOINT_INTERVAL`, `checkpoint()` runs:
+            // columns are fsync'd and the WAL is truncated, bounding it.
+            writes_since_checkpoint: u64,
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -761,6 +781,7 @@ impl RustGenerator {
                 root.join(#wal_path),
                 forgedb_wal::FsyncPolicy::Always,
             ).expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
             changefeed: None,
         }
     }
@@ -967,7 +988,10 @@ impl RustGenerator {
                     row_count: self.row_count,
                     columns,
                     wal_enabled: false,
-                    last_checkpoint: 0,
+                    // Observability only (#89 step 2): rows durable on disk at open
+                    // (== row_count — recovery already realigned the columns).  NOT
+                    // load-bearing for recovery, which reads the column lengths.
+                    last_checkpoint: self.row_count as u64,
                     compaction_epoch: 0,
                     format_version: 1,
                     row_anchor: Some(forgedb_storage::RowAnchor {
@@ -1260,11 +1284,70 @@ impl RustGenerator {
         }
     }
 
+    /// Emit `checkpoint(&mut self)` (#89 step 2 — bound the WAL).  Makes every
+    /// column + the tombstone file durable (`flush()` == `sync_all`), THEN
+    /// truncates the WAL.  The order is load-bearing: the WAL is discarded only
+    /// after the data it protects is durable, so a crash *between* the two leaves
+    /// the (not-yet-truncated) WAL able to replay, and a crash *after* leaves
+    /// durable columns and an empty WAL.  Recovery derives the durable prefix
+    /// from the column file lengths themselves (`recover_from_wal`), so no
+    /// persisted checkpoint marker is load-bearing — this only bounds the WAL and
+    /// shortens reopen.  Single-writer only, and called between mutations, so all
+    /// columns are aligned at `row_count` when it runs.
+    fn generate_checkpoint_method(model: &forgedb_parser::Model) -> TokenStream {
+        let col_idents: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| {
+                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+            })
+            .map(|f| format_ident!("{}_col", f.name))
+            .collect();
+
+        quote! {
+            /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+            /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+            /// required for correctness (recovery reads the column lengths).
+            pub fn checkpoint(&mut self) {
+                // 1. Make the committed columns durable up to `row_count`.
+                #(
+                    self.#col_idents
+                        .flush()
+                        .expect("Failed to fsync column on checkpoint");
+                )*
+                self.tombstones
+                    .flush()
+                    .expect("Failed to fsync tombstones on checkpoint");
+                // 2. Only now that the data is durable, discard the redundant WAL.
+                self.wal
+                    .truncate()
+                    .expect("Failed to truncate WAL on checkpoint");
+                self.writes_since_checkpoint = 0;
+            }
+        }
+    }
+
+    /// Emit the tail every mutation runs after its columns are appended and
+    /// `row_count` is bumped: count the write and checkpoint once the interval is
+    /// reached.  Placed AFTER the append + increment so the checkpoint always sees
+    /// a consistent, fully-appended column prefix.
+    fn generate_maybe_checkpoint() -> TokenStream {
+        quote! {
+            // Bound the WAL (#89 step 2): after enough mutations, fsync columns
+            // and truncate the WAL so it never grows without limit.
+            self.writes_since_checkpoint += 1;
+            if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+                self.checkpoint();
+            }
+        }
+    }
+
     fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
         let append_statements = Self::generate_append_statements(model);
         let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let maybe_checkpoint = Self::generate_maybe_checkpoint();
 
         quote! {
             let row_index = self.row_count;
@@ -1291,6 +1374,8 @@ impl RustGenerator {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Inserted);
             }
 
+            #maybe_checkpoint
+
             id
         }
     }
@@ -1307,6 +1392,7 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let maybe_checkpoint = Self::generate_maybe_checkpoint();
 
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
@@ -1333,6 +1419,8 @@ impl RustGenerator {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Updated);
             }
 
+            #maybe_checkpoint
+
             true
         })
     }
@@ -1349,6 +1437,7 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
+        let maybe_checkpoint = Self::generate_maybe_checkpoint();
 
         Some(quote! {
             // Materialize the current live record; also gives the values to
@@ -1383,6 +1472,8 @@ impl RustGenerator {
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, deleted_row, forgedb_changefeed::ChangeKind::Deleted);
             }
+
+            #maybe_checkpoint
 
             true
         })
@@ -1896,6 +1987,17 @@ impl RustGenerator {
                     }
                 }
 
+                /// Force a WAL checkpoint across every collection (#89 step 2):
+                /// fsync all columns and truncate every model WAL now, bounding
+                /// the WALs and shortening the next reopen.  Models fsync-then-
+                /// truncate their WAL; junctions (no WAL — a #89 boundary) only
+                /// fsync their id columns.  Runs automatically every
+                /// `WAL_CHECKPOINT_INTERVAL` mutations per collection; this is the
+                /// explicit, force-now entry point.  Single-writer only.
+                pub fn checkpoint(&mut self) {
+                    #(self.#field_idents.checkpoint();)*
+                }
+
                 /// Open a read-only handle over the whole database (#56 Direction
                 /// B).  The returned `DatabaseReader` shares every collection's
                 /// files via independent descriptors, so it (and any clones handed
@@ -2017,7 +2119,10 @@ impl RustGenerator {
                             row_count: self.row_count,
                             columns,
                             wal_enabled: false,
-                            last_checkpoint: 0,
+                            // Observability only (#89 step 2): rows durable on disk at open
+                    // (== row_count — recovery already realigned the columns).  NOT
+                    // load-bearing for recovery, which reads the column lengths.
+                    last_checkpoint: self.row_count as u64,
                             compaction_epoch: 0,
                             format_version: 1,
                             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -2041,6 +2146,20 @@ impl RustGenerator {
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
                         }
+                    }
+
+                    /// Make this junction's id columns durable (#89 step 2).  M2M
+                    /// junctions have no WAL (a #89 boundary — link appends are not
+                    /// yet crash-recovered), so there is nothing to truncate; this
+                    /// only fsyncs the two columns so a `Database::checkpoint()`
+                    /// leaves link rows as durable as model rows.
+                    pub fn checkpoint(&mut self) {
+                        self.left_col
+                            .flush()
+                            .expect("Failed to fsync junction left column on checkpoint");
+                        self.right_col
+                            .flush()
+                            .expect("Failed to fsync junction right column on checkpoint");
                     }
 
                     /// Every recorded (left, right) id pair.

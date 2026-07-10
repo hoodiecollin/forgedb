@@ -11,6 +11,7 @@ use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};
 use forgedb_types::{Uuid, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 ///GeoPoint embedded struct
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -37,6 +38,7 @@ pub struct PlaceStorage {
     location_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
+    writes_since_checkpoint: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PlaceStorage {
@@ -87,6 +89,7 @@ impl PlaceStorage {
                     forgedb_wal::FsyncPolicy::Always,
                 )
                 .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -126,7 +129,7 @@ impl PlaceStorage {
             row_count: self.row_count,
             columns,
             wal_enabled: false,
-            last_checkpoint: 0,
+            last_checkpoint: self.row_count as u64,
             compaction_epoch: 0,
             format_version: 1,
             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -189,6 +192,10 @@ impl PlaceStorage {
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
+        }
         id
     }
     /// Append a superseding version of an existing record (#66).
@@ -244,6 +251,10 @@ impl PlaceStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Updated);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -304,6 +315,10 @@ impl PlaceStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -386,6 +401,18 @@ impl PlaceStorage {
                 self.row_count += 1;
             }
         }
+    }
+    /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+    /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+    /// required for correctness (recovery reads the column lengths).
+    pub fn checkpoint(&mut self) {
+        self.id_col.flush().expect("Failed to fsync column on checkpoint");
+        self.name_col.flush().expect("Failed to fsync column on checkpoint");
+        self.description_col.flush().expect("Failed to fsync column on checkpoint");
+        self.location_col.flush().expect("Failed to fsync column on checkpoint");
+        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
+        self.writes_since_checkpoint = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -729,6 +756,16 @@ impl Database {
         DatabaseSnapshot {
             place: self.place.snapshot(),
         }
+    }
+    /// Force a WAL checkpoint across every collection (#89 step 2):
+    /// fsync all columns and truncate every model WAL now, bounding
+    /// the WALs and shortening the next reopen.  Models fsync-then-
+    /// truncate their WAL; junctions (no WAL — a #89 boundary) only
+    /// fsync their id columns.  Runs automatically every
+    /// `WAL_CHECKPOINT_INTERVAL` mutations per collection; this is the
+    /// explicit, force-now entry point.  Single-writer only.
+    pub fn checkpoint(&mut self) {
+        self.place.checkpoint();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's

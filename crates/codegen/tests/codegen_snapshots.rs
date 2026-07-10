@@ -1334,6 +1334,92 @@ User {
 }
 
 #[test]
+fn test_rust_generation_wal_checkpoint() {
+    // WAL checkpoint (#89 step 2 — bound the WAL): a generated `checkpoint()`
+    // fsyncs every column + tombstone THEN truncates the WAL (order load-bearing),
+    // auto-invoked once `writes_since_checkpoint` reaches the generated interval.
+    // A `Database::checkpoint()` forces it across every collection.  Pure generated
+    // wiring over existing substrate (`flush()` / `truncate()`) — no new substrate.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: u32
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  users: [User]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // A fixed, generated checkpoint interval (not config — same posture as the
+    // fixed fsync policy) and an in-struct counter that drives it.
+    assert!(
+        code.contains("const WAL_CHECKPOINT_INTERVAL: u64"),
+        "generated checkpoint interval constant"
+    );
+    assert!(
+        code.contains("writes_since_checkpoint: u64"),
+        "storage tracks mutations since the last checkpoint"
+    );
+
+    // The checkpoint fsyncs columns BEFORE truncating the WAL (the correctness
+    // ordering) and resets the counter.
+    assert!(
+        code.contains("pub fn checkpoint(&mut self)"),
+        "generated per-model checkpoint method"
+    );
+    assert!(
+        code.contains("self.tombstones.flush()") && code.contains("self.wal.truncate()"),
+        "checkpoint fsyncs columns/tombstones then truncates the WAL"
+    );
+    let flush_pos = code.find(".flush().expect(\"Failed to fsync tombstones on checkpoint\")");
+    let trunc_pos = code.find(".truncate().expect(\"Failed to truncate WAL on checkpoint\")");
+    assert!(
+        matches!((flush_pos, trunc_pos), (Some(f), Some(t)) if f < t),
+        "columns are fsync'd before the WAL is truncated (durability ordering)"
+    );
+
+    // Auto-invoked from the mutation path once the interval is reached.
+    assert!(
+        code.contains("self.writes_since_checkpoint += 1;")
+            && code.contains("if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL"),
+        "mutations count toward and trigger the auto-checkpoint"
+    );
+
+    // Database-wide force-checkpoint across every collection.
+    assert!(
+        code.contains("self.user.checkpoint();") && code.contains("self.tag.checkpoint();"),
+        "Database::checkpoint() checkpoints every model collection"
+    );
+
+    // Care item (identity/observability): the manifest's last_checkpoint is set
+    // truthfully to the row count, NOT hardcoded 0, and is NOT load-bearing for
+    // recovery (recovery reads column lengths, not this field).
+    assert!(
+        code.contains("last_checkpoint: self.row_count as u64"),
+        "manifest last_checkpoint reflects the durable row count (observability)"
+    );
+    assert!(
+        !code.contains("last_checkpoint: 0"),
+        "no hardcoded-0 checkpoint left in the manifest"
+    );
+
+    // Junctions (no WAL — a #89 boundary) still fsync their id columns at checkpoint
+    // so a full Database::checkpoint() leaves link rows as durable as model rows.
+    assert!(
+        code.contains("Failed to fsync junction left column on checkpoint"),
+        "junction checkpoint fsyncs its id columns (no WAL to truncate)"
+    );
+}
+
+#[test]
 fn test_rust_generation_changefeed_emits() {
     // Change notifications (#62 Direction A): generated insert()/link_* emit a
     // FIELD-BLIND (model, row_index) signal into a shared substrate ChangeFeed;
