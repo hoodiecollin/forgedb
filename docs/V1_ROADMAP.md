@@ -26,8 +26,8 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 
 | Tier | Requirement | State | Evidence |
 |---|---|---|---|
-| **0** Data you can trust | Crash-safe durability | 🔴 | `wal` unwired, no fsync, no recovery (`crates/codegen/src/rust.rs:1133-1246`) |
-| | Bounded storage | 🟡 | engine real but **manual-only** → grows forever by default |
+| **0** Data you can trust | Crash-safe durability | ✅ | #89 LANDED: WAL commit + fsync + reopen recovery + single-writer lock (`kill -9` E2E: 0 acked rows lost) |
+| | Bounded storage | 🟡 | **WAL** bounded (#96 checkpoint LANDED); **column** storage still manual-compaction-only → grows until `forgedb compact` |
 | | Schema evolution w/o data loss | 🔴 | infra only; no data-transform engine; `AddField` doesn't backfill |
 | | Constraint integrity (unique/FK) | 🔴 | unchecked at write |
 | **1** Real-app capability | Query surface (filter/sort/paginate) | 🔴 | **list endpoint returns `{"data":[]}`** (`crates/codegen/src/api.rs:168-171`) |
@@ -42,8 +42,11 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 
 Ordered by "what makes it a database at all," not by what is most visible.
 
-### Phase 1 — Durable write path · [#89](https://github.com/hoodiecollin/forgedb/issues/89) · *Tier 0 · the blocker*
+### Phase 1 — Durable write path · [#89](https://github.com/hoodiecollin/forgedb/issues/89) · *Tier 0 · the blocker* · ✅ LANDED (unpublished)
 Wire WAL → flush/fsync → recovery-on-open into the generated write path; add the single-writer lock. **Done when** a `kill -9` writer-stress test shows zero lost/corrupted committed rows and a second writer is safely refused.
+- **Step 1 (#89):** WAL commit boundary + fsync + reopen recovery (torn-tail truncate + idempotent replay) + `DirLock` single-writer. `kill -9` E2E: 0 acked rows lost.
+- **Step 2 (#96):** bound the WAL — generated `checkpoint()` (fsync columns → truncate WAL) auto-invoked past a fixed interval; reopen no longer replays the whole history. E2E: WAL sawtoothed/bounded under sustained writes; 23 rows recovered from a 309-byte WAL.
+- **Remaining to close Phase 1:** publish `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` (the publish gap).
 
 ### Phase 2 — Readable database · [#90](https://github.com/hoodiecollin/forgedb/issues/90) · *Tier 1 · co-critical*
 Real list endpoint; filter/sort/pagination (wire `query-params`); generated secondary indexes + `find_by_*`. **Done when** list+filter+sort+paginate work over a real schema and an indexed lookup is a probe, not a scan.
