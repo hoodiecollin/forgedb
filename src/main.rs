@@ -148,6 +148,10 @@ enum Commands {
     #[command(subcommand)]
     Backup(BackupCommands),
 
+    /// Manage physical, dir-per-tenant data directories (#59 multi-tenancy)
+    #[command(subcommand)]
+    Tenant(TenantCommands),
+
     /// Start ForgeDB server (Rust API + Bun Runtime + nginx)
     Serve {
         /// Host address
@@ -203,6 +207,40 @@ enum MigrateCommands {
         /// Number of migrations to rollback (default: 1)
         #[arg(short, long)]
         steps: Option<usize>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TenantCommands {
+    /// Create a new tenant's data directory under the tenant root
+    Create {
+        /// Tenant name (becomes the directory name under the root)
+        name: String,
+        /// Tenant root directory (default: from forgedb.toml `[tenant].root`, else ./data)
+        #[arg(short, long)]
+        root: Option<String>,
+    },
+
+    /// List existing tenant data directories under the tenant root
+    List {
+        /// Tenant root directory (default: from forgedb.toml `[tenant].root`, else ./data)
+        #[arg(short, long)]
+        root: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove a tenant's data directory (destructive)
+    Drop {
+        /// Tenant name to remove
+        name: String,
+        /// Tenant root directory (default: from forgedb.toml `[tenant].root`, else ./data)
+        #[arg(short, long)]
+        root: Option<String>,
+        /// Skip the confirmation guard
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -479,6 +517,37 @@ fn run(cli: Cli) -> Result<()> {
                 })
             }
         },
+
+        Commands::Tenant(tenant_cmd) => {
+            // Root precedence: --root flag > [tenant].root in config > ./data.
+            let default_root = forge_config.tenant.root();
+            let resolve = |root: Option<String>| {
+                root.map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| default_root.clone())
+            };
+            match tenant_cmd {
+                TenantCommands::Create { name, root } => {
+                    commands::tenant::create(commands::tenant::CreateOptions {
+                        name,
+                        root: resolve(root),
+                        auth_env: forge_config.auth.env_exports(),
+                    })
+                }
+                TenantCommands::List { root, json } => {
+                    commands::tenant::list(commands::tenant::ListOptions {
+                        root: resolve(root),
+                        json,
+                    })
+                }
+                TenantCommands::Drop { name, root, force } => {
+                    commands::tenant::drop(commands::tenant::DropOptions {
+                        name,
+                        root: resolve(root),
+                        force,
+                    })
+                }
+            }
+        }
     }
 }
 

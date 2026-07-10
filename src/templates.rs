@@ -147,6 +147,27 @@ schema = "schema.forge"
 output = "./generated"
 # Uncomment to restrict which targets are generated:
 # targets = ["rust", "typescript", "api", "stubs"]
+
+# Multi-tenancy (#59): physical, dir-per-tenant isolation. Each tenant's data
+# lives under <root>/<tenant>/, and ONE `forgedb serve` process serves ONE
+# tenant (process-per-tenant). Manage tenant dirs with `forgedb tenant`.
+[tenant]
+root = "./data"
+
+# Verify-only JWT tenant guard for the generated server (#59). ForgeDB verifies
+# tokens signed by YOUR identity provider (Auth0/Clerk/Cognito/…) — it never
+# issues tokens. The generated process reads these at runtime via env
+# (FORGEDB_TENANT selects which tenant this process serves); this table is the
+# declarative source. Off by default.
+[auth]
+enabled = false
+# issuer = "https://your-idp.example/"
+# audience = "your-api"
+# tenant_claim = "tenant"          # claim carrying the tenant id
+# jwks_url = "https://your-idp.example/.well-known/jwks.json"
+# public_key_path = "./idp_pub.pem"  # alternative to jwks_url (static key)
+# algorithms = ["RS256"]           # asymmetric only
+# leeway_secs = 60
 "#,
         project_name
     )
