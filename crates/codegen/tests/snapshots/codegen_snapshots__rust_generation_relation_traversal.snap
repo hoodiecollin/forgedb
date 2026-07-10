@@ -11,6 +11,7 @@ use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};
 use forgedb_types::{Uuid, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 ///User model
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -27,6 +28,7 @@ pub struct UserStorage {
     name_col: VariableColumn,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
+    writes_since_checkpoint: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl UserStorage {
@@ -67,6 +69,7 @@ impl UserStorage {
                     forgedb_wal::FsyncPolicy::Always,
                 )
                 .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -101,7 +104,7 @@ impl UserStorage {
             row_count: self.row_count,
             columns,
             wal_enabled: false,
-            last_checkpoint: 0,
+            last_checkpoint: self.row_count as u64,
             compaction_epoch: 0,
             format_version: 1,
             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -143,6 +146,10 @@ impl UserStorage {
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
+        }
         id
     }
     /// Append a superseding version of an existing record (#66).
@@ -177,6 +184,10 @@ impl UserStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -216,6 +227,10 @@ impl UserStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("User", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -263,6 +278,16 @@ impl UserStorage {
                 self.row_count += 1;
             }
         }
+    }
+    /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+    /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+    /// required for correctness (recovery reads the column lengths).
+    pub fn checkpoint(&mut self) {
+        self.id_col.flush().expect("Failed to fsync column on checkpoint");
+        self.name_col.flush().expect("Failed to fsync column on checkpoint");
+        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
+        self.writes_since_checkpoint = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -499,6 +524,7 @@ pub struct PostStorage {
     editor_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
+    writes_since_checkpoint: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PostStorage {
@@ -546,6 +572,7 @@ impl PostStorage {
                     forgedb_wal::FsyncPolicy::Always,
                 )
                 .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -589,7 +616,7 @@ impl PostStorage {
             row_count: self.row_count,
             columns,
             wal_enabled: false,
-            last_checkpoint: 0,
+            last_checkpoint: self.row_count as u64,
             compaction_epoch: 0,
             format_version: 1,
             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -643,6 +670,10 @@ impl PostStorage {
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
+        }
         id
     }
     /// Append a superseding version of an existing record (#66).
@@ -689,6 +720,10 @@ impl PostStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Updated);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -740,6 +775,10 @@ impl PostStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -813,6 +852,18 @@ impl PostStorage {
                 self.row_count += 1;
             }
         }
+    }
+    /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+    /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+    /// required for correctness (recovery reads the column lengths).
+    pub fn checkpoint(&mut self) {
+        self.id_col.flush().expect("Failed to fsync column on checkpoint");
+        self.title_col.flush().expect("Failed to fsync column on checkpoint");
+        self.author_col.flush().expect("Failed to fsync column on checkpoint");
+        self.editor_col.flush().expect("Failed to fsync column on checkpoint");
+        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
+        self.writes_since_checkpoint = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1081,6 +1132,7 @@ pub struct TagStorage {
     label_col: VariableColumn,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
+    writes_since_checkpoint: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl TagStorage {
@@ -1119,6 +1171,7 @@ impl TagStorage {
                     forgedb_wal::FsyncPolicy::Always,
                 )
                 .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -1153,7 +1206,7 @@ impl TagStorage {
             row_count: self.row_count,
             columns,
             wal_enabled: false,
-            last_checkpoint: 0,
+            last_checkpoint: self.row_count as u64,
             compaction_epoch: 0,
             format_version: 1,
             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -1195,6 +1248,10 @@ impl TagStorage {
         if let Some(feed) = &self.changefeed {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
+        }
         id
     }
     /// Append a superseding version of an existing record (#66).
@@ -1229,6 +1286,10 @@ impl TagStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Updated);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -1268,6 +1329,10 @@ impl TagStorage {
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Tag", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            self.checkpoint();
         }
         true
     }
@@ -1315,6 +1380,16 @@ impl TagStorage {
                 self.row_count += 1;
             }
         }
+    }
+    /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+    /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+    /// required for correctness (recovery reads the column lengths).
+    pub fn checkpoint(&mut self) {
+        self.id_col.flush().expect("Failed to fsync column on checkpoint");
+        self.label_col.flush().expect("Failed to fsync column on checkpoint");
+        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
+        self.writes_since_checkpoint = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1681,7 +1756,7 @@ impl PostTagLink {
             row_count: self.row_count,
             columns,
             wal_enabled: false,
-            last_checkpoint: 0,
+            last_checkpoint: self.row_count as u64,
             compaction_epoch: 0,
             format_version: 1,
             row_anchor: Some(forgedb_storage::RowAnchor {
@@ -1705,6 +1780,19 @@ impl PostTagLink {
                 forgedb_changefeed::ChangeKind::Linked,
             );
         }
+    }
+    /// Make this junction's id columns durable (#89 step 2).  M2M
+    /// junctions have no WAL (a #89 boundary — link appends are not
+    /// yet crash-recovered), so there is nothing to truncate; this
+    /// only fsyncs the two columns so a `Database::checkpoint()`
+    /// leaves link rows as durable as model rows.
+    pub fn checkpoint(&mut self) {
+        self.left_col
+            .flush()
+            .expect("Failed to fsync junction left column on checkpoint");
+        self.right_col
+            .flush()
+            .expect("Failed to fsync junction right column on checkpoint");
     }
     /// Every recorded (left, right) id pair.
     pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
@@ -1892,6 +1980,19 @@ impl Database {
             tag: self.tag.snapshot(),
             post_tag_link: self.post_tag_link.snapshot(),
         }
+    }
+    /// Force a WAL checkpoint across every collection (#89 step 2):
+    /// fsync all columns and truncate every model WAL now, bounding
+    /// the WALs and shortening the next reopen.  Models fsync-then-
+    /// truncate their WAL; junctions (no WAL — a #89 boundary) only
+    /// fsync their id columns.  Runs automatically every
+    /// `WAL_CHECKPOINT_INTERVAL` mutations per collection; this is the
+    /// explicit, force-now entry point.  Single-writer only.
+    pub fn checkpoint(&mut self) {
+        self.user.checkpoint();
+        self.post.checkpoint();
+        self.tag.checkpoint();
+        self.post_tag_link.checkpoint();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
