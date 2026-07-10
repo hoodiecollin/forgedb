@@ -42,11 +42,11 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 
 Ordered by "what makes it a database at all," not by what is most visible.
 
-### Phase 1 — Durable write path · [#89](https://github.com/hoodiecollin/forgedb/issues/89) · *Tier 0 · the blocker* · ✅ LANDED (unpublished)
+### Phase 1 — Durable write path · [#89](https://github.com/hoodiecollin/forgedb/issues/89) · *Tier 0 · the blocker* · ✅ COMPLETE
 Wire WAL → flush/fsync → recovery-on-open into the generated write path; add the single-writer lock. **Done when** a `kill -9` writer-stress test shows zero lost/corrupted committed rows and a second writer is safely refused.
 - **Step 1 (#89):** WAL commit boundary + fsync + reopen recovery (torn-tail truncate + idempotent replay) + `DirLock` single-writer. `kill -9` E2E: 0 acked rows lost.
 - **Step 2 (#96):** bound the WAL — generated `checkpoint()` (fsync columns → truncate WAL) auto-invoked past a fixed interval; reopen no longer replays the whole history. E2E: WAL sawtoothed/bounded under sustained writes; 23 rows recovered from a 309-byte WAL.
-- **Remaining to close Phase 1:** publish `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` (the publish gap).
+- **Published (2026-07-10):** `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5`; the reclose is proven by an outside-repo `init → generate → cargo build` resolving them from crates.io. Phase 1 is fully closed.
 
 ### Phase 2 — Readable database · [#90](https://github.com/hoodiecollin/forgedb/issues/90) · *Tier 1 · co-critical*
 Real list endpoint; filter/sort/pagination (wire `query-params`); generated secondary indexes + `find_by_*`. **Done when** list+filter+sort+paginate work over a real schema and an indexed lookup is a probe, not a scan.
