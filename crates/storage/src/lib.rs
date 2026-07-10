@@ -101,23 +101,6 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
-//! ## Transaction Support via WAL
-//!
-//! ```rust,no_run
-//! use forgedb_storage::{Database, FsyncPolicy};
-//! use std::path::PathBuf;
-//!
-//! // Open database with WAL enabled
-//! let mut db = Database::open_with_wal(
-//!     PathBuf::from("./mydb"),
-//!     FsyncPolicy::Always
-//! )?;
-//!
-//! // Check if WAL is enabled
-//! assert!(db.has_wal());
-//! # Ok::<(), std::io::Error>(())
-//! ```
-//!
 //! # Durability Model
 //!
 //! Column files (`FixedColumn`, `VariableColumn`, `Tombstones`) **do not fsync on every append**.
@@ -127,8 +110,8 @@
 //!
 //! The **WAL is the crash-durability boundary**: all mutations should be recorded in the WAL
 //! (via [`WalManager`]) before being applied to the column files. On recovery, the WAL is replayed
-//! into the columnar materialization. Call `flush()` at commit / checkpoint boundaries (e.g. at the
-//! end of a transaction, before advancing the WAL checkpoint) to durably persist the column files.
+//! into the columnar materialization. Call `flush()` at commit / checkpoint boundaries to durably
+//! persist the column files.
 //!
 //! # Public API
 //!
@@ -144,25 +127,20 @@
 //!
 //! Types from [`forgedb-wal`](../forgedb_wal) for convenience:
 //! - [`FsyncPolicy`] - Controls when WAL is fsynced to disk
-//! - [`Transaction`] - Groups WAL operations with atomic commit
+//! - [`WalEntry`] - A framed opaque-bytes entry (model tag + `Raw` payload)
 //! - [`WalManager`] - High-level WAL interface
+//! - [`WalOperation`] - The `Raw { payload }` operation variant
 //!
 //! # Related Crates
 //!
-//! - [`forgedb-wal`](../forgedb_wal) - Write-Ahead Log for ACID properties
+//! - [`forgedb-wal`](../forgedb_wal) - Write-Ahead Log for durability
 //! - [`forgedb-compaction`](../forgedb_compaction) - Background compaction for space reclamation
-//! - [`forgedb-query-optimization`](../forgedb_query_optimization) - SIMD-optimized query execution
-//!
-//! # See Also
-//!
-//! - [README](./README.md) for detailed documentation and examples
-//! - [SPRINT2_PERSISTENCE.md](../../archive/sprint-summaries/SPRINT2_PERSISTENCE.md) - Original implementation
-//! - [SPRINT7_SUMMARY.md](../../archive/sprint-summaries/SPRINT7_SUMMARY.md) - WAL integration
 
-// Sprint 7: WAL re-exports
-pub use forgedb_wal::{
-    FsyncPolicy, Transaction, TransactionId, WalEntry, WalManager, WalOperation, WalValue,
-};
+// WAL re-exports (schema-agnostic substrate surface only)
+pub use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalOperation};
+
+mod dir_lock;
+pub use dir_lock::DirLock;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -614,6 +592,32 @@ impl FixedColumn {
         self.row_count == 0
     }
 
+    /// Truncate the column to hold exactly `rows` rows, discarding everything
+    /// after that point.
+    ///
+    /// This is the crash-recovery primitive: after replaying a WAL, generated
+    /// code calls `truncate_to_rows` on every column to realign them back to the
+    /// last consistent row watermark before resuming appends.  Any partial
+    /// trailing value left by a torn write is physically removed so the next
+    /// `append_*` lands at exactly row `rows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if `rows > self.len()` — truncation cannot
+    /// extend a column.  All other errors come from the underlying `set_len`
+    /// syscall.
+    pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
+        if rows > self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate_to_rows beyond current length",
+            ));
+        }
+        self.file.set_len((rows * self.value_size) as u64)?;
+        self.row_count = rows;
+        Ok(())
+    }
+
     /// Open a read-only, positionally-reading view over this column's file
     /// (#56 Direction B).  The returned [`FixedColumnReader`] shares the file
     /// via an independent (`try_clone`d) descriptor, so a single `&mut self`
@@ -739,6 +743,49 @@ impl VariableColumn {
         self.row_count == 0
     }
 
+    /// Truncate the column to hold exactly `rows` rows, discarding everything
+    /// after that point.
+    ///
+    /// The data file is cut at the byte immediately after the last byte of row
+    /// `rows - 1` (read from the offsets entry for that row).  The offsets file
+    /// is cut to `rows * 16` bytes.  Both in-memory counters are updated so the
+    /// next `append_string` lands at exactly row `rows`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if `rows > self.len()`.  All other errors
+    /// come from underlying I/O or `set_len` syscalls.
+    pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
+        if rows > self.row_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate_to_rows beyond current length",
+            ));
+        }
+
+        let data_len: u64 = if rows == 0 {
+            0
+        } else {
+            // Positionally read the (offset, length) pair for row `rows - 1`.
+            let offsets_pos = ((rows - 1) * 16) as u64;
+            let mut offset_buf = [0u8; 8];
+            let mut length_buf = [0u8; 8];
+            self.offsets_file
+                .read_exact_at(&mut offset_buf, offsets_pos)?;
+            self.offsets_file
+                .read_exact_at(&mut length_buf, offsets_pos + 8)?;
+            let offset = u64::from_le_bytes(offset_buf);
+            let length = u64::from_le_bytes(length_buf);
+            offset + length
+        };
+
+        self.offsets_file.set_len((rows * 16) as u64)?;
+        self.data_file.set_len(data_len)?;
+        self.current_data_offset = data_len;
+        self.row_count = rows;
+        Ok(())
+    }
+
     /// Open a read-only, positionally-reading view over this column's data +
     /// offsets files (#56 Direction B).  The returned [`VariableColumnReader`]
     /// shares both files via independent (`try_clone`d) descriptors, so a single
@@ -817,6 +864,25 @@ impl Tombstones {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Truncate the tombstone bitmap to hold exactly `rows` rows, discarding
+    /// everything after that point.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if `rows > self.len()`.  All other errors
+    /// come from the underlying `set_len` syscall.
+    pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
+        if rows > self.count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "truncate_to_rows beyond current length",
+            ));
+        }
+        self.file.set_len(rows as u64)?;
+        self.count = rows;
+        Ok(())
     }
 
     /// Open a read-only, positionally-reading view over this tombstone file
@@ -1067,9 +1133,9 @@ impl Database {
     /// This attaches a [`WalManager`] but does **not** itself replay outstanding
     /// WAL entries into the columnar files: the storage layer has no knowledge of
     /// how logged operations map onto column writes. Crash recovery is the
-    /// caller's responsibility — after opening, drive
-    /// [`WalManager::replay_committed`] (via [`Database::wal_mut`]) and apply each
-    /// committed entry before serving reads.
+    /// caller's responsibility — after opening, drive [`WalManager::replay`]
+    /// (via [`Database::wal_mut`]) and apply each entry's opaque `Raw` payload
+    /// before serving reads.
     pub fn open_with_wal(
         root_path: PathBuf,
         fsync_policy: forgedb_wal::FsyncPolicy,

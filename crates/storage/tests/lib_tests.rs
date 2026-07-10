@@ -760,3 +760,402 @@ fn test_reader_lockfree_concurrent_with_live_writer() {
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// truncate_to_rows: crash-recovery realignment for FixedColumn
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_column_truncate_to_rows_basic() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_fixed_basic");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    col.append_u64(10).unwrap();
+    col.append_u64(20).unwrap();
+    col.append_u64(30).unwrap();
+    col.append_u64(40).unwrap();
+    assert_eq!(col.len(), 4);
+
+    // Truncate to 2 rows.
+    col.truncate_to_rows(2).unwrap();
+    assert_eq!(col.len(), 2);
+    // Rows below the cut are intact.
+    assert_eq!(col.read_u64(0).unwrap(), 10);
+    assert_eq!(col.read_u64(1).unwrap(), 20);
+    // Rows above the cut are gone.
+    assert!(col.read_u64(2).is_err());
+
+    // The next append lands at exactly row 2.
+    col.append_u64(99).unwrap();
+    assert_eq!(col.len(), 3);
+    assert_eq!(col.read_u64(2).unwrap(), 99);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_truncate_to_rows_zero() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_fixed_zero");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    col.append_u64(1).unwrap();
+    col.append_u64(2).unwrap();
+    assert_eq!(col.len(), 2);
+
+    // Truncate to zero — all rows discarded.
+    col.truncate_to_rows(0).unwrap();
+    assert_eq!(col.len(), 0);
+    assert!(col.is_empty());
+    assert!(col.read_u64(0).is_err());
+
+    // Append resumes from row 0.
+    col.append_u64(42).unwrap();
+    assert_eq!(col.len(), 1);
+    assert_eq!(col.read_u64(0).unwrap(), 42);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_truncate_to_rows_beyond_length_errors() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_fixed_oob");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    col.append_u64(1).unwrap();
+
+    let err = col.truncate_to_rows(2).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_truncate_repairs_torn_tail() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_fixed_torn");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("c.bin");
+
+    // Write 3 full rows (8 bytes each = 24 bytes).
+    {
+        let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+        col.append_u64(10).unwrap();
+        col.append_u64(20).unwrap();
+        col.append_u64(30).unwrap();
+    }
+
+    // Simulate a partial/torn write by manually extending the file with 3 stray bytes,
+    // as if a crash happened mid-append of a 4th row.
+    {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(24 + 3).unwrap(); // 3 bytes of a partial 8-byte value
+    }
+
+    // Reopen: row_count = 27 / 8 = 3 (integer division floors the partial row).
+    let mut col = FixedColumn::new(path.clone(), 8).unwrap();
+    assert_eq!(col.len(), 3, "partial row is excluded from row_count");
+    // Verify the file is NOT yet clean (it still has 27 bytes).
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        27,
+        "stray bytes still present before truncate"
+    );
+
+    // Truncate to the current row count — this removes the torn tail.
+    col.truncate_to_rows(col.len()).unwrap();
+    assert_eq!(col.len(), 3);
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        24,
+        "file length is exact multiple of value_size after truncate"
+    );
+
+    // All three original values survive.
+    assert_eq!(col.read_u64(0).unwrap(), 10);
+    assert_eq!(col.read_u64(1).unwrap(), 20);
+    assert_eq!(col.read_u64(2).unwrap(), 30);
+
+    // Next append lands at row 3, not at some torn offset.
+    col.append_u64(40).unwrap();
+    assert_eq!(col.len(), 4);
+    assert_eq!(col.read_u64(3).unwrap(), 40);
+    assert_eq!(fs::metadata(&path).unwrap().len(), 32);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// truncate_to_rows: crash-recovery realignment for VariableColumn
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_variable_column_truncate_to_rows_basic() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_var_basic");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+
+    let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+    col.append_string("alpha").unwrap();
+    col.append_string("beta").unwrap();
+    col.append_string("gamma").unwrap();
+    col.append_string("delta").unwrap();
+    assert_eq!(col.len(), 4);
+
+    // Truncate to 2 rows.
+    col.truncate_to_rows(2).unwrap();
+    assert_eq!(col.len(), 2);
+    assert_eq!(col.read_string(0).unwrap(), "alpha");
+    assert_eq!(col.read_string(1).unwrap(), "beta");
+    assert!(col.read_string(2).is_err());
+
+    // The next append lands at row 2 with the correct data offset.
+    col.append_string("new").unwrap();
+    assert_eq!(col.len(), 3);
+    assert_eq!(col.read_string(2).unwrap(), "new");
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_variable_column_truncate_to_rows_zero() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_var_zero");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+
+    let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+    col.append_string("hello").unwrap();
+    col.append_string("world").unwrap();
+    assert_eq!(col.len(), 2);
+
+    col.truncate_to_rows(0).unwrap();
+    assert_eq!(col.len(), 0);
+    assert!(col.is_empty());
+    assert!(col.read_string(0).is_err());
+
+    // Files are empty.
+    assert_eq!(fs::metadata(&data_path).unwrap().len(), 0);
+    assert_eq!(fs::metadata(&offsets_path).unwrap().len(), 0);
+
+    // Append resumes cleanly from row 0.
+    col.append_string("fresh").unwrap();
+    assert_eq!(col.len(), 1);
+    assert_eq!(col.read_string(0).unwrap(), "fresh");
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_variable_column_truncate_to_rows_beyond_length_errors() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_var_oob");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+
+    let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+    col.append_string("x").unwrap();
+
+    let err = col.truncate_to_rows(2).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_variable_column_truncate_to_rows_persistence() {
+    // Verify that truncate + reopen + append is consistent.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_var_persist");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let data_path = temp_dir.join("data.bin");
+    let offsets_path = temp_dir.join("offsets.bin");
+
+    {
+        let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+        col.append_string("one").unwrap();
+        col.append_string("two").unwrap();
+        col.append_string("three").unwrap();
+        col.truncate_to_rows(2).unwrap();
+    }
+
+    // After reopen the state reflects the truncation.
+    {
+        let mut col = VariableColumn::new(data_path.clone(), offsets_path.clone()).unwrap();
+        assert_eq!(col.len(), 2);
+        assert_eq!(col.read_string(0).unwrap(), "one");
+        assert_eq!(col.read_string(1).unwrap(), "two");
+        assert!(col.read_string(2).is_err());
+
+        col.append_string("after").unwrap();
+    }
+
+    {
+        let col = VariableColumn::new(data_path, offsets_path).unwrap();
+        assert_eq!(col.len(), 3);
+        assert_eq!(col.read_string(2).unwrap(), "after");
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// truncate_to_rows: crash-recovery realignment for Tombstones
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tombstones_truncate_to_rows_basic() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_tomb_basic");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("tombstones.bin");
+
+    let mut t = Tombstones::new(path.clone()).unwrap();
+    t.append(false).unwrap();
+    t.append(true).unwrap();
+    t.append(false).unwrap();
+    t.append(true).unwrap();
+    assert_eq!(t.len(), 4);
+
+    // Truncate to 2 rows.
+    t.truncate_to_rows(2).unwrap();
+    assert_eq!(t.len(), 2);
+    assert!(!t.is_deleted(0).unwrap());
+    assert!(t.is_deleted(1).unwrap());
+    assert!(t.is_deleted(2).is_err());
+
+    // Next append lands at row 2.
+    t.append(false).unwrap();
+    assert_eq!(t.len(), 3);
+    assert!(!t.is_deleted(2).unwrap());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_tombstones_truncate_to_rows_zero() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_tomb_zero");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("tombstones.bin");
+
+    let mut t = Tombstones::new(path.clone()).unwrap();
+    t.append(true).unwrap();
+    t.append(false).unwrap();
+    assert_eq!(t.len(), 2);
+
+    t.truncate_to_rows(0).unwrap();
+    assert_eq!(t.len(), 0);
+    assert!(t.is_empty());
+    assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+    // Append resumes from row 0.
+    t.append(true).unwrap();
+    assert_eq!(t.len(), 1);
+    assert!(t.is_deleted(0).unwrap());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_tombstones_truncate_to_rows_beyond_length_errors() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_trunc_tomb_oob2");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("tombstones.bin");
+
+    let mut t = Tombstones::new(path.clone()).unwrap();
+    t.append(false).unwrap();
+
+    let err = t.truncate_to_rows(5).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// DirLock: single-writer advisory lock
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_dir_lock_acquire_fresh_dir_succeeds() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_dirlock_fresh");
+    let _ = fs::remove_dir_all(&temp_dir);
+
+    let lock = DirLock::acquire(&temp_dir).unwrap();
+    // The lock file must exist.
+    assert!(temp_dir.join(".forgedb.lock").exists());
+    drop(lock);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_dir_lock_second_acquire_while_held_fails() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_dirlock_conflict");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let lock1 = DirLock::acquire(&temp_dir).unwrap();
+
+    // A second acquire on the same directory — different file handle, same advisory
+    // lock target — must fail with WouldBlock.
+    let err = DirLock::acquire(&temp_dir).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "second acquire must be refused while first DirLock is alive"
+    );
+
+    // The first lock is still alive.
+    drop(lock1);
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_dir_lock_reacquire_after_drop_succeeds() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_dirlock_reacquire");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let lock1 = DirLock::acquire(&temp_dir).unwrap();
+    drop(lock1); // OS releases the advisory lock here.
+
+    // After the first lock is dropped, a new acquire must succeed.
+    let lock2 = DirLock::acquire(&temp_dir).unwrap();
+    drop(lock2);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_dir_lock_creates_parent_dir() {
+    let temp_dir =
+        std::env::temp_dir().join("forgedb_test_dirlock_mkdir").join("nested");
+    let _ = fs::remove_dir_all(
+        std::env::temp_dir().join("forgedb_test_dirlock_mkdir"),
+    );
+
+    // The directory does not exist — acquire must create it.
+    let lock = DirLock::acquire(&temp_dir).unwrap();
+    assert!(temp_dir.exists());
+    assert!(temp_dir.join(".forgedb.lock").exists());
+    drop(lock);
+
+    fs::remove_dir_all(std::env::temp_dir().join("forgedb_test_dirlock_mkdir")).unwrap();
+}
