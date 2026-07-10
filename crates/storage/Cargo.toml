@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-storage"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Storage engine for ForgeDB"
@@ -11,5 +11,7 @@ categories = ["database"]
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-forgedb-wal = { path = "../wal", version = "0.1.1" }
+forgedb-wal = { path = "../wal", version = "0.2.0" }
 uuid = { version = "1.6", features = ["v4"] }
+fs2 = "0.4"
+libc = "0.2.186"
