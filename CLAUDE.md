@@ -104,11 +104,11 @@ in `crates/`:
   backup / #56-A snapshot reads)
 - `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
   0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
-- `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (NOT yet published; scaffold
-  pins `forgedb-auth = "0.1"`)**. Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT
-  (JWKS or static PEM, algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant
-  claim, cross-checks it against the process's tenant → 403, injects an opaque `Principal`. Knows
-  nothing of models/rows/schema — same class as `http-server`/`changefeed`.
+- `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (published 2026-07-09)**.
+  Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM,
+  algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
+  against the process's tenant → 403, injects an opaque `Principal`. Knows nothing of
+  models/rows/schema — same class as `http-server`/`changefeed`.
 - `wal` — write-ahead log — **0.1.1**
 
 **Internal (0.1.0):**
@@ -188,11 +188,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
   the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
   Scaffold pins `forgedb-storage = "0.1.4"`, `forgedb-changefeed = "0.1"`, **`forgedb-auth = "0.1"`** (#59),
-  axum `ws`. History: the gap reopened for #57, #62-A, #66, #56-B — all closed — and **is REOPEN now for
-  #59: `forgedb-auth 0.1.0` is NOT yet published** but the scaffold pins it and the generated `main.rs`
-  links it. Publish `forgedb-auth 0.1.0` to reclose, then prove with an outside-repo `forgedb init →
-  generate → cargo build`. **Next thing that will reopen it:** any new substrate-crate dep or additive
-  substrate API the generated code starts requiring — publish before the scaffold pins it.
+  axum `ws`. History: the gap reopened for #57, #62-A, #66, #56-B, and **#59 — all closed**. #59 closed
+  2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
+  → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
+  `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
+  `main.rs` (which links `forgedb-auth`). **Next thing that will reopen it:** any new substrate-crate dep or
+  additive substrate API the generated code starts requiring — publish before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`

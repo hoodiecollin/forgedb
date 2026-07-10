@@ -12,9 +12,10 @@ tenant roots, JWT tenant=A → 200 at A's process, tenant=B → 403). Baseline 4
 **Deferred:** Layer 2 row-level `@tenant` (gated on nothing now — mutation surface #66 has landed —
 but scoped separately); model-C in-process registry (strict superset on the same `open_at` seam);
 JWKS-over-HTTP fetch in the scaffold (crate parses JWKS offline; fetch is a follow-up); RLS-style
-per-principal authz (#72); token issuance (#73, future). **Publish gap:** scaffold now pins
-`forgedb-auth = "0.1"` — must publish `forgedb-auth 0.1.0` before an outside-repo `forgedb init →
-build` resolves.
+per-principal authz (#72); token issuance (#73, future). **Publish gap CLOSED (2026-07-09):**
+`forgedb-auth 0.1.0` published + proven by an outside-repo `forgedb init → generate rust+api → cargo
+build` resolving it (+ storage 0.1.4 / changefeed 0.1.1 / types 0.2.0) from crates.io and compiling
+the generated code and the scaffold `main.rs`.
 
 **Original status (design phase):** DESIGN NOTE — product-gated. `forgedb-product-manager` verdict: **aligned-with-constraints** (one of the strongest codegen stories in the backlog). Maintainer-blessed direction (2026-07-06): **layered roadmap — Layer 1 physical isolation first (milestone), Layer 2 row-level `@tenant` scoping next (gated on the mutation surface); per-tenant *schemas* rejected**. Tenant lifecycle = **explicit `forgedb tenant` CLI**.
 
