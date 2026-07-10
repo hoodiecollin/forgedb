@@ -68,7 +68,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 432 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # 434 pass, 0 fail (incl. doctests)
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -85,9 +85,11 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 432 tests pass** (workspace, incl. doctests). 419→432 with #59 multi-tenancy (11
-`forgedb-auth` verify tests + 2 codegen guards). Dropped from 531 when the orphaned `fulltext` +
-`crud-api` crates were removed in Phase 3b. Ignore older claims of "531"/"521"/"466"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
+**Baseline: 434 tests pass** (workspace, incl. doctests). 419→432 with #59 multi-tenancy (11
+`forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
+(1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531 when the orphaned
+`fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
+"531"/"521"/"466"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
 
 ## Workspace layout
 
