@@ -1,4 +1,4 @@
-//! OpenAPI 3.0 specification generator.
+//! OpenAPI 3.1 specification generator.
 //!
 //! Emits a standalone OpenAPI document describing the REST surface the
 //! [`ApiGenerator`](crate::ApiGenerator) produces — **without compiling or
@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 pub struct OpenApiGenerator;
 
 impl OpenApiGenerator {
-    /// Generate an OpenAPI 3.0 spec (pretty-printed JSON) from a schema.
+    /// Generate an OpenAPI 3.1 spec (pretty-printed JSON) from a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         let spec = Self::build_spec(schema);
         let code = serde_json::to_string_pretty(&spec).map_err(|e| {
@@ -33,7 +33,7 @@ impl OpenApiGenerator {
 
         Ok(GeneratedCode {
             code,
-            description: format!("OpenAPI 3.0 specification ({} models)", schema.models.len()),
+            description: format!("OpenAPI 3.1 specification ({} models)", schema.models.len()),
         })
     }
 
@@ -57,7 +57,7 @@ impl OpenApiGenerator {
         }
 
         json!({
-            "openapi": "3.0.3",
+            "openapi": "3.1.0",
             "info": {
                 "title": "ForgeDB Generated API",
                 "version": "1.0.0",
@@ -259,10 +259,10 @@ impl OpenApiGenerator {
             }
             FieldType::StructType(struct_name) => Self::model_ref(struct_name),
             FieldType::OptionalStructType(struct_name) => {
-                // OpenAPI 3.0 can't add `nullable` directly to a `$ref`; wrap it.
+                // OpenAPI 3.1 / JSON Schema 2020-12: nullability is a schema, not
+                // a keyword — allow the ref or an explicit null.
                 json!({
-                    "allOf": [ Self::model_ref(struct_name) ],
-                    "nullable": true
+                    "anyOf": [ Self::model_ref(struct_name), { "type": "null" } ]
                 })
             }
             FieldType::Nullable(inner) => {
@@ -277,9 +277,8 @@ impl OpenApiGenerator {
                     "description": format!("Foreign key → {}", target)
                 }),
                 RelationType::OptionalReference(target) => json!({
-                    "type": "string",
+                    "type": ["string", "null"],
                     "format": "uuid",
-                    "nullable": true,
                     "description": format!("Foreign key → {}", target)
                 }),
                 // Virtual collections have no scalar body value.
@@ -289,14 +288,37 @@ impl OpenApiGenerator {
         })
     }
 
-    /// Mark a schema value nullable, wrapping a bare `$ref` in `allOf` (OpenAPI
-    /// 3.0 forbids sibling keywords next to `$ref`).
+    /// Mark a schema value nullable per OpenAPI 3.1 / JSON Schema 2020-12: append
+    /// `"null"` to a scalar `type`, or express a nullable composite (`$ref`,
+    /// `anyOf`/`allOf`, or a schema with no plain `type`) as `anyOf [schema,
+    /// null]`. There is no `nullable` keyword in 3.1.
     fn make_nullable(schema: &mut Value) {
-        if schema.get("$ref").is_some() {
-            let inner = schema.clone();
-            *schema = json!({ "allOf": [inner], "nullable": true });
-        } else if let Some(obj) = schema.as_object_mut() {
-            obj.insert("nullable".to_string(), Value::Bool(true));
+        match schema.get("type") {
+            // Scalar type: widen it to a `["<type>", "null"]` union in place.
+            Some(Value::String(t)) => {
+                let t = t.clone();
+                if let Some(obj) = schema.as_object_mut() {
+                    obj.insert(
+                        "type".to_string(),
+                        Value::Array(vec![Value::String(t), Value::String("null".to_string())]),
+                    );
+                }
+            }
+            // Already a type array: add "null" if not present.
+            Some(Value::Array(types)) => {
+                let mut types = types.clone();
+                if !types.iter().any(|v| v == "null") {
+                    types.push(Value::String("null".to_string()));
+                }
+                if let Some(obj) = schema.as_object_mut() {
+                    obj.insert("type".to_string(), Value::Array(types));
+                }
+            }
+            // No plain type ($ref / anyOf / allOf): wrap in an anyOf with null.
+            _ => {
+                let inner = schema.clone();
+                *schema = json!({ "anyOf": [inner, { "type": "null" }] });
+            }
         }
     }
 

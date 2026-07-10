@@ -363,19 +363,22 @@ across many domains live in `examples/` — see `examples/README.md`.**
   (bare columns stay at the join), and there is no selectivity re-estimation after pushdown.
   Guards: 9 `planner_tests` (IR parse + pushdown split/preserve/wrap).
 - **OpenAPI generation — RESTORED (#49).** Standalone `OpenApiGenerator` in
-  `crates/codegen/src/openapi.rs` emits an OpenAPI **3.0.3** document (`openapi.json`, pretty JSON
-  via `serde_json`) at schema-compile time — no compiling/running the generated crate. Paths
-  mirror the real generated routes exactly (`/api/<kebab>` list+create, `/api/<kebab>/{id}`
-  get+replace+delete, `{id}` string param); component schemas cover each model + inline struct,
-  map every `.forge` scalar/FK/nullable type, skip virtual collection + component fields, and mark
-  non-nullable fields `required`. Both call sites re-enabled in `src/commands/generate/mod.rs`
-  (the `openapi` single target + the `generate all` path). This is **distinct from** the runtime
-  `utoipa` `ApiDoc`/`openapi_json()` in `crates/codegen/src/api.rs` (left untouched) — that path
-  needs the app built and running; this is the offline artifact. Compile-test analogue for a
-  non-Rust artifact: `test_openapi_generation_is_valid_document` parses the output back and asserts
-  OpenAPI structure + `$ref` resolution. Guards: 2 snapshot + 2 structural codegen tests; e2e
-  proven by `generate openapi`/`generate all` over `examples/ecommerce-store` (9 models → 18 paths,
-  36 `$ref`s all resolved).
+  `crates/codegen/src/openapi.rs` emits an OpenAPI **3.1.0** document (`openapi.json`, pretty JSON
+  via `serde_json`) at schema-compile time — no compiling/running the generated crate. **3.1.0 to
+  match the runtime `utoipa` path** (utoipa 5.x serializes only 3.1.0), so both artifacts agree on
+  version; nullability is JSON-Schema-2020-12 style (`type: ["string","null"]` / `anyOf` with
+  `{type:null}`, **no** `nullable` keyword). Paths mirror the real generated routes exactly
+  (`/api/<kebab>` list+create, `/api/<kebab>/{id}` get+replace+delete, `{id}` string param);
+  component schemas cover each model + inline struct, map every `.forge` scalar/FK/nullable type,
+  skip virtual collection + component fields, and mark non-nullable fields `required`. Both call
+  sites re-enabled in `src/commands/generate/mod.rs` (the `openapi` single target + the `generate
+  all` path). This is **distinct from** the runtime `utoipa` `ApiDoc`/`openapi_json()` in
+  `crates/codegen/src/api.rs` (left untouched) — that path needs the app built and running; this is
+  the offline artifact. Compile-test analogue for a non-Rust artifact:
+  `test_openapi_generation_is_valid_document` parses the output back and asserts OpenAPI structure +
+  `$ref` resolution. Guards: 2 snapshot + 2 structural codegen tests; e2e proven by `generate
+  openapi`/`generate all` over `examples/ecommerce-store` (9 models → 18 paths, 36 `$ref`s all
+  resolved, 0 stray `nullable` keywords).
 
 ## Conventions
 
