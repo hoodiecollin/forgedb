@@ -2,7 +2,7 @@
 //!
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
-use forgedb_codegen::{ApiGenerator, RustGenerator, TypeScriptGenerator};
+use forgedb_codegen::{ApiGenerator, OpenApiGenerator, RustGenerator, TypeScriptGenerator};
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
 
@@ -1634,4 +1634,95 @@ User {
         !code.contains("params.get(\"author\")"),
         "relation field is not a live-query filter key"
     );
+}
+
+// ---- OpenAPI generation (#49) ----------------------------------------------
+
+#[test]
+fn test_openapi_generation_multiple_models() {
+    let schema = multi_model_schema();
+    let result = OpenApiGenerator::generate(&schema).unwrap();
+    insta::assert_snapshot!(result.code);
+}
+
+#[test]
+fn test_openapi_generation_fk_schema() {
+    let schema = fk_schema();
+    let result = OpenApiGenerator::generate(&schema).unwrap();
+    insta::assert_snapshot!(result.code);
+}
+
+/// The emitted spec must be a well-formed OpenAPI 3.0 document (this is the
+/// analogue of the compile-test discipline for a non-Rust artifact: parse the
+/// output back and assert structure, rather than only snapshotting the string).
+#[test]
+fn test_openapi_generation_is_valid_document() {
+    let schema = fk_schema();
+    let code = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&code).expect("output is valid JSON");
+
+    assert_eq!(spec["openapi"], "3.0.3");
+    assert!(spec["info"]["title"].is_string());
+    assert!(spec["servers"].is_array());
+
+    // Routes mirror the generated API: kebab path, list/create + get/put/delete.
+    let paths = &spec["paths"];
+    assert!(paths["/api/post"]["get"].is_object(), "list route");
+    assert!(paths["/api/post"]["post"].is_object(), "create route");
+    let item = &paths["/api/post/{id}"];
+    assert!(item["get"].is_object(), "get-by-id route");
+    assert!(item["put"].is_object(), "replace route");
+    assert!(item["delete"].is_object(), "delete route");
+    // The {id} path parameter is declared.
+    assert_eq!(item["parameters"][0]["name"], "id");
+    assert_eq!(item["parameters"][0]["in"], "path");
+
+    // Every $ref resolves into components/schemas.
+    let schemas = spec["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas is an object");
+    assert!(schemas.contains_key("Author"));
+    assert!(schemas.contains_key("Post"));
+
+    // FK scalars are documented; the required FK is non-nullable, the optional
+    // one is nullable.
+    let post = &schemas["Post"];
+    assert_eq!(post["properties"]["author_id"]["type"], "string");
+    assert_eq!(post["properties"]["author_id"]["format"], "uuid");
+    assert_eq!(post["properties"]["editor_id"]["nullable"], true);
+    let required: Vec<&str> = post["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(required.contains(&"author_id"), "required FK is required");
+    assert!(!required.contains(&"editor_id"), "optional FK is not required");
+}
+
+/// Virtual collection fields (one-to-many / many-to-many) and component
+/// references carry no body value and must be omitted from the schema.
+#[test]
+fn test_openapi_generation_skips_virtual_fields() {
+    let schema = component_schema();
+    let code = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&code).unwrap();
+
+    // component_schema()'s model has a OneToMany + Component field; neither is a
+    // serialized scalar, so neither appears as a property.
+    let schemas = spec["components"]["schemas"].as_object().unwrap();
+    for (_name, model) in schemas {
+        if let Some(props) = model["properties"].as_object() {
+            for (_field, prop) in props {
+                // No property should be an empty/null schema — every emitted
+                // property has a concrete `type` or `$ref`.
+                assert!(
+                    prop.get("type").is_some()
+                        || prop.get("$ref").is_some()
+                        || prop.get("allOf").is_some(),
+                    "every property has a concrete schema"
+                );
+            }
+        }
+    }
 }

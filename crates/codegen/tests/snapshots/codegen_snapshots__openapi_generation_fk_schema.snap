@@ -1,0 +1,397 @@
+---
+source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 1652
+expression: result.code
+---
+{
+  "components": {
+    "schemas": {
+      "Author": {
+        "description": "Author model",
+        "properties": {
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "Post": {
+        "description": "Post model",
+        "properties": {
+          "author_id": {
+            "description": "Foreign key → Author",
+            "format": "uuid",
+            "type": "string"
+          },
+          "editor_id": {
+            "description": "Foreign key → Author",
+            "format": "uuid",
+            "nullable": true,
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "author_id"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Auto-generated from a ForgeDB schema. Describes the REST surface emitted by the ForgeDB code generator.",
+    "title": "ForgeDB Generated API",
+    "version": "1.0.0"
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/api/author": {
+      "get": {
+        "operationId": "listAuthor",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Author"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "List of Author"
+          }
+        },
+        "summary": "List all Author",
+        "tags": [
+          "Author"
+        ]
+      },
+      "post": {
+        "operationId": "createAuthor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Author"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Author created"
+          },
+          "422": {
+            "description": "Invalid payload"
+          }
+        },
+        "summary": "Create new Author",
+        "tags": [
+          "Author"
+        ]
+      }
+    },
+    "/api/author/{id}": {
+      "delete": {
+        "operationId": "deleteAuthor",
+        "responses": {
+          "204": {
+            "description": "Author deleted"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Delete Author by ID",
+        "tags": [
+          "Author"
+        ]
+      },
+      "get": {
+        "operationId": "getAuthor",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Author"
+                }
+              }
+            },
+            "description": "Author"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get Author by ID",
+        "tags": [
+          "Author"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Identity of the Author",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "replaceAuthor",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Author"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Author replaced"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "Invalid payload"
+          }
+        },
+        "summary": "Replace Author by ID",
+        "tags": [
+          "Author"
+        ]
+      }
+    },
+    "/api/post": {
+      "get": {
+        "operationId": "listPost",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Post"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "List of Post"
+          }
+        },
+        "summary": "List all Post",
+        "tags": [
+          "Post"
+        ]
+      },
+      "post": {
+        "operationId": "createPost",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Post created"
+          },
+          "422": {
+            "description": "Invalid payload"
+          }
+        },
+        "summary": "Create new Post",
+        "tags": [
+          "Post"
+        ]
+      }
+    },
+    "/api/post/{id}": {
+      "delete": {
+        "operationId": "deletePost",
+        "responses": {
+          "204": {
+            "description": "Post deleted"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Delete Post by ID",
+        "tags": [
+          "Post"
+        ]
+      },
+      "get": {
+        "operationId": "getPost",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Post"
+                }
+              }
+            },
+            "description": "Post"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        },
+        "summary": "Get Post by ID",
+        "tags": [
+          "Post"
+        ]
+      },
+      "parameters": [
+        {
+          "description": "Identity of the Post",
+          "in": "path",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "put": {
+        "operationId": "replacePost",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Post replaced"
+          },
+          "400": {
+            "description": "Invalid id"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "422": {
+            "description": "Invalid payload"
+          }
+        },
+        "summary": "Replace Post by ID",
+        "tags": [
+          "Post"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "description": "Local generated server",
+      "url": "http://localhost:3000"
+    }
+  ]
+}

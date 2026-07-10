@@ -50,10 +50,12 @@
 pub mod rust;
 pub mod typescript;
 pub mod api;
+pub mod openapi;
 pub mod stubs;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
+pub use openapi::OpenApiGenerator;
 pub use rust::RustGenerator;
 pub use stubs::StubGenerator;
 pub use typescript::TypeScriptGenerator;
