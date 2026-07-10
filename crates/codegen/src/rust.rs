@@ -266,6 +266,15 @@ impl RustGenerator {
                 /// but the process died before the tombstone append) is excluded
                 /// and its orphaned column tail is overwritten by the next insert.
                 pub fn new() -> Self {
+                    Self::new_at(std::path::Path::new("."))
+                }
+
+                /// Open the model's storage rooted at `root` (#59): every column
+                /// and the tombstone file is joined under it.  `new()` passes `.`
+                /// (the historical CWD-relative layout); a per-tenant process
+                /// passes that tenant's data dir, so filesystem isolation is the
+                /// directory boundary — no query logic, no schema read at runtime.
+                pub fn new_at(root: &std::path::Path) -> Self {
                     let mut db = Self {
                         #storage_inits
                     };
@@ -273,7 +282,7 @@ impl RustGenerator {
                     // Refresh the physical-layout manifest on open (#57): cheap,
                     // off the insert hot path, gives schema-blind backup/inspector
                     // a current column map + row-count anchor.
-                    db.write_manifest();
+                    db.write_manifest(root);
                     db
                 }
 
@@ -692,7 +701,7 @@ impl RustGenerator {
 
                 inits.push(quote! {
                     #field_col_name: FixedColumn::new(
-                        PathBuf::from(#col_path),
+                        root.join(#col_path),
                         #value_size_expr
                     ).expect("Failed to create fixed column")
                 });
@@ -703,21 +712,26 @@ impl RustGenerator {
 
                 inits.push(quote! {
                     #field_col_name: VariableColumn::new(
-                        PathBuf::from(#data_path),
-                        PathBuf::from(#offsets_path)
+                        root.join(#data_path),
+                        root.join(#offsets_path)
                     ).expect("Failed to create variable column")
                 });
                 column_index += 1;
             }
         }
 
+        // Every column/tombstone path is joined under `root` — the data-dir the
+        // enclosing `new_at(root)` was handed.  `new()` passes `.` (CWD), so the
+        // no-arg path is byte-for-byte the old CWD-relative behavior; a per-tenant
+        // process (#59) passes that tenant's dir.  `root` is a plain value threaded
+        // through generated code — the substrate never learns the word "tenant".
         let tombstones_path = format!("{}/tombstones.bin", model_snake);
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
             #(#inits,)*
             tombstones: forgedb_storage::Tombstones::new(
-                PathBuf::from(#tombstones_path)
+                root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
             changefeed: None,
         }
@@ -918,7 +932,7 @@ impl RustGenerator {
             /// Write the physical-layout manifest for this model (#57).  Layout
             /// metadata only — schema-blind backup/inspector read it; it carries
             /// no `.forge` semantics.  Written at open, off the insert hot path.
-            fn write_manifest(&self) {
+            fn write_manifest(&self, root: &std::path::Path) {
                 let columns = vec![ #(#col_entries),* ];
                 let manifest = forgedb_storage::Manifest {
                     schema_version: 1,
@@ -935,7 +949,7 @@ impl RustGenerator {
                 };
                 // Best-effort: a failed manifest write must not abort the app;
                 // reopen/compaction anchor on the tombstone file, not this file.
-                let _ = manifest.save_to(std::path::Path::new(#manifest_path));
+                let _ = manifest.save_to(&root.join(#manifest_path));
             }
         }
     }
@@ -1566,6 +1580,30 @@ impl RustGenerator {
                 }
             }))
             .collect();
+        // Root-aware variant (#59): identical to `attach_stmts` but each
+        // collection opens under `root` (the process's tenant data dir) via
+        // `new_at(&root)` instead of the CWD-relative `new()`.  `Database::new()`
+        // and `Database::open_at(root)` share everything else.
+        let attach_stmts_at: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| {
+                let field = format_ident!("{}", Self::to_snake_case(&model.name));
+                let ty = format_ident!("{}Storage", model.name);
+                quote! {
+                    let mut #field = #ty::new_at(&root);
+                    #field.attach_changefeed(changefeed.clone());
+                }
+            })
+            .chain(m2m.iter().map(|m| {
+                let field = Self::junction_field_ident(m);
+                let ty = Self::junction_struct_ident(m);
+                quote! {
+                    let mut #field = #ty::new_at(&root);
+                    #field.attach_changefeed(changefeed.clone());
+                }
+            }))
+            .collect();
         let field_idents: Vec<_> = schema
             .models
             .iter()
@@ -1669,6 +1707,22 @@ impl RustGenerator {
                     }
                 }
 
+                /// Open the whole database rooted at `root` (#59): every model and
+                /// junction collection is opened under `root` via `new_at`, so a
+                /// single generated binary serves whichever data dir it is handed.
+                /// A per-tenant process passes that tenant's dir (e.g.
+                /// `<data>/<tenant>`), making tenant isolation the filesystem
+                /// boundary — no query logic, no `.forge` read at runtime.  `new()`
+                /// is exactly `open_at(".")`.
+                pub fn open_at(root: std::path::PathBuf) -> Self {
+                    let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+                    #(#attach_stmts_at)*
+                    Self {
+                        #(#field_idents,)*
+                        changefeed,
+                    }
+                }
+
                 /// Capture a consistent read snapshot across all collections.
                 /// Called on the single writer, so — because the writer is never
                 /// mid-mutation between calls — the per-collection watermarks are
@@ -1742,12 +1796,19 @@ impl RustGenerator {
                     /// is the count of fully-committed pairs; a torn link (left
                     /// written, right not) is excluded and overwritten by the next.
                     pub fn new() -> Self {
+                        Self::new_at(std::path::Path::new("."))
+                    }
+
+                    /// Open the junction storage rooted at `root` (#59): both uuid
+                    /// columns and the manifest are joined under it, so a per-tenant
+                    /// process's M2M links live under that tenant's dir.
+                    pub fn new_at(root: &std::path::Path) -> Self {
                         let left_col = FixedColumn::new(
-                            PathBuf::from(#left_path),
+                            root.join(#left_path),
                             16usize,
                         ).expect("Failed to create junction column");
                         let right_col = FixedColumn::new(
-                            PathBuf::from(#right_path),
+                            root.join(#right_path),
                             16usize,
                         ).expect("Failed to create junction column");
                         let row_count = right_col.len();
@@ -1757,7 +1818,7 @@ impl RustGenerator {
                             row_count,
                             changefeed: None,
                         };
-                        db.write_manifest();
+                        db.write_manifest(root);
                         db
                     }
 
@@ -1772,7 +1833,7 @@ impl RustGenerator {
                     /// (appended last per link, 16 bytes/row).  Layout only —
                     /// carries no relation semantics.  Best-effort; reopen anchors
                     /// on the file length regardless.
-                    fn write_manifest(&self) {
+                    fn write_manifest(&self, root: &std::path::Path) {
                         let columns = vec![
                             forgedb_storage::ColumnMetadata {
                                 name: "left".to_string(),
@@ -1804,7 +1865,7 @@ impl RustGenerator {
                                 bytes_per_row: 16usize,
                             }),
                         };
-                        let _ = manifest.save_to(std::path::Path::new(#manifest_path));
+                        let _ = manifest.save_to(&root.join(#manifest_path));
                     }
 
                     /// Record a link between a `left` (model1) id and a `right`

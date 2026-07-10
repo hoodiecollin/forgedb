@@ -282,7 +282,7 @@ pub struct ApiDoc;
 pub fn openapi_json() -> String {
     ApiDoc::openapi().to_json().unwrap()
 }
-/// Create the API router with all endpoints
+/// Create the API router with all endpoints (no auth).
 pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
@@ -291,4 +291,30 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
         .route(concat!("/subscribe/", "user"), get(subscribe_user))
         .route(concat!("/live-query/", "user"), get(subscribe_live_user))
         .with_state(db)
+}
+/// Create the API router with the tenant-auth guard layered over every
+/// route (#59).  Each request must carry a bearer JWT whose configured
+/// tenant claim equals this process's tenant — the `forgedb-auth`
+/// substrate verifies the signature (asymmetric, JWKS/static key,
+/// algorithm-pinned) and cross-checks the tenant, rejecting with 401
+/// (auth failure) or 403 (wrong tenant) before any handler runs; on
+/// success the verified `forgedb_auth::Principal` is injected into
+/// request extensions.  `auth` is built from deployment config
+/// (`forgedb.toml` / env), never from the `.forge` schema — the guard
+/// is a signed-string cross-check, not a schema-reading policy engine.
+///
+/// The guard also covers the WS `/subscribe` and `/live-query` routes;
+/// WS clients must send the token in the `Authorization` header (clients
+/// that cannot set WS headers are a documented limitation).
+pub fn create_router_with_auth(
+    db: Arc<RwLock<super::Database>>,
+    auth: Arc<forgedb_auth::Authenticator>,
+) -> Router {
+    create_router(db)
+        .layer(
+            axum::middleware::from_fn_with_state(
+                auth,
+                forgedb_auth::axum_mw::require_tenant,
+            ),
+        )
 }

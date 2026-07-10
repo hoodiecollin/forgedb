@@ -186,6 +186,42 @@ fn test_api_generation_has_all_crud_operations() {
 }
 
 #[test]
+fn test_rust_generation_root_threading() {
+    // #59: generated storage + Database must be openable under an arbitrary root
+    // (per-tenant data dir), and the no-arg constructors stay (CWD-relative).
+    let schema = multi_model_schema();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Per-storage root-aware constructor + the delegating no-arg one.
+    assert!(code.contains("pub fn new_at(root: &std::path::Path)"));
+    assert!(code.contains("pub fn new()"));
+    // Database-wide root open threads a PathBuf.
+    assert!(code.contains("pub fn open_at(root: std::path::PathBuf)"));
+    // Paths are joined under root, not hardcoded CWD-relative literals.
+    assert!(code.contains("root.join("));
+    assert!(
+        !code.contains("PathBuf::from(\""),
+        "no hardcoded CWD-relative column paths should remain"
+    );
+    // write_manifest is root-scoped so per-tenant manifests land under the tenant dir.
+    assert!(code.contains("fn write_manifest(&self, root: &std::path::Path)"));
+}
+
+#[test]
+fn test_api_generation_tenant_auth_router() {
+    // #59: the auth-guarded router variant layers the forgedb-auth tenant guard;
+    // the unguarded create_router stays for non-tenant use.
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub fn create_router("));
+    assert!(code.contains("pub fn create_router_with_auth("));
+    assert!(code.contains("auth: Arc<forgedb_auth::Authenticator>"));
+    assert!(code.contains("forgedb_auth::axum_mw::require_tenant"));
+    assert!(code.contains("axum::middleware::from_fn_with_state"));
+}
+
+#[test]
 fn test_api_openapi_doc_structure() {
     let schema = simple_user_schema();
     let result = ApiGenerator::generate(&schema).unwrap();
@@ -974,14 +1010,15 @@ Tag {
     let schema = parser.parse().unwrap();
     let code = RustGenerator::generate(&schema).unwrap().code;
 
-    // Every storage `new()` refreshes the physical-layout manifest on open.
+    // Every storage `new_at(root)` refreshes the physical-layout manifest on
+    // open, rooted under the (per-tenant) data dir (#59).
     assert!(
-        code.contains("db.write_manifest();"),
-        "model new() must refresh the layout manifest on open"
+        code.contains("db.write_manifest(root);"),
+        "model new_at() must refresh the root-scoped layout manifest on open"
     );
     assert!(
-        code.contains("fn write_manifest(&self)"),
-        "a write_manifest method must be generated"
+        code.contains("fn write_manifest(&self, root: &std::path::Path)"),
+        "a root-scoped write_manifest method must be generated"
     );
 
     // Manifest is built from the substrate types, layout-only.
@@ -1006,9 +1043,9 @@ Tag {
         "model manifest must anchor row count on tombstones.bin at 1 byte/row"
     );
     assert!(
-        code.contains("save_to(std :: path :: Path :: new(\"post/manifest.json\"))")
-            || code.contains("save_to(std::path::Path::new(\"post/manifest.json\"))"),
-        "model manifest must be written under the model directory"
+        code.contains("save_to(&root.join(\"post/manifest.json\"))")
+            || code.contains("save_to(& root.join(\"post/manifest.json\"))"),
+        "model manifest must be written under the (root-joined) model directory"
     );
 
     // Junction manifest anchors on fixed/right.bin at 16 bytes/row.
