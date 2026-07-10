@@ -1,45 +1,43 @@
 //! Write-Ahead Log (WAL) Implementation
 //!
-//! This module provides ACID properties and crash recovery through a WAL system.
+//! `forgedb-wal` is a **schema-agnostic substrate** crate. It stores and
+//! returns opaque byte records and knows nothing about any application schema.
 //!
-//! Architecture:
-//! - WAL entries are written before modifying data files
-//! - Each entry has: [length][type][model][data][checksum]
-//! - Checksums detect corruption
-//! - WAL replay on startup ensures durability
-//! - Transactions group operations with atomic commit
+//! ## Wire format
+//!
+//! Each entry on disk:
+//! ```text
+//! [4 bytes: total entry length (excluding this field)]
+//! [1 byte: operation type]
+//! [2 bytes: model name length]
+//! [N bytes: model name (UTF-8, opaque routing tag)]
+//! [M bytes: serialized operation data]
+//! [4 bytes: CRC32 checksum]
+//! ```
+//!
+//! Only one operation type exists:
+//! - `Raw` (`0x20`): `[payload_len (4 bytes LE)][payload_bytes...]`
+//!
+//! The WAL breaks at the first corrupt or incomplete entry and returns the
+//! valid prefix (torn-tail crash safety).
 use std::io;
 use std::path::{Path, PathBuf};
 
 mod entry;
 mod reader;
-mod transaction;
 mod writer;
 
-pub use entry::{WalEntry, WalOperation, WalValue};
-pub use reader::WalReader;
-pub use transaction::{Transaction, TransactionId, TransactionReplay};
+pub use entry::{WalEntry, WalOperation};
+pub use reader::{CorruptionInfo, WalReader};
 pub use writer::{FsyncPolicy, WalWriter};
 
-// WAL file format:
-//
-// Each entry:
-// [4 bytes: total entry length (excluding this field)]
-// [1 byte: operation type]
-// [2 bytes: model name length]
-// [N bytes: model name (UTF-8)]
-// [M bytes: serialized data (varies by operation)]
-// [4 bytes: CRC32 checksum]
-//
-// Operations:
-// - Insert (0x01): [record_id (16 bytes UUID)] [field_count] [field_data...]
-// - Update (0x02): [record_id] [field_count] [field_data...]
-// - Delete (0x03): [record_id]
-// - BeginTxn (0x10): [txn_id (8 bytes)]
-// - CommitTxn (0x11): [txn_id]
-// - RollbackTxn (0x12): [txn_id]
-
-/// WAL Manager - High-level interface for WAL operations
+/// WAL Manager — high-level interface for WAL operations.
+///
+/// Wraps a [`WalWriter`] and [`WalReader`] over a single WAL file. The
+/// manager provides the crash-recovery entry point ([`replay`]) and common
+/// lifecycle operations (`flush`, `rotate`, `truncate`).
+///
+/// [`replay`]: WalManager::replay
 pub struct WalManager {
     writer: WalWriter,
     reader: WalReader,
@@ -47,58 +45,40 @@ pub struct WalManager {
 }
 
 impl WalManager {
-    /// Open or create a WAL at the given path
+    /// Open or create a WAL at `path`.
+    ///
+    /// Creates any missing parent directories. The WAL file is opened for
+    /// append-only writes; an existing file is not truncated.
     pub fn open<P: AsRef<Path>>(path: P, fsync_policy: FsyncPolicy) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // Ensure parent directory exists
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let writer = WalWriter::new(&path, fsync_policy)?;
-        let mut reader = WalReader::new(&path)?;
+        let reader = WalReader::new(&path)?;
 
-        // Seed the global transaction-ID counter past any IDs already recorded
-        // on disk, so a restart cannot mint an ID that collides with a
-        // transaction already present in the WAL (which would confuse replay).
-        let max_txn_id = reader
-            .read_all()?
-            .iter()
-            .filter_map(|entry| match &entry.operation {
-                WalOperation::BeginTransaction { txn_id }
-                | WalOperation::CommitTransaction { txn_id }
-                | WalOperation::RollbackTransaction { txn_id } => Some(*txn_id),
-                _ => None,
-            })
-            .max();
-        if let Some(max) = max_txn_id {
-            transaction::seed_next_txn_id(max.saturating_add(1));
-        }
-
-        Ok(WalManager {
-            writer,
-            reader,
-            path,
-        })
+        Ok(WalManager { writer, reader, path })
     }
 
-    /// Write an entry to the WAL
+    /// Append an entry to the WAL.
     pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
         self.writer.write(entry)
     }
 
-    /// Flush the WAL to disk (fsync)
+    /// Flush buffered bytes to disk (fsync).
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 
-    /// Replay every entry from the WAL, in file order.
+    /// Replay every entry from the WAL in file order, passing each to
+    /// `callback`.
     ///
-    /// This is the raw stream: transaction markers are surfaced as-is and no
-    /// commit/rollback filtering is applied, so uncommitted or rolled-back
-    /// operations are included. Use [`WalManager::replay_committed`] when you
-    /// need atomic-commit semantics (skip rolled-back/incomplete transactions).
+    /// The replay is **schema-blind**: entries are returned as `WalEntry`
+    /// values carrying opaque `Raw` payloads. No decode step is applied.
+    /// Stops at the first corrupt or incomplete entry (torn tail) and returns
+    /// the entries recovered up to that point.
     pub fn replay<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
     where
         F: FnMut(&WalEntry) -> io::Result<()>,
@@ -112,64 +92,17 @@ impl WalManager {
         Ok(entries)
     }
 
-    /// Replay only the entries that belong to committed transactions, plus all
-    /// non-transactional entries.
-    ///
-    /// Entries recorded between a `BeginTransaction` and its `CommitTransaction`
-    /// are replayed only if that commit is present. Rolled-back transactions and
-    /// transactions left open by a crash (BEGIN with no COMMIT) are skipped, so
-    /// the callback observes exactly the durable, atomically-committed effects.
-    /// Transaction markers themselves are not passed to the callback. Returns the
-    /// entries that were applied.
-    pub fn replay_committed<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
-    where
-        F: FnMut(&WalEntry) -> io::Result<()>,
-    {
-        let entries = self.reader.read_all()?;
-
-        // First pass: learn which transactions reached a commit.
-        let mut replay = TransactionReplay::new();
-        for entry in &entries {
-            replay.process_entry(entry);
-        }
-
-        // Second pass: apply non-transactional entries and entries from
-        // committed transactions only.
-        let mut applied = Vec::new();
-        let mut current_txn: Option<TransactionId> = None;
-        for entry in entries {
-            match &entry.operation {
-                WalOperation::BeginTransaction { txn_id } => {
-                    current_txn = Some(*txn_id);
-                }
-                WalOperation::CommitTransaction { .. }
-                | WalOperation::RollbackTransaction { .. } => {
-                    current_txn = None;
-                }
-                _ => {
-                    let apply = match current_txn {
-                        Some(txn_id) => replay.is_committed(txn_id),
-                        None => true,
-                    };
-                    if apply {
-                        callback(&entry)?;
-                        applied.push(entry);
-                    }
-                }
-            }
-        }
-
-        Ok(applied)
-    }
-
-    /// Truncate the WAL (remove all entries)
+    /// Truncate the WAL, removing all entries.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.writer.truncate()?;
         self.reader = WalReader::new(&self.path)?;
         Ok(())
     }
 
-    /// Rotate the WAL (archive current and start fresh)
+    /// Rotate the WAL: archive the current file under a timestamped name and
+    /// start a fresh, empty WAL at the original path.
+    ///
+    /// Returns the path of the archived WAL file.
     pub fn rotate(&mut self) -> io::Result<PathBuf> {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -178,26 +111,22 @@ impl WalManager {
 
         let archive_path = self.path.with_extension(format!("log.{}", timestamp));
 
-        // Close current writer
         self.writer.flush()?;
-
-        // Rename current file
         std::fs::rename(&self.path, &archive_path)?;
 
-        // Create new WAL
         self.writer = WalWriter::new(&self.path, self.writer.fsync_policy())?;
         self.reader = WalReader::new(&self.path)?;
 
         Ok(archive_path)
     }
 
-    /// Check if WAL is empty
+    /// Returns `true` if the WAL file contains no entries (file length is 0).
     pub fn is_empty(&self) -> io::Result<bool> {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len() == 0)
     }
 
-    /// Get the size of the WAL in bytes
+    /// Returns the size of the WAL file in bytes.
     pub fn size(&self) -> io::Result<u64> {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len())
