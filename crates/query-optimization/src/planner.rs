@@ -5,7 +5,127 @@
 // - Join order optimization
 // - Predicate pushdown
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// Comparison operator in a structured predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateOp {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// One side of a predicate: a (possibly table-qualified) column reference, or a
+/// literal value carried verbatim (numbers, quoted strings, `true`/`false`/`null`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Operand {
+    /// `table.column` (qualified) or bare `column` (`table == None`).
+    Column {
+        table: Option<String>,
+        column: String,
+    },
+    /// An opaque literal, kept as its source text.
+    Literal(String),
+}
+
+impl Operand {
+    /// Classify a trimmed operand token as a literal or a column reference.
+    fn parse(token: &str) -> Operand {
+        let t = token.trim();
+        let is_literal = match t.chars().next() {
+            Some(c) if c.is_ascii_digit() => true,
+            Some('-') | Some('+') | Some('.') | Some('\'') | Some('"') => true,
+            _ => matches!(t, "true" | "false" | "null" | "NULL"),
+        };
+        if is_literal {
+            Operand::Literal(t.to_string())
+        } else if let Some((tbl, col)) = t.split_once('.') {
+            Operand::Column {
+                table: Some(tbl.trim().to_string()),
+                column: col.trim().to_string(),
+            }
+        } else {
+            Operand::Column {
+                table: None,
+                column: t.to_string(),
+            }
+        }
+    }
+}
+
+/// A structured predicate `<left> <op> <right>` parsed from a plan predicate
+/// string. This is the predicate IR that lets the planner attribute a predicate
+/// to a specific join side (see [`Predicate::tables_referenced`]).
+///
+/// The original source text is retained (`raw`) so a predicate can be re-emitted
+/// verbatim into a `Filter` node — the plan continues to speak strings, the IR is
+/// only an analysis lens over them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Predicate {
+    pub left: Operand,
+    pub op: PredicateOp,
+    pub right: Operand,
+    pub raw: String,
+}
+
+impl Predicate {
+    /// Parse a predicate string of the form `<operand> <op> <operand>`.
+    ///
+    /// Returns `None` when no comparison operator is present — the caller then
+    /// treats the predicate as unattributable and keeps it at the join output.
+    pub fn parse(raw: &str) -> Option<Predicate> {
+        // Ordered longest-first so `>=` is matched before `>`, etc.
+        const OPS: &[(&str, PredicateOp)] = &[
+            (">=", PredicateOp::Gte),
+            ("<=", PredicateOp::Lte),
+            ("!=", PredicateOp::Ne),
+            ("<>", PredicateOp::Ne),
+            ("=", PredicateOp::Eq),
+            (">", PredicateOp::Gt),
+            ("<", PredicateOp::Lt),
+        ];
+        // Scan left-to-right for the earliest operator; at each position the
+        // longest matching token wins (OPS is ordered to make that true).
+        for i in 0..raw.len() {
+            if !raw.is_char_boundary(i) {
+                continue;
+            }
+            for (tok, op) in OPS {
+                if raw[i..].starts_with(tok) {
+                    let left = Operand::parse(&raw[..i]);
+                    let right = Operand::parse(&raw[i + tok.len()..]);
+                    return Some(Predicate {
+                        left,
+                        op: *op,
+                        right,
+                        raw: raw.trim().to_string(),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The set of table names this predicate references through its qualified
+    /// column operands. Bare (unqualified) columns and literals contribute
+    /// nothing — so a predicate with no `table.column` operand refers to no
+    /// table and cannot be pushed to a side.
+    pub fn tables_referenced(&self) -> BTreeSet<String> {
+        let mut tables = BTreeSet::new();
+        for operand in [&self.left, &self.right] {
+            if let Operand::Column {
+                table: Some(t), ..
+            } = operand
+            {
+                tables.insert(t.clone());
+            }
+        }
+        tables
+    }
+}
 
 /// Cost estimate for a query operation
 #[derive(Debug, Clone, PartialEq)]
@@ -42,8 +162,10 @@ pub enum QueryPlanOp {
         index: String,
         selectivity: f64,
     },
-    /// Filter operation
+    /// Filter operation wrapping the sub-plan it applies to.
     Filter {
+        /// The operation whose output rows this filter is applied to.
+        input: Box<QueryPlanOp>,
         predicate: String,
         input_rows: usize,
         selectivity: f64,
@@ -217,10 +339,13 @@ impl QueryPlanner {
 
     /// Apply predicate pushdown optimization.
     ///
-    /// Moves filter predicates as close to the data source as possible.
-    /// No predicate is ever dropped: predicates that cannot be attributed to
-    /// a specific join side are preserved as a `Filter` node wrapping the join
-    /// output.
+    /// Moves filter predicates as close to the data source as possible. Over a
+    /// join, each predicate is attributed to a side by the tables its columns
+    /// reference (via the predicate IR): a predicate touching only the left
+    /// side's tables is pushed into the left sub-plan, only the right side's into
+    /// the right, and a genuinely cross-side predicate (a join condition, an
+    /// unqualified column, or an unparseable string) is preserved as a `Filter`
+    /// wrapping the join output. No predicate is ever dropped.
     pub fn pushdown_predicates(
         &self,
         plan: QueryPlanOp,
@@ -228,31 +353,26 @@ impl QueryPlanner {
     ) -> QueryPlanOp {
         match plan {
             QueryPlanOp::Join { left, right, join_type, estimated_rows } => {
-                // Partition predicates to push into each side.
-                // `partition_predicates_for_join` currently cannot inspect predicate
-                // structure (predicates are plain strings), so all predicates end up
-                // in `remaining`. They are preserved as a Filter wrapping the join
-                // output — correct (if not pushed-down-optimal).
-                let (left_preds, right_preds) =
-                    self.partition_predicates_for_join(&predicates);
+                // Collect the tables reachable through each side so a predicate can
+                // be matched to the side that can actually evaluate it.
+                let mut left_tables = HashSet::new();
+                collect_tables(&left, &mut left_tables);
+                let mut right_tables = HashSet::new();
+                collect_tables(&right, &mut right_tables);
 
-                // Predicates not routed to either side must be applied at join output.
-                let remaining: Vec<String> = predicates
-                    .iter()
-                    .filter(|p| !left_preds.contains(p) && !right_preds.contains(p))
-                    .cloned()
-                    .collect();
+                let (left_preds, right_preds, remaining) =
+                    self.partition_predicates_for_join(&predicates, &left_tables, &right_tables);
 
-                let optimized_left = if !left_preds.is_empty() {
-                    Box::new(self.pushdown_predicates(*left, left_preds))
-                } else {
+                let optimized_left = if left_preds.is_empty() {
                     left
+                } else {
+                    Box::new(self.pushdown_predicates(*left, left_preds))
                 };
 
-                let optimized_right = if !right_preds.is_empty() {
-                    Box::new(self.pushdown_predicates(*right, right_preds))
-                } else {
+                let optimized_right = if right_preds.is_empty() {
                     right
+                } else {
+                    Box::new(self.pushdown_predicates(*right, right_preds))
                 };
 
                 let join = QueryPlanOp::Join {
@@ -262,12 +382,13 @@ impl QueryPlanner {
                     estimated_rows,
                 };
 
-                // Wrap the join in a Filter when predicates remain unattributed,
-                // ensuring no predicate is silently dropped.
+                // Wrap the (already pushed-down) join in a Filter when predicates
+                // remain unattributed, ensuring no predicate is silently dropped.
                 if remaining.is_empty() {
                     join
                 } else {
                     QueryPlanOp::Filter {
+                        input: Box::new(join),
                         predicate: remaining.join(" AND "),
                         input_rows: estimated_rows,
                         selectivity: 0.1, // Conservative estimate
@@ -275,13 +396,13 @@ impl QueryPlanner {
                 }
             }
             QueryPlanOp::TableScan { table, row_count } => {
-                // Apply predicates directly to table scan
+                // Apply predicates directly on top of the table scan.
                 if predicates.is_empty() {
                     QueryPlanOp::TableScan { table, row_count }
                 } else {
-                    // Create filter operation on top of scan
                     let selectivity = 0.1; // Estimate, could be improved
                     QueryPlanOp::Filter {
+                        input: Box::new(QueryPlanOp::TableScan { table, row_count }),
                         predicate: predicates.join(" AND "),
                         input_rows: row_count,
                         selectivity,
@@ -292,16 +413,46 @@ impl QueryPlanner {
         }
     }
 
-    /// Partition predicates for left/right sides of a join.
+    /// Partition predicates for the left/right sides of a join.
     ///
-    /// Currently returns empty vecs because predicate strings carry no structured
-    /// table-attribution metadata. Callers must handle the all-remaining case by
-    /// wrapping the join in a Filter (see `pushdown_predicates`).
-    fn partition_predicates_for_join(&self, _predicates: &[String]) -> (Vec<String>, Vec<String>) {
-        // TODO: parse predicate strings to identify table/column references and
-        // route to the appropriate side. Until then, all predicates are "remaining"
-        // and get applied as a post-join Filter by the caller.
-        (Vec::new(), Vec::new())
+    /// Each predicate is parsed into the predicate IR and attributed by the
+    /// tables its qualified columns reference:
+    /// - references only tables on the left side → left,
+    /// - references only tables on the right side → right,
+    /// - references both sides, an unknown table, only unqualified columns, or
+    ///   fails to parse → remaining (kept at the join output).
+    ///
+    /// Returns `(left, right, remaining)` as the original predicate strings so
+    /// they round-trip verbatim into the plan.
+    fn partition_predicates_for_join(
+        &self,
+        predicates: &[String],
+        left_tables: &HashSet<String>,
+        right_tables: &HashSet<String>,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut remaining = Vec::new();
+
+        for p in predicates {
+            let refs = match Predicate::parse(p) {
+                Some(pred) => pred.tables_referenced(),
+                None => {
+                    remaining.push(p.clone());
+                    continue;
+                }
+            };
+
+            if !refs.is_empty() && refs.iter().all(|t| left_tables.contains(t)) {
+                left.push(p.clone());
+            } else if !refs.is_empty() && refs.iter().all(|t| right_tables.contains(t)) {
+                right.push(p.clone());
+            } else {
+                remaining.push(p.clone());
+            }
+        }
+
+        (left, right, remaining)
     }
 
     /// Create a complete query plan with cost estimation
@@ -320,9 +471,11 @@ impl QueryPlanner {
         current_cost += row_count as f64;
         operations.push(scan_op);
 
-        // Add filters
+        // Add filters, wrapping the scan they apply to.
         if !filters.is_empty() {
+            let input = operations.last().unwrap().clone();
             let filter_op = QueryPlanOp::Filter {
+                input: Box::new(input),
                 predicate: filters.join(" AND "),
                 input_rows: row_count,
                 selectivity: 0.1, // Estimate
@@ -351,6 +504,24 @@ impl QueryPlanner {
 impl Default for QueryPlanner {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Collect every table name reachable through a plan sub-tree, so a join can
+/// know which tables each of its sides can evaluate predicates against.
+fn collect_tables(op: &QueryPlanOp, out: &mut HashSet<String>) {
+    match op {
+        QueryPlanOp::TableScan { table, .. }
+        | QueryPlanOp::IndexScan { table, .. }
+        | QueryPlanOp::IndexRangeScan { table, .. } => {
+            out.insert(table.clone());
+        }
+        QueryPlanOp::Filter { input, .. } => collect_tables(input, out),
+        QueryPlanOp::Join { left, right, .. } => {
+            collect_tables(left, out);
+            collect_tables(right, out);
+        }
+        QueryPlanOp::Limit { input, .. } => collect_tables(input, out),
     }
 }
 

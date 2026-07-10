@@ -143,5 +143,7 @@ pub mod planner;
 pub mod statistics;
 
 pub use scan::{ColumnScan, ScanFilter, ScanResult};
-pub use planner::{QueryPlan, QueryPlanner, CostEstimate};
+pub use planner::{
+    CostEstimate, Operand, Predicate, PredicateOp, QueryPlan, QueryPlanOp, QueryPlanner,
+};
 pub use statistics::{IndexStats, IndexStatistics};
