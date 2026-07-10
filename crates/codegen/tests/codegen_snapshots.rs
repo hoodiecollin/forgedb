@@ -186,6 +186,23 @@ fn test_api_generation_has_all_crud_operations() {
 }
 
 #[test]
+fn test_api_generation_has_update_delete_endpoints() {
+    // #69: generated REST exposes update (PUT) + delete (DELETE) over the
+    // generated update()/delete() (#66), not just insert.
+    let schema = simple_user_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("async fn update_user"));
+    assert!(code.contains("async fn delete_user"));
+    // Wired on the /{id} route alongside get.
+    assert!(code.contains(".put(update_user)"));
+    assert!(code.contains(".delete(delete_user)"));
+    // Backed by the generated mutation surface.
+    assert!(code.contains(".update(key, record)"));
+    assert!(code.contains(".delete(key)"));
+}
+
+#[test]
 fn test_rust_generation_root_threading() {
     // #59: generated storage + Database must be openable under an arbitrary root
     // (per-tenant data dir), and the no-arg constructors stay (CWD-relative).
