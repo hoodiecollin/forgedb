@@ -1,5 +1,4 @@
 use forgedb_wal::*;
-use std::collections::HashMap;
 use std::time::Duration;
 
 #[test]
@@ -11,15 +10,9 @@ fn test_writer_always_fsync() {
     let wal_path = temp_dir.join("test.wal");
     let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Always).unwrap();
 
-    let mut fields = HashMap::new();
-    fields.insert(
-        "email".to_string(),
-        WalValue::String("test@example.com".to_string()),
-    );
-    let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
-
+    let entry = WalEntry::raw("User", b"row bytes".to_vec());
     writer.write(&entry).unwrap();
-    assert_eq!(writer.bytes_since_fsync(), 0); // Should be 0 after Always fsync
+    assert_eq!(writer.bytes_since_fsync(), 0); // flushed immediately
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
@@ -33,18 +26,12 @@ fn test_writer_never_fsync() {
     let wal_path = temp_dir.join("test.wal");
     let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Never).unwrap();
 
-    let mut fields = HashMap::new();
-    fields.insert(
-        "email".to_string(),
-        WalValue::String("test@example.com".to_string()),
-    );
-    let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
-
+    let entry = WalEntry::raw("User", b"row bytes".to_vec());
     writer.write(&entry).unwrap();
-    assert!(writer.bytes_since_fsync() > 0); // Should have unflushed bytes
+    assert!(writer.bytes_since_fsync() > 0); // unflushed bytes remain
 
     writer.flush().unwrap();
-    assert_eq!(writer.bytes_since_fsync(), 0); // Should be 0 after manual flush
+    assert_eq!(writer.bytes_since_fsync(), 0); // flushed after explicit call
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
@@ -59,18 +46,13 @@ fn test_writer_periodic_fsync() {
     let mut writer =
         WalWriter::new(&wal_path, FsyncPolicy::Periodic(Duration::from_millis(100))).unwrap();
 
-    let mut fields = HashMap::new();
-    fields.insert(
-        "email".to_string(),
-        WalValue::String("test@example.com".to_string()),
-    );
-    let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
+    let entry = WalEntry::raw("User", b"row bytes".to_vec());
 
-    // First write shouldn't fsync immediately
+    // First write should not fsync immediately
     writer.write(&entry).unwrap();
     assert!(writer.bytes_since_fsync() > 0);
 
-    // Wait for period to elapse
+    // Wait for the period to elapse
     std::thread::sleep(Duration::from_millis(150));
 
     // Next write should trigger fsync
@@ -89,13 +71,7 @@ fn test_writer_truncate() {
     let wal_path = temp_dir.join("test.wal");
     let mut writer = WalWriter::new(&wal_path, FsyncPolicy::Always).unwrap();
 
-    let mut fields = HashMap::new();
-    fields.insert(
-        "email".to_string(),
-        WalValue::String("test@example.com".to_string()),
-    );
-    let entry = WalEntry::insert("User".to_string(), uuid::Uuid::new_v4(), fields);
-
+    let entry = WalEntry::raw("User", b"row bytes".to_vec());
     writer.write(&entry).unwrap();
 
     let metadata = std::fs::metadata(&wal_path).unwrap();

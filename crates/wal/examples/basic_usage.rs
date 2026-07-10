@@ -1,109 +1,70 @@
 //! Basic usage example for forgedb-wal
 //!
-//! This example demonstrates creating a Write-Ahead Log (WAL),
-//! writing entries, and replaying them for crash recovery.
+//! Demonstrates creating a Write-Ahead Log (WAL), writing opaque `Raw`
+//! entries, and replaying them for crash recovery.
+//!
+//! The WAL is schema-agnostic: it stores and returns byte payloads verbatim.
+//! The encoding of each payload is owned entirely by the caller (generated
+//! code in production use).
 
-use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalValue};
-use std::collections::HashMap;
+use forgedb_wal::{FsyncPolicy, WalEntry, WalManager, WalOperation};
 use std::path::PathBuf;
 
 fn main() -> std::io::Result<()> {
     println!("=== ForgeDB WAL - Basic Usage ===\n");
 
-    // Create a temporary WAL file
     let wal_path = PathBuf::from("/tmp/forgedb_wal_basic_example.log");
 
-    // Clean up if exists
     if wal_path.exists() {
         std::fs::remove_file(&wal_path)?;
     }
 
-    // Create a new WAL with automatic fsync after every write
     println!("--- Creating WAL ---");
     let mut wal = WalManager::open(&wal_path, FsyncPolicy::Always)?;
     println!("WAL opened at: {:?}\n", wal_path);
 
-    // Write some Insert operations
-    println!("--- Writing Insert Operations ---");
-    
-    // Insert operation for a user record
-    let mut user_fields = HashMap::new();
-    user_fields.insert("id".to_string(), WalValue::U64(1));
-    user_fields.insert("name".to_string(), WalValue::String("Alice".to_string()));
-    user_fields.insert("age".to_string(), WalValue::U64(30));
-    user_fields.insert("active".to_string(), WalValue::Bool(true));
+    // In generated code the payload would be a serialized row struct.
+    // Here we use simple byte literals to illustrate the API.
+    println!("--- Writing Raw Entries ---");
 
-    let insert_entry = WalEntry::insert(
-        "User".to_string(),
-        uuid::Uuid::new_v4(),
-        user_fields,
-    );
+    let entry_a = WalEntry::raw("Post", b"serialized post row #1".to_vec());
+    wal.write(&entry_a)?;
+    println!("Wrote Raw entry for model 'Post'");
 
-    wal.write(&insert_entry)?;
-    println!("✓ Wrote insert for User: Alice");
+    let entry_b = WalEntry::raw("Comment", b"serialized comment row #1".to_vec());
+    wal.write(&entry_b)?;
+    println!("Wrote Raw entry for model 'Comment'");
 
-    // Insert another record
-    let mut user_fields2 = HashMap::new();
-    user_fields2.insert("id".to_string(), WalValue::U64(2));
-    user_fields2.insert("name".to_string(), WalValue::String("Bob".to_string()));
-    user_fields2.insert("age".to_string(), WalValue::U64(25));
-    user_fields2.insert("active".to_string(), WalValue::Bool(true));
-
-    let insert_entry2 = WalEntry::insert(
-        "User".to_string(),
-        uuid::Uuid::new_v4(),
-        user_fields2,
-    );
-
-    wal.write(&insert_entry2)?;
-    println!("✓ Wrote insert for User: Bob");
-
-    // Write an Update operation
-    println!("\n--- Writing Update Operation ---");
-    let mut update_fields = HashMap::new();
-    update_fields.insert("age".to_string(), WalValue::U64(31));
-    update_fields.insert("active".to_string(), WalValue::Bool(false));
-
-    let update_entry = WalEntry::update(
-        "User".to_string(),
-        uuid::Uuid::new_v4(),
-        update_fields,
-    );
-
-    wal.write(&update_entry)?;
-    println!("✓ Wrote update for User");
-
-    // Write a Delete operation
-    println!("\n--- Writing Delete Operation ---");
-    let delete_entry = WalEntry::delete("User".to_string(), uuid::Uuid::new_v4());
-    wal.write(&delete_entry)?;
-    println!("✓ Wrote delete for User");
-
-    // Flush to disk
     wal.flush()?;
-    println!("\n✓ All entries flushed to disk");
+    println!("\nAll entries flushed to disk");
 
-    // Check WAL statistics
     println!("\n--- WAL Statistics ---");
-    let size = wal.size()?;
-    let empty = wal.is_empty()?;
-    println!("WAL size: {} bytes", size);
-    println!("WAL empty: {}", empty);
+    println!("WAL size:  {} bytes", wal.size()?);
+    println!("WAL empty: {}", wal.is_empty()?);
 
-    // Replay the WAL (simulating crash recovery)
-    println!("\n--- Replaying WAL Entries ---");
-    let mut entry_count = 0;
+    println!("\n--- Replaying WAL Entries (crash recovery) ---");
+    let mut count = 0;
     wal.replay(|entry| {
-        entry_count += 1;
-        println!(
-            "Entry {}: {:?} on model '{}'",
-            entry_count, entry.operation, entry.model_name
-        );
+        count += 1;
+        match &entry.operation {
+            WalOperation::Raw { payload } => {
+                println!(
+                    "Entry {}: model='{}', payload_len={}",
+                    count,
+                    entry.model_name,
+                    payload.len()
+                );
+            }
+        }
         Ok(())
     })?;
+    println!("\nReplayed {} entries", count);
 
-    println!("\n✓ Successfully replayed {} entries", entry_count);
-    println!("\n✓ Example completed successfully!");
+    println!("\n--- WAL Rotation ---");
+    let archive = wal.rotate()?;
+    println!("Archived WAL at: {:?}", archive);
+    println!("Fresh WAL is empty: {}", wal.is_empty()?);
 
+    println!("\nExample completed successfully!");
     Ok(())
 }
