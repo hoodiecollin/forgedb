@@ -1652,7 +1652,7 @@ fn test_openapi_generation_fk_schema() {
     insta::assert_snapshot!(result.code);
 }
 
-/// The emitted spec must be a well-formed OpenAPI 3.0 document (this is the
+/// The emitted spec must be a well-formed OpenAPI 3.1 document (this is the
 /// analogue of the compile-test discipline for a non-Rust artifact: parse the
 /// output back and assert structure, rather than only snapshotting the string).
 #[test]
@@ -1661,7 +1661,7 @@ fn test_openapi_generation_is_valid_document() {
     let code = OpenApiGenerator::generate(&schema).unwrap().code;
     let spec: serde_json::Value = serde_json::from_str(&code).expect("output is valid JSON");
 
-    assert_eq!(spec["openapi"], "3.0.3");
+    assert_eq!(spec["openapi"], "3.1.0");
     assert!(spec["info"]["title"].is_string());
     assert!(spec["servers"].is_array());
 
@@ -1685,11 +1685,17 @@ fn test_openapi_generation_is_valid_document() {
     assert!(schemas.contains_key("Post"));
 
     // FK scalars are documented; the required FK is non-nullable, the optional
-    // one is nullable.
+    // one is nullable via a 3.1 `["string", "null"]` type union (no `nullable`
+    // keyword in 3.1).
     let post = &schemas["Post"];
     assert_eq!(post["properties"]["author_id"]["type"], "string");
     assert_eq!(post["properties"]["author_id"]["format"], "uuid");
-    assert_eq!(post["properties"]["editor_id"]["nullable"], true);
+    assert!(post["properties"]["editor_id"].get("nullable").is_none());
+    let editor_type = post["properties"]["editor_id"]["type"]
+        .as_array()
+        .expect("optional FK uses a type union");
+    assert!(editor_type.iter().any(|v| v == "string"));
+    assert!(editor_type.iter().any(|v| v == "null"));
     let required: Vec<&str> = post["required"]
         .as_array()
         .unwrap()
@@ -1719,7 +1725,7 @@ fn test_openapi_generation_skips_virtual_fields() {
                 assert!(
                     prop.get("type").is_some()
                         || prop.get("$ref").is_some()
-                        || prop.get("allOf").is_some(),
+                        || prop.get("anyOf").is_some(),
                     "every property has a concrete schema"
                 );
             }

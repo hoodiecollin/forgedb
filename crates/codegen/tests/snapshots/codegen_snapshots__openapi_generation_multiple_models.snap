@@ -43,7 +43,7 @@ expression: result.code
     "title": "ForgeDB Generated API",
     "version": "1.0.0"
   },
-  "openapi": "3.0.3",
+  "openapi": "3.1.0",
   "paths": {
     "/api/post": {
       "get": {

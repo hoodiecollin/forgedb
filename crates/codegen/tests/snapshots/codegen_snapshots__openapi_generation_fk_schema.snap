@@ -30,8 +30,10 @@ expression: result.code
           "editor_id": {
             "description": "Foreign key → Author",
             "format": "uuid",
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "format": "uuid",
@@ -55,7 +57,7 @@ expression: result.code
     "title": "ForgeDB Generated API",
     "version": "1.0.0"
   },
-  "openapi": "3.0.3",
+  "openapi": "3.1.0",
   "paths": {
     "/api/author": {
       "get": {
