@@ -2,19 +2,28 @@
 
 /**
  * The record editor — a right-side drawer of type-aware field controls. Update
- * is whole-record replace (ForgeDB's superseding-version append), never a
- * field-level partial update; the footer says so.
+ * is whole-record replace (ForgeDB's superseding-version append via the #69
+ * PUT endpoint), never a field-level partial update; the footer says so. In
+ * live mode against a real project, editing seeds the controls from the current
+ * row (fetched by id) and Save/Delete hit the generated REST surface.
  */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
+import { useEffect } from "react";
 import { toast } from "sonner";
 import {
+  apiBaseAtom,
   browseModelAtom,
   closeEditorAtom,
   connectedAtom,
+  deleteEditorRowAtom,
+  editBaseRowAtom,
+  editSubmittingAtom,
+  editValuesAtom,
   editorAtom,
   projectSourceAtom,
   schemaAtom,
+  submitEditorAtom,
 } from "@/lib/inspector/atoms";
 import { isTauri } from "@/lib/inspector/data-source";
 import { FieldControl } from "./field-control";
@@ -34,24 +43,79 @@ export function RecordEditor() {
   const schema = useAtomValue(schemaAtom);
   const source = useAtomValue(projectSourceAtom);
   const connected = useAtomValue(connectedAtom);
+  const apiBase = useAtomValue(apiBaseAtom);
+  const submit = useSetAtom(submitEditorAtom);
+  const del = useSetAtom(deleteEditorRowAtom);
+  const setBaseRow = useSetAtom(editBaseRowAtom);
+  const setValues = useSetAtom(editValuesAtom);
+  const submitting = useAtomValue(editSubmittingAtom);
 
   const fields = schema[editor.model] ?? [];
   const creating = editor.mode === "create";
-  // Live against a real API: the generated REST surface is insert-only — there is
-  // NO update or delete endpoint (those mutations exist in the DB layer, unexposed).
-  // So editing an existing row is read-only; typed insert submission is the next
-  // slice (the field controls aren't wired to collect values yet).
+  // Live against a real project: the generated REST surface now supports
+  // create (POST) + whole-record replace (PUT) + delete (#69), so the editor is
+  // writeable in both modes.
   const live = isTauri() && source === "project" && connected;
-  const readOnly = live && !creating;
+
+  // On opening an edit against a live row, fetch it and seed the controls so
+  // Save sends every generated struct field (the PUT is a whole-record replace).
+  useEffect(() => {
+    if (!editor.open || !live || creating || !editor.rowId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { getRow } = await import("@/lib/inspector/live");
+        const row = await getRow(apiBase, editor.model, editor.rowId ?? "");
+        if (cancelled || !row) return;
+        setBaseRow(row);
+        // Seed controlled scalar values with the row's string-coerced fields.
+        const seed: Record<string, string> = {};
+        for (const f of fields) {
+          const v = row[f.name];
+          if (v !== null && v !== undefined && typeof v !== "object") {
+            seed[f.name] = String(v);
+          }
+        }
+        setValues(seed);
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor.open, editor.model, editor.rowId, live, creating]);
 
   const followRelation = (target: string, label: string) => {
     closeEditor();
     browse({ model: target, pivot: `${label} of this ${editor.model}` });
   };
 
-  const save = () => {
-    closeEditor();
-    toast.success(creating ? "Record inserted" : "Record replaced");
+  const onSave = async () => {
+    if (!live) {
+      // Structure/mock preview — no backend to write to.
+      closeEditor();
+      toast.success(creating ? "Record inserted (preview)" : "Record replaced (preview)");
+      return;
+    }
+    try {
+      await submit();
+      closeEditor();
+      toast.success(creating ? "Record inserted" : "Record replaced");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const onDelete = async () => {
+    try {
+      await del();
+      closeEditor();
+      toast.success("Record deleted");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
@@ -81,21 +145,28 @@ export function RecordEditor() {
 
         <SheetFooter className="flex-row items-center gap-2.5 border-t border-border p-3.5">
           <span className="text-[11.5px] text-muted-foreground">
-            {readOnly
-              ? "read-only — the generated API is insert-only (no update/delete)"
-              : live && creating
-                ? "typed insert submission is not wired yet — preview only"
-                : "Update replaces the whole record"}
+            {live
+              ? "PUT replaces the whole record (superseding-version append)"
+              : "Update replaces the whole record"}
           </span>
           <span className="ml-auto" />
-          <Button variant="ghost" size="sm" onClick={() => closeEditor()}>
-            {readOnly ? "Close" : "Cancel"}
-          </Button>
-          {!readOnly ? (
-            <Button size="sm" onClick={save} disabled={live}>
-              {creating ? "Insert record" : "Save (replace)"}
+          {live && !creating ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-danger hover:text-danger"
+              onClick={onDelete}
+              disabled={submitting}
+            >
+              Delete
             </Button>
           ) : null}
+          <Button variant="ghost" size="sm" onClick={() => closeEditor()}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={onSave} disabled={submitting}>
+            {creating ? "Insert record" : "Save (replace)"}
+          </Button>
         </SheetFooter>
       </SheetContent>
     </Sheet>
