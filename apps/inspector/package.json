@@ -13,11 +13,13 @@
 		"tauri": "tauri"
 	},
 	"dependencies": {
+		"@dagrejs/dagre": "^3.0.0",
 		"@tauri-apps/api": "^2.11.1",
 		"@tauri-apps/plugin-dialog": "^2.7.1",
 		"@tauri-apps/plugin-http": "^2.5.9",
 		"@tauri-apps/plugin-opener": "^2.5.4",
 		"@tauri-apps/plugin-websocket": "^2.4.2",
+		"@xyflow/react": "^12.11.2",
 		"class-variance-authority": "^0.7.1",
 		"clsx": "^2.1.1",
 		"cmdk": "^1.1.1",

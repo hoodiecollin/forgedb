@@ -8,7 +8,7 @@
  */
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
-import { Boxes, Activity, TriangleAlert } from "lucide-react";
+import { Boxes, Activity } from "lucide-react";
 import {
   browseModelAtom,
   connectedAtom,
@@ -23,10 +23,9 @@ import {
 import type { Model } from "@/lib/inspector/types";
 import { Button } from "@/components/ui/button";
 import { NotAttached } from "./not-attached";
+import { RelationGraph } from "./relation-graph";
 import { cn } from "@/lib/utils";
 
-const dotColor = (h: string) =>
-  h === "warn" ? "bg-warn" : h === "danger" ? "bg-danger" : "bg-ok";
 const relColor = (k: string) =>
   k === "m2m" ? "text-info border-info/50" : k === "hm" ? "text-ok border-ok/50" : "text-muted-foreground border-border";
 
@@ -74,69 +73,21 @@ export function AtlasScreen() {
               : "Typed data over the running API server — rows, queries, edits, live changes."}
           </div>
           <div className="ml-auto flex items-center gap-3">
-            <span
-              title="Design spike (#67): the relation graph is hand-composed. Real layout = @xyflow/react + @dagrejs/dagre."
-              className="inline-flex items-center gap-1.5 rounded-md border border-dashed border-warn/45 bg-warn/10 px-2 py-0.5 font-mono text-[10.5px] font-semibold text-warn"
-            >
-              <TriangleAlert className="size-3" /> SPIKE · graph lib (#67)
-            </span>
             <span className="font-mono text-[12px] text-muted-foreground">
               {models.length} models · {relCount} relations
             </span>
           </div>
         </div>
 
-        {/* graph canvas */}
-        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-[radial-gradient(circle_at_1px_1px,color-mix(in_oklab,var(--foreground)_8%,transparent)_1px,transparent_0)] bg-[length:22px_22px]">
-          <div className="relative h-[420px] w-[620px] flex-none">
-            {showMockEdges ? (
-              <>
-                <svg
-                  className="absolute inset-0 h-[420px] w-[620px]"
-                  fill="none"
-                  stroke="color-mix(in oklab,var(--muted-foreground) 55%,transparent)"
-                  strokeWidth={1.5}
-                >
-                  <path d="M250 92 L184 78" />
-                  <path d="M386 96 L460 90" />
-                  <path d="M528 118 C540 170 540 210 538 252" />
-                  <path d="M494 118 C430 210 372 262 340 300" />
-                  <path d="M318 300 L318 130" strokeDasharray="5 5" />
-                </svg>
-                <EdgeLabel x={186} y={64} text="org ∗FK" />
-                <EdgeLabel x={398} y={70} text="[posts] 1—∞" />
-                <EdgeLabel x={544} y={176} text="tags ↔ M2M" cls="text-info" />
-                <EdgeLabel x={398} y={216} text="[comments]" />
-                <EdgeLabel x={326} y={206} text="author ?FK" />
-              </>
-            ) : null}
-            {models.map((m) => {
-              const on = m.key === selModel;
-              return (
-                <button
-                  key={m.key}
-                  type="button"
-                  onClick={() => setSelModel(m.key)}
-                  style={{ left: m.x, top: m.y }}
-                  className={cn(
-                    "absolute w-34 rounded-[11px] border bg-card px-3 py-2.5 text-left shadow-md",
-                    on
-                      ? "border-primary ring-3 ring-primary/25"
-                      : "border-border",
-                  )}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span className={cn("size-2 rounded-full", dotColor(m.health))} />
-                    <span className="text-[14px] font-semibold">{m.key}</span>
-                  </div>
-                  <div className="mt-0.5 font-mono text-[11px] text-muted-foreground">
-                    {m.rows}
-                    {m.deadPct >= 10 ? ` · ${m.deadPct}% dead` : " rows"}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
+        {/* graph canvas — real DAG layout (#70): @xyflow/react + @dagrejs/dagre */}
+        <div className="min-h-0 flex-1">
+          <RelationGraph
+            models={models}
+            rel={rel}
+            selModel={selModel}
+            onSelect={setSelModel}
+            onOpen={(key) => browse({ model: key })}
+          />
         </div>
 
         {/* health strip */}
@@ -367,30 +318,6 @@ function Row({ k, v }: { k: string; v: string }) {
       <span className="text-muted-foreground">{k}</span>
       <span>{v}</span>
     </div>
-  );
-}
-
-function EdgeLabel({
-  x,
-  y,
-  text,
-  cls,
-}: {
-  x: number;
-  y: number;
-  text: string;
-  cls?: string;
-}) {
-  return (
-    <span
-      style={{ left: x, top: y }}
-      className={cn(
-        "absolute rounded bg-background px-1 py-px font-mono text-[10px] text-muted-foreground",
-        cls,
-      )}
-    >
-      {text}
-    </span>
   );
 }
 
