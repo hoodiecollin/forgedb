@@ -262,23 +262,22 @@ impl StatsCollector {
             let entry = entry.map_err(|e| e.to_string())?;
             let path = entry.path();
 
+            // Match variable *data* files by `*.bin` + `_data` substring, deriving
+            // the offsets name via `_data` → `_offsets` — same broadened rule as
+            // the compactor, so this covers the generated `string_data_<idx>.bin`
+            // layout (the old `ends_with("_data.bin")` silently skipped it, making
+            // variable bytes invisible to stats).
+            let name = path.file_name().and_then(|s| s.to_str()).map(|s| s.to_string());
             if path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.ends_with("_data.bin"))
+                && name
+                    .as_deref()
+                    .map(|s| s.ends_with(".bin") && s.contains("_data"))
                     .unwrap_or(false)
             {
                 let data_size = fs::metadata(&path).map_err(|e| e.to_string())?.len();
 
-                let column_name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.strip_suffix("_data"))
-                    .ok_or_else(|| "Invalid column name".to_string())?
-                    .to_string();
-
-                let offset_path = variable_dir.join(format!("{}_offsets.bin", column_name));
+                let offset_path = variable_dir
+                    .join(name.as_deref().unwrap().replacen("_data", "_offsets", 1));
                 let offsets = if offset_path.exists() {
                     self.read_offsets(&offset_path)?
                 } else {
@@ -298,6 +297,14 @@ impl StatsCollector {
                 };
 
                 let total_bytes = data_size + offset_size;
+
+                // Derive a display name from the data filename (drop the trailing
+                // `_data.bin` / `_data_<idx>.bin` suffix for readability).
+                let column_name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.replacen("_data", "", 1))
+                    .unwrap_or_default();
 
                 let mut col_stats = ColumnStats {
                     name: column_name,
