@@ -263,6 +263,8 @@ impl RustGenerator {
         let reader_name = format_ident!("{}StorageReader", model.name);
         let reader_fields = Self::generate_reader_storage_fields(model);
         let reader_inits = Self::generate_reader_inits(model);
+        // Reader index probes (#103): `_at`-only (no live `get` on a reader).
+        let reader_index_probes = Self::generate_index_probes(model, false);
         let reader_doc = format!(
             "Read-only, lock-free reader handle for {} storage (#56 Direction B)",
             model.name
@@ -408,6 +410,11 @@ impl RustGenerator {
                 }
 
                 #snapshot_accessors
+
+                // Snapshot-only index probes (#103): `find_by_*_at` / `get_by_*_at`
+                // over the cloned index maps, resolved through this reader's
+                // `get_at`.  No live `find_by_*` — a reader has no live `get`.
+                #reader_index_probes
             }
         };
 
@@ -697,11 +704,16 @@ impl RustGenerator {
     // path enforces — the index only narrows the candidate set, it does not
     // short-circuit version resolution.
 
-    /// The scalar fields of a model that carry a secondary index: `^index` or
-    /// `&unique`.  Restricted to non-nullable filterable scalars (the same
-    /// closed set the REST filter uses) and excludes the primary id (already
-    /// covered by `id_to_row`) and relations.  Empty when the model has no
-    /// id/auto field (it cannot be inserted, so there is nothing to index).
+    /// The scalar fields of a model that carry a secondary index.  Three sources:
+    ///   * **explicit** `^index` / `&unique` scalar fields (#90) — now including
+    ///     `Nullable(_)` scalars (#102), keyed null-distinctly by `index_key_expr`;
+    ///   * **foreign-key** scalars `*Target` (`RequiredReference` → `Uuid`) and
+    ///     `?Target` (`OptionalReference` → `Option<Uuid>`) (#100) — always indexed
+    ///     (a reverse one-to-many getter that would otherwise scan always exists),
+    ///     so the index intent is the relation itself, no `^`/`&` needed.
+    ///
+    /// Excludes the primary id (already covered by `id_to_row`).  Empty when the
+    /// model has no id/auto field (it cannot be inserted, so nothing to index).
     fn indexed_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
             return Vec::new();
@@ -710,11 +722,18 @@ impl RustGenerator {
             .fields
             .iter()
             .filter(|f| {
-                (f.indexed || f.unique)
+                let is_fk = matches!(
+                    f.field_type,
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(_)
+                            | forgedb_parser::RelationType::OptionalReference(_),
+                    )
+                );
+                let is_explicit = (f.indexed || f.unique)
                     && f.name != "id"
                     && !f.auto_generate
-                    && Self::is_filterable_scalar(&f.field_type)
-                    && !matches!(f.field_type, forgedb_parser::FieldType::Nullable(_))
+                    && Self::is_filterable_scalar(&f.field_type);
+                is_explicit || is_fk
             })
             .collect()
     }
@@ -745,28 +764,62 @@ impl RustGenerator {
     }
 
     /// The parameter type a `find_by_<field>` / `get_by_<field>` probe accepts:
-    /// `&str` for `string` fields (ergonomic), the (Copy) mapped type by value
-    /// otherwise (integers, bool, `f64`, `uuid`, `timestamp`, `char(N)`).
+    ///   * `string`               → `&str` (ergonomic)
+    ///   * `string?`              → `Option<&str>` (#102 — `None` probes the unset bucket)
+    ///   * `T?` (other scalar)    → `Option<T>` (#102)
+    ///   * `*Target` FK           → `Uuid` (#100 — the FK is a plain `Uuid`)
+    ///   * `?Target` FK           → `Option<Uuid>` (#100 — `None` probes unlinked rows)
+    ///   * other scalar           → the (Copy) mapped type by value
+    ///
+    /// The arg-side key (`index_key_expr(value)`) and record-side key
+    /// (`index_key_expr(record.field)`) must serialize identically; the `Option<_>`
+    /// param types above are exactly the record field types, so both agree.
     fn index_param_type(field: &forgedb_parser::Field) -> TokenStream {
-        if Self::is_string_type(&field.field_type) {
-            quote! { &str }
-        } else {
-            let ty = Self::map_field_type_ident(&field.field_type);
-            quote! { #ty }
+        use forgedb_parser::{FieldType, RelationType};
+        match &field.field_type {
+            FieldType::Relation(RelationType::RequiredReference(_)) => quote! { Uuid },
+            FieldType::Relation(RelationType::OptionalReference(_)) => quote! { Option<Uuid> },
+            FieldType::Nullable(inner) if Self::is_string_type(inner) => quote! { Option<&str> },
+            FieldType::Nullable(inner) => {
+                let ty = Self::map_field_type_ident(inner);
+                quote! { Option<#ty> }
+            }
+            _ if Self::is_string_type(&field.field_type) => quote! { &str },
+            _ => {
+                let ty = Self::map_field_type_ident(&field.field_type);
+                quote! { #ty }
+            }
         }
     }
 
-    /// Canonical string key for a value expression — the SAME normalization the
-    /// REST filter (`<model>_event_matches`) compares by: a JSON string keeps its
-    /// raw contents, any other scalar uses its JSON `to_string`.  Computing the
-    /// key identically for the stored field value and the probe argument is what
-    /// makes an index hit agree with a filter match.
+    /// Canonical, **null-distinct** string key for a value expression.  A leading
+    /// tag byte encodes the JSON type class so values that stringify alike can
+    /// never collide across classes — critically `None`/`Value::Null` (`\u{0}`)
+    /// vs the literal string `"null"` (`\u{1}null`), the collision that made #90
+    /// gate nullable/optional-FK fields out (#102).  The tags:
+    ///   `\u{0}`        → JSON null (a `None` / unset optional / unlinked FK)
+    ///   `\u{1}` + raw  → JSON string (raw contents, incl. uuid hyphenated form)
+    ///   `\u{2}` + text → any other scalar (number / bool) via JSON `to_string`
+    ///   `\u{3}`        → serialization error (unreachable for scalar fields)
+    /// The key is internal to the index probes — it is NOT the value the REST
+    /// filter (`<model>_event_matches`) compares by — so tagging is free of any
+    /// cross-path constraint.  Computing it identically for the stored field value
+    /// and the probe argument is what keeps an index hit self-consistent.
     fn index_key_expr(value_expr: TokenStream) -> TokenStream {
         quote! {
             match serde_json::to_value(&(#value_expr)) {
-                Ok(serde_json::Value::String(__s)) => __s,
-                Ok(__other) => __other.to_string(),
-                Err(_) => String::new(),
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
             }
         }
     }
@@ -812,6 +865,137 @@ impl RustGenerator {
         }
     }
 
+    /// The composite `@index(a, b, …)` indexes of a model (#101), resolved to their
+    /// component `&Field`s.  A composite is emitted only when the model has an
+    /// identity field, has ≥2 components, and **every** component resolves to an
+    /// indexable scalar or FK field (same eligibility as a single-field index);
+    /// an unresolvable or non-scalar component skips the whole composite (the
+    /// schema validator is the place to hard-error — here we skip defensively).
+    fn composite_indexes(
+        model: &forgedb_parser::Model,
+    ) -> Vec<(proc_macro2::Ident, Vec<&forgedb_parser::Field>)> {
+        if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+            return Vec::new();
+        }
+        model
+            .composite_indexes
+            .iter()
+            .filter_map(|ci| {
+                if ci.fields.len() < 2 {
+                    return None;
+                }
+                let comps: Option<Vec<&forgedb_parser::Field>> = ci
+                    .fields
+                    .iter()
+                    .map(|name| {
+                        model
+                            .fields
+                            .iter()
+                            .find(|f| &f.name == name)
+                            .filter(|f| Self::is_composite_component(&f.field_type))
+                    })
+                    .collect();
+                let comps = comps?;
+                let ident = format_ident!("{}_index", ci.fields.join("_"));
+                Some((ident, comps))
+            })
+            .collect()
+    }
+
+    /// Whether a field type may be a component of a composite index: the same set
+    /// a single-field index accepts — a filterable scalar (incl. `Nullable`, #102)
+    /// or an FK reference (`*Target` / `?Target`, #100).
+    fn is_composite_component(field_type: &forgedb_parser::FieldType) -> bool {
+        Self::is_filterable_scalar(field_type)
+            || matches!(
+                field_type,
+                forgedb_parser::FieldType::Relation(
+                    forgedb_parser::RelationType::RequiredReference(_)
+                        | forgedb_parser::RelationType::OptionalReference(_),
+                )
+            )
+    }
+
+    /// The base name of a composite index probe, e.g. `find_by_status_and_created_at`.
+    fn composite_probe_ident(components: &[&forgedb_parser::Field]) -> proc_macro2::Ident {
+        let joined = components
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join("_and_");
+        format_ident!("find_by_{}", joined)
+    }
+
+    /// Build a collision-free composite key from N per-component key expressions.
+    /// Each component's null-distinct `index_key_expr` string is length-prefixed
+    /// (`<byte-len>:<key>`), so `("ab","c")` and `("a","bc")` can never collide.
+    fn composite_key_build(part_key_exprs: &[TokenStream]) -> TokenStream {
+        let pushes = part_key_exprs.iter().map(|k| {
+            quote! {
+                {
+                    let __p: String = { #k };
+                    __ck.push_str(&__p.len().to_string());
+                    __ck.push(':');
+                    __ck.push_str(&__p);
+                }
+            }
+        });
+        quote! {
+            {
+                let mut __ck = String::new();
+                #(#pushes)*
+                __ck
+            }
+        }
+    }
+
+    /// Emit an "add `id` under the composite key of the component value exprs".
+    fn composite_add_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        part_value_exprs: &[TokenStream],
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        let part_keys: Vec<_> = part_value_exprs
+            .iter()
+            .map(|v| Self::index_key_expr(v.clone()))
+            .collect();
+        let key = Self::composite_key_build(&part_keys);
+        quote! {
+            {
+                let __k: String = #key;
+                #receiver.#index_ident.entry(__k).or_default().insert(#id_expr);
+            }
+        }
+    }
+
+    /// Emit a "remove `id` from the composite key" statement, pruning empty buckets.
+    fn composite_remove_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        part_value_exprs: &[TokenStream],
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        let part_keys: Vec<_> = part_value_exprs
+            .iter()
+            .map(|v| Self::index_key_expr(v.clone()))
+            .collect();
+        let key = Self::composite_key_build(&part_keys);
+        quote! {
+            {
+                let __k: String = #key;
+                let mut __empty = false;
+                if let Some(__set) = #receiver.#index_ident.get_mut(&__k) {
+                    __set.remove(&(#id_expr));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    #receiver.#index_ident.remove(&__k);
+                }
+            }
+        }
+    }
+
     /// Generate storage field declarations for columnar storage
     fn generate_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
@@ -845,11 +1029,23 @@ impl RustGenerator {
             })
             .collect();
 
+        // Composite `@index(a, b)` fields (#101): same `key -> {id}` shape, keyed
+        // by the collision-free length-prefixed composite key.
+        let composite_fields: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, _comps)| {
+                quote! {
+                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                }
+            })
+            .collect();
+
         quote! {
             id_to_row: HashMap<#id_type, usize>,
             row_count: usize,
             #(#column_fields,)*
             #(#index_fields,)*
+            #(#composite_fields,)*
             tombstones: forgedb_storage::Tombstones,
             // Write-ahead log (#89 durable write path): every mutation records an
             // opaque row blob here + fsync BEFORE touching columns, so a crash
@@ -926,11 +1122,20 @@ impl RustGenerator {
             })
             .collect();
 
+        // Composite index maps (#101), also rebuilt by `#rehydrate_logic`.
+        let composite_inits: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, _comps)| {
+                quote! { #ident: std::collections::HashMap::new() }
+            })
+            .collect();
+
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
             #(#inits,)*
             #(#index_inits,)*
+            #(#composite_inits,)*
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
@@ -968,9 +1173,32 @@ impl RustGenerator {
             }
         }
         let id_type = Self::id_type_tokens(model);
+        // Index maps (#103): the reader carries a point-in-time CLONE of every
+        // secondary + composite index, captured on the writer at `reader()` time
+        // (same instant its column readers open), so its `_at` probes are O(1)
+        // like the writer's.  Same field names/types as the writer storage.
+        let index_fields: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                quote! {
+                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                }
+            })
+            .collect();
+        let composite_fields: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, _comps)| {
+                quote! {
+                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                }
+            })
+            .collect();
         quote! {
             id_to_row: HashMap<#id_type, usize>,
             #(#column_fields,)*
+            #(#index_fields,)*
+            #(#composite_fields,)*
             tombstones: forgedb_storage::TombstonesReader,
         }
     }
@@ -991,9 +1219,29 @@ impl RustGenerator {
                 });
             }
         }
+        // Clone every index map (#103) — captured on the single writer, off the
+        // mutation path (same discipline as `id_to_row.clone()` and
+        // `DatabaseSnapshot::snapshot()`), so the reader's view is coherent with
+        // its column readers.  Plain clone (O(rows) per index), amortized per
+        // reader thread; an `Arc`-swap is the escape hatch if it ever matters.
+        let index_clones: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                quote! { #ident: self.#ident.clone() }
+            })
+            .collect();
+        let composite_clones: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, _comps)| {
+                quote! { #ident: self.#ident.clone() }
+            })
+            .collect();
         quote! {
             id_to_row: self.id_to_row.clone(),
             #(#inits,)*
+            #(#index_clones,)*
+            #(#composite_clones,)*
             tombstones: self.tombstones.reader()
                 .expect("Failed to open tombstones reader"),
         }
@@ -1523,6 +1771,20 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok)
             })
             .collect();
+        // Composite-index maintenance (#101): same timing, keyed by the tuple.
+        let composite_adds: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, comps)| {
+                let parts: Vec<_> = comps
+                    .iter()
+                    .map(|c| {
+                        let cf = format_ident!("{}", c.name);
+                        quote! { record.#cf }
+                    })
+                    .collect();
+                Self::composite_add_block(&recv, ident, &parts, &id_tok)
+            })
+            .collect();
 
         quote! {
             let row_index = self.row_count;
@@ -1544,6 +1806,8 @@ impl RustGenerator {
 
             // Secondary-index maintenance (#90): index the committed row.
             #(#index_adds)*
+            // Composite-index maintenance (#101).
+            #(#composite_adds)*
 
             // Change-feed emit (#62 Direction A): this generated method knows a
             // #model_name_str was inserted; the substrate feed only carries the
@@ -1578,7 +1842,10 @@ impl RustGenerator {
         // pre-update record (`__old`, resolved before the repoint) and add using
         // the incoming `record`.
         let indexed = Self::indexed_fields(model);
-        let fetch_old = if indexed.is_empty() {
+        let composites = Self::composite_indexes(model);
+        // Fetch the pre-update record when any index (single or composite) needs
+        // the old value keys to remove.
+        let fetch_old = if indexed.is_empty() && composites.is_empty() {
             quote! {}
         } else {
             quote! { let __old = self.get(id); }
@@ -1598,6 +1865,35 @@ impl RustGenerator {
                 );
                 let add_new =
                     Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok);
+                quote! {
+                    if let Some(__old_rec) = &__old {
+                        #remove_old
+                    }
+                    #add_new
+                }
+            })
+            .collect();
+        // Composite-index update maintenance (#101): remove the old tuple key
+        // (from `__old`), add the new one (from `record`).
+        let composite_updates: Vec<_> = composites
+            .iter()
+            .map(|(ident, comps)| {
+                let old_parts: Vec<_> = comps
+                    .iter()
+                    .map(|c| {
+                        let cf = format_ident!("{}", c.name);
+                        quote! { __old_rec.#cf }
+                    })
+                    .collect();
+                let new_parts: Vec<_> = comps
+                    .iter()
+                    .map(|c| {
+                        let cf = format_ident!("{}", c.name);
+                        quote! { record.#cf }
+                    })
+                    .collect();
+                let remove_old = Self::composite_remove_block(&recv, ident, &old_parts, &id_tok);
+                let add_new = Self::composite_add_block(&recv, ident, &new_parts, &id_tok);
                 quote! {
                     if let Some(__old_rec) = &__old {
                         #remove_old
@@ -1631,6 +1927,8 @@ impl RustGenerator {
 
             // Secondary-index maintenance (#90): drop stale value keys, add new.
             #(#index_updates)*
+            // Composite-index maintenance (#101): drop stale tuple keys, add new.
+            #(#composite_updates)*
 
             // #62: an Updated event carries the new live row index.
             if let Some(feed) = &self.changefeed {
@@ -1671,6 +1969,20 @@ impl RustGenerator {
                 Self::index_remove_block(&recv, &ident, quote! { record.#fname }, &id_tok)
             })
             .collect();
+        // Composite-index removal (#101): drop the deleted id's tuple key.
+        let composite_removes: Vec<_> = Self::composite_indexes(model)
+            .iter()
+            .map(|(ident, comps)| {
+                let parts: Vec<_> = comps
+                    .iter()
+                    .map(|c| {
+                        let cf = format_ident!("{}", c.name);
+                        quote! { record.#cf }
+                    })
+                    .collect();
+                Self::composite_remove_block(&recv, ident, &parts, &id_tok)
+            })
+            .collect();
 
         Some(quote! {
             // Materialize the current live record; also gives the values to
@@ -1702,6 +2014,8 @@ impl RustGenerator {
 
             // Secondary-index maintenance (#90): drop the deleted id's value keys.
             #(#index_removes)*
+            // Composite-index removal (#101).
+            #(#composite_removes)*
 
             // #62: a Deleted event carries the pre-delete row so the record is
             // still materializable by a subscriber.
@@ -1727,104 +2041,218 @@ impl RustGenerator {
     /// `_at` probe additionally post-filters on the resolved value, so a
     /// candidate whose value changed *after* the snapshot is excluded.
     fn generate_index_lookups(model: &forgedb_parser::Model) -> TokenStream {
+        Self::generate_index_probes(model, true)
+    }
+
+    /// Emit the secondary-index probe methods for a model's storage, factored so
+    /// the writer storage gets the full set (live `find_by`/`get_by` + snapshot
+    /// `_at`) while the read-only `*StorageReader` (#103) gets **only** the `_at`
+    /// forms — a reader has no live `get`, so a "live" probe would be meaningless.
+    /// Covers single-field indexes (#90/#100/#102) and composite indexes (#101).
+    ///
+    /// `include_live = true` → writer (has `get` + `get_at`); `false` → reader
+    /// (has `get_at` only, index maps cloned at `reader()` time).
+    fn generate_index_probes(model: &forgedb_parser::Model, include_live: bool) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
-        let methods: Vec<_> = Self::indexed_fields(model)
-            .iter()
-            .map(|f| {
-                let ident = Self::index_field_ident(f);
-                let fname = format_ident!("{}", f.name);
-                let param_ty = Self::index_param_type(f);
-                let find_fn = format_ident!("find_by_{}", f.name);
-                let find_at_fn = format_ident!("find_by_{}_at", f.name);
-                let key_from_arg = Self::index_key_expr(quote! { value });
-                let key_from_rec = Self::index_key_expr(quote! { __rec.#fname });
+        let mut methods: Vec<TokenStream> = Vec::new();
 
-                let find_doc = format!(
-                    "Index probe (#90): every live `{}` whose `{}` equals `value`. \
-                     O(1) candidate lookup + newest-version resolution, not a scan.",
-                    model.name, f.name
-                );
-                let find_at_doc = format!(
-                    "Snapshot-scoped index probe (#90 + #56): candidates from the live \
-                     `{}` index resolved through `get_at`, so each result is the \
-                     version live as of `snap`; a candidate whose value changed after \
-                     the snapshot is post-filtered out.  Honest limit: a row whose \
-                     `{}` changed *away* between the snapshot and now is not in the \
-                     live index (indexes are not versioned).",
-                    f.name, f.name
-                );
+        // --- Single-field probes (#90 + #100 FK + #102 nullable) --------------
+        for f in Self::indexed_fields(model) {
+            let ident = Self::index_field_ident(f);
+            let fname = format_ident!("{}", f.name);
+            let param_ty = Self::index_param_type(f);
+            let find_fn = format_ident!("find_by_{}", f.name);
+            let find_at_fn = format_ident!("find_by_{}_at", f.name);
+            let params = quote! { value: #param_ty };
+            let key_from_arg = Self::index_key_expr(quote! { value });
+            let key_from_rec = Self::index_key_expr(quote! { __rec.#fname });
+            let subject = format!("`{}`.`{}`", model.name, f.name);
+            let unique = if f.unique {
+                Some((
+                    format_ident!("get_by_{}", f.name),
+                    format_ident!("get_by_{}_at", f.name),
+                ))
+            } else {
+                None
+            };
+            methods.push(Self::emit_probe(
+                &model_name,
+                &ident,
+                &find_fn,
+                &find_at_fn,
+                &params,
+                &key_from_arg,
+                &key_from_rec,
+                include_live,
+                unique.as_ref(),
+                &subject,
+            ));
+        }
 
-                let mut m = quote! {
-                    #[doc = #find_doc]
-                    pub fn #find_fn(&self, value: #param_ty) -> Vec<#model_name> {
-                        let __k: String = { #key_from_arg };
-                        let __ids = match self.#ident.get(&__k) {
-                            Some(__s) => __s,
-                            None => return Vec::new(),
-                        };
-                        __ids.iter().filter_map(|&__id| self.get(__id)).collect()
-                    }
-
-                    #[doc = #find_at_doc]
-                    pub fn #find_at_fn(
-                        &self,
-                        snap: &forgedb_storage::Snapshot,
-                        value: #param_ty,
-                    ) -> Vec<#model_name> {
-                        let __k: String = { #key_from_arg };
-                        let __ids = match self.#ident.get(&__k) {
-                            Some(__s) => __s,
-                            None => return Vec::new(),
-                        };
-                        let mut __out = Vec::new();
-                        for &__id in __ids {
-                            if let Some(__rec) = self.get_at(snap, __id) {
-                                let __rk: String = { #key_from_rec };
-                                if __rk == __k {
-                                    __out.push(__rec);
-                                }
-                            }
-                        }
-                        __out
-                    }
-                };
-
-                if f.unique {
-                    let get_fn = format_ident!("get_by_{}", f.name);
-                    let get_at_fn = format_ident!("get_by_{}_at", f.name);
-                    let get_doc = format!(
-                        "Unique index probe (#90): the at-most-one live `{}` whose \
-                         `{}` equals `value`.",
-                        model.name, f.name
-                    );
-                    let get_at_doc = format!(
-                        "Snapshot-scoped unique index probe (#90 + #56): the \
-                         at-most-one `{}` matching `value` as of `snap`.",
-                        model.name
-                    );
-                    m.extend(quote! {
-                        #[doc = #get_doc]
-                        pub fn #get_fn(&self, value: #param_ty) -> Option<#model_name> {
-                            let __k: String = { #key_from_arg };
-                            let __ids = self.#ident.get(&__k)?;
-                            __ids.iter().find_map(|&__id| self.get(__id))
-                        }
-
-                        #[doc = #get_at_doc]
-                        pub fn #get_at_fn(
-                            &self,
-                            snap: &forgedb_storage::Snapshot,
-                            value: #param_ty,
-                        ) -> Option<#model_name> {
-                            self.#find_at_fn(snap, value).into_iter().next()
-                        }
-                    });
-                }
-                m
-            })
-            .collect();
+        // --- Composite probes (#101) — `find_by_<a>_and_<b>` (never unique) ---
+        for (ident, comps) in Self::composite_indexes(model) {
+            let find_fn = Self::composite_probe_ident(&comps);
+            let find_at_fn = format_ident!("{}_at", find_fn);
+            let params_list: Vec<_> = comps
+                .iter()
+                .map(|c| {
+                    let pn = format_ident!("{}", c.name);
+                    let pt = Self::index_param_type(c);
+                    quote! { #pn: #pt }
+                })
+                .collect();
+            let params = quote! { #(#params_list),* };
+            let arg_keys: Vec<_> = comps
+                .iter()
+                .map(|c| {
+                    let pn = format_ident!("{}", c.name);
+                    Self::index_key_expr(quote! { #pn })
+                })
+                .collect();
+            let rec_keys: Vec<_> = comps
+                .iter()
+                .map(|c| {
+                    let cf = format_ident!("{}", c.name);
+                    Self::index_key_expr(quote! { __rec.#cf })
+                })
+                .collect();
+            let key_from_arg = Self::composite_key_build(&arg_keys);
+            let key_from_rec = Self::composite_key_build(&rec_keys);
+            let subject = format!(
+                "`{}` composite ({})",
+                model.name,
+                comps.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
+            );
+            methods.push(Self::emit_probe(
+                &model_name,
+                &ident,
+                &find_fn,
+                &find_at_fn,
+                &params,
+                &key_from_arg,
+                &key_from_rec,
+                include_live,
+                None,
+                &subject,
+            ));
+        }
 
         quote! { #(#methods)* }
+    }
+
+    /// Emit one index probe family: a `Vec` `find_by`/`find_by_at`, plus (for
+    /// `&unique` single-field indexes) an `Option` `get_by`/`get_by_at`.  Live
+    /// (`get`-based) forms are emitted only when `include_live` is set (writer);
+    /// the `_at` (`get_at`-based) forms are always emitted (writer + reader).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_probe(
+        model_name: &proc_macro2::Ident,
+        index_ident: &proc_macro2::Ident,
+        find_fn: &proc_macro2::Ident,
+        find_at_fn: &proc_macro2::Ident,
+        params: &TokenStream,
+        key_from_arg: &TokenStream,
+        key_from_rec: &TokenStream,
+        include_live: bool,
+        unique: Option<&(proc_macro2::Ident, proc_macro2::Ident)>,
+        subject: &str,
+    ) -> TokenStream {
+        let find_at_doc = format!(
+            "Snapshot-scoped index probe for {subject} (#90/#56): O(1) candidate \
+             lookup, each resolved through `get_at` (the version live as of `snap`) \
+             and post-filtered so a candidate whose value changed after the snapshot \
+             is excluded.  Honest limit: a row whose value changed *away* between \
+             the snapshot and now is not in the (unversioned) index."
+        );
+        let mut m = TokenStream::new();
+
+        if include_live {
+            let find_doc = format!(
+                "Index probe for {subject} (#90): every live match for the argument(s). \
+                 O(1) candidate lookup + newest-version resolution, not a scan."
+            );
+            m.extend(quote! {
+                #[doc = #find_doc]
+                pub fn #find_fn(&self, #params) -> Vec<#model_name> {
+                    let __k: String = { #key_from_arg };
+                    let __ids = match self.#index_ident.get(&__k) {
+                        Some(__s) => __s,
+                        None => return Vec::new(),
+                    };
+                    __ids.iter().filter_map(|&__id| self.get(__id)).collect()
+                }
+            });
+        }
+
+        m.extend(quote! {
+            #[doc = #find_at_doc]
+            pub fn #find_at_fn(
+                &self,
+                snap: &forgedb_storage::Snapshot,
+                #params
+            ) -> Vec<#model_name> {
+                let __k: String = { #key_from_arg };
+                let __ids = match self.#index_ident.get(&__k) {
+                    Some(__s) => __s,
+                    None => return Vec::new(),
+                };
+                let mut __out = Vec::new();
+                for &__id in __ids {
+                    if let Some(__rec) = self.get_at(snap, __id) {
+                        let __rk: String = { #key_from_rec };
+                        if __rk == __k {
+                            __out.push(__rec);
+                        }
+                    }
+                }
+                __out
+            }
+        });
+
+        if let Some((get_fn, get_at_fn)) = unique {
+            let get_at_doc = format!(
+                "Snapshot-scoped unique index probe for {subject} (#90/#56): the \
+                 at-most-one match as of `snap`."
+            );
+            if include_live {
+                let get_doc = format!(
+                    "Unique index probe for {subject} (#90): the at-most-one live match."
+                );
+                m.extend(quote! {
+                    #[doc = #get_doc]
+                    pub fn #get_fn(&self, #params) -> Option<#model_name> {
+                        let __k: String = { #key_from_arg };
+                        let __ids = self.#index_ident.get(&__k)?;
+                        __ids.iter().find_map(|&__id| self.get(__id))
+                    }
+                });
+            }
+            m.extend(quote! {
+                #[doc = #get_at_doc]
+                pub fn #get_at_fn(
+                    &self,
+                    snap: &forgedb_storage::Snapshot,
+                    #params
+                ) -> Option<#model_name> {
+                    let __k: String = { #key_from_arg };
+                    let __ids = match self.#index_ident.get(&__k) {
+                        Some(__s) => __s,
+                        None => return None,
+                    };
+                    for &__id in __ids {
+                        if let Some(__rec) = self.get_at(snap, __id) {
+                            let __rk: String = { #key_from_rec };
+                            if __rk == __k {
+                                return Some(__rec);
+                            }
+                        }
+                    }
+                    None
+                }
+            });
+        }
+
+        m
     }
 
     /// Generate the body of the shared `read_at(row_index)` accessor.
@@ -2116,11 +2544,13 @@ impl RustGenerator {
         let id_tok = quote! { __id };
         let index_rebuild = {
             let indexed = Self::indexed_fields(model);
-            if indexed.is_empty() {
+            let composites = Self::composite_indexes(model);
+            if indexed.is_empty() && composites.is_empty() {
                 quote! {}
             } else {
                 let id_type = Self::id_type_tokens(model);
-                let adds: Vec<_> = indexed
+                // Single-field index adds (#90 + #100/#102 via `indexed_fields`).
+                let mut adds: Vec<_> = indexed
                     .iter()
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
@@ -2133,6 +2563,17 @@ impl RustGenerator {
                         )
                     })
                     .collect();
+                // Composite index adds (#101), folded into the same scan.
+                adds.extend(composites.iter().map(|(ident, comps)| {
+                    let parts: Vec<_> = comps
+                        .iter()
+                        .map(|c| {
+                            let cf = format_ident!("{}", c.name);
+                            quote! { __rec.#cf }
+                        })
+                        .collect();
+                    Self::composite_add_block(&recv, ident, &parts, &id_tok)
+                }));
                 quote! {
                     let __ids: Vec<#id_type> = db.id_to_row.keys().copied().collect();
                     for __id in __ids {
@@ -2731,23 +3172,53 @@ impl RustGenerator {
             let method_ident = format_ident!("{}", method_name);
             let child_ident = format_ident!("{}", p.child_model);
             let child_field = format_ident!("{}", Self::to_snake_case(&p.child_model));
-            let fk_field = format_ident!("{}", p.child_field);
-            let doc = format!("All {} whose {} references the given id.", p.child_model, p.child_field);
+            let fk_probe = format_ident!("find_by_{}", p.child_field);
 
-            let predicate = if p.is_required {
-                quote! { record.#fk_field == id }
+            // The FK column is now indexed (#100): probe the child's FK index in
+            // O(1) instead of scanning `all()` — but only when the child model has
+            // an identity (id/auto) field, since `indexed_fields` (and thus the
+            // probe) is empty otherwise; fall back to the scan in that case.
+            let child_indexed = schema
+                .find_model(&p.child_model)
+                .is_some_and(|c| c.fields.iter().any(|f| f.name == "id" || f.auto_generate));
+
+            let doc = if child_indexed {
+                format!(
+                    "All {} whose {} references the given id (#100: O(1) FK-index probe, not a scan).",
+                    p.child_model, p.child_field
+                )
             } else {
-                quote! { record.#fk_field == Some(id) }
+                format!("All {} whose {} references the given id.", p.child_model, p.child_field)
             };
 
-            methods.push(quote! {
-                #[doc = #doc]
-                pub fn #method_ident(&self, id: Uuid) -> Vec<#child_ident> {
+            let body = if child_indexed {
+                // Required FK probe takes `Uuid`; optional FK probe takes `Option<Uuid>`.
+                let arg = if p.is_required {
+                    quote! { id }
+                } else {
+                    quote! { Some(id) }
+                };
+                quote! { self.#child_field.#fk_probe(#arg) }
+            } else {
+                let fk_field = format_ident!("{}", p.child_field);
+                let predicate = if p.is_required {
+                    quote! { record.#fk_field == id }
+                } else {
+                    quote! { record.#fk_field == Some(id) }
+                };
+                quote! {
                     self.#child_field
                         .all()
                         .into_iter()
                         .filter(|record| #predicate)
                         .collect()
+                }
+            };
+
+            methods.push(quote! {
+                #[doc = #doc]
+                pub fn #method_ident(&self, id: Uuid) -> Vec<#child_ident> {
+                    #body
                 }
             });
         }
