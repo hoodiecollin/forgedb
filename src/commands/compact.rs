@@ -7,7 +7,25 @@ pub struct CompactOptions {
     pub model: Option<String>,
     pub all: bool,
     pub threshold: Option<f64>,
+    pub force: bool,
 }
+
+/// Refusal message for the unsafe offline compaction path (#105).  The
+/// tombstone-based `compact_model` is misaligned with the generated
+/// superseding-version mutation surface (#66): superseded update-versions are
+/// orphaned but NOT tombstoned (so nothing is reclaimed), and a delete's
+/// tombstone is a NEW marker row — dropping it RESURRECTS the deleted record.
+/// Computing the correct live-row set offline needs schema-aware id-column logic
+/// the CLI does not carry, so v1 gates this path behind `--force`.
+const UNSAFE_COMPACT_MSG: &str = "\
+Offline `forgedb compact` uses a tombstone-based algorithm that is unsafe on data \
+written by the generated mutation surface (updates/deletes) — it reclaims nothing \
+from updates and can RESURRECT deleted rows (see issue #105).\n\n\
+Use the supported path instead: generated databases compact automatically \
+in-process under the single-writer lock (every COMPACTION_DEAD_THRESHOLD dead \
+versions), or call `Database::compact()` from your app.\n\n\
+Pass --force only if you know the data has no superseded/deleted rows (e.g. \
+insert-only) and accept the risk.";
 
 pub struct StatsOptions {
     pub data_dir: PathBuf,
@@ -17,6 +35,7 @@ pub struct StatsOptions {
 
 pub struct VacuumOptions {
     pub data_dir: PathBuf,
+    pub force: bool,
 }
 
 pub struct AnalyzeOptions {
@@ -26,6 +45,9 @@ pub struct AnalyzeOptions {
 
 /// Compact database or specific model
 pub fn compact(opts: CompactOptions) -> Result<(), CliError> {
+    if !opts.force {
+        return Err(CliError::Compaction(UNSAFE_COMPACT_MSG.to_string()));
+    }
     let mut config = CompactionConfig::default();
 
     if let Some(threshold) = opts.threshold {
@@ -120,6 +142,9 @@ pub fn stats(opts: StatsOptions) -> Result<(), CliError> {
 
 /// Vacuum database (compact all models)
 pub fn vacuum(opts: VacuumOptions) -> Result<(), CliError> {
+    if !opts.force {
+        return Err(CliError::Compaction(UNSAFE_COMPACT_MSG.to_string()));
+    }
     let config = CompactionConfig::default();
     let api = MaintenanceApi::new(&opts.data_dir, config);
 
