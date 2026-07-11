@@ -27,6 +27,7 @@ pub struct UserStorage {
     id_col: FixedColumn,
     email_col: VariableColumn,
     age_col: FixedColumn,
+    email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -66,6 +67,7 @@ impl UserStorage {
                     std::mem::size_of::<Option<u32>>(),
                 )
                 .expect("Failed to create fixed column"),
+            email_index: std::collections::HashMap::new(),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("user/tombstones.bin"),
                 )
@@ -87,6 +89,21 @@ impl UserStorage {
                 Uuid::from_bytes(bytes)
             };
             db.id_to_row.insert(id, i);
+        }
+        let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
+        for __id in __ids {
+            if let Some(__rec) = db.get(__id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__rec.email)) {
+                            Ok(serde_json::Value::String(__s)) => __s,
+                            Ok(__other) => __other.to_string(),
+                            Err(_) => String::new(),
+                        }
+                    };
+                    db.email_index.entry(__k).or_default().insert(__id);
+                }
+            }
         }
         db.write_manifest(root);
         db
@@ -163,6 +180,16 @@ impl UserStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.email)) {
+                    Ok(serde_json::Value::String(__s)) => __s,
+                    Ok(__other) => __other.to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            self.email_index.entry(__k).or_default().insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
@@ -181,6 +208,7 @@ impl UserStorage {
         if !self.id_to_row.contains_key(&id) {
             return false;
         }
+        let __old = self.get(id);
         let row_index = self.row_count;
         {
             let mut __wal_payload = Vec::new();
@@ -211,6 +239,35 @@ impl UserStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(__old_rec) = &__old {
+            {
+                let __k: String = {
+                    match serde_json::to_value(&(__old_rec.email)) {
+                        Ok(serde_json::Value::String(__s)) => __s,
+                        Ok(__other) => __other.to_string(),
+                        Err(_) => String::new(),
+                    }
+                };
+                let mut __empty = false;
+                if let Some(__set) = self.email_index.get_mut(&__k) {
+                    __set.remove(&(id));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    self.email_index.remove(&__k);
+                }
+            }
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.email)) {
+                    Ok(serde_json::Value::String(__s)) => __s,
+                    Ok(__other) => __other.to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            self.email_index.entry(__k).or_default().insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
@@ -263,6 +320,23 @@ impl UserStorage {
         self.tombstones.append(true).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.email)) {
+                    Ok(serde_json::Value::String(__s)) => __s,
+                    Ok(__other) => __other.to_string(),
+                    Err(_) => String::new(),
+                }
+            };
+            let mut __empty = false;
+            if let Some(__set) = self.email_index.get_mut(&__k) {
+                __set.remove(&(id));
+                __empty = __set.is_empty();
+            }
+            if __empty {
+                self.email_index.remove(&__k);
+            }
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
@@ -462,6 +536,75 @@ impl UserStorage {
             }
         }
         records
+    }
+    ///Index probe (#90): every live `User` whose `email` equals `value`. O(1) candidate lookup + newest-version resolution, not a scan.
+    pub fn find_by_email(&self, value: &str) -> Vec<User> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::String(__s)) => __s,
+                Ok(__other) => __other.to_string(),
+                Err(_) => String::new(),
+            }
+        };
+        let __ids = match self.email_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        __ids.iter().filter_map(|&__id| self.get(__id)).collect()
+    }
+    ///Snapshot-scoped index probe (#90 + #56): candidates from the live `email` index resolved through `get_at`, so each result is the version live as of `snap`; a candidate whose value changed after the snapshot is post-filtered out.  Honest limit: a row whose `email` changed *away* between the snapshot and now is not in the live index (indexes are not versioned).
+    pub fn find_by_email_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: &str,
+    ) -> Vec<User> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::String(__s)) => __s,
+                Ok(__other) => __other.to_string(),
+                Err(_) => String::new(),
+            }
+        };
+        let __ids = match self.email_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(__rec) = self.get_at(snap, __id) {
+                let __rk: String = {
+                    match serde_json::to_value(&(__rec.email)) {
+                        Ok(serde_json::Value::String(__s)) => __s,
+                        Ok(__other) => __other.to_string(),
+                        Err(_) => String::new(),
+                    }
+                };
+                if __rk == __k {
+                    __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
+    ///Unique index probe (#90): the at-most-one live `User` whose `email` equals `value`.
+    pub fn get_by_email(&self, value: &str) -> Option<User> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::String(__s)) => __s,
+                Ok(__other) => __other.to_string(),
+                Err(_) => String::new(),
+            }
+        };
+        let __ids = self.email_index.get(&__k)?;
+        __ids.iter().find_map(|&__id| self.get(__id))
+    }
+    ///Snapshot-scoped unique index probe (#90 + #56): the at-most-one `User` matching `value` as of `snap`.
+    pub fn get_by_email_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: &str,
+    ) -> Option<User> {
+        self.find_by_email_at(snap, value).into_iter().next()
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

@@ -231,6 +231,10 @@ impl RustGenerator {
         // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
         let read_at_logic = Self::generate_read_at_logic(model);
 
+        // Generate the secondary-index probe methods (#90): find_by_* / get_by_*
+        // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
+        let index_lookups = Self::generate_index_lookups(model);
+
         // Generate reopen/rehydration logic (#65): rebuild the in-memory
         // `row_count` + `id_to_row` index from the persisted columns so a fresh
         // process can read data written by a previous one.
@@ -374,6 +378,8 @@ impl RustGenerator {
                     }
                     records
                 }
+
+                #index_lookups
 
                 /// Open a read-only handle over this storage (#56 Direction B).
                 /// The handle shares this storage's column files via independent
@@ -678,6 +684,134 @@ impl RustGenerator {
         }
     }
 
+    // ---- Secondary indexes (#90) --------------------------------------------
+    //
+    // An index is in-memory derived state, exactly like `id_to_row`: a
+    // `HashMap<String, HashSet<Id>>` mapping a field's canonical string key to
+    // the set of logical ids whose *current* (newest-version) value equals it.
+    // It is maintained after the #89 WAL commit boundary on insert/update/delete
+    // and rebuilt from the committed rows on reopen (folded into the same scan
+    // that rebuilds `id_to_row`).  Probes resolve candidate ids back through the
+    // version-aware read path (`get` / `get_at`), so they never bypass the
+    // superseding-version (#66) / watermark (#56) semantics the rest of the read
+    // path enforces — the index only narrows the candidate set, it does not
+    // short-circuit version resolution.
+
+    /// The scalar fields of a model that carry a secondary index: `^index` or
+    /// `&unique`.  Restricted to non-nullable filterable scalars (the same
+    /// closed set the REST filter uses) and excludes the primary id (already
+    /// covered by `id_to_row`) and relations.  Empty when the model has no
+    /// id/auto field (it cannot be inserted, so there is nothing to index).
+    fn indexed_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+            return Vec::new();
+        }
+        model
+            .fields
+            .iter()
+            .filter(|f| {
+                (f.indexed || f.unique)
+                    && f.name != "id"
+                    && !f.auto_generate
+                    && Self::is_filterable_scalar(&f.field_type)
+                    && !matches!(f.field_type, forgedb_parser::FieldType::Nullable(_))
+            })
+            .collect()
+    }
+
+    /// Whether a field type is a non-relation scalar an index / REST filter can
+    /// key on.  Mirrors `ApiGenerator::is_filterable_field` (kept in sync).
+    fn is_filterable_scalar(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::U32
+            | FieldType::U64
+            | FieldType::I32
+            | FieldType::I64
+            | FieldType::F64
+            | FieldType::Bool
+            | FieldType::Uuid
+            | FieldType::Timestamp
+            | FieldType::String
+            | FieldType::Char(_) => true,
+            FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
+            _ => false,
+        }
+    }
+
+    /// The in-memory index field name for an indexed field, e.g. `email_index`.
+    fn index_field_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
+        format_ident!("{}_index", field.name)
+    }
+
+    /// The parameter type a `find_by_<field>` / `get_by_<field>` probe accepts:
+    /// `&str` for `string` fields (ergonomic), the (Copy) mapped type by value
+    /// otherwise (integers, bool, `f64`, `uuid`, `timestamp`, `char(N)`).
+    fn index_param_type(field: &forgedb_parser::Field) -> TokenStream {
+        if Self::is_string_type(&field.field_type) {
+            quote! { &str }
+        } else {
+            let ty = Self::map_field_type_ident(&field.field_type);
+            quote! { #ty }
+        }
+    }
+
+    /// Canonical string key for a value expression — the SAME normalization the
+    /// REST filter (`<model>_event_matches`) compares by: a JSON string keeps its
+    /// raw contents, any other scalar uses its JSON `to_string`.  Computing the
+    /// key identically for the stored field value and the probe argument is what
+    /// makes an index hit agree with a filter match.
+    fn index_key_expr(value_expr: TokenStream) -> TokenStream {
+        quote! {
+            match serde_json::to_value(&(#value_expr)) {
+                Ok(serde_json::Value::String(__s)) => __s,
+                Ok(__other) => __other.to_string(),
+                Err(_) => String::new(),
+            }
+        }
+    }
+
+    /// Emit an "add `id` under the key of `value_expr`" statement for one index.
+    fn index_add_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        value_expr: TokenStream,
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        let key = Self::index_key_expr(value_expr);
+        quote! {
+            {
+                let __k: String = { #key };
+                #receiver.#index_ident.entry(__k).or_default().insert(#id_expr);
+            }
+        }
+    }
+
+    /// Emit a "remove `id` from the key of `value_expr`" statement for one index,
+    /// pruning the bucket when it empties (structured to avoid a double mutable
+    /// borrow of the map).
+    fn index_remove_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        value_expr: TokenStream,
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        let key = Self::index_key_expr(value_expr);
+        quote! {
+            {
+                let __k: String = { #key };
+                let mut __empty = false;
+                if let Some(__set) = #receiver.#index_ident.get_mut(&__k) {
+                    __set.remove(&(#id_expr));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    #receiver.#index_ident.remove(&__k);
+                }
+            }
+        }
+    }
+
     /// Generate storage field declarations for columnar storage
     fn generate_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
@@ -698,10 +832,24 @@ impl RustGenerator {
         }
 
         let id_type = Self::id_type_tokens(model);
+
+        // Secondary index fields (#90): one `value-key -> {id}` map per `^index`
+        // / `&unique` scalar field, maintained alongside `id_to_row`.
+        let index_fields: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                quote! {
+                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                }
+            })
+            .collect();
+
         quote! {
             id_to_row: HashMap<#id_type, usize>,
             row_count: usize,
             #(#column_fields,)*
+            #(#index_fields,)*
             tombstones: forgedb_storage::Tombstones,
             // Write-ahead log (#89 durable write path): every mutation records an
             // opaque row blob here + fsync BEFORE touching columns, so a crash
@@ -767,10 +915,22 @@ impl RustGenerator {
         // through generated code — the substrate never learns the word "tenant".
         let tombstones_path = format!("{}/tombstones.bin", model_snake);
         let wal_path = format!("{}/wal.log", model_snake);
+
+        // Empty secondary indexes (#90); `new_at` rebuilds them from committed
+        // rows via `#rehydrate_logic` right after recovery.
+        let index_inits: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                quote! { #ident: std::collections::HashMap::new() }
+            })
+            .collect();
+
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
             #(#inits,)*
+            #(#index_inits,)*
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
@@ -1349,6 +1509,21 @@ impl RustGenerator {
         let wal_write = Self::generate_wal_record_write(model, false);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
 
+        // Secondary-index maintenance (#90): after the row is committed and the id
+        // is mapped, add this id under each indexed field's value key.  Sequenced
+        // after the WAL commit + `id_to_row` insert so the index only ever keys a
+        // durable row.
+        let recv = quote! { self };
+        let id_tok = quote! { id };
+        let index_adds: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fname = format_ident!("{}", f.name);
+                Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok)
+            })
+            .collect();
+
         quote! {
             let row_index = self.row_count;
             let id = record.#id_field_name;
@@ -1366,6 +1541,9 @@ impl RustGenerator {
             // Store ID mapping
             self.id_to_row.insert(id, row_index);
             self.row_count += 1;
+
+            // Secondary-index maintenance (#90): index the committed row.
+            #(#index_adds)*
 
             // Change-feed emit (#62 Direction A): this generated method knows a
             // #model_name_str was inserted; the substrate feed only carries the
@@ -1394,10 +1572,47 @@ impl RustGenerator {
         let wal_write = Self::generate_wal_record_write(model, false);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
 
+        // Secondary-index maintenance (#90): an update that changes an indexed
+        // field must drop the OLD value key and add the NEW one, else the index
+        // keeps a stale hit pointing at a superseded row.  We remove using the
+        // pre-update record (`__old`, resolved before the repoint) and add using
+        // the incoming `record`.
+        let indexed = Self::indexed_fields(model);
+        let fetch_old = if indexed.is_empty() {
+            quote! {}
+        } else {
+            quote! { let __old = self.get(id); }
+        };
+        let recv = quote! { self };
+        let id_tok = quote! { id };
+        let index_updates: Vec<_> = indexed
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fname = format_ident!("{}", f.name);
+                let remove_old = Self::index_remove_block(
+                    &recv,
+                    &ident,
+                    quote! { __old_rec.#fname },
+                    &id_tok,
+                );
+                let add_new =
+                    Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok);
+                quote! {
+                    if let Some(__old_rec) = &__old {
+                        #remove_old
+                    }
+                    #add_new
+                }
+            })
+            .collect();
+
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
                 return false;
             }
+            // Resolve the pre-update record (if live) for index removal.
+            #fetch_old
             let row_index = self.row_count;
 
             // Durability boundary (#89): WAL-record the superseding version first.
@@ -1413,6 +1628,9 @@ impl RustGenerator {
             // remain committed (backup-faithful) until compaction reclaims them.
             self.id_to_row.insert(id, row_index);
             self.row_count += 1;
+
+            // Secondary-index maintenance (#90): drop stale value keys, add new.
+            #(#index_updates)*
 
             // #62: an Updated event carries the new live row index.
             if let Some(feed) = &self.changefeed {
@@ -1438,6 +1656,21 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
+
+        // Secondary-index maintenance (#90): a delete appends a tombstoned
+        // superseding row, so the id's index entry must be DROPPED (the physical
+        // row still exists but the record reads as absent).  `record` below is
+        // the pre-delete live version — its field values are the keys to remove.
+        let recv = quote! { self };
+        let id_tok = quote! { id };
+        let index_removes: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fname = format_ident!("{}", f.name);
+                Self::index_remove_block(&recv, &ident, quote! { record.#fname }, &id_tok)
+            })
+            .collect();
 
         Some(quote! {
             // Materialize the current live record; also gives the values to
@@ -1467,6 +1700,9 @@ impl RustGenerator {
             self.id_to_row.insert(id, row_index);
             self.row_count += 1;
 
+            // Secondary-index maintenance (#90): drop the deleted id's value keys.
+            #(#index_removes)*
+
             // #62: a Deleted event carries the pre-delete row so the record is
             // still materializable by a subscriber.
             if let Some(feed) = &self.changefeed {
@@ -1477,6 +1713,118 @@ impl RustGenerator {
 
             true
         })
+    }
+
+    /// Generate the secondary-index probe methods on a model's storage (#90):
+    /// `find_by_<field>` (live) + `find_by_<field>_at` (snapshot) for every
+    /// `^index` / `&unique` field, plus `get_by_<field>` / `get_by_<field>_at`
+    /// for `&unique` fields (at most one match).
+    ///
+    /// A probe is O(1) in the index (candidate ids), NOT a scan.  It then
+    /// resolves each candidate through the version-aware read path — `get` (live
+    /// newest version) or `get_at` (the snapshot's version) — so it never
+    /// bypasses superseding-version (#66) / watermark (#56) resolution.  The
+    /// `_at` probe additionally post-filters on the resolved value, so a
+    /// candidate whose value changed *after* the snapshot is excluded.
+    fn generate_index_lookups(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let methods: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fname = format_ident!("{}", f.name);
+                let param_ty = Self::index_param_type(f);
+                let find_fn = format_ident!("find_by_{}", f.name);
+                let find_at_fn = format_ident!("find_by_{}_at", f.name);
+                let key_from_arg = Self::index_key_expr(quote! { value });
+                let key_from_rec = Self::index_key_expr(quote! { __rec.#fname });
+
+                let find_doc = format!(
+                    "Index probe (#90): every live `{}` whose `{}` equals `value`. \
+                     O(1) candidate lookup + newest-version resolution, not a scan.",
+                    model.name, f.name
+                );
+                let find_at_doc = format!(
+                    "Snapshot-scoped index probe (#90 + #56): candidates from the live \
+                     `{}` index resolved through `get_at`, so each result is the \
+                     version live as of `snap`; a candidate whose value changed after \
+                     the snapshot is post-filtered out.  Honest limit: a row whose \
+                     `{}` changed *away* between the snapshot and now is not in the \
+                     live index (indexes are not versioned).",
+                    f.name, f.name
+                );
+
+                let mut m = quote! {
+                    #[doc = #find_doc]
+                    pub fn #find_fn(&self, value: #param_ty) -> Vec<#model_name> {
+                        let __k: String = { #key_from_arg };
+                        let __ids = match self.#ident.get(&__k) {
+                            Some(__s) => __s,
+                            None => return Vec::new(),
+                        };
+                        __ids.iter().filter_map(|&__id| self.get(__id)).collect()
+                    }
+
+                    #[doc = #find_at_doc]
+                    pub fn #find_at_fn(
+                        &self,
+                        snap: &forgedb_storage::Snapshot,
+                        value: #param_ty,
+                    ) -> Vec<#model_name> {
+                        let __k: String = { #key_from_arg };
+                        let __ids = match self.#ident.get(&__k) {
+                            Some(__s) => __s,
+                            None => return Vec::new(),
+                        };
+                        let mut __out = Vec::new();
+                        for &__id in __ids {
+                            if let Some(__rec) = self.get_at(snap, __id) {
+                                let __rk: String = { #key_from_rec };
+                                if __rk == __k {
+                                    __out.push(__rec);
+                                }
+                            }
+                        }
+                        __out
+                    }
+                };
+
+                if f.unique {
+                    let get_fn = format_ident!("get_by_{}", f.name);
+                    let get_at_fn = format_ident!("get_by_{}_at", f.name);
+                    let get_doc = format!(
+                        "Unique index probe (#90): the at-most-one live `{}` whose \
+                         `{}` equals `value`.",
+                        model.name, f.name
+                    );
+                    let get_at_doc = format!(
+                        "Snapshot-scoped unique index probe (#90 + #56): the \
+                         at-most-one `{}` matching `value` as of `snap`.",
+                        model.name
+                    );
+                    m.extend(quote! {
+                        #[doc = #get_doc]
+                        pub fn #get_fn(&self, value: #param_ty) -> Option<#model_name> {
+                            let __k: String = { #key_from_arg };
+                            let __ids = self.#ident.get(&__k)?;
+                            __ids.iter().find_map(|&__id| self.get(__id))
+                        }
+
+                        #[doc = #get_at_doc]
+                        pub fn #get_at_fn(
+                            &self,
+                            snap: &forgedb_storage::Snapshot,
+                            value: #param_ty,
+                        ) -> Option<#model_name> {
+                            self.#find_at_fn(snap, value).into_iter().next()
+                        }
+                    });
+                }
+                m
+            })
+            .collect();
+
+        quote! { #(#methods)* }
     }
 
     /// Generate the body of the shared `read_at(row_index)` accessor.
@@ -1759,10 +2107,48 @@ impl RustGenerator {
             None => quote! {},
         };
 
+        // Secondary-index rebuild (#90): fold into the SAME reopen scan that
+        // rebuilds `id_to_row`.  Runs AFTER `id_scan` has resolved each id to its
+        // newest physical row (last-write-wins), so the index keys only committed,
+        // live (non-tombstoned) values.  Collect ids first to avoid holding an
+        // immutable borrow of `id_to_row` across the `get` + index mutation.
+        let recv = quote! { db };
+        let id_tok = quote! { __id };
+        let index_rebuild = {
+            let indexed = Self::indexed_fields(model);
+            if indexed.is_empty() {
+                quote! {}
+            } else {
+                let id_type = Self::id_type_tokens(model);
+                let adds: Vec<_> = indexed
+                    .iter()
+                    .map(|f| {
+                        let ident = Self::index_field_ident(f);
+                        let fname = format_ident!("{}", f.name);
+                        Self::index_add_block(
+                            &recv,
+                            &ident,
+                            quote! { __rec.#fname },
+                            &id_tok,
+                        )
+                    })
+                    .collect();
+                quote! {
+                    let __ids: Vec<#id_type> = db.id_to_row.keys().copied().collect();
+                    for __id in __ids {
+                        if let Some(__rec) = db.get(__id) {
+                            #(#adds)*
+                        }
+                    }
+                }
+            }
+        };
+
         quote! {
             let n = db.tombstones.len();
             db.row_count = n;
             #id_scan
+            #index_rebuild
         }
     }
 
