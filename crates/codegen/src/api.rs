@@ -248,7 +248,9 @@ impl ApiGenerator {
                 tag = #model_tag,
                 request_body = #model_name,
                 responses(
-                    (status = 201, description = #create_summary, body = #model_name)
+                    (status = 201, description = #create_summary, body = #model_name),
+                    (status = 409, description = "Integrity conflict (duplicate unique / dangling foreign key)"),
+                    (status = 422, description = "Field constraint violation")
                 )
             )]
             async fn #create_fn(
@@ -260,8 +262,16 @@ impl ApiGenerator {
                     Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
                 };
                 let mut db = db.write().await;
-                let id = db.#storage_field.insert(record);
-                (StatusCode::CREATED, Json(json!({ "id": id.to_string() })))
+                // Route through the Database-level validated wrapper (#91): FK
+                // existence + field constraints + `&unique`, mapped to 409/422.
+                match db.#create_fn(record) {
+                    Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id.to_string() }))),
+                    Err(e) => {
+                        let status = StatusCode::from_u16(e.status_code())
+                            .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                        (status, Json(json!({ "error": e.to_string() })))
+                    }
+                }
             }
 
             #[utoipa::path(
@@ -274,7 +284,9 @@ impl ApiGenerator {
                 request_body = #model_name,
                 responses(
                     (status = 200, description = #update_summary, body = #model_name),
-                    (status = 404, description = "Not found")
+                    (status = 404, description = "Not found"),
+                    (status = 409, description = "Integrity conflict (duplicate unique / dangling foreign key)"),
+                    (status = 422, description = "Field constraint violation")
                 )
             )]
             // Whole-record replace over the generated `update` (#66):
@@ -293,10 +305,15 @@ impl ApiGenerator {
                     Err(_) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": "invalid payload" }))),
                 };
                 let mut db = db.write().await;
-                if db.#storage_field.update(key, record) {
-                    (StatusCode::OK, Json(json!({ "id": key.to_string() })))
-                } else {
-                    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+                // Route through the Database-level validated wrapper (#91).
+                match db.#update_fn(key, record) {
+                    Ok(true) => (StatusCode::OK, Json(json!({ "id": key.to_string() }))),
+                    Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                    Err(e) => {
+                        let status = StatusCode::from_u16(e.status_code())
+                            .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                        (status, Json(json!({ "error": e.to_string() })))
+                    }
                 }
             }
 

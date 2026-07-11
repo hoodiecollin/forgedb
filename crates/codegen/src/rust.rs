@@ -70,6 +70,58 @@ impl RustGenerator {
             const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
         });
 
+        // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
+        // generic *shape* (three integrity classes) but every field name, rule,
+        // and message is filled in by generated per-field checks — there is no
+        // runtime schema-reading validator.  Carried out of `insert`/`update`
+        // (and the `Database::create_*`/`update_*` wrappers) so a write that would
+        // violate integrity is refused, not committed.
+        tokens.extend(quote! {
+            /// A rejected write (#91).  `status_code()` maps each class to the
+            /// HTTP status the generated REST boundary returns.
+            #[derive(Debug, Clone, PartialEq)]
+            pub enum ValidationError {
+                /// A `&unique` field already holds this value on another row → 409.
+                Unique { field: &'static str },
+                /// A required/optional foreign key points at a non-existent row → 409.
+                DanglingReference { field: &'static str, target: &'static str },
+                /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
+                /// was violated → 422.
+                Constraint { field: &'static str, rule: &'static str, message: String },
+            }
+
+            impl ValidationError {
+                /// The HTTP status the generated API boundary returns for this class:
+                /// integrity conflicts (unique / dangling FK) → 409, field-constraint
+                /// violations → 422.
+                pub fn status_code(&self) -> u16 {
+                    match self {
+                        ValidationError::Unique { .. }
+                        | ValidationError::DanglingReference { .. } => 409,
+                        ValidationError::Constraint { .. } => 422,
+                    }
+                }
+            }
+
+            impl std::fmt::Display for ValidationError {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    match self {
+                        ValidationError::Unique { field } => {
+                            write!(f, "unique constraint violated on field `{}`", field)
+                        }
+                        ValidationError::DanglingReference { field, target } => {
+                            write!(f, "field `{}` references a non-existent {}", field, target)
+                        }
+                        ValidationError::Constraint { field, rule, message } => {
+                            write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+                        }
+                    }
+                }
+            }
+
+            impl std::error::Error for ValidationError {}
+        });
+
         // Generate embedded struct definitions before the models that reference
         // them.  Models store structs as raw fixed-size bytes, so the struct
         // types must exist for the emitted `size_of`/`read_unaligned` code to
@@ -115,6 +167,13 @@ impl RustGenerator {
         // second `impl Database` block.
         let traversal_tokens = Self::generate_traversal_impl(schema);
         tokens.extend(traversal_tokens);
+
+        // Generate the Database-level validated write wrappers (#91 Phase 3):
+        // create_<model> / update_<model>, which add foreign-key existence checks
+        // (sibling-collection access) on top of the storage-level field + unique
+        // validation, then delegate.  The REST boundary routes through these.
+        let validated_writes = Self::generate_validated_writes(schema);
+        tokens.extend(validated_writes);
 
         // Generate the snapshot-scoped M2M traversal on the read-only
         // `DatabaseReader` (#56 Direction B), so a concurrent reader can resolve
@@ -179,6 +238,10 @@ impl RustGenerator {
         // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
         let id_type = Self::id_type_tokens(model);
 
+        // Generate the field-constraint validator (#91 Phase 3), a free fn the
+        // generated insert/update call before committing.
+        let field_validation = Self::generate_field_validation(model);
+
         // Generate insert logic
         let insert_logic = Self::generate_insert_logic(model);
 
@@ -193,9 +256,13 @@ impl RustGenerator {
                 /// Append a superseding version of an existing record (#66).
                 /// Reads resolve newest-version-wins; the prior version's bytes are
                 /// never mutated, so append-only (and thus backup / snapshots) hold.
-                /// Returns `false` if `id` is absent.  Storage grows with each
-                /// update until compaction reclaims superseded versions.
-                pub fn update(&mut self, id: #id_type, record: #model_name) -> bool {
+                /// Validates field constraints + `&unique` FIRST (#91): a rejected
+                /// update commits nothing and returns `Err(ValidationError)`.
+                /// `Ok(false)` if `id` is absent; `Ok(true)` on a successful update.
+                /// Storage grows with each update until compaction reclaims versions.
+                /// (Foreign-key existence is checked by `Database::update_<model>`,
+                /// which has sibling-collection access this storage-scoped method lacks.)
+                pub fn update(&mut self, id: #id_type, record: #model_name) -> Result<bool, ValidationError> {
                     #update_logic
                 }
 
@@ -328,7 +395,12 @@ impl RustGenerator {
                     self.changefeed = Some(feed);
                 }
 
-                pub fn insert(&mut self, record: #model_name) -> #id_type {
+                /// Insert a record.  Validates field constraints + `&unique` FIRST
+                /// (#91 Phase 3): a rejected insert commits nothing and returns
+                /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
+                /// existence is checked by `Database::create_<model>`, which has the
+                /// sibling-collection access this storage-scoped method lacks.)
+                pub fn insert(&mut self, record: #model_name) -> Result<#id_type, ValidationError> {
                     #insert_logic
                 }
 
@@ -416,6 +488,9 @@ impl RustGenerator {
                 // `get_at`.  No live `find_by_*` — a reader has no live `get`.
                 #reader_index_probes
             }
+
+            // Field-constraint validator (#91), called by insert/update.
+            #field_validation
         };
 
         Ok(tokens)
@@ -756,6 +831,212 @@ impl RustGenerator {
             FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
             _ => false,
         }
+    }
+
+    /// Whether a field type is (or wraps) a numeric scalar `@min`/`@max` can bound.
+    fn is_numeric_type(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::U32
+            | FieldType::U64
+            | FieldType::I32
+            | FieldType::I64
+            | FieldType::F64 => true,
+            FieldType::Nullable(inner) => Self::is_numeric_type(inner),
+            _ => false,
+        }
+    }
+
+    /// The `i64` params of a constraint, in order (skips string params).
+    fn constraint_numbers(c: &forgedb_parser::ast::Constraint) -> Vec<i64> {
+        c.params
+            .iter()
+            .filter_map(|p| match p {
+                forgedb_parser::ast::ConstraintParam::Number(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Generate the per-model field-constraint validator (#91 Phase 3):
+    /// `validate_<snake>(record) -> Result<(), ValidationError>`, enforcing the
+    /// declared `@min`/`@max` (numeric), `@length` (string), `@email`, and `@url`
+    /// directives.  Every check is generated from a specific field + directive —
+    /// there is no runtime constraint interpreter.  Nullable fields are validated
+    /// only when `Some` (a `None` value violates no value-constraint).
+    ///
+    /// `@pattern`/`@regex` are intentionally NOT enforced here (they need a regex
+    /// engine dependency in the generated crate) — deferred as a Phase-3 follow-up.
+    fn generate_field_validation(model: &forgedb_parser::Model) -> TokenStream {
+        let fn_name = format_ident!("validate_{}", Self::to_snake_case(&model.name));
+        let model_name = format_ident!("{}", model.name);
+
+        let field_blocks: Vec<_> = model
+            .fields
+            .iter()
+            .filter_map(|field| {
+                let is_string = Self::is_string_type(&field.field_type);
+                let is_numeric = Self::is_numeric_type(&field.field_type);
+                let fname_str = field.name.as_str();
+
+                let mut checks: Vec<TokenStream> = Vec::new();
+                for c in &field.constraints {
+                    match c.name.as_str() {
+                        "min" if is_numeric => {
+                            if let Some(&n) = Self::constraint_numbers(c).first() {
+                                let msg = format!("must be >= {n}");
+                                checks.push(quote! {
+                                    if (*__v as f64) < #n as f64 {
+                                        return Err(ValidationError::Constraint {
+                                            field: #fname_str, rule: "min",
+                                            message: #msg.to_string(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                        "max" if is_numeric => {
+                            if let Some(&n) = Self::constraint_numbers(c).first() {
+                                let msg = format!("must be <= {n}");
+                                checks.push(quote! {
+                                    if (*__v as f64) > #n as f64 {
+                                        return Err(ValidationError::Constraint {
+                                            field: #fname_str, rule: "max",
+                                            message: #msg.to_string(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                        "length" if is_string => {
+                            let nums = Self::constraint_numbers(c);
+                            if nums.len() == 1 {
+                                let max = nums[0];
+                                let msg = format!("length must be <= {max}");
+                                checks.push(quote! {
+                                    if __v.chars().count() > #max as usize {
+                                        return Err(ValidationError::Constraint {
+                                            field: #fname_str, rule: "length",
+                                            message: #msg.to_string(),
+                                        });
+                                    }
+                                });
+                            } else if nums.len() >= 2 {
+                                let (min, max) = (nums[0], nums[1]);
+                                let msg = format!("length must be between {min} and {max}");
+                                checks.push(quote! {
+                                    let __len = __v.chars().count();
+                                    if __len < #min as usize || __len > #max as usize {
+                                        return Err(ValidationError::Constraint {
+                                            field: #fname_str, rule: "length",
+                                            message: #msg.to_string(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
+                        "email" if is_string => {
+                            checks.push(quote! {
+                                let __parts: Vec<&str> = __v.split('@').collect();
+                                let __ok = __parts.len() == 2
+                                    && !__parts[0].is_empty()
+                                    && __parts[1].contains('.')
+                                    && !__parts[1].starts_with('.')
+                                    && !__parts[1].ends_with('.')
+                                    && !__v.chars().any(|__c| __c.is_whitespace());
+                                if !__ok {
+                                    return Err(ValidationError::Constraint {
+                                        field: #fname_str, rule: "email",
+                                        message: "must be a valid email address".to_string(),
+                                    });
+                                }
+                            });
+                        }
+                        "url" if is_string => {
+                            checks.push(quote! {
+                                if !(__v.starts_with("http://") || __v.starts_with("https://")) {
+                                    return Err(ValidationError::Constraint {
+                                        field: #fname_str, rule: "url",
+                                        message: "must be an http(s) URL".to_string(),
+                                    });
+                                }
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                if checks.is_empty() {
+                    return None;
+                }
+                let fident = format_ident!("{}", field.name);
+                // `__v` is always `&T` (numeric derefs via `*__v`; string methods
+                // take `&self`).  Nullable fields validate only their `Some` value.
+                if field.is_nullable() {
+                    Some(quote! {
+                        if let Some(__v) = &record.#fident {
+                            #(#checks)*
+                        }
+                    })
+                } else {
+                    Some(quote! {
+                        {
+                            let __v = &record.#fident;
+                            #(#checks)*
+                        }
+                    })
+                }
+            })
+            .collect();
+
+        quote! {
+            /// Field-constraint validation (#91): reject a record whose values
+            /// violate a declared `@min`/`@max`/`@length`/`@email`/`@url` directive.
+            fn #fn_name(record: &#model_name) -> Result<(), ValidationError> {
+                #(#field_blocks)*
+                Ok(())
+            }
+        }
+    }
+
+    /// Generate the `&unique` enforcement checks (#91) for insert/update, run
+    /// before the commit.  Probes the Phase-2 unique index (`<field>_index`):
+    /// on insert any non-empty bucket for the key is a conflict; on update a
+    /// bucket entry for a *different* id is a conflict (the record's own id may
+    /// already be present with an unchanged value — index maintenance runs AFTER
+    /// commit, so the pre-commit index still keys the old value to `id`).
+    fn generate_unique_checks(model: &forgedb_parser::Model, exclude_self: bool) -> Vec<TokenStream> {
+        Self::indexed_fields(model)
+            .iter()
+            .filter(|f| f.unique)
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fident = format_ident!("{}", f.name);
+                let fname = f.name.as_str();
+                let key = Self::index_key_expr(quote! { record.#fident });
+                if exclude_self {
+                    quote! {
+                        {
+                            let __uk: String = { #key };
+                            if let Some(__ids) = self.#ident.get(&__uk) {
+                                if __ids.iter().any(|__i| *__i != id) {
+                                    return Err(ValidationError::Unique { field: #fname });
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    quote! {
+                        {
+                            let __uk: String = { #key };
+                            if self.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
+                                return Err(ValidationError::Unique { field: #fname });
+                            }
+                        }
+                    }
+                }
+            })
+            .collect()
     }
 
     /// The in-memory index field name for an indexed field, e.g. `email_index`.
@@ -1756,6 +2037,10 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
+        // Data-integrity gate (#91): validate field constraints + `&unique` BEFORE
+        // any durable side effect, so a rejected insert commits absolutely nothing.
+        let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
+        let unique_checks = Self::generate_unique_checks(model, false);
 
         // Secondary-index maintenance (#90): after the row is committed and the id
         // is mapped, add this id under each indexed field's value key.  Sequenced
@@ -1787,6 +2072,11 @@ impl RustGenerator {
             .collect();
 
         quote! {
+            // Integrity gate (#91): field constraints, then `&unique`.  Both run
+            // before the WAL write, so a rejected insert leaves storage untouched.
+            #validate_fn(&record)?;
+            #(#unique_checks)*
+
             let row_index = self.row_count;
             let id = record.#id_field_name;
 
@@ -1818,7 +2108,7 @@ impl RustGenerator {
 
             #maybe_checkpoint
 
-            id
+            Ok(id)
         }
     }
 
@@ -1835,6 +2125,10 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
+        // Integrity gate (#91): validate field constraints + `&unique` (excluding
+        // the record's own id) before any durable side effect.
+        let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
+        let unique_checks = Self::generate_unique_checks(model, true);
 
         // Secondary-index maintenance (#90): an update that changes an indexed
         // field must drop the OLD value key and add the NEW one, else the index
@@ -1905,8 +2199,12 @@ impl RustGenerator {
 
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
-                return false;
+                return Ok(false);
             }
+            // Integrity gate (#91): validate the incoming record before touching
+            // storage; `&unique` excludes this id so an unchanged value is fine.
+            #validate_fn(&record)?;
+            #(#unique_checks)*
             // Resolve the pre-update record (if live) for index removal.
             #fetch_old
             let row_index = self.row_count;
@@ -1937,7 +2235,7 @@ impl RustGenerator {
 
             #maybe_checkpoint
 
-            true
+            Ok(true)
         })
     }
 
@@ -2839,6 +3137,108 @@ impl RustGenerator {
         };
 
         Ok(tokens)
+    }
+
+    /// Generate the `Database`-level validated write wrappers (#91 Phase 3):
+    /// `create_<model>` / `update_<model>`.  These add the one integrity check the
+    /// storage-scoped `insert`/`update` cannot make — **foreign-key existence** —
+    /// because it needs sibling-collection access (`self.<target>.get(fk)`), then
+    /// delegate to the storage method (which enforces field constraints + `&unique`).
+    /// Required FKs must resolve; optional FKs must resolve *when set*.  Only
+    /// UUID-keyed targets are checked (an FK is always a `Uuid`, so an integer-PK
+    /// target cannot be resolved by it — the same restriction as relation
+    /// traversal).  The generated REST boundary routes creates/updates through
+    /// these, so both the Rust API and REST get full integrity.
+    fn generate_validated_writes(schema: &Schema) -> TokenStream {
+        let mut methods = Vec::new();
+        for model in &schema.models {
+            if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+                continue;
+            }
+            let snake = Self::to_snake_case(&model.name);
+            let storage_field = format_ident!("{}", snake);
+            let model_ident = format_ident!("{}", model.name);
+            let id_type = Self::id_type_tokens(model);
+            let create_fn = format_ident!("create_{}", snake);
+            let update_fn = format_ident!("update_{}", snake);
+
+            let fk_checks: Vec<_> = model
+                .fields
+                .iter()
+                .filter_map(|field| {
+                    let (target_name, optional) = match &field.field_type {
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::RequiredReference(t),
+                        ) => (t, false),
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(t),
+                        ) => (t, true),
+                        _ => return None,
+                    };
+                    let target = schema.find_model(target_name)?;
+                    if !Self::is_uuid_pk(target) {
+                        return None;
+                    }
+                    let target_storage = format_ident!("{}", Self::to_snake_case(&target.name));
+                    let fk_field = format_ident!("{}", field.name);
+                    let fname = field.name.as_str();
+                    let tname = target.name.as_str();
+                    Some(if optional {
+                        quote! {
+                            if let Some(__fk) = record.#fk_field {
+                                if self.#target_storage.get(__fk).is_none() {
+                                    return Err(ValidationError::DanglingReference {
+                                        field: #fname, target: #tname,
+                                    });
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            if self.#target_storage.get(record.#fk_field).is_none() {
+                                return Err(ValidationError::DanglingReference {
+                                    field: #fname, target: #tname,
+                                });
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let create_doc = format!(
+                "Create a {} with full integrity (#91): foreign keys must resolve, \
+                 then field constraints + `&unique` are enforced by `insert`.",
+                model.name
+            );
+            let update_doc = format!(
+                "Update a {} with full integrity (#91): foreign keys must resolve, \
+                 then field constraints + `&unique` are enforced by `update`. \
+                 `Ok(false)` if the id is absent.",
+                model.name
+            );
+            methods.push(quote! {
+                #[doc = #create_doc]
+                pub fn #create_fn(&mut self, record: #model_ident) -> Result<#id_type, ValidationError> {
+                    #(#fk_checks)*
+                    self.#storage_field.insert(record)
+                }
+
+                #[doc = #update_doc]
+                pub fn #update_fn(&mut self, id: #id_type, record: #model_ident) -> Result<bool, ValidationError> {
+                    #(#fk_checks)*
+                    self.#storage_field.update(id, record)
+                }
+            });
+        }
+
+        if methods.is_empty() {
+            return quote! {};
+        }
+        quote! {
+            impl Database {
+                #(#methods)*
+            }
+        }
     }
 
     /// Generate the persisted junction storage struct for each M2M relation.
