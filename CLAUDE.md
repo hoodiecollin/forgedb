@@ -131,20 +131,25 @@ in `crates/`:
   `read_all` + `replay`); the pre-existing structured/field-decoding API (`WalValue`, `WalOperation::{Insert,
   Update,Delete}`, `Transaction`/`replay_committed`) was **pruned as a drift vector** (#95, legacy-audit epic
   #94) — 0.2.0 is that breaking removal.
+- `query-params` — REST query-string parser (#90) — **0.1.0 (published 2026-07-10)**. Schema-agnostic:
+  parses a URL query string into generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated
+  `api.rs` list endpoint links it for filter/sort/paginate. Interprets no schema — all field-aware filtering/sorting
+  is generated per-model — so it is class-1 substrate, same class as `changefeed`/`auth`.
 
 **Internal (0.1.0):**
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
 - `validation`, `migrations`, `compaction`, `backup`, `changefeed`,
-  `query-params`, `watcher`, `lsp-server`, `ffi`
+  `watcher`, `lsp-server`, `ffi`  (`query-params` is now **published** — see the
+  published-crates list above)
   (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
   removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
   in the generated handlers, and the generated `api.rs` builds its own router.)
   `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
   `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
   schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
-  links against, like `changefeed`/`auth`. Generated code now requires it (publish gap — see Known issues).
+  links against, like `changefeed`/`auth`. Generated code requires it; **published 0.1.0 (2026-07-10)**.
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
@@ -245,10 +250,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
     (ephemeral); full `examples/` corpus (incl. integer-PK `iot-sensors`) compile-checked in `scratchpad/corpus_check`.
     **Honest limits / deferred:** FK-scalar (relation) fields and **composite `@index(a,b)`** are not yet indexed
     (single-field `^`/`&` scalars only); nullable indexed fields skip index generation; the concurrent-read
-    `DatabaseReader` has no index (its `_at` reads still scan) — follow-ups. **Publish gap reopens:** generated
-    `api.rs` now depends on **`forgedb-query-params`** (scaffold pins `= "0.1"`); it must be **published** before an
-    outside-repo `init → build` resolves from crates.io (proven here with a `[patch]` path dep, matching the Phase 1
-    rhythm — publish is a separate explicit step).
+    `DatabaseReader` has no index (its `_at` reads still scan) — follow-ups (FK-scalar #100, composite #101,
+    nullable #102, reader #103). **Publish
+    gap CLOSED (2026-07-10):** generated `api.rs` now depends on **`forgedb-query-params` 0.1.0** (scaffold pins
+    `= "0.1"`); it is **published**, and the reclose is PROVEN by an outside-repo `init → generate rust+api →
+    cargo build` resolving `forgedb-query-params 0.1.0` + `forgedb-storage 0.1.5` + `forgedb-wal 0.2.0` +
+    changefeed/auth/types from crates.io and compiling the generated list + index code (0 errors).
   - **No constraint/validation enforcement.** Duplicate `&unique` + dangling required-FK are allowed;
     `@min/@max/@length/@email/@pattern` are ignored at write. → v1 Phase 3 (#91).
   - **Migrations are infrastructure without an engine.** The executor errors on type-change/remove/index ops;
@@ -274,13 +281,15 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — CLOSED again 2026-07-10 (#89/#96):** the durable write path + WAL checkpoint made
-  generated code require **`forgedb-wal 0.2.0`** (opaque `Raw` path + `truncate`) + **`forgedb-storage 0.1.5`**
-  (`truncate_to_rows` + `DirLock` + column `flush`); **both are now published** (2026-07-10, wal first then
-  storage per the dep order). The reclose is PROVEN by an outside-repo `forgedb init --template blog → generate
-  rust+api → cargo build` resolving `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` + `forgedb-changefeed 0.1.1` +
-  `forgedb-auth 0.1.0` + `forgedb-types 0.2.0` from crates.io and compiling the generated durable-write +
-  checkpoint code (0 errors). Prior history below. #56-B (single-writer/many-reader) added
+- **`init → build` publish gap — CLOSED again 2026-07-10 (#90):** Phase 2 made generated `api.rs` require
+  **`forgedb-query-params 0.1.0`** (list-endpoint filter/sort/paginate parsing); it is **now published**, and the
+  reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust+api → cargo build` resolving
+  `forgedb-query-params 0.1.0` + `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5` + `forgedb-changefeed 0.1.1` +
+  `forgedb-auth 0.1.0` + `forgedb-types 0.2.0` from crates.io and compiling the generated list + secondary-index
+  code (0 errors). Scaffold pins **`forgedb-query-params = "0.1"`**. Prior close (#89/#96, 2026-07-10): the durable
+  write path + WAL checkpoint made generated code require **`forgedb-wal 0.2.0`** (opaque `Raw` path + `truncate`)
+  + **`forgedb-storage 0.1.5`** (`truncate_to_rows` + `DirLock` + column `flush`); **both are now published** (wal
+  first then storage per the dep order), reclose proven the same way (durable-write + checkpoint code). Prior history below. #56-B (single-writer/many-reader) added
   read-only column reader handles to `forgedb-storage` (`FixedColumnReader`/`VariableColumnReader`/
   `TombstonesReader` + `*::reader()`), bumping it **0.1.3 → 0.1.4**; generated `*StorageReader` /
   `DatabaseReader` call `col.reader()`. **`forgedb-storage 0.1.4` is now published**, and the reclose is
@@ -289,8 +298,9 @@ across many domains live in `examples/` — see `examples/README.md`.**
   the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
   Scaffold pins `forgedb-storage = "0.1.5"`, `forgedb-changefeed = "0.1"`, **`forgedb-wal = "0.2"`** (#89),
-  **`forgedb-auth = "0.1"`** (#59), axum `ws`. History: the gap reopened for #57, #62-A, #66, #56-B, #59, and
-  **#89/#96** — **all now closed** (#89/#96 closed 2026-07-10 by the wal 0.2.0 + storage 0.1.5 publish above). #59 closed
+  **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), axum `ws`. History: the gap reopened
+  for #57, #62-A, #66, #56-B, #59, #89/#96, and **#90** — **all now closed** (#90 closed 2026-07-10 by the
+  query-params 0.1.0 publish above; #89/#96 by the wal 0.2.0 + storage 0.1.5 publish). #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
