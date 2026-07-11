@@ -1,5 +1,11 @@
 # SPIKE #101 — composite `@index(a,b)` indexes + multi-field probes
 
+> **Status: LANDED 2026-07-10.** Implemented with the length-prefixed collision-free key; emits
+> `find_by_<a>_and_<b>` (+ `_at`) probes. Hash exact-match only (prefix/range B-tree semantics remain
+> out of scope). Guard `test_rust_generation_index_followups`; E2E `scratchpad/followups_compile`.
+> The optional list-endpoint routing optimization (§5) was **not** done — the #90 closed-set filter
+> already answers those queries correctly.
+
 Design spike for issue #101, a Phase 2 (#90) follow-up. Builds on the single-field secondary-index
 machinery landed in #90 (`crates/codegen/src/rust.rs`). Verified against generated code + the
 parser AST as of 2026-07-10.

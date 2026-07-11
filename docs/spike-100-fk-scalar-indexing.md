@@ -1,5 +1,10 @@
 # SPIKE #100 — index FK-scalar (relation) fields for probe-not-scan traversal
 
+> **Status: LANDED 2026-07-10.** Both required (`*Target`) and optional (`?Target`, riding #102) FK
+> fields are indexed; reverse one-to-many getters now probe `find_by_<fk>` instead of scanning. Guard
+> `test_rust_generation_index_followups`; E2E `scratchpad/followups_compile`. M2M junction-column
+> indexing remains the deferred second step.
+
 Design spike for issue #100, a Phase 2 (#90) follow-up. Builds directly on the secondary-index
 machinery landed in #90 (`crates/codegen/src/rust.rs`). Verified against the generated code as
 of 2026-07-10.

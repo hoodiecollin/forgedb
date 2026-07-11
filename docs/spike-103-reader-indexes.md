@@ -1,5 +1,11 @@
 # SPIKE #103 — secondary-index probes on `DatabaseReader` (concurrent reads)
 
+> **Status: LANDED 2026-07-10.** Implemented exactly as recommended: the reader clones every index map
+> at `reader()` time and emits `_at`-only probes via a shared `generate_index_probes(model,
+> include_live)` (writer = live + `_at`, reader = `_at`) — one probe body, no drift. Plain clone (the
+> `Arc`-swap escape hatch is noted, not needed for v1). Guard `test_rust_generation_index_followups`;
+> E2E `scratchpad/followups_compile`.
+
 Design spike for issue #103, a Phase 2 (#90) follow-up. Builds on the #90 index machinery and the
 #56 Direction-B reader handles (`crates/codegen/src/rust.rs`). Verified against generated code as
 of 2026-07-10.

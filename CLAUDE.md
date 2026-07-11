@@ -85,7 +85,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 393 tests pass** (workspace, incl. doctests). 391→393 with #90 Phase 2 (2 codegen guards:
+**Baseline: 394 tests pass** (workspace, incl. doctests). 393→394 with the #100–#103 index follow-ups (1 codegen
+guard `test_rust_generation_index_followups`). 391→393 with #90 Phase 2 (2 codegen guards:
 `test_rust_generation_secondary_indexes` + `test_api_generation_list_endpoint`). 461→391 with the legacy-audit prunes
 (#94): −70 from deleting the two dead crates `query-optimization` (32 unit + doctests, incl. the
 former #48 join-predicate pushdown) and `http-server` (30 unit + doctests) plus the dead
@@ -99,7 +100,7 @@ the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint
 `forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
 (1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531
 when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
-"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"380".
+"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"393"/"380".
 
 ## Workspace layout
 
@@ -234,28 +235,47 @@ across many domains live in `examples/` — see `examples/README.md`.**
       to `MAX_LIMIT`). Response is `{data,total,limit,offset}`. query-params parses only the query string into
       generic `Sort`/`Pagination`; every field-aware step is generated — identity-clean (PM audit kept the crate
       precisely to wire here). Guard `test_api_generation_list_endpoint`.
-    - **Secondary indexes + `find_by_*` / `get_by_*` probes.** Each `^index` / `&unique` non-nullable scalar field
-      gets an in-memory `value-key → {id}` map (`<field>_index`), maintained like `id_to_row`: **after** the #89
-      WAL commit boundary on insert (add), update (remove-old + add-new — superseding-version aware, #66), delete
-      (drop); **rebuilt on reopen folded into the same id-scan** as `id_to_row` (`generate_rehydrate_logic`, after
-      #89 recovery so it keys only committed rows). Probes are an **O(1) index `get` (not a scan)** that resolve
-      candidates through the version-aware read path: `find_by_<field>`/`get_by_<field>` via live `get`,
+    - **Secondary indexes + `find_by_*` / `get_by_*` probes.** Each indexed scalar field gets an in-memory
+      `value-key → {id}` map (`<field>_index`), maintained like `id_to_row`: **after** the #89 WAL commit boundary
+      on insert (add), update (remove-old + add-new — superseding-version aware, #66), delete (drop); **rebuilt on
+      reopen folded into the same id-scan** as `id_to_row` (`generate_rehydrate_logic`, after #89 recovery so it
+      keys only committed rows). Probes are an **O(1) index `get` (not a scan)** that resolve candidates through the
+      version-aware read path: `find_by_<field>`/`get_by_<field>` via live `get`,
       `find_by_<field>_at`/`get_by_<field>_at(&Snapshot)` via `get_at` — the `_at` form resolves **the snapshot's
       version, not the live newest row**, and post-filters the resolved value so a candidate whose value changed
-      after the snapshot is excluded. Key = the same JSON canonical string the REST filter compares by (so an index
-      hit agrees with a filter match). Guard `test_rust_generation_secondary_indexes`.
+      after the snapshot is excluded. Guards `test_rust_generation_secondary_indexes` + `test_rust_generation_index_followups`.
+    - **Index-subsystem follow-ups #100–#103 LANDED (2026-07-10).** The four deferred Phase-2 index gaps are now
+      wired (pure generated code over existing storage — no new substrate, no publish gap):
+      - **#100 FK-scalar indexing.** `*Target` (`RequiredReference` → `Uuid`) and `?Target` (`OptionalReference` →
+        `Option<Uuid>`) FK fields are **always** indexed (a reverse one-to-many getter that would otherwise scan
+        always exists), and the generated reverse getters (`user_posts_by_author`, …) now **probe** `find_by_<fk>`
+        (O(1)) instead of scanning `all()` — the last linear scans in the read path are gone.
+      - **#101 composite `@index(a, b)`.** One `HashMap<String,{id}>` per composite, keyed by a **collision-free
+        length-prefixed** concat of each component's per-field key (`<byte-len>:<key>` per part, so `("ab","c")` ≠
+        `("a","bc")`); `find_by_<a>_and_<b>` (+ `_at`) probes; maintained + reopen-rebuilt alongside single-field
+        indexes. Hash exact-match only (answers `a=? AND b=?`, not prefix/range — a B-tree feature, out of scope).
+      - **#102 nullable indexing.** `T?` scalar fields are now indexable; probe params are `Option<T>`
+        (`Option<&str>` for strings), so `find_by_<field>(None)` probes the unset bucket. **Load-bearing fix:** the
+        index key is now **null-distinct + type-tagged** (`\u{0}`=null, `\u{1}`+raw=string, `\u{2}`+text=other) so
+        `None` and the literal string `"null"` can no longer collide (the exact hazard that made #90 gate nullable
+        out — proven non-colliding E2E).
+      - **#103 `DatabaseReader` snapshot index probes.** The read-only reader handle now carries a point-in-time
+        **clone** of every index map (captured on the single writer at `reader()` time, same discipline as
+        `id_to_row.clone()`) and emits **`_at`-only** probes (a reader has no live `get`) — its snapshot reads no
+        longer scan. One shared `generate_index_probes(model, include_live)` emits {writer: live + `_at`} vs
+        {reader: `_at`}, so there is no second probe body to drift.
 
-    E2E (list filter+sort+paginate over the axum router; probe + snapshot-version resolution + post-filter + delete
-    + reopen rebuild) proven through current codegen over `examples/ecommerce-store` in `scratchpad/phase2_compile`
-    (ephemeral); full `examples/` corpus (incl. integer-PK `iot-sensors`) compile-checked in `scratchpad/corpus_check`.
-    **Honest limits / deferred:** FK-scalar (relation) fields and **composite `@index(a,b)`** are not yet indexed
-    (single-field `^`/`&` scalars only); nullable indexed fields skip index generation; the concurrent-read
-    `DatabaseReader` has no index (its `_at` reads still scan) — follow-ups (FK-scalar #100, composite #101,
-    nullable #102, reader #103). **Publish
-    gap CLOSED (2026-07-10):** generated `api.rs` now depends on **`forgedb-query-params` 0.1.0** (scaffold pins
-    `= "0.1"`); it is **published**, and the reclose is PROVEN by an outside-repo `init → generate rust+api →
-    cargo build` resolving `forgedb-query-params 0.1.0` + `forgedb-storage 0.1.5` + `forgedb-wal 0.2.0` +
-    changefeed/auth/types from crates.io and compiling the generated list + index code (0 errors).
+    E2E (list filter+sort+paginate; single/composite/FK/nullable probe + snapshot-version resolution + post-filter +
+    null-vs-`"null"` non-collision + update/delete maintenance + reader `_at` + reopen rebuild) proven through
+    current codegen in `scratchpad/followups_compile` (ephemeral); full 18-schema `examples/` corpus (incl.
+    integer-PK `iot-sensors`, multi-composite `food-delivery`, composite `ecommerce-store`) compile-checked in
+    `scratchpad/corpus_check2`. **Honest limits (still deferred):** the hash index is exact-match only (no
+    prefix/range); the reader index clone is O(rows) per `reader()` (an `Arc`-swap is the escape hatch if it matters).
+    **Publish gap CLOSED (2026-07-10):** generated `api.rs` depends on **`forgedb-query-params` 0.1.0** (scaffold
+    pins `= "0.1"`, published); reclose PROVEN by an outside-repo `init → generate rust+api → cargo build` resolving
+    `forgedb-query-params 0.1.0` + `forgedb-storage 0.1.5` + `forgedb-wal 0.2.0` + changefeed/auth/types from
+    crates.io (0 errors). The #100–#103 follow-ups added **no** substrate dep (indexes are in-memory generated code),
+    so they did not reopen it.
   - **No constraint/validation enforcement.** Duplicate `&unique` + dangling required-FK are allowed;
     `@min/@max/@length/@email/@pattern` are ignored at write. → v1 Phase 3 (#91).
   - **Migrations are infrastructure without an engine.** The executor errors on type-change/remove/index ops;
@@ -320,14 +340,15 @@ across many domains live in `examples/` — see `examples/README.md`.**
   (`RequiredReference`/`OptionalReference`) persist and round-trip (Task #25); on top of that
   the `RustGenerator` now emits, on `Database`: **forward FK getters** (`post_author(&post)
   -> Option<User>`, optional FKs thread through `and_then`), **reverse one-to-many** getters
-  (`user_posts(id) -> Vec<Post>`, a linear scan via a generated `Storage::all()`; when a child
-  has multiple FKs back to one parent collection the getter disambiguates by child field, e.g.
-  `user_posts_by_author`), **many-to-many** persisted junction structs (`PostTagLink` with
+  (`user_posts(id) -> Vec<Post>`, now an **O(1) FK-index probe** `find_by_<fk>` since #100 — no longer a
+  scan; when a child has multiple FKs back to one parent collection the getter disambiguates by child field,
+  e.g. `user_posts_by_author`), **many-to-many** persisted junction structs (`PostTagLink` with
   `left`/`right` UUID columns) plus `link_post_tag` / `post_tags` / `tag_posts`, and
   **eager-load** structs (`PostWithRelations { post, author: Option<User>, … }` +
   `post_with_relations(id)`). Honest limits: traversal is generated only between **UUID-keyed**
   models (FK scalars are always `Uuid`, so integer-PK targets are skipped with a comment);
-  reverse/M2M lookups are **linear scans**, not indexed; there is **no M2M `unlink`** (storage
+  **M2M** junction lookups (`post_tags`) are still **linear scans** (junction-column indexing is a #100
+  follow-up step); there is **no M2M `unlink`** (storage
   is append-only — `Tombstones` has no in-place setter, the same reason generated models have
   no `delete`); and the `OneToMany`/`ManyToMany` fields *inside* the model struct remain virtual
   `()` (the collection lives in the traversal helpers / junction table, not the record).
