@@ -3,8 +3,8 @@
 //! Schema-agnostic, **verify-only** JWT authentication for ForgeDB generated
 //! servers, plus a single tenant cross-check.
 //!
-//! This is Class-1 substrate — the same class as `forgedb-http-server` and
-//! `forgedb-changefeed`. It knows *less* about a schema than `forgedb-storage`
+//! This is Class-1 substrate — the same class as `forgedb-changefeed`. It knows
+//! *less* about a schema than `forgedb-storage`
 //! does: it decodes no field, dispatches on no model name, reconstructs no
 //! schema surface. Its entire vocabulary is "verify a token", "extract a
 //! configured claim", "compare two opaque strings", "carry a principal". It
