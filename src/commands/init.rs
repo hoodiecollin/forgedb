@@ -116,7 +116,10 @@ fn create_rust_files(options: &InitOptions) -> Result<()> {
     // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery).
     //
     // The generated `api.rs` needs: axum (with the `ws` feature for the
-    // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json.
+    // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json,
+    // and forgedb-query-params for list-endpoint filter/sort/paginate (#90 — the
+    // query string is parsed by this schema-agnostic substrate; all field-aware
+    // filtering/sorting is generated per-model).
     let cargo_toml = format!(
         r#"[package]
 name = "{}"
@@ -129,6 +132,7 @@ forgedb-types = "0.2"
 forgedb-changefeed = "0.1"
 forgedb-wal = "0.2"
 forgedb-auth = "0.1"
+forgedb-query-params = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
