@@ -27,8 +27,8 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 | Tier | Requirement | State | Evidence |
 |---|---|---|---|
 | **0** Data you can trust | Crash-safe durability | ✅ | #89 LANDED: WAL commit + fsync + reopen recovery + single-writer lock (`kill -9` E2E: 0 acked rows lost) |
-| | Bounded storage | 🟡 | **WAL** bounded (#96 checkpoint LANDED); **column** storage still manual-compaction-only → grows until `forgedb compact` |
-| | Schema evolution w/o data loss | 🔴 | infra only; no data-transform engine; `AddField` doesn't backfill |
+| | Bounded storage | ✅ | #96 (WAL) + #92 W1 (columns): generated in-process auto-compaction under the writer lock reclaims #66 dead versions past a threshold (keep-set substrate primitive) — publish-pending on `forgedb-compaction` |
+| | Schema evolution w/o data loss | ✅ | #92 W2–W4: additive fields backfill on reopen (no wipe), `migrate --auto` gates additive-vs-breaking, breaking → documented+tested dump→reload path. Data-transform engine deferred (out of v1) |
 | | Constraint integrity (unique/FK) | ✅ | #91 LANDED: `&unique` (via Phase-2 index) + required/optional-FK existence (Database-level wrappers) rejected at write → 409 |
 | **1** Real-app capability | Query surface (filter/sort/paginate) | ✅ | #90 LANDED: real list endpoint filters (generated closed-set matcher) + sorts (generated comparator) + paginates (`query-params` substrate) |
 | | Indexed lookups | ✅ | #90 LANDED + #100–#103 follow-ups LANDED: scalar / **nullable** / **FK** / **composite `@index(a,b)`** fields → in-memory `value→{id}` index + `find_by_*`/`get_by_*` O(1) probes (writer live+`_at`, reader `_at`); reverse-relation getters now probe, not scan |
@@ -71,8 +71,14 @@ Enforce `&unique` (rides on Phase 2's index), required-FK existence, and validat
 > 3. **#90 indexes, then** — index maintenance hooks *after* #89's commit boundary; the index rebuild folds *into* #89's reopen scan. Secondary indexes must respect #66's superseding-version append (remove-old/add-new on update, drop on delete) and #56-A's watermark (a `find_by_*` probe must resolve the snapshot's version, not the live newest row). See #90's "Index maintenance constraints."
 > 4. **#91 last** — rides #90's unique index.
 
-### Phase 4 — Bounded storage + additive evolution · [#92](https://github.com/hoodiecollin/forgedb/issues/92) · *Tier 0 remainder, scoped*
-Auto-invoke compaction (engine exists — this is wiring); make additive migrations backfill existing rows; document + test the breaking-change reload path. **Done when** storage stays bounded under sustained update/delete, an additive migration preserves existing rows, and the reload path is documented.
+### Phase 4 — Bounded storage + additive evolution · [#92](https://github.com/hoodiecollin/forgedb/issues/92) · *Tier 0 remainder, scoped* · ✅ COMPLETE (W1 publish-pending)
+Auto-invoke compaction; make additive migrations backfill existing rows; gate additive-vs-breaking auto-diff; document + test the breaking-change reload path. All four workstreams LANDED + proven E2E.
+- **W1 — bounded storage (in-process auto-compaction).** Generated `Storage::compact()`/`Database::compact()` reclaim #66's dead versions under the single-writer lock (checkpoint → keep-set reclaim → reopen/reindex), auto-invoked past `COMPACTION_DEAD_THRESHOLD`. **NOT just wiring:** the tombstone-based engine was misaligned with #66 (reclaimed nothing from updates; *resurrected* deletes) and never compacted generated variable columns (filename mismatch → row scramble). Fix: new schema-agnostic substrate primitive `Compactor::compact_model_keeping(model, live_rows)` (generated code computes the live set) + variable-column-match fix in `compactor.rs`/`stats.rs`. Guard `test_rust_generation_auto_compaction`; E2E `scratchpad/compaction_compile`. **Publish gap OPEN:** `forgedb-compaction 0.1.0` must go to crates.io before the reclose is proven. Manual `forgedb compact` CLI still tombstone-based → #105.
+- **W2 — additive backfill.** Generated recovery anchors on the tombstone count and backfills any short (newly-added) column with the field default, instead of the old min-truncation that wiped data on a new empty column. Guard `test_rust_generation_additive_backfill`; E2E `scratchpad/migrate_compile`. Limits: append new fields at the end; non-null backfills to type-zero (not `@default`).
+- **W3 — additive-vs-breaking auto-diff gate.** `forgedb migrate create --auto --schema <f>` diffs against a recorded snapshot, accepts additive, refuses breaking with reload guidance + non-zero exit. Wiring over the existing `SchemaDiffer`/`is_breaking()` + a new AST→`SimpleSchema` converter. Integration test `test_migrate_auto_diff_additive_and_breaking_gate`.
+- **W4 — breaking-change reload path.** `docs/MIGRATIONS.md` documents dump (`all()`→JSON) → regenerate → reload-with-transform; proven E2E (`scratchpad/reload_compile`, `u32→string` round-trip). Data-transform engine stays out of v1.
+
+**Done when** ✅ storage stays bounded under sustained update/delete, an additive migration preserves existing rows, and the reload path is documented + tested.
 
 ### Phase 5 — Ship · [#93](https://github.com/hoodiecollin/forgedb/issues/93) · *targeted Tier 2/3 for the design-partner bar*
 Observability, deploy story, docs (incl. an honest "what v1 is / isn't"), distribution, SDK completeness, semver policy. **Done when** a design partner can install, scaffold, deploy, use the typed SDK, and read an honest account of the guarantees and limits.
