@@ -85,7 +85,9 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 395 tests pass** (workspace, incl. doctests). 394→395 with v1 Phase 3 (#91) data integrity (1 codegen
+**Baseline: 398 tests pass** (workspace, incl. doctests). 395→398 with v1 Phase 4 (#92): +2 codegen guards
+(`test_rust_generation_auto_compaction` W1 + `test_rust_generation_additive_backfill` W2) and +1 integration test
+(`test_migrate_auto_diff_additive_and_breaking_gate` W3). 394→395 with v1 Phase 3 (#91) data integrity (1 codegen
 guard `test_rust_generation_data_integrity`). 393→394 with the #100–#103 index follow-ups (1 codegen
 guard `test_rust_generation_index_followups`). 391→393 with #90 Phase 2 (2 codegen guards:
 `test_rust_generation_secondary_indexes` + `test_api_generation_list_endpoint`). 461→391 with the legacy-audit prunes
@@ -101,7 +103,7 @@ the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint
 `forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
 (1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531
 when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
-"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"393"/"380".
+"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"395"/"394"/"393"/"380".
 
 ## Workspace layout
 
@@ -137,13 +139,20 @@ in `crates/`:
   parses a URL query string into generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated
   `api.rs` list endpoint links it for filter/sort/paginate. Interprets no schema — all field-aware filtering/sorting
   is generated per-model — so it is class-1 substrate, same class as `changefeed`/`auth`.
+- `compaction` — in-process dead-row reclaim (#92 Phase 4 W1) — **0.1.0 (PUBLISH PENDING as of 2026-07-11)**.
+  Schema-agnostic byte GC keyed by model *directory name*: `Compactor::compact_model_keeping(model, live_rows)` keeps
+  exactly the caller-supplied opaque row indices (the generated code computes the live set); `compact_model` is the
+  legacy tombstone path (CLI-only, resurrection-prone against #66 → #105). Deps are serde/chrono/thiserror/log only —
+  reads no `.forge`. Generated `Database`/`Storage::compact()` link **only** `compact_model_keeping` (never
+  `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **the reclose is UNPROVEN until 0.1.0 is on
+  crates.io.** Was internal; promoted to published substrate by #92 W1.
 
 **Internal (0.1.0):**
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `compaction`, `backup`, `changefeed`,
-  `watcher`, `lsp-server`, `ffi`  (`query-params` is now **published** — see the
+- `validation`, `migrations`, `backup`, `changefeed`,
+  `watcher`, `lsp-server`, `ffi`  (`query-params` + `compaction` are now **published** — see the
   published-crates list above)
   (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
   removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
@@ -300,14 +309,50 @@ across many domains live in `examples/` — see `examples/README.md`.**
     - **Honest limits / deferred:** `@pattern`/`@regex` (#104); `db.<model>.insert` (direct storage path) enforces
       field + unique but NOT FK (use `db.create_<model>` for full integrity — documented on the method); no
       cross-field / conditional constraints; validation is fail-fast (first violation returned, not a list).
-  - **Migrations are infrastructure without an engine.** The executor errors on type-change/remove/index ops;
-    `AddField` doesn't backfill; auto-diff is hardcoded-disabled. v1 ships **additive + documented reload** only
-    (data-transform engine deferred). → v1 Phase 4 (#92).
-  - **Compaction works but is manual-only** — storage grows unbounded until `forgedb compact` is run. → v1 Phase 4 (#92).
+  - **Storage is now bounded under update/delete (v1 Phase 4 W1 — #92 LANDED, publish-pending).** Generated
+    `Storage::compact()` + `Database::compact()` reclaim the dead (superseded/tombstoned) row versions the #66
+    mutation surface leaves behind, **in-process under the single-writer lock** (never a background thread — that
+    would compact off the #89 `DirLock`), auto-invoked once `COMPACTION_DEAD_THRESHOLD` (=1000 dead versions, fixed)
+    is reached on update/delete. Ordering is load-bearing: `checkpoint()` first (fsync columns + truncate WAL, so no
+    index-relative WAL tail survives the renumber), then reclaim, then reopen to rebuild `id_to_row` + indexes.
+    **New substrate: `forgedb-compaction` gains `Compactor::compact_model_keeping(model, live_rows)`** — a
+    schema-agnostic keep-set GC: generated code computes the LIVE physical-row set from `id_to_row` + tombstone
+    liveness (the field-aware decision) and hands the opaque indices over; the substrate keeps exactly those rows.
+    This was **not** just wiring — the pre-existing tombstone-based `compact_model` was fundamentally misaligned with
+    #66: it reclaimed nothing from updates (superseded rows aren't tombstoned) and **resurrected deletes** (dropped
+    the tombstoned marker, kept the old data row). W1 also fixed a pre-existing **variable-column filename bug**
+    (compactor matched `*_data.bin` but codegen emits `string_data_<idx>.bin`, so variable columns were never
+    compacted → reopen scrambled rows across columns) in `compactor.rs` + `stats.rs`. Guard
+    `test_rust_generation_auto_compaction`; E2E `scratchpad/compaction_compile` (auto-compact at threshold, 87% byte
+    reclaim, no resurrection, reopen rebuilds indexes); all 18 examples compile. **Publish gap OPEN:** generated code
+    links `forgedb-compaction` (scaffold pins `= "0.1"`), so `forgedb-compaction 0.1.0` must publish before the
+    reclose is proven (mirrors wal/storage/query-params). Manual `forgedb compact` CLI still uses tombstone-based
+    `compact_model` (resurrection-prone against #66) → follow-up **#105**. Threshold not yet tunable (deferred).
+  - **Additive migrations preserve data (v1 Phase 4 W2 — #92 LANDED).** Adding a field (nullable, or appended at the
+    end) + regenerating + reopening no longer wipes the DB. Generated recovery anchors on the **tombstone count**
+    (authoritative committed rows) and **backfills any column shorter than it** (a newly-added field) with the
+    field's default, truncating only torn/ahead columns. (The old `min(...)`-across-columns truncation would collapse
+    everything to a new empty column → total data loss.) Per-field default encodings reuse the exact append logic
+    (nullable → None tag, numeric → 0, uuid/FK → nil, byte-blob types → zeroed bytes). Guard
+    `test_rust_generation_additive_backfill`; E2E `scratchpad/migrate_compile` (v1 writes → v2 with 2 appended fields
+    reads, existing rows intact, new fields defaulted). **Honest limits:** new fields must be **appended at the end**
+    (columns are position-addressed); non-null new fields backfill to type-zero, not `@default` (follow-up); the
+    old-WAL-across-schema-change replay is skip-on-error (needs a clean checkpoint before migrating).
+  - **`migrate --auto` additive-vs-breaking gate (v1 Phase 4 W3 — #92 LANDED).** `forgedb migrate create --auto
+    --schema <file>` now works: it diffs the schema against a recorded snapshot (`migrations/.schema-snapshot.forge`),
+    accepts purely-additive deltas (new model / new nullable field — records the migration + advises regenerate +
+    reopen), and **refuses any breaking change** (type change, field/model removal, non-null add, `&unique` add) with
+    the dump→reload guidance and a **non-zero exit** (CI-detectable). Wiring only — the `SchemaDiffer` + `is_breaking()`
+    already existed; W3 added the AST→`SimpleSchema` converter + snapshot persistence in `src/commands/migrate.rs`.
+    Integration test `test_migrate_auto_diff_additive_and_breaking_gate`.
+  - **Breaking-change reload path documented + tested (v1 Phase 4 W4 — #92 LANDED).** `docs/MIGRATIONS.md` documents
+    the v1 answer for breaking changes: dump (`all()` → JSON via the generated `Serialize`), regenerate, reload into a
+    fresh dir through `Database::create_<model>` with an app-level transform. Proven E2E (`scratchpad/reload_compile`:
+    a `u32 → string` type change round-trips, ids preserved). **The data-transform migration engine stays out of v1.**
 
-  The gaps are mostly codegen *wiring* to substrate that already exists (`wal`, `compaction`, `query-params`).
-  v1 scope is locked: **design-partner bar, single-writer-per-process, migrations data-engine deferred** — see
-  `docs/V1_ROADMAP.md` and epics #89–#93.
+  Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1 is publish-pending on `forgedb-compaction`); only Phase 5
+  (#93 — ship: observability, deploy, docs, distribution) remains. v1 scope is locked: **design-partner bar,
+  single-writer-per-process, migrations data-engine deferred** — see `docs/V1_ROADMAP.md` and epics #89–#93.
 
 - **Dead-code warnings: 0** (all 9 from the Phase 3b sweep resolved). Eight were WIRED
   (`build --no-api`, `validate --components`, the `--config`/`Config`/`CliError::exit_code`
@@ -340,9 +385,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
   the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
   Scaffold pins `forgedb-storage = "0.1.5"`, `forgedb-changefeed = "0.1"`, **`forgedb-wal = "0.2"`** (#89),
-  **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), axum `ws`. History: the gap reopened
-  for #57, #62-A, #66, #56-B, #59, #89/#96, and **#90** — **all now closed** (#90 closed 2026-07-10 by the
-  query-params 0.1.0 publish above; #89/#96 by the wal 0.2.0 + storage 0.1.5 publish). #59 closed
+  **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), **`forgedb-compaction = "0.1"`** (#92),
+  axum `ws`. **OPEN as of 2026-07-11:** #92 Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
+  auto-compaction); `0.1.0` must publish to crates.io before the reclose is proven — same ritual as wal/storage/
+  query-params. History: the gap reopened for #57, #62-A, #66, #56-B, #59, #89/#96, #90, and **#92** — all closed
+  EXCEPT #92 (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5 closed #89/#96). #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
