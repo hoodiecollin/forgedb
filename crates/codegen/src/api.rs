@@ -156,19 +156,60 @@ impl ApiGenerator {
         let update_summary = format!("Replace {} by ID", model.name);
         let delete_summary = format!("Delete {} by ID", model.name);
 
+        let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
+        let filter_fn = format_ident!("{}_event_matches", Self::to_snake_case(&model.name));
+
         let tokens = quote! {
             #[utoipa::path(
                 get,
                 path = "",
                 tag = #model_tag,
+                params(
+                    ("limit" = Option<usize>, Query, description = "Max rows (clamped to [1, 1000]; default 50)"),
+                    ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
+                    ("sort" = Option<String>, Query, description = "Field to sort by"),
+                    ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+                ),
                 responses(
                     (status = 200, description = #list_summary, body = Vec<#model_name>)
                 )
             )]
+            // Real list endpoint (#90): fetch live rows, then filter / sort /
+            // paginate.  `forgedb_query_params` is schema-agnostic substrate — it
+            // only parses the query string into generic Sort / Pagination; every
+            // field-aware step is generated per-model.  Filtering reuses the exact
+            // closed-set `#filter_fn` the change-feed / live-query paths use (no
+            // second predicate parser); sorting uses the generated `#sort_fn`
+            // comparator; pagination is clamped by the substrate (MAX_LIMIT).
             async fn #list_fn(
-                State(_db): State<Arc<RwLock<super::Database>>>
+                Query(params): Query<HashMap<String, String>>,
+                State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
-                (StatusCode::OK, Json(json!({ "data": [] })))
+                // Parse the generic query params (sort/order/limit/offset); the
+                // remaining `?field=value` pairs stay in `params` for the filter.
+                let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+                let db = db.read().await;
+                // 1. Live rows, then the closed-set field filter (ignores the
+                //    special sort/limit/offset keys — they are not model fields).
+                let mut rows: Vec<super::#model_name> = db
+                    .#storage_field
+                    .all()
+                    .into_iter()
+                    .filter(|r| #filter_fn(r, &params))
+                    .collect();
+                // 2. Generated per-model sort (no-op if `sort` is absent/unknown).
+                #sort_fn(&mut rows, &qp.sort);
+                // 3. Total after filtering (pre-pagination), useful to clients.
+                let total = rows.len();
+                // 4. Substrate-clamped pagination.
+                let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                let body = json!({
+                    "data": page,
+                    "total": total,
+                    "limit": qp.pagination.limit,
+                    "offset": qp.pagination.offset,
+                });
+                (StatusCode::OK, Json(body))
             }
 
             #[utoipa::path(
@@ -290,7 +331,73 @@ impl ApiGenerator {
             }
         };
 
-        Ok(tokens)
+        let sort_tokens = Self::generate_list_sort(model);
+        Ok(quote! { #tokens #sort_tokens })
+    }
+
+    /// Generate the per-model `<model>_apply_sort` comparator used by the list
+    /// endpoint (#90).  Closed-set: a `match` over each declared scalar field by
+    /// name selects a typed comparison (`Ord::cmp`, or `f64::partial_cmp` for
+    /// floating-point fields); an unknown / relation `sort` field is a no-op.
+    /// `forgedb_query_params::Sort` supplies only the field name + direction —
+    /// the type-aware ordering is generated here, never interpreted at runtime.
+    fn generate_list_sort(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
+
+        let arms: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| Self::is_filterable_field(&f.field_type))
+            .map(|f| {
+                let fname = &f.name;
+                let fident = format_ident!("{}", f.name);
+                if Self::is_float_field(&f.field_type) {
+                    // f64 (or nullable f64): only PartialOrd — fall back to Equal
+                    // for NaN so the total order `sort_by` requires is well-defined.
+                    quote! {
+                        #fname => rows.sort_by(|a, b| {
+                            a.#fident.partial_cmp(&b.#fident)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        }),
+                    }
+                } else {
+                    // Every other filterable scalar is `Ord` (integers, bool,
+                    // String, char(N), Uuid, Timestamp, and their nullable forms).
+                    quote! {
+                        #fname => rows.sort_by(|a, b| a.#fident.cmp(&b.#fident)),
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            fn #sort_fn(
+                rows: &mut Vec<super::#model_name>,
+                sort: &Option<forgedb_query_params::Sort>,
+            ) {
+                let Some(sort) = sort.as_ref() else { return; };
+                match sort.field.as_str() {
+                    #(#arms)*
+                    _ => return,
+                }
+                if sort.is_descending() {
+                    rows.reverse();
+                }
+            }
+        }
+    }
+
+    /// Whether a field's underlying scalar is `f64` (directly or nullable),
+    /// which only implements `PartialOrd` — so generated sort must use
+    /// `partial_cmp` rather than `Ord::cmp`.
+    fn is_float_field(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::F64 => true,
+            FieldType::Nullable(inner) => Self::is_float_field(inner),
+            _ => false,
+        }
     }
 
     /// Whether a field is a JSON scalar a subscription filter can match on.
