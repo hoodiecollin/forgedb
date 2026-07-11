@@ -129,7 +129,6 @@
 //! # Related Crates
 //!
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schemas before validation
-//! - [`forgedb-http-server`](../forgedb_http_server) - Uses HTTP validation
 //!
 //! # See Also
 //!

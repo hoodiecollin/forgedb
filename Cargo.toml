@@ -8,14 +8,12 @@ members = [
     "crates/validation",
     "crates/watcher",
     "crates/wal",
-    "crates/http-server",
     "crates/query-params",
     "crates/migrations",
     "crates/compaction",
     "crates/backup",
     "crates/changefeed",
     "crates/auth",
-    "crates/query-optimization",
     "crates/lsp-server",
     "crates/ffi",
     "apps/inspector/src-tauri",
@@ -60,10 +58,8 @@ forgedb-parser = { path = "crates/parser" }
 forgedb-validation = { path = "crates/validation" }
 forgedb-watcher = { path = "crates/watcher" }
 forgedb-wal = { path = "crates/wal" }
-forgedb-http-server = { path = "crates/http-server" }
 forgedb-query-params = { path = "crates/query-params" }
 forgedb-migrations = { path = "crates/migrations" }
 forgedb-compaction = { path = "crates/compaction" }
-forgedb-query-optimization = { path = "crates/query-optimization" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
