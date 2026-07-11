@@ -31,7 +31,7 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 | | Schema evolution w/o data loss | 🔴 | infra only; no data-transform engine; `AddField` doesn't backfill |
 | | Constraint integrity (unique/FK) | 🔴 | unchecked at write |
 | **1** Real-app capability | Query surface (filter/sort/paginate) | ✅ | #90 LANDED: real list endpoint filters (generated closed-set matcher) + sorts (generated comparator) + paginates (`query-params` substrate) |
-| | Indexed lookups | ✅ | #90 LANDED: `^index`/`&unique` scalar fields → in-memory `value→{id}` index + `find_by_*`/`get_by_*` O(1) probes (composite `@index(a,b)` deferred) |
+| | Indexed lookups | ✅ | #90 LANDED + #100–#103 follow-ups LANDED: scalar / **nullable** / **FK** / **composite `@index(a,b)`** fields → in-memory `value→{id}` index + `find_by_*`/`get_by_*` O(1) probes (writer live+`_at`, reader `_at`); reverse-relation getters now probe, not scan |
 | | Validation enforced | 🔴 | `@min`/`@email`/… ignored at write |
 | | Types apps need (enum/decimal/json) | 🔴 | missing from the schema language |
 | | Delete semantics (cascade / M2M unlink) | 🟡 | delete exists; no cascade, no unlink |
@@ -53,7 +53,8 @@ Real list endpoint; filter/sort/pagination (wired `query-params`); generated sec
 - **List endpoint:** `all()` + generated closed-set filter (`<model>_event_matches`, reused — no second predicate parser) + generated per-model sort comparator + `query-params` `Pagination` (clamped). Response `{data,total,limit,offset}`.
 - **Secondary indexes:** per `^index`/`&unique` scalar, an in-memory `value→{id}` map maintained after the #89 commit boundary (insert/update/delete, superseding-version aware) and rebuilt into the reopen id-scan; `find_by_*`/`get_by_*` (live) + `_at` (snapshot-version-resolving, post-filtered) probes — an index `get`, not a scan.
 - **Proven E2E** through current codegen (`scratchpad/phase2_compile`: axum-router list filter/sort/paginate + probe/snapshot/reopen; `scratchpad/corpus_check`: full `examples/` corpus compiles). Guards `test_api_generation_list_endpoint`, `test_rust_generation_secondary_indexes`.
-- **Publish gap CLOSED:** generated `api.rs` links `forgedb-query-params` **0.1.0 (published 2026-07-10)**; reclose proven by an outside-repo `init → generate → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / changefeed / auth / types) from crates.io. **Deferred (tracked):** FK-scalar indexing (#100), composite `@index(a,b)` (#101), nullable-field indexing (#102), `DatabaseReader` indexes (#103).
+- **Publish gap CLOSED:** generated `api.rs` links `forgedb-query-params` **0.1.0 (published 2026-07-10)**; reclose proven by an outside-repo `init → generate → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / changefeed / auth / types) from crates.io.
+- **Index follow-ups #100–#103 LANDED (2026-07-10):** FK-scalar indexing + reverse-getter probe (#100), composite `@index(a,b)` (#101), nullable-field indexing with a null-distinct key (#102), and `DatabaseReader` snapshot probes (#103). Pure generated code over existing storage — **no new substrate, no publish gap reopened.** Proven E2E in `scratchpad/followups_compile` + full-corpus compile in `scratchpad/corpus_check2`; guard `test_rust_generation_index_followups`.
 
 ### Phase 3 — Data integrity · [#91](https://github.com/hoodiecollin/forgedb/issues/91) · *Tier 0 constraints + Tier 1 validation*
 Enforce `&unique` (rides on Phase 2's index), required-FK existence, and validation directives at write + API boundary. **Done when** duplicate-unique, dangling-FK, and invalid-field writes are all rejected with clear errors.

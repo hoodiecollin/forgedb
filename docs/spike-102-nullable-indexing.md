@@ -1,5 +1,12 @@
 # SPIKE #102 — index nullable scalar fields
 
+> **Status: LANDED 2026-07-10.** Nullable scalars are indexed with `Option<T>` probe params. The
+> load-bearing null-distinct key was implemented as a **type-tag** (`\u{0}`=null, `\u{1}`+raw=string,
+> `\u{2}`+text=other) applied to ALL fields uniformly — strictly stronger than the presence-tag this
+> spike proposed (also separates string-vs-number classes). The null-vs-`"null"` non-collision is
+> proven E2E in `scratchpad/followups_compile`. Guard `test_rust_generation_index_followups`. This
+> also unblocked #100's optional-FK case (landed together).
+
 Design spike for issue #102, a Phase 2 (#90) follow-up. Builds on the single-field secondary-index
 machinery landed in #90 (`crates/codegen/src/rust.rs`). Verified against generated code as of
 2026-07-10.
