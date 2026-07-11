@@ -30,8 +30,8 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 | | Bounded storage | 🟡 | **WAL** bounded (#96 checkpoint LANDED); **column** storage still manual-compaction-only → grows until `forgedb compact` |
 | | Schema evolution w/o data loss | 🔴 | infra only; no data-transform engine; `AddField` doesn't backfill |
 | | Constraint integrity (unique/FK) | 🔴 | unchecked at write |
-| **1** Real-app capability | Query surface (filter/sort/paginate) | 🔴 | **list endpoint returns `{"data":[]}`** (`crates/codegen/src/api.rs:168-171`) |
-| | Indexed lookups | 🔴 | `^index`/`&unique`/`@index` decorative; full scans |
+| **1** Real-app capability | Query surface (filter/sort/paginate) | ✅ | #90 LANDED: real list endpoint filters (generated closed-set matcher) + sorts (generated comparator) + paginates (`query-params` substrate) |
+| | Indexed lookups | ✅ | #90 LANDED: `^index`/`&unique` scalar fields → in-memory `value→{id}` index + `find_by_*`/`get_by_*` O(1) probes (composite `@index(a,b)` deferred) |
 | | Validation enforced | 🔴 | `@min`/`@email`/… ignored at write |
 | | Types apps need (enum/decimal/json) | 🔴 | missing from the schema language |
 | | Delete semantics (cascade / M2M unlink) | 🟡 | delete exists; no cascade, no unlink |
@@ -48,8 +48,12 @@ Wire WAL → flush/fsync → recovery-on-open into the generated write path; add
 - **Step 2 (#96):** bound the WAL — generated `checkpoint()` (fsync columns → truncate WAL) auto-invoked past a fixed interval; reopen no longer replays the whole history. E2E: WAL sawtoothed/bounded under sustained writes; 23 rows recovered from a 309-byte WAL.
 - **Published (2026-07-10):** `forgedb-wal 0.2.0` + `forgedb-storage 0.1.5`; the reclose is proven by an outside-repo `init → generate → cargo build` resolving them from crates.io. Phase 1 is fully closed.
 
-### Phase 2 — Readable database · [#90](https://github.com/hoodiecollin/forgedb/issues/90) · *Tier 1 · co-critical*
-Real list endpoint; filter/sort/pagination (wire `query-params`); generated secondary indexes + `find_by_*`. **Done when** list+filter+sort+paginate work over a real schema and an indexed lookup is a probe, not a scan.
+### Phase 2 — Readable database · [#90](https://github.com/hoodiecollin/forgedb/issues/90) · *Tier 1 · co-critical* · ✅ COMPLETE
+Real list endpoint; filter/sort/pagination (wired `query-params`); generated secondary indexes + `find_by_*`. **Done when** list+filter+sort+paginate work over a real schema and an indexed lookup is a probe, not a scan.
+- **List endpoint:** `all()` + generated closed-set filter (`<model>_event_matches`, reused — no second predicate parser) + generated per-model sort comparator + `query-params` `Pagination` (clamped). Response `{data,total,limit,offset}`.
+- **Secondary indexes:** per `^index`/`&unique` scalar, an in-memory `value→{id}` map maintained after the #89 commit boundary (insert/update/delete, superseding-version aware) and rebuilt into the reopen id-scan; `find_by_*`/`get_by_*` (live) + `_at` (snapshot-version-resolving, post-filtered) probes — an index `get`, not a scan.
+- **Proven E2E** through current codegen (`scratchpad/phase2_compile`: axum-router list filter/sort/paginate + probe/snapshot/reopen; `scratchpad/corpus_check`: full `examples/` corpus compiles). Guards `test_api_generation_list_endpoint`, `test_rust_generation_secondary_indexes`.
+- **Publish gap reopens:** generated `api.rs` now links `forgedb-query-params` (scaffold pins `= "0.1"`); publish before an outside-repo `init → build`. **Deferred:** FK-scalar + composite `@index(a,b)` indexing, nullable-field indexing, `DatabaseReader` indexes.
 
 ### Phase 3 — Data integrity · [#91](https://github.com/hoodiecollin/forgedb/issues/91) · *Tier 0 constraints + Tier 1 validation*
 Enforce `&unique` (rides on Phase 2's index), required-FK existence, and validation directives at write + API boundary. **Done when** duplicate-unique, dangling-FK, and invalid-field writes are all rejected with clear errors.

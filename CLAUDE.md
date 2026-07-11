@@ -85,7 +85,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 391 tests pass** (workspace, incl. doctests). 461→391 with the legacy-audit prunes
+**Baseline: 393 tests pass** (workspace, incl. doctests). 391→393 with #90 Phase 2 (2 codegen guards:
+`test_rust_generation_secondary_indexes` + `test_api_generation_list_endpoint`). 461→391 with the legacy-audit prunes
 (#94): −70 from deleting the two dead crates `query-optimization` (32 unit + doctests, incl. the
 former #48 join-predicate pushdown) and `http-server` (30 unit + doctests) plus the dead
 `storage::Database` wrapper's 1 test — all zero-consumer dead code, no production regression. Prior
@@ -140,6 +141,10 @@ in `crates/`:
   (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
   removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
   in the generated handlers, and the generated `api.rs` builds its own router.)
+  `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
+  `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
+  schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
+  links against, like `changefeed`/`auth`. Generated code now requires it (publish gap — see Known issues).
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
@@ -215,10 +220,35 @@ across many domains live in `examples/` — see `examples/README.md`.**
     checkpoint recovers 23 rows from a 309-byte WAL, no whole-history replay) in `scratchpad/durable_compile`;
     guard `test_rust_generation_wal_checkpoint`. **Deferred:** the interval is not yet tunable (a knob rides the
     Phase 4 bounded-storage follow-up #92); junction (M2M) link *crash recovery* remains a #89 boundary.
-  - **The generated REST list endpoint is a stub** returning `{"data":[]}` (`crates/codegen/src/api.rs:168-171`) —
-    the generated API can currently only get-by-id. → v1 Phase 2 (#90).
-  - **Indexes are decorative.** `^index`/`&unique`/`@index(a,b)` parse but no index structures are generated;
-    every non-PK lookup is a full scan. → v1 Phase 2 (#90).
+  - **The generated database is now readable (v1 Phase 2 — #90 LANDED).** Two workstreams, proven E2E:
+    - **Real list endpoint + filter/sort/paginate.** The list handler no longer returns `{"data":[]}` — it
+      fetches live rows via `all()`, filters through the SAME generated closed-set matcher `<model>_event_matches`
+      the change-feed / live-query paths use (no second predicate parser), sorts via a generated per-model
+      comparator `<model>_apply_sort` (`Ord::cmp`, or `f64::partial_cmp` for float fields), and paginates via the
+      **schema-agnostic `forgedb-query-params` substrate** (`QueryParams::from_map` + `Pagination::apply`, clamped
+      to `MAX_LIMIT`). Response is `{data,total,limit,offset}`. query-params parses only the query string into
+      generic `Sort`/`Pagination`; every field-aware step is generated — identity-clean (PM audit kept the crate
+      precisely to wire here). Guard `test_api_generation_list_endpoint`.
+    - **Secondary indexes + `find_by_*` / `get_by_*` probes.** Each `^index` / `&unique` non-nullable scalar field
+      gets an in-memory `value-key → {id}` map (`<field>_index`), maintained like `id_to_row`: **after** the #89
+      WAL commit boundary on insert (add), update (remove-old + add-new — superseding-version aware, #66), delete
+      (drop); **rebuilt on reopen folded into the same id-scan** as `id_to_row` (`generate_rehydrate_logic`, after
+      #89 recovery so it keys only committed rows). Probes are an **O(1) index `get` (not a scan)** that resolve
+      candidates through the version-aware read path: `find_by_<field>`/`get_by_<field>` via live `get`,
+      `find_by_<field>_at`/`get_by_<field>_at(&Snapshot)` via `get_at` — the `_at` form resolves **the snapshot's
+      version, not the live newest row**, and post-filters the resolved value so a candidate whose value changed
+      after the snapshot is excluded. Key = the same JSON canonical string the REST filter compares by (so an index
+      hit agrees with a filter match). Guard `test_rust_generation_secondary_indexes`.
+
+    E2E (list filter+sort+paginate over the axum router; probe + snapshot-version resolution + post-filter + delete
+    + reopen rebuild) proven through current codegen over `examples/ecommerce-store` in `scratchpad/phase2_compile`
+    (ephemeral); full `examples/` corpus (incl. integer-PK `iot-sensors`) compile-checked in `scratchpad/corpus_check`.
+    **Honest limits / deferred:** FK-scalar (relation) fields and **composite `@index(a,b)`** are not yet indexed
+    (single-field `^`/`&` scalars only); nullable indexed fields skip index generation; the concurrent-read
+    `DatabaseReader` has no index (its `_at` reads still scan) — follow-ups. **Publish gap reopens:** generated
+    `api.rs` now depends on **`forgedb-query-params`** (scaffold pins `= "0.1"`); it must be **published** before an
+    outside-repo `init → build` resolves from crates.io (proven here with a `[patch]` path dep, matching the Phase 1
+    rhythm — publish is a separate explicit step).
   - **No constraint/validation enforcement.** Duplicate `&unique` + dangling required-FK are allowed;
     `@min/@max/@length/@email/@pattern` are ignored at write. → v1 Phase 3 (#91).
   - **Migrations are infrastructure without an engine.** The executor errors on type-change/remove/index ops;
