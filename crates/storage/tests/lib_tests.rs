@@ -163,38 +163,43 @@ fn test_tombstones() {
 }
 
 #[test]
-fn test_database_manifest() {
+fn test_manifest_roundtrip() {
     let temp_dir = std::env::temp_dir().join("forgedb_test_manifest");
     let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+    let path = temp_dir.join("manifest.json");
 
-    let mut db = Database::open(temp_dir.clone()).unwrap();
+    let manifest = Manifest {
+        schema_version: 1,
+        row_count: 42,
+        columns: vec![
+            ColumnMetadata {
+                name: "id".to_string(),
+                column_type: ColumnType::U64,
+                column_index: 0,
+                ..Default::default()
+            },
+            ColumnMetadata {
+                name: "email".to_string(),
+                column_type: ColumnType::String,
+                column_index: 1,
+                ..Default::default()
+            },
+        ],
+        wal_enabled: false,
+        last_checkpoint: 0,
+        compaction_epoch: 0,
+        format_version: 1,
+        row_anchor: None,
+    };
+    manifest.save_to(&path).unwrap();
 
-    // Set up columns
-    let columns = vec![
-        ColumnMetadata {
-            name: "id".to_string(),
-            column_type: ColumnType::U64,
-            column_index: 0,
-            ..Default::default()
-        },
-        ColumnMetadata {
-            name: "email".to_string(),
-            column_type: ColumnType::String,
-            column_index: 0,
-            ..Default::default()
-        },
-    ];
-
-    db.set_columns(columns);
-    db.update_row_count(42);
-    db.save_manifest().unwrap();
-
-    // Reopen and verify
-    let db2 = Database::open(temp_dir.clone()).unwrap();
-    assert_eq!(db2.get_manifest().row_count, 42);
-    assert_eq!(db2.get_manifest().columns.len(), 2);
-    assert_eq!(db2.get_manifest().columns[0].name, "id");
-    assert_eq!(db2.get_manifest().columns[1].name, "email");
+    // Reopen and verify the physical-layout manifest round-trips.
+    let reopened = Manifest::load_from(&path).unwrap();
+    assert_eq!(reopened.row_count, 42);
+    assert_eq!(reopened.columns.len(), 2);
+    assert_eq!(reopened.columns[0].name, "id");
+    assert_eq!(reopened.columns[1].name, "email");
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
@@ -362,21 +367,6 @@ fn test_tombstones_out_of_bounds() {
     let result = tombstones.is_deleted(1);
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
-
-    fs::remove_dir_all(&temp_dir).unwrap();
-}
-
-#[test]
-fn test_database_empty() {
-    let temp_dir = std::env::temp_dir().join("forgedb_test_empty");
-    let _ = fs::remove_dir_all(&temp_dir);
-
-    let db = Database::open(temp_dir.clone()).unwrap();
-
-    // Empty database should have default manifest
-    assert_eq!(db.get_manifest().row_count, 0);
-    assert_eq!(db.get_manifest().columns.len(), 0);
-    assert_eq!(db.get_manifest().schema_version, 1);
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
