@@ -481,6 +481,8 @@ pub struct PostStorage {
     title_col: VariableColumn,
     author_id_col: FixedColumn,
     editor_id_col: FixedColumn,
+    author_id_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    editor_id_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -522,6 +524,8 @@ impl PostStorage {
                     std::mem::size_of::<Option<Uuid>>(),
                 )
                 .expect("Failed to create fixed column"),
+            author_id_index: std::collections::HashMap::new(),
+            editor_id_index: std::collections::HashMap::new(),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("post/tombstones.bin"),
                 )
@@ -543,6 +547,49 @@ impl PostStorage {
                 Uuid::from_bytes(bytes)
             };
             db.id_to_row.insert(id, i);
+        }
+        let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
+        for __id in __ids {
+            if let Some(__rec) = db.get(__id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__rec.author_id)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    db.author_id_index.entry(__k).or_default().insert(__id);
+                }
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__rec.editor_id)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    db.editor_id_index.entry(__k).or_default().insert(__id);
+                }
+            }
         }
         db.write_manifest(root);
         db
@@ -626,6 +673,44 @@ impl PostStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.author_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            self.author_id_index.entry(__k).or_default().insert(id);
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.editor_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            self.editor_id_index.entry(__k).or_default().insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
@@ -644,6 +729,7 @@ impl PostStorage {
         if !self.id_to_row.contains_key(&id) {
             return false;
         }
+        let __old = self.get(id);
         let row_index = self.row_count;
         {
             let mut __wal_payload = Vec::new();
@@ -677,6 +763,100 @@ impl PostStorage {
         self.tombstones.append(false).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        if let Some(__old_rec) = &__old {
+            {
+                let __k: String = {
+                    match serde_json::to_value(&(__old_rec.author_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                let mut __empty = false;
+                if let Some(__set) = self.author_id_index.get_mut(&__k) {
+                    __set.remove(&(id));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    self.author_id_index.remove(&__k);
+                }
+            }
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.author_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            self.author_id_index.entry(__k).or_default().insert(id);
+        }
+        if let Some(__old_rec) = &__old {
+            {
+                let __k: String = {
+                    match serde_json::to_value(&(__old_rec.editor_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                let mut __empty = false;
+                if let Some(__set) = self.editor_id_index.get_mut(&__k) {
+                    __set.remove(&(id));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    self.editor_id_index.remove(&__k);
+                }
+            }
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.editor_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            self.editor_id_index.entry(__k).or_default().insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
@@ -732,6 +912,58 @@ impl PostStorage {
         self.tombstones.append(true).expect("Failed to append tombstone");
         self.id_to_row.insert(id, row_index);
         self.row_count += 1;
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.author_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            let mut __empty = false;
+            if let Some(__set) = self.author_id_index.get_mut(&__k) {
+                __set.remove(&(id));
+                __empty = __set.is_empty();
+            }
+            if __empty {
+                self.author_id_index.remove(&__k);
+            }
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.editor_id)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            let mut __empty = false;
+            if let Some(__set) = self.editor_id_index.get_mut(&__k) {
+                __set.remove(&(id));
+                __empty = __set.is_empty();
+            }
+            if __empty {
+                self.editor_id_index.remove(&__k);
+            }
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
@@ -948,6 +1180,158 @@ impl PostStorage {
         }
         records
     }
+    ///Index probe for `Post`.`author_id` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
+    pub fn find_by_author_id(&self, value: Uuid) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.author_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        __ids.iter().filter_map(|&__id| self.get(__id)).collect()
+    }
+    ///Snapshot-scoped index probe for `Post`.`author_id` (#90/#56): O(1) candidate lookup, each resolved through `get_at` (the version live as of `snap`) and post-filtered so a candidate whose value changed after the snapshot is excluded.  Honest limit: a row whose value changed *away* between the snapshot and now is not in the (unversioned) index.
+    pub fn find_by_author_id_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: Uuid,
+    ) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.author_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(__rec) = self.get_at(snap, __id) {
+                let __rk: String = {
+                    match serde_json::to_value(&(__rec.author_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                if __rk == __k {
+                    __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
+    ///Index probe for `Post`.`editor_id` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
+    pub fn find_by_editor_id(&self, value: Option<Uuid>) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.editor_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        __ids.iter().filter_map(|&__id| self.get(__id)).collect()
+    }
+    ///Snapshot-scoped index probe for `Post`.`editor_id` (#90/#56): O(1) candidate lookup, each resolved through `get_at` (the version live as of `snap`) and post-filtered so a candidate whose value changed after the snapshot is excluded.  Honest limit: a row whose value changed *away* between the snapshot and now is not in the (unversioned) index.
+    pub fn find_by_editor_id_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: Option<Uuid>,
+    ) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.editor_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(__rec) = self.get_at(snap, __id) {
+                let __rk: String = {
+                    match serde_json::to_value(&(__rec.editor_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                if __rk == __k {
+                    __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
@@ -967,6 +1351,8 @@ impl PostStorage {
                 .editor_id_col
                 .reader()
                 .expect("Failed to open column reader"),
+            author_id_index: self.author_id_index.clone(),
+            editor_id_index: self.editor_id_index.clone(),
             tombstones: self
                 .tombstones
                 .reader()
@@ -981,6 +1367,8 @@ pub struct PostStorageReader {
     title_col: forgedb_storage::VariableColumnReader,
     author_id_col: forgedb_storage::FixedColumnReader,
     editor_id_col: forgedb_storage::FixedColumnReader,
+    author_id_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    editor_id_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl PostStorageReader {
@@ -1077,6 +1465,110 @@ impl PostStorageReader {
             }
         }
         records
+    }
+    ///Snapshot-scoped index probe for `Post`.`author_id` (#90/#56): O(1) candidate lookup, each resolved through `get_at` (the version live as of `snap`) and post-filtered so a candidate whose value changed after the snapshot is excluded.  Honest limit: a row whose value changed *away* between the snapshot and now is not in the (unversioned) index.
+    pub fn find_by_author_id_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: Uuid,
+    ) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.author_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(__rec) = self.get_at(snap, __id) {
+                let __rk: String = {
+                    match serde_json::to_value(&(__rec.author_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                if __rk == __k {
+                    __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
+    ///Snapshot-scoped index probe for `Post`.`editor_id` (#90/#56): O(1) candidate lookup, each resolved through `get_at` (the version live as of `snap`) and post-filtered so a candidate whose value changed after the snapshot is excluded.  Honest limit: a row whose value changed *away* between the snapshot and now is not in the (unversioned) index.
+    pub fn find_by_editor_id_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        value: Option<Uuid>,
+    ) -> Vec<Post> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.editor_id_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Vec::new(),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(__rec) = self.get_at(snap, __id) {
+                let __rk: String = {
+                    match serde_json::to_value(&(__rec.editor_id)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                if __rk == __k {
+                    __out.push(__rec);
+                }
+            }
+        }
+        __out
     }
 }
 ///Change-feed event: a `Author` was inserted (#62).
