@@ -12,6 +12,46 @@ use forgedb_types::{Uuid, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
+/// A rejected write (#91).  `status_code()` maps each class to the
+/// HTTP status the generated REST boundary returns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidationError {
+    /// A `&unique` field already holds this value on another row → 409.
+    Unique { field: &'static str },
+    /// A required/optional foreign key points at a non-existent row → 409.
+    DanglingReference { field: &'static str, target: &'static str },
+    /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
+    /// was violated → 422.
+    Constraint { field: &'static str, rule: &'static str, message: String },
+}
+impl ValidationError {
+    /// The HTTP status the generated API boundary returns for this class:
+    /// integrity conflicts (unique / dangling FK) → 409, field-constraint
+    /// violations → 422.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            ValidationError::Unique { .. }
+            | ValidationError::DanglingReference { .. } => 409,
+            ValidationError::Constraint { .. } => 422,
+        }
+    }
+}
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ValidationError::Unique { field } => {
+                write!(f, "unique constraint violated on field `{}`", field)
+            }
+            ValidationError::DanglingReference { field, target } => {
+                write!(f, "field `{}` references a non-existent {}", field, target)
+            }
+            ValidationError::Constraint { field, rule, message } => {
+                write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+            }
+        }
+    }
+}
+impl std::error::Error for ValidationError {}
 ///Author model
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -108,7 +148,13 @@ impl AuthorStorage {
     pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
         self.changefeed = Some(feed);
     }
-    pub fn insert(&mut self, record: Author) -> Uuid {
+    /// Insert a record.  Validates field constraints + `&unique` FIRST
+    /// (#91 Phase 3): a rejected insert commits nothing and returns
+    /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
+    /// existence is checked by `Database::create_<model>`, which has the
+    /// sibling-collection access this storage-scoped method lacks.)
+    pub fn insert(&mut self, record: Author) -> Result<Uuid, ValidationError> {
+        validate_author(&record)?;
         let row_index = self.row_count;
         let id = record.id;
         {
@@ -137,17 +183,22 @@ impl AuthorStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
-        id
+        Ok(id)
     }
     /// Append a superseding version of an existing record (#66).
     /// Reads resolve newest-version-wins; the prior version's bytes are
     /// never mutated, so append-only (and thus backup / snapshots) hold.
-    /// Returns `false` if `id` is absent.  Storage grows with each
-    /// update until compaction reclaims superseded versions.
-    pub fn update(&mut self, id: Uuid, record: Author) -> bool {
+    /// Validates field constraints + `&unique` FIRST (#91): a rejected
+    /// update commits nothing and returns `Err(ValidationError)`.
+    /// `Ok(false)` if `id` is absent; `Ok(true)` on a successful update.
+    /// Storage grows with each update until compaction reclaims versions.
+    /// (Foreign-key existence is checked by `Database::update_<model>`,
+    /// which has sibling-collection access this storage-scoped method lacks.)
+    pub fn update(&mut self, id: Uuid, record: Author) -> Result<bool, ValidationError> {
         if !self.id_to_row.contains_key(&id) {
-            return false;
+            return Ok(false);
         }
+        validate_author(&record)?;
         let row_index = self.row_count;
         {
             let mut __wal_payload = Vec::new();
@@ -175,7 +226,7 @@ impl AuthorStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
-        true
+        Ok(true)
     }
     /// Logically delete a record by appending a tombstoned superseding
     /// version (#66).  `get` then reads the row as absent.  Returns
@@ -464,6 +515,11 @@ impl AuthorStorageReader {
         records
     }
 }
+/// Field-constraint validation (#91): reject a record whose values
+/// violate a declared `@min`/`@max`/`@length`/`@email`/`@url` directive.
+fn validate_author(record: &Author) -> Result<(), ValidationError> {
+    Ok(())
+}
 ///Post model
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -638,7 +694,13 @@ impl PostStorage {
     pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
         self.changefeed = Some(feed);
     }
-    pub fn insert(&mut self, record: Post) -> Uuid {
+    /// Insert a record.  Validates field constraints + `&unique` FIRST
+    /// (#91 Phase 3): a rejected insert commits nothing and returns
+    /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
+    /// existence is checked by `Database::create_<model>`, which has the
+    /// sibling-collection access this storage-scoped method lacks.)
+    pub fn insert(&mut self, record: Post) -> Result<Uuid, ValidationError> {
+        validate_post(&record)?;
         let row_index = self.row_count;
         let id = record.id;
         {
@@ -718,17 +780,22 @@ impl PostStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
-        id
+        Ok(id)
     }
     /// Append a superseding version of an existing record (#66).
     /// Reads resolve newest-version-wins; the prior version's bytes are
     /// never mutated, so append-only (and thus backup / snapshots) hold.
-    /// Returns `false` if `id` is absent.  Storage grows with each
-    /// update until compaction reclaims superseded versions.
-    pub fn update(&mut self, id: Uuid, record: Post) -> bool {
+    /// Validates field constraints + `&unique` FIRST (#91): a rejected
+    /// update commits nothing and returns `Err(ValidationError)`.
+    /// `Ok(false)` if `id` is absent; `Ok(true)` on a successful update.
+    /// Storage grows with each update until compaction reclaims versions.
+    /// (Foreign-key existence is checked by `Database::update_<model>`,
+    /// which has sibling-collection access this storage-scoped method lacks.)
+    pub fn update(&mut self, id: Uuid, record: Post) -> Result<bool, ValidationError> {
         if !self.id_to_row.contains_key(&id) {
-            return false;
+            return Ok(false);
         }
+        validate_post(&record)?;
         let __old = self.get(id);
         let row_index = self.row_count;
         {
@@ -864,7 +931,7 @@ impl PostStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
-        true
+        Ok(true)
     }
     /// Logically delete a record by appending a tombstoned superseding
     /// version (#66).  `get` then reads the row as absent.  Returns
@@ -1571,6 +1638,11 @@ impl PostStorageReader {
         __out
     }
 }
+/// Field-constraint validation (#91): reject a record whose values
+/// violate a declared `@min`/`@max`/`@length`/`@email`/`@url` directive.
+fn validate_post(record: &Post) -> Result<(), ValidationError> {
+    Ok(())
+}
 ///Change-feed event: a `Author` was inserted (#62).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AuthorInserted {
@@ -1748,6 +1820,60 @@ impl Database {
     ///Resolve the optional foreign key to its record.
     pub fn post_editor_id(&self, record: &Post) -> Option<Author> {
         record.editor_id.and_then(|fk| self.author.get(fk))
+    }
+}
+impl Database {
+    ///Create a Author with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `insert`.
+    pub fn create_author(&mut self, record: Author) -> Result<Uuid, ValidationError> {
+        self.author.insert(record)
+    }
+    ///Update a Author with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `update`. `Ok(false)` if the id is absent.
+    pub fn update_author(
+        &mut self,
+        id: Uuid,
+        record: Author,
+    ) -> Result<bool, ValidationError> {
+        self.author.update(id, record)
+    }
+    ///Create a Post with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `insert`.
+    pub fn create_post(&mut self, record: Post) -> Result<Uuid, ValidationError> {
+        if self.author.get(record.author_id).is_none() {
+            return Err(ValidationError::DanglingReference {
+                field: "author_id",
+                target: "Author",
+            });
+        }
+        if let Some(__fk) = record.editor_id {
+            if self.author.get(__fk).is_none() {
+                return Err(ValidationError::DanglingReference {
+                    field: "editor_id",
+                    target: "Author",
+                });
+            }
+        }
+        self.post.insert(record)
+    }
+    ///Update a Post with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `update`. `Ok(false)` if the id is absent.
+    pub fn update_post(
+        &mut self,
+        id: Uuid,
+        record: Post,
+    ) -> Result<bool, ValidationError> {
+        if self.author.get(record.author_id).is_none() {
+            return Err(ValidationError::DanglingReference {
+                field: "author_id",
+                target: "Author",
+            });
+        }
+        if let Some(__fk) = record.editor_id {
+            if self.author.get(__fk).is_none() {
+                return Err(ValidationError::DanglingReference {
+                    field: "editor_id",
+                    target: "Author",
+                });
+            }
+        }
+        self.post.update(id, record)
     }
 }
 ///Post with its forward references resolved
