@@ -112,8 +112,10 @@ fn create_rust_files(options: &InitOptions) -> Result<()> {
     //
     // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
     // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields), plus
-    // forgedb-changefeed for the change-feed emits (#62 Direction A) and
-    // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery).
+    // forgedb-changefeed for the change-feed emits (#62 Direction A),
+    // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery),
+    // and forgedb-compaction for in-process auto-compaction (#92 — schema-agnostic
+    // dead-row reclaim keyed by dir name; the trigger + reindex are generated).
     //
     // The generated `api.rs` needs: axum (with the `ws` feature for the
     // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json,
@@ -133,6 +135,7 @@ forgedb-changefeed = "0.1"
 forgedb-wal = "0.2"
 forgedb-auth = "0.1"
 forgedb-query-params = "0.1"
+forgedb-compaction = "0.1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
