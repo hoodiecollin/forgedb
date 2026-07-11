@@ -86,7 +86,6 @@ impl Compactor {
     /// different post-compaction versions.  Full directory-level atomicity is
     /// deferred.
     pub fn compact_model(&self, model_name: &str) -> Result<CompactionResult, String> {
-        let start_time = Instant::now();
         let model_dir = self.data_dir.join(model_name);
 
         if !model_dir.exists() {
@@ -96,44 +95,102 @@ impl Compactor {
         // --- C1: read row count from the tombstone file length; no guessing (#65) ---
         let row_count = Self::read_row_count(&model_dir)?;
 
+        // Tombstone-derived drop mask: a row is dropped iff its tombstone byte is
+        // set.  NOTE this is the classic model — it reclaims *deleted* rows only.
+        // It CANNOT reclaim the superseding-version dead rows the #66 mutation
+        // surface leaves behind (those are orphaned but NOT tombstoned), and it is
+        // unsafe against #66 deletes (which tombstone a *marker* row, not the old
+        // data row) — see `compact_model_keeping`, which the generated in-process
+        // path (#92) uses instead.  Kept for the schema-agnostic CLI path.
+        let tombstone_path = model_dir.join("tombstones.bin");
+        let drop_mask = self.read_tombstone_bitmap(&tombstone_path, row_count)?;
+        self.compact_with_drop_mask(model_name, &model_dir, drop_mask)
+    }
+
+    /// Compact a model keeping EXACTLY the physical rows named in `keep`
+    /// (any order; out-of-range indices ignored), dropping every other row and
+    /// renumbering the survivors densely.
+    ///
+    /// Schema-agnostic: the CALLER decides which rows are live and hands over an
+    /// opaque set of row indices — this substrate only rewrites bytes, it reads no
+    /// schema.  This is the reclaim primitive the generated in-process auto-
+    /// compaction (#92) drives: for the #66 superseding-version mutation surface,
+    /// the generated code passes the newest non-tombstoned row per live id, so
+    /// orphaned old versions AND deleted rows are simply omitted from `keep`.  It
+    /// exists because the tombstone-only `compact_model` cannot express "this
+    /// non-tombstoned row is a superseded dead version" and would resurrect #66
+    /// deletes.
+    pub fn compact_model_keeping(
+        &self,
+        model_name: &str,
+        keep: &[usize],
+    ) -> Result<CompactionResult, String> {
+        let model_dir = self.data_dir.join(model_name);
+
+        if !model_dir.exists() {
+            return Err(format!("Model directory not found: {:?}", model_dir));
+        }
+
+        let row_count = Self::read_row_count(&model_dir)?;
+
+        // Build the drop mask: drop everything, then un-drop each kept row.
+        let mut drop_mask = vec![true; row_count];
+        for &r in keep {
+            if r < row_count {
+                drop_mask[r] = false;
+            }
+        }
+        self.compact_with_drop_mask(model_name, &model_dir, drop_mask)
+    }
+
+    /// Shared compaction core: given a per-row drop mask (`true` = drop), stage a
+    /// rewrite of every column + the tombstone file dropping those rows, commit
+    /// the renames, and update the manifest row_count.  Both `compact_model`
+    /// (tombstone-derived mask) and `compact_model_keeping` (keep-set-derived
+    /// mask) funnel through here, so the atomic-rename staging logic lives once.
+    fn compact_with_drop_mask(
+        &self,
+        model_name: &str,
+        model_dir: &Path,
+        tombstones: Vec<bool>,
+    ) -> Result<CompactionResult, String> {
+        let start_time = Instant::now();
+
         // Collect stats before compaction (needs manifest row_count too)
         let collector = StatsCollector::new(&self.data_dir);
         let stats_before = collector.collect_model_stats(model_name)?;
         let bytes_before = stats_before.total_disk_bytes;
 
-        // Read tombstone bitmap using the authoritative row count
         let tombstone_path = model_dir.join("tombstones.bin");
-        let tombstones = self.read_tombstone_bitmap(&tombstone_path, row_count)?;
 
         // --- C2: stage all writes before committing any ---
         let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-        // Stage variable columns
+        // Stage variable columns.  A variable *data* file is any `*.bin` whose
+        // name contains `_data`; its paired offsets file is the same name with
+        // `_data` → `_offsets`.  This matches BOTH the generated layout
+        // (`string_data_<idx>.bin` / `string_offsets_<idx>.bin`) and the older
+        // `<col>_data.bin` / `<col>_offsets.bin` convention.  (The prior
+        // `ends_with("_data.bin")` check silently skipped every generated variable
+        // column — `string_data_1.bin` does NOT end with `_data.bin` — so variable
+        // columns were never compacted, and reopen then truncated them to a wrong
+        // prefix, scrambling rows across columns.)
         let variable_dir = model_dir.join("variable");
         if variable_dir.exists() {
             let entries = fs::read_dir(&variable_dir).map_err(|e| e.to_string())?;
             for entry in entries {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
-                if path.is_file()
-                    && path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.ends_with("_data.bin"))
-                        .unwrap_or(false)
-                {
-                    let column_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .and_then(|s| s.strip_suffix("_data"))
-                        .ok_or_else(|| "Invalid column file name".to_string())?
-                        .to_string();
-                    let data_path = path.clone();
-                    let offset_path =
-                        variable_dir.join(format!("{}_offsets.bin", column_name));
+                let name = match path.file_name().and_then(|s| s.to_str()) {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                if path.is_file() && name.ends_with(".bin") && name.contains("_data") {
+                    let offset_name = name.replacen("_data", "_offsets", 1);
+                    let offset_path = variable_dir.join(offset_name);
                     if offset_path.exists() {
                         staged.extend(Self::stage_variable_column_write(
-                            &data_path,
+                            &path,
                             &offset_path,
                             &tombstones,
                         )?);
@@ -172,7 +229,7 @@ impl Compactor {
         // This is the logical commit record (last rename so it confirms all column
         // renames above have completed).
         let active_count = tombstones.iter().filter(|&&t| !t).count();
-        Self::update_manifest_row_count(&model_dir, active_count)?;
+        Self::update_manifest_row_count(model_dir, active_count)?;
 
         // Record compaction timestamp
         let compaction_marker = model_dir.join(".last_compaction");
