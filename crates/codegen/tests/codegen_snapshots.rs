@@ -197,8 +197,10 @@ fn test_api_generation_has_update_delete_endpoints() {
     // Wired on the /{id} route alongside get.
     assert!(code.contains(".put(update_user)"));
     assert!(code.contains(".delete(delete_user)"));
-    // Backed by the generated mutation surface.
-    assert!(code.contains(".update(key, record)"));
+    // Backed by the generated mutation surface. Create/update route through the
+    // #91 Database-level validated wrappers (FK + field + unique); delete is direct.
+    assert!(code.contains("db.update_user(key, record)"));
+    assert!(code.contains("db.create_user(record)"));
     assert!(code.contains(".delete(key)"));
 }
 
@@ -537,7 +539,8 @@ Place {
 
     // Gap 3: integer PK — identity type is u64 across map key + insert/get.
     assert!(code.contains("id_to_row: HashMap<u64, usize>"), "id map must be keyed by u64");
-    assert!(code.contains("-> u64"), "insert must return the u64 PK");
+    // insert now returns Result<u64, _> (#91 validation); the PK type still threads through.
+    assert!(code.contains("-> Result<u64, ValidationError>"), "insert must return the u64 PK");
     assert!(code.contains("id: u64"), "get must take the u64 PK");
 
     // Gap 1: nullable string field renders as Option<String> and is encoded
@@ -1238,9 +1241,10 @@ Counter {
     let schema = parser.parse().unwrap();
     let code = RustGenerator::generate(&schema).unwrap().code;
 
-    // Signatures, per PK type.
+    // Signatures, per PK type. update now returns Result (#91 validation);
+    // delete stays bool (no validation on delete).
     assert!(
-        code.contains("pub fn update(&mut self, id: Uuid, record: Post) -> bool"),
+        code.contains("pub fn update(&mut self, id: Uuid, record: Post) -> Result<bool, ValidationError>"),
         "uuid-PK update signature"
     );
     assert!(
@@ -1248,7 +1252,7 @@ Counter {
         "uuid-PK delete signature"
     );
     assert!(
-        code.contains("pub fn update(&mut self, id: u64, record: Counter) -> bool"),
+        code.contains("pub fn update(&mut self, id: u64, record: Counter) -> Result<bool, ValidationError>"),
         "integer-PK update signature"
     );
     assert!(
@@ -1609,6 +1613,64 @@ Post {
         1,
         "#103: live probe emitted on the writer only"
     );
+}
+
+#[test]
+fn test_rust_generation_data_integrity() {
+    // Phase 3 (#91): enforce field constraints, &unique, and required/optional-FK
+    // existence at write time; insert/update carry a ValidationError; the REST path
+    // routes through Database-level create_/update_ wrappers that add FK checks.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string @email
+  age: u32 @min(0) @max(150)
+  name: string @length(2, 50)
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  reviewer: ?User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // ValidationError type with the three integrity classes + status mapping.
+    assert!(code.contains("pub enum ValidationError"), "ValidationError type emitted");
+    assert!(code.contains("Unique { field") && code.contains("DanglingReference { field")
+        && code.contains("Constraint { field"), "three integrity variants");
+    assert!(code.contains("pub fn status_code(&self) -> u16"), "status_code maps to HTTP");
+
+    // Per-model field validator with the declared directives.
+    assert!(code.contains("fn validate_user(record: &User) -> Result<(), ValidationError>"),
+        "generated per-model field validator");
+    assert!(code.contains("rule: \"email\"") && code.contains("rule: \"min\"")
+        && code.contains("rule: \"max\"") && code.contains("rule: \"length\""),
+        "each declared directive is enforced");
+
+    // insert/update validate first and carry the error.
+    assert!(code.contains("pub fn insert(&mut self, record: User) -> Result<Uuid, ValidationError>"),
+        "insert returns Result");
+    assert!(code.contains("validate_user(&record)?;"), "insert/update call the validator first");
+    // &unique enforcement probes the Phase-2 unique index and rejects a duplicate.
+    assert!(code.contains("self.email_index.get(&__uk)") && code.contains("ValidationError::Unique"),
+        "duplicate &unique email is rejected via the unique index");
+
+    // Database-level validated wrappers add FK existence (sibling access).
+    assert!(code.contains("pub fn create_post(&mut self, record: Post) -> Result<Uuid, ValidationError>"),
+        "create_<model> wrapper");
+    assert!(code.contains("pub fn update_post(") && code.contains("-> Result<bool, ValidationError>"),
+        "update_<model> wrapper");
+    // Required FK checked directly; optional FK checked only when Some.
+    assert!(code.contains("self.user.get(record.author).is_none()"),
+        "required FK author existence checked");
+    assert!(code.contains("if let Some(__fk) = record.reviewer"),
+        "optional FK reviewer checked only when set");
+    assert!(code.contains("ValidationError::DanglingReference"), "dangling FK rejected");
 }
 
 #[test]

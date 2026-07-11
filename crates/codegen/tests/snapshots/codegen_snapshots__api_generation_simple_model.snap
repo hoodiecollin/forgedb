@@ -92,7 +92,14 @@ async fn get_user(
     path = "",
     tag = "User",
     request_body = User,
-    responses((status = 201, description = "Create new User", body = User))
+    responses(
+        (status = 201, description = "Create new User", body = User),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
+    )
 )]
 async fn create_user(
     State(db): State<Arc<RwLock<super::Database>>>,
@@ -108,8 +115,14 @@ async fn create_user(
         }
     };
     let mut db = db.write().await;
-    let id = db.user.insert(record);
-    (StatusCode::CREATED, Json(json!({ "id" : id.to_string() })))
+    match db.create_user(record) {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id" : id.to_string() }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
 }
 #[utoipa::path(
     put,
@@ -119,7 +132,12 @@ async fn create_user(
     request_body = User,
     responses(
         (status = 200, description = "Replace User by ID", body = User),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
     )
 )]
 async fn update_user(
@@ -143,10 +161,14 @@ async fn update_user(
         }
     };
     let mut db = db.write().await;
-    if db.user.update(key, record) {
-        (StatusCode::OK, Json(json!({ "id" : key.to_string() })))
-    } else {
-        (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" })))
+    match db.update_user(key, record) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "id" : key.to_string() }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
     }
 }
 #[utoipa::path(
