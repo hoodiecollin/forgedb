@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 145
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -26,12 +25,38 @@ use utoipa_axum::routes;
     get,
     path = "",
     tag = "User",
+    params(
+        (
+            "limit" = Option<usize>,
+            Query,
+            description = "Max rows (clamped to [1, 1000]; default 50)"
+        ),
+        ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
+        ("sort" = Option<String>, Query, description = "Field to sort by"),
+        ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+    ),
     responses((status = 200, description = "List all User", body = Vec<User>))
 )]
 async fn list_user(
-    State(_db): State<Arc<RwLock<super::Database>>>,
+    Query(params): Query<HashMap<String, String>>,
+    State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::OK, Json(json!({ "data" : [] })))
+    let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    let db = db.read().await;
+    let mut rows: Vec<super::User> = db
+        .user
+        .all()
+        .into_iter()
+        .filter(|r| user_event_matches(r, &params))
+        .collect();
+    user_apply_sort(&mut rows, &qp.sort);
+    let total = rows.len();
+    let page: Vec<super::User> = qp.pagination.apply(&rows).to_vec();
+    let body = json!(
+        { "data" : page, "total" : total, "limit" : qp.pagination.limit, "offset" : qp
+        .pagination.offset, }
+    );
+    (StatusCode::OK, Json(body))
 }
 #[utoipa::path(
     get,
@@ -144,6 +169,22 @@ async fn delete_user(
     };
     let mut db = db.write().await;
     if db.user.delete(key) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+}
+fn user_apply_sort(
+    rows: &mut Vec<super::User>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
 }
 ///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code; the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
