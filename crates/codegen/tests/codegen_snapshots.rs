@@ -604,13 +604,20 @@ Tag {
         code.contains("pub fn user_posts_by_editor(&self, id: Uuid) -> Vec<Post>"),
         "reverse getter disambiguated by optional FK"
     );
+    // #100: the reverse getters now PROBE the child's FK index (O(1)) instead of
+    // scanning `all()` and filtering. Required FK passes the id; optional FK wraps
+    // it in `Some(_)` (the FK column is `Option<Uuid>`).
     assert!(
-        code.contains("record.author == id"),
-        "required-FK reverse getter filters by equality"
+        code.contains("self.post.find_by_author(id)"),
+        "required-FK reverse getter probes find_by_author (not a scan)"
     );
     assert!(
-        code.contains("record.editor == Some(id)"),
-        "optional-FK reverse getter filters by Some(id)"
+        code.contains("self.post.find_by_editor(Some(id))"),
+        "optional-FK reverse getter probes find_by_editor(Some(id))"
+    );
+    assert!(
+        !code.contains("record.author == id"),
+        "reverse getter no longer scans on record.author == id (#100)"
     );
 
     // C. Many-to-many: a persisted junction struct + link/query helpers.
@@ -823,6 +830,26 @@ fn test_rust_generation_with_fk_fields() {
 
     // repr(C) present (C3)
     assert!(code.contains("#[repr(C)]"), "missing #[repr(C)]");
+
+    // #100: FK scalars are now indexed (unconditionally — a reverse getter that
+    // would otherwise scan always exists). Required FK → Uuid param; optional FK
+    // → Option<Uuid> param (rides #102's null-distinct key).
+    assert!(
+        code.contains("author_id_index"),
+        "required FK author_id must have a secondary index (#100)"
+    );
+    assert!(
+        code.contains("editor_id_index"),
+        "optional FK editor_id must have a secondary index (#100)"
+    );
+    assert!(
+        code.contains("pub fn find_by_author_id(&self, value: Uuid) -> Vec<Post>"),
+        "required FK gets a find_by_author_id(Uuid) probe (#100)"
+    );
+    assert!(
+        code.contains("pub fn find_by_editor_id(&self, value: Option<Uuid>) -> Vec<Post>"),
+        "optional FK gets a find_by_editor_id(Option<Uuid>) probe (#100 + #102)"
+    );
 
     // Snapshot for future regression detection
     insta::assert_snapshot!(code);
@@ -1487,6 +1514,100 @@ User {
     assert!(
         code.contains("db.email_index.entry(__k).or_default().insert(__id);"),
         "indexes are rebuilt from committed rows on reopen"
+    );
+}
+
+#[test]
+fn test_rust_generation_index_followups() {
+    // Phase-2 index follow-ups #100 (FK-scalar), #101 (composite @index),
+    // #102 (nullable), #103 (reader probes) — all four exercised at once.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  handle: ^string?
+  region: string
+  tier: u32
+  posts: [Post]
+  @index(region, tier)
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  reviewer: ?User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // --- #102 nullable indexing --------------------------------------------
+    assert!(code.contains("handle_index"), "#102: nullable ^field is indexed");
+    assert!(
+        code.contains("pub fn find_by_handle(&self, value: Option<&str>) -> Vec<User>"),
+        "#102: nullable string probe takes Option<&str>"
+    );
+    // Null-distinct key: None keys to '\u{0}', Some(\"null\") to '\u{1}null' — no collision.
+    assert!(
+        code.contains(r"String::from('\u{0}')"),
+        "#102: None keys to a distinct null sentinel"
+    );
+
+    // --- #100 FK-scalar indexing -------------------------------------------
+    assert!(code.contains("author_index"), "#100: required FK is indexed");
+    assert!(code.contains("reviewer_index"), "#100: optional FK is indexed");
+    assert!(
+        code.contains("pub fn find_by_author(&self, value: Uuid) -> Vec<Post>"),
+        "#100: required FK probe takes Uuid"
+    );
+    assert!(
+        code.contains("pub fn find_by_reviewer(&self, value: Option<Uuid>) -> Vec<Post>"),
+        "#100 + #102: optional FK probe takes Option<Uuid>"
+    );
+    // Reverse one-to-many getter now PROBES the FK index instead of scanning.
+    assert!(
+        code.contains("self.post.find_by_author(id)"),
+        "#100: reverse getter user_posts probes find_by_author (not a scan)"
+    );
+
+    // --- #101 composite @index(region, tier) -------------------------------
+    assert!(
+        code.contains("region_tier_index"),
+        "#101: composite index field named <a>_<b>_index"
+    );
+    assert!(
+        code.contains("pub fn find_by_region_and_tier(&self, region: &str, tier: u32) -> Vec<User>"),
+        "#101: composite probe find_by_<a>_and_<b> with per-component params"
+    );
+    // Collision-free length-prefixed composite key build.
+    assert!(
+        code.contains("__ck.push_str(&__p.len().to_string());") && code.contains("__ck.push(':');"),
+        "#101: composite key is length-prefixed (collision-free join)"
+    );
+
+    // --- #103 reader probes (snapshot `_at` only) --------------------------
+    // The reader clones each index map; the clone init only appears on the reader.
+    assert!(
+        code.contains("handle_index: self.handle_index.clone()"),
+        "#103: reader clones the index maps"
+    );
+    assert!(
+        code.contains("region_tier_index: self.region_tier_index.clone()"),
+        "#103: reader clones the composite index too"
+    );
+    // The `_at` probe is emitted on BOTH writer and reader (2×); the LIVE probe
+    // only on the writer (1×) — a reader has no live `get`.
+    assert_eq!(
+        code.matches("pub fn find_by_handle_at(").count(),
+        2,
+        "#103: snapshot probe emitted on writer + reader"
+    );
+    assert_eq!(
+        code.matches("pub fn find_by_handle(").count(),
+        1,
+        "#103: live probe emitted on the writer only"
     );
 }
 
