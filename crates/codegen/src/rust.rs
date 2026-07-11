@@ -70,6 +70,18 @@ impl RustGenerator {
             const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
         });
 
+        // Compaction trigger threshold (#92 Phase 4 — bound column storage).
+        // Each update/delete leaves a dead (superseded/tombstoned) row version
+        // behind (#66); once this many accumulate since the last compaction, the
+        // storage compacts IN-PROCESS under the single-writer lock, reclaiming the
+        // dead bytes.  Fixed for v1 (not yet configurable — the same posture as
+        // `WAL_CHECKPOINT_INTERVAL` and `FsyncPolicy::Always`; a tuning knob rides
+        // the Phase 4 bounded-storage follow-up).  Storage is bounded to roughly
+        // this many dead versions between compactions.
+        tokens.extend(quote! {
+            const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+        });
+
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
         // generic *shape* (three integrity classes) but every field name, rule,
         // and message is filled in by generated per-field checks — there is no
@@ -316,6 +328,10 @@ impl RustGenerator {
         // WAL so it stays bounded and reopen replays only the post-checkpoint tail.
         let checkpoint_method = Self::generate_checkpoint_method(model);
 
+        // Generate in-process compaction (#92 Phase 4): reclaim dead row versions
+        // under the writer lock, then reopen to rebuild the in-memory maps.
+        let compact_method = Self::generate_compact_method(model);
+
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
@@ -409,6 +425,8 @@ impl RustGenerator {
                 #recover_method
 
                 #checkpoint_method
+
+                #compact_method
 
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1337,6 +1355,15 @@ impl RustGenerator {
             // 2).  When it reaches `WAL_CHECKPOINT_INTERVAL`, `checkpoint()` runs:
             // columns are fsync'd and the WAL is truncated, bounding it.
             writes_since_checkpoint: u64,
+            // Data root this storage was opened at (#92 Phase 4).  Remembered so
+            // in-process compaction can rewrite this model's files under it and
+            // then reopen the column handles from the compacted files.
+            root: std::path::PathBuf,
+            // Dead (superseded/tombstoned) row versions accumulated since the last
+            // compaction (#92 Phase 4).  When it reaches `COMPACTION_DEAD_THRESHOLD`,
+            // `compact()` reclaims them under the writer lock.  Incremented by
+            // update/delete only — an insert creates no dead version.
+            dead_since_compaction: u64,
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -1428,6 +1455,9 @@ impl RustGenerator {
                 forgedb_wal::FsyncPolicy::Always,
             ).expect("Failed to open WAL"),
             writes_since_checkpoint: 0,
+            // Remember the data root so `compact()` can rewrite + reopen files (#92).
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
             changefeed: None,
         }
     }
@@ -1903,16 +1933,110 @@ impl RustGenerator {
         }
     }
 
+    /// Emit one "append a default entry" statement per storage-backed field —
+    /// the same column encoding as `generate_append_statements`, but with the
+    /// field's type default instead of a record value.  Used to backfill a newly
+    /// added column so existing rows keep a well-formed value (#92 Phase 4 additive
+    /// migration).  Defaults are type-zero / null (nullable → None, string → "",
+    /// numeric → 0, uuid/FK → nil); the schema `@default` is not yet honored here
+    /// (a follow-up), which is why additive fields should be nullable or carry a
+    /// meaningful zero.
+    fn generate_backfill_appends(model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
+        let mut out = Vec::new();
+        for field in &model.fields {
+            let col = format_ident!("{}_col", field.name);
+            if Self::is_string_type(&field.field_type) {
+                let one = if field.is_nullable() {
+                    // Nullable string: the 1-byte presence tag `\u{0}` = None.
+                    quote! {
+                        self.#col.append_string(&String::from('\u{0}'))
+                            .expect("Failed to backfill string column");
+                    }
+                } else {
+                    quote! {
+                        self.#col.append_string("")
+                            .expect("Failed to backfill string column");
+                    }
+                };
+                out.push((col, one));
+            } else if Self::is_fixed_size_type(&field.field_type) {
+                let needs_byte_conversion = matches!(
+                    &field.field_type,
+                    forgedb_parser::FieldType::Char(_)
+                        | forgedb_parser::FieldType::FixedArray(_, _)
+                        | forgedb_parser::FieldType::StructType(_)
+                        | forgedb_parser::FieldType::OptionalStructType(_)
+                        | forgedb_parser::FieldType::Nullable(_)
+                        | forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(_),
+                        )
+                );
+                let one = if needs_byte_conversion {
+                    // Byte-blob types (char(N), arrays, inline struct, nullable /
+                    // optional-FK) backfill as zeroed bytes of the column width —
+                    // decodes to None / all-zero, matching the append encoding.
+                    let value_size = Self::column_value_size_expr(&field.field_type);
+                    quote! {
+                        self.#col.append_bytes(&vec![0u8; #value_size])
+                            .expect("Failed to backfill column");
+                    }
+                } else {
+                    let append_method = Self::get_append_method(&field.field_type);
+                    let is_uuid_like = matches!(
+                        &field.field_type,
+                        forgedb_parser::FieldType::Uuid
+                            | forgedb_parser::FieldType::Relation(
+                                forgedb_parser::RelationType::RequiredReference(_),
+                            )
+                    );
+                    let is_timestamp =
+                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                    if is_uuid_like {
+                        quote! {
+                            self.#col.#append_method([0u8; 16])
+                                .expect("Failed to backfill column");
+                        }
+                    } else if is_timestamp {
+                        quote! {
+                            self.#col.#append_method(0i64)
+                                .expect("Failed to backfill column");
+                        }
+                    } else if matches!(&field.field_type, forgedb_parser::FieldType::F64) {
+                        quote! {
+                            self.#col.#append_method(0.0)
+                                .expect("Failed to backfill column");
+                        }
+                    } else if matches!(&field.field_type, forgedb_parser::FieldType::Bool) {
+                        quote! {
+                            self.#col.#append_method(false)
+                                .expect("Failed to backfill column");
+                        }
+                    } else {
+                        quote! {
+                            self.#col.#append_method(0)
+                                .expect("Failed to backfill column");
+                        }
+                    }
+                };
+                out.push((col, one));
+            }
+        }
+        out
+    }
+
     /// Emit `recover_from_wal(&mut self)` (#89): torn-tail repair + WAL replay on
-    /// reopen.  Truncates every column + the tombstone file back to the largest
-    /// prefix present in ALL of them (a crash can leave one column ahead of
-    /// another), then replays the WAL, re-driving every record whose absolute row
-    /// index is `>= row_count`.  Because `FsyncPolicy::Always` made each record
-    /// durable before its columns were touched, a row acked to the client survives
-    /// even if its column append was lost to the page cache.  Recovery decode is
-    /// generated per-model here (the columns are baked in) — the WAL crate stays
-    /// field-blind, and there is no runtime `model_name` dispatch.  Emits no
-    /// change-feed events (recovery is not a live mutation).
+    /// reopen — plus additive-field backfill (#92 Phase 4).  The tombstone file is
+    /// the authoritative committed row count (appended LAST in every insert, so it
+    /// never over-counts).  Realign every column to that anchor: a column SHORTER
+    /// than the anchor is a newly-added field (the schema was regenerated with an
+    /// extra field) — backfill it with the field's default so existing rows stay
+    /// intact; a column LONGER than the anchor is a torn insert tail — truncate it.
+    /// Then replay the WAL, re-driving every record whose absolute row index is
+    /// `>= row_count`.  Because `FsyncPolicy::Always` made each record durable
+    /// before its columns were touched, a row acked to the client survives even if
+    /// its column append was lost to the page cache.  Recovery decode is generated
+    /// per-model here (the columns are baked in) — the WAL crate stays field-blind,
+    /// and there is no runtime `model_name` dispatch.  Emits no change-feed events.
     fn generate_recover_method(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let append_statements = Self::generate_append_statements(model);
@@ -1925,20 +2049,34 @@ impl RustGenerator {
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
 
+        // Additive-migration backfill (#92 Phase 4): for each column shorter than
+        // the anchor, append its default until it reaches the anchor.
+        let backfill_loops: Vec<_> = Self::generate_backfill_appends(model)
+            .into_iter()
+            .map(|(col, append_default)| {
+                quote! {
+                    while self.#col.len() < __anchor {
+                        #append_default
+                    }
+                }
+            })
+            .collect();
+
         quote! {
             fn recover_from_wal(&mut self) {
-                // Largest prefix present in EVERY column + the tombstone file.
-                let __c = self.tombstones.len() #(.min(self.#col_idents.len()))*;
-                // Drop any torn / ahead tail so all columns realign at `__c`.
+                // The tombstone file is the authoritative committed row count.
+                let __anchor = self.tombstones.len();
+                // Backfill newly-added (short) columns up to the anchor so existing
+                // rows keep a well-formed default value (#92 additive migration).
+                #(#backfill_loops)*
+                // Drop any torn / ahead column tail so all columns realign at the
+                // anchor (a crash can leave one column ahead of the tombstone).
                 #(
                     self.#col_idents
-                        .truncate_to_rows(__c)
+                        .truncate_to_rows(__anchor)
                         .expect("Failed to truncate column on recovery");
                 )*
-                self.tombstones
-                    .truncate_to_rows(__c)
-                    .expect("Failed to truncate tombstones on recovery");
-                self.row_count = __c;
+                self.row_count = __anchor;
 
                 // Replay the WAL, re-driving records the columns don't yet have.
                 let __entries = self
@@ -2016,6 +2154,80 @@ impl RustGenerator {
         }
     }
 
+    /// Emit `compact(&mut self)` (#92 Phase 4 — bound column storage).  Reclaims
+    /// the dead (superseded/tombstoned) row versions the mutation surface (#66)
+    /// leaves behind, IN-PROCESS under the single-writer discipline.  Never a
+    /// background thread: #89's `DirLock` makes single-writer the durability
+    /// contract, so compaction must run on the writer, between mutations.
+    ///
+    /// Order is load-bearing:
+    /// 1. `checkpoint()` first — fsync columns + truncate the WAL, so no
+    ///    index-relative WAL tail (#89, which replays by *absolute* row index)
+    ///    survives the row renumbering compaction is about to do.
+    /// 2. Generated code computes the LIVE physical-row set from `id_to_row` +
+    ///    tombstone liveness (the field-aware decision) and hands that opaque set
+    ///    to `forgedb_compaction::Compactor::compact_model_keeping`, which keeps
+    ///    exactly those rows and drops the rest.  The substrate is schema-blind
+    ///    byte GC keyed by the model *directory name* + a list of row indices — it
+    ///    reads no `.forge`, no field types.  (Only `compact_model_keeping` is
+    ///    linked — never `BackgroundCompactor`, which would compact off the writer
+    ///    lock.)  The keep-set model — not `compact_model`'s tombstone model — is
+    ///    load-bearing: #66 leaves superseded update-versions orphaned but NOT
+    ///    tombstoned, and marks a delete with a *new* tombstoned marker row, so a
+    ///    tombstone-driven drop reclaims nothing from updates and would resurrect
+    ///    deletes.
+    /// 3. Compaction renumbers surviving rows, invalidating every in-memory
+    ///    `id_to_row` / secondary-index entry, so reopen the storage to rebuild
+    ///    them from the compacted files via the SAME reopen-scan as `new_at`.
+    ///
+    /// Best-effort: a compaction error leaves the (still-correct) un-compacted
+    /// files in place and retries after the next interval — it never corrupts
+    /// live state.
+    fn generate_compact_method(model: &forgedb_parser::Model) -> TokenStream {
+        let model_snake = Self::to_snake_case(&model.name);
+        quote! {
+            /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
+            /// rewrite this model's files dropping dead rows, then reopen to
+            /// rebuild `id_to_row` + secondary indexes from the compacted files.
+            pub fn compact(&mut self) {
+                // 1. Make columns durable + discard the WAL tail (no index-relative
+                //    replay may survive the renumbering below).
+                self.checkpoint();
+                // 2. Compute the LIVE physical-row set — the field-aware decision,
+                //    made here in generated code, never in the substrate.  For the
+                //    superseding-version mutation surface (#66), `id_to_row` maps
+                //    each id to its newest physical row: a live id's newest row is
+                //    non-tombstoned; a deleted id's newest row is the tombstoned
+                //    marker, which we OMIT so the delete is truly reclaimed (and
+                //    never resurrected).  Orphaned old versions are absent from
+                //    `id_to_row.values()` entirely, so they drop out too.
+                let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
+                for &__row in self.id_to_row.values() {
+                    // Keep-on-error: an unclassifiable row is retained (never lost),
+                    // and reopen's version-resolving read still reads it correctly —
+                    // worst case it is simply reclaimed on a later pass.
+                    if !self.tombstones.is_deleted(__row).unwrap_or(false) {
+                        __keep.push(__row);
+                    }
+                }
+                // 3. Hand the opaque live-row set to the schema-blind byte GC.
+                let __config = forgedb_compaction::CompactionConfig::default();
+                let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
+                if __compactor.compact_model_keeping(#model_snake, &__keep).is_ok() {
+                    // 3. Rows renumbered: reopen to rebuild the in-memory maps from
+                    //    the compacted files (preserving the shared change feed).
+                    let __root = self.root.clone();
+                    let __feed = self.changefeed.take();
+                    *self = Self::new_at(&__root);
+                    self.changefeed = __feed;
+                }
+                // Reset unconditionally: a failed compaction waits a full interval
+                // rather than re-attempting on every subsequent mutation.
+                self.dead_since_compaction = 0;
+            }
+        }
+    }
+
     /// Emit the tail every mutation runs after its columns are appended and
     /// `row_count` is bumped: count the write and checkpoint once the interval is
     /// reached.  Placed AFTER the append + increment so the checkpoint always sees
@@ -2027,6 +2239,23 @@ impl RustGenerator {
             self.writes_since_checkpoint += 1;
             if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
                 self.checkpoint();
+            }
+        }
+    }
+
+    /// Emit the tail an update/delete runs after its dead-version bookkeeping:
+    /// count the dead row and compact once enough accumulate (#92 Phase 4).  Only
+    /// update/delete emit this — an insert produces no dead version.  Placed AFTER
+    /// `#maybe_checkpoint` so a compaction (which itself checkpoints) sees a
+    /// consistent, bounded WAL.
+    fn generate_maybe_compact() -> TokenStream {
+        quote! {
+            // Bound column storage (#92 Phase 4): this mutation left a dead
+            // (superseded/tombstoned) row version behind; once enough accumulate,
+            // reclaim them in-process under the writer lock.
+            self.dead_since_compaction += 1;
+            if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+                self.compact();
             }
         }
     }
@@ -2125,6 +2354,7 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
+        let maybe_compact = Self::generate_maybe_compact();
         // Integrity gate (#91): validate field constraints + `&unique` (excluding
         // the record's own id) before any durable side effect.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
@@ -2235,6 +2465,10 @@ impl RustGenerator {
 
             #maybe_checkpoint
 
+            // Bound column storage (#92): this update superseded a live version,
+            // leaving a dead row behind — compact once enough accumulate.
+            #maybe_compact
+
             Ok(true)
         })
     }
@@ -2252,6 +2486,7 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
+        let maybe_compact = Self::generate_maybe_compact();
 
         // Secondary-index maintenance (#90): a delete appends a tombstoned
         // superseding row, so the id's index entry must be DROPPED (the physical
@@ -2322,6 +2557,10 @@ impl RustGenerator {
             }
 
             #maybe_checkpoint
+
+            // Bound column storage (#92): this delete left a tombstoned dead row
+            // behind — compact once enough accumulate.
+            #maybe_compact
 
             true
         })
@@ -2970,6 +3209,15 @@ impl RustGenerator {
             .chain(m2m.iter().map(Self::junction_field_ident))
             .collect();
 
+        // Model-only field idents (#92 Phase 4): `Database::compact()` compacts
+        // model storages, not junctions — a junction is an append-only link table
+        // with no update/delete, so it accumulates no dead versions to reclaim.
+        let model_field_idents: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| format_ident!("{}", Self::to_snake_case(&model.name)))
+            .collect();
+
         // DatabaseSnapshot (#56, Direction A): one row-count watermark per model
         // and per junction, captured together by `Database::snapshot()`.  Because
         // storage is append-only, this set of watermarks defines a database-wide
@@ -3121,6 +3369,20 @@ impl RustGenerator {
                 /// explicit, force-now entry point.  Single-writer only.
                 pub fn checkpoint(&mut self) {
                     #(self.#field_idents.checkpoint();)*
+                }
+
+                /// Force compaction across every model (#92 Phase 4): reclaim the
+                /// dead (superseded/tombstoned) row versions the mutation surface
+                /// (#66) leaves behind, in-process under the single-writer lock.
+                /// Each model checkpoints, rewrites its files dropping dead rows,
+                /// then reopens to rebuild its in-memory maps.  Runs automatically
+                /// every `COMPACTION_DEAD_THRESHOLD` dead versions per model; this
+                /// is the explicit, force-now entry point (parity with the manual
+                /// `forgedb compact` CLI path).  Junctions are skipped — an
+                /// append-only link table accumulates no dead versions.  Single-
+                /// writer only.
+                pub fn compact(&mut self) {
+                    #(self.#model_field_idents.compact();)*
                 }
 
                 /// Open a read-only handle over the whole database (#56 Direction

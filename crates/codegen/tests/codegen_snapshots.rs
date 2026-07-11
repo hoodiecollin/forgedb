@@ -1340,7 +1340,7 @@ User {
         "generated per-model recovery method"
     );
     assert!(
-        code.contains("truncate_to_rows(__c)")
+        code.contains("truncate_to_rows(__anchor)")
             && code.contains("self.wal") && code.contains(".replay("),
         "recovery repairs torn tail then replays the WAL"
     );
@@ -1671,6 +1671,163 @@ Post {
     assert!(code.contains("if let Some(__fk) = record.reviewer"),
         "optional FK reviewer checked only when set");
     assert!(code.contains("ValidationError::DanglingReference"), "dangling FK rejected");
+}
+
+#[test]
+fn test_rust_generation_auto_compaction() {
+    // Bounded storage (v1 Phase 4 — #92 Workstream 1): the mutation surface (#66)
+    // leaves dead row versions behind; generated code auto-compacts IN-PROCESS
+    // under the single-writer lock once enough accumulate.  The reclaim itself is a
+    // schema-agnostic keep-set primitive in `forgedb-compaction` — generated code
+    // computes the LIVE physical-row set (the field-aware decision) and hands the
+    // opaque indices over; the substrate keeps exactly those rows.
+    let src = r#"
+Widget {
+  id: +uuid
+  sku: &string
+  category: ^string
+  qty: u32
+}
+
+Gadget {
+  id: +uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // A fixed, generated dead-version threshold (not config — same posture as the
+    // WAL checkpoint interval) plus the per-storage counter + remembered root.
+    assert!(
+        code.contains("const COMPACTION_DEAD_THRESHOLD: u64"),
+        "generated compaction threshold constant"
+    );
+    assert!(
+        code.contains("dead_since_compaction: u64"),
+        "storage tracks dead versions since the last compaction"
+    );
+    assert!(
+        code.contains("root: std::path::PathBuf"),
+        "storage remembers its data root for compact + reopen"
+    );
+
+    // The generated compact() checkpoints FIRST (no index-relative WAL tail may
+    // survive the renumbering), then drives the schema-agnostic keep-set primitive.
+    assert!(
+        code.contains("pub fn compact(&mut self)"),
+        "generated per-model compact method"
+    );
+    let ckpt = code.find("pub fn compact(&mut self)").and_then(|start| {
+        code[start..].find("self.checkpoint();").map(|o| start + o)
+    });
+    let keep = code.find("compact_model_keeping");
+    assert!(
+        matches!((ckpt, keep), (Some(c), Some(k)) if c < k),
+        "compact() checkpoints before invoking the keep-set reclaim"
+    );
+
+    // The reclaim is the keep-set primitive — NOT tombstone-based compact_model,
+    // and NEVER BackgroundCompactor (which would run off the writer lock).
+    assert!(
+        code.contains("compact_model_keeping"),
+        "generated code uses the keep-set primitive"
+    );
+    assert!(
+        !code.contains("BackgroundCompactor"),
+        "generated code must NOT link the off-writer-lock background thread"
+    );
+
+    // The live-row set is computed in generated code from id_to_row + tombstone
+    // liveness (deleted ids' tombstoned marker rows are omitted — no resurrection).
+    assert!(
+        code.contains("for &__row in self.id_to_row.values()")
+            && code.contains("self.tombstones.is_deleted(__row)"),
+        "generated code computes the live keep-set from id_to_row + liveness"
+    );
+
+    // Compaction renumbers rows → reopen to rebuild id_to_row + indexes.
+    assert!(
+        code.contains("*self = Self::new_at(&__root);"),
+        "compact() reopens to rebuild the in-memory maps from compacted files"
+    );
+
+    // Auto-invoked from update AND delete (not insert — inserts create no dead
+    // version) once the threshold is reached.
+    assert!(
+        code.contains("self.dead_since_compaction += 1;")
+            && code.contains("if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD"),
+        "update/delete count toward and trigger the auto-compaction"
+    );
+
+    // Database-wide force-compact across every MODEL (junctions excluded — an
+    // append-only link table accumulates no dead versions).
+    assert!(
+        code.contains("self.widget.compact();") && code.contains("self.gadget.compact();"),
+        "Database::compact() compacts every model collection"
+    );
+}
+
+#[test]
+fn test_rust_generation_additive_backfill() {
+    // Additive migrations (v1 Phase 4 — #92 Workstream 2): after a field is added
+    // to the schema and code is regenerated, reopening an existing data dir must
+    // NOT wipe rows.  Recovery anchors on the tombstone count (the authoritative
+    // committed row count) and BACKFILLS any column shorter than it (a newly-added
+    // field) with the field's default, while truncating only torn/ahead columns.
+    let src = r#"
+Widget {
+  id: +uuid
+  sku: &string
+  qty: u32
+  note: string?
+  score: f64
+  active: bool
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Recovery anchors on the tombstone count, NOT the min across all columns
+    // (the old `min(...)` would truncate everything to a new empty column → wipe).
+    assert!(
+        code.contains("let __anchor = self.tombstones.len();"),
+        "recovery anchors on the authoritative tombstone row count"
+    );
+    assert!(
+        !code.contains(".min(self.") ,
+        "recovery no longer truncates to the min column length (would wipe on a new field)"
+    );
+
+    // Short columns (newly-added fields) are backfilled up to the anchor.
+    assert!(
+        code.contains("while self.note_col.len() < __anchor")
+            && code.contains("while self.score_col.len() < __anchor"),
+        "each column is backfilled up to the anchor when short"
+    );
+
+    // Correct per-type defaults: nullable string → None tag, numeric → 0,
+    // f64 → 0.0, bool → false.
+    assert!(
+        code.contains("append_string(&String::from('\\u{0}'))"),
+        "nullable string backfills the None presence tag"
+    );
+    assert!(
+        code.contains("append_f64(0.0)"),
+        "f64 field backfills 0.0"
+    );
+    assert!(
+        code.contains("append_bool(false)"),
+        "bool field backfills false"
+    );
+
+    // Torn/ahead columns are still truncated to the anchor.
+    assert!(
+        code.contains("truncate_to_rows(__anchor)"),
+        "torn/ahead columns truncate down to the anchor"
+    );
 }
 
 #[test]

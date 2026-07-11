@@ -12,6 +12,7 @@ use forgedb_types::{Uuid, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
+const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,6 +67,8 @@ pub struct AuthorStorage {
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
+    root: std::path::PathBuf,
+    dead_since_compaction: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl AuthorStorage {
@@ -102,6 +105,8 @@ impl AuthorStorage {
                 )
                 .expect("Failed to open WAL"),
             writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -226,6 +231,10 @@ impl AuthorStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            self.compact();
+        }
         Ok(true)
     }
     /// Logically delete a record by appending a tombstoned superseding
@@ -268,17 +277,21 @@ impl AuthorStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            self.compact();
+        }
         true
     }
     fn recover_from_wal(&mut self) {
-        let __c = self.tombstones.len().min(self.id_col.len());
+        let __anchor = self.tombstones.len();
+        while self.id_col.len() < __anchor {
+            self.id_col.append_uuid([0u8; 16]).expect("Failed to backfill column");
+        }
         self.id_col
-            .truncate_to_rows(__c)
+            .truncate_to_rows(__anchor)
             .expect("Failed to truncate column on recovery");
-        self.tombstones
-            .truncate_to_rows(__c)
-            .expect("Failed to truncate tombstones on recovery");
-        self.row_count = __c;
+        self.row_count = __anchor;
         let __entries = self
             .wal
             .replay(|_| -> std::io::Result<()> { Ok(()) })
@@ -317,6 +330,27 @@ impl AuthorStorage {
         self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
         self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
         self.writes_since_checkpoint = 0;
+    }
+    /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
+    /// rewrite this model's files dropping dead rows, then reopen to
+    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    pub fn compact(&mut self) {
+        self.checkpoint();
+        let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
+        for &__row in self.id_to_row.values() {
+            if !self.tombstones.is_deleted(__row).unwrap_or(false) {
+                __keep.push(__row);
+            }
+        }
+        let __config = forgedb_compaction::CompactionConfig::default();
+        let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
+        if __compactor.compact_model_keeping("author", &__keep).is_ok() {
+            let __root = self.root.clone();
+            let __feed = self.changefeed.take();
+            *self = Self::new_at(&__root);
+            self.changefeed = __feed;
+        }
+        self.dead_since_compaction = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -542,6 +576,8 @@ pub struct PostStorage {
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
+    root: std::path::PathBuf,
+    dead_since_compaction: u64,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
 }
 impl PostStorage {
@@ -592,6 +628,8 @@ impl PostStorage {
                 )
                 .expect("Failed to open WAL"),
             writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
             changefeed: None,
         };
         db.recover_from_wal();
@@ -931,6 +969,10 @@ impl PostStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            self.compact();
+        }
         Ok(true)
     }
     /// Logically delete a record by appending a tombstoned superseding
@@ -1038,32 +1080,43 @@ impl PostStorage {
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
             self.checkpoint();
         }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            self.compact();
+        }
         true
     }
     fn recover_from_wal(&mut self) {
-        let __c = self
-            .tombstones
-            .len()
-            .min(self.id_col.len())
-            .min(self.title_col.len())
-            .min(self.author_id_col.len())
-            .min(self.editor_id_col.len());
+        let __anchor = self.tombstones.len();
+        while self.id_col.len() < __anchor {
+            self.id_col.append_uuid([0u8; 16]).expect("Failed to backfill column");
+        }
+        while self.title_col.len() < __anchor {
+            self.title_col.append_string("").expect("Failed to backfill string column");
+        }
+        while self.author_id_col.len() < __anchor {
+            self.author_id_col
+                .append_uuid([0u8; 16])
+                .expect("Failed to backfill column");
+        }
+        while self.editor_id_col.len() < __anchor {
+            self.editor_id_col
+                .append_bytes(&vec![0u8; std::mem::size_of:: < Option < Uuid >> ()])
+                .expect("Failed to backfill column");
+        }
         self.id_col
-            .truncate_to_rows(__c)
+            .truncate_to_rows(__anchor)
             .expect("Failed to truncate column on recovery");
         self.title_col
-            .truncate_to_rows(__c)
+            .truncate_to_rows(__anchor)
             .expect("Failed to truncate column on recovery");
         self.author_id_col
-            .truncate_to_rows(__c)
+            .truncate_to_rows(__anchor)
             .expect("Failed to truncate column on recovery");
         self.editor_id_col
-            .truncate_to_rows(__c)
+            .truncate_to_rows(__anchor)
             .expect("Failed to truncate column on recovery");
-        self.tombstones
-            .truncate_to_rows(__c)
-            .expect("Failed to truncate tombstones on recovery");
-        self.row_count = __c;
+        self.row_count = __anchor;
         let __entries = self
             .wal
             .replay(|_| -> std::io::Result<()> { Ok(()) })
@@ -1122,6 +1175,27 @@ impl PostStorage {
         self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
         self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
         self.writes_since_checkpoint = 0;
+    }
+    /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
+    /// rewrite this model's files dropping dead rows, then reopen to
+    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    pub fn compact(&mut self) {
+        self.checkpoint();
+        let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
+        for &__row in self.id_to_row.values() {
+            if !self.tombstones.is_deleted(__row).unwrap_or(false) {
+                __keep.push(__row);
+            }
+        }
+        let __config = forgedb_compaction::CompactionConfig::default();
+        let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
+        if __compactor.compact_model_keeping("post", &__keep).is_ok() {
+            let __root = self.root.clone();
+            let __feed = self.changefeed.take();
+            *self = Self::new_at(&__root);
+            self.changefeed = __feed;
+        }
+        self.dead_since_compaction = 0;
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1799,6 +1873,20 @@ impl Database {
     pub fn checkpoint(&mut self) {
         self.author.checkpoint();
         self.post.checkpoint();
+    }
+    /// Force compaction across every model (#92 Phase 4): reclaim the
+    /// dead (superseded/tombstoned) row versions the mutation surface
+    /// (#66) leaves behind, in-process under the single-writer lock.
+    /// Each model checkpoints, rewrites its files dropping dead rows,
+    /// then reopens to rebuild its in-memory maps.  Runs automatically
+    /// every `COMPACTION_DEAD_THRESHOLD` dead versions per model; this
+    /// is the explicit, force-now entry point (parity with the manual
+    /// `forgedb compact` CLI path).  Junctions are skipped — an
+    /// append-only link table accumulates no dead versions.  Single-
+    /// writer only.
+    pub fn compact(&mut self) {
+        self.author.compact();
+        self.post.compact();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
