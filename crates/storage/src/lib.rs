@@ -56,33 +56,32 @@
 //!
 //! # Examples
 //!
-//! ## Creating a Database
+//! ## Describing a model's physical layout (`Manifest`)
+//!
+//! Generated code owns the directory layout and drives the column types directly;
+//! the schema-blind [`Manifest`] records the physical layout (read by backup /
+//! the inspector), persisted next to the column files.
 //!
 //! ```rust,no_run
-//! use forgedb_storage::{Database, ColumnMetadata, ColumnType};
+//! use forgedb_storage::{Manifest, ColumnMetadata, ColumnType};
 //! use std::path::PathBuf;
 //!
-//! // Create or open a database
-//! let mut db = Database::open(PathBuf::from("./mydb"))?;
-//!
-//! // Define schema
-//! let columns = vec![
-//!     ColumnMetadata {
-//!         name: "id".to_string(),
-//!         column_type: ColumnType::U64,
-//!         column_index: 0,
-//!         ..Default::default()
-//!     },
-//!     ColumnMetadata {
-//!         name: "email".to_string(),
-//!         column_type: ColumnType::String,
-//!         column_index: 0,
-//!         ..Default::default()
-//!     },
-//! ];
-//!
-//! db.set_columns(columns);
-//! db.save_manifest()?;
+//! let manifest = Manifest {
+//!     schema_version: 1,
+//!     row_count: 42,
+//!     columns: vec![
+//!         ColumnMetadata { name: "id".to_string(), column_type: ColumnType::U64, column_index: 0, ..Default::default() },
+//!         ColumnMetadata { name: "email".to_string(), column_type: ColumnType::String, column_index: 1, ..Default::default() },
+//!     ],
+//!     wal_enabled: false,
+//!     last_checkpoint: 0,
+//!     compaction_epoch: 0,
+//!     format_version: 1,
+//!     row_anchor: None,
+//! };
+//! manifest.save_to(&PathBuf::from("./mydb/manifest.json"))?;
+//! let reopened = Manifest::load_from(&PathBuf::from("./mydb/manifest.json"))?;
+//! assert_eq!(reopened.row_count, 42);
 //! # Ok::<(), std::io::Error>(())
 //! ```
 //!
@@ -117,8 +116,7 @@
 //!
 //! ## Core Types
 //!
-//! - [`Database`] - Main entry point for storage operations
-//! - [`Manifest`] - Database metadata stored in manifest.json
+//! - [`Manifest`] - Physical-layout metadata stored in manifest.json
 //! - [`FixedColumn`] - Storage for fixed-size column data
 //! - [`VariableColumn`] - Storage for variable-length column data
 //! - [`Tombstones`] - Deletion tracking bitmap
@@ -198,7 +196,7 @@ pub struct RowAnchor {
 
 impl Manifest {
     /// Load a manifest from an explicit path (e.g. a per-model
-    /// `<model>/manifest.json`), without opening a full [`Database`]. Used by
+    /// `<model>/manifest.json`). Used by
     /// schema-blind ops tooling — `forgedb-backup` (#57), the inspector (#63) —
     /// that reads layout metadata for one model directory.
     pub fn load_from(path: &std::path::Path) -> io::Result<Manifest> {
@@ -1088,182 +1086,5 @@ impl TombstonesReader {
             .read_exact_at(&mut buf, index as u64)
             .map_err(map_out_of_bounds)?;
         Ok(buf[0] != 0)
-    }
-}
-
-/// Database directory manager
-pub struct Database {
-    root_path: PathBuf,
-    manifest: Manifest,
-    wal_manager: Option<forgedb_wal::WalManager>,
-}
-
-impl Database {
-    pub fn open(root_path: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(&root_path)?;
-
-        let manifest_path = root_path.join("manifest.json");
-        let manifest = if manifest_path.exists() {
-            let content = fs::read_to_string(&manifest_path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        } else {
-            // Create default manifest
-            Manifest {
-                schema_version: 1,
-                row_count: 0,
-                columns: Vec::new(),
-                wal_enabled: false,
-                last_checkpoint: 0,
-                compaction_epoch: 0,
-                format_version: default_format_version(),
-                row_anchor: None,
-            }
-        };
-
-        Ok(Database {
-            root_path,
-            manifest,
-            wal_manager: None,
-        })
-    }
-
-    /// Open database with WAL support.
-    ///
-    /// This attaches a [`WalManager`] but does **not** itself replay outstanding
-    /// WAL entries into the columnar files: the storage layer has no knowledge of
-    /// how logged operations map onto column writes. Crash recovery is the
-    /// caller's responsibility — after opening, drive [`WalManager::replay`]
-    /// (via [`Database::wal_mut`]) and apply each entry's opaque `Raw` payload
-    /// before serving reads.
-    pub fn open_with_wal(
-        root_path: PathBuf,
-        fsync_policy: forgedb_wal::FsyncPolicy,
-    ) -> io::Result<Self> {
-        fs::create_dir_all(&root_path)?;
-
-        let manifest_path = root_path.join("manifest.json");
-        let mut manifest = if manifest_path.exists() {
-            let content = fs::read_to_string(&manifest_path)?;
-            serde_json::from_str(&content)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        } else {
-            // Create default manifest
-            Manifest {
-                schema_version: 1,
-                row_count: 0,
-                columns: Vec::new(),
-                wal_enabled: true,
-                last_checkpoint: 0,
-                compaction_epoch: 0,
-                format_version: default_format_version(),
-                row_anchor: None,
-            }
-        };
-
-        // Mark WAL as enabled
-        manifest.wal_enabled = true;
-
-        // Open WAL
-        let wal_path = root_path.join("wal.log");
-        let wal_manager = forgedb_wal::WalManager::open(wal_path, fsync_policy)?;
-
-        Ok(Database {
-            root_path,
-            manifest,
-            wal_manager: Some(wal_manager),
-        })
-    }
-
-    /// Get a mutable reference to the WAL manager
-    pub fn wal_mut(&mut self) -> Option<&mut forgedb_wal::WalManager> {
-        self.wal_manager.as_mut()
-    }
-
-    /// Get a reference to the WAL manager
-    pub fn wal(&self) -> Option<&forgedb_wal::WalManager> {
-        self.wal_manager.as_ref()
-    }
-
-    /// Check if WAL is enabled
-    pub fn has_wal(&self) -> bool {
-        self.wal_manager.is_some()
-    }
-
-    pub fn save_manifest(&self) -> io::Result<()> {
-        self.manifest
-            .save_to(&self.root_path.join("manifest.json"))
-    }
-
-    pub fn get_manifest(&self) -> &Manifest {
-        &self.manifest
-    }
-
-    pub fn update_row_count(&mut self, count: usize) {
-        self.manifest.row_count = count;
-    }
-
-    pub fn set_columns(&mut self, columns: Vec<ColumnMetadata>) {
-        self.manifest.columns = columns;
-    }
-
-    /// Returns the storage path for a fixed-size column.
-    ///
-    /// # Deprecation
-    ///
-    /// This helper always uses `u64` as the type component of the path (e.g. `fixed/u64_0.bin`),
-    /// regardless of the actual column type. Prefer [`fixed_column_path_typed`](Database::fixed_column_path_typed)
-    /// which uses the real column type so that file names reflect the stored data type.
-    ///
-    /// Note: generated code already uses type-aware paths; this helper is used only by examples
-    /// and tests that pre-date the typed variant.
-    #[deprecated(
-        since = "0.1.1",
-        note = "use `fixed_column_path_typed` for type-aware file naming"
-    )]
-    pub fn fixed_column_path(&self, column_index: usize) -> PathBuf {
-        self.root_path
-            .join(format!("fixed/u64_{}.bin", column_index))
-    }
-
-    /// Returns the storage path for a fixed-size column, using the actual column type
-    /// in the file name (e.g. `fixed/i32_0.bin` for an `I32` column).
-    ///
-    /// Generated code already uses this naming convention. The older
-    /// [`fixed_column_path`](Database::fixed_column_path) always used `u64_` regardless of type
-    /// and is deprecated.
-    pub fn fixed_column_path_typed(
-        &self,
-        column_index: usize,
-        column_type: &ColumnType,
-    ) -> PathBuf {
-        let type_name = match column_type {
-            ColumnType::U32 => "u32",
-            ColumnType::U64 => "u64",
-            ColumnType::I32 => "i32",
-            ColumnType::I64 => "i64",
-            ColumnType::F64 => "f64",
-            ColumnType::Bool => "bool",
-            ColumnType::Uuid => "uuid",
-            ColumnType::Timestamp => "timestamp",
-            ColumnType::String => "string",
-            ColumnType::FixedBytes(_) => "bytes",
-        };
-        self.root_path
-            .join(format!("fixed/{}_{}.bin", type_name, column_index))
-    }
-
-    pub fn variable_data_path(&self, column_index: usize) -> PathBuf {
-        self.root_path
-            .join(format!("variable/string_data_{}.bin", column_index))
-    }
-
-    pub fn variable_offsets_path(&self, column_index: usize) -> PathBuf {
-        self.root_path
-            .join(format!("variable/string_offsets_{}.bin", column_index))
-    }
-
-    pub fn tombstones_path(&self) -> PathBuf {
-        self.root_path.join("tombstones.bin")
     }
 }
