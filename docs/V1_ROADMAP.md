@@ -29,10 +29,10 @@ Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` p
 | **0** Data you can trust | Crash-safe durability | ✅ | #89 LANDED: WAL commit + fsync + reopen recovery + single-writer lock (`kill -9` E2E: 0 acked rows lost) |
 | | Bounded storage | 🟡 | **WAL** bounded (#96 checkpoint LANDED); **column** storage still manual-compaction-only → grows until `forgedb compact` |
 | | Schema evolution w/o data loss | 🔴 | infra only; no data-transform engine; `AddField` doesn't backfill |
-| | Constraint integrity (unique/FK) | 🔴 | unchecked at write |
+| | Constraint integrity (unique/FK) | ✅ | #91 LANDED: `&unique` (via Phase-2 index) + required/optional-FK existence (Database-level wrappers) rejected at write → 409 |
 | **1** Real-app capability | Query surface (filter/sort/paginate) | ✅ | #90 LANDED: real list endpoint filters (generated closed-set matcher) + sorts (generated comparator) + paginates (`query-params` substrate) |
 | | Indexed lookups | ✅ | #90 LANDED + #100–#103 follow-ups LANDED: scalar / **nullable** / **FK** / **composite `@index(a,b)`** fields → in-memory `value→{id}` index + `find_by_*`/`get_by_*` O(1) probes (writer live+`_at`, reader `_at`); reverse-relation getters now probe, not scan |
-| | Validation enforced | 🔴 | `@min`/`@email`/… ignored at write |
+| | Validation enforced | ✅ | #91 LANDED: `@min`/`@max`/`@length`/`@email`/`@url` enforced in generated `validate_<model>` → 422 (`@pattern`/`@regex` deferred → #104) |
 | | Types apps need (enum/decimal/json) | 🔴 | missing from the schema language |
 | | Delete semantics (cascade / M2M unlink) | 🟡 | delete exists; no cascade, no unlink |
 
@@ -56,8 +56,12 @@ Real list endpoint; filter/sort/pagination (wired `query-params`); generated sec
 - **Publish gap CLOSED:** generated `api.rs` links `forgedb-query-params` **0.1.0 (published 2026-07-10)**; reclose proven by an outside-repo `init → generate → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / changefeed / auth / types) from crates.io.
 - **Index follow-ups #100–#103 LANDED (2026-07-10):** FK-scalar indexing + reverse-getter probe (#100), composite `@index(a,b)` (#101), nullable-field indexing with a null-distinct key (#102), and `DatabaseReader` snapshot probes (#103). Pure generated code over existing storage — **no new substrate, no publish gap reopened.** Proven E2E in `scratchpad/followups_compile` + full-corpus compile in `scratchpad/corpus_check2`; guard `test_rust_generation_index_followups`.
 
-### Phase 3 — Data integrity · [#91](https://github.com/hoodiecollin/forgedb/issues/91) · *Tier 0 constraints + Tier 1 validation*
+### Phase 3 — Data integrity · [#91](https://github.com/hoodiecollin/forgedb/issues/91) · *Tier 0 constraints + Tier 1 validation* · ✅ COMPLETE
 Enforce `&unique` (rides on Phase 2's index), required-FK existence, and validation directives at write + API boundary. **Done when** duplicate-unique, dangling-FK, and invalid-field writes are all rejected with clear errors.
+- **Field constraints:** generated `validate_<model>` enforces `@min`/`@max`/`@length`/`@email`/`@url` at the top of `insert`/`update` (nullable → only when `Some`). `@pattern`/`@regex` deferred (need a `regex` dep) → #104.
+- **`&unique`:** `insert`/`update` probe the Phase-2 unique index before committing (insert: any hit; update: a *different* id's hit) — self-contained in `Storage`.
+- **Foreign-key existence:** generated `Database::create_<model>`/`update_<model>` wrappers verify each required/optional FK resolves via `self.<target>.get(fk)` (sibling access), then delegate. The REST boundary routes through them, so Rust API + REST both get full integrity.
+- **Signatures/HTTP:** `insert`/`update` return `Result<_, ValidationError>`; `ValidationError::status_code()` → 409 (unique/dangling FK) / 422 (field). **No new substrate or scaffold dep** — pure generated std code, no publish gap. Proven E2E (`scratchpad/phase3_compile`) + full-corpus db+api compile; guard `test_rust_generation_data_integrity`.
 
 > **Coordination:** Phases 1–3 all rewrite generated `insert/update/delete` (and Phase 2 the read path). Do them as **one coordinated core-rework thrust**, not three scattered passes — otherwise the same generated write logic churns three times.
 >
