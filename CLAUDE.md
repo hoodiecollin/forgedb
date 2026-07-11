@@ -85,8 +85,12 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 461 tests pass** (workspace, incl. doctests). 434→447 with #48 join predicate
-pushdown (9 planner tests) + #49 restored OpenAPI generation (4 codegen tests); 447→460 with #89
+**Baseline: 391 tests pass** (workspace, incl. doctests). 461→391 with the legacy-audit prunes
+(#94): −70 from deleting the two dead crates `query-optimization` (32 unit + doctests, incl. the
+former #48 join-predicate pushdown) and `http-server` (30 unit + doctests) plus the dead
+`storage::Database` wrapper's 1 test — all zero-consumer dead code, no production regression. Prior
+history (pre-prune, at 461): 434→447 with #48 join predicate pushdown + #49 restored OpenAPI
+generation (4 codegen tests; #49 OpenAPI stays, in codegen); 447→460 with #89
 durable write path + #95 wal prune (net +13: new `forgedb-wal` `Raw`-path + `forgedb-storage`
 `truncate_to_rows`/`DirLock` tests + 1 `test_rust_generation_durable_write_path` codegen guard, minus
 the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint (1
@@ -109,14 +113,18 @@ in `crates/`:
   `DirLock` single-writer advisory lock, both for #89 durable writes; 0.1.4 adds read-only column reader handles
   `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
   many-reader; 0.1.3 added `Manifest` layout fields + `Manifest::save_to/load_from` + `Snapshot` for #57
-  backup / #56-A snapshot reads)
+  backup / #56-A snapshot reads). **In-tree since 0.1.5 published:** the legacy audit (#94/#99) removed the
+  dead `Database` directory-manager wrapper (`open_with_wal`/`wal_mut`/`has_wal`/`save_manifest`/… — zero
+  production consumers; generated code drives `FixedColumn`/`VariableColumn`/`Tombstones`/`Manifest`/`DirLock`
+  directly). Published 0.1.5 still contains it harmlessly; removing it is breaking, so the **next** storage
+  publish bumps accordingly (do not republish 0.1.5).
 - `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
   0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
 - `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (published 2026-07-09)**.
   Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM,
   algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
   against the process's tenant → 403, injects an opaque `Principal`. Knows nothing of
-  models/rows/schema — same class as `http-server`/`changefeed`.
+  models/rows/schema — same class as `changefeed`.
 - `wal` — write-ahead log — **0.2.0 (published 2026-07-10; 0.1.1 published)**. The generated durable write path (#89)
   links only the **opaque `Raw`** record path (schema-agnostic bytes + CRC framing + fsync policy + torn-tail
   `read_all` + `replay`); the pre-existing structured/field-decoding API (`WalValue`, `WalOperation::{Insert,
@@ -127,10 +135,11 @@ in `crates/`:
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
-- `validation`, `migrations`, `compaction`, `backup`, `changefeed`, `query-optimization`,
-  `query-params`, `http-server` (axum), `watcher`, `lsp-server`, `ffi`
-  (`fulltext` + `crud-api` were removed in Phase 3b — orphaned runtime-library crates
-  with zero consumers; the API existence/404 logic now lives in the generated handlers.)
+- `validation`, `migrations`, `compaction`, `backup`, `changefeed`,
+  `query-params`, `watcher`, `lsp-server`, `ffi`
+  (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
+  removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
+  in the generated handlers, and the generated `api.rs` builds its own router.)
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
@@ -409,19 +418,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
   tests, `test_rust_generation_root_threading`, `test_api_generation_tenant_auth_router`; **live e2e**
   (two isolated tenant roots + JWT tenant=A→200 / tenant=B→403 on the generated router) in
   `scratchpad/tenancy_compile` (ephemeral). Requires the `forgedb-auth 0.1.0` publish (see the publish gap).
-- **`query-optimization` join predicate pushdown — LANDED (#48).** A predicate IR
-  (`Predicate`/`Operand`/`PredicateOp` in `crates/query-optimization/src/planner.rs`) parses plan
-  predicate strings into `table.column <op> operand` and attributes each to a join side by the
-  tables its qualified columns reference. `partition_predicates_for_join` now splits predicates
-  into `(left, right, remaining)`; `pushdown_predicates` pushes single-side predicates into the
-  matching sub-plan (`collect_tables` walks each side for its table set) and keeps genuinely
-  cross-side conditions (join conditions, unqualified columns, or unparseable strings) as the
-  wrapping `Filter`. The `QueryPlanOp::Filter` node gained an `input: Box<QueryPlanOp>` so it
-  actually **wraps** its sub-plan (previously childless → the optimized join was discarded).
-  Honest limits: the crate still has **zero consumers** (speculative infra — not wired into
-  codegen or generated code), predicates are attributed only by qualified `table.column` refs
-  (bare columns stay at the join), and there is no selectivity re-estimation after pushdown.
-  Guards: 9 `planner_tests` (IR parse + pushdown split/preserve/wrap).
+- **`query-optimization` join predicate pushdown (#48) — REMOVED by the legacy audit (#94).** The
+  whole `query-optimization` crate (a speculative predicate-pushdown planner IR with zero consumers —
+  never wired into codegen or generated code) was pruned as dead infra. Git history is the audit
+  trail; re-add with a real consumer when a query planner is actually designed.
 - **OpenAPI generation — RESTORED (#49).** Standalone `OpenApiGenerator` in
   `crates/codegen/src/openapi.rs` emits an OpenAPI **3.1.0** document (`openapi.json`, pretty JSON
   via `serde_json`) at schema-compile time — no compiling/running the generated crate. **3.1.0 to
