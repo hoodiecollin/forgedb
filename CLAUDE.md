@@ -85,7 +85,8 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 394 tests pass** (workspace, incl. doctests). 393→394 with the #100–#103 index follow-ups (1 codegen
+**Baseline: 395 tests pass** (workspace, incl. doctests). 394→395 with v1 Phase 3 (#91) data integrity (1 codegen
+guard `test_rust_generation_data_integrity`). 393→394 with the #100–#103 index follow-ups (1 codegen
 guard `test_rust_generation_index_followups`). 391→393 with #90 Phase 2 (2 codegen guards:
 `test_rust_generation_secondary_indexes` + `test_api_generation_list_endpoint`). 461→391 with the legacy-audit prunes
 (#94): −70 from deleting the two dead crates `query-optimization` (32 unit + doctests, incl. the
@@ -100,7 +101,7 @@ the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint
 `forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
 (1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531
 when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
-"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"393"/"380".
+"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"394"/"393"/"380".
 
 ## Workspace layout
 
@@ -276,8 +277,29 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `forgedb-query-params 0.1.0` + `forgedb-storage 0.1.5` + `forgedb-wal 0.2.0` + changefeed/auth/types from
     crates.io (0 errors). The #100–#103 follow-ups added **no** substrate dep (indexes are in-memory generated code),
     so they did not reopen it.
-  - **No constraint/validation enforcement.** Duplicate `&unique` + dangling required-FK are allowed;
-    `@min/@max/@length/@email/@pattern` are ignored at write. → v1 Phase 3 (#91).
+  - **Data integrity is now enforced at write (v1 Phase 3 — #91 LANDED).** Generated writes refuse to commit
+    a record that would break integrity — proven E2E (`scratchpad/phase3_compile`), full 18-schema corpus
+    compile-checked (db+api), guard `test_rust_generation_data_integrity`. Three layers, all **generated
+    per-field** (no runtime schema-reading validator):
+    - **Field constraints.** A generated `validate_<model>(record) -> Result<(), ValidationError>` enforces
+      `@min`/`@max` (numeric), `@length` (string, `@length(max)` or `@length(min,max)`), `@email`, `@url`.
+      Nullable fields validate only when `Some`. Called at the TOP of `insert`/`update`, before any durable side
+      effect. **Deferred:** `@pattern`/`@regex` (need a `regex` dep in the generated crate — #104).
+    - **`&unique`.** `insert`/`update` probe the Phase-2 unique index (`<field>_index`) before committing —
+      insert rejects any existing key; update rejects a key held by a *different* id (own-id excluded, since index
+      maintenance runs post-commit). Self-contained in `Storage` (it owns the index).
+    - **Foreign-key existence.** Generated `Database::create_<model>` / `update_<model>` wrappers check each
+      required FK (`*Target`) resolves, and each optional FK (`?Target`) resolves *when set*, via
+      `self.<target>.get(fk)` — the one check needing sibling-collection access `Storage` lacks — then delegate.
+      Only UUID-keyed targets (an FK is always a `Uuid`). The **REST create/update route through these wrappers**,
+      so both the Rust API and REST get full integrity.
+    - **Signatures + HTTP.** `insert -> Result<Id, ValidationError>`, `update -> Result<bool, ValidationError>`
+      (`Ok(false)` = absent id); `delete` stays `-> bool`. `ValidationError::status_code()` maps Unique/DanglingRef
+      → **409**, field Constraint → **422**; the generated handlers return those with the message. **No new
+      substrate / scaffold dep** — validation is pure generated std code, so no publish gap.
+    - **Honest limits / deferred:** `@pattern`/`@regex` (#104); `db.<model>.insert` (direct storage path) enforces
+      field + unique but NOT FK (use `db.create_<model>` for full integrity — documented on the method); no
+      cross-field / conditional constraints; validation is fail-fast (first violation returned, not a list).
   - **Migrations are infrastructure without an engine.** The executor errors on type-change/remove/index ops;
     `AddField` doesn't backfill; auto-diff is hardcoded-disabled. v1 ships **additive + documented reload** only
     (data-transform engine deferred). → v1 Phase 4 (#92).
