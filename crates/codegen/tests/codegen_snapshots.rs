@@ -1420,6 +1420,117 @@ Tag {
 }
 
 #[test]
+fn test_rust_generation_secondary_indexes() {
+    // Secondary indexes (#90): each `^index` / `&unique` scalar field gets an
+    // in-memory `value-key -> {id}` map, maintained on insert/update/delete
+    // (superseding-version aware) and rebuilt on reopen, plus `find_by_*` /
+    // `get_by_*` probes that resolve candidates through the version-aware read
+    // path — never a scan, never bypassing snapshot resolution.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  handle: ^string
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // A per-field index structure keyed by canonical string -> set of ids.
+    assert!(
+        code.contains("email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>")
+            || code.contains("email_index : std :: collections :: HashMap"),
+        "unique field gets a value->ids index"
+    );
+    assert!(
+        code.contains("handle_index") ,
+        "^index field gets an index too"
+    );
+    // A non-indexed field gets NO index.
+    assert!(!code.contains("name_index"), "plain fields are not indexed");
+
+    // Unique field gets an Option-returning probe; indexed field gets Vec probes.
+    assert!(code.contains("pub fn get_by_email(&self, value: &str) -> Option<User>"),
+        "unique -> get_by_ Option probe");
+    assert!(code.contains("pub fn find_by_email(&self, value: &str) -> Vec<User>"),
+        "unique also exposes find_by_ Vec probe");
+    assert!(code.contains("pub fn find_by_handle(&self, value: &str) -> Vec<User>"),
+        "^index -> find_by_ Vec probe");
+
+    // The probe is an index GET (O(1) candidate lookup), not a scan/loop over all().
+    assert!(
+        code.contains("match self.email_index.get(&__k)"),
+        "probe hits the index map, not a full scan"
+    );
+
+    // Snapshot-scoped probe exists and resolves via get_at (the snapshot's
+    // version), and post-filters the resolved value against the key.
+    assert!(
+        code.contains("pub fn find_by_email_at(")
+            && code.contains("self.get_at(snap, __id)"),
+        "snapshot probe resolves candidates through the version-aware read path"
+    );
+
+    // Maintenance: insert adds, delete removes, update removes-old + adds-new.
+    assert!(
+        code.contains("self.email_index.entry(__k).or_default().insert(id);"),
+        "insert/update maintain the index"
+    );
+    assert!(
+        code.contains("self.email_index.get_mut(&__k)"),
+        "update/delete remove stale index entries"
+    );
+
+    // Reopen rebuild is folded into the id-scan rehydrate (keyed off db.get).
+    assert!(
+        code.contains("db.email_index.entry(__k).or_default().insert(__id);"),
+        "indexes are rebuilt from committed rows on reopen"
+    );
+}
+
+#[test]
+fn test_api_generation_list_endpoint() {
+    // Real list endpoint (#90): fetch live rows via all(), filter with the
+    // generated closed-set matcher, sort with the generated per-model comparator,
+    // paginate with the schema-agnostic query-params substrate.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  age: u32
+  score: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // No stub: the handler fetches real rows and filters/sorts/paginates.
+    assert!(!code.contains(r#"json!({ "data": [] })"#), "list stub is gone");
+    assert!(
+        code.contains(".all()") && code.contains("user_event_matches(r, &params)"),
+        "list fetches real rows and reuses the closed-set filter (no second parser)"
+    );
+    assert!(
+        code.contains("forgedb_query_params::QueryParams::from_map")
+            && code.contains("qp.pagination.apply(&rows)"),
+        "query-params substrate parses + clamps pagination"
+    );
+    // Generated per-model sort comparator: Ord for `age`, partial_cmp for `f64`.
+    assert!(code.contains("fn user_apply_sort("), "generated per-model sort fn");
+    assert!(
+        code.contains("a.age.cmp(&b.age)"),
+        "Ord field sorted with cmp"
+    );
+    assert!(
+        code.contains("a.score.partial_cmp(&b.score)"),
+        "f64 field sorted with partial_cmp"
+    );
+}
+
+#[test]
 fn test_rust_generation_changefeed_emits() {
     // Change notifications (#62 Direction A): generated insert()/link_* emit a
     // FIELD-BLIND (model, row_index) signal into a shared substrate ChangeFeed;
