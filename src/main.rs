@@ -190,6 +190,10 @@ enum MigrateCommands {
         /// Auto-detect schema changes
         #[arg(short, long)]
         auto: bool,
+
+        /// Schema file to diff against the recorded snapshot (for --auto)
+        #[arg(short, long)]
+        schema: Option<std::path::PathBuf>,
     },
 
     /// Show migration status
@@ -427,9 +431,10 @@ fn run(cli: Cli) -> Result<()> {
         }),
 
         Commands::Migrate(migrate_cmd) => match migrate_cmd {
-            MigrateCommands::Create { description, auto } => {
+            MigrateCommands::Create { description, auto, schema } => {
                 commands::migrate::create(commands::migrate::MigrateCreateOptions {
                     description,
+                    schema,
                     auto,
                 })
             }

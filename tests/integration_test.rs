@@ -239,3 +239,54 @@ fn test_generate_check_mode() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// v1 Phase 4 (#92) Workstream 3: `migrate create --auto` diffs the schema against
+/// a recorded snapshot and gates on additive-vs-breaking.  Additive (new nullable
+/// field) is accepted; breaking (new non-null field) is refused with a non-zero
+/// exit so CI catches it.  Hermetic: runs the real binary with an explicit cwd.
+#[test]
+fn test_migrate_auto_diff_additive_and_breaking_gate() {
+    let temp_dir = setup_test_dir();
+    let dir = temp_dir.path();
+
+    let v1 = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n}\n";
+    let v2_additive = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n}\n";
+    let v3_breaking =
+        "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n  priority: u32\n}\n";
+    fs::write(dir.join("v1.forge"), v1).unwrap();
+    fs::write(dir.join("v2.forge"), v2_additive).unwrap();
+    fs::write(dir.join("v3.forge"), v3_breaking).unwrap();
+
+    // 1. Baseline records a snapshot with nothing to diff (succeeds, no migration).
+    let out = forgedb_cmd(dir)
+        .args(["migrate", "create", "baseline", "--auto", "--schema", "v1.forge"])
+        .output()
+        .expect("run migrate baseline");
+    assert!(out.status.success(), "baseline should succeed");
+    assert!(dir.join("migrations/.schema-snapshot.forge").exists(), "snapshot recorded");
+
+    // 2. Additive (new nullable field) is accepted and a migration is written.
+    let out = forgedb_cmd(dir)
+        .args(["migrate", "create", "add_note", "--auto", "--schema", "v2.forge"])
+        .output()
+        .expect("run migrate additive");
+    assert!(out.status.success(), "additive migration should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("note"), "reports the added field: {stdout}");
+
+    // 3. Breaking (new non-null field, no default) is refused with a non-zero exit.
+    let out = forgedb_cmd(dir)
+        .args(["migrate", "create", "add_priority", "--auto", "--schema", "v3.forge"])
+        .output()
+        .expect("run migrate breaking");
+    assert!(!out.status.success(), "breaking change must be refused (non-zero exit)");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("Breaking") && combined.to_lowercase().contains("reload"),
+        "refusal explains the breaking change + reload path: {combined}"
+    );
+}
