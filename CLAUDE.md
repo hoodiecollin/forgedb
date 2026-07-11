@@ -139,13 +139,15 @@ in `crates/`:
   parses a URL query string into generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated
   `api.rs` list endpoint links it for filter/sort/paginate. Interprets no schema — all field-aware filtering/sorting
   is generated per-model — so it is class-1 substrate, same class as `changefeed`/`auth`.
-- `compaction` — in-process dead-row reclaim (#92 Phase 4 W1) — **0.1.0 (PUBLISH PENDING as of 2026-07-11)**.
+- `compaction` — in-process dead-row reclaim (#92 Phase 4 W1) — **0.1.0 (published 2026-07-11)**.
   Schema-agnostic byte GC keyed by model *directory name*: `Compactor::compact_model_keeping(model, live_rows)` keeps
   exactly the caller-supplied opaque row indices (the generated code computes the live set); `compact_model` is the
-  legacy tombstone path (CLI-only, resurrection-prone against #66 → #105). Deps are serde/chrono/thiserror/log only —
+  legacy tombstone path (CLI-only, resurrection-prone against #66 — now **guarded**: `forgedb compact`/`vacuum`
+  refuse without `--force`, #105). Deps are serde/chrono/thiserror/log only —
   reads no `.forge`. Generated `Database`/`Storage::compact()` link **only** `compact_model_keeping` (never
-  `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **the reclose is UNPROVEN until 0.1.0 is on
-  crates.io.** Was internal; promoted to published substrate by #92 W1.
+  `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **reclose PROVEN** by an outside-repo
+  `init → generate rust+api → cargo build` resolving `forgedb-compaction 0.1.0` (+ the rest) from crates.io. Was
+  internal; promoted to published substrate by #92 W1.
 
 **Internal (0.1.0):**
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
@@ -326,8 +328,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `test_rust_generation_auto_compaction`; E2E `scratchpad/compaction_compile` (auto-compact at threshold, 87% byte
     reclaim, no resurrection, reopen rebuilds indexes); all 18 examples compile. **Publish gap OPEN:** generated code
     links `forgedb-compaction` (scaffold pins `= "0.1"`), so `forgedb-compaction 0.1.0` must publish before the
-    reclose is proven (mirrors wal/storage/query-params). Manual `forgedb compact` CLI still uses tombstone-based
-    `compact_model` (resurrection-prone against #66) → follow-up **#105**. Threshold not yet tunable (deferred).
+    reclose is proven (mirrors wal/storage/query-params). Manual `forgedb compact`/`vacuum` CLI is the legacy
+    tombstone path (resurrection-prone against #66) and is now **guarded — it refuses without `--force`** and points
+    to the safe in-process path (#105 mitigated; full schema-aware offline compaction deferred). Threshold not yet
+    tunable (deferred).
   - **Additive migrations preserve data (v1 Phase 4 W2 — #92 LANDED).** Adding a field (nullable, or appended at the
     end) + regenerating + reopening no longer wipes the DB. Generated recovery anchors on the **tombstone count**
     (authoritative committed rows) and **backfills any column shorter than it** (a newly-added field) with the
@@ -350,7 +354,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
     fresh dir through `Database::create_<model>` with an app-level transform. Proven E2E (`scratchpad/reload_compile`:
     a `u32 → string` type change round-trips, ids preserved). **The data-transform migration engine stays out of v1.**
 
-  Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1 is publish-pending on `forgedb-compaction`); only Phase 5
+  Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1's `forgedb-compaction 0.1.0` published + reclose proven); only Phase 5
   (#93 — ship: observability, deploy, docs, distribution) remains. v1 scope is locked: **design-partner bar,
   single-writer-per-process, migrations data-engine deferred** — see `docs/V1_ROADMAP.md` and epics #89–#93.
 
@@ -386,10 +390,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
   Scaffold pins `forgedb-storage = "0.1.5"`, `forgedb-changefeed = "0.1"`, **`forgedb-wal = "0.2"`** (#89),
   **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), **`forgedb-compaction = "0.1"`** (#92),
-  axum `ws`. **OPEN as of 2026-07-11:** #92 Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
-  auto-compaction); `0.1.0` must publish to crates.io before the reclose is proven — same ritual as wal/storage/
-  query-params. History: the gap reopened for #57, #62-A, #66, #56-B, #59, #89/#96, #90, and **#92** — all closed
-  EXCEPT #92 (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5 closed #89/#96). #59 closed
+  axum `ws`. **#92 CLOSED 2026-07-11:** Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
+  auto-compaction); `forgedb-compaction 0.1.0` is published and the reclose is PROVEN by an outside-repo
+  `init → generate rust+api → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / query-params 0.1.0 /
+  changefeed / auth / types) from crates.io (0 errors). History: the gap reopened for #57, #62-A, #66, #56-B, #59,
+  #89/#96, #90, and #92 — **all now closed** (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5
+  closed #89/#96; compaction 0.1.0 closed #92). #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
