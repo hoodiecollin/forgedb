@@ -1482,7 +1482,6 @@ version = "0.2.0"
 dependencies = [
  "crc32fast",
  "tempfile",
- "uuid",
 ]
 
 [[package]]

@@ -4,18 +4,8 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::FsyncPolicy;
 use crate::entry::WalEntry;
-
-/// Fsync policy determines when to flush WAL to disk
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FsyncPolicy {
-    /// Fsync after every write (maximum durability, slower)
-    Always,
-    /// Fsync periodically based on time
-    Periodic(Duration),
-    /// Never fsync automatically (fastest, less durable - must call flush manually)
-    Never,
-}
 
 /// WAL Writer
 pub struct WalWriter {

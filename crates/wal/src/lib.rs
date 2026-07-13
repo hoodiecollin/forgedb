@@ -21,15 +21,39 @@
 //! The WAL breaks at the first corrupt or incomplete entry and returns the
 //! valid prefix (torn-tail crash safety).
 use std::io;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(target_arch = "wasm32")]
+use std::path::Path;
 
 mod entry;
+#[cfg(not(target_arch = "wasm32"))]
 mod reader;
+#[cfg(not(target_arch = "wasm32"))]
 mod writer;
 
 pub use entry::{WalEntry, WalOperation};
+#[cfg(not(target_arch = "wasm32"))]
 pub use reader::{CorruptionInfo, WalReader};
-pub use writer::{FsyncPolicy, WalWriter};
+#[cfg(not(target_arch = "wasm32"))]
+pub use writer::WalWriter;
+
+/// Fsync policy determines when a native WAL is flushed to disk.
+///
+/// Defined at the crate root (not in the native-only `writer` module) because it
+/// is part of the schema-agnostic substrate surface `forgedb-storage` re-exports
+/// and generated code names (`FsyncPolicy::Always`) — it must exist on **both**
+/// the native and the `wasm32` follower target. On `wasm32` there is no file WAL
+/// (see the in-memory [`WalManager`] below), so the policy is inert there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsyncPolicy {
+    /// Fsync after every write (maximum durability, slower).
+    Always,
+    /// Fsync periodically based on elapsed time.
+    Periodic(std::time::Duration),
+    /// Never fsync automatically (fastest, less durable — must call flush manually).
+    Never,
+}
 
 /// WAL Manager — high-level interface for WAL operations.
 ///
@@ -38,12 +62,14 @@ pub use writer::{FsyncPolicy, WalWriter};
 /// lifecycle operations (`flush`, `rotate`, `truncate`).
 ///
 /// [`replay`]: WalManager::replay
+#[cfg(not(target_arch = "wasm32"))]
 pub struct WalManager {
     writer: WalWriter,
     reader: WalReader,
     path: PathBuf,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl WalManager {
     /// Open or create a WAL at `path`.
     ///
@@ -130,5 +156,89 @@ impl WalManager {
     pub fn size(&self) -> io::Result<u64> {
         let metadata = std::fs::metadata(&self.path)?;
         Ok(metadata.len())
+    }
+}
+
+/// In-memory `WalManager` for the `wasm32` browser read-replica target (#110).
+///
+/// The design note (`docs/proposals/wasm-runtime.md`) drops the **file** WAL on
+/// wasm: the browser follower is durable at IndexedDB/OPFS *commit* granularity,
+/// and its upstream (the server) is the authoritative durable log, so a
+/// crash-recovery WAL is unnecessary there. But the generated `database.rs` is
+/// emitted **once** and compiled for both targets — it unconditionally
+/// constructs a `forgedb_wal::WalManager` in `new_at` and names `FsyncPolicy`.
+///
+/// So rather than fork the generator (forbidden — the data logic stays
+/// byte-identical across targets), the *substrate* absorbs the difference: on
+/// wasm the WAL is a functional **in-memory** append log with the same public
+/// surface. It framing-encodes entries into a `Vec<u8>` exactly like the file
+/// writer, replays them with the same torn-tail-safe parse, and truncates by
+/// clearing the buffer. It never touches the (absent) wasm filesystem, so
+/// `open`/`recover`/`checkpoint` all succeed; nothing persists across a reload
+/// (that is the IDB/OPFS column commit's job, not the WAL's).
+#[cfg(target_arch = "wasm32")]
+pub struct WalManager {
+    buffer: Vec<u8>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WalManager {
+    /// Open an in-memory WAL. The `path` and `fsync_policy` are accepted for
+    /// signature parity with the native constructor and then ignored — there is
+    /// no file and no fsync on this target.
+    pub fn open<P: AsRef<Path>>(_path: P, _fsync_policy: FsyncPolicy) -> io::Result<Self> {
+        Ok(WalManager { buffer: Vec::new() })
+    }
+
+    /// Append an entry to the in-memory log (same framing as the file writer).
+    pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
+        self.buffer.extend_from_slice(&entry.to_bytes());
+        Ok(())
+    }
+
+    /// No-op flush — there is no disk to sync to on wasm.
+    pub fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Replay every entry from the in-memory log in order, torn-tail-safe.
+    ///
+    /// Mirrors [`WalReader::read_all`]: parses framed entries from the buffer and
+    /// stops at the first incomplete/corrupt frame, returning the valid prefix.
+    pub fn replay<F>(&mut self, mut callback: F) -> io::Result<Vec<WalEntry>>
+    where
+        F: FnMut(&WalEntry) -> io::Result<()>,
+    {
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < self.buffer.len() {
+            match WalEntry::from_bytes(&self.buffer[offset..]) {
+                Ok((entry, size)) => {
+                    entries.push(entry);
+                    offset += size;
+                }
+                Err(_) => break,
+            }
+        }
+        for entry in &entries {
+            callback(entry)?;
+        }
+        Ok(entries)
+    }
+
+    /// Clear the in-memory log.
+    pub fn truncate(&mut self) -> io::Result<()> {
+        self.buffer.clear();
+        Ok(())
+    }
+
+    /// Returns `true` if the in-memory log holds no bytes.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.buffer.is_empty())
+    }
+
+    /// Returns the in-memory log size in bytes.
+    pub fn size(&self) -> io::Result<u64> {
+        Ok(self.buffer.len() as u64)
     }
 }
