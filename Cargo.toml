@@ -31,18 +31,25 @@ edition = "2024"
 name = "forgedb"
 version = "0.1.0"
 edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "ForgeDB — an application database generator. Compiles a declarative .forge schema into tailored Rust database code, a TypeScript SDK, and a REST API."
+repository = "https://github.com/hoodiecollin/forgedb"
+homepage = "https://github.com/hoodiecollin/forgedb"
+readme = "README.md"
+keywords = ["database", "codegen", "orm", "cli", "generator"]
+categories = ["database", "command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "forgedb"
 path = "src/main.rs"
 
 [dependencies]
-forgedb-parser = { path = "crates/parser" }
-forgedb-codegen = { path = "crates/codegen" }
-forgedb-watcher = { path = "crates/watcher" }
-forgedb-migrations = { path = "crates/migrations" }
-forgedb-compaction = { path = "crates/compaction" }
-forgedb-backup = { path = "crates/backup" }
+forgedb-parser = { path = "crates/parser", version = "0.1.0" }
+forgedb-codegen = { path = "crates/codegen", version = "0.1.0" }
+forgedb-watcher = { path = "crates/watcher", version = "0.1.0" }
+forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
+forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
+forgedb-backup = { path = "crates/backup", version = "0.1.0" }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
 thiserror = "2.0"
@@ -54,12 +61,12 @@ ctrlc = "3.4"
 which = "8.0"
 
 [dev-dependencies]
-forgedb-parser = { path = "crates/parser" }
-forgedb-validation = { path = "crates/validation" }
-forgedb-watcher = { path = "crates/watcher" }
-forgedb-wal = { path = "crates/wal" }
-forgedb-query-params = { path = "crates/query-params" }
-forgedb-migrations = { path = "crates/migrations" }
-forgedb-compaction = { path = "crates/compaction" }
+forgedb-parser = { path = "crates/parser", version = "0.1.0" }
+forgedb-validation = { path = "crates/validation", version = "0.1.0" }
+forgedb-watcher = { path = "crates/watcher", version = "0.1.0" }
+forgedb-wal = { path = "crates/wal", version = "0.2.0" }
+forgedb-query-params = { path = "crates/query-params", version = "0.1.0" }
+forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
+forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
