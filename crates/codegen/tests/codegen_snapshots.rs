@@ -2008,6 +2008,162 @@ Tag {
 }
 
 #[test]
+fn test_rust_generation_replication_broker() {
+    // Durable replication (#82 Direction C): alongside the best-effort change-feed
+    // emit, each mutation is recorded to a durable, offset-addressed broker so a
+    // resumable follower (#110) can replay from a watermark.  The broker stays
+    // FIELD-BLIND — it is handed the model NAME (opaque tag), the row index, the
+    // kind, and the opaque serialized row bytes; it never decodes a field.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    // RustGenerator emits a raw token stream (spaces around `::`/`<`/`>`); compare
+    // against a whitespace-stripped copy so needles stay readable.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Each storage + the Database hold the optional shared broker. (prettyplease
+    // may wrap the long generic with a trailing comma, so match the inner type.)
+    assert!(
+        flat.contains("broker:Option<")
+            && flat.contains(
+                "std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>"
+            ),
+        "each storage/Database must hold an optional shared durable broker"
+    );
+    assert!(flat.contains("fnattach_broker"), "storages must expose attach_broker");
+
+    // The mutation sites record to the broker with the OPAQUE serialized row bytes
+    // — never a decoded field.
+    assert!(flat.contains(".record("), "mutations must record to the durable broker");
+    assert!(
+        flat.contains("serde_json::to_vec(&record).unwrap_or_default()"),
+        "the broker is handed the opaque serialized row bytes (field-blind)"
+    );
+    // All four kinds carry through the broker (insert/update/delete/link).
+    for kind in ["Inserted", "Updated", "Deleted", "Linked"] {
+        let needle = format!("forgedb_changefeed::ChangeKind::{}", kind);
+        assert!(flat.contains(&needle), "broker record must carry ChangeKind::{}", kind);
+    }
+    // The link record carries the 32-byte opaque pair, no field.
+    assert!(
+        flat.contains("left.as_bytes()") && flat.contains("right.as_bytes()"),
+        "the link record carries the opaque left++right uuid bytes"
+    );
+
+    // Database open_at creates a durable log under the data root.
+    assert!(
+        flat.contains("forgedb_changefeed::durable::DurableBroker::open("),
+        "open_at opens a durable broker log"
+    );
+    assert!(
+        flat.contains("\"_replication.log\""),
+        "the broker log lives under the data root"
+    );
+    assert!(
+        flat.contains("post.attach_broker(broker.clone())"),
+        "each collection gets a clone of the shared broker on open_at"
+    );
+
+    // Identity red line: the broker never branches on a decoded field.
+    assert!(
+        !flat.contains("matchmodel_name"),
+        "the broker must never match on the model name to decode a field"
+    );
+}
+
+#[test]
+fn test_api_generation_replication_endpoint() {
+    // The generated replication WS endpoint (#82 Direction C): one schema-wide
+    // /replicate route behind the tenant-auth guard, a resumable handshake
+    // (?after=<offset> → durable replay + live tail), and FIELD-BLIND binary
+    // frames (PersistedEvent::to_wire) — the handler forwards opaque bytes and
+    // never decodes a frame.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+User {
+  id: +uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let norm = code.replace(" :: ", "::").replace(" . ", ".");
+
+    // A single schema-wide handler + route (NOT per model).
+    assert!(
+        code.contains("async fn __replicate") && code.contains("async fn __handle_replicate"),
+        "the replication upgrade + handler are generated"
+    );
+    assert!(
+        norm.contains(".route(\"/replicate\", get(__replicate))")
+            || code.contains("/replicate"),
+        "the /replicate route is registered"
+    );
+
+    // Resumable handshake: reads ?after=<offset>, replays durably, streams live.
+    assert!(
+        code.contains("\"after\""),
+        "the handler resumes from the ?after=<offset> query param"
+    );
+    assert!(
+        norm.contains("catch_up_from(after, usize::MAX)"),
+        "the handler uses the broker's race-free catch_up_from"
+    );
+    // Idempotent by absolute offset: skip anything the replay already covered.
+    assert!(
+        code.contains("ev.offset <= boundary"),
+        "the live tail is idempotent by absolute offset (skip <= boundary)"
+    );
+
+    // Field-blind binary frames: opaque wire bytes, never a decoded field.
+    assert!(
+        norm.contains("ev.to_wire()"),
+        "frames are sent as opaque binary wire bytes"
+    );
+    assert!(
+        code.contains("db.read().await.broker.clone()")
+            || norm.contains("db.read().await.broker.clone()"),
+        "the handler reads the shared broker from the Database"
+    );
+
+    // The route sits INSIDE __data_routes (behind the tenant-auth guard).
+    let data_routes = code
+        .split("fn __data_routes")
+        .nth(1)
+        .and_then(|s| s.split("fn __ops_routes").next())
+        .unwrap_or("");
+    assert!(
+        data_routes.contains("/replicate"),
+        "the /replicate route must be behind the tenant-auth guard (in __data_routes)"
+    );
+
+    // Identity: no model-name field-decoding branch in the transport.
+    assert!(
+        !code.contains("match model_name"),
+        "the replication transport must not decode a field by model name"
+    );
+}
+
+#[test]
 fn test_api_generation_websocket_subscription() {
     // The generated WS endpoint (#62 Direction A): a per-model /subscribe route,
     // an upgrade handler that routes by model NAME and materializes a typed event
