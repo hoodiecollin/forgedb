@@ -210,7 +210,7 @@ semantic-only), `@soft_delete` + composite `@index(a,b)` (model-level), `@relati
 args accept numbers, bare identifiers, **and quoted string literals** (`@pattern("^[0-9]+$")`,
 `@default("pending")` — escapes `\" \\ \n \t \r`; still semantic-only markers). **NOT
 supported despite older docs:** `~` auto-update, `text` type, `@on_delete`, block comments
-`/* */`. Full verified reference: `docs/proposals/corpus/forge-grammar-reference.md`. **18 worked example schemas
+`/* */`. Full verified reference: `docs/SCHEMA.md`. **18 worked example schemas
 across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
