@@ -86,6 +86,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let path = output_path.join("types.ts");
             write_file(&path, &result.code, options.force)?;
             generated_files.push((path, result));
+            write_ts_package_scaffold(&output_path)?;
         }
         "api" => {
             let result = ApiGenerator::generate(&schema)
@@ -165,6 +166,7 @@ fn generate_all(
         let ts_path = output_path.join("types.ts");
         write_file(&ts_path, &ts_result.code, force)?;
         files.push((ts_path, ts_result));
+        write_ts_package_scaffold(output_path)?;
     }
 
     // Generate API
@@ -197,6 +199,25 @@ fn generate_all(
     }
 
     Ok(files)
+}
+
+/// Write the npm packaging scaffold for the generated TypeScript SDK (Phase 5
+/// WS5): `package.json` + `tsconfig.json` alongside `types.ts`.  These are
+/// user-editable config, so they are written ONLY when absent — a regenerate
+/// (even `--force`, which overwrites `types.ts`) never clobbers them.
+fn write_ts_package_scaffold(output_path: &Path) -> Result<()> {
+    let files = [
+        ("package.json", TypeScriptGenerator::package_json_scaffold()),
+        ("tsconfig.json", TypeScriptGenerator::tsconfig_scaffold()),
+    ];
+    for (name, content) in files {
+        let path = output_path.join(name);
+        if !path.exists() {
+            fs::write(&path, content)?;
+            ui::info(&format!("  ✓ {} (npm SDK scaffold)", path.display()));
+        }
+    }
+    Ok(())
 }
 
 fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {

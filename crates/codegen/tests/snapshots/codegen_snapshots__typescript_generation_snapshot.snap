@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 670
 expression: code
 ---
 /**
@@ -12,6 +11,8 @@ export interface Author {
   id: string;
 }
 
+/** Input to `createAuthor` — a Author without its server-assigned `id`. */
+export type AuthorCreate = Omit<Author, 'id'>;
 
 export interface Post {
   id: string;
@@ -20,58 +21,182 @@ export interface Post {
   editor_id: any | null;
 }
 
+/** Input to `createPost` — a Post without its server-assigned `id`. */
+export type PostCreate = Omit<Post, 'id'>;
+
+/** Thrown on any non-2xx response, except a get-by-id / delete 404 (which the
+* corresponding methods surface as `null` / `false` instead). Carries the HTTP
+* status and the parsed error body when present. */
+export class ForgeDBError extends Error {
+readonly status: number;
+readonly body: unknown;
+constructor(status: number, message: string, body: unknown) {
+super(message);
+this.name = 'ForgeDBError';
+this.status = status;
+this.body = body;
+}
+}
+
+/** A page of list results — mirrors the REST list endpoint's response. */
+export interface ListResult<T> {
+data: T[];
+total: number;
+limit: number;
+offset: number;
+}
+
+/** Options for a list query. `filter` holds exact-match `?field=value` pairs
+* matched by the generated per-model filter server-side. */
+export interface ListOptions {
+limit?: number;
+offset?: number;
+sort?: string;
+order?: 'asc' | 'desc';
+filter?: Record<string, string | number | boolean>;
+}
 
 export class ForgeDBClient {
   private baseUrl: string;
 
   constructor(baseUrl: string = 'http://localhost:3000') {
-    this.baseUrl = baseUrl;
+    // Trim a trailing slash so path concatenation is unambiguous.
+    this.baseUrl = baseUrl.replace(/\/$/, '');
   }
 
+/** Throw a typed `ForgeDBError` for any non-2xx response, extracting the
+* server's `{ error }` message when the body is JSON. */
+private async assertOk(response: Response): Promise<void> {
+if (response.ok) return;
+let body: unknown = undefined;
+let message = `${response.status} ${response.statusText}`;
+try {
+body = await response.json();
+if (body && typeof body === 'object' && 'error' in body) {
+message = String((body as { error: unknown }).error);
+}
+} catch {
+// Non-JSON (or empty) body — keep the status-line message.
+}
+throw new ForgeDBError(response.status, message, body);
+}
+
+/** Build the `?limit=&offset=&sort=&order=&<filter>` query string for a list. */
+private listQuery(options: ListOptions): string {
+const params = new URLSearchParams();
+if (options.limit !== undefined) params.set('limit', String(options.limit));
+if (options.offset !== undefined) params.set('offset', String(options.offset));
+if (options.sort !== undefined) params.set('sort', options.sort);
+if (options.order !== undefined) params.set('order', options.order);
+if (options.filter) {
+for (const [key, value] of Object.entries(options.filter)) {
+params.set(key, String(value));
+}
+}
+const query = params.toString();
+return query ? `?${query}` : '';
+}
+
+  /** Get a Author by id, or `null` if it does not exist. */
   async getAuthor(id: string): Promise<Author | null> {
-    const response = await fetch(`${this.baseUrl}/api/author/${id}`);
-    if (!response.ok) return null;
-    const data = await response.json();
-    return data.data;
+    const response = await fetch(`${this.baseUrl}/api/author/${encodeURIComponent(id)}`);
+    if (response.status === 404) return null;
+    await this.assertOk(response);
+    return (await response.json()) as Author;
   }
 
-  async listAuthor(): Promise<Author[]> {
-    const response = await fetch(`${this.baseUrl}/api/author`);
-    const data = await response.json();
-    return data.data || [];
+  /** List Author rows with optional pagination, sort, and exact-match filters. */
+  async listAuthor(options: ListOptions = {}): Promise<ListResult<Author>> {
+    const response = await fetch(`${this.baseUrl}/api/author${this.listQuery(options)}`);
+    await this.assertOk(response);
+    return (await response.json()) as ListResult<Author>;
   }
 
-  async createAuthor(data: Omit<Author, 'id'>): Promise<Author> {
+  /** Create a Author. Returns the new id. Throws `ForgeDBError` on a
+   * constraint (422) or integrity conflict (409). */
+  async createAuthor(data: AuthorCreate): Promise<string> {
     const response = await fetch(`${this.baseUrl}/api/author`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    const result = await response.json();
-    return result.data;
+    await this.assertOk(response);
+    const result = (await response.json()) as { id: string };
+    return result.id;
   }
 
+  /** Replace a Author by id (whole-record PUT). Returns `false` if the id
+   * does not exist; throws `ForgeDBError` on a constraint/conflict. */
+  async updateAuthor(id: string, data: Author): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/author/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (response.status === 404) return false;
+    await this.assertOk(response);
+    return true;
+  }
+
+  /** Delete a Author by id. Returns `true` if deleted, `false` if absent. */
+  async deleteAuthor(id: string): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/author/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    if (response.status === 404) return false;
+    await this.assertOk(response);
+    return true;
+  }
+
+  /** Get a Post by id, or `null` if it does not exist. */
   async getPost(id: string): Promise<Post | null> {
-    const response = await fetch(`${this.baseUrl}/api/post/${id}`);
-    if (!response.ok) return null;
-    const data = await response.json();
-    return data.data;
+    const response = await fetch(`${this.baseUrl}/api/post/${encodeURIComponent(id)}`);
+    if (response.status === 404) return null;
+    await this.assertOk(response);
+    return (await response.json()) as Post;
   }
 
-  async listPost(): Promise<Post[]> {
-    const response = await fetch(`${this.baseUrl}/api/post`);
-    const data = await response.json();
-    return data.data || [];
+  /** List Post rows with optional pagination, sort, and exact-match filters. */
+  async listPost(options: ListOptions = {}): Promise<ListResult<Post>> {
+    const response = await fetch(`${this.baseUrl}/api/post${this.listQuery(options)}`);
+    await this.assertOk(response);
+    return (await response.json()) as ListResult<Post>;
   }
 
-  async createPost(data: Omit<Post, 'id'>): Promise<Post> {
+  /** Create a Post. Returns the new id. Throws `ForgeDBError` on a
+   * constraint (422) or integrity conflict (409). */
+  async createPost(data: PostCreate): Promise<string> {
     const response = await fetch(`${this.baseUrl}/api/post`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    const result = await response.json();
-    return result.data;
+    await this.assertOk(response);
+    const result = (await response.json()) as { id: string };
+    return result.id;
+  }
+
+  /** Replace a Post by id (whole-record PUT). Returns `false` if the id
+   * does not exist; throws `ForgeDBError` on a constraint/conflict. */
+  async updatePost(id: string, data: Post): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/post/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (response.status === 404) return false;
+    await this.assertOk(response);
+    return true;
+  }
+
+  /** Delete a Post by id. Returns `true` if deleted, `false` if absent. */
+  async deletePost(id: string): Promise<boolean> {
+    const response = await fetch(`${this.baseUrl}/api/post/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    if (response.status === 404) return false;
+    await this.assertOk(response);
+    return true;
   }
 
 }
