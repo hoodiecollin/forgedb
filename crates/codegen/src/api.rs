@@ -86,6 +86,12 @@ impl ApiGenerator {
             tokens.extend(Self::generate_live_query(model));
         }
 
+        // Generate the durable replication WS endpoint (#82 Direction C): a single
+        // schema-wide `/replicate` handler that streams the field-blind broker
+        // frames to a resumable follower.  Emitted once (not per model) — the
+        // broker carries one global offset across all models.
+        tokens.extend(Self::generate_replication_handler());
+
         // Generate the operational endpoints — liveness / readiness / metrics
         // (Phase 5 WS1 observability).  Schema-agnostic transport glue: `/health`
         // and `/ready` are identical for every app; `/metrics` reports per-model
@@ -576,6 +582,105 @@ impl ApiGenerator {
         }
     }
 
+    /// Generate the durable replication WebSocket endpoint (#82 Direction C).
+    ///
+    /// One schema-wide handler (the broker carries a single global offset across
+    /// all models).  A follower connects with `?after=<offset>` (its last applied
+    /// offset, or omitted / `0` when cold) and receives a resumable stream of
+    /// **field-blind binary frames** ([`PersistedEvent::to_wire`]): first the
+    /// durably-retained frames it missed, then the live tail.  The handler NEVER
+    /// decodes a frame — it forwards opaque `(model, row_index, kind, offset,
+    /// bytes)` verbatim; typed materialization is the follower's generated code.
+    ///
+    /// Identity: this is Class-2 transport glue over the Class-1 broker.  Routing
+    /// is by opaque model name and the apply order is the opaque global offset —
+    /// no `match model_name { ... field ... }`, no per-model branch.  Sits behind
+    /// the same `forgedb-auth` tenant guard as the CRUD/WS routes (it is added to
+    /// `__data_routes`), so a follower receives only its own tenant's stream.
+    fn generate_replication_handler() -> TokenStream {
+        quote! {
+            /// Upgrade to a replication stream.  `?after=<offset>` resumes from the
+            /// follower's last applied offset (default `0` = cold / from the start
+            /// of the retained log).  Tenant-scoped by the router's auth guard.
+            async fn __replicate(
+                Query(params): Query<HashMap<String, String>>,
+                ws: WebSocketUpgrade,
+                State(db): State<Arc<RwLock<super::Database>>>,
+            ) -> Response {
+                ws.on_upgrade(move |socket| __handle_replicate(socket, db, params))
+            }
+
+            async fn __handle_replicate(
+                mut socket: WebSocket,
+                db: Arc<RwLock<super::Database>>,
+                params: HashMap<String, String>,
+            ) {
+                let after: u64 = params
+                    .get("after")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+
+                // Clone the shared broker handle out, releasing the DB read lock
+                // immediately (the broker is an independent Arc<Mutex<..>>).
+                let broker = { db.read().await.broker.clone() };
+                let Some(broker) = broker else {
+                    // Durable replication is not enabled on this process (e.g. a
+                    // `Database::new()` standalone path); close cleanly.
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                };
+
+                // Race-free resume: subscribe to the live tail AND read the durable
+                // replay under ONE brief lock (single-writer, so no `record`
+                // interleaves).  Everything > `boundary` is guaranteed to arrive live.
+                let catch = match broker.lock() {
+                    Ok(b) => b.catch_up_from(after, usize::MAX),
+                    Err(_) => return, // poisoned lock: bail
+                };
+                let Ok(mut catch) = catch else { return };
+
+                // 1. Replay the durably-retained frames the follower missed.
+                for ev in &catch.replayed {
+                    if socket
+                        .send(Message::Binary(ev.to_wire().into()))
+                        .await
+                        .is_err()
+                    {
+                        return; // follower disconnected
+                    }
+                }
+
+                // 2. Stream the live tail, skipping any frame already covered by the
+                //    replay — idempotent by absolute offset (never by content).
+                let boundary = catch.boundary;
+                loop {
+                    match catch.receiver.recv().await {
+                        Ok(ev) => {
+                            if ev.offset <= boundary {
+                                continue;
+                            }
+                            if socket
+                                .send(Message::Binary(ev.to_wire().into()))
+                                .await
+                                .is_err()
+                            {
+                                break; // follower disconnected
+                            }
+                        }
+                        // The follower fell behind the live ring buffer.  Durable
+                        // replay covers the gap, so close and let it reconnect with
+                        // `?after=<last applied offset>` to resume losslessly.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    }
+
     /// Generate the live-query WebSocket handler for a model (#62 Direction B).
     ///
     /// A stateful, removal-aware result-set subscription.  On connect it runs a
@@ -895,6 +1000,10 @@ impl ApiGenerator {
             fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
                 Router::new()
                     #(#routes)*
+                    // Durable replication stream (#82 Direction C): one schema-wide
+                    // endpoint behind the tenant-auth guard, so a follower receives
+                    // only its own tenant's frames.
+                    .route("/replicate", get(__replicate))
             }
 
             /// The operational routes (Phase 5 WS1): liveness / readiness / minimal
@@ -931,9 +1040,10 @@ impl ApiGenerator {
             /// guard is a signed-string cross-check, not a schema-reading policy
             /// engine.
             ///
-            /// The guard covers the WS `/subscribe` and `/live-query` routes (WS
-            /// clients must send the token in the `Authorization` header — a
-            /// documented limitation); it does NOT cover the operational
+            /// The guard covers the WS `/subscribe`, `/live-query`, and
+            /// `/replicate` routes (WS clients must send the token in the
+            /// `Authorization` header — a documented limitation); it does NOT cover
+            /// the operational
             /// `/health` / `/ready` / `/metrics` routes, which are merged in
             /// AFTER the guard so infra probes stay unauthenticated (Phase 5 WS1).
             pub fn create_router_with_auth(
