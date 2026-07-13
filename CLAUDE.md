@@ -85,7 +85,10 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 414 tests pass** (workspace, incl. doctests). 400→414 with #82 realtime Direction C (durable
+**Baseline: 424 tests pass** (workspace, incl. doctests). 414→424 with #110 Milestone C (browser
+read-replica follower): +9 `forgedb-storage-web` arena-parity unit tests and +1 codegen guard
+(`test_rust_generation_replica_apply_path`). (The moved `forgedb-storage-native` tests — 45 unit + 4 doctests —
+were already counted under the old `storage` crate, so the facade split is test-count-neutral.) 400→414 with #82 realtime Direction C (durable
 replication broker): +9 `forgedb-changefeed` `durable` unit tests (offsets / opaque round-trip / reopen /
 torn-tail / prune / catch-up / wire codec) and +2 codegen guards (`test_rust_generation_replication_broker`
 + `test_api_generation_replication_endpoint`). 399→400 with v1 Phase 5 WS1 observability (1 codegen
@@ -119,8 +122,14 @@ in `crates/`:
 
 **Published to crates.io (independent version lines, do NOT normalize):**
 - `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
-- `storage` — columnar storage engine (positional-I/O fixed columns + append-only variable) — **0.1.5
-  (published 2026-07-10; 0.1.4 published 2026-07-08)** (0.1.5 adds `truncate_to_rows` on the three column types +
+- `storage` — columnar storage **facade** (#110 Milestone C): `crates/storage` is now a thin `cfg` re-export —
+  `forgedb-storage-native` on host targets, `forgedb-storage-web` on `wasm32` — bumped **0.1.5 → 0.2.0 (in-tree,
+  NOT yet published)**. Generated code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};`
+  verbatim and stays byte-identical across targets. The historical engine moved verbatim into **`storage-native`
+  0.1.0** (native public surface unchanged — the 0.2.0 facade is surface-compatible for host consumers); the browser
+  arena backend is **`storage-web` 0.1.0** (in-memory arenas + IndexedDB/OPFS `persist`). See the #110 bullet in the
+  backlog for the wasm publish gap. Details of the pre-split engine (still the native backend):
+  0.1.5 (published 2026-07-10; 0.1.4 published 2026-07-08) — 0.1.5 adds `truncate_to_rows` on the three column types +
   `DirLock` single-writer advisory lock, both for #89 durable writes; 0.1.4 adds read-only column reader handles
   `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
   many-reader; 0.1.3 added `Manifest` layout fields + `Manifest::save_to/load_from` + `Snapshot` for #57
@@ -639,6 +648,49 @@ across many domains live in `examples/` — see `examples/README.md`.**
     the reclose is PROVEN by an outside-repo `init --template blog → generate rust+api → cargo build` that
     downloaded `forgedb-changefeed 0.2.0` (+ storage/wal/query-params/compaction/auth/types) from crates.io and
     compiled the generated replication code (0 errors).
+- **Browser read-replica follower (#110 realtime Milestone C) — LANDED 2026-07-13 (wasm publish-pending).**
+  The `wasm32` build of the SAME generated `database.rs` running in the browser as a **read-only replica** that
+  catches up from the server's `/replicate` stream (#82) and persists locally, so the UI queries a local WASM
+  instance instead of the network. Proven E2E in a real browser (Playwright) for **BOTH IndexedDB and OPFS**:
+  server insert/update/delete/link → real `PersistedEvent::to_wire` frames → WS `/replicate?after=W` → wasm
+  `applyWire` → generated `apply_frame` → correct local reads (update/delete/link reflected, reverse traversal)
+  → `commit()` to IDB/OPFS → **reload → resume from the persisted watermark, 0 frames re-applied, data intact.**
+  Five layers:
+  - **L0 — wasm-safe substrate.** `forgedb-types` gains a `cfg(wasm32)` uuid `js`/getrandom feature (additive,
+    native unchanged); `forgedb-wal` drops its (unused) uuid dep and splits `WalManager` — the file impl is
+    `cfg(not wasm32)`, an **in-memory** impl is `cfg(wasm32)` (the design note drops the file WAL on wasm;
+    durable at commit granularity). `FsyncPolicy` moved to the wal crate root (shared, both targets).
+  - **L1 — storage facade split.** `crates/storage` → thin `cfg` facade over **`storage-native`** (moved engine,
+    renamed, 0.1.0, native surface unchanged) and NEW **`storage-web`** (0.1.0): in-memory arena columns with
+    **byte-identical positional semantics** (a `thread_local` path→bytes STORE — the "path IS the key" trick),
+    no-op `DirLock`, arena-routed `Manifest`, + a `persist` module (wasm-only: IndexedDB keyed-blobs + OPFS
+    snapshot-file — the async **hydrate/commit** boundary; the per-row API stays sync). storage-web's arena core
+    is target-agnostic, so its parity is unit-tested natively. Facade bumped 0.1.5 → 0.2.0.
+  - **L2 — codegen (target-agnostic, zero branches).** Additive `Database::commit()` (flush all cols; native
+    fsync / wasm arena no-op) + the follower apply path: per-model `apply(kind, bytes)` decodes the opaque row
+    bytes and **replays through the SAME generated `insert`/`update`/`delete`** (broker/feed are `None` on a
+    follower, WAL is in-memory, so those side effects are inert — no second write path, no drift), a schema-wide
+    `Database::apply_frame(&PersistedEvent)` dispatching on the **opaque model tag** (never a decoded field), and
+    an `ApplyError` type. **The generated `database.rs` compiles to `wasm32-unknown-unknown` with ZERO codegen
+    branches** — the facade absorbs the target difference (the identity proof: no WASM generator branch). Guard
+    `test_rust_generation_replica_apply_path`; runtime apply round-trip also proven natively.
+  - **L3 — `wasm-bindgen` transport (class-2 glue).** A `#[wasm_bindgen]` `Replica` exposing ONLY
+    open/applyWire/commit/watermark + generated reads (getUser/userCount/userPosts) — no invented query surface
+    (red line). `wasm-pack build --target web` → `.wasm` + ES module + `.d.ts`.
+  - **L4 — browser E2E.** A native `genframes` bin emits real `to_wire` frames; a Bun WS server streams them
+    honoring `?after`; Playwright drives the round-trip + reload-resume for IDB and OPFS. Ephemeral harness
+    `scratchpad/wasm_l2/`.
+  PM identity red lines held: the replica is the SAME generated code (no schema read at runtime); dispatch is by
+  the opaque model tag; the storage backend + `persist` move opaque path→bytes blobs and know no schema.
+  **Honest limits / deferred:** OPFS uses async main-thread file I/O + a whole-DB snapshot file (sync-access
+  handles in a Worker + per-column files = follow-up); whole-DB hydrate on open + commit-granularity durability
+  (accepted milestone-1 limits); the wasm-bindgen transport is hand-written per-schema in the harness
+  (codegen-generating it per-schema is a follow-up); **read-only** replica (local/optimistic writes = Phase 2).
+  **WASM PUBLISH GAP (OPEN):** the browser build needs `forgedb-types` (wasm uuid feature) + `forgedb-wal` (wasm
+  `WalManager`) republished and NEW `forgedb-storage 0.2.0` facade + `forgedb-storage-native 0.1.0` +
+  `forgedb-storage-web 0.1.0` published. The **native** `init→build` gap is NOT reopened — the new apply/commit
+  codegen uses only already-published surface (storage `flush`, changefeed 0.2.0 `PersistedEvent`), and the
+  scaffold still pins published `forgedb-storage = "0.1.5"`. Not yet committed.
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
