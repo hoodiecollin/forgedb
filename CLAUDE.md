@@ -152,7 +152,10 @@ in `crates/`:
   `init → generate rust+api → cargo build` resolving `forgedb-compaction 0.1.0` (+ the rest) from crates.io. Was
   internal; promoted to published substrate by #92 W1.
 
-**Internal (0.1.0):**
+**Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
+are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI
+from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates.
+`lsp-server` + `ffi` remain unpublished.)
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
@@ -358,9 +361,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
     a `u32 → string` type change round-trips, ids preserved). **The data-transform migration engine stays out of v1.**
 
   Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1's `forgedb-compaction 0.1.0` published + reclose proven).
-  **Phase 5 (#93 — ship) is IN PROGRESS: WS1 (observability), WS2 (deploy), WS5 (SDK) LANDED; WS3 (docs), WS4
-  (distribution), WS6 (semver) remain.** v1 scope is locked: **design-partner bar, single-writer-per-process,
-  migrations data-engine deferred** — see `docs/V1_ROADMAP.md` and epics #89–#93.
+  **Phase 5 (#93 — ship) is IN PROGRESS: WS1 (observability), WS2 (deploy), WS4 (distribution), WS5 (SDK),
+  WS6 (semver) LANDED; only WS3 (the honest "what v1 is / isn't" docs) remains.** v1 scope is locked:
+  **design-partner bar, single-writer-per-process, migrations data-engine deferred** — see `docs/V1_ROADMAP.md`
+  and epics #89–#93.
 
   - **Observability (v1 Phase 5 WS1 — LANDED).** Generated axum router serves unauthenticated ops routes `/health`
     (liveness, DB-free), `/ready` (read-lock probe → 200), `/metrics` (minimal JSON: per-model live `row_count()` +
@@ -385,6 +389,20 @@ across many domains live in `examples/` — see `examples/README.md`.**
     (strict) clean; live `list` returns the `ListResult` shape. **Honest limits:** ids are typed `string` uniformly (URL
     paths are strings — integer-PK callers pass `String(n)`); `create` returns the id, not the full record (the REST
     create responds `{id}`); no WS/subscription client yet (REST only).
+  - **Distribution (v1 Phase 5 WS4 — LANDED).** `cargo install forgedb` now works from crates.io: the CLI's full
+    internal crate closure was published leaves-first — **`forgedb-validation` / `-parser` / `-codegen` / `-migrations`
+    / `-backup` / `-watcher` 0.1.0** (joining the already-published substrate) and the root **`forgedb` 0.1.0** — each
+    with package metadata + version-pinned path deps. Proven E2E by an isolated-`CARGO_HOME` `cargo install forgedb`
+    resolving all 7 from crates.io and running the binary. Prebuilt cross-platform binaries via
+    `.github/workflows/release.yml` (tag `v*` → Linux x86_64/aarch64 + macOS Intel/ARM + Windows → GitHub Release).
+    `docs/INSTALL.md` covers every install path + the substrate version matrix. **Note:** these 6 compiler crates are
+    now on crates.io **only so `cargo install` can build the CLI** — per `docs/SEMVER.md` they are explicitly NOT a
+    stable public API (unlike the substrate crates, which are). **Honest limit:** the release workflow is authored +
+    YAML-validated but not yet run by a real tag push.
+  - **Semver / stability (v1 Phase 5 WS6 — LANDED).** `docs/SEMVER.md` states the compatibility policy across four
+    surfaces (schema language, substrate ABI incl. on-disk format, CLI + `--json` outputs, compiler-internals
+    carve-out) and what a 1.0 commits to. Currently pre-1.0, so the guarantees are stated as the policy that takes
+    effect at 1.0; the schema-language additive-vs-breaking boundary agrees with the #92 migration gate.
 
 - **Dead-code warnings: 0** (all 9 from the Phase 3b sweep resolved). Eight were WIRED
   (`build --no-api`, `validate --components`, the `--config`/`Config`/`CliError::exit_code`
