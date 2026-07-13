@@ -1,4 +1,14 @@
 //! TypeScript types and SDK generator
+//!
+//! Emits an npm-publishable TypeScript client (Phase 5 WS5): typed model
+//! interfaces + create-input types, a shared `ListResult` / `ListOptions` /
+//! `ForgeDBError` surface, and a `ForgeDBClient` with full CRUD (get / list with
+//! pagination + filters + sort / create / update / delete) that faithfully wraps
+//! the generated REST API's real response shapes and status codes.
+//!
+//! This is a transport client over the already-generated, schema-tailored REST
+//! surface — it interprets no schema at runtime, so it is class-2 access glue,
+//! not a generic runtime.
 
 use crate::{GeneratedCode, Result};
 use forgedb_parser::Schema;
@@ -21,10 +31,7 @@ impl TypeScriptGenerator {
 
         Ok(GeneratedCode {
             code,
-            description: format!(
-                "TypeScript types and SDK ({} models)",
-                schema.models.len()
-            ),
+            description: format!("TypeScript types and SDK ({} models)", schema.models.len()),
         })
     }
 
@@ -38,13 +45,23 @@ impl TypeScriptGenerator {
         code.push_str(" * DO NOT EDIT - This file is auto-generated\n");
         code.push_str(" */\n\n");
 
-        // Generate type definitions
+        // Model interfaces + their create-input aliases.
         for model in &schema.models {
             code.push_str(&Self::generate_interface(model)?);
-            code.push_str("\n\n");
+            code.push('\n');
+            // `Omit<Model, 'id'>` — the shape `create<Model>` accepts (the server
+            // assigns the id).
+            code.push_str(&format!(
+                "/** Input to `create{0}` — a {0} without its server-assigned `id`. */\n\
+                 export type {0}Create = Omit<{0}, 'id'>;\n\n",
+                model.name
+            ));
         }
 
-        // Generate SDK client
+        // Shared SDK types (error, pagination) — schema-independent.
+        code.push_str(Self::shared_types());
+
+        // SDK client
         code.push_str(&Self::generate_sdk_client(schema)?);
 
         Ok(code)
@@ -60,15 +77,50 @@ impl TypeScriptGenerator {
             let field_type = Self::map_field_type(&field.field_type);
             let nullable = if field.is_nullable() { " | null" } else { "" };
 
-            code.push_str(&format!(
-                "  {}: {}{};\n",
-                field.name, field_type, nullable
-            ));
+            code.push_str(&format!("  {}: {}{};\n", field.name, field_type, nullable));
         }
 
         code.push_str("}\n");
 
         Ok(code)
+    }
+
+    /// The schema-independent SDK support types: the thrown error, the list
+    /// response envelope, and the list query options.
+    fn shared_types() -> &'static str {
+        "\
+/** Thrown on any non-2xx response, except a get-by-id / delete 404 (which the\n\
+ * corresponding methods surface as `null` / `false` instead). Carries the HTTP\n\
+ * status and the parsed error body when present. */\n\
+export class ForgeDBError extends Error {\n\
+  readonly status: number;\n\
+  readonly body: unknown;\n\
+  constructor(status: number, message: string, body: unknown) {\n\
+    super(message);\n\
+    this.name = 'ForgeDBError';\n\
+    this.status = status;\n\
+    this.body = body;\n\
+  }\n\
+}\n\
+\n\
+/** A page of list results — mirrors the REST list endpoint's response. */\n\
+export interface ListResult<T> {\n\
+  data: T[];\n\
+  total: number;\n\
+  limit: number;\n\
+  offset: number;\n\
+}\n\
+\n\
+/** Options for a list query. `filter` holds exact-match `?field=value` pairs\n\
+ * matched by the generated per-model filter server-side. */\n\
+export interface ListOptions {\n\
+  limit?: number;\n\
+  offset?: number;\n\
+  sort?: string;\n\
+  order?: 'asc' | 'desc';\n\
+  filter?: Record<string, string | number | boolean>;\n\
+}\n\
+\n"
     }
 
     /// Convert PascalCase model name to kebab-case for URL paths.
@@ -91,56 +143,165 @@ impl TypeScriptGenerator {
         code.push_str("export class ForgeDBClient {\n");
         code.push_str("  private baseUrl: string;\n\n");
         code.push_str("  constructor(baseUrl: string = 'http://localhost:3000') {\n");
-        code.push_str("    this.baseUrl = baseUrl;\n");
+        code.push_str("    // Trim a trailing slash so path concatenation is unambiguous.\n");
+        code.push_str("    this.baseUrl = baseUrl.replace(/\\/$/, '');\n");
         code.push_str("  }\n\n");
 
+        // Shared internal helpers: error mapping + list query building.
+        code.push_str(Self::client_helpers());
+
         for model in &schema.models {
-            // H3: use kebab-case to match the Rust router's route registration
-            let model_kebab = Self::to_kebab_case(&model.name);
+            // kebab-case to match the Rust router's route registration.
+            let kebab = Self::to_kebab_case(&model.name);
+            let name = &model.name;
 
+            // GET by id — 404 -> null.
             code.push_str(&format!(
-                "  async get{}(id: string): Promise<{} | null> {{\n",
-                model.name, model.name
+                "  /** Get a {name} by id, or `null` if it does not exist. */\n\
+                 \x20 async get{name}(id: string): Promise<{name} | null> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}/${{encodeURIComponent(id)}}`);\n\
+                 \x20   if (response.status === 404) return null;\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return (await response.json()) as {name};\n\
+                 \x20 }}\n\n"
             ));
-            // H1: fix malformed template literal — id must be interpolated correctly
-            code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}/${{id}}`);\n"
-            ));
-            code.push_str("    if (!response.ok) return null;\n");
-            code.push_str("    const data = await response.json();\n");
-            code.push_str("    return data.data;\n");
-            code.push_str("  }\n\n");
 
+            // LIST — pagination + filters + sort -> ListResult.
             code.push_str(&format!(
-                "  async list{}(): Promise<{}[]> {{\n",
-                model.name, model.name
+                "  /** List {name} rows with optional pagination, sort, and exact-match filters. */\n\
+                 \x20 async list{name}(options: ListOptions = {{}}): Promise<ListResult<{name}>> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}${{this.listQuery(options)}}`);\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return (await response.json()) as ListResult<{name}>;\n\
+                 \x20 }}\n\n"
             ));
-            code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}`);\n"
-            ));
-            code.push_str("    const data = await response.json();\n");
-            code.push_str("    return data.data || [];\n");
-            code.push_str("  }\n\n");
 
+            // CREATE — returns the new id (the REST create responds with `{id}`).
             code.push_str(&format!(
-                "  async create{}(data: Omit<{}, 'id'>): Promise<{}> {{\n",
-                model.name, model.name, model.name
+                "  /** Create a {name}. Returns the new id. Throws `ForgeDBError` on a\n\
+                 \x20  * constraint (422) or integrity conflict (409). */\n\
+                 \x20 async create{name}(data: {name}Create): Promise<string> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}`, {{\n\
+                 \x20     method: 'POST',\n\
+                 \x20     headers: {{ 'Content-Type': 'application/json' }},\n\
+                 \x20     body: JSON.stringify(data),\n\
+                 \x20   }});\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   const result = (await response.json()) as {{ id: string }};\n\
+                 \x20   return result.id;\n\
+                 \x20 }}\n\n"
             ));
+
+            // UPDATE — whole-record replace (PUT). 404 -> false.
             code.push_str(&format!(
-                "    const response = await fetch(`${{this.baseUrl}}/api/{model_kebab}`, {{\n"
+                "  /** Replace a {name} by id (whole-record PUT). Returns `false` if the id\n\
+                 \x20  * does not exist; throws `ForgeDBError` on a constraint/conflict. */\n\
+                 \x20 async update{name}(id: string, data: {name}): Promise<boolean> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}/${{encodeURIComponent(id)}}`, {{\n\
+                 \x20     method: 'PUT',\n\
+                 \x20     headers: {{ 'Content-Type': 'application/json' }},\n\
+                 \x20     body: JSON.stringify(data),\n\
+                 \x20   }});\n\
+                 \x20   if (response.status === 404) return false;\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return true;\n\
+                 \x20 }}\n\n"
             ));
-            code.push_str("      method: 'POST',\n");
-            code.push_str("      headers: { 'Content-Type': 'application/json' },\n");
-            code.push_str("      body: JSON.stringify(data),\n");
-            code.push_str("    });\n");
-            code.push_str("    const result = await response.json();\n");
-            code.push_str("    return result.data;\n");
-            code.push_str("  }\n\n");
+
+            // DELETE — 204 -> true, 404 -> false.
+            code.push_str(&format!(
+                "  /** Delete a {name} by id. Returns `true` if deleted, `false` if absent. */\n\
+                 \x20 async delete{name}(id: string): Promise<boolean> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}/${{encodeURIComponent(id)}}`, {{\n\
+                 \x20     method: 'DELETE',\n\
+                 \x20   }});\n\
+                 \x20   if (response.status === 404) return false;\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return true;\n\
+                 \x20 }}\n\n"
+            ));
         }
 
         code.push_str("}\n");
 
         Ok(code)
+    }
+
+    /// The client's shared private helpers, emitted once inside the class.
+    fn client_helpers() -> &'static str {
+        "\
+  /** Throw a typed `ForgeDBError` for any non-2xx response, extracting the\n\
+   * server's `{ error }` message when the body is JSON. */\n\
+  private async assertOk(response: Response): Promise<void> {\n\
+    if (response.ok) return;\n\
+    let body: unknown = undefined;\n\
+    let message = `${response.status} ${response.statusText}`;\n\
+    try {\n\
+      body = await response.json();\n\
+      if (body && typeof body === 'object' && 'error' in body) {\n\
+        message = String((body as { error: unknown }).error);\n\
+      }\n\
+    } catch {\n\
+      // Non-JSON (or empty) body — keep the status-line message.\n\
+    }\n\
+    throw new ForgeDBError(response.status, message, body);\n\
+  }\n\
+\n\
+  /** Build the `?limit=&offset=&sort=&order=&<filter>` query string for a list. */\n\
+  private listQuery(options: ListOptions): string {\n\
+    const params = new URLSearchParams();\n\
+    if (options.limit !== undefined) params.set('limit', String(options.limit));\n\
+    if (options.offset !== undefined) params.set('offset', String(options.offset));\n\
+    if (options.sort !== undefined) params.set('sort', options.sort);\n\
+    if (options.order !== undefined) params.set('order', options.order);\n\
+    if (options.filter) {\n\
+      for (const [key, value] of Object.entries(options.filter)) {\n\
+        params.set(key, String(value));\n\
+      }\n\
+    }\n\
+    const query = params.toString();\n\
+    return query ? `?${query}` : '';\n\
+  }\n\
+\n"
+    }
+
+    /// An npm `package.json` for the generated SDK (Phase 5 WS5 — publishable).
+    /// Written next to `types.ts` only if absent, so user edits survive
+    /// regeneration.  `npm install && npm run build && npm publish` ships it.
+    pub fn package_json_scaffold() -> &'static str {
+        "{\n\
+        \x20 \"name\": \"forgedb-client\",\n\
+        \x20 \"version\": \"0.1.0\",\n\
+        \x20 \"description\": \"Generated TypeScript client for a ForgeDB app\",\n\
+        \x20 \"type\": \"module\",\n\
+        \x20 \"main\": \"dist/types.js\",\n\
+        \x20 \"types\": \"dist/types.d.ts\",\n\
+        \x20 \"files\": [\n\
+        \x20   \"dist\"\n\
+        \x20 ],\n\
+        \x20 \"scripts\": {\n\
+        \x20   \"build\": \"tsc\"\n\
+        \x20 },\n\
+        \x20 \"sideEffects\": false\n\
+        }\n"
+    }
+
+    /// A `tsconfig.json` that compiles `types.ts` to `dist/` with declarations,
+    /// so the SDK is consumable as a typed npm package.
+    pub fn tsconfig_scaffold() -> &'static str {
+        "{\n\
+        \x20 \"compilerOptions\": {\n\
+        \x20   \"target\": \"ES2020\",\n\
+        \x20   \"module\": \"ESNext\",\n\
+        \x20   \"moduleResolution\": \"bundler\",\n\
+        \x20   \"declaration\": true,\n\
+        \x20   \"outDir\": \"dist\",\n\
+        \x20   \"strict\": true,\n\
+        \x20   \"skipLibCheck\": true,\n\
+        \x20   \"lib\": [\"ES2020\", \"DOM\"]\n\
+        \x20 },\n\
+        \x20 \"include\": [\"types.ts\"]\n\
+        }\n"
     }
 
     /// Map ForgeDB field type to TypeScript type
