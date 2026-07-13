@@ -666,8 +666,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
     renamed, 0.1.0, native surface unchanged) and NEW **`storage-web`** (0.1.0): in-memory arena columns with
     **byte-identical positional semantics** (a `thread_local` path→bytes STORE — the "path IS the key" trick),
     no-op `DirLock`, arena-routed `Manifest`, + a `persist` module (wasm-only: IndexedDB keyed-blobs + OPFS
-    snapshot-file — the async **hydrate/commit** boundary; the per-row API stays sync). storage-web's arena core
-    is target-agnostic, so its parity is unit-tested natively. Facade bumped 0.1.5 → 0.2.0.
+    **per-column files** — the async **hydrate/commit** boundary; the per-row API stays sync). The OPFS path (#1,
+    LANDED 2026-07-13) writes each arena column to its own file `<db>/<flat-path>` via **`createSyncAccessHandle`
+    in a dedicated Web Worker** (the only context that exposes the sync OPFS handle API); storage-web spawns that
+    Worker itself from an embedded Blob URL (no external `.js` asset, no codegen change — the main-thread replica,
+    transport, and generated code are untouched). storage-web's arena core is target-agnostic, so its parity is
+    unit-tested natively. Facade bumped 0.1.5 → 0.2.0.
   - **L2 — codegen (target-agnostic, zero branches).** Additive `Database::commit()` (flush all cols; native
     fsync / wasm arena no-op) + the follower apply path: per-model `apply(kind, bytes)` decodes the opaque row
     bytes and **replays through the SAME generated `insert`/`update`/`delete`** (broker/feed are `None` on a
@@ -688,14 +692,16 @@ across many domains live in `examples/` — see `examples/README.md`.**
     --target web` → `.wasm` + ES module + `.d.ts`. Guard `test_wasm_generation_transport`.
   - **L4 — browser E2E.** A native `genframes` bin emits real `to_wire` frames; a Bun WS server streams them
     honoring `?after`; Playwright drives the round-trip + reload-resume for IDB and OPFS. Ephemeral harness
-    `scratchpad/wasm_l2/`. **Re-proven end-to-end with the GENERATED transport (#3):** `forgedb generate wasm` →
-    `wasm-pack build` → both backends green (phase-1 applies all 7 frames incl. update/delete/M2M-link + reverse
-    traversal; reload resumes from watermark 7 with 0 frames re-applied, data intact).
+    `scratchpad/wasm_l2/`. **Re-proven end-to-end with the GENERATED transport (#3) AND the OPFS Worker (#1):**
+    `forgedb generate wasm` → `wasm-pack build` → both backends green (phase-1 applies all 7 frames incl.
+    update/delete/M2M-link + reverse traversal; reload resumes from watermark 7 with 0 frames re-applied, data
+    intact). #1 additionally verified in-browser that OPFS writes 25 discrete per-column files (e.g.
+    `user/fixed/uuid_0.bin` @ 64 B = 4 uuids, `user/tombstones.bin` @ 4 B), not one snapshot blob.
   PM identity red lines held: the replica is the SAME generated code (no schema read at runtime); dispatch is by
   the opaque model tag; the storage backend + `persist` move opaque path→bytes blobs and know no schema.
-  **Honest limits / deferred:** OPFS uses async main-thread file I/O + a whole-DB snapshot file (sync-access
-  handles in a Worker + per-column files = follow-up, #1, NEXT); whole-DB hydrate on open + commit-granularity
-  durability (accepted milestone-1 limits, #2 — to be revisited in a design discussion before any impl);
+  **Honest limits / deferred:** OPFS now uses sync-access-handles in a Web Worker + per-column files (#1 LANDED
+  2026-07-13); whole-DB hydrate on open + commit-granularity durability (accepted milestone-1 limits, #2 — to be
+  revisited in a design discussion before any impl);
   **read-only** replica (local/optimistic writes = Phase 2). (The prior "wasm-bindgen transport hand-written in
   the harness" limit is RESOLVED by #3 above.)
   **WASM PUBLISH GAP (OPEN):** the browser build needs `forgedb-types` (wasm uuid feature) + `forgedb-wal` (wasm
