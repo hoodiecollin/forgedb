@@ -2,7 +2,9 @@
 //!
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
-use forgedb_codegen::{ApiGenerator, OpenApiGenerator, RustGenerator, TypeScriptGenerator};
+use forgedb_codegen::{
+    ApiGenerator, OpenApiGenerator, RustGenerator, TypeScriptGenerator, WasmGenerator,
+};
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
 
@@ -2165,6 +2167,85 @@ Tag {
 }
 
 #[test]
+fn test_wasm_generation_transport() {
+    // Browser read-replica transport (#110 Milestone C, follow-up #3): the
+    // per-schema `#[wasm_bindgen] Replica` that was hand-written in the harness
+    // is now GENERATED. It exposes schema-invariant lifecycle plus a read surface
+    // that MIRRORS the generated Database's reads exactly — inventing no query
+    // API (the identity red line) and exposing no mutators (a read-only follower).
+    let src = r#"
+User {
+  id: +uuid
+  email: string
+  posts: [Post]
+  tags: [Tag]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Tag {
+  id: +uuid
+  label: string
+  users: [User]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = WasmGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The wasm-bindgen struct + schema-invariant lifecycle.
+    assert!(flat.contains("#[wasm_bindgen]"), "must annotate for wasm-bindgen");
+    assert!(flat.contains("pubstructReplica"), "must expose a Replica struct");
+    assert!(flat.contains("pubasyncfnopen("), "lifecycle: open");
+    assert!(flat.contains("js_name=applyWire"), "lifecycle: applyWire");
+    assert!(flat.contains("pubasyncfncommit("), "lifecycle: commit");
+    assert!(flat.contains("pubfnwatermark(&self)->u64"), "lifecycle: watermark");
+    // Follower routes opaque frames through the generated apply_frame.
+    assert!(
+        flat.contains("apply_frame(&ev)"),
+        "applyWire replays through the generated apply_frame"
+    );
+
+    // Per-model core reads for every model (get / count / all). Generated reads
+    // carry a string `js_name` (interpolated); the fixed lifecycle uses the ident
+    // form (e.g. `js_name = applyWire`).
+    for js in [
+        "js_name=\"getUser\"", "js_name=\"userCount\"", "js_name=\"allUsers\"",
+        "js_name=\"getPost\"", "js_name=\"postCount\"", "js_name=\"allPosts\"",
+        "js_name=\"getTag\"", "js_name=\"tagCount\"", "js_name=\"allTags\"",
+    ] {
+        assert!(flat.contains(js), "missing core read {js}");
+    }
+
+    // Relation traversals, mirroring the generated Database method names:
+    //   forward FK (post.author -> User), reverse 1:M (user -> posts),
+    //   M2M query helpers (user.tags -> Tag, tag.users -> User).
+    assert!(flat.contains("js_name=\"postAuthor\""), "forward FK getter");
+    assert!(flat.contains("js_name=\"userPosts\""), "reverse one-to-many getter");
+    assert!(flat.contains("js_name=\"userTags\""), "M2M forward query");
+    assert!(flat.contains("js_name=\"tagUsers\""), "M2M reverse query");
+
+    // The reads call the generated surface — never a reimplemented query.
+    assert!(flat.contains(".post_author(&__rec)"), "forward FK resolves via generated getter");
+    assert!(flat.contains(".user_posts(__pk)"), "reverse getter calls generated method");
+
+    // IDENTITY RED LINE: read-only follower — exposes NO mutators. Every write
+    // path (insert/update/delete/link) stays in the generated Database (reached
+    // only by the follower `apply_frame`, never by a JS-callable method here).
+    for forbidden in [".insert(", ".update(", ".delete(", "js_name=\"linkUserTag\"", "fnlink_"] {
+        assert!(
+            !flat.contains(forbidden),
+            "transport must expose no mutator (found {forbidden})"
+        );
+    }
+}
+
+#[test]
 fn test_api_generation_replication_endpoint() {
     // The generated replication WS endpoint (#82 Direction C): one schema-wide
     // /replicate route behind the tenant-auth guard, a resumable handshake
@@ -2624,3 +2705,4 @@ fn test_openapi_generation_skips_virtual_fields() {
         }
     }
 }
+

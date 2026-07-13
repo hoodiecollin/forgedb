@@ -746,7 +746,7 @@ impl RustGenerator {
     /// only type-checks when the referenced key is also `Uuid`.  Integer-PK
     /// models are skipped (with a comment) rather than emitting code that won't
     /// compile.
-    fn is_uuid_pk(model: &forgedb_parser::Model) -> bool {
+    pub(crate) fn is_uuid_pk(model: &forgedb_parser::Model) -> bool {
         match model
             .fields
             .iter()
@@ -759,7 +759,7 @@ impl RustGenerator {
 
     /// Many-to-many relations that can be safely generated: both endpoints must
     /// be UUID-keyed (the junction stores two `Uuid` columns).
-    fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
+    pub(crate) fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
         schema
             .detect_many_to_many_relations()
             .into_iter()
@@ -4573,7 +4573,7 @@ impl RustGenerator {
     }
 
     /// Convert PascalCase to snake_case
-    fn to_snake_case(s: &str) -> String {
+    pub(crate) fn to_snake_case(s: &str) -> String {
         let mut result = String::new();
         for (i, c) in s.chars().enumerate() {
             if c.is_uppercase() && i > 0 {
