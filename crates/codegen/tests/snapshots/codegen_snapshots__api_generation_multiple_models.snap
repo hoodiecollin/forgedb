@@ -748,6 +748,39 @@ async fn handle_post_live_query(
         }
     }
 }
+/// Liveness probe (Phase 5 WS1): 200 as long as the process is up and
+/// the async runtime is scheduling.  Never touches the database, so it
+/// never blocks on a write lock — the correct signal for a k8s
+/// `livenessProbe` / load-balancer health check.
+async fn __health() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({ "status" : "ok" })))
+}
+/// Readiness probe (Phase 5 WS1): acquires a read lock on the database
+/// and returns 200 once obtained, proving the store opened and the
+/// lock is not wedged — the correct signal for a k8s `readinessProbe`.
+async fn __ready(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let _guard = db.read().await;
+    (StatusCode::OK, Json(json!({ "status" : "ready" })))
+}
+/// Minimal metrics (Phase 5 WS1): per-model live row counts + totals,
+/// as JSON.  Generated per-schema by naming each model's storage field;
+/// no schema is interpreted at runtime.
+async fn __metrics(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let db = db.read().await;
+    let per_model = json!(
+        { "User" : db.user.row_count(), "Post" : db.post.row_count(), }
+    );
+    let total_rows: usize = 0 + db.user.row_count() + db.post.row_count();
+    let body = json!(
+        { "model_count" : 2usize, "total_rows" : total_rows, "rows_per_model" :
+        per_model, }
+    );
+    (StatusCode::OK, Json(body))
+}
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -776,8 +809,11 @@ pub struct ApiDoc;
 pub fn openapi_json() -> String {
     ApiDoc::openapi().to_json().unwrap()
 }
-/// Create the API router with all endpoints (no auth).
-pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
+/// The data-plane routes (CRUD + WS subscriptions) with the database
+/// state still unbound.  Factored out so the tenant-auth guard can wrap
+/// ONLY these routes, leaving the operational endpoints unauthenticated
+/// (Phase 5 WS1).
+fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
         .route(concat!("/api/", "user"), post(create_user))
@@ -795,31 +831,57 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
         )
         .route(concat!("/subscribe/", "post"), get(subscribe_post))
         .route(concat!("/live-query/", "post"), get(subscribe_live_post))
+}
+/// The operational routes (Phase 5 WS1): liveness / readiness / minimal
+/// metrics.  Never behind the tenant-auth guard so infra probes and
+/// metric scrapers reach them without a JWT.
+fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
+    Router::new()
+        .route("/health", get(__health))
+        .route("/ready", get(__ready))
+        .route("/metrics", get(__metrics))
+}
+/// Create the API router with all endpoints (no auth).  A
+/// `tower_http::trace::TraceLayer` wraps every route so each request is
+/// logged as a structured `tracing` span (level via `RUST_LOG`) — the
+/// server-side half of Phase 5 WS1 observability; the scaffold
+/// `main.rs` installs the subscriber.
+pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
+    __data_routes()
+        .merge(__ops_routes())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(db)
 }
-/// Create the API router with the tenant-auth guard layered over every
-/// route (#59).  Each request must carry a bearer JWT whose configured
-/// tenant claim equals this process's tenant — the `forgedb-auth`
-/// substrate verifies the signature (asymmetric, JWKS/static key,
-/// algorithm-pinned) and cross-checks the tenant, rejecting with 401
-/// (auth failure) or 403 (wrong tenant) before any handler runs; on
-/// success the verified `forgedb_auth::Principal` is injected into
-/// request extensions.  `auth` is built from deployment config
-/// (`forgedb.toml` / env), never from the `.forge` schema — the guard
-/// is a signed-string cross-check, not a schema-reading policy engine.
+/// Create the API router with the tenant-auth guard layered over the
+/// data routes (#59).  Each data request must carry a bearer JWT whose
+/// configured tenant claim equals this process's tenant — the
+/// `forgedb-auth` substrate verifies the signature (asymmetric,
+/// JWKS/static key, algorithm-pinned) and cross-checks the tenant,
+/// rejecting with 401 (auth failure) or 403 (wrong tenant) before any
+/// handler runs; on success the verified `forgedb_auth::Principal` is
+/// injected into request extensions.  `auth` is built from deployment
+/// config (`forgedb.toml` / env), never from the `.forge` schema — the
+/// guard is a signed-string cross-check, not a schema-reading policy
+/// engine.
 ///
-/// The guard also covers the WS `/subscribe` and `/live-query` routes;
-/// WS clients must send the token in the `Authorization` header (clients
-/// that cannot set WS headers are a documented limitation).
+/// The guard covers the WS `/subscribe` and `/live-query` routes (WS
+/// clients must send the token in the `Authorization` header — a
+/// documented limitation); it does NOT cover the operational
+/// `/health` / `/ready` / `/metrics` routes, which are merged in
+/// AFTER the guard so infra probes stay unauthenticated (Phase 5 WS1).
 pub fn create_router_with_auth(
     db: Arc<RwLock<super::Database>>,
     auth: Arc<forgedb_auth::Authenticator>,
 ) -> Router {
-    create_router(db)
+    let guarded = __data_routes()
         .layer(
             axum::middleware::from_fn_with_state(
                 auth,
                 forgedb_auth::axum_mw::require_tenant,
             ),
-        )
+        );
+    guarded
+        .merge(__ops_routes())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(db)
 }
