@@ -1,0 +1,117 @@
+# Versioning & Stability Policy
+
+This document states what ForgeDB promises to keep stable, and what a **1.0**
+release will mean. It covers four distinct surfaces, each with its own version
+line and its own compatibility rules.
+
+> **Current status: pre-1.0.** Everything below describes the policy that takes
+> effect at **1.0**. While ForgeDB is `0.x`, per Cargo's semver rules a minor
+> version bump (`0.1 → 0.2`) *may* contain breaking changes. We already avoid
+> gratuitous breakage and document every change, but the guarantees in this
+> document are only *promises* once the corresponding surface reaches `1.0`.
+
+## The four surfaces
+
+| Surface | Artifact | Version line |
+|---|---|---|
+| 1. Schema language | the `.forge` grammar, directives, and the shape of the generated API | the `forgedb` CLI version |
+| 2. Substrate ABI | the published `forgedb-*` runtime crates the generated code links | per-crate, independent |
+| 3. The CLI | `forgedb` commands, flags, config | the `forgedb` CLI version |
+| 4. Compiler internals | `forgedb-parser`, `forgedb-codegen`, `forgedb-migrations`, `forgedb-watcher`, `forgedb-validation`, `forgedb-backup` | per-crate, but **not a stability surface** — see §4 |
+
+---
+
+## 1. Schema language
+
+The compatibility promise most users care about: **a `.forge` schema that compiles
+on `forgedb 1.x` keeps compiling on every later `1.y`**, and the generated REST
+API's routes + request/response shapes for a given schema stay backward
+compatible within `1.x`.
+
+**Additive (minor bump, never breaks an existing schema):**
+- new types, directives, modifiers, or relation kinds;
+- new optional/nullable fields on a model (appended — see `docs/MIGRATIONS.md`);
+- new generated API endpoints or new optional query parameters;
+- new fields *added* to a generated JSON response object.
+
+**Breaking (major bump only):**
+- removing or renaming a type, directive, modifier, or field;
+- changing the meaning or default of an existing directive;
+- changing a field's type;
+- changing an existing generated route, its method, or the shape/semantics of
+  its request or response;
+- tightening validation such that a previously-valid schema is rejected.
+
+This is the same additive-vs-breaking boundary the migration gate enforces at
+the *data* level (`forgedb migrate create --auto` accepts additive deltas and
+refuses breaking ones with a non-zero exit — Phase 4 W3). The schema-language
+policy and the data-migration policy therefore agree on what "breaking" means.
+
+## 2. Substrate ABI
+
+Generated code is **not** dependency-free — it links a set of small,
+schema-agnostic runtime crates (the "substrate"; see `docs/INSTALL.md` for the
+version matrix). Each is versioned **independently** and pins are intentionally
+**not** normalized across them.
+
+- A substrate crate follows Cargo semver: a breaking change to its public API or
+  its on-disk/on-wire format bumps its major (or, pre-1.0, its minor).
+- The generated `Cargo.toml` pins each substrate crate with a **caret range**
+  (e.g. `forgedb-storage = "0.1.5"`, `forgedb-wal = "0.2"`), so a compatible
+  patch/minor is picked up automatically but an incompatible major is not.
+- **On-disk format** is part of the substrate ABI: a change to the columnar
+  layout, WAL framing, or manifest that a prior binary cannot read is a breaking
+  change and bumps the owning crate's major, with a documented migration path.
+- The CLI that *generates* against a substrate version and the substrate itself
+  move together: `forgedb init` always pins substrate versions the current CLI is
+  known-compatible with.
+
+At **1.0**, each substrate crate at `1.x` guarantees ABI + format compatibility
+within its major.
+
+## 3. The CLI
+
+`forgedb` commands, their flags, and `forgedb.toml` config keys follow the CLI's
+own semver.
+
+- Removing a command/flag or changing its meaning is breaking (major).
+- Adding a command/flag/config key is additive (minor).
+- Output *format* of human-readable command output is **not** covered — scripts
+  should use the `--json` variants where offered, which *are* covered.
+
+## 4. Compiler internals are NOT a public API
+
+`forgedb-parser`, `forgedb-codegen`, `forgedb-migrations`, `forgedb-watcher`,
+`forgedb-validation`, and `forgedb-backup` are published to crates.io **only so
+that `cargo install forgedb` can build the CLI from the registry.** They are the
+CLI's implementation, not a supported library surface.
+
+- Their public APIs may change in any release, including breaking changes in a
+  minor bump, without notice.
+- Do **not** build a product on top of them expecting stability. If you need
+  programmatic access, open an issue describing the use case so we can consider a
+  supported surface.
+- This is the deliberate line ForgeDB draws (`CLAUDE.md`): the *substrate* crates
+  (§2) are a stability surface because **generated code links them**; the
+  *compiler* crates are not, because nothing generated depends on them.
+
+---
+
+## What "1.0" means
+
+A `1.0` release is a **compatibility commitment**, not a feature milestone:
+
+1. A `.forge` schema and its generated API stay compatible across all of `1.x`.
+2. Each `1.x` substrate crate holds its ABI + on-disk format within the major.
+3. The CLI's commands/flags/config + `--json` outputs stay compatible across `1.x`.
+4. Breaking any of the above requires a `2.0` and a documented migration path.
+
+Until then, read the `CLAUDE.md` "what v1 is / isn't" section and the roadmap
+(`docs/V1_ROADMAP.md`) for the honest current state.
+
+## Deprecation
+
+Once at `1.0`: a feature slated for removal is first **deprecated** — it keeps
+working and emits a warning (CLI) or a `#[deprecated]` note (substrate API) for at
+least one minor release before removal in the next major. Removals are listed in
+the release notes.
