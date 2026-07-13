@@ -411,6 +411,17 @@ impl RustGenerator {
                     self.changefeed = Some(feed);
                 }
 
+                /// Attach the shared durable replication broker (#82 Direction C).
+                /// Called by `Database::open_at()`; afterwards each mutation is
+                /// durably recorded (with the opaque row bytes + a global offset)
+                /// for a resumable follower, in addition to the change-feed emit.
+                pub fn attach_broker(
+                    &mut self,
+                    broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
+                ) {
+                    self.broker = broker;
+                }
+
                 /// Insert a record.  Validates field constraints + `&unique` FIRST
                 /// (#91 Phase 3): a rejected insert commits nothing and returns
                 /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
@@ -1367,6 +1378,12 @@ impl RustGenerator {
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
+            // Durable replication broker (#82 Direction C): `None` for standalone
+            // use; `Database::open_at()` attaches a shared, offset-addressed broker
+            // so each mutation is durably recorded for a resumable follower (#110).
+            // Shared across every collection behind an `Arc<Mutex<..>>` so one
+            // global offset sequences changes across models.
+            broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
         }
     }
 
@@ -1459,6 +1476,7 @@ impl RustGenerator {
             root: root.to_path_buf(),
             dead_since_compaction: 0,
             changefeed: None,
+            broker: None,
         }
     }
 
@@ -1933,6 +1951,38 @@ impl RustGenerator {
         }
     }
 
+    /// Emit the durable replication record for one mutation (#82 Direction C).
+    ///
+    /// Alongside the best-effort in-process change-feed emit, record the change to
+    /// the durable, offset-addressed broker so a cross-process / browser follower
+    /// (#110) can resume from a watermark. The broker is **field-blind**: it is
+    /// handed the model name (an opaque routing tag), the absolute `row_index` of
+    /// the appended physical row, the `kind`, and the **opaque serialized row
+    /// bytes** — the same `serde_json(record)` bytes the WAL journals. The broker
+    /// assigns the global offset and never interprets the bytes.
+    ///
+    /// Assumes `record` (the row's values) and `row_index` (the appended physical
+    /// row) are in scope — true at every mutation emit site (insert / update /
+    /// delete). `None` on the standalone `Database::new()` path where no broker is
+    /// attached; a per-tenant `open_at` process attaches one.
+    fn generate_broker_record(model: &forgedb_parser::Model, kind: TokenStream) -> TokenStream {
+        let model_name_str = model.name.clone();
+        quote! {
+            if let Some(__broker) = &self.broker {
+                // Reuse the WAL's opaque row encoding; the broker never decodes it.
+                let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
+                if let Ok(mut __b) = __broker.lock() {
+                    let _ = __b.record(
+                        #model_name_str,
+                        row_index as u64,
+                        #kind,
+                        __row_bytes,
+                    );
+                }
+            }
+        }
+    }
+
     /// Emit one "append a default entry" statement per storage-backed field —
     /// the same column encoding as `generate_append_statements`, but with the
     /// field's type default instead of a record value.  Used to backfill a newly
@@ -2215,11 +2265,14 @@ impl RustGenerator {
                 let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
                 if __compactor.compact_model_keeping(#model_snake, &__keep).is_ok() {
                     // 3. Rows renumbered: reopen to rebuild the in-memory maps from
-                    //    the compacted files (preserving the shared change feed).
+                    //    the compacted files (preserving the shared change feed and
+                    //    the durable replication broker across the reopen).
                     let __root = self.root.clone();
                     let __feed = self.changefeed.take();
+                    let __broker = self.broker.take();
                     *self = Self::new_at(&__root);
                     self.changefeed = __feed;
+                    self.broker = __broker;
                 }
                 // Reset unconditionally: a failed compaction waits a full interval
                 // rather than re-attempting on every subsequent mutation.
@@ -2265,6 +2318,8 @@ impl RustGenerator {
         let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let broker_record =
+            Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Inserted });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
         // Data-integrity gate (#91): validate field constraints + `&unique` BEFORE
         // any durable side effect, so a rejected insert commits absolutely nothing.
@@ -2334,6 +2389,9 @@ impl RustGenerator {
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Inserted);
             }
+            // Durable replication record (#82 Direction C): same field-blind signal
+            // plus the opaque row bytes + a global offset, for a resumable follower.
+            #broker_record
 
             #maybe_checkpoint
 
@@ -2353,6 +2411,8 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let broker_record =
+            Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Updated });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
         let maybe_compact = Self::generate_maybe_compact();
         // Integrity gate (#91): validate field constraints + `&unique` (excluding
@@ -2462,6 +2522,9 @@ impl RustGenerator {
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, row_index, forgedb_changefeed::ChangeKind::Updated);
             }
+            // Durable replication record (#82): the superseding version's new live
+            // row index + its opaque bytes, at a fresh global offset.
+            #broker_record
 
             #maybe_checkpoint
 
@@ -2485,6 +2548,11 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
+        // The broker records the *tombstoned* physical row (`row_index`), so a
+        // follower applies the tombstone at the same position; `record` (the
+        // pre-delete values re-appended under the tombstone) supplies the bytes.
+        let broker_record =
+            Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Deleted });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
         let maybe_compact = Self::generate_maybe_compact();
 
@@ -2555,6 +2623,9 @@ impl RustGenerator {
             if let Some(feed) = &self.changefeed {
                 feed.emit(#model_name_str, deleted_row, forgedb_changefeed::ChangeKind::Deleted);
             }
+            // Durable replication record (#82): the tombstoned physical row so a
+            // follower reproduces the delete by position.
+            #broker_record
 
             #maybe_checkpoint
 
@@ -3191,6 +3262,7 @@ impl RustGenerator {
                 quote! {
                     let mut #field = #ty::new_at(&root);
                     #field.attach_changefeed(changefeed.clone());
+                    #field.attach_broker(broker.clone());
                 }
             })
             .chain(m2m.iter().map(|m| {
@@ -3199,6 +3271,7 @@ impl RustGenerator {
                 quote! {
                     let mut #field = #ty::new_at(&root);
                     #field.attach_changefeed(changefeed.clone());
+                    #field.attach_broker(broker.clone());
                 }
             }))
             .collect();
@@ -3282,6 +3355,13 @@ impl RustGenerator {
                 /// The generated WS endpoint subscribes to it; standalone callers
                 /// can ignore it.
                 pub changefeed: forgedb_changefeed::ChangeFeed,
+                /// Durable replication broker (#82 Direction C): `Some` on the
+                /// per-tenant `open_at` path (durable log under the data root),
+                /// `None` on the lock-free `new()` convenience path.  Shared across
+                /// every collection behind an `Arc<Mutex<..>>` so one global offset
+                /// sequences all changes; the generated `/replicate` WS endpoint
+                /// streams from it to a resumable follower (#110).
+                pub broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
                 /// Single-writer guard (#89): `open_at` holds an exclusive advisory
                 /// lock on the data dir, so a second writer process refuses rather
                 /// than corrupting (v1 single-writer-per-process contract — this
@@ -3317,6 +3397,8 @@ impl RustGenerator {
                     Self {
                         #(#field_idents,)*
                         changefeed,
+                        // Standalone / test path: no durable replication broker.
+                        broker: None,
                         _lock: None,
                     }
                 }
@@ -3339,10 +3421,24 @@ impl RustGenerator {
                         ),
                     );
                     let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+                    // Durable replication broker (#82 Direction C): one offset-addressed
+                    // log per tenant, under the data root, shared across all collections
+                    // so a single global offset sequences every change.  If it cannot be
+                    // opened the server still runs — replication is simply unavailable
+                    // (the `/replicate` endpoint reports it), never blocking writes.
+                    let broker = match forgedb_changefeed::durable::DurableBroker::open(
+                        root.join("_replication.log"),
+                        forgedb_changefeed::durable::FsyncPolicy::Always,
+                        1024,
+                    ) {
+                        Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
+                        Err(_) => None,
+                    };
                     #(#attach_stmts_at)*
                     Self {
                         #(#field_idents,)*
                         changefeed,
+                        broker,
                         _lock,
                     }
                 }
@@ -3538,6 +3634,7 @@ impl RustGenerator {
                     right_col: FixedColumn,
                     row_count: usize,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
+                    broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
                 }
 
                 impl #struct_ident {
@@ -3568,6 +3665,7 @@ impl RustGenerator {
                             right_col,
                             row_count,
                             changefeed: None,
+                            broker: None,
                         };
                         db.write_manifest(root);
                         db
@@ -3577,6 +3675,15 @@ impl RustGenerator {
                     /// field-blind `(junction_name, row_index)` signal.
                     pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
                         self.changefeed = Some(feed);
+                    }
+
+                    /// Attach the shared durable replication broker (#82): `link`
+                    /// then durably records the pair (opaque bytes) at a global offset.
+                    pub fn attach_broker(
+                        &mut self,
+                        broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
+                    ) {
+                        self.broker = broker;
                     }
 
                     /// Write the junction's physical-layout manifest (#57): two
@@ -3634,6 +3741,21 @@ impl RustGenerator {
                         // Change-feed emit (#62): a link is an M2M junction append.
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
+                        }
+                        // Durable replication record (#82): the link pair as opaque
+                        // bytes (left ++ right, 32 bytes) at a global offset.
+                        if let Some(__broker) = &self.broker {
+                            let mut __row_bytes = Vec::with_capacity(32);
+                            __row_bytes.extend_from_slice(left.as_bytes());
+                            __row_bytes.extend_from_slice(right.as_bytes());
+                            if let Ok(mut __b) = __broker.lock() {
+                                let _ = __b.record(
+                                    #base,
+                                    row_index as u64,
+                                    forgedb_changefeed::ChangeKind::Linked,
+                                    __row_bytes,
+                                );
+                            }
                         }
                     }
 
