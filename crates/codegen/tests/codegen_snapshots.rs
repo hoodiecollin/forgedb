@@ -2085,6 +2085,86 @@ Tag {
 }
 
 #[test]
+fn test_rust_generation_replica_apply_path() {
+    // Browser read-replica follower apply path (#110 Milestone C): the same
+    // generated data logic recompiles for wasm and gains a follower entry point
+    // that REPLAYS opaque frames through the existing insert/update/delete — no
+    // second write path, and it never decodes a field to *route* (dispatch is by
+    // the opaque model tag; only materialization decodes, in generated code).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The apply error type + its reuse-the-write-path conversion.
+    assert!(flat.contains("pubenumApplyError"), "must emit an ApplyError type");
+    assert!(
+        flat.contains("implFrom<ValidationError>forApplyError"),
+        "apply reuses the write path, so ValidationError converts into ApplyError"
+    );
+
+    // Per-model follower apply, decoding the OPAQUE bytes (not a field) and
+    // replaying through the same generated mutation surface.
+    assert!(
+        flat.contains("pubfnapply(&mut self,kind:forgedb_changefeed::ChangeKind,bytes:&[u8],)")
+            || flat.contains("pubfnapply(&mutself,kind:forgedb_changefeed::ChangeKind,bytes:&[u8],)"),
+        "each id-bearing model must expose a follower apply(kind, bytes)"
+    );
+    assert!(
+        flat.contains("serde_json::from_slice(bytes)"),
+        "apply decodes the opaque row bytes into the typed record"
+    );
+    // Replays through the existing surface — self.insert / self.update / self.delete.
+    for m in ["self.insert(record)", "self.update(id,record)", "self.delete(id)"] {
+        assert!(flat.contains(m), "apply must replay through the existing {m}");
+    }
+
+    // Schema-wide dispatcher, routing by the OPAQUE model tag.
+    assert!(
+        flat.contains("pubfnapply_frame(&mutself,ev:&forgedb_changefeed::durable::PersistedEvent,)"),
+        "Database must expose apply_frame(&PersistedEvent)"
+    );
+    assert!(
+        flat.contains("matchev.model.as_str()"),
+        "apply_frame dispatches on the opaque model tag string"
+    );
+    assert!(flat.contains("\"Post\"=>"), "model tag arm present");
+    assert!(flat.contains("\"post_tag_link\"=>"), "junction tag arm present");
+    // The junction arm re-links from the opaque 32-byte pair, no field decode.
+    assert!(
+        flat.contains("self.post_tag_link.link(Uuid::from_bytes(__l),Uuid::from_bytes(__r))"),
+        "junction frames re-link from the opaque left++right pair"
+    );
+
+    // Additive commit across collections.
+    assert!(
+        flat.contains("pubfncommit(&mutself)->std::io::Result<()>"),
+        "Database + each storage must expose an additive commit()"
+    );
+
+    // IDENTITY RED LINE: apply_frame must dispatch on the model TAG, never on a
+    // decoded record field.  (`match ev.model` is allowed — the tag; `match`ing a
+    // decoded field would be the forbidden generic engine.)
+    assert!(
+        !flat.contains("matchrecord."),
+        "apply_frame/apply must never branch on a decoded record field"
+    );
+}
+
+#[test]
 fn test_api_generation_replication_endpoint() {
     // The generated replication WS endpoint (#82 Direction C): one schema-wide
     // /replicate route behind the tenant-auth guard, a resumable handshake

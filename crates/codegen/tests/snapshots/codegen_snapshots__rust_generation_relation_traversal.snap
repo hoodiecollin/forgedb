@@ -54,6 +54,35 @@ impl std::fmt::Display for ValidationError {
     }
 }
 impl std::error::Error for ValidationError {}
+/// An error applying a replicated change frame on the read-replica
+/// follower (#110 Milestone C).  Emitted by the generated
+/// `<Model>Storage::apply` / `Database::apply_frame`.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The opaque row bytes did not deserialize into the model record
+    /// (a corrupt frame, or a schema skew between server and replica).
+    Decode(String),
+    /// The replayed write failed the generated integrity validators.
+    /// Should not happen for a faithful replica of already-valid data,
+    /// but is surfaced rather than silently dropped.
+    Validation(ValidationError),
+}
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::Decode(m) => {
+                write!(f, "failed to decode replication frame: {}", m)
+            }
+            ApplyError::Validation(e) => write!(f, "replicated write rejected: {}", e),
+        }
+    }
+}
+impl std::error::Error for ApplyError {}
+impl From<ValidationError> for ApplyError {
+    fn from(e: ValidationError) -> Self {
+        ApplyError::Validation(e)
+    }
+}
 ///User model
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -350,6 +379,48 @@ impl UserStorage {
             self.compact();
         }
         true
+    }
+    /// Apply a replicated change for this model on the read-replica
+    /// follower (#110).  Decodes the opaque row bytes the server journaled
+    /// and replays through the same generated mutation surface.  The
+    /// follower never decodes a field to *route* — `Database::apply_frame`
+    /// already dispatched by the model tag; this only materializes the
+    /// typed record to *apply* it.
+    pub fn apply(
+        &mut self,
+        kind: forgedb_changefeed::ChangeKind,
+        bytes: &[u8],
+    ) -> Result<(), ApplyError> {
+        match kind {
+            forgedb_changefeed::ChangeKind::Inserted => {
+                let record: User = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                self.insert(record)?;
+            }
+            forgedb_changefeed::ChangeKind::Updated => {
+                let record: User = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.update(id, record)?;
+            }
+            forgedb_changefeed::ChangeKind::Deleted => {
+                let record: User = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.delete(id);
+            }
+            forgedb_changefeed::ChangeKind::Linked => {}
+        }
+        Ok(())
+    }
+    /// Flush this model's columns + tombstones (#110 additive commit).
+    /// Native fsync; wasm arena no-op (durability at the transport's
+    /// IndexedDB/OPFS write boundary).
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        self.id_col.flush()?;
+        self.name_col.flush()?;
+        self.tombstones.flush()?;
+        Ok(())
     }
     fn recover_from_wal(&mut self) {
         let __anchor = self.tombstones.len();
@@ -1236,6 +1307,50 @@ impl PostStorage {
             self.compact();
         }
         true
+    }
+    /// Apply a replicated change for this model on the read-replica
+    /// follower (#110).  Decodes the opaque row bytes the server journaled
+    /// and replays through the same generated mutation surface.  The
+    /// follower never decodes a field to *route* — `Database::apply_frame`
+    /// already dispatched by the model tag; this only materializes the
+    /// typed record to *apply* it.
+    pub fn apply(
+        &mut self,
+        kind: forgedb_changefeed::ChangeKind,
+        bytes: &[u8],
+    ) -> Result<(), ApplyError> {
+        match kind {
+            forgedb_changefeed::ChangeKind::Inserted => {
+                let record: Post = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                self.insert(record)?;
+            }
+            forgedb_changefeed::ChangeKind::Updated => {
+                let record: Post = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.update(id, record)?;
+            }
+            forgedb_changefeed::ChangeKind::Deleted => {
+                let record: Post = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.delete(id);
+            }
+            forgedb_changefeed::ChangeKind::Linked => {}
+        }
+        Ok(())
+    }
+    /// Flush this model's columns + tombstones (#110 additive commit).
+    /// Native fsync; wasm arena no-op (durability at the transport's
+    /// IndexedDB/OPFS write boundary).
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        self.id_col.flush()?;
+        self.title_col.flush()?;
+        self.author_col.flush()?;
+        self.editor_col.flush()?;
+        self.tombstones.flush()?;
+        Ok(())
     }
     fn recover_from_wal(&mut self) {
         let __anchor = self.tombstones.len();
@@ -2159,6 +2274,48 @@ impl TagStorage {
         }
         true
     }
+    /// Apply a replicated change for this model on the read-replica
+    /// follower (#110).  Decodes the opaque row bytes the server journaled
+    /// and replays through the same generated mutation surface.  The
+    /// follower never decodes a field to *route* — `Database::apply_frame`
+    /// already dispatched by the model tag; this only materializes the
+    /// typed record to *apply* it.
+    pub fn apply(
+        &mut self,
+        kind: forgedb_changefeed::ChangeKind,
+        bytes: &[u8],
+    ) -> Result<(), ApplyError> {
+        match kind {
+            forgedb_changefeed::ChangeKind::Inserted => {
+                let record: Tag = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                self.insert(record)?;
+            }
+            forgedb_changefeed::ChangeKind::Updated => {
+                let record: Tag = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.update(id, record)?;
+            }
+            forgedb_changefeed::ChangeKind::Deleted => {
+                let record: Tag = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.delete(id);
+            }
+            forgedb_changefeed::ChangeKind::Linked => {}
+        }
+        Ok(())
+    }
+    /// Flush this model's columns + tombstones (#110 additive commit).
+    /// Native fsync; wasm arena no-op (durability at the transport's
+    /// IndexedDB/OPFS write boundary).
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        self.id_col.flush()?;
+        self.label_col.flush()?;
+        self.tombstones.flush()?;
+        Ok(())
+    }
     fn recover_from_wal(&mut self) {
         let __anchor = self.tombstones.len();
         while self.id_col.len() < __anchor {
@@ -2926,6 +3083,58 @@ impl Database {
             tag: self.tag.reader(),
             post_tag_link: self.post_tag_link.reader(),
         }
+    }
+    /// Apply one replicated change frame on the browser read-replica
+    /// follower (#110 Milestone C).
+    ///
+    /// Dispatches on the frame's **opaque model tag** (a generated
+    /// closed set — the follower never reads a `.forge` schema at
+    /// runtime) to the matching generated collection, which decodes
+    /// the opaque row bytes and replays through the SAME generated
+    /// mutation surface the server used.  An unknown tag is ignored
+    /// (forward-compatible with a server that gained a model).  The
+    /// change feed / broker are `None` on a follower, so applying
+    /// neither re-emits nor re-journals — it is a pure local replay.
+    ///
+    /// Idempotent by absolute position for an in-order, from-zero
+    /// replay: the follower reproduces the server's exact physical
+    /// layout row-for-row.
+    pub fn apply_frame(
+        &mut self,
+        ev: &forgedb_changefeed::durable::PersistedEvent,
+    ) -> Result<(), ApplyError> {
+        match ev.model.as_str() {
+            "User" => self.user.apply(ev.kind, &ev.bytes),
+            "Post" => self.post.apply(ev.kind, &ev.bytes),
+            "Tag" => self.tag.apply(ev.kind, &ev.bytes),
+            "post_tag_link" => {
+                if ev.bytes.len() == 32 {
+                    let mut __l = [0u8; 16];
+                    __l.copy_from_slice(&ev.bytes[0..16]);
+                    let mut __r = [0u8; 16];
+                    __r.copy_from_slice(&ev.bytes[16..32]);
+                    self.post_tag_link
+                        .link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    /// Commit every collection (#110 Milestone C additive commit):
+    /// flush all model columns + tombstones and fsync junction id
+    /// columns.  Native: an fsync durability boundary.  Wasm arena
+    /// backend: per-column `flush` is a no-op — durability instead
+    /// comes from the transport writing the arena blobs to
+    /// IndexedDB/OPFS in one transaction after this returns.  So on
+    /// the follower this is the "arenas are consistent, safe to
+    /// persist" barrier the transport's async commit waits on.
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        self.user.commit()?;
+        self.post.commit()?;
+        self.tag.commit()?;
+        self.post_tag_link.checkpoint();
+        Ok(())
     }
 }
 impl Database {

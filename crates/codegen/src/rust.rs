@@ -134,6 +134,48 @@ impl RustGenerator {
             impl std::error::Error for ValidationError {}
         });
 
+        // Replication apply error (#110 browser read-replica follower).  The
+        // follower decodes an opaque `PersistedEvent` and replays it through the
+        // SAME generated mutation surface the server uses (`insert`/`update`/
+        // `delete`); this is the union of what that replay can fail with.  Like
+        // `ValidationError` it is a fixed *shape* — no schema is read at runtime.
+        tokens.extend(quote! {
+            /// An error applying a replicated change frame on the read-replica
+            /// follower (#110 Milestone C).  Emitted by the generated
+            /// `<Model>Storage::apply` / `Database::apply_frame`.
+            #[derive(Debug)]
+            pub enum ApplyError {
+                /// The opaque row bytes did not deserialize into the model record
+                /// (a corrupt frame, or a schema skew between server and replica).
+                Decode(String),
+                /// The replayed write failed the generated integrity validators.
+                /// Should not happen for a faithful replica of already-valid data,
+                /// but is surfaced rather than silently dropped.
+                Validation(ValidationError),
+            }
+
+            impl std::fmt::Display for ApplyError {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    match self {
+                        ApplyError::Decode(m) => {
+                            write!(f, "failed to decode replication frame: {}", m)
+                        }
+                        ApplyError::Validation(e) => {
+                            write!(f, "replicated write rejected: {}", e)
+                        }
+                    }
+                }
+            }
+
+            impl std::error::Error for ApplyError {}
+
+            impl From<ValidationError> for ApplyError {
+                fn from(e: ValidationError) -> Self {
+                    ApplyError::Validation(e)
+                }
+            }
+        });
+
         // Generate embedded struct definitions before the models that reference
         // them.  Models store structs as raw fixed-size bytes, so the struct
         // types must exist for the emitted `size_of`/`read_unaligned` code to
@@ -289,6 +331,14 @@ impl RustGenerator {
             _ => quote! {},
         };
 
+        // Replication apply surface (#110 Milestone C): the follower's per-model
+        // entry point, replaying an opaque frame through the same insert/update/
+        // delete above.  `None` (skipped) for a model with no id (cannot mutate).
+        let apply_method = Self::generate_apply_method(model).unwrap_or_else(|| quote! {});
+        // Additive commit (#110): flush every column + tombstone (native fsync;
+        // wasm arena no-op — durability is the transport's IndexedDB/OPFS write).
+        let commit_method = Self::generate_commit_method(model);
+
         // Snapshot-scoped newest-version resolution (#66 + #56): read the id at a
         // physical row so `get_at` / `all_at` can resolve the newest version
         // *within a watermark* — a snapshot captured before an update/delete still
@@ -432,6 +482,10 @@ impl RustGenerator {
                 }
 
                 #mutation_methods
+
+                #apply_method
+
+                #commit_method
 
                 #recover_method
 
@@ -2161,6 +2215,96 @@ impl RustGenerator {
         }
     }
 
+    /// Emit the follower's per-model `apply(kind, bytes)` (#110 Milestone C).
+    ///
+    /// The browser read-replica receives an opaque `PersistedEvent` frame and,
+    /// once `Database::apply_frame` has dispatched by the field-blind model tag,
+    /// hands the row bytes here.  This method decodes them into the typed record
+    /// and **replays through the SAME generated `insert` / `update` / `delete`**
+    /// the server uses — no second write path, so there is no drift risk.  On a
+    /// follower the change feed and durable broker are `None` and the WAL is the
+    /// in-memory wasm variant, so those side effects are inert; the replay is
+    /// purely the column-append + `id_to_row` + index maintenance the server did.
+    ///
+    /// Idempotent by absolute row position for a from-zero replay: applying the
+    /// frames in offset order reproduces the server's exact physical layout.
+    /// `None` (no method emitted) for a model with no id — it cannot be mutated
+    /// and so is never replicated.
+    fn generate_apply_method(model: &forgedb_parser::Model) -> Option<TokenStream> {
+        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        let model_name = format_ident!("{}", model.name);
+        let id_field = Self::id_field_ident(model);
+        Some(quote! {
+            /// Apply a replicated change for this model on the read-replica
+            /// follower (#110).  Decodes the opaque row bytes the server journaled
+            /// and replays through the same generated mutation surface.  The
+            /// follower never decodes a field to *route* — `Database::apply_frame`
+            /// already dispatched by the model tag; this only materializes the
+            /// typed record to *apply* it.
+            pub fn apply(
+                &mut self,
+                kind: forgedb_changefeed::ChangeKind,
+                bytes: &[u8],
+            ) -> Result<(), ApplyError> {
+                match kind {
+                    forgedb_changefeed::ChangeKind::Inserted => {
+                        let record: #model_name = serde_json::from_slice(bytes)
+                            .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                        self.insert(record)?;
+                    }
+                    forgedb_changefeed::ChangeKind::Updated => {
+                        let record: #model_name = serde_json::from_slice(bytes)
+                            .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                        let id = record.#id_field;
+                        self.update(id, record)?;
+                    }
+                    forgedb_changefeed::ChangeKind::Deleted => {
+                        let record: #model_name = serde_json::from_slice(bytes)
+                            .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                        let id = record.#id_field;
+                        self.delete(id);
+                    }
+                    forgedb_changefeed::ChangeKind::Linked => {
+                        // A junction link is not a model event; it is applied by
+                        // `Database::apply_frame` on the junction table directly.
+                    }
+                }
+                Ok(())
+            }
+        })
+    }
+
+    /// Emit the additive `commit(&mut self)` (#110 Milestone C).
+    ///
+    /// Flushes every column + the tombstone file.  Natively this is an `fsync`
+    /// (the same durability boundary `checkpoint` uses, minus the WAL truncate);
+    /// on the wasm arena backend `flush` is a no-op and durability instead comes
+    /// from the transport writing the arena blobs to IndexedDB/OPFS after this
+    /// returns (`forgedb_storage_web::dump`).  Target-agnostic generated code —
+    /// the difference lives entirely in the storage facade.
+    fn generate_commit_method(model: &forgedb_parser::Model) -> TokenStream {
+        let col_idents: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| {
+                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+            })
+            .map(|f| format_ident!("{}_col", f.name))
+            .collect();
+        quote! {
+            /// Flush this model's columns + tombstones (#110 additive commit).
+            /// Native fsync; wasm arena no-op (durability at the transport's
+            /// IndexedDB/OPFS write boundary).
+            pub fn commit(&mut self) -> std::io::Result<()> {
+                #(
+                    self.#col_idents.flush()?;
+                )*
+                self.tombstones.flush()?;
+                Ok(())
+            }
+        }
+    }
+
     /// Emit `checkpoint(&mut self)` (#89 step 2 — bound the WAL).  Makes every
     /// column + the tombstone file durable (`flush()` == `sync_all`), THEN
     /// truncates the WAL.  The order is load-bearing: the WAL is discarded only
@@ -3345,6 +3489,53 @@ impl RustGenerator {
             .map(|field| quote! { #field: self.#field.reader() })
             .collect();
 
+        // Replication apply dispatch (#110 Milestone C): map a frame's OPAQUE
+        // model tag to the matching collection's follower `apply`.  A closed,
+        // generated match — the follower reads no `.forge` at runtime; it only
+        // routes by the string tag the server stamped and lets generated code
+        // materialize the typed record.  Id-bearing models dispatch to their
+        // per-model `apply`; a junction tag decodes the 32-byte opaque pair and
+        // re-links.  (Guard: this method must never `match` on a *decoded field*.)
+        let apply_model_arms: Vec<_> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .map(|model| {
+                let field = format_ident!("{}", Self::to_snake_case(&model.name));
+                let name = model.name.as_str();
+                quote! { #name => self.#field.apply(ev.kind, &ev.bytes), }
+            })
+            .collect();
+        let apply_junction_arms: Vec<_> = m2m
+            .iter()
+            .map(|m| {
+                let field = Self::junction_field_ident(m);
+                let base = format!(
+                    "{}_{}_link",
+                    Self::to_snake_case(&m.model1),
+                    Self::to_snake_case(&m.model2)
+                );
+                quote! {
+                    #base => {
+                        // Opaque 32-byte pair: left uuid ++ right uuid, exactly as
+                        // the junction broker recorded it.  The follower re-links
+                        // through the same generated `link` (broker `None`, inert).
+                        if ev.bytes.len() == 32 {
+                            let mut __l = [0u8; 16];
+                            __l.copy_from_slice(&ev.bytes[0..16]);
+                            let mut __r = [0u8; 16];
+                            __r.copy_from_slice(&ev.bytes[16..32]);
+                            self.#field.link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                        }
+                        Ok(())
+                    }
+                }
+            })
+            .collect();
+        // Junctions flush via `checkpoint` (they have no WAL to truncate — a #89
+        // boundary — so it is just an fsync of both id columns) in `commit`.
+        let junction_field_idents: Vec<_> = m2m.iter().map(Self::junction_field_ident).collect();
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
@@ -3490,6 +3681,52 @@ impl RustGenerator {
                     DatabaseReader {
                         #(#reader_inits,)*
                     }
+                }
+
+                /// Apply one replicated change frame on the browser read-replica
+                /// follower (#110 Milestone C).
+                ///
+                /// Dispatches on the frame's **opaque model tag** (a generated
+                /// closed set — the follower never reads a `.forge` schema at
+                /// runtime) to the matching generated collection, which decodes
+                /// the opaque row bytes and replays through the SAME generated
+                /// mutation surface the server used.  An unknown tag is ignored
+                /// (forward-compatible with a server that gained a model).  The
+                /// change feed / broker are `None` on a follower, so applying
+                /// neither re-emits nor re-journals — it is a pure local replay.
+                ///
+                /// Idempotent by absolute position for an in-order, from-zero
+                /// replay: the follower reproduces the server's exact physical
+                /// layout row-for-row.
+                pub fn apply_frame(
+                    &mut self,
+                    ev: &forgedb_changefeed::durable::PersistedEvent,
+                ) -> Result<(), ApplyError> {
+                    match ev.model.as_str() {
+                        #(#apply_model_arms)*
+                        #(#apply_junction_arms)*
+                        // Unknown model tag: ignore (a newer server model the
+                        // replica's generated code does not know).  Forward-compat.
+                        _ => Ok(()),
+                    }
+                }
+
+                /// Commit every collection (#110 Milestone C additive commit):
+                /// flush all model columns + tombstones and fsync junction id
+                /// columns.  Native: an fsync durability boundary.  Wasm arena
+                /// backend: per-column `flush` is a no-op — durability instead
+                /// comes from the transport writing the arena blobs to
+                /// IndexedDB/OPFS in one transaction after this returns.  So on
+                /// the follower this is the "arenas are consistent, safe to
+                /// persist" barrier the transport's async commit waits on.
+                pub fn commit(&mut self) -> std::io::Result<()> {
+                    #(
+                        self.#model_field_idents.commit()?;
+                    )*
+                    #(
+                        self.#junction_field_idents.checkpoint();
+                    )*
+                    Ok(())
                 }
             }
         };
