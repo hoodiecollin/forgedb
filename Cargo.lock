@@ -1357,8 +1357,10 @@ dependencies = [
 
 [[package]]
 name = "forgedb-changefeed"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
+ "crc32fast",
+ "tempfile",
  "tokio",
 ]
 

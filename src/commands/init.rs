@@ -137,7 +137,7 @@ edition = "2021"
 [dependencies]
 forgedb-storage = "0.1.5"
 forgedb-types = "0.2"
-forgedb-changefeed = "0.1"
+forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-auth = "0.1"
 forgedb-query-params = "0.1"
