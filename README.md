@@ -233,7 +233,22 @@ Dual-licensed under either [MIT](./LICENSE-MIT) or [Apache 2.0](./LICENSE-APACHE
 
 ## Documentation
 
-Comprehensive documentation is available in the [`docs/`](./docs/) directory:
+Comprehensive documentation is available in the [`docs/`](./docs/) directory.
+
+**Start here:**
+
+- **[Getting Started](./docs/GETTING_STARTED.md)** - Install → scaffold → generate → build → serve → typed SDK
+- **[Schema Language Reference](./docs/SCHEMA.md)** - The complete, parser-verified `.forge` reference
+- **[What v1 Is — and Isn't](./docs/WHAT_V1_IS.md)** - Honest guarantees and limits of v1
+- **[Installing](./docs/INSTALL.md)** - Every install path + the substrate version matrix
+
+**Operating:**
+
+- **[Deployment](./docs/DEPLOYMENT.md)** - Containers, env config, ops routes, multi-tenancy, JWT
+- **[Migrations](./docs/MIGRATIONS.md)** - How schema changes affect existing data
+- **[Versioning & Stability](./docs/SEMVER.md)** - Compatibility policy across the four surfaces
+
+**Internals & contributing:**
 
 - **[Architecture](./docs/ARCHITECTURE.md)** - System design, component architecture, and design decisions
 - **[Public Crates](./docs/PUBLIC_CRATES.md)** - Runtime library guide and API documentation
