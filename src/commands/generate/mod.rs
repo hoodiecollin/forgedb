@@ -1,6 +1,7 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
     ApiGenerator, OpenApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator,
+    WasmGenerator,
 };
 use forgedb_parser::Parser;
 use std::fs;
@@ -111,9 +112,12 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             write_file(&path, &result.code, options.force)?;
             generated_files.push((path, result));
         }
+        "wasm" => {
+            generated_files.extend(generate_wasm_replica(&schema, &output_path, options.force)?);
+        }
         _ => {
             return Err(CliError::Other(format!(
-                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs",
+                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm",
                 target
             )));
         }
@@ -198,7 +202,61 @@ fn generate_all(
         files.push((stub_path, stub_result));
     }
 
+    // Generate the wasm browser read-replica crate.  This is an OPT-IN target:
+    // the default `all` (no config filter) skips it, since it emits a whole
+    // browser crate most projects don't need; a project enables it by listing
+    // `wasm` in `[generate].targets`.
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "wasm")) {
+        files.extend(generate_wasm_replica(schema, output_path, force)?);
+    }
+
     Ok(files)
+}
+
+/// Generate the `wasm32` browser read-replica crate (#110 Milestone C): the
+/// `#[wasm_bindgen]` transport (`replica/src/lib.rs`) over the SAME generated
+/// `database.rs` (`replica/src/database.rs`), plus a `Cargo.toml` scaffold
+/// written only when absent.  Build it with `wasm-pack build --target web`.
+fn generate_wasm_replica(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let replica_dir = output_path.join("replica");
+    let src_dir = replica_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let mut files = Vec::new();
+
+    // The wasm-bindgen transport glue.
+    let wasm_result = WasmGenerator::generate(schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let lib_path = src_dir.join("lib.rs");
+    write_file(&lib_path, &wasm_result.code, force)?;
+    files.push((lib_path, wasm_result));
+
+    // The generated database the transport compiles against (same generator as
+    // the `rust` target — the follower is the same data logic, recompiled).
+    let rust_result = RustGenerator::generate(schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let db_path = src_dir.join("database.rs");
+    write_file(&db_path, &rust_result.code, force)?;
+    files.push((db_path, rust_result));
+
+    write_wasm_replica_scaffold(&replica_dir)?;
+    Ok(files)
+}
+
+/// Write the wasm replica crate's `Cargo.toml`.  User-editable config, so it is
+/// written ONLY when absent — a regenerate (even `--force`, which overwrites the
+/// `.rs` files) never clobbers it, mirroring the TS SDK's `package.json`.
+fn write_wasm_replica_scaffold(replica_dir: &Path) -> Result<()> {
+    let path = replica_dir.join("Cargo.toml");
+    if !path.exists() {
+        fs::write(&path, WasmGenerator::cargo_toml_scaffold("forgedb-replica"))?;
+        ui::info(&format!("  ✓ {} (wasm replica scaffold)", path.display()));
+    }
+    Ok(())
 }
 
 /// Write the npm packaging scaffold for the generated TypeScript SDK (Phase 5
