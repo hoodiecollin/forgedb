@@ -1,8 +1,16 @@
-# ForgeDB `.forge` Schema Language — Complete Reference
+# ForgeDB `.forge` Schema Language Reference
 
-**Date:** 2026-07-06  
-**Source:** Comprehensive analysis of parser implementation, AST, validator, and real-world examples  
-**Basis:** `crates/parser/src/{ast.rs, lexer.rs, parser/core.rs}`, existing schemas, templates
+The complete, parser-verified reference for the `.forge` schema language: every
+type, modifier, relation kind, and directive the compiler accepts. New to
+ForgeDB? Start with the [Getting Started](./GETTING_STARTED.md) guide, then use
+this as the lookup reference. For 18 worked schemas across many domains, see
+[`examples/`](../examples/README.md).
+
+> **Verified against the parser.** Every rule below is grounded in
+> `crates/parser/src/{ast.rs, lexer.rs, parser/core.rs}` and the validator, with
+> source line references. Where older docs disagree with this file, this file is
+> correct — see [§10 Known Invalid Patterns](#10-known-invalid-patterns-parser-rejects)
+> and [§12 Quick Drift Summary](#12-quick-drift-summary-vs-claudemd-quick-ref).
 
 ---
 
