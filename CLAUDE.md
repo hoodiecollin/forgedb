@@ -85,7 +85,10 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 400 tests pass** (workspace, incl. doctests). 399→400 with v1 Phase 5 WS1 observability (1 codegen
+**Baseline: 414 tests pass** (workspace, incl. doctests). 400→414 with #82 realtime Direction C (durable
+replication broker): +9 `forgedb-changefeed` `durable` unit tests (offsets / opaque round-trip / reopen /
+torn-tail / prune / catch-up / wire codec) and +2 codegen guards (`test_rust_generation_replication_broker`
++ `test_api_generation_replication_endpoint`). 399→400 with v1 Phase 5 WS1 observability (1 codegen
 guard `test_api_generation_observability_endpoints`; the TS SDK rewrite (WS5) extended `test_typescript_generation_snapshot`
 in place). 398→399 with #105 offline-compact `--force` guard (1 test `test_offline_compact_refuses_without_force`).
 395→398 with v1 Phase 4 (#92): +2 codegen guards
@@ -126,8 +129,16 @@ in `crates/`:
   production consumers; generated code drives `FixedColumn`/`VariableColumn`/`Tombstones`/`Manifest`/`DirLock`
   directly). Published 0.1.5 still contains it harmlessly; removing it is breaking, so the **next** storage
   publish bumps accordingly (do not republish 0.1.5).
-- `changefeed` — field-blind change-feed broadcast substrate (#62-A) — **0.1.1 (published 2026-07-08;
-  0.1.1 adds `ChangeKind::Updated`/`Deleted` for #66; 0.1.0 published 2026-07-07)**
+- `changefeed` — field-blind change-feed broadcast + **durable replication broker** substrate
+  (#62-A / #82) — **0.2.0 (NOT yet published; publish gap OPEN — see below)**. 0.2.0 adds the
+  `durable` module for #82 realtime Direction C: a `DurableBroker` that records each change to a
+  CRC-framed, append-only log at a **monotonic global offset** (the opaque cross-model ordering
+  token) + a resumable subscription (`read_from`/`subscribe`/`catch_up_from`, idempotent by absolute
+  offset) — the substrate the WASM read-replica follower (#110) resumes from. Field-blind:
+  `PersistedEvent { offset, model, row_index, kind, bytes }` carries the model name as an opaque tag
+  and the committed row bytes verbatim (same class as the in-process feed). The generated `/replicate`
+  WS endpoint streams its `to_wire()` binary frames. (0.1.1 added `ChangeKind::Updated`/`Deleted` for
+  #66 — published 2026-07-08; 0.1.0 published 2026-07-07.)
 - `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (published 2026-07-09)**.
   Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM,
   algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
@@ -437,14 +448,19 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` + `forgedb-types 0.2.0` from crates.io and compiling
   the generated reader code. (#62-B live queries needed **no** substrate change — the changefeed already
   carried the coarse signal — so `forgedb-changefeed` stayed 0.1.1.) `wal` 0.1.1 / `types` 0.2.0 unchanged.
-  Scaffold pins `forgedb-storage = "0.1.5"`, `forgedb-changefeed = "0.1"`, **`forgedb-wal = "0.2"`** (#89),
+  Scaffold pins `forgedb-storage = "0.1.5"`, **`forgedb-changefeed = "0.2"`** (#82 — bumped from "0.1"),
+  **`forgedb-wal = "0.2"`** (#89),
   **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), **`forgedb-compaction = "0.1"`** (#92),
-  axum `ws`. **#92 CLOSED 2026-07-11:** Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
+  axum `ws`. **#82 REOPENED the gap 2026-07-13:** realtime Direction C (durable replication broker) made
+  generated `database.rs` + `api.rs` link **`forgedb-changefeed 0.2.0`** (the `durable` module + `/replicate`
+  endpoint), which is **not yet published** — so `forgedb-changefeed 0.2.0` must publish before the reclose is
+  proven (same pattern as wal/storage/query-params/compaction). **#92 CLOSED 2026-07-11:** Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
   auto-compaction); `forgedb-compaction 0.1.0` is published and the reclose is PROVEN by an outside-repo
   `init → generate rust+api → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / query-params 0.1.0 /
   changefeed / auth / types) from crates.io (0 errors). History: the gap reopened for #57, #62-A, #66, #56-B, #59,
-  #89/#96, #90, and #92 — **all now closed** (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5
-  closed #89/#96; compaction 0.1.0 closed #92). #59 closed
+  #89/#96, #90, #92, and #82 (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5
+  closed #89/#96; compaction 0.1.0 closed #92 — **all closed except #82, which is currently OPEN and needs
+  `forgedb-changefeed 0.2.0` published**). #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
@@ -581,6 +597,44 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `serde_json` compare (#62-A fragility inherited); single-process. Guards:
   `test_api_generation_live_query`, `test_rust_generation_live_delta_enums`; **live WS round-trip**
   (Init→Added→silent→Updated→Removed) in `scratchpad/directionb_compile` (ephemeral).
+- **Durable replication broker (#82 realtime Direction C) — Milestones A + B LANDED (publish-pending).**
+  The deferred networked/durable/resumable slice of #62, and the critical-path substrate that unblocks
+  the WASM read-replica (#110). Two milestones landed:
+  - **A — substrate core (`forgedb-changefeed::durable`).** A `DurableBroker` records each committed
+    change to a **CRC-framed, append-only log** (mirroring `forgedb-wal`'s framing + torn-tail recovery)
+    at a **monotonic global `u64` offset** — the single **opaque cross-model ordering token** (PM
+    constraint #2; single-writer `record` order == commit order). Resumable API: `read_from(after,max)`
+    (durable replay), `subscribe()` (live tail), `catch_up_from()` (the race-free stitch: subscribe →
+    replay to a `boundary` → drain live **skipping `offset <= boundary`**, i.e. idempotent by absolute
+    offset — PM constraint #1), plus `watermark()`/`earliest_retained()` (snapshot-vs-tail cutover) and
+    `prune_through()` (retention). Frame `PersistedEvent { offset, model, row_index, kind, bytes }` is
+    **field-blind by construction** (no field-typed member; `model` an opaque tag; `bytes` the opaque
+    committed row bytes carried verbatim, with a public `to_wire`/`from_wire` binary codec == the log
+    framing). Bumped changefeed **0.1.1 → 0.2.0**. 17 unit tests (monotonic offsets, verbatim
+    opaque-byte round-trip, cold replay, offset-continuity across reopen, torn-tail recovery, prune,
+    gap-free/dup-free catch-up, wire round-trip).
+  - **B — generated wiring.** Each generated mutation now **also** records to the shared broker
+    alongside the best-effort change-feed emit: `insert`/`update`/`delete` hand it the model name + the
+    tombstone/superseding physical `row_index` + the **same opaque `serde_json(record)` bytes the WAL
+    journals** (never a decoded field); M2M `link` records the 32-byte opaque pair. `Database` owns one
+    `Arc<Mutex<DurableBroker>>` (durable log `<root>/_replication.log`), created in `open_at` and
+    attached to every collection (`attach_broker`), `None` on the standalone `new()` path; compaction
+    preserves it across reopen. A single schema-wide generated WS endpoint **`GET /replicate?after=<offset>`**,
+    **inside `__data_routes` so it sits behind the #59 `forgedb-auth` tenant guard** (reuses the SAME
+    extractor — PM constraint #4), does the resumable handshake via `catch_up_from` and streams
+    `PersistedEvent::to_wire()` **binary** frames (opaque; the handler decodes nothing). Guards
+    `test_rust_generation_replication_broker` + `test_api_generation_replication_endpoint` (both assert
+    no `match model_name`). **Compile-verified** (full `init`-style crate: db+api `cargo check` clean via
+    path deps) + **server-record E2E** in `scratchpad/dirc_compile` (ephemeral): 6 mutations through real
+    generated code → 6 records at monotonic offsets 1..6, correct kinds + append-only row positions
+    (insert row 0 / update row 1 / delete row 2), 32-byte link, resumable replay from offset 3.
+    **Honest limits / deferred:** the **live WS round-trip** E2E + the browser follower **apply** path
+    land with Milestone C (= #110, OPFS/`wasm32`); the durable-log fsync policy is fixed `Always` and the
+    retention/`prune_through` trigger is not yet auto-wired (manual today); M2M follower apply stays out
+    of M1 (UUID-only-traversal inheritance); single-process source of truth.
+    **Publish gap OPEN:** generated `database.rs` + `api.rs` now link **`forgedb-changefeed 0.2.0`**
+    (`durable` module), unpublished — so `forgedb-changefeed 0.2.0` must publish before the reclose is
+    proven (mirrors wal/storage/query-params/compaction). Scaffold pin bumped `= "0.1"` → **`= "0.2"`**.
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
