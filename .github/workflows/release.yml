@@ -1,0 +1,78 @@
+# Prebuilt-binary releases for the `forgedb` CLI (Phase 5 WS4 distribution).
+#
+# Trigger: push a semver tag, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+# The job cross-builds the `forgedb` binary for the supported targets, packages
+# each (tar.gz on Unix, zip on Windows), and attaches them to a GitHub Release.
+# Publishing to crates.io is a separate manual step (see docs/INSTALL.md) — this
+# workflow only produces downloadable binaries.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release + upload assets
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # aarch64 Linux needs a cross linker under the x86_64 runner.
+      - name: Install cross linker (aarch64-linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+
+      - name: Build
+        run: cargo build --release --locked --bin forgedb --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/forgedb"
+          pkg="forgedb-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          tar -czf "$pkg" -C "$(dirname "$bin")" forgedb
+          echo "ASSET=$pkg" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/forgedb.exe"
+          $pkg = "forgedb-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive -Path $bin -DestinationPath $pkg
+          "ASSET=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
