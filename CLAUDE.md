@@ -85,7 +85,9 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 424 tests pass** (workspace, incl. doctests). 414→424 with #110 Milestone C (browser
+**Baseline: 425 tests pass** (workspace, incl. doctests). 424→425 with #110 Milestone C follow-up #3
+(the wasm-bindgen browser-replica transport is now GENERATED per-schema, not hand-written): +1 codegen
+guard (`test_wasm_generation_transport`). 414→424 with #110 Milestone C (browser
 read-replica follower): +9 `forgedb-storage-web` arena-parity unit tests and +1 codegen guard
 (`test_rust_generation_replica_apply_path`). (The moved `forgedb-storage-native` tests — 45 unit + 4 doctests —
 were already counted under the old `storage` crate, so the facade split is test-count-neutral.) 400→414 with #82 realtime Direction C (durable
@@ -674,23 +676,37 @@ across many domains live in `examples/` — see `examples/README.md`.**
     an `ApplyError` type. **The generated `database.rs` compiles to `wasm32-unknown-unknown` with ZERO codegen
     branches** — the facade absorbs the target difference (the identity proof: no WASM generator branch). Guard
     `test_rust_generation_replica_apply_path`; runtime apply round-trip also proven natively.
-  - **L3 — `wasm-bindgen` transport (class-2 glue).** A `#[wasm_bindgen]` `Replica` exposing ONLY
-    open/applyWire/commit/watermark + generated reads (getUser/userCount/userPosts) — no invented query surface
-    (red line). `wasm-pack build --target web` → `.wasm` + ES module + `.d.ts`.
+  - **L3 — `wasm-bindgen` transport (class-2 glue) — now GENERATED per-schema (#3 follow-up LANDED 2026-07-13).**
+    A new codegen artifact `WasmGenerator` (`crates/codegen/src/wasm.rs`, joining Rust/TypeScript/Api/Stub/OpenApi)
+    emits the `#[wasm_bindgen]` `Replica` per schema: schema-invariant lifecycle (open/applyWire/commit/watermark)
+    plus a read surface that MIRRORS the generated `Database`'s live reads EXACTLY — per-model get/count/all + every
+    relation traversal (forward FK, reverse one-to-many, M2M queries), reusing `RustGenerator`'s own
+    `to_snake_case`/`is_uuid_pk`/`valid_m2m` name derivation (promoted `pub(crate)`) so names never drift. It
+    invents no query API and exposes no mutators (a read-only follower) — the identity red line, guard-checked.
+    Wired into the CLI as `forgedb generate wasm` (emits `replica/{Cargo.toml (only-if-absent),src/lib.rs,
+    src/database.rs}`); opt-in in `generate all` (only when `[generate].targets` lists `wasm`). `wasm-pack build
+    --target web` → `.wasm` + ES module + `.d.ts`. Guard `test_wasm_generation_transport`.
   - **L4 — browser E2E.** A native `genframes` bin emits real `to_wire` frames; a Bun WS server streams them
     honoring `?after`; Playwright drives the round-trip + reload-resume for IDB and OPFS. Ephemeral harness
-    `scratchpad/wasm_l2/`.
+    `scratchpad/wasm_l2/`. **Re-proven end-to-end with the GENERATED transport (#3):** `forgedb generate wasm` →
+    `wasm-pack build` → both backends green (phase-1 applies all 7 frames incl. update/delete/M2M-link + reverse
+    traversal; reload resumes from watermark 7 with 0 frames re-applied, data intact).
   PM identity red lines held: the replica is the SAME generated code (no schema read at runtime); dispatch is by
   the opaque model tag; the storage backend + `persist` move opaque path→bytes blobs and know no schema.
   **Honest limits / deferred:** OPFS uses async main-thread file I/O + a whole-DB snapshot file (sync-access
-  handles in a Worker + per-column files = follow-up); whole-DB hydrate on open + commit-granularity durability
-  (accepted milestone-1 limits); the wasm-bindgen transport is hand-written per-schema in the harness
-  (codegen-generating it per-schema is a follow-up); **read-only** replica (local/optimistic writes = Phase 2).
+  handles in a Worker + per-column files = follow-up, #1, NEXT); whole-DB hydrate on open + commit-granularity
+  durability (accepted milestone-1 limits, #2 — to be revisited in a design discussion before any impl);
+  **read-only** replica (local/optimistic writes = Phase 2). (The prior "wasm-bindgen transport hand-written in
+  the harness" limit is RESOLVED by #3 above.)
   **WASM PUBLISH GAP (OPEN):** the browser build needs `forgedb-types` (wasm uuid feature) + `forgedb-wal` (wasm
   `WalManager`) republished and NEW `forgedb-storage 0.2.0` facade + `forgedb-storage-native 0.1.0` +
   `forgedb-storage-web 0.1.0` published. The **native** `init→build` gap is NOT reopened — the new apply/commit
   codegen uses only already-published surface (storage `flush`, changefeed 0.2.0 `PersistedEvent`), and the
-  scaffold still pins published `forgedb-storage = "0.1.5"`. Not yet committed.
+  **server** scaffold still pins published `forgedb-storage = "0.1.5"`. #3 does NOT widen this gap: the generated
+  `replica/Cargo.toml` scaffold (`WasmGenerator::cargo_toml_scaffold`) pins the SAME still-unpublished wasm crate
+  set (`forgedb-storage = "0.2"`, `-wal = "0.2"`, `-types = "0.2"`, `-changefeed = "0.2"`, `-compaction = "0.1"`);
+  the harness proves the build via local path deps until that set publishes. Committed 2026-07-13 (types/wal/
+  storage-split + codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13.
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
