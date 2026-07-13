@@ -361,8 +361,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
     a `u32 → string` type change round-trips, ids preserved). **The data-transform migration engine stays out of v1.**
 
   Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1's `forgedb-compaction 0.1.0` published + reclose proven).
-  **Phase 5 (#93 — ship) is IN PROGRESS: WS1 (observability), WS2 (deploy), WS4 (distribution), WS5 (SDK),
-  WS6 (semver) LANDED; only WS3 (the honest "what v1 is / isn't" docs) remains.** v1 scope is locked:
+  **Phase 5 (#93 — ship) is COMPLETE: all six workstreams landed — WS1 (observability), WS2 (deploy),
+  WS3 (docs), WS4 (distribution), WS5 (SDK), WS6 (semver).** WS3 shipped four docs grounded in a real
+  `init → generate → build → serve → curl` e2e run: `docs/GETTING_STARTED.md`, `docs/SCHEMA.md` (the
+  parser-verified `.forge` reference, promoted from `docs/proposals/corpus/forge-grammar-reference.md`),
+  `docs/DEPLOYMENT.md`, and `docs/WHAT_V1_IS.md` (the honest "what v1 is / isn't"). v1 scope is locked:
   **design-partner bar, single-writer-per-process, migrations data-engine deferred** — see `docs/V1_ROADMAP.md`
   and epics #89–#93.
 
