@@ -12,8 +12,21 @@
 //!
 //! The append-only storage engine *is* a change log — every write is positionally
 //! an event. This primitive simply fans that fact out to subscribers, best-effort
-//! and in-process. Durable replay, offsets, and cross-process fan-out are
-//! explicitly out of scope (Direction C in the realtime-subscriptions proposal).
+//! and in-process.
+//!
+//! ## Two feeds, one red line
+//!
+//! - [`ChangeFeed`] (this module) — the **in-process, best-effort** signal:
+//!   ephemeral `tokio::sync::broadcast` of a field-blind `{model, row_index,
+//!   kind}`, no durability and no offsets. Directions A + B (#62).
+//! - [`durable::DurableBroker`] — the **durable, offset-addressed, resumable**
+//!   broker (#82, Direction C): the same field-blind signal *plus* the opaque
+//!   committed row bytes and a monotonic global offset, persisted to a
+//!   CRC-framed append-only log so a subscriber can reconnect and resume from a
+//!   watermark. The substrate the WASM read-replica follower pulls from (#110).
+//!
+//! Both stay field-blind. The offset is an **opaque ordering token**, not a
+//! decoded value; the bytes are carried verbatim and never interpreted here.
 //!
 //! ## The red line
 //!
@@ -24,6 +37,8 @@
 //! typed payload both happen in generated code.
 
 use tokio::sync::broadcast;
+
+pub mod durable;
 
 /// What kind of change a [`ChangeEvent`] describes.
 ///
@@ -48,6 +63,35 @@ pub enum ChangeKind {
     Deleted,
     /// A pair was appended to an M2M junction table.
     Linked,
+}
+
+impl ChangeKind {
+    /// Stable on-disk / on-wire byte encoding.
+    ///
+    /// These byte values are a **durable format contract** for [`durable`] —
+    /// they are persisted to the broker log and sent across a process boundary,
+    /// so they must never be reordered or reused. Append new variants with new
+    /// byte values only.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            ChangeKind::Inserted => 0,
+            ChangeKind::Updated => 1,
+            ChangeKind::Deleted => 2,
+            ChangeKind::Linked => 3,
+        }
+    }
+
+    /// Decode a [`ChangeKind`] from its stable byte encoding, or `None` if the
+    /// byte does not name a known kind (a corrupt or newer-format record).
+    pub fn from_byte(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(ChangeKind::Inserted),
+            1 => Some(ChangeKind::Updated),
+            2 => Some(ChangeKind::Deleted),
+            3 => Some(ChangeKind::Linked),
+            _ => None,
+        }
+    }
 }
 
 /// A single positional change signal: model `model` gained a row at `row_index`.
