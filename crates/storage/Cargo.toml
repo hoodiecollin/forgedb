@@ -1,17 +1,21 @@
 [package]
 name = "forgedb-storage"
-version = "0.1.5"
+version = "0.2.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
-description = "Storage engine for ForgeDB"
+description = "Columnar storage facade for ForgeDB — re-exports the native positional-file backend on host targets and the in-memory-arena browser backend (IndexedDB/OPFS) on wasm32. Generated code links this crate and stays byte-identical across targets."
 repository = "https://github.com/hoodiecollin/forgedb"
-keywords = ["database", "storage", "forgedb"]
+keywords = ["database", "storage", "forgedb", "wasm"]
 categories = ["database"]
 
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-forgedb-wal = { path = "../wal", version = "0.2.0" }
-uuid = { version = "1.6", features = ["v4"] }
-fs2 = "0.4"
-libc = "0.2.186"
+# The facade selects a backend by target. Generated code keeps
+# `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};` verbatim; the
+# re-export below resolves to the native engine on host builds and to the
+# in-memory-arena web backend on the browser read-replica target (#110). Only one
+# backend is ever linked per build, so their (identical) public types never
+# collide.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+forgedb-storage-native = { path = "../storage-native", version = "0.1.0" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+forgedb-storage-web = { path = "../storage-web", version = "0.1.0" }

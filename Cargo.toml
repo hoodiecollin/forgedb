@@ -4,6 +4,8 @@ members = [
     "crates/parser",
     "crates/codegen",
     "crates/storage",
+    "crates/storage-native",
+    "crates/storage-web",
     "crates/types",
     "crates/validation",
     "crates/watcher",

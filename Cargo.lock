@@ -1453,7 +1453,15 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.1.5"
+version = "0.2.0"
+dependencies = [
+ "forgedb-storage-native",
+ "forgedb-storage-web",
+]
+
+[[package]]
+name = "forgedb-storage-native"
+version = "0.1.0"
 dependencies = [
  "forgedb-wal",
  "fs2",
@@ -1461,6 +1469,19 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "forgedb-storage-web"
+version = "0.1.0"
+dependencies = [
+ "forgedb-wal",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

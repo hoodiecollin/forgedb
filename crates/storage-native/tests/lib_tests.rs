@@ -1,4 +1,4 @@
-use forgedb_storage::*;
+use forgedb_storage_native::*;
 use std::fs;
 
 // ---------------------------------------------------------------------------

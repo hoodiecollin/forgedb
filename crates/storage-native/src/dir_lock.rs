@@ -29,7 +29,7 @@ use std::path::Path;
 /// # Acquiring
 ///
 /// ```no_run
-/// use forgedb_storage::DirLock;
+/// use forgedb_storage_native::DirLock;
 /// use std::path::Path;
 ///
 /// let lock = DirLock::acquire(Path::new("./data"))?;
@@ -45,7 +45,7 @@ use std::path::Path;
 /// should print a human-readable message and exit:
 ///
 /// ```no_run
-/// use forgedb_storage::DirLock;
+/// use forgedb_storage_native::DirLock;
 /// use std::path::Path;
 ///
 /// match DirLock::acquire(Path::new("./data")) {
