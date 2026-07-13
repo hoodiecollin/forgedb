@@ -130,7 +130,7 @@ in `crates/`:
   directly). Published 0.1.5 still contains it harmlessly; removing it is breaking, so the **next** storage
   publish bumps accordingly (do not republish 0.1.5).
 - `changefeed` — field-blind change-feed broadcast + **durable replication broker** substrate
-  (#62-A / #82) — **0.2.0 (NOT yet published; publish gap OPEN — see below)**. 0.2.0 adds the
+  (#62-A / #82) — **0.2.0 (published 2026-07-13)**. 0.2.0 adds the
   `durable` module for #82 realtime Direction C: a `DurableBroker` that records each change to a
   CRC-framed, append-only log at a **monotonic global offset** (the opaque cross-model ordering
   token) + a resumable subscription (`read_from`/`subscribe`/`catch_up_from`, idempotent by absolute
@@ -451,16 +451,18 @@ across many domains live in `examples/` — see `examples/README.md`.**
   Scaffold pins `forgedb-storage = "0.1.5"`, **`forgedb-changefeed = "0.2"`** (#82 — bumped from "0.1"),
   **`forgedb-wal = "0.2"`** (#89),
   **`forgedb-auth = "0.1"`** (#59), **`forgedb-query-params = "0.1"`** (#90), **`forgedb-compaction = "0.1"`** (#92),
-  axum `ws`. **#82 REOPENED the gap 2026-07-13:** realtime Direction C (durable replication broker) made
+  axum `ws`. **#82 CLOSED 2026-07-13:** realtime Direction C (durable replication broker) made
   generated `database.rs` + `api.rs` link **`forgedb-changefeed 0.2.0`** (the `durable` module + `/replicate`
-  endpoint), which is **not yet published** — so `forgedb-changefeed 0.2.0` must publish before the reclose is
-  proven (same pattern as wal/storage/query-params/compaction). **#92 CLOSED 2026-07-11:** Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
+  endpoint); `forgedb-changefeed 0.2.0` is **published** and the reclose is PROVEN by an outside-repo
+  `init --template blog → generate rust+api → cargo build` that **downloaded `forgedb-changefeed 0.2.0`** (+
+  storage 0.1.5 / wal 0.2.0 / query-params 0.1.0 / compaction 0.1.0 / auth 0.1.0 / types 0.2.0) from crates.io
+  and compiled the generated replication code (0 errors). **#92 CLOSED 2026-07-11:** Phase 4 W1 made generated code link **`forgedb-compaction`** (in-process
   auto-compaction); `forgedb-compaction 0.1.0` is published and the reclose is PROVEN by an outside-repo
   `init → generate rust+api → cargo build` resolving it (+ storage 0.1.5 / wal 0.2.0 / query-params 0.1.0 /
   changefeed / auth / types) from crates.io (0 errors). History: the gap reopened for #57, #62-A, #66, #56-B, #59,
-  #89/#96, #90, #92, and #82 (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 + storage 0.1.5
-  closed #89/#96; compaction 0.1.0 closed #92 — **all closed except #82, which is currently OPEN and needs
-  `forgedb-changefeed 0.2.0` published**). #59 closed
+  #89/#96, #90, #92, and #82 — **all now closed** (query-params 0.1.0 closed #90 on 2026-07-10; wal 0.2.0 +
+  storage 0.1.5 closed #89/#96; compaction 0.1.0 closed #92; **changefeed 0.2.0 closed #82 on 2026-07-13**).
+  #59 closed
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
@@ -632,9 +634,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
     land with Milestone C (= #110, OPFS/`wasm32`); the durable-log fsync policy is fixed `Always` and the
     retention/`prune_through` trigger is not yet auto-wired (manual today); M2M follower apply stays out
     of M1 (UUID-only-traversal inheritance); single-process source of truth.
-    **Publish gap OPEN:** generated `database.rs` + `api.rs` now link **`forgedb-changefeed 0.2.0`**
-    (`durable` module), unpublished — so `forgedb-changefeed 0.2.0` must publish before the reclose is
-    proven (mirrors wal/storage/query-params/compaction). Scaffold pin bumped `= "0.1"` → **`= "0.2"`**.
+    **Publish gap CLOSED (2026-07-13):** generated `database.rs` + `api.rs` link **`forgedb-changefeed 0.2.0`**
+    (`durable` module + `/replicate`); it is **published**, scaffold pin bumped `= "0.1"` → **`= "0.2"`**, and
+    the reclose is PROVEN by an outside-repo `init --template blog → generate rust+api → cargo build` that
+    downloaded `forgedb-changefeed 0.2.0` (+ storage/wal/query-params/compaction/auth/types) from crates.io and
+    compiled the generated replication code (0 errors).
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
