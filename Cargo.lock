@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-types"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1499,7 +1499,7 @@ version = "0.1.0"
 
 [[package]]
 name = "forgedb-wal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crc32fast",
  "tempfile",
