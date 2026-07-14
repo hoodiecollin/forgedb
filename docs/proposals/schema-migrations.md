@@ -204,6 +204,10 @@ manifest-read-preserve).
   single-writer discipline).
 - **Multi-step / expression data transforms** (e.g. split a column, compute a new field from others) —
   deferred; Phase 2/3 handle structural changes with constant defaults, not row-wise computation.
+  **Now designed → [`data-transform-migrations.md`](./data-transform-migrations.md)** (issue #74, PM
+  verdict PASS-WITH-CONSTRAINTS): row-wise transforms are a **generated typed `transform(old) -> new`
+  Rust function** (dev-time codegen + one-shot offline compiled binary), not a runtime expression
+  interpreter — the manual dump/reload path, generated and type-checked.
 - **Lossy down-migrations** for rewrite-class changes (a type narrowing can't round-trip) — `down` may be
   refused or documented-lossy, not silently reconstructed.
 - **Cross-tenant coordination** beyond a sequential rolling sweep — deferred (composes with #59's model-C
