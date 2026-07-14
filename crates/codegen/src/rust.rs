@@ -975,19 +975,29 @@ impl RustGenerator {
             .collect()
     }
 
+    /// The first string param of a constraint (`@pattern("...")`/`@default("...")`).
+    fn constraint_first_string(c: &forgedb_parser::ast::Constraint) -> Option<&str> {
+        c.params.iter().find_map(|p| match p {
+            forgedb_parser::ast::ConstraintParam::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
     /// Generate the per-model field-constraint validator (#91 Phase 3):
     /// `validate_<snake>(record) -> Result<(), ValidationError>`, enforcing the
-    /// declared `@min`/`@max` (numeric), `@length` (string), `@email`, and `@url`
-    /// directives.  Every check is generated from a specific field + directive —
-    /// there is no runtime constraint interpreter.  Nullable fields are validated
-    /// only when `Some` (a `None` value violates no value-constraint).
+    /// declared `@min`/`@max` (numeric), `@length`/`@email`/`@url`/`@pattern`/`@regex`
+    /// (string) directives.  Every check is generated from a specific field +
+    /// directive — there is no runtime constraint interpreter.  Nullable fields are
+    /// validated only when `Some` (a `None` value violates no value-constraint).
     ///
-    /// `@pattern`/`@regex` are intentionally NOT enforced here (they need a regex
-    /// engine dependency in the generated crate) — deferred as a Phase-3 follow-up.
+    /// `@pattern`/`@regex` (#104) are aliases: the value must match a schema-declared
+    /// regex, compiled once into a per-(model,field) `LazyLock<regex::Regex>` static.
     fn generate_field_validation(model: &forgedb_parser::Model) -> TokenStream {
         let fn_name = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let model_name = format_ident!("{}", model.name);
 
+        // `LazyLock<Regex>` statics for each `@pattern`/`@regex` field (#104),
+        // compiled once and shared across every validate call.
+        let pattern_statics = std::cell::RefCell::new(Vec::<TokenStream>::new());
         let field_blocks: Vec<_> = model
             .fields
             .iter()
@@ -1079,6 +1089,38 @@ impl RustGenerator {
                                 }
                             });
                         }
+                        // `@pattern("...")` / `@regex("...")` are aliases (#104): the
+                        // value must match the declared regex.  The pattern is authored
+                        // at schema-write time, so it is compiled ONCE into a per-(model,
+                        // field) `LazyLock<Regex>` static; the whole value is tested with
+                        // `is_match` (a match anywhere unless the pattern is anchored,
+                        // consistent with common regex-constraint semantics).
+                        "pattern" | "regex" if is_string => {
+                            if let Some(pat) = Self::constraint_first_string(c) {
+                                let rname = format!(
+                                    "__PAT_{}_{}",
+                                    Self::to_snake_case(&model.name).to_uppercase(),
+                                    field.name.to_uppercase()
+                                );
+                                let rident = format_ident!("{}", rname);
+                                let msg = format!("must match pattern {pat}");
+                                pattern_statics.borrow_mut().push(quote! {
+                                    static #rident: std::sync::LazyLock<regex::Regex> =
+                                        std::sync::LazyLock::new(|| {
+                                            regex::Regex::new(#pat)
+                                                .expect("schema-declared @pattern/@regex is a valid regex")
+                                        });
+                                });
+                                checks.push(quote! {
+                                    if !#rident.is_match(__v.as_str()) {
+                                        return Err(ValidationError::Constraint {
+                                            field: #fname_str, rule: "pattern",
+                                            message: #msg.to_string(),
+                                        });
+                                    }
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1106,10 +1148,14 @@ impl RustGenerator {
             })
             .collect();
 
+        let pattern_statics = pattern_statics.into_inner();
+
         quote! {
             /// Field-constraint validation (#91): reject a record whose values
-            /// violate a declared `@min`/`@max`/`@length`/`@email`/`@url` directive.
+            /// violate a declared `@min`/`@max`/`@length`/`@email`/`@url`/`@pattern`
+            /// directive.
             fn #fn_name(record: &#model_name) -> Result<(), ValidationError> {
+                #(#pattern_statics)*
                 #(#field_blocks)*
                 Ok(())
             }

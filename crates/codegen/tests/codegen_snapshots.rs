@@ -1859,6 +1859,49 @@ Post {
 }
 
 #[test]
+fn test_rust_generation_pattern_validation() {
+    // #104: `@pattern("...")` / `@regex("...")` are now ENFORCED in the same
+    // generated per-model `validate_<model>` as `@email`/`@length`, compiled once
+    // into a `LazyLock<regex::Regex>` static and reported via the Constraint (422)
+    // path.  Nullable string fields validate only when `Some`.
+    let src = r#"
+Account {
+  id: +uuid
+  code: string @pattern("^[0-9]+$")
+  slug: string? @regex("^[a-z-]+$")
+  age: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The validator exists and carries the pattern rule (Constraint → 422).
+    assert!(
+        flat.contains("fn validate_account(record: &Account) -> Result<(), ValidationError>"),
+        "generated per-model field validator"
+    );
+    assert!(flat.contains("rule: \"pattern\""), "@pattern/@regex map to the Constraint rule");
+
+    // The regex is compiled once into a LazyLock static over the plain `regex` crate,
+    // and each declared pattern's source is embedded verbatim.
+    assert!(
+        flat.contains("std::sync::LazyLock<regex::Regex>"),
+        "pattern compiled once into a LazyLock<regex::Regex> static"
+    );
+    assert!(flat.contains("regex::Regex::new(\"^[0-9]+$\")"), "@pattern source embedded");
+    assert!(flat.contains("regex::Regex::new(\"^[a-z-]+$\")"), "@regex source embedded");
+    assert!(flat.contains(".is_match(__v.as_str())"), "the value is tested with is_match");
+
+    // The nullable `slug` field only validates its `Some` value (matches @email/@length).
+    assert!(
+        flat.contains("if let Some(__v) = &record.slug"),
+        "nullable pattern field validated only when Some"
+    );
+}
+
+#[test]
 fn test_rust_generation_auto_compaction() {
     // Bounded storage (v1 Phase 4 — #92 Workstream 1): the mutation surface (#66)
     // leaves dead row versions behind; generated code auto-compacts IN-PROCESS

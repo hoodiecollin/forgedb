@@ -142,6 +142,7 @@ forgedb-wal = "0.2"
 forgedb-auth = "0.1"
 forgedb-query-params = "0.1"
 forgedb-compaction = "0.1"
+regex = "1"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}
