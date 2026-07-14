@@ -1347,6 +1347,7 @@ dependencies = [
 name = "forgedb-backup"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "forgedb-storage",
  "log",
  "serde",
