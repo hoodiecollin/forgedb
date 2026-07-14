@@ -56,6 +56,9 @@ impl TypeScriptGenerator {
                  export type {0}Create = Omit<{0}, 'id'>;\n\n",
                 model.name
             ));
+            // Column-projection interfaces (#113): one tight type per @projection,
+            // PK + selected columns only.
+            code.push_str(&Self::generate_projection_interfaces(model));
         }
 
         // Shared SDK types (error, pagination) — schema-independent.
@@ -83,6 +86,75 @@ impl TypeScriptGenerator {
         code.push_str("}\n");
 
         Ok(code)
+    }
+
+    /// Generate the TS interface for each declared `@projection` (#113): a tight
+    /// type named `<Model><Name>` carrying PK + the selected columns, mirroring
+    /// the Rust projection struct.  Empty when the model has no projections.
+    fn generate_projection_interfaces(model: &forgedb_parser::Model) -> String {
+        let mut code = String::new();
+        for proj in &model.projections {
+            let type_name = format!(
+                "{}{}",
+                model.name,
+                crate::rust::RustGenerator::projection_pascal(&proj.name)
+            );
+            code.push_str(&format!(
+                "/** Projection `{}` of `{}` — PK + declared columns only. */\n\
+                 export interface {} {{\n",
+                proj.name, model.name, type_name
+            ));
+            for field in crate::rust::RustGenerator::projected_field_set(model, proj) {
+                let field_type = Self::map_field_type(&field.field_type);
+                let nullable = if field.is_nullable() { " | null" } else { "" };
+                code.push_str(&format!("  {}: {}{};\n", field.name, field_type, nullable));
+            }
+            code.push_str("}\n\n");
+        }
+        code
+    }
+
+    /// Generate the client methods for each declared `@projection` (#113):
+    /// `get<Model><Name>(id)` and `list<Model><Name>(options)`, both hitting the
+    /// REST `?projection=<name>` closed-set surface.  Empty when none declared.
+    fn generate_projection_methods(model: &forgedb_parser::Model) -> String {
+        let mut code = String::new();
+        let kebab = Self::to_kebab_case(&model.name);
+        for proj in &model.projections {
+            let type_name = format!(
+                "{}{}",
+                model.name,
+                crate::rust::RustGenerator::projection_pascal(&proj.name)
+            );
+            let method = format!(
+                "{}{}",
+                model.name,
+                crate::rust::RustGenerator::projection_pascal(&proj.name)
+            );
+            let pname = &proj.name;
+            code.push_str(&format!(
+                "  /** Get the `{pname}` projection of a {name} by id, or `null` if absent. */\n\
+                 \x20 async get{method}(id: string): Promise<{ty} | null> {{\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}/${{encodeURIComponent(id)}}?projection={pname}`);\n\
+                 \x20   if (response.status === 404) return null;\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return (await response.json()) as {ty};\n\
+                 \x20 }}\n\n",
+                name = model.name, ty = type_name,
+            ));
+            code.push_str(&format!(
+                "  /** List {name} rows as the `{pname}` projection (PK + declared columns). */\n\
+                 \x20 async list{method}(options: ListOptions = {{}}): Promise<ListResult<{ty}>> {{\n\
+                 \x20   const q = this.listQuery(options);\n\
+                 \x20   const sep = q ? '&' : '?';\n\
+                 \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}${{q}}${{sep}}projection={pname}`);\n\
+                 \x20   await this.assertOk(response);\n\
+                 \x20   return (await response.json()) as ListResult<{ty}>;\n\
+                 \x20 }}\n\n",
+                name = model.name, ty = type_name,
+            ));
+        }
+        code
     }
 
     /// The schema-independent SDK support types: the thrown error, the list
@@ -220,6 +292,9 @@ export interface ListOptions {\n\
                  \x20   return true;\n\
                  \x20 }}\n\n"
             ));
+
+            // Column-projection read methods (#113): get<Model><Name> / list<Model><Name>.
+            code.push_str(&Self::generate_projection_methods(model));
         }
 
         code.push_str("}\n");

@@ -2,7 +2,7 @@
 //!
 //! Generates optimized Rust code with columnar storage for ForgeDB schemas.
 
-use crate::{GeneratedCode, Result};
+use crate::{CodegenError, GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -32,8 +32,51 @@ impl RustGenerator {
         })
     }
 
+    /// Whether a field can appear in a `@projection` (#113): it must have a
+    /// storage column, i.e. be a stored scalar, char/array/struct, or FK scalar.
+    /// Relation collections (`OneToMany`/`ManyToMany`), virtual `()` relation
+    /// fields, and component refs have no column and are NOT projectable — this
+    /// is exactly the set for which `field_read_stmt` returns `None`.
+    fn is_projectable(field: &forgedb_parser::Field) -> bool {
+        Self::is_string_type(&field.field_type) || Self::is_fixed_size_type(&field.field_type)
+    }
+
+    /// Compile-time validation of `@projection` directives (#113, PM constraint 2):
+    /// every projected field must resolve to a projectable (column-backed) field.
+    /// The parser already guarantees the field exists and names are unique; here
+    /// we reject relation / virtual / component fields with a clear error.
+    fn validate_projections(schema: &Schema) -> Result<()> {
+        for model in &schema.models {
+            for proj in &model.projections {
+                for fname in &proj.fields {
+                    let field = model
+                        .fields
+                        .iter()
+                        .find(|f| &f.name == fname)
+                        .ok_or_else(|| {
+                            CodegenError::InvalidSchema(format!(
+                                "@projection '{}' on model '{}' references undefined field '{}'",
+                                proj.name, model.name, fname
+                            ))
+                        })?;
+                    if !Self::is_projectable(field) {
+                        return Err(CodegenError::InvalidSchema(format!(
+                            "@projection '{}' on model '{}' cannot include field '{}': \
+                             relation and virtual fields have no column and are not projectable \
+                             (use eager-load / relation traversal for related records)",
+                            proj.name, model.name, fname
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Generate the Rust code as a string
     fn generate_code(schema: &Schema) -> Result<String> {
+        Self::validate_projections(schema)?;
+
         let mut tokens = TokenStream::new();
 
         // File header comments
@@ -258,29 +301,7 @@ impl RustGenerator {
         let fields: Vec<_> = model
             .fields
             .iter()
-            .map(|field| {
-                let field_name = format_ident!("{}", field.name);
-                let field_type = Self::map_field_type_ident(&field.field_type);
-
-                // forgedb_types::Timestamp is a newtype over i64 and does not implement
-                // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
-                // schema while the struct field keeps the semantic Timestamp type.
-                let schema_attr = if Self::is_timestamp_type(&field.field_type) {
-                    if field.is_nullable() {
-                        quote! { #[schema(value_type = Option<i64>)] }
-                    } else {
-                        quote! { #[schema(value_type = i64)] }
-                    }
-                } else {
-                    quote! {}
-                };
-
-                if field.is_nullable() {
-                    quote! { #schema_attr pub #field_name: Option<#field_type> }
-                } else {
-                    quote! { #schema_attr pub #field_name: #field_type }
-                }
-            })
+            .map(Self::model_struct_field)
             .collect();
 
         // Generate columnar storage fields
@@ -360,6 +381,13 @@ impl RustGenerator {
         // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
         let read_at_logic = Self::generate_read_at_logic(model);
 
+        // Generate declared column projections (#113): per @projection, a tailored
+        // struct + narrow reads that touch only PK + selected columns.  Reuses the
+        // shared `field_read_stmt` decode (one read path) and the id-at-row
+        // expression for the snapshot `_at` variants.
+        let (projection_structs, projection_methods) =
+            Self::generate_projections(model, &id_type, id_read_at_row.as_ref());
+
         // Generate the secondary-index probe methods (#90): find_by_* / get_by_*
         // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
         let index_lookups = Self::generate_index_lookups(model);
@@ -411,6 +439,8 @@ impl RustGenerator {
             pub struct #model_name {
                 #(#fields),*
             }
+
+            #projection_structs
 
             #[doc = #storage_doc]
             pub struct #storage_name {
@@ -537,6 +567,10 @@ impl RustGenerator {
                 }
 
                 #index_lookups
+
+                // Declared column projections (#113): narrow reads over PK +
+                // selected columns, plus their snapshot `_at` variants.
+                #projection_methods
 
                 /// Open a read-only handle over this storage (#56 Direction B).
                 /// The handle shares this storage's column files via independent
@@ -3014,131 +3048,397 @@ impl RustGenerator {
     /// (live index lookup) and the snapshot accessors `get_at`/`all_at` (#56,
     /// watermark-clamped) funnel through it, so there is exactly one place that
     /// knows a model's column layout.
-    fn generate_read_at_logic(model: &forgedb_parser::Model) -> TokenStream {
-        let mut read_statements = Vec::new();
-        let mut field_values = Vec::new();
+    /// Emit the decode of ONE stored field at `row_index` from `receiver`, binding
+    /// a `<field>_value` local whose type is EXACTLY the model struct field's type.
+    /// Returns `None` for virtual/unstored fields (relations/components have no
+    /// column).
+    ///
+    /// This is the single per-field decode path shared by `read_at` (full record)
+    /// and the reopen index rebuild (`generate_rehydrate_logic`, which reads only
+    /// the indexed-field columns) — one body, so the two can never drift, and the
+    /// reopen path can fault in just the columns an index needs instead of the
+    /// whole record.
+    fn field_read_stmt(
+        field: &forgedb_parser::Field,
+        receiver: &TokenStream,
+        row_index: &TokenStream,
+    ) -> Option<(proc_macro2::Ident, TokenStream)> {
+        let field_col_name = format_ident!("{}_col", field.name);
+        let field_value_name = format_ident!("{}_value", field.name);
 
-        for field in &model.fields {
-            let field_name = format_ident!("{}", field.name);
-            let field_col_name = format_ident!("{}_col", field.name);
-            let field_value_name = format_ident!("{}_value", field.name);
-
-            if Self::is_string_type(&field.field_type) {
-                if field.is_nullable() {
-                    // Decode the 1-byte presence tag written by insert
-                    // (0x01 = Some, anything else = None).
-                    read_statements.push(quote! {
-                        let #field_value_name = {
-                            let raw = self.#field_col_name.read_string(row_index)
-                                .expect("Failed to read string");
-                            if raw.as_bytes().first() == Some(&1u8) {
-                                Some(raw[1..].to_string())
-                            } else {
-                                None
-                            }
-                        };
-                    });
-                } else {
-                    read_statements.push(quote! {
-                        let #field_value_name = self.#field_col_name.read_string(row_index)
+        if Self::is_string_type(&field.field_type) {
+            let stmt = if field.is_nullable() {
+                // Decode the 1-byte presence tag written by insert
+                // (0x01 = Some, anything else = None).
+                quote! {
+                    let #field_value_name = {
+                        let raw = #receiver.#field_col_name.read_string(#row_index)
                             .expect("Failed to read string");
-                    });
+                        if raw.as_bytes().first() == Some(&1u8) {
+                            Some(raw[1..].to_string())
+                        } else {
+                            None
+                        }
+                    };
                 }
-                // C1: only push to field_values inside the branch that emits a binding
-                field_values.push(quote! { #field_name: #field_value_name });
-            } else if Self::is_fixed_size_type(&field.field_type) {
-                // Check if this is a complex type that needs byte conversion.
-                // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
-                let needs_byte_conversion = matches!(
+            } else {
+                quote! {
+                    let #field_value_name = #receiver.#field_col_name.read_string(#row_index)
+                        .expect("Failed to read string");
+                }
+            };
+            Some((field_value_name, stmt))
+        } else if Self::is_fixed_size_type(&field.field_type) {
+            // Check if this is a complex type that needs byte conversion.
+            // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
+            let needs_byte_conversion = matches!(
+                &field.field_type,
+                forgedb_parser::FieldType::Char(_)
+                    | forgedb_parser::FieldType::FixedArray(_, _)
+                    | forgedb_parser::FieldType::StructType(_)
+                    | forgedb_parser::FieldType::OptionalStructType(_)
+                    | forgedb_parser::FieldType::Nullable(_)
+                    | forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::OptionalReference(_),
+                    )
+            );
+
+            let stmt = if needs_byte_conversion {
+                // C3: use the actual stored type (Option<T> for nullable/optional) for the
+                // type annotation and use ptr::read_unaligned to avoid UB on unaligned reads
+                let stored_type = Self::stored_type_tokens(&field.field_type, field.is_nullable());
+                quote! {
+                    let #field_value_name: #stored_type = {
+                        let bytes = #receiver.#field_col_name.read_bytes(#row_index)
+                            .expect("Failed to read from column");
+                        unsafe {
+                            std::ptr::read_unaligned(bytes.as_ptr() as *const #stored_type)
+                        }
+                    };
+                }
+            } else {
+                // For primitives, use typed method
+                let read_method = Self::get_read_method(&field.field_type);
+
+                // UUID and RequiredReference (FK scalar) both read raw [u8; 16]
+                let is_uuid_like = matches!(
                     &field.field_type,
-                    forgedb_parser::FieldType::Char(_)
-                        | forgedb_parser::FieldType::FixedArray(_, _)
-                        | forgedb_parser::FieldType::StructType(_)
-                        | forgedb_parser::FieldType::OptionalStructType(_)
-                        | forgedb_parser::FieldType::Nullable(_)
+                    forgedb_parser::FieldType::Uuid
                         | forgedb_parser::FieldType::Relation(
-                            forgedb_parser::RelationType::OptionalReference(_),
+                            forgedb_parser::RelationType::RequiredReference(_),
                         )
                 );
+                // read_timestamp returns i64; the struct field is Timestamp
+                let is_timestamp =
+                    matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
 
-                if needs_byte_conversion {
-                    // C3: use the actual stored type (Option<T> for nullable/optional) for the
-                    // type annotation and use ptr::read_unaligned to avoid UB on unaligned reads
-                    let stored_type = Self::stored_type_tokens(&field.field_type, field.is_nullable());
-                    read_statements.push(quote! {
-                        let #field_value_name: #stored_type = {
-                            let bytes = self.#field_col_name.read_bytes(row_index)
+                if is_uuid_like {
+                    quote! {
+                        let #field_value_name = {
+                            let bytes = #receiver.#field_col_name.#read_method(#row_index)
                                 .expect("Failed to read from column");
-                            unsafe {
-                                std::ptr::read_unaligned(bytes.as_ptr() as *const #stored_type)
-                            }
+                            Uuid::from_bytes(bytes)
                         };
-                    });
+                    }
+                } else if is_timestamp {
+                    quote! {
+                        let #field_value_name = Timestamp::from(
+                            #receiver.#field_col_name.#read_method(#row_index)
+                                .expect("Failed to read from column"),
+                        );
+                    }
                 } else {
-                    // For primitives, use typed method
-                    let read_method = Self::get_read_method(&field.field_type);
-
-                    // UUID and RequiredReference (FK scalar) both read raw [u8; 16]
-                    let is_uuid_like = matches!(
-                        &field.field_type,
-                        forgedb_parser::FieldType::Uuid
-                            | forgedb_parser::FieldType::Relation(
-                                forgedb_parser::RelationType::RequiredReference(_),
-                            )
-                    );
-                    // read_timestamp returns i64; the struct field is Timestamp
-                    let is_timestamp =
-                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
-
-                    if is_uuid_like {
-                        read_statements.push(quote! {
-                            let #field_value_name = {
-                                let bytes = self.#field_col_name.#read_method(row_index)
-                                    .expect("Failed to read from column");
-                                Uuid::from_bytes(bytes)
-                            };
-                        });
-                    } else if is_timestamp {
-                        read_statements.push(quote! {
-                            let #field_value_name = Timestamp::from(
-                                self.#field_col_name.#read_method(row_index)
-                                    .expect("Failed to read from column"),
-                            );
-                        });
-                    } else {
-                        read_statements.push(quote! {
-                            let #field_value_name = self.#field_col_name.#read_method(row_index)
-                                .expect("Failed to read from column");
-                        });
+                    quote! {
+                        let #field_value_name = #receiver.#field_col_name.#read_method(#row_index)
+                            .expect("Failed to read from column");
                     }
                 }
-                // C1: only push inside this branch
-                field_values.push(quote! { #field_name: #field_value_name });
+            };
+            Some((field_value_name, stmt))
+        } else {
+            None
+        }
+    }
+
+    /// Render one struct field (`pub name: Type`) exactly as the model struct
+    /// does, with the `utoipa` Timestamp `value_type` annotation and nullable
+    /// wrapping.  Shared by the model struct and every projection struct (#113)
+    /// so a projected field's type never drifts from the model's.
+    fn model_struct_field(field: &forgedb_parser::Field) -> TokenStream {
+        let field_name = format_ident!("{}", field.name);
+        let field_type = Self::map_field_type_ident(&field.field_type);
+
+        // forgedb_types::Timestamp is a newtype over i64 and does not implement
+        // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
+        // schema while the struct field keeps the semantic Timestamp type.
+        let schema_attr = if Self::is_timestamp_type(&field.field_type) {
+            if field.is_nullable() {
+                quote! { #[schema(value_type = Option<i64>)] }
             } else {
-                // C1: Relation/component fields have no storage column.
-                // Provide a type-appropriate default value so the struct literal compiles.
-                let default_val = Self::default_for_unstored_field(&field.field_type);
-                field_values.push(quote! { #field_name: #default_val });
+                quote! { #[schema(value_type = i64)] }
+            }
+        } else {
+            quote! {}
+        };
+
+        if field.is_nullable() {
+            quote! { #schema_attr pub #field_name: Option<#field_type> }
+        } else {
+            quote! { #schema_attr pub #field_name: #field_type }
+        }
+    }
+
+    /// The model's identity field (`id` or an `+auto` field), if any.  A
+    /// projection always materializes it (#113, PM constraint 3).
+    pub(crate) fn identity_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
+        model
+            .fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+    }
+
+    /// PascalCase a snake_case projection name (`list_row` → `ListRow`) for the
+    /// generated struct suffix.
+    pub(crate) fn projection_pascal(name: &str) -> String {
+        name.split('_')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                let mut c = s.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// The ordered field set a projection materializes: the identity field
+    /// first (always, PM constraint 3), then each selected field in declared
+    /// order, de-duplicated (a projection may list `id` explicitly).
+    pub(crate) fn projected_field_set<'a>(
+        model: &'a forgedb_parser::Model,
+        proj: &forgedb_parser::Projection,
+    ) -> Vec<&'a forgedb_parser::Field> {
+        let mut out: Vec<&forgedb_parser::Field> = Vec::new();
+        if let Some(id_field) = Self::identity_field(model) {
+            out.push(id_field);
+        }
+        for fname in &proj.fields {
+            if out.iter().any(|f| &f.name == fname) {
+                continue;
+            }
+            if let Some(f) = model.fields.iter().find(|f| &f.name == fname) {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    /// Emit, for a model's `@projection` directives (#113), the projection
+    /// structs (top-level, alongside the model struct) and the read methods
+    /// (inside the `*Storage` impl).  Returns `(structs, methods)`.  Empty when
+    /// the model declares no projections.  `id_read` is the id-at-row expression
+    /// (`generate_id_read_expr`) used to resolve newest-version-within-watermark
+    /// for the snapshot `_at` variants; `None` for a model with no identity field.
+    fn generate_projections(
+        model: &forgedb_parser::Model,
+        id_type: &TokenStream,
+        id_read: Option<&TokenStream>,
+    ) -> (TokenStream, TokenStream) {
+        if model.projections.is_empty() {
+            return (quote! {}, quote! {});
+        }
+
+        // Per-model snapshot row-resolver helpers, emitted ONCE and reused by
+        // every projection's `_at` variant, so the newest-version scan is not
+        // duplicated per projection.  They mirror `get_at`/`all_at`'s resolution
+        // but return row indices (leaving the final read to the projected
+        // decoder).  Guarded on identity presence exactly like the accessors.
+        let resolvers = match id_read {
+            Some(id_read) => quote! {
+                /// Resolve the newest committed row of `id` as of `snap`
+                /// (#113 projection `_at` support; same logic as `get_at`).
+                fn __proj_resolve_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<usize> {
+                    let watermark = snap.watermark();
+                    let mut newest: Option<usize> = None;
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        if row_id == id {
+                            newest = Some(row_index);
+                        }
+                    }
+                    newest
+                }
+
+                /// Row indices of every live record as of `snap` — the newest
+                /// version per id in row order (#113; same logic as `all_at`).
+                fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
+                    let watermark = snap.watermark();
+                    let mut newest: HashMap<#id_type, usize> = HashMap::new();
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        newest.insert(row_id, row_index);
+                    }
+                    let mut rows = Vec::new();
+                    for row_index in 0..watermark {
+                        let row_id = #id_read;
+                        if newest.get(&row_id) == Some(&row_index) {
+                            rows.push(row_index);
+                        }
+                    }
+                    rows
+                }
+            },
+            None => quote! {
+                /// Resolve `id`'s row clamped to `snap` (no-mutation model).
+                fn __proj_resolve_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<usize> {
+                    let row_index = *self.id_to_row.get(&id)?;
+                    if !snap.visible(row_index) { return None; }
+                    Some(row_index)
+                }
+
+                /// Every visible row as of `snap` (no-mutation model).
+                fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
+                    (0..snap.watermark()).collect()
+                }
+            },
+        };
+
+        let mut structs = Vec::new();
+        let mut methods = Vec::new();
+
+        for proj in &model.projections {
+            let proj_ident = format_ident!("{}{}", model.name, Self::projection_pascal(&proj.name));
+            let fields = Self::projected_field_set(model, proj);
+            let struct_field_defs: Vec<_> = fields.iter().map(|f| Self::model_struct_field(f)).collect();
+
+            let read_at_name = format_ident!("read_{}_at", proj.name);
+            let get_name = format_ident!("get_{}", proj.name);
+            let all_name = format_ident!("all_{}", proj.name);
+            let get_at_name = format_ident!("get_{}_at", proj.name);
+            let all_at_name = format_ident!("all_{}_at", proj.name);
+
+            let read_body = Self::generate_row_read_body(&proj_ident, &fields);
+            let doc = format!(
+                "Projection `{}` of `{}` (#113): materializes only PK + \
+                 declared columns, leaving unselected columns unread.",
+                proj.name, model.name
+            );
+
+            structs.push(quote! {
+                #[doc = #doc]
+                #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+                pub struct #proj_ident {
+                    #(#struct_field_defs),*
+                }
+            });
+
+            methods.push(quote! {
+                /// Read the projection at a physical row index (subset decode —
+                /// only the projected columns are touched).
+                pub fn #read_at_name(&self, row_index: usize) -> Option<#proj_ident> {
+                    #read_body
+                }
+
+                /// Fetch the projection for `id` from the live newest version.
+                pub fn #get_name(&self, id: #id_type) -> Option<#proj_ident> {
+                    let row_index = *self.id_to_row.get(&id)?;
+                    self.#read_at_name(row_index)
+                }
+
+                /// Every live record as this projection (order follows the id map).
+                pub fn #all_name(&self) -> Vec<#proj_ident> {
+                    let mut records = Vec::new();
+                    for id in self.id_to_row.keys() {
+                        if let Some(record) = self.#get_name(*id) {
+                            records.push(record);
+                        }
+                    }
+                    records
+                }
+
+                /// Snapshot-scoped projection point read (#56 + #113).
+                pub fn #get_at_name(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#proj_ident> {
+                    let row_index = self.__proj_resolve_at(snap, id)?;
+                    self.#read_at_name(row_index)
+                }
+
+                /// Snapshot-scoped projection scan (#56 + #113).
+                pub fn #all_at_name(&self, snap: &forgedb_storage::Snapshot) -> Vec<#proj_ident> {
+                    let mut records = Vec::new();
+                    for row_index in self.__proj_live_rows_at(snap) {
+                        if let Some(record) = self.#read_at_name(row_index) {
+                            records.push(record);
+                        }
+                    }
+                    records
+                }
+            });
+        }
+
+        let structs = quote! { #(#structs)* };
+        let methods = quote! {
+            #resolvers
+            #(#methods)*
+        };
+        (structs, methods)
+    }
+
+    /// Emit the body of a read-by-`row_index` over a chosen `fields` subset,
+    /// constructing `struct_ident`.  Shared by `read_at` (all model fields) and
+    /// projection reads (PK + selected) so there is ONE decode path — every
+    /// field decode is the same `field_read_stmt` branch (#113, PM constraint 1).
+    /// Only the columns of `fields` are touched, which is what lets a projection
+    /// skip the wasm lazy fault-in of unselected columns.
+    fn generate_row_read_body(
+        struct_ident: &proc_macro2::Ident,
+        fields: &[&forgedb_parser::Field],
+    ) -> TokenStream {
+        let mut read_statements = Vec::new();
+        let mut field_values = Vec::new();
+        let recv = quote! { self };
+        let row = quote! { row_index };
+
+        for field in fields {
+            let field_name = format_ident!("{}", field.name);
+            match Self::field_read_stmt(field, &recv, &row) {
+                Some((value_ident, stmt)) => {
+                    read_statements.push(stmt);
+                    // C1: only push to field_values when a binding was emitted.
+                    field_values.push(quote! { #field_name: #value_ident });
+                }
+                None => {
+                    // C1: Relation/component fields have no storage column.
+                    // Provide a type-appropriate default so the struct literal compiles.
+                    // (Projections never hit this branch — validation rejects
+                    // non-projectable fields — so it only serves the full record.)
+                    let default_val = Self::default_for_unstored_field(&field.field_type);
+                    field_values.push(quote! { #field_name: #default_val });
+                }
             }
         }
 
-        let model_name = format_ident!("{}", model.name);
-
         quote! {
-            // `read_at` receives an already-resolved physical row index.
+            // Read receives an already-resolved physical row index.
             // Check if deleted
             if self.tombstones.is_deleted(row_index).unwrap_or(true) {
                 return None;
             }
 
-            // Read all fields
+            // Read the selected fields
             #(#read_statements)*
 
-            // Construct model
-            Some(#model_name {
+            // Construct the record
+            Some(#struct_ident {
                 #(#field_values),*
             })
         }
+    }
+
+    fn generate_read_at_logic(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let fields: Vec<&forgedb_parser::Field> = model.fields.iter().collect();
+        Self::generate_row_read_body(&model_name, &fields)
     }
 
     /// Return the Rust type tokens used for raw byte storage read/write (C3).
@@ -3290,8 +3590,18 @@ impl RustGenerator {
         // Secondary-index rebuild (#90): fold into the SAME reopen scan that
         // rebuilds `id_to_row`.  Runs AFTER `id_scan` has resolved each id to its
         // newest physical row (last-write-wins), so the index keys only committed,
-        // live (non-tombstoned) values.  Collect ids first to avoid holding an
-        // immutable borrow of `id_to_row` across the `get` + index mutation.
+        // live (non-tombstoned) values.
+        //
+        // Reads ONLY the indexed-field columns at each id's newest physical row —
+        // NOT the full record via `db.get()`.  `get()` would decode every column,
+        // which on the wasm lazy-source backend faults every column in at reopen
+        // (defeating partial hydrate); native pays the same over-read as file I/O.
+        // We resolve the row from `id_to_row` (already populated by `id_scan`),
+        // gate on the tombstone exactly as `read_at` does, then decode just the
+        // union of {single-index fields} ∪ {composite components} via the shared
+        // `field_read_stmt` decode path (same body `read_at` uses — no drift).
+        // Collect ids first to avoid holding an immutable borrow of `id_to_row`
+        // across the index mutation.
         let recv = quote! { db };
         let id_tok = quote! { __id };
         let index_rebuild = {
@@ -3301,18 +3611,38 @@ impl RustGenerator {
                 quote! {}
             } else {
                 let id_type = Self::id_type_tokens(model);
-                // Single-field index adds (#90 + #100/#102 via `indexed_fields`).
+
+                // The set of fields whose columns the rebuild must decode: every
+                // single-index field plus every composite component, de-duplicated
+                // by name (a field can be both).  Each becomes a `<field>_value`
+                // local via the shared per-field decode path.
+                let mut read_fields: Vec<&forgedb_parser::Field> = Vec::new();
+                for f in indexed.iter().copied() {
+                    read_fields.push(f);
+                }
+                for (_, comps) in &composites {
+                    for c in comps.iter().copied() {
+                        if !read_fields.iter().any(|g| g.name == c.name) {
+                            read_fields.push(c);
+                        }
+                    }
+                }
+                let row_tok = quote! { __row };
+                let field_reads: Vec<_> = read_fields
+                    .iter()
+                    .filter_map(|f| {
+                        Self::field_read_stmt(f, &recv, &row_tok).map(|(_, stmt)| stmt)
+                    })
+                    .collect();
+
+                // Single-field index adds (#90 + #100/#102 via `indexed_fields`),
+                // keyed off the just-decoded `<field>_value` locals.
                 let mut adds: Vec<_> = indexed
                     .iter()
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
-                        let fname = format_ident!("{}", f.name);
-                        Self::index_add_block(
-                            &recv,
-                            &ident,
-                            quote! { __rec.#fname },
-                            &id_tok,
-                        )
+                        let val = format_ident!("{}_value", f.name);
+                        Self::index_add_block(&recv, &ident, quote! { #val }, &id_tok)
                     })
                     .collect();
                 // Composite index adds (#101), folded into the same scan.
@@ -3320,8 +3650,8 @@ impl RustGenerator {
                     let parts: Vec<_> = comps
                         .iter()
                         .map(|c| {
-                            let cf = format_ident!("{}", c.name);
-                            quote! { __rec.#cf }
+                            let val = format_ident!("{}_value", c.name);
+                            quote! { #val }
                         })
                         .collect();
                     Self::composite_add_block(&recv, ident, &parts, &id_tok)
@@ -3329,9 +3659,18 @@ impl RustGenerator {
                 quote! {
                     let __ids: Vec<#id_type> = db.id_to_row.keys().copied().collect();
                     for __id in __ids {
-                        if let Some(__rec) = db.get(__id) {
-                            #(#adds)*
+                        let __row = match db.id_to_row.get(&__id) {
+                            Some(__r) => *__r,
+                            None => continue,
+                        };
+                        // Skip deleted rows — the same tombstone gate `read_at`
+                        // (and therefore `get`) applies, so the index keys only
+                        // live values.
+                        if db.tombstones.is_deleted(__row).unwrap_or(true) {
+                            continue;
                         }
+                        #(#field_reads)*
+                        #(#adds)*
                     }
                 }
             }

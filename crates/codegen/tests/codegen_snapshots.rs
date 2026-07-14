@@ -1090,6 +1090,138 @@ Widget {
 }
 
 #[test]
+fn test_rust_generation_reopen_index_rebuild_is_narrow() {
+    // Reopen rebuilds secondary indexes reading ONLY the indexed columns at each
+    // id's newest physical row — never the full record via `db.get()`.  This is
+    // what lets the wasm lazy-source backend keep non-indexed columns unhydrated
+    // at open (and saves native the same over-read as file I/O).
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+  bio: string?
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    // prettyplease wraps method chains across lines; collapse whitespace so the
+    // column-read assertions match regardless of formatting.
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The old full-record read is gone from the index rebuild loop.
+    assert!(
+        !code.contains("if let Some(__rec) = db.get(__id)"),
+        "reopen index rebuild must NOT decode the whole record via db.get()"
+    );
+    // Row resolved from the already-built id_to_row, then a tombstone gate — the
+    // same liveness check `read_at`/`get` apply, so only live values are indexed.
+    assert!(
+        code.contains("let __row = match db.id_to_row.get(&__id)"),
+        "reopen index rebuild must resolve the physical row from id_to_row"
+    );
+    assert!(
+        code.contains("if db.tombstones.is_deleted(__row)"),
+        "reopen index rebuild must gate on the tombstone before indexing"
+    );
+    // Indexed columns ARE read at reopen (email is &unique, age is ^index)...
+    assert!(
+        flat.contains(".email_col .read_string(__row)"),
+        "reopen must read the indexed email column at the resolved row"
+    );
+    assert!(
+        flat.contains(".age_col .read_u32(__row)"),
+        "reopen must read the indexed age column at the resolved row"
+    );
+    // ...but the NON-indexed `bio` column is never touched by the rebuild — the
+    // partial-hydrate win: it stays lazy on the wasm backend at open.
+    assert!(
+        !flat.contains(".bio_col .read_string(__row)"),
+        "reopen must NOT read the non-indexed bio column (partial hydrate)"
+    );
+}
+
+#[test]
+fn test_rust_generation_column_projection() {
+    // A model with a `@projection` naming a subset of its columns (#113): the
+    // generated projection read must touch ONLY PK + selected columns (never the
+    // full record), giving a tight struct and — on the wasm backend — skipping
+    // fault-in of the unselected columns.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+  bio: string?
+  created_at: +timestamp
+
+  @projection(card: email, age)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Tight projection struct: PK + selected columns only, with the real types
+    // (age is `u32`, not `Option`), and NOT the unselected `bio`/`created_at`.
+    assert!(code.contains("pub struct UserCard"), "projection struct emitted");
+    assert!(
+        flat.contains("pub struct UserCard { pub id: Uuid, pub email: String, pub age: u32, }"),
+        "UserCard = PK + selected only, tight types.\nGot: {flat}"
+    );
+
+    // The narrow decoder reads ONLY id + email + age columns...
+    assert!(code.contains("pub fn read_card_at"), "read_card_at emitted");
+    assert!(flat.contains(".id_col .read_uuid(row_index)"), "reads PK column");
+    assert!(flat.contains(".email_col .read_string(row_index)"), "reads selected email column");
+    assert!(flat.contains(".age_col .read_u32(row_index)"), "reads selected age column");
+
+    // ...never the unselected columns inside the projection decoder, and never a
+    // full-record `read_at`-style construct of the model. We check by isolating
+    // the `read_card_at` body.
+    let body_start = code.find("fn read_card_at").expect("has read_card_at");
+    let body = &code[body_start..body_start + 800.min(code.len() - body_start)];
+    assert!(!body.contains("bio_col"), "projection decoder must NOT read unselected bio column");
+    assert!(!body.contains("created_at_col"), "projection decoder must NOT read unselected created_at column");
+    assert!(body.contains("UserCard"), "projection decoder constructs the projection struct");
+
+    // The read surface funnels through the shared subset decoder (get/all + `_at`).
+    assert!(code.contains("pub fn get_card"), "get_card emitted");
+    assert!(code.contains("pub fn all_card"), "all_card emitted");
+    assert!(code.contains("pub fn get_card_at"), "snapshot get_card_at emitted");
+    assert!(code.contains("pub fn all_card_at"), "snapshot all_card_at emitted");
+}
+
+#[test]
+fn test_rust_generation_projection_rejects_relation_field() {
+    // A projection naming a virtual relation field is a compile-time error
+    // (#113 PM constraint 2): relations have no column and are not projectable.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+
+  @projection(bad: name, posts)
+}
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let err = RustGenerator::generate(&schema).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not projectable") && msg.contains("posts"),
+        "expected a clear rejection of the relation field, got: {msg}"
+    );
+}
+
+#[test]
 fn test_rust_generation_layout_manifest() {
     // A uuid-PK model with a variable (string) column plus an M2M junction —
     // exercises both the model manifest and the junction manifest (#57).
@@ -2251,6 +2383,94 @@ Tag {
         assert!(
             !flat.contains(forbidden),
             "transport must expose no mutator (found {forbidden})"
+        );
+    }
+}
+
+#[test]
+fn test_wasm_generation_async_client_and_worker() {
+    // #110 follow-up #2 (engine-in-Worker): the generated main-thread async
+    // `ReplicaClient` must STRICTLY MIRROR the `Replica`'s read surface (PM
+    // constraint 2 — reuse the one enumerator, invent nothing), and the Worker
+    // bootstrap must be STATIC + schema-agnostic (PM constraint 3).
+    let src = r#"
+User {
+  id: +uuid
+  email: string
+  posts: [Post]
+  tags: [Tag]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Tag {
+  id: +uuid
+  label: string
+  users: [User]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let replica = WasmGenerator::generate(&schema).unwrap().code;
+    let client = WasmGenerator::generate_client(&schema).unwrap().code;
+    let worker = WasmGenerator::worker_bootstrap();
+
+    // --- Client mirrors the Replica read surface exactly ---------------------
+    // Every generated read the Replica exposes has a same-named async client
+    // method; the client invents none.
+    for name in [
+        "getUser", "userCount", "allUsers", "getPost", "postCount", "allPosts",
+        "getTag", "tagCount", "allTags", "postAuthor", "userPosts", "userTags", "tagUsers",
+    ] {
+        assert!(
+            client.contains(&format!("async {name}(")),
+            "client missing generated read {name}"
+        );
+    }
+
+    // STRICT MIRROR: every async method the client declares (minus the fixed
+    // lifecycle) must correspond to a `js_name` the Replica actually exports —
+    // the client can never drift ahead of, or invent a method absent from, the
+    // Replica. Lifecycle names are schema-invariant and exempt.
+    let lifecycle = ["init", "open", "applyWire", "commit", "watermark", "close"];
+    for line in client.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("async ") {
+            let name = &rest[..rest.find('(').unwrap_or(rest.len())];
+            if lifecycle.contains(&name) {
+                continue;
+            }
+            assert!(
+                replica.contains(&format!("js_name = \"{name}\"")),
+                "client method `{name}` has no matching Replica read (strict-mirror violation)"
+            );
+        }
+    }
+
+    // IDENTITY RED LINE: read-only follower — the client exposes no mutator.
+    for forbidden in ["async create", "async insert", "async update", "async delete", "async link"] {
+        assert!(
+            !client.contains(forbidden),
+            "client must expose no mutator (found {forbidden})"
+        );
+    }
+
+    // --- Worker is static + schema-agnostic (PM constraint 3) ----------------
+    // Generic dispatch only; it interprets no schema.
+    assert!(
+        worker.contains("replica[method](...args)"),
+        "worker dispatches reads generically by method name"
+    );
+    // It must not mention any model, field, or a `match`/route over the schema.
+    for schema_token in ["User", "Post", "Tag", "email", "title", "author", "getUser", "userPosts"] {
+        assert!(
+            !worker.contains(schema_token),
+            "worker bootstrap must be schema-agnostic (found `{schema_token}`)"
         );
     }
 }

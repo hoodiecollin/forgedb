@@ -152,10 +152,98 @@ impl ApiGenerator {
     }
 
     /// Generate handler functions for a model
+    /// Build the `?projection=<name>` REST support for a model (#113): a closed
+    /// set of declared projection names only — no ad-hoc `?fields=` — so the wire
+    /// carries a compile-time-declared name, never a runtime column list (PM
+    /// constraint 6).  Returns `(get_query_param, get_block, list_block)`, all
+    /// empty when the model declares no projections.  On the `get` path we route
+    /// through the narrow `get_<name>` read (full server-side skip of unselected
+    /// columns); on `list` we field-copy the already-filtered/sorted page to the
+    /// projection struct (filter/sort need full rows, so only the wire shrinks).
+    fn generate_projection_rest(
+        model: &forgedb_parser::Model,
+        storage_field: &proc_macro2::Ident,
+        id_type: &TokenStream,
+    ) -> (TokenStream, TokenStream, TokenStream) {
+        if model.projections.is_empty() {
+            return (quote! {}, quote! {}, quote! {});
+        }
+
+        let mut get_arms = Vec::new();
+        let mut list_arms = Vec::new();
+        for proj in &model.projections {
+            let name = &proj.name;
+            let get_fn = format_ident!("get_{}", proj.name);
+            let proj_ident = format_ident!(
+                "{}{}",
+                model.name,
+                crate::rust::RustGenerator::projection_pascal(&proj.name)
+            );
+            let fields = crate::rust::RustGenerator::projected_field_set(model, proj);
+            let field_copies: Vec<_> = fields
+                .iter()
+                .map(|f| {
+                    let fname = format_ident!("{}", f.name);
+                    quote! { #fname: r.#fname.clone() }
+                })
+                .collect();
+
+            get_arms.push(quote! {
+                #name => match db.#storage_field.#get_fn(key) {
+                    Some(r) => (StatusCode::OK, Json(serde_json::to_value(&r).unwrap_or(json!(null)))),
+                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                },
+            });
+            list_arms.push(quote! {
+                #name => page
+                    .iter()
+                    .map(|r| serde_json::to_value(super::#proj_ident { #(#field_copies),* }).unwrap_or(json!(null)))
+                    .collect(),
+            });
+        }
+
+        let get_query_param = quote! {
+            Query(params): Query<HashMap<String, String>>,
+        };
+        let get_block = quote! {
+            // #113: named-projection point read (closed set of declared names).
+            if let Some(__proj) = params.get("projection") {
+                let key = match id.parse::<#id_type>() {
+                    Ok(key) => key,
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
+                };
+                let db = db.read().await;
+                return match __proj.as_str() {
+                    #(#get_arms)*
+                    _ => (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" }))),
+                };
+            }
+        };
+        let list_block = quote! {
+            // #113: named-projection list (filter/sort/paginate on full rows,
+            // then emit only the projection's columns for the page).
+            if let Some(__proj) = params.get("projection") {
+                let data: Vec<serde_json::Value> = match __proj.as_str() {
+                    #(#list_arms)*
+                    _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" }))),
+                };
+                return (StatusCode::OK, Json(json!({
+                    "data": data,
+                    "total": total,
+                    "limit": qp.pagination.limit,
+                    "offset": qp.pagination.offset,
+                })));
+            }
+        };
+        (get_query_param, get_block, list_block)
+    }
+
     fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
         let id_type = Self::id_parse_type(model);
         let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
+        let (proj_get_query, proj_get_block, proj_list_block) =
+            Self::generate_projection_rest(model, &storage_field, &id_type);
         let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
         let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
         let create_fn = format_ident!("create_{}", Self::to_snake_case(&model.name));
@@ -217,6 +305,7 @@ impl ApiGenerator {
                 let total = rows.len();
                 // 4. Substrate-clamped pagination.
                 let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                #proj_list_block
                 let body = json!({
                     "data": page,
                     "total": total,
@@ -240,8 +329,10 @@ impl ApiGenerator {
             )]
             async fn #get_fn(
                 Path(id): Path<String>,
+                #proj_get_query
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
+                #proj_get_block
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
                     Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),

@@ -24,10 +24,37 @@ use std::collections::{HashMap, HashSet};
 /// Generates the `#[wasm_bindgen]` browser read-replica transport (`lib.rs`).
 pub struct WasmGenerator;
 
+/// The JSON shape a generated read returns across the boundary — drives both the
+/// Rust wrapper body and the TS client's parse.
+#[derive(Clone, Copy)]
+enum ReadRet {
+    /// `u32` live-record count.
+    Count,
+    /// `Option<String>` — a JSON record or `null`.
+    Optional,
+    /// `String` — a JSON array (never null; `"[]"` when empty).
+    Array,
+}
+
+/// One generated read method — the single source of truth shared by the Rust
+/// `Replica` (`rust`) and the TS `ReplicaClient` (name/args/ret). Enumerated
+/// once by [`WasmGenerator::read_surface`] so the client can never drift from,
+/// or invent a method absent from, the `Replica` (the PM's strict-mirror
+/// constraint).
+struct ReadMethod {
+    js_name: String,
+    /// Whether the method takes a single `id: String` argument.
+    takes_id: bool,
+    ret: ReadRet,
+    /// The `#[wasm_bindgen]` Rust wrapper emitted into the `Replica` impl.
+    rust: TokenStream,
+}
+
 impl WasmGenerator {
     /// Generate the transport `lib.rs` for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
-        let reads = Self::generate_reads(schema);
+        let surface = Self::read_surface(schema);
+        let reads: Vec<&TokenStream> = surface.iter().map(|m| &m.rust).collect();
 
         // Lifecycle is schema-invariant boilerplate; the reads impl is generated.
         let tokens = quote! {
@@ -81,10 +108,13 @@ impl WasmGenerator {
                 pub async fn open(db_name: String, backend: String) -> Result<Replica, JsValue> {
                     let backend = Backend::from_str_lossy(&backend);
                     store::clear();
-                    let entries = persist::load(backend, &db_name)
+                    // Hydrate strategy is the backend's: IndexedDB loads every
+                    // blob now (eager); OPFS registers a synchronous fault-in
+                    // source and reads nothing until a column is first touched
+                    // (lazy / partial). Either way the per-row API stays sync.
+                    persist::hydrate(backend, &db_name)
                         .await
                         .map_err(|e| JsValue::from_str(&format!("hydrate failed: {e:?}")))?;
-                    store::hydrate(entries);
 
                     // The follower opens under a stable root == db_name, so its
                     // arena paths are identical across sessions and round-trip
@@ -137,8 +167,10 @@ impl WasmGenerator {
                         watermark_key(&self.db_name),
                         self.watermark.get().to_le_bytes().to_vec(),
                     );
-                    let entries = store::dump();
-                    persist::store(self.backend, &self.db_name, entries)
+                    // IndexedDB rewrites the whole snapshot; OPFS writes only the
+                    // grown column tails, watermark marker last (crash-recoverable
+                    // prefix — see `persist::commit`).
+                    persist::commit(self.backend, &self.db_name)
                         .await
                         .map_err(|e| JsValue::from_str(&format!("persist failed: {e:?}")))?;
                     Ok(())
@@ -169,24 +201,34 @@ impl WasmGenerator {
         })
     }
 
-    /// Emit the generated read wrappers, mirroring the read surface of the
-    /// generated `Database` exactly (same names, via the same `RustGenerator`
-    /// helpers) so the transport never invents a query. A single `seen` gate on
-    /// both the Rust ident and the JS name guarantees no duplicate method or
-    /// duplicate `js_name` (either would fail to compile / bind).
-    fn generate_reads(schema: &Schema) -> Vec<TokenStream> {
-        let mut methods = Vec::new();
+    /// Enumerate the generated read surface ONCE, mirroring the read methods of
+    /// the generated `Database` exactly (same names, via the same `RustGenerator`
+    /// helpers) so neither the `Replica` nor the `ReplicaClient` ever invents a
+    /// query. Each entry carries the Rust wrapper AND the (name, args, ret)
+    /// descriptor the TS client is generated from — one source of truth. A
+    /// single `seen` gate on both the Rust ident and the JS name guarantees no
+    /// duplicate method or duplicate `js_name` (either would fail to compile /
+    /// bind).
+    fn read_surface(schema: &Schema) -> Vec<ReadMethod> {
+        let mut methods: Vec<ReadMethod> = Vec::new();
         let mut seen_rust: HashSet<String> = HashSet::new();
         let mut seen_js: HashSet<String> = HashSet::new();
 
-        let mut push = |methods: &mut Vec<TokenStream>,
+        let mut push = |methods: &mut Vec<ReadMethod>,
                         rust_name: &str,
                         js_name: &str,
+                        takes_id: bool,
+                        ret: ReadRet,
                         tokens: TokenStream| {
             if !seen_rust.insert(rust_name.to_string()) || !seen_js.insert(js_name.to_string()) {
                 return;
             }
-            methods.push(tokens);
+            methods.push(ReadMethod {
+                js_name: js_name.to_string(),
+                takes_id,
+                ret,
+                rust: tokens,
+            });
         };
 
         // --- Per-model core reads: get / count / all -------------------------
@@ -202,6 +244,8 @@ impl WasmGenerator {
                 &mut methods,
                 &count_rust,
                 &count_js,
+                false,
+                ReadRet::Count,
                 quote! {
                     #[doc = "Number of live records (a generated read)."]
                     #[wasm_bindgen(js_name = #count_js)]
@@ -219,6 +263,8 @@ impl WasmGenerator {
                 &mut methods,
                 &all_rust,
                 &all_js,
+                false,
+                ReadRet::Array,
                 quote! {
                     #[doc = "All live records as a JSON array (a generated read)."]
                     #[wasm_bindgen(js_name = #all_js)]
@@ -239,6 +285,8 @@ impl WasmGenerator {
                     &mut methods,
                     &get_rust,
                     &get_js,
+                    true,
+                    ReadRet::Optional,
                     quote! {
                         #[doc = "A record by id as JSON, or `null` (a generated read; 404-equivalent)."]
                         #[wasm_bindgen(js_name = #get_js)]
@@ -284,6 +332,8 @@ impl WasmGenerator {
                     &mut methods,
                     &method_name,
                     &js,
+                    true,
+                    ReadRet::Optional,
                     quote! {
                         #[doc = "Resolve the foreign key to its record as JSON, or `null` (a generated read)."]
                         #[wasm_bindgen(js_name = #js)]
@@ -341,6 +391,8 @@ impl WasmGenerator {
                 &mut methods,
                 &method_name,
                 &js,
+                true,
+                ReadRet::Array,
                 quote! {
                     #[doc = #doc]
                     #[wasm_bindgen(js_name = #js)]
@@ -373,6 +425,8 @@ impl WasmGenerator {
                     &mut methods,
                     &method_name,
                     &js,
+                    true,
+                    ReadRet::Array,
                     quote! {
                         #[doc = #doc]
                         #[wasm_bindgen(js_name = #js)]
@@ -389,7 +443,224 @@ impl WasmGenerator {
             }
         }
 
+        // --- Column projections (#113) ---------------------------------------
+        // Per @projection, a narrow read on the follower: only the projected
+        // columns are decoded, so the storage-web lazy backend never faults in
+        // the unselected columns — the browser working-set win. Mirrors the
+        // generated `get_<name>` / `all_<name>` storage methods.
+        for model in &schema.models {
+            let model_snake = RustGenerator::to_snake_case(&model.name);
+            let model_field = format_ident!("{model_snake}");
+            for proj in &model.projections {
+                let pascal = RustGenerator::projection_pascal(&proj.name);
+
+                // all_<name> -> JSON array
+                let all_rust = format!("all_{model_snake}_{}", proj.name);
+                let all_js = format!("all{}{}", model.name, pascal);
+                let all_ident = format_ident!("{all_rust}");
+                let proj_all = format_ident!("all_{}", proj.name);
+                push(
+                    &mut methods,
+                    &all_rust,
+                    &all_js,
+                    false,
+                    ReadRet::Array,
+                    quote! {
+                        #[doc = "All live records as this projection (a generated narrow read; unselected columns stay lazy)."]
+                        #[wasm_bindgen(js_name = #all_js)]
+                        pub fn #all_ident(&self) -> String {
+                            serde_json::to_string(&self.db.borrow().#model_field.#proj_all())
+                                .unwrap_or_else(|_| "[]".to_string())
+                        }
+                    },
+                );
+
+                // get_<name>(id) -> JSON | null — id-bearing models only.
+                if identity_field(model).is_some() {
+                    let get_rust = format!("get_{model_snake}_{}", proj.name);
+                    let get_js = format!("get{}{}", model.name, pascal);
+                    let get_ident = format_ident!("{get_rust}");
+                    let proj_get = format_ident!("get_{}", proj.name);
+                    let pk_parse = pk_parse_opt(model);
+                    push(
+                        &mut methods,
+                        &get_rust,
+                        &get_js,
+                        true,
+                        ReadRet::Optional,
+                        quote! {
+                            #[doc = "The projection for an id as JSON, or `null` (a generated narrow read; unselected columns stay lazy)."]
+                            #[wasm_bindgen(js_name = #get_js)]
+                            pub fn #get_ident(&self, id: String) -> Option<String> {
+                                let __pk = #pk_parse?;
+                                let __rec = self.db.borrow().#model_field.#proj_get(__pk)?;
+                                serde_json::to_string(&__rec).ok()
+                            }
+                        },
+                    );
+                }
+            }
+        }
+
         methods
+    }
+
+    /// Generate the per-schema async **`ReplicaClient`** (TypeScript, main
+    /// thread). It mirrors the `Replica`'s read surface EXACTLY — one typed async
+    /// method per [`ReadMethod`] from [`read_surface`] — each `postMessage`-ing
+    /// `{method, args}` to the Worker (which runs the engine) and awaiting the
+    /// reply. It invents no query and exposes no mutator: strict class-2 glue,
+    /// the async transport hop across the Worker boundary (the PM constraint).
+    /// The Worker bootstrap it drives is a STATIC, schema-agnostic script emitted
+    /// separately (never from this generator).
+    pub fn generate_client(schema: &Schema) -> Result<GeneratedCode> {
+        let surface = Self::read_surface(schema);
+
+        let mut methods = String::new();
+        for m in &surface {
+            let (sig_args, call_args) = if m.takes_id {
+                ("id: string", "[id]")
+            } else {
+                ("", "[]")
+            };
+            let (ret_ty, body) = match m.ret {
+                ReadRet::Count => (
+                    "number".to_string(),
+                    format!("return (await this.#call('{}', {})) as number;", m.js_name, call_args),
+                ),
+                ReadRet::Optional => (
+                    "Record<string, unknown> | null".to_string(),
+                    format!(
+                        "const r = await this.#call('{}', {}); return r == null ? null : JSON.parse(r as string);",
+                        m.js_name, call_args
+                    ),
+                ),
+                ReadRet::Array => (
+                    "Record<string, unknown>[]".to_string(),
+                    format!(
+                        "const r = await this.#call('{}', {}); return JSON.parse((r as string) ?? '[]');",
+                        m.js_name, call_args
+                    ),
+                ),
+            };
+            methods.push_str(&format!(
+                "\n  /** Generated read — mirrors `Replica.{name}`. */\n  async {name}({sig}): Promise<{ret}> {{\n    {body}\n  }}\n",
+                name = m.js_name,
+                sig = sig_args,
+                ret = ret_ty,
+                body = body,
+            ));
+        }
+
+        let code = format!(
+            r#"// Generated by ForgeDB — browser read-replica async client.
+// DO NOT EDIT - This file is auto-generated.
+//
+// Class-2 transport glue for the #110 browser read-replica follower. Runs on the
+// main thread and mirrors the generated `Replica`'s read surface EXACTLY, one
+// typed async method per generated read. Each call is a `postMessage` RPC to the
+// Worker that runs the engine (`replica-worker.js`, a static schema-agnostic
+// script). This file invents no query and exposes no mutator — a follower is
+// read-only, and all field-aware logic lives in the generated Rust it drives.
+
+export type ReplicaBackend = "indexeddb" | "opfs" | "auto";
+
+export interface ReplicaOpenOptions {{
+  /** Durable backend; "auto" probes for OPFS sync-access support. */
+  backend?: ReplicaBackend;
+  /** WebSocket `/replicate` URL; when set the Worker follows the live stream. */
+  replicateUrl?: string;
+}}
+
+interface Pending {{
+  resolve: (v: unknown) => void;
+  reject: (e: unknown) => void;
+}}
+
+export class ReplicaClient {{
+  #worker: Worker;
+  #seq = 0;
+  #pending = new Map<number, Pending>();
+
+  /**
+   * @param workerUrl URL of the static `replica-worker.js` (schema-agnostic).
+   * @param wasmUrl   URL of the wasm-pack ES module (`<pkg>/<name>.js`).
+   */
+  constructor(workerUrl: string | URL, private wasmUrl: string) {{
+    this.#worker = new Worker(workerUrl, {{ type: "module" }});
+    this.#worker.onmessage = (e: MessageEvent) => {{
+      const {{ id, ok, result, error }} = e.data ?? {{}};
+      const p = this.#pending.get(id);
+      if (!p) return;
+      this.#pending.delete(id);
+      if (ok) p.resolve(result);
+      else p.reject(new Error(String(error)));
+    }};
+  }}
+
+  #call(method: string, args: unknown[]): Promise<unknown> {{
+    const id = ++this.#seq;
+    return new Promise((resolve, reject) => {{
+      this.#pending.set(id, {{ resolve, reject }});
+      this.#worker.postMessage({{ id, method, args }});
+    }});
+  }}
+
+  /** Boot the wasm module in the Worker (call once before `open`). */
+  async init(): Promise<void> {{
+    await this.#call("__init", [this.wasmUrl]);
+  }}
+
+  /** Open (or resume) the replica for `dbName` and, if given, follow the stream. */
+  async open(dbName: string, opts: ReplicaOpenOptions = {{}}): Promise<void> {{
+    await this.#call("__open", [
+      dbName,
+      opts.backend ?? "auto",
+      opts.replicateUrl ?? null,
+    ]);
+  }}
+
+  /** Apply one binary `/replicate` frame directly (for manual/test streaming). */
+  async applyWire(frame: Uint8Array): Promise<void> {{
+    await this.#call("__applyWire", [frame]);
+  }}
+
+  /** Persist the current state now (bypassing the debounce). */
+  async commit(): Promise<void> {{
+    await this.#call("commit", []);
+  }}
+
+  /** Highest applied replication offset (u64 arrives as BigInt → Number). */
+  async watermark(): Promise<number> {{
+    return Number(await this.#call("watermark", []));
+  }}
+
+  /** Tear down the Worker and its engine. */
+  close(): void {{
+    this.#worker.terminate();
+  }}
+{methods}}}
+"#,
+            methods = methods
+        );
+
+        Ok(GeneratedCode {
+            code,
+            description: format!(
+                "async ReplicaClient (main-thread, {} read methods)",
+                surface.len()
+            ),
+        })
+    }
+
+    /// The STATIC, schema-agnostic Worker bootstrap (`replica-worker.js`). It
+    /// runs the wasm engine, owns the `/replicate` WebSocket, debounces
+    /// auto-commit, and dispatches reads generically via `replica[method](...)`.
+    /// It is a fixed string — NOT emitted by any schema-aware code path — so it
+    /// cannot become schema-aware (the PM constraint). The `ReplicaClient` above
+    /// is the schema-tailored half; this pipe knows only method NAMES it is told.
+    pub fn worker_bootstrap() -> &'static str {
+        WORKER_BOOTSTRAP_JS
     }
 
     /// The `Cargo.toml` for the generated replica crate. User-editable config,
@@ -427,6 +698,116 @@ opt-level = "s"
         )
     }
 }
+
+/// The static, schema-agnostic Worker bootstrap. Runs the wasm engine, owns the
+/// `/replicate` WebSocket, debounces auto-commit (idle ~250ms or ~100 frames),
+/// probes for an OPFS sync-access backend, and dispatches reads generically via
+/// `replica[method](...args)`. It interprets NO schema — it knows only the method
+/// NAMES it is handed in each message (the PM's schema-agnostic-pipe constraint).
+const WORKER_BOOTSTRAP_JS: &str = r#"// Generated by ForgeDB — browser read-replica Worker bootstrap (STATIC).
+// DO NOT EDIT - schema-agnostic. Runs the wasm engine, follows /replicate,
+// auto-commits on a debounce, and dispatches reads via replica[method](...args).
+
+let mod = null;      // the wasm-pack ES module (booted on __init)
+let replica = null;  // the generated Replica instance (opened on __open)
+let ws = null;
+
+// --- debounced auto-commit -------------------------------------------------
+let pendingFrames = 0;
+let commitTimer = null;
+let committing = false;
+const COMMIT_DEBOUNCE_MS = 250;
+const COMMIT_MAX_FRAMES = 100;
+
+function scheduleCommit() {
+  pendingFrames++;
+  if (pendingFrames >= COMMIT_MAX_FRAMES) { void doCommit(); return; }
+  if (commitTimer) clearTimeout(commitTimer);
+  commitTimer = setTimeout(() => { void doCommit(); }, COMMIT_DEBOUNCE_MS);
+}
+
+async function doCommit() {
+  if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
+  if (committing || !replica) return;
+  committing = true;
+  pendingFrames = 0;
+  try {
+    await replica.commit();
+  } catch (err) {
+    console.error('[forgedb replica] commit failed', err);
+  } finally {
+    committing = false;
+  }
+}
+
+// --- backend capability probe (sync-access-handle semantics) ---------------
+async function probeBackend() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle('__forgedb_probe', { create: true });
+    const fh = await dir.getFileHandle('p', { create: true });
+    const ah = await fh.createSyncAccessHandle();
+    const ok = typeof ah.getSize() === 'number'; // sync semantics -> a number
+    ah.close();
+    try { await dir.removeEntry('p'); } catch (_) {}
+    try { await root.removeEntry('__forgedb_probe', { recursive: true }); } catch (_) {}
+    return ok ? 'opfs' : 'indexeddb';
+  } catch (_) {
+    return 'indexeddb';
+  }
+}
+
+// --- live /replicate follow ------------------------------------------------
+function connect(url) {
+  const sep = url.includes('?') ? '&' : '?';
+  ws = new WebSocket(`${url}${sep}after=${replica.watermark()}`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (e) => {
+    // The /replicate stream is binary frames; ignore any non-binary control
+    // message (e.g. a harness end-of-stream sentinel).
+    if (typeof e.data === 'string') return;
+    try {
+      replica.applyWire(new Uint8Array(e.data));
+      scheduleCommit();
+    } catch (err) {
+      console.error('[forgedb replica] apply failed', err);
+    }
+  };
+  ws.onerror = (err) => console.error('[forgedb replica] ws error', err);
+}
+
+// --- generic RPC (schema-agnostic pipe) ------------------------------------
+self.onmessage = async (e) => {
+  const { id, method, args } = e.data || {};
+  try {
+    let result;
+    if (method === '__init') {
+      mod = await import(args[0]);
+      await mod.default();
+    } else if (method === '__open') {
+      let [dbName, backend, replicateUrl] = args;
+      if (backend === 'auto') backend = await probeBackend();
+      replica = await mod.Replica.open(dbName, backend);
+      if (replicateUrl) connect(replicateUrl);
+      result = backend;
+    } else if (method === '__applyWire') {
+      replica.applyWire(new Uint8Array(args[0]));
+      scheduleCommit();
+    } else if (method === 'commit') {
+      await replica.commit();
+    } else if (method === 'watermark') {
+      result = replica.watermark();
+    } else {
+      // A generated read: dispatch by name to the compiled Replica. The pipe
+      // interprets nothing — the method name came from the generated client.
+      result = replica[method](...args);
+    }
+    self.postMessage({ id, ok: true, result });
+  } catch (err) {
+    self.postMessage({ id, ok: false, error: String((err && err.stack) || err) });
+  }
+};
+"#;
 
 /// A model's identity field (`id`, or the first auto-generate field), if any.
 fn identity_field(model: &Model) -> Option<&forgedb_parser::Field> {
