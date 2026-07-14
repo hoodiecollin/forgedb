@@ -111,7 +111,9 @@ deferred superset. See [WHAT_V1_IS.md](./WHAT_V1_IS.md).
 
 - The data directory is the whole database. Back it up with
   `forgedb backup create` (a lock-free full snapshot); run `forgedb backup
-  --help` for the `create`/`restore`/`list` subcommands.
+  --help` for the `create`/`restore`/`list` subcommands. For full/incremental
+  backups **and point-in-time recovery** (recover to a precise broker offset),
+  see [BACKUP_RECOVERY.md](./BACKUP_RECOVERY.md).
 - Writes are crash-safe: each mutation is journaled to a per-model WAL with an
   fsync **before** columns are touched, and recovery repairs a torn tail on
   reopen.
