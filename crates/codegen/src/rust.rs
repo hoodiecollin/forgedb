@@ -2046,13 +2046,16 @@ impl RustGenerator {
     /// Called from `new()`, off the insert hot path; the manifest's first
     /// reader is schema-blind backup (#57) / the inspector (#63).
     ///
-    /// FUTURE TRAP (incremental backups): this hardcodes `compaction_epoch: 0`
-    /// and runs on every open, so once compaction starts *bumping* the epoch
-    /// (deferred with incrementals), a reopen here would clobber it back to 0
-    /// and silently break an incremental chain. When that lands, make the
-    /// generated writer load any existing manifest and *preserve* its
-    /// `compaction_epoch` instead of overwriting with 0. Harmless today because
-    /// nothing bumps the epoch yet.
+    /// INCREMENTAL-BACKUP CHAIN TOKEN (#76): `compaction_epoch` is the
+    /// chain-validity generation counter.  Within one epoch the columns are
+    /// strictly append-only, so an incremental backup can ship just the byte
+    /// tail appended since the base.  A compaction renumbers rows and so *breaks*
+    /// the chain — `compact()` bumps the epoch, and an incremental against a base
+    /// in a different epoch is refused.  Because `write_manifest` runs on *every*
+    /// reopen, it must NOT hardcode the epoch (that would clobber a bumped epoch
+    /// back to 0 on the next open and silently corrupt a chain); instead it
+    /// *loads any existing manifest and preserves* its `compaction_epoch`,
+    /// stamping the baseline `0` only for a fresh directory.
     fn generate_write_manifest(model: &forgedb_parser::Model) -> TokenStream {
         let model_snake = Self::to_snake_case(&model.name);
         let manifest_path = format!("{}/manifest.json", model_snake);
@@ -2104,6 +2107,14 @@ impl RustGenerator {
             /// no `.forge` semantics.  Written at open, off the insert hot path.
             fn write_manifest(&self, root: &std::path::Path) {
                 let columns = vec![ #(#col_entries),* ];
+                let __manifest_abs = root.join(#manifest_path);
+                // Preserve the incremental-backup chain token (#76): load any
+                // existing manifest and carry its `compaction_epoch` forward, so a
+                // reopen never clobbers a bumped epoch back to 0.  Baseline 0 for a
+                // fresh directory (no manifest yet).
+                let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                    .map(|m| m.compaction_epoch)
+                    .unwrap_or(0);
                 let manifest = forgedb_storage::Manifest {
                     schema_version: 1,
                     row_count: self.row_count,
@@ -2113,7 +2124,7 @@ impl RustGenerator {
                     // (== row_count — recovery already realigned the columns).  NOT
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
-                    compaction_epoch: 0,
+                    compaction_epoch: __compaction_epoch,
                     format_version: 1,
                     row_anchor: Some(forgedb_storage::RowAnchor {
                         relative_path: "tombstones.bin".to_string(),
@@ -2122,7 +2133,20 @@ impl RustGenerator {
                 };
                 // Best-effort: a failed manifest write must not abort the app;
                 // reopen/compaction anchor on the tombstone file, not this file.
-                let _ = manifest.save_to(&root.join(#manifest_path));
+                let _ = manifest.save_to(&__manifest_abs);
+            }
+
+            /// Bump this model's `compaction_epoch` (#76): compaction renumbers
+            /// rows, breaking the append-only byte-tail chain incremental backups
+            /// rely on, so the epoch is incremented to invalidate any incremental
+            /// taken against a pre-compaction base.  Reads + rewrites the manifest
+            /// (temp + rename via `save_to`); best-effort, off the hot path.
+            fn bump_compaction_epoch(&self, root: &std::path::Path) {
+                let __manifest_abs = root.join(#manifest_path);
+                if let Ok(mut __m) = forgedb_storage::Manifest::load_from(&__manifest_abs) {
+                    __m.compaction_epoch = __m.compaction_epoch.saturating_add(1);
+                    let _ = __m.save_to(&__manifest_abs);
+                }
             }
         }
     }
@@ -2855,6 +2879,13 @@ impl RustGenerator {
                     *self = Self::new_at(&__root);
                     self.changefeed = __feed;
                     self.broker = __broker;
+                    // 4. Break the incremental-backup chain (#76): renumbering
+                    //    moved every row's bytes, so a byte-tail delta computed
+                    //    against a pre-compaction base is invalid.  Bump the epoch
+                    //    AFTER the reopen (which rewrote the manifest preserving the
+                    //    old epoch) so an incremental across this boundary is
+                    //    refused rather than silently corrupt.
+                    self.bump_compaction_epoch(&__root);
                 }
                 // Reset unconditionally: a failed compaction waits a full interval
                 // rather than re-attempting on every subsequent mutation.
@@ -4634,6 +4665,98 @@ impl RustGenerator {
                     }
                 }
 
+                /// Point-in-time recovery (#77): replay durable-broker frames in
+                /// `(base_offset .. target_offset]` through `apply_frame`, then
+                /// commit, leaving this database at exactly the state as of broker
+                /// offset `target_offset`.
+                ///
+                /// The recovery recipe: restore a full base backup (taken at broker
+                /// offset `base_offset`, recorded in the archive header) into this
+                /// data dir, place the retained `_replication.log` alongside it, then
+                /// `open_at` and call `recover_to(base_offset, target_offset)`. The
+                /// base's committed columns already contain every change through
+                /// `base_offset` (the generated mutation records to the broker only
+                /// *after* the column commit), so replay begins strictly *after* it —
+                /// exactly like #110's reload-resume skips frames `<= watermark`.
+                ///
+                /// Recovery reuses the SAME opaque-model-tag `apply_frame` the
+                /// browser follower (#110) uses — there is no second decode/apply
+                /// path, and the broker offset is the only ordering key (never a
+                /// decoded field). Reads the log via `DurableBroker::read_from` in
+                /// bounded batches so a long log does not materialize at once.
+                ///
+                /// Idempotent by id: even if a boundary frame `<= base_offset` were
+                /// re-applied (it is not, given the strict `>` filter), the
+                /// superseding-version append means `get`/`all` still resolve one
+                /// record per id — double-apply is read-safe.
+                ///
+                /// Returns the highest offset actually applied (`base_offset` if the
+                /// log holds nothing after it, capped at the log's watermark if
+                /// `target_offset` runs past the retained tail). Errors if there is
+                /// no broker (the standalone `new()` path has no `_replication.log`
+                /// to replay) or a frame fails to apply.
+                pub fn recover_to(
+                    &mut self,
+                    base_offset: u64,
+                    target_offset: u64,
+                ) -> Result<u64, ApplyError> {
+                    // Read frames from the broker's durable log, but DETACH the
+                    // broker for the duration of replay so `apply_frame`'s
+                    // insert/update/delete do NOT re-record the frames we are
+                    // reading back into the same `_replication.log` (which would
+                    // duplicate the tail and corrupt the offset stream).  This is
+                    // exactly why the #110 follower runs with `broker: None`; here
+                    // we take it out, replay, then put the original handle back so
+                    // the recovered database stays usable (its log is unchanged,
+                    // still holding the pre-recovery frames).
+                    let broker = self
+                        .broker
+                        .take()
+                        .ok_or_else(|| ApplyError::Decode(
+                            "no replication broker: recover_to needs a data dir \
+                             opened via open_at with a _replication.log present"
+                                .to_string(),
+                        ))?;
+                    // Detach the shared handle from every collection too, so their
+                    // generated mutations stay inert during replay.
+                    #(self.#field_idents.attach_broker(None);)*
+
+                    const BATCH: usize = 512;
+                    let mut after = base_offset;
+                    let mut applied = base_offset;
+                    let result: Result<u64, ApplyError> = (|| {
+                        loop {
+                            // Read the next batch of frames strictly after `after`.
+                            let frames = {
+                                let guard = broker.lock().unwrap();
+                                guard
+                                    .read_from(after, BATCH)
+                                    .map_err(|e| ApplyError::Decode(e.to_string()))?
+                            };
+                            if frames.is_empty() {
+                                break;
+                            }
+                            for ev in &frames {
+                                if ev.offset > target_offset {
+                                    // Reached the recovery point — stop, don't apply.
+                                    return Ok(applied);
+                                }
+                                self.apply_frame(ev)?;
+                                applied = ev.offset;
+                                after = ev.offset;
+                            }
+                        }
+                        Ok(applied)
+                    })();
+
+                    // Re-attach the broker regardless of outcome, then flush.
+                    #(self.#field_idents.attach_broker(Some(broker.clone()));)*
+                    self.broker = Some(broker);
+                    let applied = result?;
+                    self.commit().map_err(|e| ApplyError::Decode(e.to_string()))?;
+                    Ok(applied)
+                }
+
                 /// Commit every collection (#110 Milestone C additive commit):
                 /// flush all model columns + tombstones and fsync junction id
                 /// columns.  Native: an fsync durability boundary.  Wasm arena
@@ -5127,6 +5250,13 @@ impl RustGenerator {
                                 relative_path: "fixed/right.bin".to_string(),
                             },
                         ];
+                        let __manifest_abs = root.join(#manifest_path);
+                        // Preserve the incremental-backup chain token (#76) across
+                        // reopen, same as the model path (junctions are not compacted
+                        // today, so this stays 0 — but the invariant is uniform).
+                        let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                            .map(|m| m.compaction_epoch)
+                            .unwrap_or(0);
                         let manifest = forgedb_storage::Manifest {
                             schema_version: 1,
                             row_count: self.row_count,
@@ -5136,14 +5266,14 @@ impl RustGenerator {
                     // (== row_count — recovery already realigned the columns).  NOT
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
-                            compaction_epoch: 0,
+                            compaction_epoch: __compaction_epoch,
                             format_version: 1,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: 16usize,
                             }),
                         };
-                        let _ = manifest.save_to(&root.join(#manifest_path));
+                        let _ = manifest.save_to(&__manifest_abs);
                     }
 
                     /// Record a link between a `left` (model1) id and a `right`

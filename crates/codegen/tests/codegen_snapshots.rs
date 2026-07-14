@@ -1343,10 +1343,16 @@ Tag {
             || code.contains("bytes_per_row: 1usize"),
         "model manifest must anchor row count on tombstones.bin at 1 byte/row"
     );
+    // The manifest path is bound to `__manifest_abs = root.join("post/...")`
+    // (so both the epoch-preserving load and the save use the one path).
     assert!(
-        code.contains("save_to(&root.join(\"post/manifest.json\"))")
-            || code.contains("save_to(& root.join(\"post/manifest.json\"))"),
-        "model manifest must be written under the (root-joined) model directory"
+        code.contains("root.join(\"post/manifest.json\")")
+            || code.contains("root.join (\"post/manifest.json\")"),
+        "model manifest path must be the root-joined model directory"
+    );
+    assert!(
+        code.contains("save_to(&__manifest_abs)") || code.contains("save_to (& __manifest_abs)"),
+        "model manifest must be written via the bound __manifest_abs path"
     );
 
     // Junction manifest anchors on fixed/right.bin at 16 bytes/row.
@@ -1358,6 +1364,73 @@ Tag {
     assert!(
         code.contains("post_tag_link/manifest.json") || code.contains("tag_post_link/manifest.json"),
         "junction manifest must be written under the junction directory"
+    );
+}
+
+#[test]
+fn test_rust_generation_compaction_epoch_bump() {
+    // Incremental-backup chain token (#76): `compact()` must bump the
+    // manifest's `compaction_epoch` (chain-validity generation counter) so a
+    // byte-tail incremental against a pre-compaction base is refused; and
+    // `write_manifest` must PRESERVE an existing epoch on reopen rather than
+    // clobbering it back to 0 (the trap documented at generate_write_manifest).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // write_manifest loads any existing manifest and carries its epoch forward
+    // (no hardcoded `compaction_epoch : 0` overwrite on reopen).
+    assert!(
+        code.contains("Manifest :: load_from") || code.contains("Manifest::load_from"),
+        "write_manifest must load the existing manifest to preserve its compaction_epoch"
+    );
+    assert!(
+        code.contains("compaction_epoch : __compaction_epoch")
+            || code.contains("compaction_epoch: __compaction_epoch"),
+        "the written manifest must reuse the preserved epoch, not a hardcoded 0"
+    );
+    assert!(
+        !code.contains("compaction_epoch : 0") && !code.contains("compaction_epoch: 0"),
+        "the epoch must never be hardcoded to 0 on reopen (that clobbers a bumped chain token)"
+    );
+
+    // A generated bump_compaction_epoch increments + rewrites the manifest.
+    assert!(
+        code.contains("fn bump_compaction_epoch"),
+        "a bump_compaction_epoch method must be generated"
+    );
+    assert!(
+        code.contains("saturating_add (1)") || code.contains("saturating_add(1)"),
+        "the epoch bump must increment by 1"
+    );
+
+    // compact() must call the bump AFTER the reopen (so the reopen-written
+    // manifest, which preserves the old epoch, is then advanced).
+    assert!(
+        code.contains("self . bump_compaction_epoch") || code.contains("self.bump_compaction_epoch"),
+        "compact() must bump the compaction epoch to break the incremental chain"
+    );
+    let compact_pos = code
+        .find("pub fn compact")
+        .expect("a compact() method must be generated");
+    let bump_pos = code[compact_pos..]
+        .find("bump_compaction_epoch")
+        .map(|p| p + compact_pos)
+        .expect("compact() must reference bump_compaction_epoch");
+    let reopen_pos = code[compact_pos..]
+        .find("Self :: new_at")
+        .or_else(|| code[compact_pos..].find("Self::new_at"))
+        .map(|p| p + compact_pos)
+        .expect("compact() must reopen via new_at");
+    assert!(
+        bump_pos > reopen_pos,
+        "the epoch bump must run AFTER the reopen (which rewrites the manifest preserving the old epoch)"
     );
 }
 
@@ -2642,6 +2715,65 @@ Tag {
     assert!(
         !flat.contains("matchrecord."),
         "apply_frame/apply must never branch on a decoded record field"
+    );
+}
+
+#[test]
+fn test_rust_generation_recover_to() {
+    // Point-in-time recovery (#77): the generated Database exposes recover_to,
+    // which replays durable-broker frames in (base_offset .. target] through the
+    // SAME opaque-model-tag apply_frame the #110 follower uses — no second decode
+    // path, the broker offset is the only ordering key, and it detaches the broker
+    // during replay so replayed mutations don't re-record into the log it reads.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The recovery entry point.
+    assert!(
+        flat.contains("pubfnrecover_to(&mutself,base_offset:u64,target_offset:u64,)->Result<u64,ApplyError>"),
+        "Database must expose recover_to(base_offset, target_offset)"
+    );
+    // Reuses the durable broker's read_from — no new read path.
+    assert!(
+        flat.contains(".read_from(after,BATCH)"),
+        "recover_to reads frames via DurableBroker::read_from"
+    );
+    // Replays through the SAME apply_frame (opaque model tag dispatch) — no second
+    // decode path.
+    assert!(
+        flat.contains("self.apply_frame(ev)"),
+        "recover_to must replay through the existing apply_frame, not a new path"
+    );
+    // Strict (base_offset .. target] window: begins after base, stops past target.
+    assert!(
+        flat.contains("ifev.offset>target_offset"),
+        "recover_to stops at the target offset (exclusive upper bound past target)"
+    );
+    // Detaches the broker during replay so replayed mutations do not re-record.
+    assert!(
+        flat.contains(".attach_broker(None)"),
+        "recover_to detaches the broker during replay so apply doesn't re-record frames"
+    );
+    // IDENTITY RED LINE: recovery ordering is the opaque broker offset, never a
+    // decoded record field.  apply_frame already dispatches by the model tag.
+    assert!(
+        !flat.contains("matchrecord."),
+        "recover_to must never branch on a decoded record field — offset is the only key"
     );
 }
 
