@@ -163,6 +163,14 @@ invariant).  No version chains / transaction manager (Direction C).
 
 ## Direction C — full version-chain MVCC (held; on demand only)
 
+> **Designed 2026-07-14 → [`multi-writer-mvcc.md`](./multi-writer-mvcc.md)** (issue #75, PM verdict
+> PASS-WITH-CONSTRAINTS). That note supersedes the sketch below: it reframes C as **transactions +
+> concurrent writers in three tiers** and finds that **Tiers 1–2 need no on-disk `xmin`/`xmax`
+> engine** (serialized commit keeps the watermark valid; conflict detection is in-memory). Tier 1
+> (transactions, rollback-by-`truncate_to_rows`) is the recommended first milestone with **zero new
+> substrate**. The heavyweight version-chain engine sketched here is only the Tier-3 / segmented-
+> column horizon. Read that note for the current design.
+
 Per-row `xmin`/`xmax` visibility, a transaction manager handing out txn IDs + snapshots,
 UPDATE = append-new-version + stamp-old-`xmax`, reads walk version chains filtering by snapshot,
 a GC/vacuum loop. Unlocks true concurrent writers + full snapshot isolation across updates/
