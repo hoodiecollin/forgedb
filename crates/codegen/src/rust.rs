@@ -945,6 +945,9 @@ impl RustGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp
             | FieldType::String
+            // decimal is `Ord` + `Hash`, so it is filterable / sortable / indexable
+            // (index keyed scale-invariantly via `index_value_expr`).
+            | FieldType::Decimal
             | FieldType::Char(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
             _ => false,
@@ -1177,7 +1180,10 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(quote! { record.#fident });
+                let key = Self::index_key_expr(Self::index_value_expr(
+                    &f.field_type,
+                    quote! { record.#fident },
+                ));
                 if exclude_self {
                     quote! {
                         {
@@ -1250,6 +1256,25 @@ impl RustGenerator {
     /// filter (`<model>_event_matches`) compares by — so tagging is free of any
     /// cross-path constraint.  Computing it identically for the stored field value
     /// and the probe argument is what keeps an index hit self-consistent.
+    /// Pre-transform a field value expression before it is fed to `index_key_expr`,
+    /// so the resulting index key is **scale-invariant** for `decimal` fields.
+    ///
+    /// `rust_decimal::Decimal` preserves scale (`1.0` != `1.00` in `to_string()` /
+    /// serde form) even though they are `Ord`-equal; feeding them raw into
+    /// `index_key_expr` would bucket them separately (the same key-collision class
+    /// #102 fixed for nullable).  `Decimal::normalize()` collapses trailing-zero
+    /// scale, so normalizing both the stored value and the probe argument keys them
+    /// identically.  Nullable decimal normalizes through `.map(...)`; every other
+    /// field type is returned unchanged.
+    fn index_value_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
+        match field_type {
+            forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
+            forgedb_parser::FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
+                quote! { (#value_expr).map(|__d| __d.normalize()) }
+            }
+            _ => value_expr,
+        }
+    }
     fn index_key_expr(value_expr: TokenStream) -> TokenStream {
         quote! {
             match serde_json::to_value(&(#value_expr)) {
@@ -1748,6 +1773,9 @@ impl RustGenerator {
                     forgedb_parser::FieldType::F64 => 8,
                     forgedb_parser::FieldType::Bool => 1,
                     forgedb_parser::FieldType::Uuid => 16,
+                    // decimal = rust_decimal::Decimal, a fixed 16-byte value
+                    // (Decimal::serialize() -> [u8; 16]).
+                    forgedb_parser::FieldType::Decimal => 16,
                     forgedb_parser::FieldType::Timestamp => 8,
                     forgedb_parser::FieldType::Char(n) => *n,
                     forgedb_parser::FieldType::FixedArray(inner, count) => {
@@ -2001,8 +2029,17 @@ impl RustGenerator {
                     // Timestamp is a newtype over i64; append_timestamp expects i64
                     let is_timestamp =
                         matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                    // Non-null decimal: a fixed 16-byte column stored via
+                    // Decimal::serialize() -> [u8; 16], on the raw uuid byte path.
+                    let is_decimal =
+                        matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
 
-                    if is_uuid_like {
+                    if is_decimal {
+                        append_statements.push(quote! {
+                            self.#field_col_name.append_uuid(record.#field_name.serialize())
+                                .expect("Failed to append to column");
+                        });
+                    } else if is_uuid_like {
                         append_statements.push(quote! {
                             self.#field_col_name.#append_method(*record.#field_name.as_bytes())
                                 .expect("Failed to append to column");
@@ -2229,7 +2266,16 @@ impl RustGenerator {
                     );
                     let is_timestamp =
                         matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
-                    if is_uuid_like {
+                    let is_decimal =
+                        matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
+                    if is_decimal {
+                        // Non-null decimal backfills to Decimal::ZERO (its 16-byte
+                        // serialized form), so a read decodes to `0` — the zero value.
+                        quote! {
+                            self.#col.append_uuid(rust_decimal::Decimal::ZERO.serialize())
+                                .expect("Failed to backfill column");
+                        }
+                    } else if is_uuid_like {
                         quote! {
                             self.#col.#append_method([0u8; 16])
                                 .expect("Failed to backfill column");
@@ -2618,7 +2664,8 @@ impl RustGenerator {
             .map(|f| {
                 let ident = Self::index_field_ident(f);
                 let fname = format_ident!("{}", f.name);
-                Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok)
+                let val = Self::index_value_expr(&f.field_type, quote! { record.#fname });
+                Self::index_add_block(&recv, &ident, val, &id_tok)
             })
             .collect();
         // Composite-index maintenance (#101): same timing, keyed by the tuple.
@@ -2629,7 +2676,7 @@ impl RustGenerator {
                     .iter()
                     .map(|c| {
                         let cf = format_ident!("{}", c.name);
-                        quote! { record.#cf }
+                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
                     })
                     .collect();
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
@@ -2725,11 +2772,15 @@ impl RustGenerator {
                 let remove_old = Self::index_remove_block(
                     &recv,
                     &ident,
-                    quote! { __old_rec.#fname },
+                    Self::index_value_expr(&f.field_type, quote! { __old_rec.#fname }),
                     &id_tok,
                 );
-                let add_new =
-                    Self::index_add_block(&recv, &ident, quote! { record.#fname }, &id_tok);
+                let add_new = Self::index_add_block(
+                    &recv,
+                    &ident,
+                    Self::index_value_expr(&f.field_type, quote! { record.#fname }),
+                    &id_tok,
+                );
                 quote! {
                     if let Some(__old_rec) = &__old {
                         #remove_old
@@ -2747,14 +2798,14 @@ impl RustGenerator {
                     .iter()
                     .map(|c| {
                         let cf = format_ident!("{}", c.name);
-                        quote! { __old_rec.#cf }
+                        Self::index_value_expr(&c.field_type, quote! { __old_rec.#cf })
                     })
                     .collect();
                 let new_parts: Vec<_> = comps
                     .iter()
                     .map(|c| {
                         let cf = format_ident!("{}", c.name);
-                        quote! { record.#cf }
+                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
                     })
                     .collect();
                 let remove_old = Self::composite_remove_block(&recv, ident, &old_parts, &id_tok);
@@ -2848,7 +2899,8 @@ impl RustGenerator {
             .map(|f| {
                 let ident = Self::index_field_ident(f);
                 let fname = format_ident!("{}", f.name);
-                Self::index_remove_block(&recv, &ident, quote! { record.#fname }, &id_tok)
+                let val = Self::index_value_expr(&f.field_type, quote! { record.#fname });
+                Self::index_remove_block(&recv, &ident, val, &id_tok)
             })
             .collect();
         // Composite-index removal (#101): drop the deleted id's tuple key.
@@ -2859,7 +2911,7 @@ impl RustGenerator {
                     .iter()
                     .map(|c| {
                         let cf = format_ident!("{}", c.name);
-                        quote! { record.#cf }
+                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
                     })
                     .collect();
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
@@ -2953,8 +3005,12 @@ impl RustGenerator {
             let find_fn = format_ident!("find_by_{}", f.name);
             let find_at_fn = format_ident!("find_by_{}_at", f.name);
             let params = quote! { value: #param_ty };
-            let key_from_arg = Self::index_key_expr(quote! { value });
-            let key_from_rec = Self::index_key_expr(quote! { __rec.#fname });
+            let key_from_arg =
+                Self::index_key_expr(Self::index_value_expr(&f.field_type, quote! { value }));
+            let key_from_rec = Self::index_key_expr(Self::index_value_expr(
+                &f.field_type,
+                quote! { __rec.#fname },
+            ));
             let subject = format!("`{}`.`{}`", model.name, f.name);
             let unique = if f.unique {
                 Some((
@@ -2995,14 +3051,17 @@ impl RustGenerator {
                 .iter()
                 .map(|c| {
                     let pn = format_ident!("{}", c.name);
-                    Self::index_key_expr(quote! { #pn })
+                    Self::index_key_expr(Self::index_value_expr(&c.field_type, quote! { #pn }))
                 })
                 .collect();
             let rec_keys: Vec<_> = comps
                 .iter()
                 .map(|c| {
                     let cf = format_ident!("{}", c.name);
-                    Self::index_key_expr(quote! { __rec.#cf })
+                    Self::index_key_expr(Self::index_value_expr(
+                        &c.field_type,
+                        quote! { __rec.#cf },
+                    ))
                 })
                 .collect();
             let key_from_arg = Self::composite_key_build(&arg_keys);
@@ -3263,8 +3322,19 @@ impl RustGenerator {
                 // read_timestamp returns i64; the struct field is Timestamp
                 let is_timestamp =
                     matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                // Non-null decimal reads raw [u8; 16] then Decimal::deserialize.
+                let is_decimal =
+                    matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
 
-                if is_uuid_like {
+                if is_decimal {
+                    quote! {
+                        let #field_value_name = {
+                            let bytes = #receiver.#field_col_name.read_uuid(#row_index)
+                                .expect("Failed to read from column");
+                            rust_decimal::Decimal::deserialize(bytes)
+                        };
+                    }
+                } else if is_uuid_like {
                     quote! {
                         let #field_value_name = {
                             let bytes = #receiver.#field_col_name.#read_method(#row_index)
@@ -3303,20 +3373,37 @@ impl RustGenerator {
         // forgedb_types::Timestamp is a newtype over i64 and does not implement
         // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
         // schema while the struct field keeps the semantic Timestamp type.
-        let schema_attr = if Self::is_timestamp_type(&field.field_type) {
+        //
+        // `decimal` (rust_decimal::Decimal) likewise does not implement ToSchema,
+        // and is serialized as a JSON *string* (precision-preserving, matching the
+        // TS SDK's `string` type) via rust_decimal's `serde::str` module — so it
+        // gets both a `#[schema(value_type = String)]` and a `#[serde(with = ...)]`.
+        let (schema_attr, serde_attr) = if Self::is_timestamp_type(&field.field_type) {
             if field.is_nullable() {
-                quote! { #[schema(value_type = Option<i64>)] }
+                (quote! { #[schema(value_type = Option<i64>)] }, quote! {})
             } else {
-                quote! { #[schema(value_type = i64)] }
+                (quote! { #[schema(value_type = i64)] }, quote! {})
+            }
+        } else if Self::is_decimal_type(&field.field_type) {
+            if field.is_nullable() {
+                (
+                    quote! { #[schema(value_type = Option<String>)] },
+                    quote! { #[serde(with = "rust_decimal::serde::str_option")] },
+                )
+            } else {
+                (
+                    quote! { #[schema(value_type = String)] },
+                    quote! { #[serde(with = "rust_decimal::serde::str")] },
+                )
             }
         } else {
-            quote! {}
+            (quote! {}, quote! {})
         };
 
         if field.is_nullable() {
-            quote! { #schema_attr pub #field_name: Option<#field_type> }
+            quote! { #schema_attr #serde_attr pub #field_name: Option<#field_type> }
         } else {
-            quote! { #schema_attr pub #field_name: #field_type }
+            quote! { #schema_attr #serde_attr pub #field_name: #field_type }
         }
     }
 
@@ -3615,6 +3702,9 @@ impl RustGenerator {
             | forgedb_parser::FieldType::Bool
             | forgedb_parser::FieldType::Uuid
             | forgedb_parser::FieldType::Timestamp
+            // `decimal` is a fixed 16-byte column (rust_decimal::Decimal::serialize),
+            // stored exactly like Uuid.
+            | forgedb_parser::FieldType::Decimal
             | forgedb_parser::FieldType::Char(_)
             | forgedb_parser::FieldType::FixedArray(_, _)
             | forgedb_parser::FieldType::StructType(_)
@@ -3662,6 +3752,22 @@ impl RustGenerator {
             _ => false,
         }
     }
+    /// Check if a field type is (or wraps) `decimal` — an exact fixed-point value
+    /// typed `rust_decimal::Decimal`.
+    ///
+    /// `decimal` rides the FIXED 16-byte column path (like `Uuid`), encoded via
+    /// `Decimal::serialize() -> [u8; 16]` and decoded via `Decimal::deserialize`.
+    /// It needs its own append/read body (raw 16-byte column, but a
+    /// serialize/deserialize round-trip rather than uuid's `as_bytes`/`from_bytes`),
+    /// so this predicate special-cases it out of the generic fixed path — the same
+    /// way `is_uuid_like`/`is_timestamp` do.
+    fn is_decimal_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::Decimal => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_decimal_type(inner),
+            _ => false,
+        }
+    }
     /// Whether a field occupies a variable-length column (`String` OR `json`).
     /// This is the classification predicate for storage layout / column
     /// iteration / projectability — everywhere the question is "does this field
@@ -3695,6 +3801,9 @@ impl RustGenerator {
             forgedb_parser::FieldType::Bool => "bool",
             forgedb_parser::FieldType::Uuid => "uuid",
             forgedb_parser::FieldType::Timestamp => "timestamp",
+            // decimal persists as a raw [u8; 16] (Decimal::serialize) — reuses the
+            // uuid column file-path label, same 16-byte fixed column on disk.
+            forgedb_parser::FieldType::Decimal => "decimal",
             forgedb_parser::FieldType::Char(_) => "bytes",
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
@@ -3802,7 +3911,8 @@ impl RustGenerator {
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
-                        Self::index_add_block(&recv, &ident, quote! { #val }, &id_tok)
+                        let val = Self::index_value_expr(&f.field_type, quote! { #val });
+                        Self::index_add_block(&recv, &ident, val, &id_tok)
                     })
                     .collect();
                 // Composite index adds (#101), folded into the same scan.
@@ -3811,7 +3921,7 @@ impl RustGenerator {
                         .iter()
                         .map(|c| {
                             let val = format_ident!("{}_value", c.name);
-                            quote! { #val }
+                            Self::index_value_expr(&c.field_type, quote! { #val })
                         })
                         .collect();
                     Self::composite_add_block(&recv, ident, &parts, &id_tok)
@@ -5040,6 +5150,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::Bool => quote! { bool },
             forgedb_parser::FieldType::String => quote! { String },
             forgedb_parser::FieldType::Json => quote! { serde_json::Value },
+            forgedb_parser::FieldType::Decimal => quote! { rust_decimal::Decimal },
             forgedb_parser::FieldType::Uuid => quote! { Uuid },
             forgedb_parser::FieldType::Timestamp => quote! { Timestamp },
             forgedb_parser::FieldType::StructType(name) => {

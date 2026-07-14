@@ -393,7 +393,12 @@ export interface ListOptions {\n\
             forgedb_parser::FieldType::String | forgedb_parser::FieldType::Uuid => {
                 "string".to_string()
             }
+            // json is an arbitrary JSON value; `unknown` keeps callers honest
+            // under `tsc --strict` (they must narrow before use).
             forgedb_parser::FieldType::Json => "unknown".to_string(),
+            // decimal serializes as a JSON string (precision-preserving over the
+            // wire), so the SDK types it `string` — same discipline as ids.
+            forgedb_parser::FieldType::Decimal => "string".to_string(),
             // Nullable wraps the inner type; the `| null` suffix is added by is_nullable()
             forgedb_parser::FieldType::Nullable(inner) => Self::map_field_type(inner),
             _ => "any".to_string(),

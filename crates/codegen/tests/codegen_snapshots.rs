@@ -3039,3 +3039,84 @@ fn test_openapi_generation_skips_virtual_fields() {
     }
 }
 
+#[test]
+fn test_rust_generation_decimal_type() {
+    // `decimal` is an exact fixed-point value (rust_decimal::Decimal) on the
+    // FIXED 16-byte column path (like uuid): Decimal::serialize()/deserialize().
+    // It is filterable/sortable/indexable (Ord+Hash), with a SCALE-INVARIANT
+    // index key (value.normalize()) so `1.0` and `1.00` share one bucket.
+    let src = r#"
+Product {
+  id: +uuid
+  price: ^decimal
+  discount: decimal?
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // 1. Struct field is rust_decimal::Decimal (non-null) / Option<...> (nullable),
+    //    serialized as a JSON string (precision-preserving) via the serde `str`
+    //    module, and schema'd as a String (Decimal has no ToSchema impl).
+    assert!(
+        code.contains("pub price: rust_decimal::Decimal"),
+        "non-null decimal field type"
+    );
+    assert!(
+        code.contains("pub discount: Option<rust_decimal::Decimal>"),
+        "nullable decimal field type"
+    );
+    assert!(
+        code.contains("#[serde(with = \"rust_decimal::serde::str\")]"),
+        "non-null decimal uses the string serde module"
+    );
+    assert!(
+        code.contains("#[serde(with = \"rust_decimal::serde::str_option\")]"),
+        "nullable decimal uses the string_option serde module"
+    );
+    assert!(
+        code.contains("#[schema(value_type = String)]"),
+        "decimal is schema'd as a String for utoipa"
+    );
+
+    // 2. Fixed 16-byte column storage — the raw uuid byte path but with a
+    //    Decimal::serialize()/deserialize() round-trip (not uuid's as_bytes).
+    assert!(
+        code.contains(".append_uuid(record.price.serialize())"),
+        "non-null decimal appends via Decimal::serialize() -> [u8; 16]"
+    );
+    assert!(
+        code.contains("rust_decimal::Decimal::deserialize(bytes)"),
+        "non-null decimal reads via Decimal::deserialize([u8; 16])"
+    );
+    // The column is a FixedColumn (not a VariableColumn like string/json).
+    assert!(
+        code.contains("price_col: FixedColumn"),
+        "decimal occupies a fixed column"
+    );
+    // Nullable decimal rides the generic nullable-fixed-byte path (Option<Decimal>).
+    assert!(
+        code.contains("std::mem::size_of::<Option<rust_decimal::Decimal>>()"),
+        "nullable decimal sizes as Option<Decimal>"
+    );
+
+    // 3. Scale-invariant index key: an explicitly-indexed decimal field
+    //    (`^decimal`) is indexed and its value is normalized before keying.
+    assert!(code.contains("price_index"), "^decimal is indexed");
+    assert!(
+        code.contains("(record.price).normalize()"),
+        "the decimal index key normalizes away scale (1.0 == 1.00)"
+    );
+
+    // 4. Sort uses Ord::cmp (decimal is Ord) — never the float partial_cmp branch.
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    assert!(
+        api.contains("\"price\" => rows.sort_by(|a, b| a.price.cmp(&b.price))"),
+        "decimal sorts via Ord::cmp, not partial_cmp"
+    );
+
+    insta::assert_snapshot!(code);
+}
+

@@ -538,6 +538,9 @@ impl ApiGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp
             | FieldType::String
+            // decimal is `Ord`, so it is filterable + sortable (sort uses the
+            // `Ord::cmp` branch, not float `partial_cmp`).
+            | FieldType::Decimal
             | FieldType::Char(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_field(inner),
             _ => false,

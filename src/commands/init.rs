@@ -143,6 +143,7 @@ forgedb-auth = "0.1"
 forgedb-query-params = "0.1"
 forgedb-compaction = "0.1"
 regex = "1"
+rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 utoipa = {{ version = "5", features = ["uuid"] }}

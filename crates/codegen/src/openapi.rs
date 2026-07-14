@@ -236,6 +236,8 @@ impl OpenApiGenerator {
             // `json` accepts any JSON value. In JSON Schema 2020-12 an empty
             // schema validates everything; keep a description for readability.
             FieldType::Json => json!({ "description": "Arbitrary JSON value" }),
+            // decimal serializes as a precision-preserving JSON string.
+            FieldType::Decimal => json!({ "type": "string", "format": "decimal" }),
             FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
             FieldType::Timestamp => json!({
                 "type": "integer",

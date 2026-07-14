@@ -288,6 +288,7 @@ impl Parser {
                     | Token::TypeUuid
                     | Token::TypeTimestamp
                     | Token::TypeJson
+                    | Token::TypeDecimal
                     | Token::TypeChar => {
                         let inner = self.parse_primitive_type()?;
                         return Ok(FieldType::Nullable(Box::new(inner)));
@@ -355,6 +356,7 @@ impl Parser {
             Token::TypeBool => FieldType::Bool,
             Token::TypeString => FieldType::String,
             Token::TypeJson => FieldType::Json,
+            Token::TypeDecimal => FieldType::Decimal,
             Token::TypeUuid => FieldType::Uuid,
             Token::TypeTimestamp => FieldType::Timestamp,
             Token::TypeChar => {
@@ -579,6 +581,7 @@ impl Parser {
                 | FieldType::Bool
                 | FieldType::String
                 | FieldType::Json
+                | FieldType::Decimal
                 | FieldType::Uuid
                 | FieldType::Timestamp
                 | FieldType::Char(_)
@@ -1024,6 +1027,30 @@ mod tests {
         assert!(!payload.field_type.is_fixed_size());
         assert!(!meta.field_type.is_fixed_size());
     }
+    #[test]
+    fn parses_decimal_and_nullable_decimal_types() {
+        let src = r#"
+            Product {
+                id: +uuid
+                price: decimal
+                discount: decimal?
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let m = schema.models.iter().find(|m| m.name == "Product").unwrap();
+        let price = m.fields.iter().find(|f| f.name == "price").unwrap();
+        let discount = m.fields.iter().find(|f| f.name == "discount").unwrap();
+        assert_eq!(price.field_type, FieldType::Decimal);
+        assert_eq!(
+            discount.field_type,
+            FieldType::Nullable(Box::new(FieldType::Decimal))
+        );
+        // decimal is a fixed 16-byte column (like Uuid), NOT variable-length.
+        assert!(price.field_type.is_fixed_size());
+        assert!(discount.field_type.is_fixed_size());
+        assert_eq!(price.field_type.to_rust_type(), "rust_decimal::Decimal");
+    }
+
     #[test]
     fn parses_string_literal_directive_arg() {
         let src = r#"

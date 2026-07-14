@@ -95,6 +95,7 @@ status: string? @default("pending")     // nullable string with default
 | `bool`    | `bool`            | `bool`              | Boolean (true/false)             |
 | `string`  | `string`          | `String`            | Variable-length UTF-8 string     |
 | `json`    | `json`            | `serde_json::Value` | Arbitrary JSON value (variable-length column, stored as serialized JSON) |
+| `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
 | `timestamp` | `timestamp`     | `i64`               | Unix timestamp (milliseconds)    |
 | `char(N)` | `char(8)`         | `[u8; 8]`           | Fixed-size byte array (Sprint 8) |
@@ -103,6 +104,7 @@ status: string? @default("pending")     // nullable string with default
 - No `text` type in parser (CLAUDE.md mentions it but parser has only `string`)
 - `char(N)` is parsed as `FieldType::Char(usize)` and requires `(...)` syntax (`crates/parser/src/parser/core.rs:354-369`)
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
+- `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
 
 ---
 

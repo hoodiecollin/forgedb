@@ -65,6 +65,12 @@ pub enum FieldType {
     /// typed `serde_json::Value` in generated Rust (#json). Rides the same
     /// variable-column storage path as `String`.
     Json,
+    /// Exact fixed-point decimal (money/quantity). Typed `rust_decimal::Decimal`
+    /// in generated Rust; stored in a FIXED 16-byte column (via `Decimal::serialize`),
+    /// exactly like `Uuid`. Serialized as a JSON string to preserve precision.
+    /// `Ord`+`Hash`, so it is filterable/sortable/indexable (index key normalized
+    /// to be scale-invariant). Bare `decimal` only — `decimal(p, s)` is deferred.
+    Decimal,
     // Fixed-size types (Sprint 8)
     Char(usize),                       // Fixed-size character array: char(N)
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
@@ -387,6 +393,7 @@ impl FieldType {
             FieldType::Bool => "bool".to_string(),
             FieldType::String => "String".to_string(),
             FieldType::Json => "serde_json::Value".to_string(),
+            FieldType::Decimal => "rust_decimal::Decimal".to_string(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
             FieldType::Char(size) => format!("[u8; {}]", size),
@@ -438,6 +445,7 @@ impl FieldType {
             | FieldType::Bool
             | FieldType::Uuid
             | FieldType::Timestamp
+            | FieldType::Decimal // exact decimal is a fixed 16-byte column, like Uuid
             | FieldType::Char(_) => true,
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size

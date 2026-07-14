@@ -25,6 +25,7 @@ pub enum Token {
     TypeUuid,
     TypeTimestamp,
     TypeJson,    // json - variable-length column typed serde_json::Value
+    TypeDecimal, // decimal - fixed 16-byte column typed rust_decimal::Decimal
     TypeChar,    // char(N) - fixed-size character array
 
     // Keywords
@@ -312,6 +313,7 @@ impl Lexer {
                     "uuid" => Token::TypeUuid,
                     "timestamp" => Token::TypeTimestamp,
                     "json" => Token::TypeJson,
+                    "decimal" => Token::TypeDecimal,
                     "char" => Token::TypeChar,
                     "struct" => Token::KwStruct,
                     _ => Token::Ident(ident),
