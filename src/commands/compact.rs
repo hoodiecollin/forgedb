@@ -2,30 +2,34 @@ use crate::error::CliError;
 use forgedb_compaction::{CompactionConfig, MaintenanceApi};
 use std::path::PathBuf;
 
+/// Options for the DEPRECATED offline `compact` command (#105).  The fields are
+/// still parsed from the CLI (so the flags resolve rather than erroring) but are
+/// no longer acted on — the command mutates nothing and returns a deprecation
+/// error.  `#[allow(dead_code)]` because the offline execution was removed.
+#[allow(dead_code)]
 pub struct CompactOptions {
     pub data_dir: PathBuf,
     pub model: Option<String>,
     pub all: bool,
     pub threshold: Option<f64>,
-    pub force: bool,
 }
 
-/// Refusal message for the unsafe offline compaction path (#105).  The
+/// Deprecation message for the offline compaction path (#105).  The
 /// tombstone-based `compact_model` is misaligned with the generated
 /// superseding-version mutation surface (#66): superseded update-versions are
 /// orphaned but NOT tombstoned (so nothing is reclaimed), and a delete's
 /// tombstone is a NEW marker row — dropping it RESURRECTS the deleted record.
 /// Computing the correct live-row set offline needs schema-aware id-column logic
-/// the CLI does not carry, so v1 gates this path behind `--force`.
-const UNSAFE_COMPACT_MSG: &str = "\
-Offline `forgedb compact` uses a tombstone-based algorithm that is unsafe on data \
-written by the generated mutation surface (updates/deletes) — it reclaims nothing \
-from updates and can RESURRECT deleted rows (see issue #105).\n\n\
+/// the CLI does not carry, so this path is REMOVED: the supported path is the
+/// in-process, keep-set-based `Database::compact()` (#92).
+const DEPRECATED_COMPACT_MSG: &str = "\
+Offline `forgedb compact` / `vacuum` is REMOVED (issue #105).  Its tombstone-based \
+algorithm is unsafe on data written by the generated mutation surface \
+(updates/deletes): it reclaims nothing from updates and can RESURRECT deleted rows.\n\n\
 Use the supported path instead: generated databases compact automatically \
 in-process under the single-writer lock (every COMPACTION_DEAD_THRESHOLD dead \
-versions), or call `Database::compact()` from your app.\n\n\
-Pass --force only if you know the data has no superseded/deleted rows (e.g. \
-insert-only) and accept the risk.";
+versions), or call `Database::compact()` from your running app.  That path is \
+keep-set-based (it keeps exactly the live rows), so it never resurrects deletes.";
 
 pub struct StatsOptions {
     pub data_dir: PathBuf,
@@ -33,9 +37,11 @@ pub struct StatsOptions {
     pub json: bool,
 }
 
+/// Options for the DEPRECATED offline `vacuum` command (#105).  See
+/// [`CompactOptions`] — parsed but not acted on.
+#[allow(dead_code)]
 pub struct VacuumOptions {
     pub data_dir: PathBuf,
-    pub force: bool,
 }
 
 pub struct AnalyzeOptions {
@@ -43,71 +49,14 @@ pub struct AnalyzeOptions {
     pub json: bool,
 }
 
-/// Compact database or specific model
-pub fn compact(opts: CompactOptions) -> Result<(), CliError> {
-    if !opts.force {
-        return Err(CliError::Compaction(UNSAFE_COMPACT_MSG.to_string()));
-    }
-    let mut config = CompactionConfig::default();
-
-    if let Some(threshold) = opts.threshold {
-        if threshold < 0.0 || threshold > 1.0 {
-            return Err(CliError::Compaction(
-                "Threshold must be between 0.0 and 1.0".to_string(),
-            ));
-        }
-        config.dead_space_threshold = threshold;
-    }
-
-    let api = MaintenanceApi::new(&opts.data_dir, config);
-
-    let results = if let Some(model) = opts.model {
-        // Compact specific model
-        let result = api.compact_model(&model).map_err(map_err)?;
-        vec![result]
-    } else if opts.all {
-        // Compact all models
-        api.compact_all().map_err(map_err)?
-    } else {
-        // Compact only models that need it
-        api.compact_needed().map_err(map_err)?
-    };
-
-    if results.is_empty() {
-        println!("✓ No models need compaction");
-        return Ok(());
-    }
-
-    println!("\n✓ Compaction completed\n");
-    println!(
-        "{:<20} {:>15} {:>15} {:>10} {:>10}",
-        "Model", "Before", "Reclaimed", "Percent", "Time"
-    );
-    println!("{}", "=".repeat(75));
-
-    for result in results {
-        if result.success {
-            println!(
-                "{:<20} {:>15} {:>15} {:>9.1}% {:>9}ms",
-                result.model_name,
-                format_bytes(result.bytes_before),
-                format_bytes(result.bytes_reclaimed),
-                result.reclaim_percentage(),
-                result.duration_ms
-            );
-        } else {
-            eprintln!(
-                "{:<20} Error: {}",
-                result.model_name,
-                result
-                    .error
-                    .as_ref()
-                    .unwrap_or(&"Unknown error".to_string())
-            );
-        }
-    }
-
-    Ok(())
+/// Offline compaction is DEPRECATED and no longer executed (#105).
+///
+/// The tombstone-based offline algorithm is unsafe against the generated
+/// mutation surface (#66) — it reclaims nothing from updates and can resurrect
+/// deleted rows — so this command mutates nothing and returns an error (non-zero
+/// exit) pointing to the supported in-process `Database::compact()` path (#92).
+pub fn compact(_opts: CompactOptions) -> Result<(), CliError> {
+    Err(CliError::Compaction(DEPRECATED_COMPACT_MSG.to_string()))
 }
 
 /// Show database statistics
@@ -140,32 +89,10 @@ pub fn stats(opts: StatsOptions) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Vacuum database (compact all models)
-pub fn vacuum(opts: VacuumOptions) -> Result<(), CliError> {
-    if !opts.force {
-        return Err(CliError::Compaction(UNSAFE_COMPACT_MSG.to_string()));
-    }
-    let config = CompactionConfig::default();
-    let api = MaintenanceApi::new(&opts.data_dir, config);
-
-    println!("Running vacuum on database...");
-
-    let results = api.vacuum().map_err(map_err)?;
-
-    if results.is_empty() {
-        println!("✓ No models to vacuum");
-        return Ok(());
-    }
-
-    let total_reclaimed: u64 = results.iter().map(|r| r.bytes_reclaimed).sum();
-    let success_count = results.iter().filter(|r| r.success).count();
-
-    println!("\n✓ Vacuum completed\n");
-    println!("{} model(s) processed", results.len());
-    println!("{} successful", success_count);
-    println!("Total space reclaimed: {}", format_bytes(total_reclaimed));
-
-    Ok(())
+/// Vacuum is DEPRECATED and no longer executed (#105) — an alias for the removed
+/// offline compaction path.  See [`compact`]; use in-process `Database::compact()`.
+pub fn vacuum(_opts: VacuumOptions) -> Result<(), CliError> {
+    Err(CliError::Compaction(DEPRECATED_COMPACT_MSG.to_string()))
 }
 
 /// Analyze database (collect statistics)
@@ -198,7 +125,12 @@ pub fn analyze(opts: AnalyzeOptions) -> Result<(), CliError> {
                     model.dead_space_ratio * 100.0
                 );
             }
-            println!("\n  Run 'forgedb compact' to reclaim space");
+            println!(
+                "\n  Compact in-process: generated databases reclaim this space \
+                 automatically under the single-writer lock, or call \
+                 `Database::compact()` from your app (offline `forgedb compact` is \
+                 deprecated — see #105)."
+            );
         }
     }
 

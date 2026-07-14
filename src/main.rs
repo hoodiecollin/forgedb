@@ -250,7 +250,10 @@ enum TenantCommands {
 
 #[derive(Subcommand)]
 enum CompactCommands {
-    /// Compact database to reclaim dead space
+    /// DEPRECATED (see #105): offline compaction is removed because it is unsafe
+    /// against the generated mutation surface (it can resurrect deleted rows).
+    /// Use in-process `Database::compact()` instead (auto-invoked). This command
+    /// mutates nothing and exits non-zero.
     Run {
         /// Data directory (default: ./data)
         #[arg(short, long, default_value = "data")]
@@ -267,12 +270,6 @@ enum CompactCommands {
         /// Dead space threshold (0.0-1.0)
         #[arg(short, long)]
         threshold: Option<f64>,
-
-        /// Run the UNSAFE tombstone-based offline compaction anyway (see #105):
-        /// it can resurrect deleted rows on data written by the generated
-        /// mutation surface. Prefer automatic in-process compaction.
-        #[arg(long)]
-        force: bool,
     },
 
     /// Show database statistics
@@ -290,15 +287,12 @@ enum CompactCommands {
         json: bool,
     },
 
-    /// Vacuum database (compact all models)
+    /// DEPRECATED (see #105): alias for the removed offline compaction path.
+    /// Use in-process `Database::compact()`. Mutates nothing; exits non-zero.
     Vacuum {
         /// Data directory (default: ./data)
         #[arg(short, long, default_value = "data")]
         data_dir: String,
-
-        /// Run the UNSAFE tombstone-based offline compaction anyway (see #105).
-        #[arg(long)]
-        force: bool,
     },
 
     /// Analyze database and show recommendations
@@ -481,13 +475,11 @@ fn run(cli: Cli) -> Result<()> {
                 model,
                 all,
                 threshold,
-                force,
             } => commands::compact::compact(commands::compact::CompactOptions {
                 data_dir: data_dir.into(),
                 model,
                 all,
                 threshold,
-                force,
             }),
             CompactCommands::Stats {
                 data_dir,
@@ -498,10 +490,9 @@ fn run(cli: Cli) -> Result<()> {
                 model,
                 json,
             }),
-            CompactCommands::Vacuum { data_dir, force } => {
+            CompactCommands::Vacuum { data_dir } => {
                 commands::compact::vacuum(commands::compact::VacuumOptions {
                     data_dir: data_dir.into(),
-                    force,
                 })
             }
             CompactCommands::Analyze { data_dir, json } => {

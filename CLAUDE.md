@@ -105,7 +105,9 @@ replication broker): +9 `forgedb-changefeed` `durable` unit tests (offsets / opa
 torn-tail / prune / catch-up / wire codec) and +2 codegen guards (`test_rust_generation_replication_broker`
 + `test_api_generation_replication_endpoint`). 399→400 with v1 Phase 5 WS1 observability (1 codegen
 guard `test_api_generation_observability_endpoints`; the TS SDK rewrite (WS5) extended `test_typescript_generation_snapshot`
-in place). 398→399 with #105 offline-compact `--force` guard (1 test `test_offline_compact_refuses_without_force`).
+in place). 398→399 with #105 offline-compact deprecation guard (1 test
+`test_offline_compact_is_deprecated_and_mutates_nothing` — offline `compact`/`vacuum` return the #105 deprecation
+error and mutate nothing; test-count-neutral, the prior `--force` guard test was rewritten in place).
 395→398 with v1 Phase 4 (#92): +2 codegen guards
 (`test_rust_generation_auto_compaction` W1 + `test_rust_generation_additive_backfill` W2) and +1 integration test
 (`test_migrate_auto_diff_additive_and_breaking_gate` W3). 394→395 with v1 Phase 3 (#91) data integrity (1 codegen
@@ -177,8 +179,9 @@ in `crates/`:
 - `compaction` — in-process dead-row reclaim (#92 Phase 4 W1) — **0.1.0 (published 2026-07-11)**.
   Schema-agnostic byte GC keyed by model *directory name*: `Compactor::compact_model_keeping(model, live_rows)` keeps
   exactly the caller-supplied opaque row indices (the generated code computes the live set); `compact_model` is the
-  legacy tombstone path (CLI-only, resurrection-prone against #66 — now **guarded**: `forgedb compact`/`vacuum`
-  refuse without `--force`, #105). Deps are serde/chrono/thiserror/log only —
+  legacy tombstone path (resurrection-prone against #66) — now **DEPRECATED** (doc-noted, not `#[deprecated]` to keep
+  the published 0.1.0 API stable): the offline `forgedb compact`/`vacuum` CLI no longer calls it and just returns a
+  deprecation error pointing to in-process `Database::compact()` (#105 RESOLVED). Deps are serde/chrono/thiserror/log only —
   reads no `.forge`. Generated `Database`/`Storage::compact()` link **only** `compact_model_keeping` (never
   `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **reclose PROVEN** by an outside-repo
   `init → generate rust+api → cargo build` resolving `forgedb-compaction 0.1.0` (+ the rest) from crates.io. Was
@@ -367,9 +370,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `test_rust_generation_auto_compaction`; E2E `scratchpad/compaction_compile` (auto-compact at threshold, 87% byte
     reclaim, no resurrection, reopen rebuilds indexes); all 18 examples compile. **Publish gap OPEN:** generated code
     links `forgedb-compaction` (scaffold pins `= "0.1"`), so `forgedb-compaction 0.1.0` must publish before the
-    reclose is proven (mirrors wal/storage/query-params). Manual `forgedb compact`/`vacuum` CLI is the legacy
-    tombstone path (resurrection-prone against #66) and is now **guarded — it refuses without `--force`** and points
-    to the safe in-process path (#105 mitigated; full schema-aware offline compaction deferred). Threshold not yet
+    reclose is proven (mirrors wal/storage/query-params). Offline `forgedb compact`/`vacuum` CLI (the legacy
+    tombstone path, resurrection-prone against #66) is **REMOVED (#105 RESOLVED by deprecation)**: both subcommands
+    mutate nothing and exit non-zero (code 6) with guidance pointing to the safe in-process `Database::compact()`
+    (auto-invoked, keep-set-based). The substrate `compact_model` fn is doc-deprecated but retained (removing a
+    published-crate public fn is breaking — no compaction publish gap reopened). Threshold not yet
     tunable (deferred).
   - **Additive migrations preserve data (v1 Phase 4 W2 — #92 LANDED).** Adding a field (nullable, or appended at the
     end) + regenerating + reopening no longer wipes the DB. Generated recovery anchors on the **tombstone count**

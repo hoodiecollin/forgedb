@@ -71,7 +71,15 @@ impl Compactor {
         Ok(())
     }
 
-    /// Compact a specific model.
+    /// Compact a specific model (tombstone-based, **DEPRECATED** — see #105).
+    ///
+    /// Unsafe against the #66 generated mutation surface: it reclaims nothing
+    /// from superseding-version updates and RESURRECTS deleted rows (a delete
+    /// tombstones a *marker* row, not the old data row).  Use
+    /// [`Compactor::compact_model_keeping`] — the keep-set primitive the
+    /// generated in-process `Database::compact()` (#92) drives.  Retained (not
+    /// `#[deprecated]`) only to keep the published `forgedb-compaction 0.1.0`
+    /// API stable; the offline `forgedb compact` CLI no longer calls it.
     ///
     /// # Crash safety (C2)
     ///
