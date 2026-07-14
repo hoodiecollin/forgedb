@@ -85,7 +85,19 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 437 tests pass** (workspace, incl. doctests). 432→437 with column projection (#113): +3 `forgedb-parser`
+**Baseline: 455 tests pass** (workspace, incl. doctests). 450→455 with delete semantics (`@on_delete` + M2M unlink):
++5 codegen guards (`test_rust_generation_delete_*` — restrict/cascade/set_null enforcement in the generated
+`Database::delete_<model>` wrappers + junction `unlink`/`unlink_all` + set-null-on-required-FK codegen error).
+442→450 with the user-declared `enum` type: +7 `forgedb-parser` unit tests (`enum` decl parses / rejects
+non-PascalCase name or variant / duplicate variant / empty / bare-name field ref resolves / unknown bare name errors)
++1 codegen guard (`test_rust_generation_enum_type` — 1-byte discriminant column, variant-name string serde, filter/
+sort/index by name). 440→442 with the `decimal` scalar type: +1 `forgedb-parser` unit test + 1 codegen guard
+(`test_rust_generation_decimal_type` — 16-byte column, string serde, scale-invariant normalized index key).
+438→440 with the `json` scalar type: +1 `forgedb-parser` unit test + 1 codegen guard (`test_rust_generation_json_type`
+— rides the variable-length column, `serde_json::Value`, not indexable/filterable/sortable). 437→438 with #104
+`@pattern`/`@regex` enforcement (+1 codegen guard `test_rust_generation_pattern_validation` — per-field `LazyLock<Regex>`,
+non-match → 422). #105 offline-compact deprecation is test-count-neutral (the prior `--force` guard test was rewritten
+in place as `test_offline_compact_is_deprecated_and_mutates_nothing`). 432→437 with column projection (#113): +3 `forgedb-parser`
 unit tests (`@projection` parses / rejects unknown field / rejects duplicate name) + 2 codegen guards
 (`test_rust_generation_column_projection` — tight struct = PK+selected, narrow decoder touches only selected columns,
 no full `db.get()`, snapshot `_at` present; `test_rust_generation_projection_rejects_relation_field`).
@@ -135,14 +147,16 @@ Root crate `forgedb` (`src/`) is the CLI: `src/main.rs` (clap), `src/commands/*`
 in `crates/`:
 
 **Published to crates.io (independent version lines, do NOT normalize):**
-- `types` — core type system (uuid, timestamp, primitives) — **0.2.0**
+- `types` — core type system (uuid, timestamp, primitives) — **0.2.1 (published 2026-07-14)** — 0.2.1 adds the
+  `cfg(wasm32)` uuid `js`/getrandom feature for the browser build (additive; native unchanged).
 - `storage` — columnar storage **facade** (#110 Milestone C): `crates/storage` is now a thin `cfg` re-export —
-  `forgedb-storage-native` on host targets, `forgedb-storage-web` on `wasm32` — bumped **0.1.5 → 0.2.0 (in-tree,
-  NOT yet published)**. Generated code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};`
+  `forgedb-storage-native` on host targets, `forgedb-storage-web` on `wasm32` — **0.2.0 (published 2026-07-14)**.
+  Generated code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};`
   verbatim and stays byte-identical across targets. The historical engine moved verbatim into **`storage-native`
-  0.1.0** (native public surface unchanged — the 0.2.0 facade is surface-compatible for host consumers); the browser
-  arena backend is **`storage-web` 0.1.0** (in-memory arenas + IndexedDB/OPFS `persist`). See the #110 bullet in the
-  backlog for the wasm publish gap. Details of the pre-split engine (still the native backend):
+  0.1.0 (published 2026-07-14)** (native public surface unchanged — the 0.2.0 facade is surface-compatible for host
+  consumers); the browser arena backend is **`storage-web` 0.1.0 (published 2026-07-14)** (in-memory arenas +
+  IndexedDB/OPFS `persist`). The wasm publish gap is now CLOSED (see the #110 bullet). Details of the pre-split
+  engine (still the native backend):
   0.1.5 (published 2026-07-10; 0.1.4 published 2026-07-08) — 0.1.5 adds `truncate_to_rows` on the three column types +
   `DirLock` single-writer advisory lock, both for #89 durable writes; 0.1.4 adds read-only column reader handles
   `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
@@ -167,11 +181,13 @@ in `crates/`:
   algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
   against the process's tenant → 403, injects an opaque `Principal`. Knows nothing of
   models/rows/schema — same class as `changefeed`.
-- `wal` — write-ahead log — **0.2.0 (published 2026-07-10; 0.1.1 published)**. The generated durable write path (#89)
-  links only the **opaque `Raw`** record path (schema-agnostic bytes + CRC framing + fsync policy + torn-tail
-  `read_all` + `replay`); the pre-existing structured/field-decoding API (`WalValue`, `WalOperation::{Insert,
-  Update,Delete}`, `Transaction`/`replay_committed`) was **pruned as a drift vector** (#95, legacy-audit epic
-  #94) — 0.2.0 is that breaking removal.
+- `wal` — write-ahead log — **0.2.1 (published 2026-07-14; 0.2.0 published 2026-07-10)**. 0.2.1 splits `WalManager`
+  per-target for the browser build — the file impl is `cfg(not wasm32)`, an in-memory impl is `cfg(wasm32)` (durable
+  at commit granularity), `FsyncPolicy` hoisted to the crate root (shared) — and drops the unused uuid dep (native
+  surface unchanged). The generated durable write path (#89) links only the **opaque `Raw`** record path
+  (schema-agnostic bytes + CRC framing + fsync policy + torn-tail `read_all` + `replay`); the pre-existing
+  structured/field-decoding API (`WalValue`, `WalOperation::{Insert,Update,Delete}`, `Transaction`/`replay_committed`)
+  was **pruned as a drift vector** (#95, legacy-audit epic #94) — 0.2.0 was that breaking removal.
 - `query-params` — REST query-string parser (#90) — **0.1.0 (published 2026-07-10)**. Schema-agnostic:
   parses a URL query string into generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated
   `api.rs` list endpoint links it for filter/sort/paginate. Interprets no schema — all field-aware filtering/sorting
@@ -235,17 +251,23 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case.
 Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
-FK). Types: `u32/u64/i32/i64/f64/bool/string/uuid/timestamp`, `char(N)` — **there is no
-`text`**. Relations: `[Model]` one-to-many, `*Model` required FK, `?Model` optional FK,
-bidirectional `[..]`/`[..]` = many-to-many; `[type; N]` fixed array; inline `struct`
-(fixed-size fields only — no string/relations inside). Directives: `@min @max @length @email
-@url @pattern @regex @default @index @computed @fulltext @materialized` (field-level, mostly
-semantic-only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
+FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `char(N)` — **there is no
+`text`**. `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
+sortable — no total order); `decimal` (→ `rust_decimal::Decimal`, exact fixed-point on the 16-byte column, string
+serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p,s)` precision/scale deferred). Enums:
+top-level `enum Name { A, B, C }` (PascalCase name + variants), referenced by bare name — 1-byte discriminant column,
+serialized as the variant-name string, filterable/sortable (declaration order)/indexable. Relations: `[Model]`
+one-to-many, `*Model` required FK, `?Model` optional FK, bidirectional `[..]`/`[..]` = many-to-many; `[type; N]`
+fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives: `@min @max @length
+@email @url @default @index @computed @fulltext @materialized` (field-level, mostly semantic-only), **`@pattern`/
+`@regex` ENFORCED** (per-field `LazyLock<Regex>`, non-match → 422; #104), **`@on_delete(restrict|cascade|set_null)`
+ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
+`set_null` optional-FK only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
 model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`
 (component fields only). Component refs `tsx:// jsx:// api://`. Only `//` comments. Directive
 args accept numbers, bare identifiers, **and quoted string literals** (`@pattern("^[0-9]+$")`,
-`@default("pending")` — escapes `\" \\ \n \t \r`; still semantic-only markers). **NOT
-supported despite older docs:** `~` auto-update, `text` type, `@on_delete`, block comments
+`@default("pending")` — escapes `\" \\ \n \t \r`; `@default` still a semantic-only marker). **NOT
+supported despite older docs:** `~` auto-update, `text` type, block comments
 `/* */`. Full verified reference: `docs/SCHEMA.md`. **18 worked example schemas
 across many domains live in `examples/` — see `examples/README.md`.**
 
@@ -335,9 +357,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
     compile-checked (db+api), guard `test_rust_generation_data_integrity`. Three layers, all **generated
     per-field** (no runtime schema-reading validator):
     - **Field constraints.** A generated `validate_<model>(record) -> Result<(), ValidationError>` enforces
-      `@min`/`@max` (numeric), `@length` (string, `@length(max)` or `@length(min,max)`), `@email`, `@url`.
+      `@min`/`@max` (numeric), `@length` (string, `@length(max)` or `@length(min,max)`), `@email`, `@url`, and
+      **`@pattern`/`@regex`** (per-field `LazyLock<regex::Regex>`, non-match → 422 — #104 RESOLVED, see the dedicated
+      bullet; adds a plain `regex = "1"` dep to the generated crate, no publish gap).
       Nullable fields validate only when `Some`. Called at the TOP of `insert`/`update`, before any durable side
-      effect. **Deferred:** `@pattern`/`@regex` (need a `regex` dep in the generated crate — #104).
+      effect.
     - **`&unique`.** `insert`/`update` probe the Phase-2 unique index (`<field>_index`) before committing —
       insert rejects any existing key; update rejects a key held by a *different* id (own-id excluded, since index
       maintenance runs post-commit). Self-contained in `Storage` (it owns the index).
@@ -350,9 +374,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
       (`Ok(false)` = absent id); `delete` stays `-> bool`. `ValidationError::status_code()` maps Unique/DanglingRef
       → **409**, field Constraint → **422**; the generated handlers return those with the message. **No new
       substrate / scaffold dep** — validation is pure generated std code, so no publish gap.
-    - **Honest limits / deferred:** `@pattern`/`@regex` (#104); `db.<model>.insert` (direct storage path) enforces
+    - **Honest limits / deferred:** `db.<model>.insert` (direct storage path) enforces
       field + unique but NOT FK (use `db.create_<model>` for full integrity — documented on the method); no
       cross-field / conditional constraints; validation is fail-fast (first violation returned, not a list).
+      (`@pattern`/`@regex` are now ENFORCED — #104 RESOLVED.)
   - **Storage is now bounded under update/delete (v1 Phase 4 W1 — #92 LANDED, publish-pending).** Generated
     `Storage::compact()` + `Database::compact()` reclaim the dead (superseded/tombstoned) row versions the #66
     mutation surface leaves behind, **in-process under the single-writer lock** (never a background thread — that
@@ -666,7 +691,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
     the reclose is PROVEN by an outside-repo `init --template blog → generate rust+api → cargo build` that
     downloaded `forgedb-changefeed 0.2.0` (+ storage/wal/query-params/compaction/auth/types) from crates.io and
     compiled the generated replication code (0 errors).
-- **Browser read-replica follower (#110 realtime Milestone C) — LANDED 2026-07-13 (wasm publish-pending).**
+- **Browser read-replica follower (#110 realtime Milestone C) — LANDED 2026-07-13 (wasm substrate published 2026-07-14).**
   The `wasm32` build of the SAME generated `database.rs` running in the browser as a **read-only replica** that
   catches up from the server's `/replicate` stream (#82) and persists locally, so the UI queries a local WASM
   instance instead of the network. Proven E2E in a real browser (Playwright) for **BOTH IndexedDB and OPFS**:
@@ -715,7 +740,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `user/fixed/uuid_0.bin` @ 64 B = 4 uuids, `user/tombstones.bin` @ 4 B), not one snapshot blob.
   PM identity red lines held: the replica is the SAME generated code (no schema read at runtime); dispatch is by
   the opaque model tag; the storage backend + `persist` move opaque path→bytes blobs and know no schema.
-  - **#2 — engine-in-Worker + partial hydrate + incremental commit — LANDED 2026-07-13 (wasm publish-pending).**
+  - **#2 — engine-in-Worker + partial hydrate + incremental commit — LANDED 2026-07-13 (wasm substrate published 2026-07-14).**
     The design discussion settled on **Architecture ①** (engine in a dedicated Web Worker, so the storage arena can
     do SYNCHRONOUS fault-in from OPFS sync-access handles, which are Worker-only). PM re-gate =
     **PASS-WITH-CONSTRAINTS** (5 binding constraints, all honored — see `memory/wasm-replica-plan.md`). Five WS
@@ -765,18 +790,20 @@ across many domains live in `examples/` — see `examples/README.md`.**
   **Honest limits / deferred (Milestone C overall):** **read-only** replica (local/optimistic writes = Phase 2).
   (The prior "wasm-bindgen transport hand-written in the harness" limit is RESOLVED by #3; the "whole-DB hydrate /
   main-thread OPFS" limits are RESOLVED by #2 above.)
-  **WASM PUBLISH GAP (OPEN):** the browser build needs `forgedb-types` (wasm uuid feature) + `forgedb-wal` (wasm
-  `WalManager`) republished and NEW `forgedb-storage 0.2.0` facade + `forgedb-storage-native 0.1.0` +
-  `forgedb-storage-web 0.1.0` published. The **native** `init→build` gap is NOT reopened — the new apply/commit
-  codegen uses only already-published surface (storage `flush`, changefeed 0.2.0 `PersistedEvent`), and the
-  **server** scaffold still pins published `forgedb-storage = "0.1.5"`. #3 does NOT widen this gap: the generated
-  `replica/Cargo.toml` scaffold (`WasmGenerator::cargo_toml_scaffold`) pins the SAME still-unpublished wasm crate
-  set (`forgedb-storage = "0.2"`, `-wal = "0.2"`, `-types = "0.2"`, `-changefeed = "0.2"`, `-compaction = "0.1"`);
-  the harness proves the build via local path deps until that set publishes. #2 does NOT widen this gap: its
-  substrate changes are in `forgedb-storage-web` (already in the unpublished wasm set) and its client/worker are
-  codegen-emitted assets with no new crate dep. Committed 2026-07-13 (types/wal/
-  storage-split + codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13. #2 (engine-in-
-  Worker partial hydrate) NOT yet committed as of this note.
+  **WASM PUBLISH GAP — CLOSED (2026-07-14):** the browser build's substrate set is now all on crates.io —
+  **`forgedb-types 0.2.1`** (wasm uuid feature) + **`forgedb-wal 0.2.1`** (wasm in-memory `WalManager`) republished,
+  and NEW **`forgedb-storage-native 0.1.0`** + **`forgedb-storage-web 0.1.0`** + the **`forgedb-storage 0.2.0`**
+  facade published. The reclose is proven LIVE by each dependent's publish verify-build resolving its freshly-published
+  deps from the registry (the facade pulled `storage-native 0.1.0`; `storage-native` pulled `wal 0.2.1`). The generated
+  wasm replica scaffold pins (`forgedb-storage = "0.2"`, `-wal = "0.2"`, `-types = "0.2"`, `-changefeed = "0.2"`,
+  `-compaction = "0.1"`) now all resolve. **RESIDUAL:** the full outside-repo `wasm-pack build` reclose was NOT run —
+  this environment's `wasm32-unknown-unknown` std is broken (`can't find crate for core`); the **host-side registry
+  resolution** is proven, the wasm-pack reclose is deferred to a working wasm toolchain. The **native** `init→build`
+  gap stays CLOSED — the apply/commit codegen uses only already-published surface (storage `flush`, changefeed 0.2.0
+  `PersistedEvent`), the M2M-unlink junction `Tombstones` is the already-published `Tombstones` type, and the
+  **server** scaffold still pins published `forgedb-storage = "0.1.5"`. Committed 2026-07-13 (types/wal/storage-split +
+  codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13; #2 (engine-in-Worker partial
+  hydrate) committed; substrate publish (`types 0.2.1` / `wal 0.2.1` / `storage 0.2.0` / `-native` / `-web`) 2026-07-14.
 - **Column projection / partial model reads (#113) — LANDED 2026-07-14 (design `docs/proposals/column-projection.md`).**
   A declared model-level directive `@projection(card: title, slug)` generates a tailored `<Model>Card` struct +
   narrow reads (`get_card`/`all_card`/`read_card_at` + snapshot `_at`) that materialize **only PK + the selected
@@ -799,6 +826,56 @@ across many domains live in `examples/` — see `examples/README.md`.**
   browser-proven for #110's `Tag.label`) + the wasm32 build — the full Playwright harness was NOT re-run for a
   projection-specific fault-in log. Also: REST `list` projection shrinks only the **wire** (filter/sort need full
   rows, so the server still reads them); the point-`get` and wasm paths get the full column-skip.
+- **`@pattern`/`@regex` validation ENFORCED (#104 RESOLVED — 2026-07-14).** The generated `validate_<model>` now
+  compiles a per-(model, field) `LazyLock<regex::Regex>` from the directive's pattern and **rejects a non-matching
+  string** → field-`Constraint` `ValidationError` (HTTP **422**), fired at the top of `insert`/`update` alongside the
+  #91 `@min`/`@max`/`@length`/`@email`/`@url` checks. Nullable fields validate only when `Some`. The generated crate
+  gains a plain `regex = "1"` dep (crates.io — **no substrate / publish gap**). Guard
+  `test_rust_generation_pattern_validation`. This closes the last #91 "deferred" item (`@pattern`/`@regex` were the
+  parsed-but-unenforced markers).
+- **`json` scalar type — LANDED 2026-07-14.** New schema type: Rust `serde_json::Value` (stored as its serialized
+  JSON bytes on the **variable-length string column** path), TS `unknown`, OpenAPI permissive. `json?` uses the same
+  1-byte presence tag as `string?` (so `None` vs `Some(Value::Null)` round-trip distinctly). **No new dep**
+  (serde_json already linked). **Honest limit:** NOT indexable / filterable / sortable (`^`/`&`/composite index, REST
+  `?field=` filter/sort, `find_by_*` all rejected) — JSON has no total order the closed-set matcher can key on. Guard
+  `test_rust_generation_json_type`.
+- **`decimal` scalar type — LANDED 2026-07-14.** Exact fixed-point (`rust_decimal::Decimal`, plain dep, feature
+  `serde-with-str`) for money/quantity where `f64` drifts. Rides the fixed **16-byte column** (uuid storage path);
+  serializes to/from JSON as a **string** (precision-preserving; TS `string`, OpenAPI `{type:string}`). Because
+  `Decimal` is `Ord`+`Hash` it **is filterable / sortable / indexable** (`^`/`&`/composite `@index` + `find_by_*`) —
+  the index key is **scale-invariant** (`.normalize()`, so `1.0`/`1.00` share a bucket). `decimal?` rides the same
+  nullable fixed-byte path as `timestamp?`/`u64?`. **Honest limit:** bare `decimal` only — `decimal(p, s)`
+  precision/scale metadata is not yet parsed (deferred). Guard `test_rust_generation_decimal_type`.
+- **`enum` user-declared type — LANDED 2026-07-14.** New top-level declaration `enum Name { A, B, C }` (a sibling of
+  `struct`/model; name + variants PascalCase, unique, non-empty), referenced from a field by its **bare PascalCase
+  name**. Stored as a fixed **1-byte `u8` discriminant** (variants → `0..N` in declaration order; **>256 variants is
+  a codegen error**); nullable enum is a 2-byte `[present, disc]` column (`None` vs `Some(variant-0)` distinct).
+  Serialized as the **variant-name string** (REST / TS / JSON all agree); TS = a closed string union; OpenAPI =
+  `{type:string, enum:[...]}`. Filterable / sortable (by **declaration order**) / indexable (variant-name key); an
+  invalid variant string on the REST boundary fails serde `Deserialize` → 4xx. A realistic `OrderStatus` enum was
+  added to `examples/food-delivery/schema.forge`. Guard `test_rust_generation_enum_type`.
+- **Delete semantics — `@on_delete` + M2M unlink — LANDED 2026-07-14.** `@on_delete(restrict|cascade|set_null)` on a
+  relation FK field is now **ENFORCED** in the generated `Database::delete_<model>` wrapper (mirroring the #91
+  create/update wrappers; the REST `DELETE /{id}` route goes through it):
+  - **`restrict`** (the DEFAULT when `@on_delete` is absent): refuse to delete a parent still referenced by a live
+    child → new `ValidationError::ReferencedByChildren` → **409** (detected via the O(1) reverse FK index).
+  - **`cascade`**: recursively delete every referencing child (each child's own rules fire; a pathological FK cycle is
+    bounded by `MAX_CASCADE_DEPTH = 64`).
+  - **`set_null`**: null each referencing child's **optional** FK — a **codegen HARD-ERROR** if applied to a required
+    `*Target` (use `?Target`, or `cascade`/`restrict`).
+  **M2M unlink also LANDED**: junctions gained a `Tombstones` column (using the **already-published** `Tombstones`
+  type on both `storage-native` + `storage-web` → **no publish gap**), plus `unlink_<a>_<b>` / `unlink_all_*` and a
+  **latest-wins** `pairs()` so a re-link restores a previously-unlinked pair; a cascade delete unlinks its junctions.
+  Guards `test_rust_generation_delete_*` (5). **Honest limits / deferred:** the junction has no WAL (a torn unlink
+  could duplicate a pair, hidden by the latest-wins traversal); unlink is a linear junction scan. This replaces the
+  old "`@on_delete` will not parse" claim and the "no M2M `unlink`" limit.
+- **Offline `compact`/`vacuum` DEPRECATED (#105 RESOLVED — 2026-07-14).** The resurrection-prone offline tombstone
+  path is removed: `forgedb compact run` / `compact vacuum` now **mutate nothing** and print deprecation guidance to
+  stderr + **exit non-zero (code 6)**, pointing to the supported in-process keep-set-based `Database::compact()` (#92)
+  — the ONLY supported compaction path. The substrate `compact_model` fn is left in place **doc-deprecated** (removing
+  it is breaking → next major; **no compaction publish gap**). Was previously only MITIGATED behind `--force`; the
+  `--force` flag / unsafe branch is dropped. Test-count-neutral (the `--force` guard was rewritten in place as
+  `test_offline_compact_is_deprecated_and_mutates_nothing`).
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
