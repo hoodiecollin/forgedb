@@ -380,7 +380,7 @@ export interface ListOptions {\n\
     }
 
     /// Map ForgeDB field type to TypeScript type
-    fn map_field_type(field_type: &forgedb_parser::FieldType) -> &'static str {
+    fn map_field_type(field_type: &forgedb_parser::FieldType) -> String {
         match field_type {
             // M1: U32/U64 should map to number, not any
             forgedb_parser::FieldType::U32
@@ -388,12 +388,15 @@ export interface ListOptions {\n\
             | forgedb_parser::FieldType::I32
             | forgedb_parser::FieldType::I64
             | forgedb_parser::FieldType::F64
-            | forgedb_parser::FieldType::Timestamp => "number",
-            forgedb_parser::FieldType::Bool => "boolean",
-            forgedb_parser::FieldType::String | forgedb_parser::FieldType::Uuid => "string",
+            | forgedb_parser::FieldType::Timestamp => "number".to_string(),
+            forgedb_parser::FieldType::Bool => "boolean".to_string(),
+            forgedb_parser::FieldType::String | forgedb_parser::FieldType::Uuid => {
+                "string".to_string()
+            }
+            forgedb_parser::FieldType::Json => "unknown".to_string(),
             // Nullable wraps the inner type; the `| null` suffix is added by is_nullable()
             forgedb_parser::FieldType::Nullable(inner) => Self::map_field_type(inner),
-            _ => "any",
+            _ => "any".to_string(),
         }
     }
 }

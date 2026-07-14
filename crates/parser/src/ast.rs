@@ -61,6 +61,10 @@ pub enum FieldType {
     String,
     Uuid,
     Timestamp,
+    /// JSON value stored as its serialized bytes in a variable-length column,
+    /// typed `serde_json::Value` in generated Rust (#json). Rides the same
+    /// variable-column storage path as `String`.
+    Json,
     // Fixed-size types (Sprint 8)
     Char(usize),                       // Fixed-size character array: char(N)
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
@@ -382,6 +386,7 @@ impl FieldType {
             FieldType::F64 => "f64".to_string(),
             FieldType::Bool => "bool".to_string(),
             FieldType::String => "String".to_string(),
+            FieldType::Json => "serde_json::Value".to_string(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
             FieldType::Char(size) => format!("[u8; {}]", size),
@@ -439,6 +444,7 @@ impl FieldType {
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
             FieldType::Nullable(inner) => inner.is_fixed_size(),
             FieldType::String => false,
+            FieldType::Json => false, // JSON is a variable-length column, like String
             FieldType::Relation(_) => false, // Relations are virtual or variable
             FieldType::Component(_) => false, // Components are virtual
         }

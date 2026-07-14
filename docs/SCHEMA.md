@@ -94,6 +94,7 @@ status: string? @default("pending")     // nullable string with default
 | `f64`     | `f64`             | `f64`               | Floating-point 64-bit            |
 | `bool`    | `bool`            | `bool`              | Boolean (true/false)             |
 | `string`  | `string`          | `String`            | Variable-length UTF-8 string     |
+| `json`    | `json`            | `serde_json::Value` | Arbitrary JSON value (variable-length column, stored as serialized JSON) |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
 | `timestamp` | `timestamp`     | `i64`               | Unix timestamp (milliseconds)    |
 | `char(N)` | `char(8)`         | `[u8; 8]`           | Fixed-size byte array (Sprint 8) |
@@ -101,6 +102,7 @@ status: string? @default("pending")     // nullable string with default
 **Key points:**
 - No `text` type in parser (CLAUDE.md mentions it but parser has only `string`)
 - `char(N)` is parsed as `FieldType::Char(usize)` and requires `(...)` syntax (`crates/parser/src/parser/core.rs:354-369`)
+- `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 
 ---
 
@@ -639,7 +641,7 @@ Order {
 
 1. **Define models** (PascalCase names) with **snake_case fields**
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
-3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, uuid, timestamp, char(N)
+3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, char(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
 5. **Constraints** (`@min`, `@max`, `@email`, `@length`, `@default`, `@regex`, `@url`) are parsed but semantic validation is deferred
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)

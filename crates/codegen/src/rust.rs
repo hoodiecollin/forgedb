@@ -38,7 +38,8 @@ impl RustGenerator {
     /// fields, and component refs have no column and are NOT projectable — this
     /// is exactly the set for which `field_read_stmt` returns `None`.
     fn is_projectable(field: &forgedb_parser::Field) -> bool {
-        Self::is_string_type(&field.field_type) || Self::is_fixed_size_type(&field.field_type)
+        Self::is_variable_column_type(&field.field_type)
+            || Self::is_fixed_size_type(&field.field_type)
     }
 
     /// Compile-time validation of `@projection` directives (#113, PM constraint 2):
@@ -1451,7 +1452,7 @@ impl RustGenerator {
                 column_fields.push(quote! {
                     #field_col_name: FixedColumn
                 });
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_column_type(&field.field_type) {
                 column_fields.push(quote! {
                     #field_col_name: VariableColumn
                 });
@@ -1549,7 +1550,7 @@ impl RustGenerator {
                     ).expect("Failed to create fixed column")
                 });
                 column_index += 1;
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_column_type(&field.field_type) {
                 let data_path = format!("{}/variable/string_data_{}.bin", model_snake, column_index);
                 let offsets_path = format!("{}/variable/string_offsets_{}.bin", model_snake, column_index);
 
@@ -1629,7 +1630,7 @@ impl RustGenerator {
                 column_fields.push(quote! {
                     #field_col_name: forgedb_storage::FixedColumnReader
                 });
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_column_type(&field.field_type) {
                 column_fields.push(quote! {
                     #field_col_name: forgedb_storage::VariableColumnReader
                 });
@@ -1674,7 +1675,7 @@ impl RustGenerator {
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
             if Self::is_fixed_size_type(&field.field_type)
-                || Self::is_string_type(&field.field_type)
+                || Self::is_variable_column_type(&field.field_type)
             {
                 inits.push(quote! {
                     #field_col_name: self.#field_col_name.reader()
@@ -1832,11 +1833,13 @@ impl RustGenerator {
                     }
                 });
                 column_index += 1;
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_column_type(&field.field_type) {
                 let rel_path = format!("variable/string_data_{}.bin", column_index);
                 col_entries.push(quote! {
                     forgedb_storage::ColumnMetadata {
                         name: #name.to_string(),
+                        // Physical-layout tag only (variable-length column); `json`
+                        // and `string` share the same on-disk representation.
                         column_type: forgedb_storage::ColumnType::String,
                         column_index: #column_index,
                         value_size: 0usize,
@@ -1893,7 +1896,41 @@ impl RustGenerator {
             let field_name = format_ident!("{}", field.name);
             let field_col_name = format_ident!("{}_col", field.name);
 
-            if Self::is_string_type(&field.field_type) {
+            if Self::is_json_type(&field.field_type) {
+                if field.is_nullable() {
+                    // Nullable json (`json?` -> Option<serde_json::Value>).  Encode
+                    // with a 1-byte presence tag so `None` and `Some(Value::Null)`
+                    // round-trip distinctly (0x00 = None, 0x01 = Some), then store
+                    // the serialized JSON (always valid UTF-8) as a variable-length
+                    // string — the same column machinery `string` uses.
+                    append_statements.push(quote! {
+                        {
+                            let encoded = match &record.#field_name {
+                                Some(v) => {
+                                    let s = serde_json::to_string(v)
+                                        .expect("Failed to serialize json");
+                                    let mut e = String::with_capacity(s.len() + 1);
+                                    e.push('\u{1}');
+                                    e.push_str(&s);
+                                    e
+                                }
+                                None => String::from('\u{0}'),
+                            };
+                            self.#field_col_name.append_string(&encoded)
+                                .expect("Failed to append string");
+                        }
+                    });
+                } else {
+                    append_statements.push(quote! {
+                        {
+                            let s = serde_json::to_string(&record.#field_name)
+                                .expect("Failed to serialize json");
+                            self.#field_col_name.append_string(&s)
+                                .expect("Failed to append string");
+                        }
+                    });
+                }
+            } else if Self::is_string_type(&field.field_type) {
                 if field.is_nullable() {
                     // Nullable string (`string?` -> Option<String>).  Encode with a
                     // 1-byte presence tag so `None` and `Some("")` round-trip
@@ -2129,7 +2166,24 @@ impl RustGenerator {
         let mut out = Vec::new();
         for field in &model.fields {
             let col = format_ident!("{}_col", field.name);
-            if Self::is_string_type(&field.field_type) {
+            if Self::is_json_type(&field.field_type) {
+                let one = if field.is_nullable() {
+                    // Nullable json: the 1-byte presence tag `\u{0}` = None.
+                    quote! {
+                        self.#col.append_string(&String::from('\u{0}'))
+                            .expect("Failed to backfill json column");
+                    }
+                } else {
+                    // Non-null json backfill: the serialized form of
+                    // `serde_json::Value::Null` (`"null"`), so a read decodes to
+                    // `Value::Null` — the meaningful zero for a JSON column.
+                    quote! {
+                        self.#col.append_string("null")
+                            .expect("Failed to backfill json column");
+                    }
+                };
+                out.push((col, one));
+            } else if Self::is_string_type(&field.field_type) {
                 let one = if field.is_nullable() {
                     // Nullable string: the 1-byte presence tag `\u{0}` = None.
                     quote! {
@@ -2228,7 +2282,8 @@ impl RustGenerator {
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+                Self::is_fixed_size_type(&f.field_type)
+                    || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
@@ -2367,7 +2422,8 @@ impl RustGenerator {
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+                Self::is_fixed_size_type(&f.field_type)
+                    || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
@@ -2400,7 +2456,8 @@ impl RustGenerator {
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type) || Self::is_string_type(&f.field_type)
+                Self::is_fixed_size_type(&f.field_type)
+                    || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
             .collect();
@@ -3113,6 +3170,35 @@ impl RustGenerator {
         let field_value_name = format_ident!("{}_value", field.name);
 
         if Self::is_string_type(&field.field_type) {
+        } else if Self::is_json_type(&field.field_type) {
+            let stmt = if field.is_nullable() {
+                // Decode the 1-byte presence tag written by insert
+                // (0x01 = Some, anything else = None), then parse the JSON tail
+                // back into a `serde_json::Value`.
+                quote! {
+                    let #field_value_name = {
+                        let raw = #receiver.#field_col_name.read_string(#row_index)
+                            .expect("Failed to read string");
+                        if raw.as_bytes().first() == Some(&1u8) {
+                            Some(serde_json::from_str(&raw[1..])
+                                .expect("Failed to deserialize json"))
+                        } else {
+                            None
+                        }
+                    };
+                }
+            } else {
+                quote! {
+                    let #field_value_name = {
+                        let raw = #receiver.#field_col_name.read_string(#row_index)
+                            .expect("Failed to read string");
+                        serde_json::from_str(&raw)
+                            .expect("Failed to deserialize json")
+                    };
+                }
+            };
+            Some((field_value_name, stmt))
+        } else if Self::is_string_type(&field.field_type) {
             let stmt = if field.is_nullable() {
                 // Decode the 1-byte presence tag written by insert
                 // (0x01 = Some, anything else = None).
@@ -3547,7 +3633,13 @@ impl RustGenerator {
         }
     }
 
-    /// Check if a field type is a string (variable-length)
+    /// Check if a field type is a string (variable-length).
+    ///
+    /// This is the *semantic* "String" predicate — it gates the string-specific
+    /// encode/decode body (`append_string`/`read_string` with UTF-8 conversion)
+    /// and the string validation directives (`@length`/`@email`/…).  For
+    /// column-layout classification (does this field get a `VariableColumn`?) use
+    /// `is_variable_column_type`, which also covers `json`.
     fn is_string_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::String => true,
@@ -3556,6 +3648,28 @@ impl RustGenerator {
         }
     }
 
+    /// Check if a field type is `json` (variable-length, typed `serde_json::Value`).
+    ///
+    /// `json` rides the exact same variable-column storage path as `String`
+    /// (a `VariableColumn`), but its encode/decode body serializes via
+    /// `serde_json::to_string`/`from_str` (JSON is always valid UTF-8, so the
+    /// serialized form is stored through the same `append_string`/`read_string`
+    /// as a plain string — no new storage machinery, no new dependency).
+    fn is_json_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::Json => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_json_type(inner),
+            _ => false,
+        }
+    }
+    /// Whether a field occupies a variable-length column (`String` OR `json`).
+    /// This is the classification predicate for storage layout / column
+    /// iteration / projectability — everywhere the question is "does this field
+    /// get a `VariableColumn`?" (as opposed to the string-semantic checks that
+    /// stay on `is_string_type`).
+    fn is_variable_column_type(field_type: &forgedb_parser::FieldType) -> bool {
+        Self::is_string_type(field_type) || Self::is_json_type(field_type)
+    }
     /// Check if a field type is (or wraps) a `Timestamp`.
     ///
     /// `forgedb_types::Timestamp` is a newtype over `i64` but does not implement
@@ -4925,6 +5039,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::F64 => quote! { f64 },
             forgedb_parser::FieldType::Bool => quote! { bool },
             forgedb_parser::FieldType::String => quote! { String },
+            forgedb_parser::FieldType::Json => quote! { serde_json::Value },
             forgedb_parser::FieldType::Uuid => quote! { Uuid },
             forgedb_parser::FieldType::Timestamp => quote! { Timestamp },
             forgedb_parser::FieldType::StructType(name) => {

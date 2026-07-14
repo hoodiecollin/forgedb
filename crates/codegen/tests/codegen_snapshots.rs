@@ -1222,6 +1222,66 @@ Post {
 }
 
 #[test]
+fn test_rust_generation_json_type() {
+    // A model with a `json` field and a nullable `json?` field. `json` rides the
+    // same variable-column storage path as `string` but is typed
+    // `serde_json::Value` and encoded/decoded as its serialized JSON bytes.
+    let src = r#"
+Event {
+  id: +uuid
+  payload: json
+  meta: json?
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Struct field types: serde_json::Value / Option<serde_json::Value>.
+    assert!(
+        flat.contains("pub payload : serde_json :: Value")
+            || flat.contains("pub payload: serde_json::Value"),
+        "payload field is serde_json::Value.\nGot: {flat}"
+    );
+    assert!(
+        flat.contains("pub meta : Option < serde_json :: Value >")
+            || flat.contains("pub meta: Option<serde_json::Value>"),
+        "meta field is Option<serde_json::Value>.\nGot: {flat}"
+    );
+
+    // Storage: a `json` field gets a VariableColumn (same as string), NOT a
+    // FixedColumn.
+    assert!(
+        flat.contains("payload_col : VariableColumn") || flat.contains("payload_col: VariableColumn"),
+        "payload uses a VariableColumn.\nGot: {flat}"
+    );
+
+    // Write path serializes via serde_json::to_string and appends as a string.
+    assert!(
+        flat.contains("serde_json :: to_string") || flat.contains("serde_json::to_string"),
+        "json write path serializes via serde_json::to_string.\nGot: {flat}"
+    );
+
+    // Read path decodes via serde_json::from_str over read_string.
+    assert!(
+        flat.contains("serde_json :: from_str") || flat.contains("serde_json::from_str"),
+        "json read path decodes via serde_json::from_str.\nGot: {flat}"
+    );
+    assert!(
+        flat.contains("payload_col .read_string") || flat.contains("payload_col.read_string"),
+        "json read path reads the variable string column.\nGot: {flat}"
+    );
+
+    // Nullable json uses the same 1-byte presence tag scheme as nullable string
+    // (`\u{1}` = Some, `\u{0}` = None) so None vs Some(Value::Null) stay distinct.
+    assert!(
+        code.contains("'\\u{1}'") && code.contains("'\\u{0}'"),
+        "nullable json uses the presence-tag scheme"
+    );
+}
+
+#[test]
 fn test_rust_generation_layout_manifest() {
     // A uuid-PK model with a variable (string) column plus an M2M junction —
     // exercises both the model manifest and the junction manifest (#57).

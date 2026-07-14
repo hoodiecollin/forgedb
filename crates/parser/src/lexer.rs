@@ -24,7 +24,8 @@ pub enum Token {
     TypeString,
     TypeUuid,
     TypeTimestamp,
-    TypeChar, // char(N) - fixed-size character array
+    TypeJson,    // json - variable-length column typed serde_json::Value
+    TypeChar,    // char(N) - fixed-size character array
 
     // Keywords
     KwStruct, // struct
@@ -310,6 +311,7 @@ impl Lexer {
                     "string" => Token::TypeString,
                     "uuid" => Token::TypeUuid,
                     "timestamp" => Token::TypeTimestamp,
+                    "json" => Token::TypeJson,
                     "char" => Token::TypeChar,
                     "struct" => Token::KwStruct,
                     _ => Token::Ident(ident),

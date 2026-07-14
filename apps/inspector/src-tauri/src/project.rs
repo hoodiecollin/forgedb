@@ -246,6 +246,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::F64 => "f64",
         FieldType::Bool => "bool",
         FieldType::String => "string",
+        FieldType::Json => "json",
         FieldType::Uuid => "uuid",
         FieldType::Timestamp => "timestamp",
         FieldType::Char(n) => {

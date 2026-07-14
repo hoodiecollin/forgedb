@@ -233,6 +233,9 @@ impl OpenApiGenerator {
             FieldType::F64 => json!({ "type": "number", "format": "double" }),
             FieldType::Bool => json!({ "type": "boolean" }),
             FieldType::String => json!({ "type": "string" }),
+            // `json` accepts any JSON value. In JSON Schema 2020-12 an empty
+            // schema validates everything; keep a description for readability.
+            FieldType::Json => json!({ "description": "Arbitrary JSON value" }),
             FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
             FieldType::Timestamp => json!({
                 "type": "integer",

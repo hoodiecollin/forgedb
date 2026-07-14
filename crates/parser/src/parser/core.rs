@@ -287,6 +287,7 @@ impl Parser {
                     | Token::TypeString
                     | Token::TypeUuid
                     | Token::TypeTimestamp
+                    | Token::TypeJson
                     | Token::TypeChar => {
                         let inner = self.parse_primitive_type()?;
                         return Ok(FieldType::Nullable(Box::new(inner)));
@@ -353,6 +354,7 @@ impl Parser {
             Token::TypeF64 => FieldType::F64,
             Token::TypeBool => FieldType::Bool,
             Token::TypeString => FieldType::String,
+            Token::TypeJson => FieldType::Json,
             Token::TypeUuid => FieldType::Uuid,
             Token::TypeTimestamp => FieldType::Timestamp,
             Token::TypeChar => {
@@ -576,6 +578,7 @@ impl Parser {
                 | FieldType::F64
                 | FieldType::Bool
                 | FieldType::String
+                | FieldType::Json
                 | FieldType::Uuid
                 | FieldType::Timestamp
                 | FieldType::Char(_)
@@ -999,6 +1002,28 @@ mod tests {
         assert!(err.contains("Duplicate @projection name 'card'"), "got: {err}");
     }
 
+    #[test]
+    fn parses_json_and_nullable_json_types() {
+        let src = r#"
+            Event {
+                id: +uuid
+                payload: json
+                meta: json?
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let m = schema.models.iter().find(|m| m.name == "Event").unwrap();
+        let payload = m.fields.iter().find(|f| f.name == "payload").unwrap();
+        let meta = m.fields.iter().find(|f| f.name == "meta").unwrap();
+        assert_eq!(payload.field_type, FieldType::Json);
+        assert_eq!(
+            meta.field_type,
+            FieldType::Nullable(Box::new(FieldType::Json))
+        );
+        // json is variable-length (rides the string column path), not fixed-size.
+        assert!(!payload.field_type.is_fixed_size());
+        assert!(!meta.field_type.is_fixed_size());
+    }
     #[test]
     fn parses_string_literal_directive_arg() {
         let src = r#"
