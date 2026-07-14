@@ -541,6 +541,9 @@ impl ApiGenerator {
             // decimal is `Ord`, so it is filterable + sortable (sort uses the
             // `Ord::cmp` branch, not float `partial_cmp`).
             | FieldType::Decimal
+            // enum derives `Ord`, so it is filterable + sortable via `Ord::cmp`
+            // (sort orders by declaration order — the variant discriminant).
+            | FieldType::Enum(_)
             | FieldType::Char(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_field(inner),
             _ => false,

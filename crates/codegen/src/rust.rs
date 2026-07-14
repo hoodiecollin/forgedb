@@ -229,6 +229,16 @@ impl RustGenerator {
             tokens.extend(struct_tokens);
         }
 
+        // Generate user-declared enum definitions (#enum) before the models that
+        // reference them.  Each becomes a fieldless Rust enum (serialized as its
+        // variant name string) plus a private `__to_u8`/`__from_u8` pair that maps
+        // the variant to/from its 1-byte stored discriminant (`0..N` in declaration
+        // order) — the encode/decode path in `insert`/`read_at` calls these so the
+        // variant list lives in exactly one place.
+        for enum_def in &schema.enums {
+            tokens.extend(Self::generate_enum(enum_def)?);
+        }
+
         // Generate models
         for model in &schema.models {
             let model_tokens = Self::generate_model(model, schema)?;
@@ -884,6 +894,90 @@ impl RustGenerator {
         }
     }
 
+    /// Generate a user-declared enum (#enum): a fieldless Rust enum plus the
+    /// private discriminant codec used by the storage path.
+    ///
+    /// * The derives match the surrounding generated types and add what an enum
+    ///   used as an index/sort key needs — `Copy`+`Eq`+`Hash`+`Ord` — while the
+    ///   default serde derive serializes each variant as its NAME string (so
+    ///   REST / TS / JSON all agree on `"Active"`).
+    /// * Variants map to `0..N` in declaration order.  `__to_u8`/`__from_u8`
+    ///   localize that mapping to one place; the generated 1-byte fixed column
+    ///   stores `__to_u8()` and reads back through `__from_u8()` (which hard-fails
+    ///   on an out-of-range byte — a corrupt column / schema skew).
+    /// * A hard codegen error if the enum has more than 256 variants — the
+    ///   discriminant must fit in one byte (u8 = `0..=255`).
+    fn generate_enum(enum_def: &forgedb_parser::EnumDef) -> Result<TokenStream> {
+        if enum_def.variants.len() > 256 {
+            return Err(CodegenError::InvalidSchema(format!(
+                "enum '{}' has {} variants; a maximum of 256 is supported (the stored \
+                 discriminant is a single byte)",
+                enum_def.name,
+                enum_def.variants.len()
+            )));
+        }
+
+        let enum_name = format_ident!("{}", enum_def.name);
+        let enum_doc = format!("{} enum (#enum)", enum_def.name);
+
+        let variant_idents: Vec<_> = enum_def
+            .variants
+            .iter()
+            .map(|v| format_ident!("{}", v))
+            .collect();
+
+        // `__to_u8`: variant -> declaration-order discriminant.
+        let to_arms: Vec<_> = variant_idents
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let disc = i as u8;
+                quote! { #enum_name::#v => #disc }
+            })
+            .collect();
+
+        // `__from_u8`: discriminant -> variant (panics on an out-of-range byte).
+        let from_arms: Vec<_> = variant_idents
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let disc = i as u8;
+                quote! { #disc => #enum_name::#v }
+            })
+            .collect();
+
+        let name_str = &enum_def.name;
+
+        Ok(quote! {
+            #[doc = #enum_doc]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
+            pub enum #enum_name {
+                #(#variant_idents),*
+            }
+
+            impl #enum_name {
+                /// This variant's 1-byte stored discriminant (declaration order).
+                fn __to_u8(&self) -> u8 {
+                    match self {
+                        #(#to_arms),*
+                    }
+                }
+
+                /// Decode a stored discriminant back to a variant.  Panics on an
+                /// out-of-range byte (a corrupt column or server/replica schema skew).
+                fn __from_u8(__b: u8) -> #enum_name {
+                    match __b {
+                        #(#from_arms,)*
+                        other => panic!(
+                            "invalid {} discriminant byte {} (out of range)",
+                            #name_str, other
+                        ),
+                    }
+                }
+            }
+        })
+    }
+
     // ---- Secondary indexes (#90) --------------------------------------------
     //
     // An index is in-memory derived state, exactly like `id_to_row`: a
@@ -948,6 +1042,9 @@ impl RustGenerator {
             // decimal is `Ord` + `Hash`, so it is filterable / sortable / indexable
             // (index keyed scale-invariantly via `index_value_expr`).
             | FieldType::Decimal
+            // enum derives `Ord` + `Hash`, so it is filterable / sortable /
+            // indexable (index key = the variant name string, via `index_key_expr`).
+            | FieldType::Enum(_)
             | FieldType::Char(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
             _ => false,
@@ -986,6 +1083,7 @@ impl RustGenerator {
             _ => None,
         })
     }
+
     /// Generate the per-model field-constraint validator (#91 Phase 3):
     /// `validate_<snake>(record) -> Result<(), ValidationError>`, enforcing the
     /// declared `@min`/`@max` (numeric), `@length`/`@email`/`@url`/`@pattern`/`@regex`
@@ -1002,6 +1100,7 @@ impl RustGenerator {
         // `LazyLock<Regex>` statics for each `@pattern`/`@regex` field (#104),
         // compiled once and shared across every validate call.
         let pattern_statics = std::cell::RefCell::new(Vec::<TokenStream>::new());
+
         let field_blocks: Vec<_> = model
             .fields
             .iter()
@@ -1275,6 +1374,7 @@ impl RustGenerator {
             _ => value_expr,
         }
     }
+
     fn index_key_expr(value_expr: TokenStream) -> TokenStream {
         quote! {
             match serde_json::to_value(&(#value_expr)) {
@@ -1741,6 +1841,16 @@ impl RustGenerator {
     /// `std::mem::size_of::<T>()` evaluated at compile time in the generated code.
     fn column_value_size_expr(field_type: &forgedb_parser::FieldType) -> TokenStream {
         match field_type {
+            // enum: a 1-byte discriminant column (`__to_u8`/`__from_u8`), or a
+            // 2-byte `[present, disc]` column for nullable enum — both stored via
+            // an explicit `append_bytes`/`read_bytes` path (never `read_unaligned`).
+            _ if Self::is_enum_type(field_type) => {
+                if matches!(field_type, forgedb_parser::FieldType::Nullable(_)) {
+                    quote! { 2usize }
+                } else {
+                    quote! { 1usize }
+                }
+            }
             forgedb_parser::FieldType::StructType(name) => {
                 let ident = format_ident!("{}", name);
                 quote! { std::mem::size_of::<#ident>() }
@@ -1772,6 +1882,8 @@ impl RustGenerator {
                     forgedb_parser::FieldType::U64 | forgedb_parser::FieldType::I64 => 8,
                     forgedb_parser::FieldType::F64 => 8,
                     forgedb_parser::FieldType::Bool => 1,
+                    // enum = 1-byte u8 discriminant.
+                    forgedb_parser::FieldType::Enum(_) => 1,
                     forgedb_parser::FieldType::Uuid => 16,
                     // decimal = rust_decimal::Decimal, a fixed 16-byte value
                     // (Decimal::serialize() -> [u8; 16]).
@@ -1983,6 +2095,27 @@ impl RustGenerator {
                     append_statements.push(quote! {
                         self.#field_col_name.append_string(&record.#field_name)
                             .expect("Failed to append string");
+                    });
+                }
+            } else if Self::is_enum_type(&field.field_type) {
+                // Enum (#enum): store the 1-byte discriminant via the generated
+                // `__to_u8`.  Nullable enum stores a 2-byte `[present, disc]` so
+                // `None` and `Some(variant-0)` round-trip distinctly.
+                if field.is_nullable() {
+                    append_statements.push(quote! {
+                        {
+                            let bytes: [u8; 2] = match &record.#field_name {
+                                Some(v) => [1u8, v.__to_u8()],
+                                None => [0u8, 0u8],
+                            };
+                            self.#field_col_name.append_bytes(&bytes)
+                                .expect("Failed to append to column");
+                        }
+                    });
+                } else {
+                    append_statements.push(quote! {
+                        self.#field_col_name.append_bytes(&[record.#field_name.__to_u8()])
+                            .expect("Failed to append to column");
                     });
                 }
             } else if Self::is_fixed_size_type(&field.field_type) {
@@ -2217,6 +2350,21 @@ impl RustGenerator {
                     quote! {
                         self.#col.append_string("null")
                             .expect("Failed to backfill json column");
+                    }
+                };
+                out.push((col, one));
+            } else if Self::is_enum_type(&field.field_type) {
+                // enum backfill: nullable → `[0, 0]` (None); non-null → `[0]`
+                // (variant 0, the meaningful zero — matches the append encoding).
+                let one = if field.is_nullable() {
+                    quote! {
+                        self.#col.append_bytes(&[0u8, 0u8])
+                            .expect("Failed to backfill enum column");
+                    }
+                } else {
+                    quote! {
+                        self.#col.append_bytes(&[0u8])
+                            .expect("Failed to backfill enum column");
                     }
                 };
                 out.push((col, one));
@@ -3228,7 +3376,34 @@ impl RustGenerator {
         let field_col_name = format_ident!("{}_col", field.name);
         let field_value_name = format_ident!("{}_value", field.name);
 
-        if Self::is_string_type(&field.field_type) {
+        if Self::is_enum_type(&field.field_type) {
+            // Enum (#enum): a 1-byte discriminant column (2 bytes for nullable —
+            // `[present, disc]`).  Decode via the generated `__from_u8`, which
+            // hard-fails on an out-of-range byte.
+            let enum_ident = Self::enum_type_ident(&field.field_type)
+                .expect("enum field has an enum type");
+            let stmt = if field.is_nullable() {
+                quote! {
+                    let #field_value_name = {
+                        let bytes = #receiver.#field_col_name.read_bytes(#row_index)
+                            .expect("Failed to read from column");
+                        if bytes.first() == Some(&1u8) {
+                            Some(#enum_ident::__from_u8(bytes[1]))
+                        } else {
+                            None
+                        }
+                    };
+                }
+            } else {
+                quote! {
+                    let #field_value_name = {
+                        let bytes = #receiver.#field_col_name.read_bytes(#row_index)
+                            .expect("Failed to read from column");
+                        #enum_ident::__from_u8(bytes[0])
+                    };
+                }
+            };
+            Some((field_value_name, stmt))
         } else if Self::is_json_type(&field.field_type) {
             let stmt = if field.is_nullable() {
                 // Decode the 1-byte presence tag written by insert
@@ -3705,6 +3880,11 @@ impl RustGenerator {
             // `decimal` is a fixed 16-byte column (rust_decimal::Decimal::serialize),
             // stored exactly like Uuid.
             | forgedb_parser::FieldType::Decimal
+            // `enum` is a fixed 1-byte discriminant column (2 bytes for nullable);
+            // the enum-specific append/read branches (gated on `is_enum_type`) run
+            // BEFORE the generic fixed path everywhere, so this only makes column
+            // layout / iteration agree that an enum field HAS a column.
+            | forgedb_parser::FieldType::Enum(_)
             | forgedb_parser::FieldType::Char(_)
             | forgedb_parser::FieldType::FixedArray(_, _)
             | forgedb_parser::FieldType::StructType(_)
@@ -3752,6 +3932,7 @@ impl RustGenerator {
             _ => false,
         }
     }
+
     /// Check if a field type is (or wraps) `decimal` — an exact fixed-point value
     /// typed `rust_decimal::Decimal`.
     ///
@@ -3768,6 +3949,29 @@ impl RustGenerator {
             _ => false,
         }
     }
+
+    /// Check if a field type is (or wraps) a user-declared enum (#enum).
+    ///
+    /// An enum is stored as a fixed 1-byte `u8` discriminant column (2 bytes for
+    /// nullable enum, `[present, disc]`), encoded via the generated `__to_u8`/
+    /// `__from_u8` codec.  Like `is_decimal_type` it special-cases enum out of the
+    /// generic fixed byte-conversion path (it needs an explicit variant match, not
+    /// `read_unaligned`), so this predicate gates that branch.
+    fn is_enum_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::Enum(_) => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_enum_type(inner),
+            _ => false,
+        }
+    }
+
+    /// The generated enum type ident an enum field maps to (for `__from_u8`), if any.
+    fn enum_type_ident(field_type: &forgedb_parser::FieldType) -> Option<proc_macro2::Ident> {
+        field_type
+            .enum_name()
+            .map(|n| format_ident!("{}", n))
+    }
+
     /// Whether a field occupies a variable-length column (`String` OR `json`).
     /// This is the classification predicate for storage layout / column
     /// iteration / projectability — everywhere the question is "does this field
@@ -3776,6 +3980,7 @@ impl RustGenerator {
     fn is_variable_column_type(field_type: &forgedb_parser::FieldType) -> bool {
         Self::is_string_type(field_type) || Self::is_json_type(field_type)
     }
+
     /// Check if a field type is (or wraps) a `Timestamp`.
     ///
     /// `forgedb_types::Timestamp` is a newtype over `i64` but does not implement
@@ -3804,6 +4009,8 @@ impl RustGenerator {
             // decimal persists as a raw [u8; 16] (Decimal::serialize) — reuses the
             // uuid column file-path label, same 16-byte fixed column on disk.
             forgedb_parser::FieldType::Decimal => "decimal",
+            // enum persists as a raw 1-byte discriminant (append_bytes/read_bytes).
+            forgedb_parser::FieldType::Enum(_) => "enum",
             forgedb_parser::FieldType::Char(_) => "bytes",
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
@@ -5151,6 +5358,10 @@ impl RustGenerator {
             forgedb_parser::FieldType::String => quote! { String },
             forgedb_parser::FieldType::Json => quote! { serde_json::Value },
             forgedb_parser::FieldType::Decimal => quote! { rust_decimal::Decimal },
+            forgedb_parser::FieldType::Enum(name) => {
+                let ident = format_ident!("{}", name);
+                quote! { #ident }
+            }
             forgedb_parser::FieldType::Uuid => quote! { Uuid },
             forgedb_parser::FieldType::Timestamp => quote! { Timestamp },
             forgedb_parser::FieldType::StructType(name) => {
@@ -5251,6 +5462,7 @@ mod tests {
                 soft_delete: false,
             }],
             structs: vec![],
+            enums: vec![],
         };
 
         let result = RustGenerator::generate(&schema).unwrap();
@@ -5316,6 +5528,7 @@ mod tests {
                 },
             ],
             structs: vec![],
+            enums: vec![],
         };
 
         let result = RustGenerator::generate(&schema).unwrap();

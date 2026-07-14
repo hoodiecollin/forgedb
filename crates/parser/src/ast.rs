@@ -71,6 +71,14 @@ pub enum FieldType {
     /// `Ord`+`Hash`, so it is filterable/sortable/indexable (index key normalized
     /// to be scale-invariant). Bare `decimal` only — `decimal(p, s)` is deferred.
     Decimal,
+    /// A reference to a user-declared top-level `enum Name { ... }` by its bare
+    /// PascalCase name (#enum). Typed as the generated Rust enum in `database.rs`,
+    /// serialized as the variant NAME string (so REST/TS/JSON all agree). Stored in
+    /// a FIXED 1-byte `u8` discriminant column (variants map to `0..N` in declaration
+    /// order). `Ord`+`Hash`, so it is filterable/sortable/indexable (index key = the
+    /// variant name string). A bare PascalCase identifier that is NOT a declared enum
+    /// stays a `StructType` and is caught by struct-reference validation.
+    Enum(String),
     // Fixed-size types (Sprint 8)
     Char(usize),                       // Fixed-size character array: char(N)
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
@@ -141,6 +149,16 @@ pub struct Struct {
     pub fields: Vec<Field>,
 }
 
+/// A user-declared top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
+/// `Model`/`Struct`.  Referenced from a field by its bare PascalCase name.
+/// Variants are PascalCase, unique, non-empty, and map to `0..N` (the stored
+/// `u8` discriminant) in declaration order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Model {
     pub name: String,
@@ -153,6 +171,7 @@ pub struct Model {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub structs: Vec<Struct>, // Struct definitions (Sprint 8)
+    pub enums: Vec<EnumDef>,   // Enum definitions (#enum)
     pub models: Vec<Model>,
 }
 
@@ -165,6 +184,11 @@ impl Schema {
     /// Find a struct by name (Sprint 8)
     pub fn find_struct(&self, name: &str) -> Option<&Struct> {
         self.structs.iter().find(|s| s.name == name)
+    }
+
+    /// Find an enum by name (#enum)
+    pub fn find_enum(&self, name: &str) -> Option<&EnumDef> {
+        self.enums.iter().find(|e| e.name == name)
     }
 
     /// Validate all relations in the schema
@@ -200,13 +224,19 @@ impl Schema {
             }
         }
 
-        // Validate struct references in models
+        // Validate struct references in models.  A bare PascalCase identifier is
+        // parsed as a `StructType`; the enum-resolution pass has already rewritten
+        // any that name a declared enum into `FieldType::Enum`.  So a remaining
+        // `StructType` that resolves to neither a struct nor an enum is an unknown
+        // named type (#enum: report both possibilities).
         for model in &self.models {
             for field in &model.fields {
                 if let Some(struct_name) = field.field_type.struct_name() {
-                    if self.find_struct(struct_name).is_none() {
+                    if self.find_struct(struct_name).is_none()
+                        && self.find_enum(struct_name).is_none()
+                    {
                         return Err(format!(
-                            "Model '{}' field '{}' references undefined struct '{}'",
+                            "Model '{}' field '{}' references unknown type '{}' (no such struct or enum)",
                             model.name, field.name, struct_name
                         ));
                     }
@@ -394,6 +424,7 @@ impl FieldType {
             FieldType::String => "String".to_string(),
             FieldType::Json => "serde_json::Value".to_string(),
             FieldType::Decimal => "rust_decimal::Decimal".to_string(),
+            FieldType::Enum(name) => name.clone(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
             FieldType::Char(size) => format!("[u8; {}]", size),
@@ -446,6 +477,7 @@ impl FieldType {
             | FieldType::Uuid
             | FieldType::Timestamp
             | FieldType::Decimal // exact decimal is a fixed 16-byte column, like Uuid
+            | FieldType::Enum(_) // enum is a fixed 1-byte discriminant column
             | FieldType::Char(_) => true,
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size
@@ -467,12 +499,22 @@ impl FieldType {
         }
     }
 
+    /// Get the enum name if this is (or wraps) an enum reference (#enum).
+    pub fn enum_name(&self) -> Option<&str> {
+        match self {
+            FieldType::Enum(name) => Some(name),
+            FieldType::Nullable(inner) => inner.enum_name(),
+            _ => None,
+        }
+    }
+
     /// Get the size in bytes for fixed-size types (Sprint 8)
     pub fn size_in_bytes(&self, schema: &Schema) -> usize {
         match self {
             FieldType::U32 | FieldType::I32 => 4,
             FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
             FieldType::Bool => 1,
+            FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16,
             FieldType::Char(size) => *size,
             FieldType::FixedArray(inner, count) => inner.size_in_bytes(schema) * count,
@@ -503,6 +545,7 @@ impl FieldType {
             FieldType::U32 | FieldType::I32 => 4,
             FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
             FieldType::Bool => 1,
+            FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16, // UUID is typically 16-byte aligned
             FieldType::Char(_) => 1,
             FieldType::FixedArray(inner, _) => inner.alignment(schema),

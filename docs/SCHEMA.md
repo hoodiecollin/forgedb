@@ -106,6 +106,27 @@ status: string? @default("pending")     // nullable string with default
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 - `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
 
+### Enum types
+
+A closed set of named values is declared as a top-level `enum` (a sibling of `struct`/model) and referenced from a field by its bare PascalCase name (no sigil — sigils `*`/`?`/`[]` are relations):
+
+```
+enum OrderStatus { Pending, Paid, Shipped, Delivered, Cancelled }
+
+Order {
+  id: +uuid
+  status: ^OrderStatus       // indexed enum field
+  prev_status: OrderStatus?  // nullable enum -> Option
+}
+```
+
+- **Declaration:** `enum Name { V1, V2, ... }` — name PascalCase (parser-enforced), variants PascalCase, unique, non-empty; trailing comma optional. Enums may be declared **before or after** the models that reference them.
+- **Storage:** a fixed **1-byte `u8` discriminant** column (variants map to `0..N` in declaration order; a codegen error if an enum has more than 256 variants). Nullable enum is a 2-byte `[present, disc]` column, so `None` and `Some(variant-0)` round-trip distinctly.
+- **Rust:** a fieldless `#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]` enum. **Serialized as the variant NAME string**, so REST / TS / JSON all agree on `"Active"`.
+- **TypeScript:** a closed string union (`export type OrderStatus = "Pending" | ...`). **OpenAPI:** `{ "type": "string", "enum": [...] }`.
+- **Filter / sort / index:** because the enum is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — sort orders by **declaration order** (the discriminant), and the index key is the variant **name** string. No runtime validation is needed on the Rust path (a closed enum cannot hold an invalid variant); an invalid variant string on the REST boundary fails serde `Deserialize` → 4xx automatically.
+- A bare PascalCase identifier used as a field type must resolve to a declared enum (or an inline `struct`); otherwise it is an "unknown type" error.
+
 ---
 
 ## 4. Field Modifiers (Symbols)
@@ -648,6 +669,7 @@ Order {
 5. **Constraints** (`@min`, `@max`, `@email`, `@length`, `@default`, `@regex`, `@url`) are parsed but semantic validation is deferred
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
+7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable
 8. **Components:** `field: tsx://path @relations(*)` (Sprint 17)
 9. **Comments:** Only `//` line comments work; `/* */` blocks will **fail to parse**
 10. **DO NOT use:** `~`, `text`, block comments, `@on_delete`, duplicate names, non-PascalCase models, non-snake_case fields

@@ -56,6 +56,7 @@ fn simple_user_schema() -> Schema {
             soft_delete: false,
         }],
         structs: vec![],
+        enums: vec![],
     }
 }
 
@@ -115,6 +116,7 @@ fn multi_model_schema() -> Schema {
             },
         ],
         structs: vec![],
+        enums: vec![],
     }
 }
 
@@ -356,6 +358,7 @@ fn test_different_field_types() {
             soft_delete: false,
         }],
         structs: vec![],
+        enums: vec![],
     };
 
     let result = RustGenerator::generate(&schema).unwrap();
@@ -427,6 +430,7 @@ fn complex_types_schema() -> Schema {
                 ],
             },
         ],
+        enums: vec![],
         models: vec![Model {
             name: "Place".to_string(),
             fields: vec![
@@ -770,6 +774,7 @@ fn fk_schema() -> Schema {
             },
         ],
         structs: vec![],
+        enums: vec![],
     }
 }
 
@@ -841,6 +846,7 @@ fn component_schema() -> Schema {
             soft_delete: false,
         }],
         structs: vec![],
+        enums: vec![],
     }
 }
 
@@ -967,6 +973,7 @@ fn test_typescript_kebab_case_multi_word() {
             soft_delete: false,
         }],
         structs: vec![],
+        enums: vec![],
     };
 
     let result = TypeScriptGenerator::generate(&schema).unwrap();
@@ -1013,6 +1020,7 @@ fn test_typescript_u32_u64_are_number() {
             soft_delete: false,
         }],
         structs: vec![],
+        enums: vec![],
     };
 
     let result = TypeScriptGenerator::generate(&schema).unwrap();
@@ -1917,6 +1925,7 @@ Post {
         "optional FK reviewer checked only when set");
     assert!(code.contains("ValidationError::DanglingReference"), "dangling FK rejected");
 }
+
 
 #[test]
 fn test_rust_generation_pattern_validation() {
@@ -3120,3 +3129,128 @@ Product {
     insta::assert_snapshot!(code);
 }
 
+#[test]
+fn test_rust_generation_enum_type() {
+    // A user-declared `enum` (#enum) is a NEW top-level declaration referenced by
+    // its bare PascalCase name.  It becomes a fieldless Rust enum (serialized as
+    // its variant NAME string) stored in a FIXED 1-byte u8 discriminant column
+    // (2 bytes for nullable — `[present, disc]`), mapped via a generated
+    // `__to_u8`/`__from_u8` codec.  Ord+Hash ⇒ filterable/sortable/indexable.
+    let src = r#"
+enum OrderStatus { Pending, Paid, Shipped }
+
+Order {
+  id: +uuid
+  label: string
+  status: ^OrderStatus
+  prev_status: OrderStatus?
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+
+    // The parser resolved the bare identifier to `FieldType::Enum` (not a struct).
+    let order = schema.models.iter().find(|m| m.name == "Order").unwrap();
+    let status = order.fields.iter().find(|f| f.name == "status").unwrap();
+    assert_eq!(status.field_type, FieldType::Enum("OrderStatus".to_string()));
+    let prev = order.fields.iter().find(|f| f.name == "prev_status").unwrap();
+    assert_eq!(
+        prev.field_type,
+        FieldType::Nullable(Box::new(FieldType::Enum("OrderStatus".to_string())))
+    );
+
+    let result = RustGenerator::generate(&schema).unwrap();
+    let code = &result.code;
+
+    // 1. The fieldless enum definition with the expected derives + variants.
+    assert!(code.contains("pub enum OrderStatus"), "enum def emitted");
+    assert!(
+        code.contains("Copy") && code.contains("Ord") && code.contains("Hash"),
+        "enum derives include Copy/Ord/Hash (needed for index + sort)"
+    );
+
+    // 2. The 1-byte discriminant codec (declaration-order 0..N) + out-of-range guard.
+    assert!(
+        code.contains("fn __to_u8(&self) -> u8"),
+        "enum has a __to_u8 discriminant encoder"
+    );
+    assert!(
+        code.contains("OrderStatus::Pending => 0u8")
+            && code.contains("OrderStatus::Paid => 1u8")
+            && code.contains("OrderStatus::Shipped => 2u8"),
+        "variants map to 0..N in declaration order"
+    );
+    assert!(
+        code.contains("fn __from_u8(__b: u8) -> OrderStatus"),
+        "enum has a __from_u8 decoder"
+    );
+    assert!(
+        code.contains("discriminant byte"),
+        "__from_u8 hard-fails on an out-of-range byte"
+    );
+
+    // 3. Fixed 1-byte column storage — an explicit append_bytes([disc]) / read_bytes
+    //    path (NOT the string/variable path, NOT read_unaligned).
+    assert!(
+        code.contains("status_col: FixedColumn"),
+        "enum occupies a fixed column"
+    );
+    assert!(
+        code.contains(".append_bytes(&[record.status.__to_u8()])"),
+        "non-null enum writes its 1-byte discriminant"
+    );
+    assert!(
+        code.contains("OrderStatus::__from_u8(bytes[0])"),
+        "non-null enum reads its discriminant back via __from_u8"
+    );
+    // Nullable enum: a 2-byte [present, disc] column, distinguishing None from
+    // Some(variant-0).
+    assert!(
+        code.contains("Some(v) => [1u8, v.__to_u8()]"),
+        "nullable enum encodes a presence tag + discriminant"
+    );
+    assert!(
+        code.contains("Some(OrderStatus::__from_u8(bytes[1]))"),
+        "nullable enum decodes present values via __from_u8"
+    );
+
+    // 4. Indexing: `^OrderStatus` is a secondary index keyed by the variant NAME
+    //    string (the default serde form) via the shared index_key_expr path.
+    assert!(code.contains("status_index"), "^enum field is indexed");
+    assert!(
+        code.contains("pub fn find_by_status(&self, value: OrderStatus)"),
+        "enum probe takes the enum type"
+    );
+
+    // 5. Sort uses Ord::cmp (enum is Ord), never the float partial_cmp branch.
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    assert!(
+        api.contains("\"status\" => rows.sort_by(|a, b| a.status.cmp(&b.status))"),
+        "enum sorts via Ord::cmp"
+    );
+
+    // 6. TypeScript: a closed string-union type alias + the field typed as it.
+    let ts = TypeScriptGenerator::generate(&schema).unwrap().code;
+    assert!(
+        ts.contains("export type OrderStatus = \"Pending\" | \"Paid\" | \"Shipped\";"),
+        "TS emits a string-union alias for the enum"
+    );
+    assert!(
+        ts.contains("status: OrderStatus;"),
+        "TS field is typed as the enum union"
+    );
+
+    // 7. OpenAPI: a `{ type: string, enum: [...] }` component schema referenced
+    //    by the field.
+    let oa = OpenApiGenerator::generate(&schema).unwrap().code;
+    let oa_json: serde_json::Value = serde_json::from_str(&oa).unwrap();
+    let enum_schema = &oa_json["components"]["schemas"]["OrderStatus"];
+    assert_eq!(enum_schema["type"], "string", "OpenAPI enum is a string");
+    assert_eq!(
+        enum_schema["enum"],
+        serde_json::json!(["Pending", "Paid", "Shipped"]),
+        "OpenAPI enum lists the variant names"
+    );
+
+    insta::assert_snapshot!(code);
+}

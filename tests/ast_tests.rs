@@ -5,6 +5,7 @@ fn test_detect_many_to_many() {
     // Create a simple schema with M:N relations
     let schema = Schema {
         structs: vec![],
+        enums: vec![],
         models: vec![
             Model {
                 name: "Post".to_string(),
@@ -90,6 +91,7 @@ fn test_no_m2m_with_fk() {
     // Schema with 1:N relationship (should not be detected as M:N)
     let schema = Schema {
         structs: vec![],
+        enums: vec![],
         models: vec![
             Model {
                 name: "User".to_string(),

@@ -1,6 +1,6 @@
 use crate::ast::{
-    ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, Field,
-    FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
+    ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, EnumDef,
+    Field, FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{validate_field_name, validate_model_name, Position};
@@ -744,6 +744,94 @@ impl Parser {
         Ok(Struct { name, fields })
     }
 
+    /// Parse a top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
+    /// `struct`/model; variants are a comma/newline-separated PascalCase list
+    /// (trailing comma optional, matching the struct/model brace style).
+    fn parse_enum(&mut self) -> Result<EnumDef, String> {
+        self.skip_newlines();
+
+        // Expect 'enum' keyword
+        self.expect(Token::KwEnum)?;
+
+        // Parse enum name (PascalCase — validated like a model/struct name).
+        let enum_pos = self.get_current_position();
+        let name = match self.current_token() {
+            Token::Ident(s) => s.clone(),
+            _ => {
+                return Err(format!(
+                    "Expected enum name, found {:?}",
+                    self.current_token()
+                ))
+            }
+        };
+        self.advance();
+
+        if self.use_validation {
+            if let Err(e) = validate_model_name(&name, enum_pos) {
+                return Err(e.to_string());
+            }
+        }
+
+        // Expect opening brace
+        self.skip_newlines();
+        self.expect(Token::LBrace)?;
+        self.skip_newlines();
+
+        // Parse variant list.
+        let mut variants = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
+            let variant = match self.current_token() {
+                Token::Ident(s) => s.clone(),
+                _ => {
+                    return Err(format!(
+                        "Expected enum variant name in enum '{}', found {:?}",
+                        name,
+                        self.current_token()
+                    ))
+                }
+            };
+            self.advance();
+
+            // Variant naming: PascalCase (reuse the model-name rule: leading
+            // uppercase, alphanumerics), and unique within the enum.
+            if self.use_validation {
+                if let Err(e) = validate_model_name(&variant, None) {
+                    return Err(format!(
+                        "Enum '{}' variant '{}' must be PascalCase: {}",
+                        name, variant, e
+                    ));
+                }
+            }
+            if !seen.insert(variant.clone()) {
+                return Err(format!(
+                    "Duplicate variant '{}' in enum '{}'",
+                    variant, name
+                ));
+            }
+            variants.push(variant);
+
+            // Separator: comma or newline; trailing comma optional.
+            match self.current_token() {
+                Token::Comma => {
+                    self.advance();
+                    self.skip_newlines();
+                }
+                _ => {
+                    self.skip_newlines();
+                }
+            }
+        }
+
+        self.expect(Token::RBrace)?;
+
+        if variants.is_empty() {
+            return Err(format!("Enum '{}' has no variants", name));
+        }
+
+        Ok(EnumDef { name, variants })
+    }
+
     fn parse_model(&mut self) -> Result<Model, String> {
         self.skip_newlines();
 
@@ -891,13 +979,15 @@ impl Parser {
 
     pub fn parse(&mut self) -> Result<Schema, String> {
         let mut structs = Vec::new();
+        let mut enums = Vec::new();
         let mut models = Vec::new();
         let mut struct_names = std::collections::HashSet::new();
+        let mut enum_names = std::collections::HashSet::new();
         let mut model_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::Eof) {
-            // Check if this is a struct or model declaration
+            // Dispatch on the leading keyword: struct / enum / (bare) model.
             if matches!(self.current_token(), Token::KwStruct) {
                 let struct_def = self.parse_struct()?;
 
@@ -908,6 +998,16 @@ impl Parser {
                 struct_names.insert(struct_def.name.clone());
 
                 structs.push(struct_def);
+            } else if matches!(self.current_token(), Token::KwEnum) {
+                let enum_def = self.parse_enum()?;
+
+                // Check for duplicate enum name
+                if enum_names.contains(&enum_def.name) {
+                    return Err(format!("Duplicate enum name '{}'", enum_def.name));
+                }
+                enum_names.insert(enum_def.name.clone());
+
+                enums.push(enum_def);
             } else {
                 let model = self.parse_model()?;
 
@@ -923,17 +1023,51 @@ impl Parser {
             self.skip_newlines();
         }
 
-        if models.is_empty() && structs.is_empty() {
+        if models.is_empty() && structs.is_empty() && enums.is_empty() {
             return Err("Schema is empty".to_string());
         }
 
-        let schema = Schema { structs, models };
+        // Resolve bare-identifier field types (parsed as `StructType`/
+        // `OptionalStructType`) that name a declared enum into `FieldType::Enum`
+        // (#enum).  A bare PascalCase identifier is either an enum (resolved here)
+        // or a struct (left as `StructType`, validated by struct-reference checks).
+        // This runs AFTER all declarations are collected so an enum may be declared
+        // after the model that references it.
+        for model in &mut models {
+            for field in &mut model.fields {
+                Self::resolve_enum_field_type(&mut field.field_type, &enum_names);
+            }
+        }
+
+        let schema = Schema {
+            structs,
+            enums,
+            models,
+        };
 
         // Validate relations and struct references
         schema.validate_relations()?;
         schema.validate_struct_references()?;
 
         Ok(schema)
+    }
+
+    /// Rewrite `StructType(name)`/`OptionalStructType(name)` → `Enum(name)`/
+    /// `Nullable(Enum(name))` when `name` is a declared enum (#enum).  Everything
+    /// else is left untouched (a real struct reference, or a non-named type).
+    fn resolve_enum_field_type(
+        field_type: &mut FieldType,
+        enum_names: &std::collections::HashSet<String>,
+    ) {
+        match field_type {
+            FieldType::StructType(name) if enum_names.contains(name) => {
+                *field_type = FieldType::Enum(name.clone());
+            }
+            FieldType::OptionalStructType(name) if enum_names.contains(name) => {
+                *field_type = FieldType::Nullable(Box::new(FieldType::Enum(name.clone())));
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1027,6 +1161,7 @@ mod tests {
         assert!(!payload.field_type.is_fixed_size());
         assert!(!meta.field_type.is_fixed_size());
     }
+
     #[test]
     fn parses_decimal_and_nullable_decimal_types() {
         let src = r#"
@@ -1124,5 +1259,98 @@ mod tests {
             cons[1].params,
             vec![ConstraintParam::Number(3), ConstraintParam::Number(3)]
         );
+    }
+
+    #[test]
+    fn parses_enum_and_enum_typed_fields() {
+        // A top-level enum declaration, a field referencing it by bare name (the
+        // field is resolved to `FieldType::Enum`), a nullable enum field, and an
+        // enum declared AFTER the model that uses it (forward reference).
+        let src = r#"
+            Order {
+                id: +uuid
+                status: Status
+                prev_status: Status?
+            }
+            enum Status { Active, Inactive, Pending }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        assert_eq!(schema.enums.len(), 1);
+        let status_enum = schema.find_enum("Status").unwrap();
+        assert_eq!(status_enum.variants, vec!["Active", "Inactive", "Pending"]);
+
+        let order = schema.models.iter().find(|m| m.name == "Order").unwrap();
+        let status = order.fields.iter().find(|f| f.name == "status").unwrap();
+        assert_eq!(status.field_type, FieldType::Enum("Status".to_string()));
+        let prev = order.fields.iter().find(|f| f.name == "prev_status").unwrap();
+        assert_eq!(
+            prev.field_type,
+            FieldType::Nullable(Box::new(FieldType::Enum("Status".to_string())))
+        );
+        // enum is a fixed 1-byte column (not variable-length).
+        assert!(status.field_type.is_fixed_size());
+    }
+
+    #[test]
+    fn enum_trailing_comma_optional() {
+        // Both trailing-comma and no-trailing-comma variant lists parse.
+        let with = Parser::new("enum A { X, Y, }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(with.find_enum("A").unwrap().variants, vec!["X", "Y"]);
+        let without = Parser::new("enum A { X, Y }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(without.find_enum("A").unwrap().variants, vec!["X", "Y"]);
+    }
+
+    #[test]
+    fn enum_rejects_duplicate_variant() {
+        let err = Parser::new("enum Status { Active, Active }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(err.contains("Duplicate variant 'Active'"), "got: {err}");
+    }
+
+    #[test]
+    fn enum_rejects_lowercase_variant() {
+        // Variants must be PascalCase.
+        let err = Parser::new("enum Status { active }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(err.contains("PascalCase"), "got: {err}");
+    }
+
+    #[test]
+    fn enum_rejects_empty() {
+        let err = Parser::new("enum Status { }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(err.contains("no variants"), "got: {err}");
+    }
+
+    #[test]
+    fn field_referencing_undefined_named_type_errors() {
+        // A bare PascalCase identifier that is neither a declared enum nor struct
+        // is an unknown named type.
+        let err = Parser::new("Order { id: +uuid\n status: Nope }")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(err.contains("unknown type 'Nope'"), "got: {err}");
+    }
+
+    #[test]
+    fn enum_rejects_duplicate_declaration() {
+        let err = Parser::new("enum S { A }\nenum S { B }\nM { id: +uuid }")
+            .unwrap()
+            .parse()
+            .unwrap_err();
+        assert!(err.contains("Duplicate enum name 'S'"), "got: {err}");
     }
 }

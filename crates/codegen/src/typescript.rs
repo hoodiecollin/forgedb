@@ -45,6 +45,23 @@ impl TypeScriptGenerator {
         code.push_str(" * DO NOT EDIT - This file is auto-generated\n");
         code.push_str(" */\n\n");
 
+        // Enum string-union type aliases (#enum), emitted before the interfaces
+        // that reference them.  Each declared enum becomes a closed string union
+        // so `tsc --strict` narrows every enum-typed field to its variant names.
+        for en in &schema.enums {
+            let variants: Vec<String> = en
+                .variants
+                .iter()
+                .map(|v| format!("\"{}\"", v))
+                .collect();
+            code.push_str(&format!(
+                "/** {} enum — one of its declared variant names. */\n\
+                 export type {} = {};\n\n",
+                en.name,
+                en.name,
+                variants.join(" | ")
+            ));
+        }
         // Model interfaces + their create-input aliases.
         for model in &schema.models {
             code.push_str(&Self::generate_interface(model)?);
@@ -399,6 +416,9 @@ export interface ListOptions {\n\
             // decimal serializes as a JSON string (precision-preserving over the
             // wire), so the SDK types it `string` — same discipline as ids.
             forgedb_parser::FieldType::Decimal => "string".to_string(),
+            // An enum serializes as its variant name string; type it as the
+            // generated string-union type name (#enum), e.g. `Status`.
+            forgedb_parser::FieldType::Enum(name) => name.clone(),
             // Nullable wraps the inner type; the `| null` suffix is added by is_nullable()
             forgedb_parser::FieldType::Nullable(inner) => Self::map_field_type(inner),
             _ => "any".to_string(),

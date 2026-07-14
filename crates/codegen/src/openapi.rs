@@ -52,6 +52,11 @@ impl OpenApiGenerator {
         for st in &schema.structs {
             schemas.insert(st.name.clone(), Self::struct_schema(st));
         }
+        // One string-enum component schema per declared enum (#enum): a field of
+        // that type `$ref`s it, exactly like a struct.
+        for en in &schema.enums {
+            schemas.insert(en.name.clone(), Self::enum_schema(en));
+        }
         for model in &schema.models {
             schemas.insert(model.name.clone(), Self::model_schema(model));
         }
@@ -191,6 +196,21 @@ impl OpenApiGenerator {
         Self::object_schema(&st.name, &st.fields)
     }
 
+    /// Component schema for a declared enum (#enum): a string with the closed set
+    /// of variant names, e.g. `{ "type": "string", "enum": ["Active", ...] }`.
+    fn enum_schema(en: &forgedb_parser::EnumDef) -> Value {
+        let variants: Vec<Value> = en
+            .variants
+            .iter()
+            .map(|v| Value::String(v.clone()))
+            .collect();
+        json!({
+            "type": "string",
+            "enum": variants,
+            "description": format!("{} enum", en.name)
+        })
+    }
+
     /// Build an `object` schema from a field list, skipping virtual fields that
     /// carry no data payload (one-to-many / many-to-many collections and
     /// component references — they serialize to `null` and are never part of a
@@ -262,6 +282,9 @@ impl OpenApiGenerator {
                     "maxItems": *n
                 })
             }
+            // An enum serializes as its variant name string; reference the
+            // per-enum string-enum component schema (#enum).
+            FieldType::Enum(enum_name) => Self::model_ref(enum_name),
             FieldType::StructType(struct_name) => Self::model_ref(struct_name),
             FieldType::OptionalStructType(struct_name) => {
                 // OpenAPI 3.1 / JSON Schema 2020-12: nullability is a schema, not

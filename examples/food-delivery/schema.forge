@@ -8,6 +8,18 @@ struct GeoPoint {
   longitude: f64
 }
 
+// Order lifecycle states — a closed set, so a declared enum (stored as a 1-byte
+// discriminant, serialized as the variant name) is a better fit than a string.
+enum OrderStatus {
+  Placed,
+  Confirmed,
+  Preparing,
+  Ready,
+  PickedUp,
+  Delivered,
+  Cancelled,
+}
+
 Restaurant {
   id: +uuid
   name: &string @length(1, 200)
@@ -64,14 +76,13 @@ Courier {
   created_at: +timestamp
 }
 
-// status: placed | confirmed | preparing | ready | picked_up | delivered | cancelled
 // courier is optional — assigned after placement
 Order {
   id: +uuid
   customer: *Customer
   restaurant: *Restaurant
   courier: ?Courier
-  status: string @length(1, 20)
+  status: ^OrderStatus
   placed_at: +timestamp
   delivery_location: GeoPoint?
   // total_amount in minor currency units (cents)
@@ -99,7 +110,7 @@ OrderItem {
 OrderStatusEvent {
   id: +uuid
   order: *Order
-  status: string @length(1, 20)
+  status: OrderStatus
   note: string?
   changed_at: +timestamp
   @index(order, changed_at)

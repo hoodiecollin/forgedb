@@ -30,6 +30,7 @@ pub enum Token {
 
     // Keywords
     KwStruct, // struct
+    KwEnum,   // enum
 
     // Symbols
     Plus,        // +
@@ -316,6 +317,7 @@ impl Lexer {
                     "decimal" => Token::TypeDecimal,
                     "char" => Token::TypeChar,
                     "struct" => Token::KwStruct,
+                    "enum" => Token::KwEnum,
                     _ => Token::Ident(ident),
                 };
                 Ok(token)

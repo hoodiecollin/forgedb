@@ -267,6 +267,12 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
             nullable = true;
             "struct"
         }
+        // Enum reference (#enum): carry the enum name in `struct_name` (the
+        // named-type slot) — the DTO reports it as kind "enum".
+        FieldType::Enum(name) => {
+            struct_name = Some(name.clone());
+            "enum"
+        }
         FieldType::Relation(rel) => {
             rel_target = Some(rel.target_model().to_string());
             match rel {
