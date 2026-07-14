@@ -145,11 +145,20 @@ impl FixedColumn {
     }
 
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
-        if rows > self.len() {
+        let cur = self.len();
+        if rows > cur {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "truncate_to_rows beyond current length",
             ));
+        }
+        // Truncating to the current length is a no-op — return WITHOUT touching
+        // the bytes, so a lazily source-backed column (whose length is known from
+        // the source) is not needlessly faulted in. This is load-bearing for
+        // partial hydrate: recovery calls `truncate_to_rows(anchor)` on every
+        // column at open, and only genuinely-torn columns should load.
+        if rows == cur {
+            return Ok(());
         }
         store::with_bytes_mut(&self.path, |b| b.truncate(rows * self.value_size));
         Ok(())
@@ -219,11 +228,16 @@ impl VariableColumn {
     }
 
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
-        if rows > self.len() {
+        let cur = self.len();
+        if rows > cur {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "truncate_to_rows beyond current length",
             ));
+        }
+        // No-op truncation must not fault a lazy column in (see FixedColumn).
+        if rows == cur {
+            return Ok(());
         }
         let data_len = if rows == 0 {
             0
@@ -297,11 +311,16 @@ impl Tombstones {
     }
 
     pub fn truncate_to_rows(&mut self, rows: usize) -> io::Result<()> {
-        if rows > self.len() {
+        let cur = self.len();
+        if rows > cur {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "truncate_to_rows beyond current length",
             ));
+        }
+        // No-op truncation must not fault a lazy column in (see FixedColumn).
+        if rows == cur {
+            return Ok(());
         }
         store::with_bytes_mut(&self.path, |b| b.truncate(rows));
         Ok(())
