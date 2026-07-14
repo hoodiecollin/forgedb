@@ -15,7 +15,9 @@ query on the **coarse** `event.model` signal, diffs by id over opaque hashes, an
 removal-aware `<Model>LiveDelta` (`Init`/`Added`/`Updated`/`Removed`) deltas. **No substrate change / no
 `forgedb-changefeed` version bump** — the coarse signal was already there. Proven by a **live WebSocket
 round-trip** exercising Init→Added→(non-match silent)→Updated→Removed through insert/update/delete
-(`scratchpad/directionb_compile`, ephemeral). **Next: Direction C is HELD** (on-demand only).
+(`scratchpad/directionb_compile`, ephemeral). **Next: Direction C is DEFERRED** (lowest-priority
+slice — networked/durable/resumable broker over a new on-disk log format; the in-process feed above
+already covers every current caller).
 **Issue:** [#62](https://github.com/hoodiecollin/forgedb/issues/62) (`idea`, `plan-next`)
 **Date:** 2026-07-07
 
@@ -44,15 +46,18 @@ forbidden generic engine, event-shaped.
   *generated* query on a coarse change signal; deferred until `update`/`delete` exist so it can be
   co-designed with removal semantics (shared prerequisite with #56/#63).
 - **Direction C — durable broker — lowest priority.** Replay-from-offset using row-index as
-  offset space; on demand only.
+  offset space; deferred because it needs a new durable on-disk log format and resumable wire
+  protocol, and the in-process feed (A) already serves every current in-codebase caller.
 
 ## The key contrast: subscriptions are NOT hollow pre-mutation
 
 Unlike MVCC (#56) and multi-tenancy Layer 2 (#59) — which were machinery for a mutation surface
-that doesn't exist — **the events that exist today (inserts, M2M link-appends) are exactly the
-events real apps want to stream**: activity feeds, "N new items" badges, message arrival,
-audit/event logs, live-appending dashboards. An insert-only change feed is a **product, not a
-stub**. That is why A ships now rather than waiting.
+that doesn't exist — **the events A streams already have a producer in the codebase today: every
+`insert()` / M2M `link` is positionally an event**, so the change feed has a real caller the moment
+it ships (activity feeds, "N new items" badges, message arrival, audit/event logs, live-appending
+dashboards all fall out of it). An insert-only change feed is a **complete surface, not a stub** —
+it wires an existing producer, it isn't machinery waiting for one. That is why A ships now rather
+than waiting.
 
 Only *live queries* split on the mutation gate: without `update`/`delete`, a live result set can
 only ever grow (rows added, never changed or removed). The maintainer's call is to **queue all of

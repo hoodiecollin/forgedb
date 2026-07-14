@@ -17,7 +17,7 @@ substrate `forgedb_storage::Snapshot` (bare `usize` watermark) + generated
 deferred): one writer thread running insert/update/delete while N reader threads read via
 `DatabaseReader` + a published snapshot, asserting cross-model atomicity + torn-row-free prefixes
 (`scratchpad/directionb_compile`, ephemeral); guarded by `test_rust_generation_reader_handles` + substrate
-`test_reader_*`. **Next: Direction C is HELD** (on-demand only).
+`test_reader_*`. **Next: Direction C is DEFERRED** (no in-codebase caller — see below).
 **Issue:** [#56](https://github.com/hoodiecollin/forgedb/issues/56) (`idea`, `plan-next`)
 **Date:** 2026-07-06
 
@@ -31,18 +31,20 @@ generated `database.rs` has `insert`/`get`/traversal but no `update`/`delete`, a
 `Tombstones` are write-once with no in-place setter (`crates/codegen/src/rust.rs:884-886`,
 `crates/storage/src/lib.rs:588-640`). Full MVCC would be machinery with no caller.
 
-Meanwhile the most-wanted property of "snapshot isolation; concurrent readers/writers" —
+Meanwhile the foundational property of "snapshot isolation; concurrent readers/writers" —
 **consistent lock-free reads under a concurrent writer — is ~80% free already**: append-only +
 the `row_count` manifest anchor *is* read snapshot isolation (the exact insight the backup note
 leans on). Per-row version chains buy *concurrent writers* and *mutation visibility*, which are
-precisely the parts with no consumer today.
+precisely the parts with no in-codebase consumer today.
 
 **Blessed decision:** #56 is **not rejected — it is re-sequenced.**
 - **Ship A now** (watermark snapshot reads) — cheap, independently useful, already-blessed category.
 - **Build the generated mutation surface next** (`update`/`delete` + one substrate retraction
   primitive), **co-designed with #63**'s editor — this is the real gating prerequisite.
 - **Stage B** (single-writer + concurrent readers) on top of the mutation surface.
-- **Hold C** (full version-chain MVCC) until concurrent-writer demand is demonstrated.
+- **Defer C** (full version-chain MVCC) until an in-codebase caller needs concurrent writers — it
+  is reachable by extending B, so building it before B has a writer-contention consumer is
+  machinery without a caller.
 - **Scope: single-process.** Multi-process is a separately-justified future expansion.
 
 ## Identity verdict & invariant mapping
@@ -73,7 +75,7 @@ control.** So the honest unit order is:
 2. **Mutation surface** (`update`/`delete` + retraction primitive) — the real prerequisite,
    shared with #63's editor. Design once, and MVCC becomes an increment rather than greenfield.
 3. **B — single-writer + concurrent readers** (stage on top of mutation).
-4. **C — full MVCC** (hold; on demand only).
+4. **C — full MVCC** (deferred; reachable by extending B, no in-codebase caller yet).
 
 ## Direction A — watermark snapshot reads (ships now)
 
@@ -161,7 +163,7 @@ is not a multi-writer guarantee.  The fd-duplication + POSIX page-cache-coherenc
 assumption is load-bearing for reader visibility (tested explicitly, documented as a substrate
 invariant).  No version chains / transaction manager (Direction C).
 
-## Direction C — full version-chain MVCC (held; on demand only)
+## Direction C — full version-chain MVCC (deferred; no in-codebase caller)
 
 > **Designed 2026-07-14 → [`multi-writer-mvcc.md`](./multi-writer-mvcc.md)** (issue #75, PM verdict
 > PASS-WITH-CONSTRAINTS). That note supersedes the sketch below: it reframes C as **transactions +
@@ -174,7 +176,7 @@ invariant).  No version chains / transaction manager (Direction C).
 Per-row `xmin`/`xmax` visibility, a transaction manager handing out txn IDs + snapshots,
 UPDATE = append-new-version + stamp-old-`xmax`, reads walk version chains filtering by snapshot,
 a GC/vacuum loop. Unlocks true concurrent writers + full snapshot isolation across updates/
-deletes. **Held** because: it commits ForgeDB to a heavyweight storage-engine trajectory and an
+deletes. **Deferred** because: it commits ForgeDB to a heavyweight storage-engine trajectory and an
 **on-disk format break**; it has the strongest "generic engine" gravity (guard-with-care — a
 transaction manager + visibility filter must stay a mechanism the generated code drives, never a
 generic executor); and **every part of C is reachable later by extending B**. Building C's
@@ -199,7 +201,8 @@ violated.
 - **Authoring surface stays "schema + CLI + config."** Isolation level / GC policy, if
   configurable, live in `forgedb.toml` or are generated defaults — never new `.forge` syntax.
 - **Don't build C's machinery without a caller** (no version chains / GC until the mutation
-  surface exists and concurrent-writer demand is real).
+  surface exists and some in-codebase path actually needs concurrent writers — no generated code or
+  crate links a version-chain path today).
 - **Single-process scope** (blessed). Multi-process concurrency (on-disk locking/visibility) is a
   separately-justified expansion, not a silent scope creep.
 
@@ -224,7 +227,8 @@ violated.
 - **All mutation** (`update`/`delete`) — the next unit, co-designed with #63; blocked on the
   retraction-primitive decision.
 - **Direction B** (single-writer serialization) — stages after the mutation surface.
-- **Direction C** (version chains, `xmin`/`xmax`, `forgedb-txn`, GC) — held until demand.
+- **Direction C** (version chains, `xmin`/`xmax`, `forgedb-txn`, GC) — deferred; reachable by
+  extending B, no in-codebase caller and it commits to an on-disk format break.
 - **Multi-process concurrency**; any new `.forge` syntax; any generic transaction executor.
 
 **Success = a snapshot pinned mid-writes yields consistent lock-free reads with zero version

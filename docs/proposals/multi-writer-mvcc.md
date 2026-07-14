@@ -3,7 +3,7 @@
 **Status:** DESIGN NOTE — `forgedb-product-manager` verdict **PASS-WITH-CONSTRAINTS** (2026-07-14;
 3 binding constraints, folded in below — see "PM gate constraints"). Tier 1 is a clean PASS with
 zero new artifacts; Tier 2's `forgedb-txn` is PASS conditioned on enforced schema-agnosticism +
-caller-gating. Fleshes out the **Direction C** section held "on demand only" in
+caller-gating. Fleshes out the **Direction C** section deferred (no in-codebase caller) in
 [`mvcc-concurrency.md`](./mvcc-concurrency.md) (Directions A + B LANDED). This note is the design
 for the deferred rock: **transactions + concurrent writers**.
 **Issue:** [#75](https://github.com/hoodiecollin/forgedb/issues/75) (MVCC Direction C)
@@ -26,7 +26,7 @@ and *conflict detection is over in-flight transactions only* (in-memory, ephemer
 - **Tier 1 — Transactions (single writer, atomic commit/rollback).** `db.transaction(|tx| … )`:
   a set of appends made visible atomically at commit; rollback = **truncate columns back to their
   pre-transaction length** (reusing the already-published `truncate_to_rows`). No per-row version
-  metadata, no format break. This is what most "I want transactions" demand actually needs.
+  metadata, no format break. This is the smallest slice that delivers a real transaction boundary.
 - **Tier 2 — Optimistic concurrent writers (serialized commit).** Many transactions *prepare*
   concurrently (read a snapshot, validate, stage into private buffers); a **serialized commit
   point** assigns a monotonic **commit LSN** and detects write-write conflicts against an in-memory
@@ -34,12 +34,15 @@ and *conflict detection is over in-flight transactions only* (in-memory, ephemer
   break — commit remains serialized, so appends stay contiguous and the watermark stays valid.
 - **Tier 3 — Multi-process writers (held).** Removes single-process by giving one process the
   commit point (a **write coordinator**, the symmetric inverse of #82's durable broker). This is
-  the only tier that breaks single-process scope and warrants a format/protocol commitment — held
-  until real multi-process demand.
+  the only tier that breaks single-process scope and warrants a format/protocol commitment — a wire
+  protocol plus a durable 2-phase in-flight record — so it is deferred until an in-codebase caller
+  needs multi-process writes.
 
 **Recommendation:** design + build **Tier 1** (transactions) as the first milestone; it is
-independently valuable, append-only-preserving, and low identity-risk. **Tier 2** on demonstrated
-concurrent-writer demand. **Tier 3 held.** The honest ceiling that bounds Tiers 1–2 —
+independently valuable, append-only-preserving, and low identity-risk. **Tier 2** once a Tier-1
+caller (generated code or a crate) actually needs concurrent preparers — it is a strict superset of
+Tier 1, so building it before Tier 1 has a caller is machinery without a consumer. **Tier 3
+deferred** (breaks single-process scope; see below). The honest ceiling that bounds Tiers 1–2 —
 **one physical append point per column** → *concurrent prepare, serialized commit* — is named
 loudly below; true parallel append needs segmented columns (a separate, larger storage effort).
 
@@ -177,9 +180,10 @@ assigns LSNs) and of #110's replica follower. It is the only tier that:
   recoverable),
 - and plausibly a persisted commit-LSN (a format touch).
 
-**Held** until multi-process concurrent-write demand is demonstrated. Reachable by extending Tier 2
-(the coordinator replaces the in-process commit mutex). Recorded here so the staging is explicit,
-not designed in detail.
+**Deferred** because it breaks the single-process scope and needs a durable 2-phase commit protocol
+plus a wire protocol — a format/protocol commitment no in-codebase caller requires yet. Reachable by
+extending Tier 2 (the coordinator replaces the in-process commit mutex). Recorded here so the staging
+is explicit, not designed in detail.
 
 ## Identity verdict & the substrate/generated split
 
@@ -218,8 +222,9 @@ is crossed.
 5. **Authoring surface stays "schema + CLI + config."** Isolation level / retry policy, if
    configurable, live in `forgedb.toml` or are generated defaults — **never new `.forge` syntax**.
 6. **Don't build Tier 2/3 machinery without a caller.** Ship Tier 1 (transactions) first; add
-   optimistic concurrency only on demonstrated concurrent-writer demand (the
-   machinery-without-consumers failure that killed `fulltext`/`crud-api`).
+   optimistic concurrency only once something in the codebase (generated code or a crate) actually
+   links it — no generated code or crate links a concurrent-writer path today. Building it first is
+   the machinery-without-consumers failure that killed `fulltext`/`crud-api`.
 7. **Single-process scope holds through Tiers 1–2.** Multi-process (Tier 3) is a separately
    justified expansion, not silent scope creep.
 8. **"Multi-writer" is never oversold.** Every external description states the ceiling: concurrent
@@ -272,7 +277,8 @@ codegen guard asserting the txn body truncates on the error path and emits event
   separate, larger storage redesign. Out of scope.
 - **Serializable isolation** (read-set tracking) — Tier 2 ships snapshot isolation; serializable is
   a later knob.
-- **Multi-process / Tier 3 coordinator** — held until demand; reachable by extending Tier 2.
+- **Multi-process / Tier 3 coordinator** — deferred; breaks single-process scope and needs a
+  durable 2-phase protocol. Reachable by extending Tier 2.
 - **Long-running / interactive transactions** holding a read snapshot for a long time — GC of
   superseded versions (compaction #92) must not reclaim versions a live snapshot still needs; a
   transaction registers its snapshot LSN so compaction respects the oldest live reader (a small
