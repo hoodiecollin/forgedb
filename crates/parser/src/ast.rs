@@ -39,6 +39,17 @@ pub struct CompositeIndex {
     pub fields: Vec<String>,
 }
 
+/// A model-level `@projection(<name>: <field>, ...)` directive (#113): a named,
+/// compile-time-known subset of a model's stored columns.  Generates a tailored
+/// projection struct + narrow read that materializes only PK + these fields.
+/// The identity column is always materialized regardless of whether it appears
+/// in `fields` (validation/codegen enforce this).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Projection {
+    pub name: String,
+    pub fields: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     U32,
@@ -125,7 +136,8 @@ pub struct Model {
     pub name: String,
     pub fields: Vec<Field>,
     pub composite_indexes: Vec<CompositeIndex>,
-    pub soft_delete: bool, // @soft_delete directive at model level (Sprint 19)
+    pub projections: Vec<Projection>, // @projection(name: a, b) directives (#113)
+    pub soft_delete: bool,            // @soft_delete directive at model level (Sprint 19)
 }
 
 #[derive(Debug, Clone, PartialEq)]

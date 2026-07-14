@@ -4636,6 +4636,7 @@ mod tests {
                     },
                 ],
                 composite_indexes: vec![],
+                projections: Vec::new(),
                 soft_delete: false,
             }],
             structs: vec![],
@@ -4681,6 +4682,7 @@ mod tests {
                         is_materialized: false,
                     }],
                     composite_indexes: vec![],
+                    projections: Vec::new(),
                     soft_delete: false,
                 },
                 Model {
@@ -4698,6 +4700,7 @@ mod tests {
                         is_materialized: false,
                     }],
                     composite_indexes: vec![],
+                    projections: Vec::new(),
                     soft_delete: false,
                 },
             ],

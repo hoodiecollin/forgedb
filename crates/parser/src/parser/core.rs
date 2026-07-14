@@ -1,6 +1,6 @@
 use crate::ast::{
     ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, Field,
-    FieldType, Model, RelationInclusion, RelationType, Schema, Struct,
+    FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{validate_field_name, validate_model_name, Position};
@@ -446,6 +446,68 @@ impl Parser {
         Ok(CompositeIndex { fields })
     }
 
+    /// Parse a `@projection(<name>: <field>, ...)` directive body (#113).  The
+    /// caller has already consumed `@projection`; the current token is `(`.
+    fn parse_projection_directive(&mut self) -> Result<Projection, String> {
+        self.expect(Token::LParen)?;
+
+        // Projection name.
+        let name = match self.current_token() {
+            Token::Ident(s) => s.clone(),
+            _ => {
+                return Err(format!(
+                    "Expected projection name in @projection directive, found {:?}",
+                    self.current_token()
+                ))
+            }
+        };
+        self.advance();
+
+        // Name/field-list separator.
+        self.expect(Token::Colon)?;
+
+        // Field list (same shape as @index).
+        let mut fields = Vec::new();
+        loop {
+            let field_name = match self.current_token() {
+                Token::Ident(s) => s.clone(),
+                _ => {
+                    return Err(format!(
+                        "Expected field name in @projection directive, found {:?}",
+                        self.current_token()
+                    ))
+                }
+            };
+            self.advance();
+            fields.push(field_name);
+
+            match self.current_token() {
+                Token::Comma => {
+                    self.advance();
+                }
+                Token::RParen => {
+                    self.advance();
+                    break;
+                }
+                _ => {
+                    return Err(format!(
+                        "Expected ',' or ')' in @projection directive, found {:?}",
+                        self.current_token()
+                    ))
+                }
+            }
+        }
+
+        if fields.is_empty() {
+            return Err(format!(
+                "@projection '{}' must name at least one field",
+                name
+            ));
+        }
+
+        Ok(Projection { name, fields })
+    }
+
     fn parse_field(&mut self) -> Result<Field, String> {
         self.skip_newlines();
 
@@ -707,6 +769,7 @@ impl Parser {
         let mut fields = Vec::new();
         let mut field_names = std::collections::HashSet::new();
         let mut composite_indexes = Vec::new();
+        let mut projections = Vec::new();
         let mut soft_delete = false;
         self.skip_newlines();
 
@@ -738,6 +801,11 @@ impl Parser {
                         match directive_name.as_str() {
                             "soft_delete" => {
                                 soft_delete = true;
+                                self.skip_newlines();
+                            }
+                            "projection" => {
+                                let projection = self.parse_projection_directive()?;
+                                projections.push(projection);
                                 self.skip_newlines();
                             }
                             _ => {
@@ -785,10 +853,32 @@ impl Parser {
             }
         }
 
+        // Structural checks on projections (#113): referenced fields must exist,
+        // and projection names must be unique.  Type-based checks (reject
+        // relation/virtual fields) live in the validation crate.
+        let mut projection_names = std::collections::HashSet::new();
+        for proj in &projections {
+            if !projection_names.insert(proj.name.clone()) {
+                return Err(format!(
+                    "Duplicate @projection name '{}' in model '{}'",
+                    proj.name, name
+                ));
+            }
+            for field_name in &proj.fields {
+                if !field_names.contains(field_name) {
+                    return Err(format!(
+                        "@projection '{}' in model '{}' references undefined field '{}'",
+                        proj.name, name, field_name
+                    ));
+                }
+            }
+        }
+
         Ok(Model {
             name,
             fields,
             composite_indexes,
+            projections,
             soft_delete,
         })
     }
@@ -857,6 +947,56 @@ mod tests {
             .find(|f| f.name == field)
             .expect("field not found");
         &f.constraints
+    }
+
+    #[test]
+    fn parses_projection_directive() {
+        let src = r#"
+            Post {
+                id: +uuid
+                title: string
+                slug: ^string
+                content: string
+
+                @projection(card: title, slug)
+                @projection(list_row: title)
+            }
+        "#;
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+        let post = schema.models.iter().find(|m| m.name == "Post").unwrap();
+        assert_eq!(post.projections.len(), 2);
+        assert_eq!(post.projections[0].name, "card");
+        assert_eq!(post.projections[0].fields, vec!["title", "slug"]);
+        assert_eq!(post.projections[1].name, "list_row");
+        assert_eq!(post.projections[1].fields, vec!["title"]);
+    }
+
+    #[test]
+    fn projection_rejects_unknown_field() {
+        let src = r#"
+            Post {
+                id: +uuid
+                title: string
+                @projection(card: title, nope)
+            }
+        "#;
+        let err = Parser::new(src).unwrap().parse().unwrap_err();
+        assert!(err.contains("undefined field 'nope'"), "got: {err}");
+    }
+
+    #[test]
+    fn projection_rejects_duplicate_name() {
+        let src = r#"
+            Post {
+                id: +uuid
+                title: string
+                slug: string
+                @projection(card: title)
+                @projection(card: slug)
+            }
+        "#;
+        let err = Parser::new(src).unwrap().parse().unwrap_err();
+        assert!(err.contains("Duplicate @projection name 'card'"), "got: {err}");
     }
 
     #[test]

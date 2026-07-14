@@ -37,6 +37,7 @@ fn test_detect_many_to_many() {
                     },
                 ],
                 composite_indexes: vec![],
+                projections: Vec::new(),
                 soft_delete: false,
             },
             Model {
@@ -70,6 +71,7 @@ fn test_detect_many_to_many() {
                     },
                 ],
                 composite_indexes: vec![],
+                projections: Vec::new(),
                 soft_delete: false,
             },
         ],
@@ -120,6 +122,7 @@ fn test_no_m2m_with_fk() {
                     },
                 ],
                 composite_indexes: vec![],
+                projections: Vec::new(),
                 soft_delete: false,
             },
             Model {
@@ -153,6 +156,7 @@ fn test_no_m2m_with_fk() {
                     },
                 ],
                 composite_indexes: vec![],
+                projections: Vec::new(),
                 soft_delete: false,
             },
         ],
