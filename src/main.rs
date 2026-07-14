@@ -309,7 +309,8 @@ enum CompactCommands {
 
 #[derive(Subcommand)]
 enum BackupCommands {
-    /// Create a lock-free full-snapshot archive of a database directory
+    /// Create a lock-free snapshot archive of a database directory (full, or
+    /// an incremental byte-tail delta with `--incremental`)
     Create {
         /// Data directory (default: ./data)
         #[arg(short, long, default_value = "data")]
@@ -318,12 +319,25 @@ enum BackupCommands {
         /// Output archive path
         #[arg(short, long, default_value = "backup.forgebk")]
         output: String,
+
+        /// Produce an incremental delta against a base archive instead of a
+        /// full snapshot. Refused if compaction bumped the epoch since the base.
+        #[arg(long)]
+        incremental: bool,
+
+        /// Base archive the incremental deltas from (required with
+        /// `--incremental`; may itself be an earlier incremental in the chain)
+        #[arg(long)]
+        base: Option<String>,
     },
 
-    /// Restore a snapshot archive into a data directory
+    /// Restore a snapshot archive (or a base + incremental chain) into a data
+    /// directory. Pass the base first, then each incremental in order.
     Restore {
-        /// Archive path to restore from
-        archive: String,
+        /// Archive path(s) to restore. One full archive, or a base followed by
+        /// its incrementals in `sequence` order.
+        #[arg(required = true, num_args = 1..)]
+        archive: Vec<String>,
 
         /// Destination data directory
         #[arg(short, long, default_value = "data")]
@@ -504,18 +518,23 @@ fn run(cli: Cli) -> Result<()> {
         },
 
         Commands::Backup(backup_cmd) => match backup_cmd {
-            BackupCommands::Create { data_dir, output } => {
-                commands::backup::create(commands::backup::CreateOptions {
-                    data_dir: data_dir.into(),
-                    output: output.into(),
-                })
-            }
+            BackupCommands::Create {
+                data_dir,
+                output,
+                incremental,
+                base,
+            } => commands::backup::create(commands::backup::CreateOptions {
+                data_dir: data_dir.into(),
+                output: output.into(),
+                incremental,
+                base: base.map(Into::into),
+            }),
             BackupCommands::Restore {
                 archive,
                 output,
                 overwrite,
             } => commands::backup::restore(commands::backup::RestoreOptions {
-                archive: archive.into(),
+                archives: archive.into_iter().map(Into::into).collect(),
                 output: output.into(),
                 overwrite,
             }),
