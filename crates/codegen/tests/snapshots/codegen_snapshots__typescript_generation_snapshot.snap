@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 948
 expression: code
 ---
 /**
@@ -138,7 +139,8 @@ return query ? `?${query}` : '';
     return true;
   }
 
-  /** Delete a Author by id. Returns `true` if deleted, `false` if absent. */
+  /** Delete a Author by id. Returns `true` if deleted, `false` if absent.
+   * Throws `ForgeDBError` (409) if `@on_delete(restrict)` children block it. */
   async deleteAuthor(id: string): Promise<boolean> {
     const response = await fetch(`${this.baseUrl}/api/author/${encodeURIComponent(id)}`, {
       method: 'DELETE',
@@ -189,7 +191,8 @@ return query ? `?${query}` : '';
     return true;
   }
 
-  /** Delete a Post by id. Returns `true` if deleted, `false` if absent. */
+  /** Delete a Post by id. Returns `true` if deleted, `false` if absent.
+   * Throws `ForgeDBError` (409) if `@on_delete(restrict)` children block it. */
   async deletePost(id: string): Promise<boolean> {
     const response = await fetch(`${this.baseUrl}/api/post/${encodeURIComponent(id)}`, {
       method: 'DELETE',

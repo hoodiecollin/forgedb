@@ -10,6 +10,21 @@ use quote::{format_ident, quote};
 /// Rust code generator
 pub struct RustGenerator;
 
+/// On-delete referential-integrity policy for a relation FK field (delete
+/// semantics).  Declared via `@on_delete(...)`; `Restrict` is the default when
+/// the directive is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnDeletePolicy {
+    /// Refuse to delete a parent that still has any live child referencing it
+    /// (→ `ValidationError::ReferencedByChildren`, 409).  The safe default.
+    Restrict,
+    /// Deleting the parent recursively deletes every referencing child (their
+    /// own on-delete rules fire in turn).
+    Cascade,
+    /// Deleting the parent sets each referencing child's (optional) FK to `None`.
+    SetNull,
+}
+
 impl RustGenerator {
     /// Generate Rust database implementation from schema
     ///
@@ -74,9 +89,89 @@ impl RustGenerator {
         Ok(())
     }
 
+    /// The on-delete referential-integrity policy declared on a relation FK field
+    /// via `@on_delete(...)` (delete semantics).  Absent → `Restrict` (the safe
+    /// default: refuse to delete a parent that still has live children).
+    ///
+    /// Read purely from `field.constraints` — `@on_delete(cascade)` parses as a
+    /// generic directive (bare-identifier arg), so re-introducing it needs no
+    /// parser change; the policy lives entirely in generated code.
+    fn on_delete_policy(field: &forgedb_parser::ast::Field) -> OnDeletePolicy {
+        for c in &field.constraints {
+            if c.name == "on_delete" {
+                if let Some(forgedb_parser::ast::ConstraintParam::String(p)) = c.params.first() {
+                    return match p.as_str() {
+                        "cascade" => OnDeletePolicy::Cascade,
+                        "set_null" => OnDeletePolicy::SetNull,
+                        _ => OnDeletePolicy::Restrict,
+                    };
+                }
+            }
+        }
+        OnDeletePolicy::Restrict
+    }
+
+    /// Compile-time validation of `@on_delete(...)` directives (delete semantics):
+    /// - the value must be one of `restrict` / `cascade` / `set_null`;
+    /// - `@on_delete` is only meaningful on a relation FK field (`*Target` /
+    ///   `?Target`) — reject it elsewhere;
+    /// - `set_null` is only valid on an OPTIONAL FK (`?Target`) — a required
+    ///   `*Target` cannot be nulled, so this is a HARD codegen error.
+    fn validate_on_delete(schema: &Schema) -> Result<()> {
+        for model in &schema.models {
+            for field in &model.fields {
+                let Some(c) = field.constraints.iter().find(|c| c.name == "on_delete") else {
+                    continue;
+                };
+                let value = match c.params.first() {
+                    Some(forgedb_parser::ast::ConstraintParam::String(p)) => p.as_str(),
+                    _ => {
+                        return Err(CodegenError::InvalidSchema(format!(
+                            "@on_delete on '{}.{}' requires a policy argument \
+                             (restrict | cascade | set_null)",
+                            model.name, field.name
+                        )));
+                    }
+                };
+                if !matches!(value, "restrict" | "cascade" | "set_null") {
+                    return Err(CodegenError::InvalidSchema(format!(
+                        "@on_delete('{}') on '{}.{}' is not a valid policy \
+                         (expected restrict | cascade | set_null)",
+                        value, model.name, field.name
+                    )));
+                }
+                let optional_fk = match &field.field_type {
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::OptionalReference(_),
+                    ) => true,
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(_),
+                    ) => false,
+                    _ => {
+                        return Err(CodegenError::InvalidSchema(format!(
+                            "@on_delete on '{}.{}' is only valid on a foreign-key field \
+                             (`*Target` required or `?Target` optional)",
+                            model.name, field.name
+                        )));
+                    }
+                };
+                if value == "set_null" && !optional_fk {
+                    return Err(CodegenError::InvalidSchema(format!(
+                        "@on_delete(set_null) on '{}.{}' is invalid: the field is a required \
+                         foreign key (`*`) and cannot be set to null — use an optional FK \
+                         (`?Target`), or choose `cascade`/`restrict`",
+                        model.name, field.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Generate the Rust code as a string
     fn generate_code(schema: &Schema) -> Result<String> {
         Self::validate_projections(schema)?;
+        Self::validate_on_delete(schema)?;
 
         let mut tokens = TokenStream::new();
 
@@ -141,6 +236,10 @@ impl RustGenerator {
                 Unique { field: &'static str },
                 /// A required/optional foreign key points at a non-existent row → 409.
                 DanglingReference { field: &'static str, target: &'static str },
+                /// A `delete` was refused because live child rows still reference
+                /// this parent under an `@on_delete(restrict)` FK (the default
+                /// on-delete policy) → 409.
+                ReferencedByChildren { model: &'static str, field: &'static str },
                 /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
                 /// was violated → 422.
                 Constraint { field: &'static str, rule: &'static str, message: String },
@@ -153,7 +252,8 @@ impl RustGenerator {
                 pub fn status_code(&self) -> u16 {
                     match self {
                         ValidationError::Unique { .. }
-                        | ValidationError::DanglingReference { .. } => 409,
+                        | ValidationError::DanglingReference { .. }
+                        | ValidationError::ReferencedByChildren { .. } => 409,
                         ValidationError::Constraint { .. } => 422,
                     }
                 }
@@ -167,6 +267,13 @@ impl RustGenerator {
                         }
                         ValidationError::DanglingReference { field, target } => {
                             write!(f, "field `{}` references a non-existent {}", field, target)
+                        }
+                        ValidationError::ReferencedByChildren { model, field } => {
+                            write!(
+                                f,
+                                "cannot delete: {} rows still reference it via `{}` (on_delete=restrict)",
+                                model, field
+                            )
                         }
                         ValidationError::Constraint { field, rule, message } => {
                             write!(f, "field `{}` violates `{}`: {}", field, rule, message)
@@ -4642,23 +4749,261 @@ impl RustGenerator {
             });
         }
 
+        // --- delete_<model> wrappers (delete semantics: referential integrity +
+        // cascade + set_null + M2M cascade-unlink).  Mirrors the create/update
+        // wrapper pattern (#91): the referential logic needs sibling-collection
+        // access `Storage` lacks, so it lives on `Database`.  The direct
+        // `db.<model>.delete` storage path SKIPS these checks (same caveat #91
+        // documents for `insert`) — REST + `Database::delete_<model>` get full
+        // integrity.
+        let delete_methods = Self::generate_delete_wrappers(schema);
+        for m in delete_methods {
+            methods.push(m);
+        }
+
         if methods.is_empty() {
             return quote! {};
         }
         quote! {
+            /// Maximum on-delete cascade recursion depth (delete semantics).  A
+            /// cascade delete recurses into referencing children (which may cascade
+            /// in turn); this bounds a pathological schema FK cycle so it fails
+            /// loudly with `ReferencedByChildren`-class refusal rather than
+            /// looping.  Fixed for v1 (same posture as the WAL/compaction consts).
+            const MAX_CASCADE_DEPTH: u32 = 64;
+
             impl Database {
                 #(#methods)*
             }
         }
     }
 
+    /// Generate the `delete_<model>` referential-integrity wrappers on `Database`
+    /// (delete semantics).  For each UUID-keyed parent model, emits:
+    ///   * a public `delete_<model>(id) -> Result<bool, ValidationError>` that
+    ///     evaluates every child FK's `@on_delete` policy before delegating to
+    ///     `<model>Storage::delete`, and unlinks the model's M2M junction rows;
+    ///   * an internal depth-bounded `delete_<model>_cascade(id, depth)` that the
+    ///     public method and any cascading parent call (cascade recurses through
+    ///     the child's OWN wrapper so ITS rules fire — multi-level chains work).
+    ///
+    /// Policies (default `restrict` when `@on_delete` is absent):
+    ///   * `restrict`  → refuse if any live child references the parent (409).
+    ///   * `cascade`   → recursively delete every referencing child.
+    ///   * `set_null`  → null each referencing (optional) child FK via update.
+    ///
+    /// All FK-graph walking is done here at compile time; the emitted code reads
+    /// no schema at runtime (identity red line held).
+    fn generate_delete_wrappers(schema: &Schema) -> Vec<TokenStream> {
+        let mut out = Vec::new();
+
+        for parent in &schema.models {
+            // A wrapper is generated for every identity model (matching the
+            // create/update wrappers), so the REST DELETE route always has one.
+            if !parent.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+                continue;
+            }
+            let parent_snake = Self::to_snake_case(&parent.name);
+            let parent_storage = format_ident!("{}", parent_snake);
+            let public_fn = format_ident!("delete_{}", parent_snake);
+            let cascade_fn = format_ident!("delete_{}_cascade", parent_snake);
+            let parent_name_str = parent.name.as_str();
+            let id_type = Self::id_type_tokens(parent);
+
+            // Integer-PK models are never FK targets (FKs are always UUID) and
+            // never in an M2M (junctions require UUID PKs on both sides), so their
+            // wrapper is a trivial delegate — no referential-integrity work.
+            if !Self::is_uuid_pk(parent) {
+                let doc = format!(
+                    "Delete a {} (integer-keyed): no model references it via a \
+                     foreign key, so this delegates to storage `delete`.  Returns \
+                     `Ok(false)` if the id is absent.",
+                    parent.name
+                );
+                out.push(quote! {
+                    #[doc = #doc]
+                    pub fn #public_fn(&mut self, id: #id_type) -> Result<bool, ValidationError> {
+                        Ok(self.#parent_storage.delete(id))
+                    }
+                });
+                continue;
+            }
+
+            // Every child FK field that references THIS parent, with its policy.
+            // A child may have multiple FKs to the same parent (disambiguated by
+            // field), each with its own `@on_delete`.  Restrict CHECKS run before
+            // any cascade/set_null mutation, so a later `restrict` sibling refuses
+            // the whole delete without a partial cascade having already fired.
+            let mut restrict_checks: Vec<TokenStream> = Vec::new();
+            let mut mutations: Vec<TokenStream> = Vec::new();
+            for child in &schema.models {
+                if !Self::is_uuid_pk(child) {
+                    continue;
+                }
+                let child_snake = Self::to_snake_case(&child.name);
+                let child_storage = format_ident!("{}", child_snake);
+                let child_delete = format_ident!("delete_{}_cascade", child_snake);
+                let child_update = format_ident!("update_{}", child_snake);
+
+                for field in &child.fields {
+                    let (target_name, optional) = match &field.field_type {
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::RequiredReference(t),
+                        ) => (t, false),
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(t),
+                        ) => (t, true),
+                        _ => continue,
+                    };
+                    if target_name != &parent.name {
+                        continue;
+                    }
+                    // The reverse FK must be indexed to probe children in O(1).
+                    // FK fields are always indexed (#100), so this holds; guard
+                    // anyway so a non-indexed edge falls back to a scan.
+                    let fk_field = format_ident!("{}", field.name);
+                    let fk_probe = format_ident!("find_by_{}", field.name);
+                    let child_field_str = field.name.as_str();
+                    let child_name_str = child.name.as_str();
+                    let probe_arg = if optional {
+                        quote! { Some(id) }
+                    } else {
+                        quote! { id }
+                    };
+                    let child_indexed = child
+                        .fields
+                        .iter()
+                        .any(|f| f.name == "id" || f.auto_generate);
+                    let find_children = if child_indexed {
+                        quote! { self.#child_storage.#fk_probe(#probe_arg) }
+                    } else {
+                        let pred = if optional {
+                            quote! { __c.#fk_field == Some(id) }
+                        } else {
+                            quote! { __c.#fk_field == id }
+                        };
+                        quote! {
+                            self.#child_storage.all().into_iter().filter(|__c| #pred).collect::<Vec<_>>()
+                        }
+                    };
+
+                    match Self::on_delete_policy(field) {
+                        OnDeletePolicy::Restrict => {
+                            restrict_checks.push(quote! {
+                                {
+                                    let __children = #find_children;
+                                    if !__children.is_empty() {
+                                        return Err(ValidationError::ReferencedByChildren {
+                                            model: #child_name_str,
+                                            field: #child_field_str,
+                                        });
+                                    }
+                                }
+                            });
+                        }
+                        OnDeletePolicy::Cascade => {
+                            mutations.push(quote! {
+                                {
+                                    let __children = #find_children;
+                                    for __c in __children {
+                                        self.#child_delete(__c.id, __depth + 1)?;
+                                    }
+                                }
+                            });
+                        }
+                        OnDeletePolicy::SetNull => {
+                            // Only reachable for OPTIONAL FKs (validated above),
+                            // so `#fk_field = None` type-checks.
+                            mutations.push(quote! {
+                                {
+                                    let __children = #find_children;
+                                    for mut __c in __children {
+                                        let __cid = __c.id;
+                                        __c.#fk_field = None;
+                                        self.#child_update(__cid, __c)?;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
+            // M2M cascade-unlink: any junction this parent participates in has its
+            // pairs referencing the deleted id retracted, so traversal no longer
+            // resolves the gone record.  Emitted for both sides of each M2M.
+            let mut m2m_unlinks: Vec<TokenStream> = Vec::new();
+            for m in Self::valid_m2m(schema) {
+                let junction_field = Self::junction_field_ident(&m);
+                if m.model1 == parent.name {
+                    m2m_unlinks.push(quote! {
+                        self.#junction_field.unlink_all_left(id);
+                    });
+                }
+                if m.model2 == parent.name {
+                    let junction_field2 = Self::junction_field_ident(&m);
+                    m2m_unlinks.push(quote! {
+                        self.#junction_field2.unlink_all_right(id);
+                    });
+                }
+            }
+
+            let doc = format!(
+                "Delete a {} with referential integrity (delete semantics): each child \
+                 FK's `@on_delete` policy (restrict/cascade/set_null) is applied, this \
+                 model's M2M junction rows are unlinked, then the row is tombstoned. \
+                 Returns `Ok(false)` if the id is absent, `Err(ReferencedByChildren)` \
+                 (409) if a `restrict` child blocks the delete.  The REST DELETE route \
+                 goes through this wrapper; the direct `db.{}.delete` storage path does \
+                 NOT (it skips these checks).",
+                parent.name, parent_snake
+            );
+
+            out.push(quote! {
+                #[doc = #doc]
+                pub fn #public_fn(&mut self, id: Uuid) -> Result<bool, ValidationError> {
+                    self.#cascade_fn(id, 0)
+                }
+
+                /// Internal depth-bounded cascade worker.  `depth` guards a
+                /// pathological FK cycle (bounded by `MAX_CASCADE_DEPTH`).
+                fn #cascade_fn(&mut self, id: Uuid, __depth: u32) -> Result<bool, ValidationError> {
+                    if __depth > MAX_CASCADE_DEPTH {
+                        return Err(ValidationError::ReferencedByChildren {
+                            model: #parent_name_str,
+                            field: "on_delete cascade depth exceeded",
+                        });
+                    }
+                    // Nothing to delete → no-op (matches storage `delete` semantics),
+                    // and skip child work so a cascade cycle terminates.
+                    if self.#parent_storage.get(id).is_none() {
+                        return Ok(false);
+                    }
+                    // Restrict checks run FIRST so a violation refuses before any
+                    // cascade/set_null side effect fires.
+                    #(#restrict_checks)*
+                    // Then cascade-delete / set-null the referencing children.
+                    #(#mutations)*
+                    // Retract M2M junction rows for this id (both sides).
+                    #(#m2m_unlinks)*
+                    Ok(self.#parent_storage.delete(id))
+                }
+            });
+        }
+
+        out
+    }
+
     /// Generate the persisted junction storage struct for each M2M relation.
     ///
     /// Each junction stores two `Uuid` columns (`left` = model1 id, `right` =
-    /// model2 id).  `link` appends a pair; `pairs` reads them all back.  Storage
-    /// is append-only, matching the model columns — there is no `unlink`, for the
-    /// same reason generated models have no `delete`: the storage engine exposes
-    /// no in-place retraction (`Tombstones` is append-only).
+    /// model2 id) plus a per-pair `Tombstones` column (1 byte/row) for
+    /// `unlink` (delete semantics): `link` appends a pair (`false` tombstone),
+    /// `unlink` appends a NEW retracted pair (`true` tombstone) — append-only, the
+    /// same retraction primitive models use for `delete` (#66).  `pairs()` filters
+    /// out any pair that is retracted or superseded by a later retraction, so
+    /// traversal never resolves an unlinked edge.  Uses only the already-published
+    /// `Tombstones` type — no substrate change.
     fn generate_junction_structs(schema: &Schema) -> TokenStream {
         let mut structs = Vec::new();
 
@@ -4678,6 +5023,7 @@ impl RustGenerator {
             let base = format!("{}_{}_link", field_snake, field_snake2);
             let left_path = format!("{}/fixed/left.bin", base);
             let right_path = format!("{}/fixed/right.bin", base);
+            let tombstones_path = format!("{}/tombstones.bin", base);
             let manifest_path = format!("{}/manifest.json", base);
 
             structs.push(quote! {
@@ -4685,6 +5031,9 @@ impl RustGenerator {
                 pub struct #struct_ident {
                     left_col: FixedColumn,
                     right_col: FixedColumn,
+                    /// Per-pair retraction (delete semantics): `true` = unlinked.
+                    /// Appended in lockstep with `left`/`right` (append-only).
+                    tombstones: Tombstones,
                     row_count: usize,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
                     broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
@@ -4712,10 +5061,25 @@ impl RustGenerator {
                             root.join(#right_path),
                             16usize,
                         ).expect("Failed to create junction column");
+                        let mut tombstones = Tombstones::new(
+                            root.join(#tombstones_path),
+                        ).expect("Failed to create junction tombstones");
+                        // `right_col` is appended last per `link`, so its length is
+                        // the count of fully-committed pairs.  Reconcile the
+                        // tombstone column to that count: back-fill `false` for any
+                        // pre-tombstone-format rows or a torn tail (tombstone not
+                        // written for the last link) so `is_deleted(i)` is defined
+                        // for every committed pair.
                         let row_count = right_col.len();
+                        while tombstones.len() < row_count {
+                            tombstones
+                                .append(false)
+                                .expect("Failed to back-fill junction tombstone");
+                        }
                         let db = Self {
                             left_col,
                             right_col,
+                            tombstones,
                             row_count,
                             changefeed: None,
                             broker: None,
@@ -4790,6 +5154,9 @@ impl RustGenerator {
                             .expect("Failed to append link");
                         self.right_col.append_uuid(*right.as_bytes())
                             .expect("Failed to append link");
+                        // A live link — tombstone `false`, appended in lockstep.
+                        self.tombstones.append(false)
+                            .expect("Failed to append junction tombstone");
                         self.row_count += 1;
                         // Change-feed emit (#62): a link is an M2M junction append.
                         if let Some(feed) = &self.changefeed {
@@ -4812,10 +5179,89 @@ impl RustGenerator {
                         }
                     }
 
+                    /// Remove the link between `left` and `right` (delete
+                    /// semantics — the reverse of `link`).  Append-only retraction:
+                    /// a new row for the pair with tombstone `true`, so `pairs()`
+                    /// (latest-wins per pair) stops resolving it.  Returns `true` if
+                    /// a live link existed, `false` if the pair was not linked.
+                    /// Re-`link` after `unlink` restores the edge (a later live row
+                    /// supersedes the retraction).
+                    pub fn unlink(&mut self, left: Uuid, right: Uuid) -> bool {
+                        // Is the pair currently live?  Latest-wins scan.
+                        let mut __live = false;
+                        for i in 0..self.row_count {
+                            let l = Uuid::from_bytes(
+                                self.left_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            let r = Uuid::from_bytes(
+                                self.right_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            if l == left && r == right {
+                                __live = !self.tombstones.is_deleted(i).unwrap_or(false);
+                            }
+                        }
+                        if !__live {
+                            return false;
+                        }
+                        let row_index = self.row_count;
+                        self.left_col.append_uuid(*left.as_bytes())
+                            .expect("Failed to append unlink");
+                        self.right_col.append_uuid(*right.as_bytes())
+                            .expect("Failed to append unlink");
+                        self.tombstones.append(true)
+                            .expect("Failed to append junction tombstone");
+                        self.row_count += 1;
+                        if let Some(feed) = &self.changefeed {
+                            feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Deleted);
+                        }
+                        if let Some(__broker) = &self.broker {
+                            let mut __row_bytes = Vec::with_capacity(32);
+                            __row_bytes.extend_from_slice(left.as_bytes());
+                            __row_bytes.extend_from_slice(right.as_bytes());
+                            if let Ok(mut __b) = __broker.lock() {
+                                let _ = __b.record(
+                                    #base,
+                                    row_index as u64,
+                                    forgedb_changefeed::ChangeKind::Deleted,
+                                    __row_bytes,
+                                );
+                            }
+                        }
+                        true
+                    }
+
+                    /// Retract every live pair whose `left` id equals `id` (M2M
+                    /// cascade-unlink when the left model's row is deleted).
+                    pub fn unlink_all_left(&mut self, id: Uuid) {
+                        let __targets: Vec<Uuid> = self
+                            .pairs()
+                            .into_iter()
+                            .filter(|(l, _)| *l == id)
+                            .map(|(_, r)| r)
+                            .collect();
+                        for r in __targets {
+                            self.unlink(id, r);
+                        }
+                    }
+
+                    /// Retract every live pair whose `right` id equals `id` (M2M
+                    /// cascade-unlink when the right model's row is deleted).
+                    pub fn unlink_all_right(&mut self, id: Uuid) {
+                        let __targets: Vec<Uuid> = self
+                            .pairs()
+                            .into_iter()
+                            .filter(|(_, r)| *r == id)
+                            .map(|(l, _)| l)
+                            .collect();
+                        for l in __targets {
+                            self.unlink(l, id);
+                        }
+                    }
+
                     /// Make this junction's id columns durable (#89 step 2).  M2M
                     /// junctions have no WAL (a #89 boundary — link appends are not
                     /// yet crash-recovered), so there is nothing to truncate; this
-                    /// only fsyncs the two columns so a `Database::checkpoint()`
+                    /// only fsyncs the columns so a `Database::checkpoint()`
                     /// leaves link rows as durable as model rows.
                     pub fn checkpoint(&mut self) {
                         self.left_col
@@ -4824,20 +5270,41 @@ impl RustGenerator {
                         self.right_col
                             .flush()
                             .expect("Failed to fsync junction right column on checkpoint");
+                        self.tombstones
+                            .flush()
+                            .expect("Failed to fsync junction tombstones on checkpoint");
                     }
 
-                    /// Every recorded (left, right) id pair.
+                    /// Every LIVE (left, right) id pair (latest-wins per pair):
+                    /// a pair is live iff its most-recent row is not retracted, so
+                    /// `unlink`ed edges are excluded and a re-`link` restores it.
                     pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
-                        (0..self.row_count)
-                            .map(|i| {
-                                let left = Uuid::from_bytes(
-                                    self.left_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                let right = Uuid::from_bytes(
-                                    self.right_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                (left, right)
-                            })
+                        self.pairs_prefix(self.row_count)
+                    }
+
+                    /// Shared latest-wins resolution over the row prefix `0..end`.
+                    fn pairs_prefix(&self, end: usize) -> Vec<(Uuid, Uuid)> {
+                        // Preserve first-link order while applying latest-wins on
+                        // the retraction flag.
+                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
+                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                            std::collections::HashMap::new();
+                        for i in 0..end {
+                            let left = Uuid::from_bytes(
+                                self.left_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            let right = Uuid::from_bytes(
+                                self.right_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
+                            if !state.contains_key(&(left, right)) {
+                                order.push((left, right));
+                            }
+                            state.insert((left, right), deleted);
+                        }
+                        order
+                            .into_iter()
+                            .filter(|pair| !state.get(pair).copied().unwrap_or(true))
                             .collect()
                     }
 
@@ -4851,32 +5318,24 @@ impl RustGenerator {
                         forgedb_storage::Snapshot::new(self.row_count)
                     }
 
-                    /// Link pairs committed as of `snap` (#56): scans exactly the
-                    /// prefix `0..snap.watermark()`, excluding links appended after
-                    /// the snapshot was captured.
+                    /// Live link pairs committed as of `snap` (#56): latest-wins
+                    /// over the prefix `0..snap.watermark()`, excluding links
+                    /// appended after the snapshot AND pairs retracted within it.
                     pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
-                        (0..snap.watermark())
-                            .map(|i| {
-                                let left = Uuid::from_bytes(
-                                    self.left_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                let right = Uuid::from_bytes(
-                                    self.right_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                (left, right)
-                            })
-                            .collect()
+                        self.pairs_prefix(snap.watermark())
                     }
 
                     /// Open a read-only handle over this junction (#56 Direction B):
-                    /// shares both id columns via independent fds for lock-free
-                    /// snapshot reads concurrent with the writer's `link`.
+                    /// shares both id columns + tombstones via independent fds for
+                    /// lock-free snapshot reads concurrent with the writer's `link`.
                     pub fn reader(&self) -> #reader_ident {
                         #reader_ident {
                             left_col: self.left_col.reader()
                                 .expect("Failed to open junction left reader"),
                             right_col: self.right_col.reader()
                                 .expect("Failed to open junction right reader"),
+                            tombstones: self.tombstones.reader()
+                                .expect("Failed to open junction tombstones reader"),
                         }
                     }
                 }
@@ -4885,23 +5344,34 @@ impl RustGenerator {
                 pub struct #reader_ident {
                     left_col: forgedb_storage::FixedColumnReader,
                     right_col: forgedb_storage::FixedColumnReader,
+                    tombstones: forgedb_storage::TombstonesReader,
                 }
 
                 impl #reader_ident {
-                    /// Link pairs committed as of `snap` (#56 Direction B): the same
-                    /// prefix scan as the writer junction, reading through the
-                    /// shared-fd reader columns.
+                    /// Live link pairs committed as of `snap` (#56 Direction B): the
+                    /// same latest-wins prefix resolution as the writer junction,
+                    /// reading through the shared-fd reader columns.
                     pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
-                        (0..snap.watermark())
-                            .map(|i| {
-                                let left = Uuid::from_bytes(
-                                    self.left_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                let right = Uuid::from_bytes(
-                                    self.right_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                (left, right)
-                            })
+                        let end = snap.watermark();
+                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
+                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                            std::collections::HashMap::new();
+                        for i in 0..end {
+                            let left = Uuid::from_bytes(
+                                self.left_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            let right = Uuid::from_bytes(
+                                self.right_col.read_uuid(i).expect("Failed to read link"),
+                            );
+                            let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
+                            if !state.contains_key(&(left, right)) {
+                                order.push((left, right));
+                            }
+                            state.insert((left, right), deleted);
+                        }
+                        order
+                            .into_iter()
+                            .filter(|pair| !state.get(pair).copied().unwrap_or(true))
                             .collect()
                     }
                 }
@@ -5086,6 +5556,31 @@ impl RustGenerator {
                     #[doc = #doc]
                     pub fn #link_ident(&mut self, left: Uuid, right: Uuid) {
                         self.#junction_field.link(left, right);
+                    }
+                });
+            }
+
+            // unlink_<a>_<b> (delete semantics — reverse of link_<a>_<b>)
+            let unlink_name = format!(
+                "unlink_{}_{}",
+                Self::to_snake_case(&m.model1),
+                Self::to_snake_case(&m.model2)
+            );
+            if seen.insert(unlink_name.clone()) {
+                let unlink_ident = format_ident!("{}", unlink_name);
+                let junction_field_u = Self::junction_field_ident(&m);
+                let doc = format!(
+                    "Remove the link between a {} (left) and a {} (right).  Returns \
+                     `true` if a live link existed.  Traversal (`{}_{}` / `{}_{}`) \
+                     stops resolving the pair afterwards.",
+                    m.model1, m.model2,
+                    Self::to_snake_case(&m.model1), m.field1,
+                    Self::to_snake_case(&m.model2), m.field2
+                );
+                methods.push(quote! {
+                    #[doc = #doc]
+                    pub fn #unlink_ident(&mut self, left: Uuid, right: Uuid) -> bool {
+                        self.#junction_field_u.unlink(left, right)
                     }
                 });
             }

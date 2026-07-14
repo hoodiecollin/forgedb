@@ -206,6 +206,7 @@ Order {
 | `@fulltext`            | (none)          | `string`            | Full-text search index (Sprint 18)       | `content: string @fulltext` |
 | `@materialized`        | (none)          | Any                 | Field is materialized (Sprint 19)        | `count: u32 @materialized` |
 | `@relations`           | `(*)` or `(field_list)` | Component refs | Component relation inclusion (Sprint 17) | `card: tsx://path @relations(*)` |
+| `@on_delete`           | `(restrict\|cascade\|set_null)` | FK field (`*Target`/`?Target`) | On-delete referential policy (ENFORCED, delete semantics) | `author: *User @on_delete(cascade)` |
 
 **Model-level directives:**
 
@@ -224,8 +225,12 @@ Order {
 
 **Parser source:** `crates/parser/src/parser/core.rs:113-184` (constraint parsing, incl. the `Token::Str` arm), `crates/parser/src/parser/core.rs:381-447` (directive parsing); string-literal lexing in `crates/parser/src/lexer.rs` (`read_string`)
 
-**Directives NOT in Parser (LSP/Semantic only):**
-- `@on_delete(cascade|set_null|restrict)` — Found in LSP hover/completion (`crates/lsp-server/src/hover.rs:130`, `crates/lsp-server/src/completion.rs:268-274`) but **NOT parsed by core parser**. Example files use it, but it will not parse.
+**`@on_delete` (ENFORCED — delete semantics):**
+- `@on_delete(restrict | cascade | set_null)` on a relation FK field (`*Target` required / `?Target` optional) declares what happens to children when the parent is deleted. It parses as a generic directive (bare-identifier arg — no special lexer rule) and is **enforced by codegen** in the generated `Database::delete_<parent>` wrapper:
+  - **`restrict`** (also the DEFAULT when `@on_delete` is absent): refuse to delete a parent that still has any live child referencing it (→ `ValidationError::ReferencedByChildren`, HTTP 409).
+  - **`cascade`**: recursively delete every referencing child (each child's own `@on_delete` rules fire, so multi-level chains work; a pathological FK cycle is bounded by `MAX_CASCADE_DEPTH`).
+  - **`set_null`**: null each referencing child's FK — **only valid on an OPTIONAL FK (`?Target`)**; `@on_delete(set_null)` on a required `*Target` is a hard codegen error.
+- The REST `DELETE /{id}` route goes through this wrapper (Rust API + REST both get integrity). The direct `db.<model>.delete` storage path skips these checks. M2M links to a cascade-deleted model are also unlinked.
 
 **Semantic vs. Enforcement:**
 - Directives marked "(semantic)" are parsed but **not enforced by the parser**; enforcement is left to validators/codegen
@@ -428,11 +433,12 @@ field: string  // inline comment
    ```
    Parser error: unexpected `/` and `*` tokens
 
-2. **@on_delete directive** (not in parser, only in LSP)
+2. **@on_delete(set_null) on a REQUIRED FK** (codegen error)
    ```
-   author: *User @on_delete(cascade)   // PARSE FAILS in forgedb validate
+   author: *User @on_delete(set_null)   // CODEGEN ERROR: a required FK can't be nulled
    ```
-   Parser accepts it as a generic constraint but LSP validates semantics separately
+   `@on_delete` itself parses and is enforced (see §6); only `set_null` on a required
+   `*Target` is rejected (use `?Target`, or `cascade`/`restrict`).
 
 3. **Duplicate field names**
    ```

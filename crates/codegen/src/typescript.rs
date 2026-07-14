@@ -62,6 +62,7 @@ impl TypeScriptGenerator {
                 variants.join(" | ")
             ));
         }
+
         // Model interfaces + their create-input aliases.
         for model in &schema.models {
             code.push_str(&Self::generate_interface(model)?);
@@ -297,9 +298,10 @@ export interface ListOptions {\n\
                  \x20 }}\n\n"
             ));
 
-            // DELETE — 204 -> true, 404 -> false.
+            // DELETE — 204 -> true, 404 -> false, 409 -> throws (restrict).
             code.push_str(&format!(
-                "  /** Delete a {name} by id. Returns `true` if deleted, `false` if absent. */\n\
+                "  /** Delete a {name} by id. Returns `true` if deleted, `false` if absent.\n\
+                 \x20  * Throws `ForgeDBError` (409) if `@on_delete(restrict)` children block it. */\n\
                  \x20 async delete{name}(id: string): Promise<boolean> {{\n\
                  \x20   const response = await fetch(`${{this.baseUrl}}/api/{kebab}/${{encodeURIComponent(id)}}`, {{\n\
                  \x20     method: 'DELETE',\n\

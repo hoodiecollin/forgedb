@@ -204,11 +204,12 @@ fn test_api_generation_has_update_delete_endpoints() {
     // Wired on the /{id} route alongside get.
     assert!(code.contains(".put(update_user)"));
     assert!(code.contains(".delete(delete_user)"));
-    // Backed by the generated mutation surface. Create/update route through the
-    // #91 Database-level validated wrappers (FK + field + unique); delete is direct.
+    // Backed by the generated mutation surface. Create/update/delete all route
+    // through the Database-level wrappers (#91 FK/field/unique; delete semantics
+    // referential integrity + cascade + set_null).
     assert!(code.contains("db.update_user(key, record)"));
     assert!(code.contains("db.create_user(record)"));
-    assert!(code.contains(".delete(key)"));
+    assert!(code.contains("db.delete_user(key)"));
 }
 
 #[test]
@@ -1426,10 +1427,13 @@ Tag {
         code.contains("let mut newest: HashMap<Uuid, usize> = HashMap::new();"),
         "all_at must resolve the newest version per id within the watermark"
     );
-    // The junction still scans exactly the committed prefix (links are add-only).
+    // The junction pairs_at resolves latest-wins over exactly the committed
+    // prefix (delete semantics added a per-pair tombstone; `unlink`ed pairs are
+    // excluded, but links appended after the snapshot are still not scanned).
     assert!(
-        code.contains("(0..snap.watermark())"),
-        "junction pairs_at must scan exactly the committed prefix"
+        code.contains("self.pairs_prefix(snap.watermark())")
+            && code.contains("let end = snap.watermark();"),
+        "junction pairs_at must resolve latest-wins over the committed prefix"
     );
 
     // Junction snapshot surface.
@@ -1926,6 +1930,227 @@ Post {
     assert!(code.contains("ValidationError::DanglingReference"), "dangling FK rejected");
 }
 
+#[test]
+fn test_rust_generation_delete_restrict() {
+    // Delete semantics — restrict (the default): deleting a parent with live
+    // children is refused via ReferencedByChildren (409).  Absent @on_delete
+    // defaults to restrict.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User @on_delete(restrict)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("ReferencedByChildren { model: &'static str, field: &'static str }"),
+        "new ValidationError variant emitted"
+    );
+    assert!(
+        code.contains("| ValidationError::ReferencedByChildren { .. } => 409"),
+        "restrict conflict maps to 409"
+    );
+    assert!(
+        code.contains("pub fn delete_user(&mut self, id: Uuid) -> Result<bool, ValidationError>"),
+        "delete_<parent> wrapper returns Result so restrict can 409"
+    );
+    // The restrict child is probed via the FK index (O(1), #100) and refuses.
+    assert!(
+        code.contains("let __children = self.post.find_by_author(id);")
+            && code.contains("if !__children.is_empty()")
+            && code.contains("model: \"Post\"")
+            && code.contains("field: \"author\""),
+        "restrict checks the referencing children and refuses"
+    );
+    // A restrict child is never recursively cascade-deleted by the parent wrapper
+    // (delete_user_cascade must not call the child's cascade worker).
+    let user_body = code
+        .split("fn delete_user_cascade")
+        .nth(1)
+        .and_then(|s| s.split("fn ").next())
+        .unwrap_or("");
+    assert!(
+        !user_body.contains("delete_post_cascade"),
+        "restrict parent does not cascade-delete its children"
+    );
+}
+
+#[test]
+fn test_rust_generation_delete_cascade() {
+    // Delete semantics — cascade: deleting a parent recursively deletes children
+    // (through their own wrapper so multi-level chains fire), guarded by depth.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User @on_delete(cascade)
+  comments: [Comment]
+}
+
+Comment {
+  id: +uuid
+  body: string
+  post: *Post @on_delete(cascade)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("const MAX_CASCADE_DEPTH: u32"), "cascade depth bound emitted");
+    // Deleting a User cascade-deletes its Posts, recursing through the Post
+    // wrapper so the Post -> Comment cascade also fires (multi-level).
+    assert!(
+        code.contains("let __children = self.post.find_by_author(id);")
+            && code.contains("self.delete_post_cascade(__c.id, __depth + 1)?;"),
+        "User cascade recurses into Post's own wrapper"
+    );
+    assert!(
+        code.contains("let __children = self.comment.find_by_post(id);")
+            && code.contains("self.delete_comment_cascade(__c.id, __depth + 1)?;"),
+        "Post cascade recurses into Comment (multi-level chain)"
+    );
+    // Depth guard is present in the internal worker.
+    assert!(
+        code.contains("if __depth > MAX_CASCADE_DEPTH"),
+        "cascade worker guards recursion depth (cycle safety)"
+    );
+}
+
+#[test]
+fn test_rust_generation_delete_set_null() {
+    // Delete semantics — set_null: deleting a parent nulls each child's OPTIONAL
+    // FK via the child's update path.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: ?User @on_delete(set_null)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("let __children = self.post.find_by_author(Some(id));"),
+        "set_null probes the optional FK index with Some(id)"
+    );
+    assert!(
+        code.contains("__c.author = None;") && code.contains("self.update_post(__cid, __c)?;"),
+        "set_null nulls the child FK and updates it"
+    );
+}
+
+#[test]
+fn test_rust_generation_delete_set_null_on_required_is_codegen_error() {
+    // set_null on a REQUIRED FK (`*Target`) cannot null a non-null column — this
+    // is a hard codegen error, caught at generate time.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+}
+
+Post {
+  id: +uuid
+  author: *User @on_delete(set_null)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let result = RustGenerator::generate(&schema);
+    let err = result.err().expect("set_null on a required FK must be a codegen error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("set_null") && msg.contains("required"),
+        "error explains set_null is invalid on a required FK: {msg}"
+    );
+}
+
+#[test]
+fn test_rust_generation_m2m_unlink() {
+    // Delete semantics — M2M unlink: junctions gain a per-pair Tombstones column;
+    // `unlink_<a>_<b>` appends a retracted pair and traversal (`pairs`) filters it
+    // out (latest-wins).  Cascade-deleting a linked model unlinks its junction rows.
+    // Uses only the already-published Tombstones type — no substrate change.
+    let src = r#"
+Author {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *Author @on_delete(cascade)
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Junction carries a Tombstones column, appended in lockstep with link.
+    assert!(
+        code.contains("tombstones: Tombstones,"),
+        "junction gains a per-pair Tombstones column"
+    );
+    assert!(
+        code.contains("self.tombstones.append(false)"),
+        "link appends a live (false) tombstone"
+    );
+    // unlink retracts the pair (append-only true tombstone) and Database exposes it.
+    assert!(
+        code.contains("pub fn unlink(&mut self, left: Uuid, right: Uuid) -> bool")
+            && code.contains("self.tombstones.append(true)"),
+        "unlink appends a retracted (true) pair"
+    );
+    assert!(
+        code.contains("pub fn unlink_post_tag(&mut self, left: Uuid, right: Uuid) -> bool"),
+        "Database exposes unlink_<a>_<b>"
+    );
+    // pairs() applies latest-wins so unlinked edges are excluded.
+    assert!(
+        code.contains("fn pairs_prefix(&self, end: usize) -> Vec<(Uuid, Uuid)>")
+            && code.contains(".filter(|pair| !state.get(pair).copied().unwrap_or(true))"),
+        "pairs resolves latest-wins, excluding retracted pairs"
+    );
+    // Cascade-delete of Post unlinks its junction rows on the left side.
+    assert!(
+        code.contains("self.post_tag_link.unlink_all_left(id);"),
+        "cascade-delete unlinks the model's junction rows"
+    );
+}
 
 #[test]
 fn test_rust_generation_pattern_validation() {

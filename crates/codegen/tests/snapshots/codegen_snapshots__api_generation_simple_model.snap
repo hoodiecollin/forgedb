@@ -1,6 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 145
+assertion_line: 152
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -179,19 +179,30 @@ async fn update_user(
     params(("id" = String, Path, description = "User")),
     responses(
         (status = 204, description = "Delete User by ID"),
-        (status = 404, description = "Not found")
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Referenced by children (on_delete=restrict)")
     )
 )]
 async fn delete_user(
     Path(id): Path<String>,
     State(db): State<Arc<RwLock<super::Database>>>,
-) -> StatusCode {
+) -> (StatusCode, Json<serde_json::Value>) {
     let key = match id.parse::<Uuid>() {
         Ok(key) => key,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
     };
     let mut db = db.write().await;
-    if db.user.delete(key) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }
+    match db.delete_user(key) {
+        Ok(true) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::CONFLICT);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
 }
 fn user_apply_sort(
     rows: &mut Vec<super::User>,

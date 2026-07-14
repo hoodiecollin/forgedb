@@ -431,24 +431,31 @@ impl ApiGenerator {
                 ),
                 responses(
                     (status = 204, description = #delete_summary),
-                    (status = 404, description = "Not found")
+                    (status = 404, description = "Not found"),
+                    (status = 409, description = "Referenced by children (on_delete=restrict)")
                 )
             )]
-            // Tombstoned-version append over the generated `delete` (#66):
-            // `get` then reads the row as absent; append-only storage is preserved.
+            // Route through the Database-level `delete_<model>` wrapper (delete
+            // semantics): each child FK's `@on_delete` policy (restrict/cascade/
+            // set_null) is applied + M2M junctions unlinked, then the row is
+            // tombstoned.  A `restrict` violation surfaces as 409.
             async fn #delete_fn(
                 Path(id): Path<String>,
                 State(db): State<Arc<RwLock<super::Database>>>,
-            ) -> StatusCode {
+            ) -> (StatusCode, Json<serde_json::Value>) {
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
-                    Err(_) => return StatusCode::BAD_REQUEST,
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
                 };
                 let mut db = db.write().await;
-                if db.#storage_field.delete(key) {
-                    StatusCode::NO_CONTENT
-                } else {
-                    StatusCode::NOT_FOUND
+                match db.#delete_fn(key) {
+                    Ok(true) => (StatusCode::NO_CONTENT, Json(json!({}))),
+                    Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                    Err(e) => {
+                        let status = StatusCode::from_u16(e.status_code())
+                            .unwrap_or(StatusCode::CONFLICT);
+                        (status, Json(json!({ "error": e.to_string() })))
+                    }
                 }
             }
         };
