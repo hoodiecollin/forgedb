@@ -85,7 +85,17 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 425 tests pass** (workspace, incl. doctests). 424→425 with #110 Milestone C follow-up #3
+**Baseline: 437 tests pass** (workspace, incl. doctests). 432→437 with column projection (#113): +3 `forgedb-parser`
+unit tests (`@projection` parses / rejects unknown field / rejects duplicate name) + 2 codegen guards
+(`test_rust_generation_column_projection` — tight struct = PK+selected, narrow decoder touches only selected columns,
+no full `db.get()`, snapshot `_at` present; `test_rust_generation_projection_rejects_relation_field`).
+431→432 with the narrow index rehydrate (#110 follow-up):
++1 codegen guard (`test_rust_generation_reopen_index_rebuild_is_narrow` — reopen rebuilds indexes reading only the
+indexed columns, not the full record via `db.get()`). 425→431 with #110 follow-up #2 (engine-in-Worker
+partial hydrate): +5 `forgedb-storage-web` unit tests (lazy fault-in: len-without-read, alignment-preserving
+append, incremental tail diff, no-op-truncate-skips-fault-in, plus an eager-path regression) and +1 codegen
+guard (`test_wasm_generation_async_client_and_worker` — the async `ReplicaClient` strict-mirrors the `Replica`
+read surface + the Worker bootstrap stays schema-agnostic). 424→425 with #110 Milestone C follow-up #3
 (the wasm-bindgen browser-replica transport is now GENERATED per-schema, not hand-written): +1 codegen
 guard (`test_wasm_generation_transport`). 414→424 with #110 Milestone C (browser
 read-replica follower): +9 `forgedb-storage-web` arena-parity unit tests and +1 codegen guard
@@ -227,7 +237,8 @@ FK). Types: `u32/u64/i32/i64/f64/bool/string/uuid/timestamp`, `char(N)` — **th
 bidirectional `[..]`/`[..]` = many-to-many; `[type; N]` fixed array; inline `struct`
 (fixed-size fields only — no string/relations inside). Directives: `@min @max @length @email
 @url @pattern @regex @default @index @computed @fulltext @materialized` (field-level, mostly
-semantic-only), `@soft_delete` + composite `@index(a,b)` (model-level), `@relations(*|fields)`
+semantic-only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
+model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`
 (component fields only). Component refs `tsx:// jsx:// api://`. Only `//` comments. Directive
 args accept numbers, bare identifiers, **and quoted string literals** (`@pattern("^[0-9]+$")`,
 `@default("pending")` — escapes `\" \\ \n \t \r`; still semantic-only markers). **NOT
@@ -699,11 +710,56 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `user/fixed/uuid_0.bin` @ 64 B = 4 uuids, `user/tombstones.bin` @ 4 B), not one snapshot blob.
   PM identity red lines held: the replica is the SAME generated code (no schema read at runtime); dispatch is by
   the opaque model tag; the storage backend + `persist` move opaque path→bytes blobs and know no schema.
-  **Honest limits / deferred:** OPFS now uses sync-access-handles in a Web Worker + per-column files (#1 LANDED
-  2026-07-13); whole-DB hydrate on open + commit-granularity durability (accepted milestone-1 limits, #2 — to be
-  revisited in a design discussion before any impl);
-  **read-only** replica (local/optimistic writes = Phase 2). (The prior "wasm-bindgen transport hand-written in
-  the harness" limit is RESOLVED by #3 above.)
+  - **#2 — engine-in-Worker + partial hydrate + incremental commit — LANDED 2026-07-13 (wasm publish-pending).**
+    The design discussion settled on **Architecture ①** (engine in a dedicated Web Worker, so the storage arena can
+    do SYNCHRONOUS fault-in from OPFS sync-access handles, which are Worker-only). PM re-gate =
+    **PASS-WITH-CONSTRAINTS** (5 binding constraints, all honored — see `memory/wasm-replica-plan.md`). Five WS
+    landed + e2e-proven (Playwright, IDB + OPFS × stream + reload-resume, **0 frames re-applied**):
+    - **WS1 substrate (`forgedb-storage-web`):** `store` gains a `LazySource` hook — a lazily source-backed column
+      answers `byte_len` from the source's on-disk size WITHOUT reading bytes, and faults the whole column in
+      **synchronously** on first real read (`with_bytes`/`with_bytes_mut`), so untouched columns never load and the
+      generated per-row API stays sync (PM constraint 1). `persist` (OPFS) opens a sync-access handle per file at
+      open (metadata only), registers an `OpfsSource`, and **commits incrementally** — each resident column's grown
+      append-only tail, watermark marker written LAST (crash leaves columns ahead of the watermark; re-apply is
+      logically idempotent since `all()`/`get()` resolve one record per id). A **no-op `truncate_to_rows(len)`
+      early-returns** without faulting the column in — load-bearing, since `recover_from_wal` calls it on every
+      column at open. #1's helper-worker OPFS is SUPERSEDED (engine now runs in the Worker). IDB path unchanged
+      (eager load + whole-snapshot commit).
+    - **WS2 Worker bootstrap (`WasmGenerator::worker_bootstrap`):** a STATIC, schema-agnostic script (NOT emitted by
+      any schema-aware path — PM constraint 3). Runs the wasm engine, owns the `/replicate` WS, debounces
+      auto-commit (idle 250 ms or 100 frames), probes sync-access-handle semantics to pick OPFS-vs-IDB, and
+      dispatches reads generically via `replica[method](...args)` — interprets no schema.
+    - **WS3 async client (`WasmGenerator::generate_client`):** a per-schema TS `ReplicaClient` (main thread) that
+      RPCs into the Worker and mirrors the `Replica`'s read surface EXACTLY (reuses the ONE `read_surface`
+      enumerator — PM constraint 2), invents no query, exposes no mutator. `generate wasm` now also emits
+      `replica/client/{replica-client.ts, replica-worker.js}`.
+    - **WS4 capability probe:** the Worker's runtime sync-semantics probe (a temp sync-access handle; `getSize()`
+      returns a number iff sync) selects the backend; `"auto"` falls back to IndexedDB.
+    - **WS5 e2e:** the harness page drives the generated `ReplicaClient` → Worker → engine. **Partial hydrate proven
+      in-browser:** after the truncate fix, the unindexed `Tag.label` variable column NO LONGER faults in at open
+      (it was in the fault-in set before), i.e. it stays lazy until a Tag is read. Guards
+      `test_wasm_generation_async_client_and_worker` + 5 storage-web unit tests.
+    **Narrow index rehydrate — LANDED 2026-07-13 (the prior scoped follow-up, now closed).** Reopen index
+    rebuild no longer decodes the full record via `db.get()`; it reads **only the indexed columns** (the union of
+    single-index fields ∪ composite components) at each id's newest physical row. `generate_rehydrate_logic`
+    (rust.rs) resolves `__row` from the already-built `id_to_row`, applies the SAME tombstone liveness gate
+    `read_at`/`get` use (so only live values are indexed), then decodes the indexed fields via the **shared
+    `field_read_stmt` per-field decode path** — extracted from `generate_read_at_logic`, so full-record reads and
+    the narrow rebuild are one body and cannot drift (read_at output stayed byte-identical; only the secondary-index
+    snapshots changed). **Result:** an indexed model now faults in only `{id} ∪ {indexed columns}` at open —
+    non-indexed columns of an indexed model stay lazy on the wasm backend (partial hydrate now works for User/Post,
+    not just index-free Tag); native pays strictly less reopen I/O for any model with fewer indexes than columns.
+    Guard `test_rust_generation_reopen_index_rebuild_is_narrow` (asserts no `db.get(__id)` in the loop, the
+    `id_to_row`+tombstone gate, indexed columns read at `__row`, non-indexed `bio` column NOT read). E2E
+    `scratchpad/rehydrate_compile` (ephemeral): compile + reopen proving every index kind — unique / single scalar /
+    nullable / required FK / optional FK / composite — rebuilds correctly after reopen, superseded update values are
+    gone, tombstoned deletes are not indexed, full records intact. **Residual limit:** the indexed columns
+    themselves still fault in at open (unavoidable — the index needs them). Also: OPFS handles held open for the
+    session; debounced durability (crash re-streams from watermark); M2M `link` re-apply on a torn commit can
+    duplicate a junction pair (append-only, traversal not deduped).
+  **Honest limits / deferred (Milestone C overall):** **read-only** replica (local/optimistic writes = Phase 2).
+  (The prior "wasm-bindgen transport hand-written in the harness" limit is RESOLVED by #3; the "whole-DB hydrate /
+  main-thread OPFS" limits are RESOLVED by #2 above.)
   **WASM PUBLISH GAP (OPEN):** the browser build needs `forgedb-types` (wasm uuid feature) + `forgedb-wal` (wasm
   `WalManager`) republished and NEW `forgedb-storage 0.2.0` facade + `forgedb-storage-native 0.1.0` +
   `forgedb-storage-web 0.1.0` published. The **native** `init→build` gap is NOT reopened — the new apply/commit
@@ -711,8 +767,33 @@ across many domains live in `examples/` — see `examples/README.md`.**
   **server** scaffold still pins published `forgedb-storage = "0.1.5"`. #3 does NOT widen this gap: the generated
   `replica/Cargo.toml` scaffold (`WasmGenerator::cargo_toml_scaffold`) pins the SAME still-unpublished wasm crate
   set (`forgedb-storage = "0.2"`, `-wal = "0.2"`, `-types = "0.2"`, `-changefeed = "0.2"`, `-compaction = "0.1"`);
-  the harness proves the build via local path deps until that set publishes. Committed 2026-07-13 (types/wal/
-  storage-split + codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13.
+  the harness proves the build via local path deps until that set publishes. #2 does NOT widen this gap: its
+  substrate changes are in `forgedb-storage-web` (already in the unpublished wasm set) and its client/worker are
+  codegen-emitted assets with no new crate dep. Committed 2026-07-13 (types/wal/
+  storage-split + codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13. #2 (engine-in-
+  Worker partial hydrate) NOT yet committed as of this note.
+- **Column projection / partial model reads (#113) — LANDED 2026-07-14 (design `docs/proposals/column-projection.md`).**
+  A declared model-level directive `@projection(card: title, slug)` generates a tailored `<Model>Card` struct +
+  narrow reads (`get_card`/`all_card`/`read_card_at` + snapshot `_at`) that materialize **only PK + the selected
+  columns** — never the full record. **No substrate change, no publish gap** (the mechanism is "generate a narrower
+  `read_at` over the already-columnar files"). PM-gated **PASS-WITH-CONSTRAINTS** (6 constraints; the binding two:
+  **one shared `field_read_stmt` decode body** — `read_at` and the projection decoder both delegate to a new
+  `generate_row_read_body`, so there is no second read path and `read_at` output stayed byte-identical; and **REST
+  `?projection=<name>` is a generated closed set** — named declared projections only, no ad-hoc `?fields=`, so the
+  wire never carries a runtime column list). Full stack: parser (`Projection` AST + directive arm), codegen
+  validation (rejects relation/virtual fields at compile time), Rust structs+reads, REST (`?projection=` closed-set
+  `match` on get/list; unknown → 400; absent → full), TS SDK (`<Model>Card` type + `get<Model>Card`/`list<Model>Card`,
+  `tsc --strict` clean), and WASM (`read_surface` projected reads auto-mirrored into `ReplicaClient`). Strategy: the
+  typestate builder + runtime-bitmask-as-Rust-API were **deferred** (identity-ranked #2/#3; declared projections are
+  #1 — tightest types, linear in K, no 2^N). Guards `test_rust_generation_column_projection` +
+  `test_rust_generation_projection_rejects_relation_field` + 3 parser tests. E2E `scratchpad/projection_compile`
+  (native db+api compile + values across scalar/nullable/FK/timestamp + snapshot isolation + reopen + **live REST
+  `tower::oneshot`** proving `?projection=card` omits unselected columns); `scratchpad/projection_wasm` compiles the
+  projected replica to `wasm32` against `forgedb-storage-web`. **Honest limit:** the browser fault-in *skip* for a
+  projected read is proven **compositionally** (guarded narrow decoder ∘ `storage-web` per-column `LazySource`, itself
+  browser-proven for #110's `Tag.label`) + the wasm32 build — the full Playwright harness was NOT re-run for a
+  projection-specific fault-in log. Also: REST `list` projection shrinks only the **wire** (filter/sort need full
+  rows, so the server still reads them); the point-`get` and wasm paths get the full column-skip.
 - **Multi-tenancy Layer 1 (#59) — LANDED.** Physical, dir-per-tenant isolation + a verify-only JWT
   tenant guard, **process-per-tenant (model B)** — one `forgedb serve` process serves one tenant's data
   dir, N processes behind a dumb host/subdomain proxy. (This **supersedes** the note's earlier
