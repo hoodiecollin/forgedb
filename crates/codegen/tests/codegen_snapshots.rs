@@ -275,6 +275,47 @@ fn test_api_generation_observability_endpoints() {
 }
 
 #[test]
+fn test_api_generation_snapshot_reads() {
+    // #85: point-in-time reads over REST. `?as_of=<watermark>` swaps the row
+    // source to the generated `all_at`/`get_at` snapshot reads, `/snapshot`
+    // reports the current per-model watermarks, and the wire token stays an
+    // opaque `usize`. PM gate constraints: (1) the snapshot branch routes through
+    // the SAME generated filter body — no parallel handler; (2) `as_of` is a
+    // scalar watermark, never a wall-clock instant → non-numeric is a 400.
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // List/get read the snapshot via the already-generated `all_at`/`get_at` over
+    // `forgedb_storage::Snapshot::new(<watermark>)` — the substrate constructor,
+    // not a new engine surface.
+    assert!(code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"));
+    assert!(code.contains("get_at(&forgedb_storage::Snapshot::new(__w)"));
+
+    // Constraint 2: `as_of` parses as an opaque `usize` (same class as
+    // limit/offset), and a non-numeric value is a 400 — never a silent live
+    // fallback, never a timestamp lookup.
+    assert!(code.contains("params.get(\"as_of\")"));
+    assert!(code.contains(".parse::<usize>()"));
+    assert!(code.contains("StatusCode::BAD_REQUEST"));
+    assert!(code.contains("as_of must be a non-negative integer watermark"));
+
+    // Constraint 1: no parallel snapshot handler — the `as_of` branch only swaps
+    // the row source (`__source`), then feeds the SINGLE existing closed-set
+    // filter (`<model>_event_matches`) shared with the live path. There must be
+    // no second filter body keyed on a snapshot.
+    assert!(code.contains("let __source = match __as_of"));
+    assert!(code.contains("_event_matches"));
+
+    // `/snapshot` token: a schema-wide handler + route reporting the per-model
+    // watermarks as a fixed per-schema key set (row-count values), the read-side
+    // peer of `/metrics` — no dynamic `match model_name` dispatch anywhere.
+    assert!(code.contains("async fn __snapshot("));
+    assert!(code.contains("\"/snapshot\""));
+    assert!(code.contains("\"watermarks\""));
+    assert!(!code.contains("match model_name"));
+}
+
+#[test]
 fn test_api_openapi_doc_structure() {
     let schema = simple_user_schema();
     let result = ApiGenerator::generate(&schema).unwrap();

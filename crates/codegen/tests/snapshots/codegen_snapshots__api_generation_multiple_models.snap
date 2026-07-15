@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 159
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -34,6 +35,11 @@ use utoipa_axum::routes;
         ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
         ("sort" = Option<String>, Query, description = "Field to sort by"),
         ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        ),
     ),
     responses((status = 200, description = "List all User", body = Vec<User>))
 )]
@@ -42,10 +48,31 @@ async fn list_user(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
     let db = db.read().await;
-    let mut rows: Vec<super::User> = db
-        .user
-        .all()
+    let __source = match __as_of {
+        Some(__w) => db.user.all_at(&forgedb_storage::Snapshot::new(__w)),
+        None => db.user.all(),
+    };
+    let mut rows: Vec<super::User> = __source
         .into_iter()
         .filter(|r| user_event_matches(r, &params))
         .collect();
@@ -62,7 +89,14 @@ async fn list_user(
     get,
     path = "/{id}",
     tag = "User",
-    params(("id" = String, Path, description = "User")),
+    params(
+        ("id" = String, Path, description = "User"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        )
+    ),
     responses(
         (status = 200, description = "Get User by ID", body = User),
         (status = 404, description = "Not found")
@@ -70,6 +104,7 @@ async fn list_user(
 )]
 async fn get_user(
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = match id.parse::<Uuid>() {
@@ -78,8 +113,31 @@ async fn get_user(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
         }
     };
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
     let db = db.read().await;
-    match db.user.get(key) {
+    let __found = match __as_of {
+        Some(__w) => db.user.get_at(&forgedb_storage::Snapshot::new(__w), key),
+        None => db.user.get(key),
+    };
+    match __found {
         Some(record) => {
             let data = serde_json::to_value(&record).unwrap_or(json!(null));
             (StatusCode::OK, Json(data))
@@ -231,6 +289,11 @@ fn user_apply_sort(
         ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
         ("sort" = Option<String>, Query, description = "Field to sort by"),
         ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        ),
     ),
     responses((status = 200, description = "List all Post", body = Vec<Post>))
 )]
@@ -239,10 +302,31 @@ async fn list_post(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
     let db = db.read().await;
-    let mut rows: Vec<super::Post> = db
-        .post
-        .all()
+    let __source = match __as_of {
+        Some(__w) => db.post.all_at(&forgedb_storage::Snapshot::new(__w)),
+        None => db.post.all(),
+    };
+    let mut rows: Vec<super::Post> = __source
         .into_iter()
         .filter(|r| post_event_matches(r, &params))
         .collect();
@@ -259,7 +343,14 @@ async fn list_post(
     get,
     path = "/{id}",
     tag = "Post",
-    params(("id" = String, Path, description = "Post")),
+    params(
+        ("id" = String, Path, description = "Post"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        )
+    ),
     responses(
         (status = 200, description = "Get Post by ID", body = Post),
         (status = 404, description = "Not found")
@@ -267,6 +358,7 @@ async fn list_post(
 )]
 async fn get_post(
     Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let key = match id.parse::<Uuid>() {
@@ -275,8 +367,31 @@ async fn get_post(
             return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
         }
     };
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
     let db = db.read().await;
-    match db.post.get(key) {
+    let __found = match __as_of {
+        Some(__w) => db.post.get_at(&forgedb_storage::Snapshot::new(__w), key),
+        None => db.post.get(key),
+    };
+    match __found {
         Some(record) => {
             let data = serde_json::to_value(&record).unwrap_or(json!(null));
             (StatusCode::OK, Json(data))
@@ -843,6 +958,27 @@ async fn __metrics(
     );
     (StatusCode::OK, Json(body))
 }
+/// Snapshot token (#85): the current per-model row-count **watermark**
+/// of every model, captured atomically under one read guard on the
+/// single writer — a coherent "as of now" instant.  The client freezes
+/// this map and passes a model's watermark back as `?as_of=<w>` to that
+/// model's list/get for a point-in-time read.  Read-side peer of
+/// `/metrics`: opaque `usize` watermarks, a fixed per-schema key set,
+/// no field/relation/value decoded — so it is wired unauthenticated
+/// alongside the other ops routes (a process serves one tenant).  These
+/// watermarks are valid only within a compaction epoch: an in-process
+/// `compact()` renumbers physical rows, after which an older token is
+/// no longer comparable (the client must discard pinned tokens on a
+/// detected reopen).
+async fn __snapshot(
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let db = db.read().await;
+    let watermarks = json!(
+        { "User" : db.user.row_count(), "Post" : db.post.row_count(), }
+    );
+    (StatusCode::OK, Json(json!({ "watermarks" : watermarks })))
+}
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -903,6 +1039,7 @@ fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
         .route("/health", get(__health))
         .route("/ready", get(__ready))
         .route("/metrics", get(__metrics))
+        .route("/snapshot", get(__snapshot))
 }
 /// Create the API router with all endpoints (no auth).  A
 /// `tower_http::trace::TraceLayer` wraps every route so each request is
