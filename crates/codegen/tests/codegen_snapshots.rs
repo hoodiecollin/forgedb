@@ -3611,3 +3611,301 @@ Order {
 
     insta::assert_snapshot!(code);
 }
+
+#[test]
+fn test_rust_generation_transaction() {
+    // MVCC Tier 1 (#83, M1a): the generated `Database` gains a transaction API — a
+    // `TxHandle` with scoped per-model `create_/update_/delete_` writes + `get_/all_`
+    // reads, `Database::transaction(|tx| ...)`, staged-append (no eager index/feed),
+    // read-your-writes via a raised watermark, commit = advance visibility, rollback
+    // = truncate to marks.  Entirely generated on the tailored Database — identity
+    // red line: no generic runtime transaction executor.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+}
+
+Post {
+  id: +uuid
+  author: *User
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The transaction entry point + handle are generated on the tailored Database.
+    assert!(
+        code.contains("pub fn transaction<T>(")
+            && code.contains("impl FnOnce(&mut TxHandle) -> Result<T, TxError>"),
+        "Database::transaction takes a closure over a scoped TxHandle"
+    );
+    assert!(
+        code.contains("pub struct TxHandle<'db>"),
+        "generated per-schema TxHandle struct"
+    );
+    assert!(
+        code.contains("pub enum TxError"),
+        "TxError type is generated"
+    );
+    assert!(
+        code.contains("impl From<ValidationError> for TxError"),
+        "a `?` on a staged validated write propagates a #91 ValidationError"
+    );
+
+    // Scoped per-model write + read methods exist on the handle.
+    assert!(
+        code.contains("pub fn create_user(&mut self, record: User) -> Result<Uuid, TxError>")
+            && code.contains("pub fn update_user(")
+            && code.contains("pub fn delete_user("),
+        "TxHandle exposes scoped create/update/delete per model"
+    );
+    assert!(
+        code.contains("pub fn get_user(&self, id: Uuid) -> Option<User>")
+            && code.contains("pub fn all_user(&self) -> Vec<User>"),
+        "TxHandle exposes scoped get/all per model"
+    );
+
+    // Read-your-writes: reads go through `get_at`/`all_at` with the watermark raised
+    // to the current staged physical length — ONE decode path, not a forked reader.
+    assert!(
+        code.contains("forgedb_storage::Snapshot::new(self.db.user.row_count)")
+            && code.contains("self.db.user.get_at(&__snap, id)"),
+        "txn reads resolve via get_at at the raised (staged) watermark"
+    );
+
+    // Staged writes use the low-level __stage_append (WAL + columns only — NO
+    // id_to_row/index/feed/broker), so rollback is a pure truncate.
+    assert!(
+        code.contains("pub fn __stage_append(&mut self, record: User, deleted: bool) -> usize"),
+        "generated low-level staged-append that skips index/feed/broker"
+    );
+    assert!(
+        code.contains("self.db.user.__stage_append(record, false)"),
+        "TxHandle::create stages via __stage_append"
+    );
+
+    // Rollback = truncate every touched collection's columns + WAL tail to the mark.
+    assert!(
+        code.contains("fn rollback_internal(&mut self)")
+            && code.contains("__truncate_all_to(__mark)")
+            && code.contains("wal.truncate_to("),
+        "rollback truncates staged rows + the staged WAL tail back to the mark"
+    );
+    // The Drop backstop rolls back an un-committed handle (panic safety).
+    assert!(
+        code.contains("impl<'db> Drop for TxHandle<'db>")
+            && code.contains("self.rollback_internal();"),
+        "an un-committed TxHandle rolls back on drop"
+    );
+
+    // Commit advances visibility ONLY on the Ok path (rebuild indexes) — never a
+    // mid-txn eager index write.  The buffered events drain to the broker on commit.
+    assert!(
+        code.contains("self.db.user.__reindex_committed();"),
+        "commit advances visibility by rebuilding id_to_row + indexes"
+    );
+    assert!(
+        code.contains("pending_events"),
+        "changefeed/broker events are buffered and drained on commit"
+    );
+
+    // Intra-txn `&unique` duplicate guard (M1a fix): the `staged_unique_keys` buffer
+    // catches two `create_<model>` calls with the same `&unique` value in ONE txn.
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
+        "TxHandle carries a staged-unique-key buffer for intra-txn duplicate detection"
+    );
+    assert!(
+        code.contains("self.staged_unique_keys.contains(") && code.contains("self.staged_unique_keys.insert("),
+        "staged write checks then claims unique keys in the buffer"
+    );
+
+    // Identity: no generic runtime executor — dispatch is on the OPAQUE model tag,
+    // never a decoded field (the same discipline as replication).
+    assert!(
+        !code.contains("match record.") && !code.contains("match field_name"),
+        "transaction machinery must never match on a decoded field"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_intra_unique() {
+    // MVCC Tier 1 (#83, M1a fix): two `create_<model>` calls with the same `&unique`
+    // field value inside a single transaction must be caught and rejected — the
+    // committed index cannot see staged rows, so a dedicated staged-unique buffer is
+    // required.  The buffer is discarded on rollback without touching the real index.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  username: &string
+  age: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The buffer is declared on TxHandle and initialized empty.
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
+        "TxHandle must carry a staged-unique buffer"
+    );
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet::new()"),
+        "TxHandle::begin initializes the buffer empty"
+    );
+
+    // BOTH `&unique` fields (email + username) are guarded against intra-txn duplicates.
+    // For each field the generated code checks `staged_unique_keys.contains(...)` then
+    // inserts on success; a second staged write with the same value hits the contains
+    // check and returns `Err(TxError::Validation(ValidationError::Unique{..}))`.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.matches("staged_unique_keys.contains(").count() >= 2,
+        "both &unique fields (email, username) have a staged-buffer contains-check"
+    );
+    assert!(
+        flat.matches("staged_unique_keys.insert(").count() >= 2,
+        "both &unique fields claim their key in the buffer on success"
+    );
+
+    // The check fires BEFORE the stage append — a rejected duplicate leaves no staged row.
+    let create_idx = code.find("pub fn create_user(").expect("create_user method");
+    let create_body = &code[create_idx..];
+    let contains_pos = create_body.find("staged_unique_keys.contains(").expect("contains check");
+    let stage_pos = create_body.find("__stage_append").expect("stage append");
+    assert!(
+        contains_pos < stage_pos,
+        "staged-unique check fires before the stage append (a rejected dup leaves no row)"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_commit_journal() {
+    // MVCC Tier 1 (#83, M1b): the atomic multi-model commit journal.  Commit fsyncs
+    // every touched collection's columns + WAL BEFORE appending the journal record
+    // (the ordering that makes the journal fsync the atomic commit point), and
+    // reopen truncates every touched model back to its journalled committed length.
+    // The journal reuses the published `forgedb-wal` `Raw` path — no new substrate.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Database holds the journal, opened at open_at via the published WAL Raw path.
+    assert!(
+        code.contains("_txn_journal: Option<forgedb_wal::WalManager>"),
+        "Database owns the transaction commit journal"
+    );
+    assert!(
+        code.contains("root.join(\"_txn_journal.log\")"),
+        "journal is a root-level append-only log"
+    );
+
+    // Commit order: columns + WAL fsync FIRST, then the journal record + fsync.
+    let commit_idx = code.find("pub fn commit(mut self) -> Result<(), TxError>").unwrap();
+    let commit_body = &code[commit_idx..];
+    let fsync_pos = commit_body.find(".commit();").expect("commit fsyncs columns");
+    let journal_pos = commit_body
+        .find("WalEntry::raw(\"_txn\"")
+        .expect("commit writes the journal record");
+    assert!(
+        fsync_pos < journal_pos,
+        "columns must be fsynced BEFORE the journal record (the atomic commit point)"
+    );
+    assert!(
+        commit_body[journal_pos..].contains(".flush()"),
+        "the journal record is fsynced (the single commit-point fsync)"
+    );
+
+    // Journal-driven recovery: open_at reads the last record and truncates each
+    // touched collection back to its committed length via __recover_to_committed.
+    assert!(
+        code.contains("pub fn __recover_to_committed(&mut self, committed_len: usize)"),
+        "generated per-model journal recovery"
+    );
+    assert!(
+        code.contains("__db.user.__recover_to_committed(__len as usize)"),
+        "open_at applies journalled committed lengths to each touched model"
+    );
+
+    // Identity: the journal payload is opaque bytes; recovery dispatches on the
+    // opaque model tag, never a decoded field.
+    assert!(
+        code.contains("serde_json::to_vec(&__journal)"),
+        "the journal record is opaque encoded bytes (length vector), not a decoded field"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_defers_maintenance() {
+    // MVCC Tier 1 (#83, M1c/M1d, PM constraint 1): auto-checkpoint (#96) and
+    // auto-compaction (#92) MUST NOT fire mid-transaction (a checkpoint would
+    // truncate the per-model WAL underneath the rollback; a compaction would
+    // renumber rows underneath the marks).  They are deferred behind an
+    // `in_transaction` guard and run once after commit/rollback.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Storage carries the guard + deferred flags.
+    assert!(
+        code.contains("in_transaction: bool")
+            && code.contains("checkpoint_deferred: bool")
+            && code.contains("compact_deferred: bool"),
+        "storage carries the txn guard + deferred flags"
+    );
+
+    // Auto-checkpoint defers while in a transaction.
+    assert!(
+        code.contains("if self.in_transaction {")
+            && code.contains("self.checkpoint_deferred = true;"),
+        "auto-checkpoint defers to checkpoint_deferred while in a transaction"
+    );
+    // Auto-compaction defers while in a transaction.
+    assert!(
+        code.contains("self.compact_deferred = true;"),
+        "auto-compaction defers to compact_deferred while in a transaction"
+    );
+    // compact() itself early-returns mid-transaction (M1d).
+    let compact_idx = code.find("pub fn compact(&mut self) {").unwrap();
+    let compact_body = &code[compact_idx..compact_idx + 400];
+    assert!(
+        compact_body.contains("if self.in_transaction {")
+            && compact_body.contains("self.compact_deferred = true;")
+            && compact_body.contains("return;"),
+        "compact() early-returns (deferred) when called mid-transaction"
+    );
+
+    // Deferred maintenance runs once after the critical section closes.
+    assert!(
+        code.contains("pub fn run_deferred_maintenance(&mut self)"),
+        "a deferred checkpoint/compaction runs after commit/rollback"
+    );
+    assert!(
+        code.contains("self.db.user.run_deferred_maintenance();"),
+        "commit/rollback run the deferred maintenance per touched collection"
+    );
+}

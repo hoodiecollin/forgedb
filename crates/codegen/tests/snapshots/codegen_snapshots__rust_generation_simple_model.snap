@@ -94,6 +94,49 @@ impl From<ValidationError> for ApplyError {
         ApplyError::Validation(e)
     }
 }
+/// A rejected or failed transaction (MVCC Tier 1, #83).  Wraps the #91
+/// `ValidationError` (so `?` on a scoped write rolls the txn back),
+/// plus an `Io` variant for a durable-write failure and a `Conflict`
+/// variant reserved for Tier 2 optimistic concurrency.
+#[derive(Debug)]
+pub enum TxError {
+    /// A staged write failed the generated integrity validators
+    /// (field constraints / `&unique` / FK existence).  The whole
+    /// transaction rolls back.
+    Validation(ValidationError),
+    /// A durable-write failure while committing (WAL/journal fsync).
+    Io(String),
+    /// A write-write conflict lost the serialized commit (Tier 2).
+    /// Never produced by Tier 1's single-writer transactions.
+    Conflict,
+}
+impl TxError {
+    /// The HTTP status a generated boundary would return: a validation
+    /// failure maps to its #91 status (409/422); an I/O or conflict
+    /// failure is a 500/409 server-side condition.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            TxError::Validation(e) => e.status_code(),
+            TxError::Io(_) => 500,
+            TxError::Conflict => 409,
+        }
+    }
+}
+impl std::fmt::Display for TxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxError::Validation(e) => write!(f, "transaction rejected: {}", e),
+            TxError::Io(m) => write!(f, "transaction I/O failure: {}", m),
+            TxError::Conflict => write!(f, "transaction conflict (retry)"),
+        }
+    }
+}
+impl std::error::Error for TxError {}
+impl From<ValidationError> for TxError {
+    fn from(e: ValidationError) -> Self {
+        TxError::Validation(e)
+    }
+}
 ///User model
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -115,6 +158,9 @@ pub struct UserStorage {
     writes_since_checkpoint: u64,
     root: std::path::PathBuf,
     dead_since_compaction: u64,
+    in_transaction: bool,
+    checkpoint_deferred: bool,
+    compact_deferred: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -167,6 +213,9 @@ impl UserStorage {
             writes_since_checkpoint: 0,
             root: root.to_path_buf(),
             dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
             changefeed: None,
             broker: None,
         };
@@ -381,7 +430,11 @@ impl UserStorage {
         }
         self.writes_since_checkpoint += 1;
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
-            self.checkpoint();
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
         }
         Ok(id)
     }
@@ -519,11 +572,19 @@ impl UserStorage {
         }
         self.writes_since_checkpoint += 1;
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
-            self.checkpoint();
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
         }
         self.dead_since_compaction += 1;
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
-            self.compact();
+            if self.in_transaction {
+                self.compact_deferred = true;
+            } else {
+                self.compact();
+            }
         }
         Ok(true)
     }
@@ -613,11 +674,19 @@ impl UserStorage {
         }
         self.writes_since_checkpoint += 1;
         if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
-            self.checkpoint();
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
         }
         self.dead_since_compaction += 1;
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
-            self.compact();
+            if self.in_transaction {
+                self.compact_deferred = true;
+            } else {
+                self.compact();
+            }
         }
         true
     }
@@ -746,6 +815,10 @@ impl UserStorage {
     /// rewrite this model's files dropping dead rows, then reopen to
     /// rebuild `id_to_row` + secondary indexes from the compacted files.
     pub fn compact(&mut self) {
+        if self.in_transaction {
+            self.compact_deferred = true;
+            return;
+        }
         self.checkpoint();
         let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
         for &__row in self.id_to_row.values() {
@@ -765,6 +838,183 @@ impl UserStorage {
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+    }
+    /// Rebuild `id_to_row` + secondary indexes from the committed prefix
+    /// in place (MVCC Tier 1, #83).  A transaction stages rows via
+    /// `__stage_append`, which deliberately does NOT touch the identity or
+    /// secondary index maps; its `commit` calls this once per touched
+    /// collection to make the newly-visible rows resolvable.  It clears the
+    /// maps and re-runs the SAME reopen-rehydration body `new_at` uses
+    /// (last-write-wins per id, tombstone-gated index keys), so the maps
+    /// end up exactly as a fresh reopen would build them — no incremental
+    /// remove-old/add-new bookkeeping to drift.
+    pub fn __reindex_committed(&mut self) {
+        self.id_to_row.clear();
+        self.email_index.clear();
+        let n = self.tombstones.len();
+        self.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            self.id_to_row.insert(id, i);
+        }
+        let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
+        for __id in __ids {
+            let __row = match self.id_to_row.get(&__id) {
+                Some(__r) => *__r,
+                None => continue,
+            };
+            if self.tombstones.is_deleted(__row).unwrap_or(true) {
+                continue;
+            }
+            let email_value = self
+                .email_col
+                .read_string(__row)
+                .expect("Failed to read string");
+            {
+                let __k: String = {
+                    match serde_json::to_value(&(email_value)) {
+                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                        Ok(serde_json::Value::String(__s)) => {
+                            let mut __k = String::from('\u{1}');
+                            __k.push_str(&__s);
+                            __k
+                        }
+                        Ok(__other) => {
+                            let mut __k = String::from('\u{2}');
+                            __k.push_str(&__other.to_string());
+                            __k
+                        }
+                        Err(_) => String::from('\u{3}'),
+                    }
+                };
+                self.email_index.entry(__k).or_default().insert(__id);
+            }
+        }
+    }
+    /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
+    /// #83).  The transaction rollback primitive: erases staged ahead-rows
+    /// so the collection returns to its pre-txn physical length.  Reuses the
+    /// published `truncate_to_rows` on each column type (no substrate change).
+    /// A no-op past the current length (nothing staged).
+    pub fn __truncate_all_to(&mut self, rows: usize) -> std::io::Result<()> {
+        self.id_col.truncate_to_rows(rows)?;
+        self.email_col.truncate_to_rows(rows)?;
+        self.age_col.truncate_to_rows(rows)?;
+        self.tombstones.truncate_to_rows(rows)?;
+        Ok(())
+    }
+    /// Journal-driven recovery to a committed row-count (MVCC Tier 1, #83,
+    /// M1b).  Called at `open_at` when the `_txn_journal` names a committed
+    /// length for this model that is BELOW the length the columns/WAL
+    /// recovered to — i.e. a transaction staged rows into this collection
+    /// but its journal commit record never landed (a torn / aborted
+    /// commit).  Truncate every column + the tombstone back to
+    /// `committed_len` (erasing the aborted ahead-rows), discard the WAL
+    /// (the committed prefix is already durable in the columns, and the
+    /// aborted staged WAL records must not replay), then reopen to rebuild
+    /// `id_to_row` + secondary indexes from the truncated committed prefix.
+    /// A no-op when `committed_len >= row_count` (nothing aborted).
+    pub fn __recover_to_committed(&mut self, committed_len: usize) {
+        if committed_len >= self.row_count {
+            return;
+        }
+        self.id_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.email_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.age_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.tombstones
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate tombstones on journal recovery");
+        self.row_count = committed_len;
+        self.wal.truncate().expect("Failed to truncate WAL on journal recovery");
+        let __root = self.root.clone();
+        let __feed = self.changefeed.take();
+        let __broker = self.broker.take();
+        *self = Self::new_at(&__root);
+        self.changefeed = __feed;
+        self.broker = __broker;
+    }
+    /// Stage one physically-appended row for a transaction (MVCC Tier 1,
+    /// #83).  WAL-records the row (durable, `FsyncPolicy::Always`) then
+    /// appends every column + the tombstone at the current physical row
+    /// index, bumps `row_count`, and returns that index — WITHOUT touching
+    /// `id_to_row`, secondary indexes, the change feed, the broker, or the
+    /// checkpoint counter.  The transaction's `commit` applies those
+    /// deferred effects once, atomically; a `rollback` truncates every
+    /// staged row + the staged WAL tail back to the pre-txn mark.  The row
+    /// is invisible to outside readers (whose `get`/`all` clamp at the
+    /// public watermark) until commit advances the watermark past it.
+    pub fn __stage_append(&mut self, record: User, deleted: bool) -> usize {
+        let row_index = self.row_count;
+        if deleted {
+            {
+                let mut __wal_payload = Vec::new();
+                __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+                __wal_payload.push(1u8);
+                __wal_payload
+                    .extend_from_slice(
+                        &serde_json::to_vec(&record)
+                            .expect("Failed to serialize record for WAL"),
+                    );
+                self.wal
+                    .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
+                    .expect("Failed to write WAL record");
+            }
+        } else {
+            {
+                let mut __wal_payload = Vec::new();
+                __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+                __wal_payload.push(0u8);
+                __wal_payload
+                    .extend_from_slice(
+                        &serde_json::to_vec(&record)
+                            .expect("Failed to serialize record for WAL"),
+                    );
+                self.wal
+                    .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
+                    .expect("Failed to write WAL record");
+            }
+        }
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.email_col.append_string(&record.email).expect("Failed to append string");
+        {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &record.age as *const _ as *const u8,
+                    std::mem::size_of_val(&record.age),
+                )
+            };
+            self.age_col.append_bytes(bytes).expect("Failed to append to column");
+        }
+        self.tombstones.append(deleted).expect("Failed to append tombstone");
+        self.row_count += 1;
+        row_index
+    }
+    /// Run any checkpoint/compaction the transaction guard deferred (MVCC
+    /// Tier 1, #83).  Called by `TxHandle::commit`/rollback once the
+    /// critical section closes and `in_transaction` is cleared, so the
+    /// #96/#92 auto-maintenance still runs — just after the transaction,
+    /// never underneath its rollback marks.  Compaction subsumes a
+    /// checkpoint, so if both are due only compaction runs.
+    pub fn run_deferred_maintenance(&mut self) {
+        if self.compact_deferred {
+            self.compact_deferred = false;
+            self.checkpoint_deferred = false;
+            self.compact();
+        } else if self.checkpoint_deferred {
+            self.checkpoint_deferred = false;
+            self.checkpoint();
+        }
     }
     /// Materialize the record at a physical row index, or `None` if
     /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1307,6 +1557,17 @@ pub struct Database {
     /// only acquires-or-refuses; it is not a lease broker).  `None` on
     /// the lock-free `new()` convenience path (standalone / tests).
     _lock: Option<forgedb_storage::DirLock>,
+    /// Atomic multi-model commit journal (MVCC Tier 1, #83, M1b).  A
+    /// shared, CRC-framed, append-only log at the data-dir root holding
+    /// one opaque record per committed transaction: the touched
+    /// collections' post-commit row-counts `[(model_tag, post_len)]`.
+    /// Framed + fsynced by `forgedb-wal`'s published opaque `Raw` path
+    /// (no new substrate) — the single fsync that flips a transaction
+    /// from "aborted" to "committed" atomically across all its models.
+    /// `Some` on the `open_at` path (durable dir); `None` on the
+    /// lock-free `new()` convenience path, whose transactions are
+    /// in-process-atomic but not crash-atomic across models.
+    _txn_journal: Option<forgedb_wal::WalManager>,
 }
 /// A read-only, lock-free view of the whole database (#56 Direction B).
 /// One per reader thread; each field shares the writer's column files
@@ -1336,6 +1597,7 @@ impl Database {
             changefeed,
             broker: None,
             _lock: None,
+            _txn_journal: None,
         }
     }
     /// Open the whole database rooted at `root` (#59): every model and
@@ -1362,15 +1624,44 @@ impl Database {
             Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
             Err(_) => None,
         };
+        let mut _txn_journal = forgedb_wal::WalManager::open(
+                root.join("_txn_journal.log"),
+                forgedb_wal::FsyncPolicy::Always,
+            )
+            .expect("Failed to open transaction journal");
+        let __journal_committed: Vec<(String, u64)> = {
+            let __entries = _txn_journal
+                .replay(|_| -> std::io::Result<()> { Ok(()) })
+                .unwrap_or_default();
+            match __entries.last() {
+                Some(__e) => {
+                    if let forgedb_wal::WalOperation::Raw { payload } = &__e.operation {
+                        serde_json::from_slice(payload).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => Vec::new(),
+            }
+        };
         let mut user = UserStorage::new_at(&root);
         user.attach_changefeed(changefeed.clone());
         user.attach_broker(broker.clone());
-        Self {
+        let mut __db = Self {
             user,
             changefeed,
             broker,
             _lock,
+            _txn_journal: Some(_txn_journal),
+        };
+        for (__model, __len) in &__journal_committed {
+            let __len = *__len;
+            match __model.as_str() {
+                "User" => __db.user.__recover_to_committed(__len as usize),
+                _ => {}
+            }
         }
+        __db
     }
     /// Capture a consistent read snapshot across all collections.
     /// Called on the single writer, so — because the writer is never
@@ -1569,5 +1860,314 @@ impl Database {
             return Ok(false);
         }
         Ok(self.user.delete(id))
+    }
+}
+/// A scoped transaction handle (MVCC Tier 1, #83).  Exposes exactly the
+/// per-model write surface codegen already emits (`create_/update_/
+/// delete_`), scoped to the transaction, plus a read surface
+/// (`get_/all_`) with **read-your-writes**: reads resolve against the
+/// staged physical length (the watermark raised past the public one),
+/// so the transaction sees its own uncommitted appends over the
+/// committed prefix — the same `get_at` decode path, just a raised
+/// watermark (no forked decoder).  Outside readers still clamp at the
+/// public watermark, so staged rows are invisible until commit.
+pub struct TxHandle<'db> {
+    db: &'db mut Database,
+    /// Pre-txn physical row-count per touched collection (lazy, on first
+    /// write) — the rollback truncation target.
+    marks: std::collections::BTreeMap<&'static str, usize>,
+    /// Pre-txn per-model WAL byte offset per touched collection — the
+    /// rollback WAL-tail truncation target.
+    wal_marks: std::collections::BTreeMap<&'static str, u64>,
+    /// Buffered change-feed + durable-broker records, drained (offsets
+    /// consumed) only on commit — so a rolled-back txn consumes NO
+    /// broker offset and emits NO changefeed event (no offset gap).
+    pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, usize, Vec<u8>)>,
+    /// Unique keys claimed by staged writes in this transaction (M1a fix).
+    ///
+    /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
+    /// committed index so that two `create_<model>` calls with the SAME
+    /// `&unique` value in one transaction both see the conflict — the
+    /// committed index only reflects rows visible before the txn started.
+    /// Rollback discards the set automatically (it is owned by `TxHandle`
+    /// and never touches the real index maps, so no undo is needed).
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
+    committed: bool,
+}
+impl<'db> TxHandle<'db> {
+    fn begin(db: &'db mut Database) -> Self {
+        TxHandle {
+            db,
+            marks: std::collections::BTreeMap::new(),
+            wal_marks: std::collections::BTreeMap::new(),
+            pending_events: Vec::new(),
+            staged_unique_keys: std::collections::BTreeSet::new(),
+            committed: false,
+        }
+    }
+    /// Record `#tag`'s pre-txn rollback marks on first touch and set
+    /// its transaction guard (so auto-checkpoint/compaction defer).
+    fn __mark_user(&mut self) {
+        if !self.marks.contains_key("User") {
+            let __rc = self.db.user.row_count;
+            let __wb = self.db.user.wal.size().unwrap_or(0);
+            self.marks.insert("User", __rc);
+            self.wal_marks.insert("User", __wb);
+            self.db.user.in_transaction = true;
+        }
+    }
+    ///Stage the creation of a User in this transaction (#83).  Validates field constraints + `&unique` (committed index) + FK existence (txn-visible targets), then stages the row; visible only after `commit`.
+    pub fn create_user(&mut self, record: User) -> Result<Uuid, TxError> {
+        self.__mark_user();
+        validate_user(&record)?;
+        {
+            let __uk: String = {
+                match serde_json::to_value(&(record.email)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            if self.db.user.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty())
+            {
+                return Err(
+                    TxError::Validation(ValidationError::Unique {
+                        field: "email",
+                    }),
+                );
+            }
+            if self.staged_unique_keys.contains(&("email", __uk.clone())) {
+                return Err(
+                    TxError::Validation(ValidationError::Unique {
+                        field: "email",
+                    }),
+                );
+            }
+            self.staged_unique_keys.insert(("email", __uk));
+        }
+        let id = record.id;
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.user.__stage_append(record, false);
+        self.pending_events
+            .push(("User", forgedb_changefeed::ChangeKind::Inserted, __row, __bytes));
+        Ok(id)
+    }
+    ///Stage an update of a User in this transaction (#83).  `Ok(false)` if the id is not visible to the transaction.
+    pub fn update_user(&mut self, id: Uuid, record: User) -> Result<bool, TxError> {
+        if self.get_user(id).is_none() {
+            return Ok(false);
+        }
+        self.__mark_user();
+        validate_user(&record)?;
+        {
+            let __uk: String = {
+                match serde_json::to_value(&(record.email)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            if let Some(__ids) = self.db.user.email_index.get(&__uk) {
+                if __ids.iter().any(|__i| *__i != id) {
+                    return Err(
+                        TxError::Validation(ValidationError::Unique {
+                            field: "email",
+                        }),
+                    );
+                }
+            }
+            let __committed_owns = self
+                .db
+                .user
+                .email_index
+                .get(&__uk)
+                .is_some_and(|__ids| __ids.contains(&id));
+            if !__committed_owns
+                && self.staged_unique_keys.contains(&("email", __uk.clone()))
+            {
+                return Err(
+                    TxError::Validation(ValidationError::Unique {
+                        field: "email",
+                    }),
+                );
+            }
+            self.staged_unique_keys.insert(("email", __uk));
+        }
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.user.__stage_append(record, false);
+        self.pending_events
+            .push(("User", forgedb_changefeed::ChangeKind::Updated, __row, __bytes));
+        Ok(true)
+    }
+    ///Stage a delete of a User in this transaction (#83).  Appends a tombstoned version; `false` if the id is not visible to the transaction.
+    pub fn delete_user(&mut self, id: Uuid) -> bool {
+        let record = match self.get_user(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        self.__mark_user();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.user.__stage_append(record, true);
+        self.pending_events
+            .push(("User", forgedb_changefeed::ChangeKind::Deleted, __row, __bytes));
+        true
+    }
+    ///Read a User within the transaction (#83) with read-your-writes: resolves the newest version over the committed prefix ∪ this txn's staged rows.
+    pub fn get_user(&self, id: Uuid) -> Option<User> {
+        let __snap = forgedb_storage::Snapshot::new(self.db.user.row_count);
+        self.db.user.get_at(&__snap, id)
+    }
+    ///Read every live User within the transaction (#83), including this txn's own staged rows (read-your-writes).
+    pub fn all_user(&self) -> Vec<User> {
+        let __snap = forgedb_storage::Snapshot::new(self.db.user.row_count);
+        self.db.user.all_at(&__snap)
+    }
+    /// Commit the transaction (MVCC Tier 1, #83).  Ordering is
+    /// load-bearing (mirrors #96's checkpoint order): (1) fsync every
+    /// touched collection's columns + per-model WAL, (2) append + fsync
+    /// the atomic multi-model commit record to `_txn_journal.log` (THE
+    /// commit point — a present record ⟺ all its columns durable), (3)
+    /// advance visibility by rebuilding each touched collection's
+    /// id_to_row + indexes from the now-committed prefix, (4) drain the
+    /// buffered changefeed + broker events (offsets consumed HERE and
+    /// only here).  A crash before step 2 leaves no journal record → the
+    /// staged rows are truncated on reopen (all-or-nothing).
+    pub fn commit(mut self) -> Result<(), TxError> {
+        let mut __journal: Vec<(String, u64)> = Vec::new();
+        let __touched: Vec<&'static str> = self.marks.keys().copied().collect();
+        for __tag in &__touched {
+            match *__tag {
+                "User" => {
+                    let _ = self.db.user.commit();
+                    let _ = self.db.user.wal.flush();
+                    __journal.push(("User".to_string(), self.db.user.row_count as u64));
+                }
+                _ => {}
+            }
+        }
+        if let Some(__jrnl) = self.db._txn_journal.as_mut() {
+            let __payload = serde_json::to_vec(&__journal)
+                .map_err(|e| TxError::Io(e.to_string()))?;
+            __jrnl
+                .write(&forgedb_wal::WalEntry::raw("_txn", __payload))
+                .map_err(|e| TxError::Io(e.to_string()))?;
+            __jrnl.flush().map_err(|e| TxError::Io(e.to_string()))?;
+        }
+        for __tag in &__touched {
+            match *__tag {
+                "User" => {
+                    self.db.user.__reindex_committed();
+                    self.db.user.in_transaction = false;
+                    self.db.user.run_deferred_maintenance();
+                }
+                _ => {}
+            }
+        }
+        for (__model, __kind, __row, __bytes) in std::mem::take(
+            &mut self.pending_events,
+        ) {
+            self.db.changefeed.emit(__model, __row, __kind);
+            if let Some(__broker) = &self.db.broker {
+                if let Ok(mut __b) = __broker.lock() {
+                    let _ = __b.record(__model, __row as u64, __kind, __bytes);
+                }
+            }
+        }
+        self.committed = true;
+        Ok(())
+    }
+    /// Roll back the transaction: truncate every touched collection's
+    /// staged rows + WAL tail back to its pre-txn mark, discard the
+    /// buffered events (no broker offset consumed, no changefeed emit),
+    /// and clear each txn guard.  No journal record is written, no
+    /// watermark advanced — nothing outside the transaction ever
+    /// observed the staged rows.
+    pub fn rollback(mut self) {
+        self.rollback_internal();
+        self.committed = true;
+    }
+    fn rollback_internal(&mut self) {
+        let __touched: Vec<&'static str> = self.marks.keys().copied().collect();
+        for __tag in &__touched {
+            if let Some(__mark) = self.marks.get(*__tag) {
+                match *__tag {
+                    "User" => {
+                        let __mark = *__mark;
+                        let _ = self.db.user.__truncate_all_to(__mark);
+                        self.db.user.row_count = __mark;
+                        if let Some(__wm) = self.wal_marks.get("User") {
+                            let _ = self.db.user.wal.truncate_to(*__wm);
+                        }
+                        self.db.user.in_transaction = false;
+                        self.db.user.run_deferred_maintenance();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.pending_events.clear();
+    }
+}
+impl<'db> Drop for TxHandle<'db> {
+    /// Panic-safety backstop: an un-committed handle (dropped via an
+    /// early `?`, a panic, or an explicit non-commit) rolls back, so a
+    /// half-staged transaction never becomes visible.
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback_internal();
+        }
+    }
+}
+impl Database {
+    /// Run a transaction (MVCC Tier 1, #83).  The closure receives a
+    /// scoped `TxHandle` exposing the per-model `create_/update_/delete_`
+    /// writes + `get_/all_` reads; its writes are staged (physically
+    /// appended past the public watermark, durable in the per-model WAL,
+    /// but invisible outside) and made visible ATOMICALLY on `Ok`
+    /// (commit) or discarded on `Err`/panic (rollback-by-truncate).
+    /// Multi-model writes commit all-or-nothing across a crash via the
+    /// `_txn_journal.log` (M1b).
+    ///
+    /// ```ignore
+    /// let id = db.transaction(|tx| {
+    ///     let uid = tx.create_user(user)?;   // staged
+    ///     tx.create_post(post)?;             // atomic with the user
+    ///     Ok(uid)
+    /// })?;                                   // Ok → commit; Err → rollback
+    /// ```
+    pub fn transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut TxHandle) -> Result<T, TxError>,
+    ) -> Result<T, TxError> {
+        let mut tx = TxHandle::begin(self);
+        match f(&mut tx) {
+            Ok(v) => {
+                tx.commit()?;
+                Ok(v)
+            }
+            Err(e) => {
+                tx.rollback();
+                Err(e)
+            }
+        }
     }
 }
