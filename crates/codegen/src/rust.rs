@@ -1091,7 +1091,9 @@ impl RustGenerator {
         quote! {
             #[doc = #struct_doc]
             #[repr(C)]
-            #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+            // `PartialEq` (not `Eq` — a struct may hold `f64`) so a struct-typed
+            // field participates in the live-query typed change detector (#84).
+            #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
             pub struct #struct_name {
                 #(#fields),*
             }
