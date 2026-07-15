@@ -538,13 +538,15 @@ across many domains live in `examples/` — see `examples/README.md`.**
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
-  `main.rs` (which links `forgedb-auth`). **REOPENED 2026-07-14 by MVCC Tiers 1–3 (#75/#84):** generated code now
-  links two NEW substrate crates `forgedb-txn 0.1.0` + `forgedb-coordinator 0.1.0` (scaffold pins both `= "0.1"`) and
-  additive substrate methods `WalManager::truncate_to` (`forgedb-wal`) + `sync_from_disk` (`forgedb-storage-native`) —
-  all four **publish-pending**, so the native `init → build` reclose is NOT yet proven from crates.io. Publish order:
-  `forgedb-txn` + `forgedb-coordinator` (leaves) and the `wal`/`storage-native` republish, then prove the reclose the
-  usual way (outside-repo `init → generate → cargo build` resolving them). **Next thing that will reopen it:** any new
-  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the scaffold pins it.
+  `main.rs` (which links `forgedb-auth`). **#75/#84 MVCC reopened + CLOSED again 2026-07-15:** generated code started
+  linking two NEW substrate crates `forgedb-txn 0.1.0` + `forgedb-coordinator 0.1.0` (scaffold pins both `= "0.1"`) +
+  additive methods `WalManager::truncate_to` (`forgedb-wal`) + `sync_from_disk` (`forgedb-storage-native`, mirrored as
+  a no-op on `forgedb-storage-web`); **all published** (`txn 0.1.0`, `coordinator 0.1.0`, `wal 0.2.2`,
+  `storage-native 0.1.1`, `storage-web 0.1.1`) and the scaffold pin moved `forgedb-storage = "0.1.5"` → `"0.2"` (the
+  facade, which the monolith 0.1.5 could not provide `sync_from_disk` from). Reclose PROVEN by an outside-repo
+  `/tmp init → generate rust+api → cargo build` resolving them all from crates.io (0 errors). **Next thing that will
+  reopen it:** any new substrate-crate dep or additive substrate API the generated code starts requiring — publish
+  before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -886,6 +888,20 @@ across many domains live in `examples/` — see `examples/README.md`.**
   0.1.0` (scaffold pins both `= "0.1"`) and the additive `WalManager::truncate_to` + storage-native `sync_from_disk` —
   all four are additive (no format break) but must publish before an outside-repo `init → build` resolves from crates.io
   (mirrors the wal/storage/compaction publish sequence).
+  **PUBLISH GAP CLOSED (2026-07-15):** published `forgedb-txn 0.1.0` + `forgedb-coordinator 0.1.0` (new) + the
+  additive-method bumps `forgedb-wal 0.2.2` (`truncate_to`) + `forgedb-storage-native 0.1.1` (`sync_from_disk`) +
+  `forgedb-storage-web 0.1.1` (a no-op `sync_from_disk` for wasm API parity — the shared `database.rs` calls it
+  ungated and also compiles to wasm32; arena `len()` is always live so the browser follower needs no re-derive), and
+  moved the scaffold pin `forgedb-storage = "0.1.5"` → **`"0.2"`** (0.1.5 = the pre-split monolith without
+  `sync_from_disk`; the facade 0.2.0 re-exports storage-native 0.1.1). Reclose PROVEN by an outside-repo (`/tmp`)
+  `init --template blog → generate rust+api → cargo build` whose generated `Cargo.lock` resolved
+  `forgedb-coordinator 0.1.0` + `forgedb-txn 0.1.0` + `forgedb-storage 0.2.0` (→ `storage-native 0.1.1` +
+  `storage-web 0.1.1`) + `forgedb-wal 0.2.2` (+ changefeed 0.2.0 / query-params / compaction / auth / types) all from
+  `registry+…/crates.io-index` and compiled the generated MVCC code (0 errors). **RESIDUAL (wasm):** the `storage-web`
+  `sync_from_disk` no-op was native-compiled + arena-parity-tested but the full `wasm-pack build` of the MVCC
+  `database.rs` was NOT run (this env's `wasm32-unknown-unknown` std is broken — same residual as #110); the method is
+  a trivial parity no-op. Minor: `forgedb-coordinator` ships a benign `CONNECT_TIMEOUT` dead-code warning (a follow-up
+  cleanup; published harmlessly).
 - **`@pattern`/`@regex` validation ENFORCED (#104 RESOLVED — 2026-07-14).** The generated `validate_<model>` now
   compiles a per-(model, field) `LazyLock<regex::Regex>` from the directive's pattern and **rejects a non-matching
   string** → field-`Constraint` `ValidationError` (HTTP **422**), fired at the top of `insert`/`update` alongside the

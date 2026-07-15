@@ -16,7 +16,11 @@ become visible) — plus **two new substrate crates** `forgedb-txn 0.1.0` (Tier 
 break, watermark stays valid* — holds; but they **do open a publish gap**: generated code links
 `forgedb-txn`/`-coordinator` (scaffold pins `= "0.1"`) and the additive `wal`/`storage-native` methods,
 so those must publish before an outside-repo `init → build` resolves from crates.io. **Publish gap
-OPEN** (new crates + `wal`/`storage-native` republish pending). The design reasoning below is preserved
+CLOSED (2026-07-15):** published `forgedb-txn 0.1.0` + `forgedb-coordinator 0.1.0` + `forgedb-wal 0.2.2`
+(`truncate_to`) + `forgedb-storage-native 0.1.1` (`sync_from_disk`) + `forgedb-storage-web 0.1.1` (no-op
+`sync_from_disk` for wasm parity), scaffold pin `forgedb-storage 0.1.5 → 0.2`; reclose PROVEN by an
+outside-repo `/tmp init → generate → cargo build` resolving them all from crates.io (0 errors). The
+design reasoning below is preserved
 as-authored; where it says "zero substrate change," read it against this correction.
 
 **Original design-gate status:** DESIGN NOTE — Tiers 1–2 carried a `forgedb-product-manager` verdict
