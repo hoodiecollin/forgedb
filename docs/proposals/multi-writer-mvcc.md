@@ -1,5 +1,13 @@
 # Proposal: Multi-Writer Concurrency & Transactions (MVCC Direction C)
 
+> **📌 RETAINED — SHIPPED, AUTHORITATIVE DESIGN RECORD.** This feature is fully implemented (all
+> three tiers, #75/#84). Unlike other shipped proposals — which are **deleted** post-ship, with git
+> history as their record — this note is **kept on purpose**: it is the authoritative reference for
+> ForgeDB's concurrency/transaction model (the control-plane/data-plane split, the append-only +
+> watermark invariant, the identity red lines, the tier ceiling) and is expected to **inform later
+> work** — segmented-column parallel append, multi-machine replication (#54), and any future change
+> to the transaction surface. Read it as design rationale + as-built record, **not** as pending work.
+
 **Status:** **ALL THREE TIERS LANDED (2026-07-14, #75/#84; merged to `main` 2026-07-15).** Tier 1
 (generated transactions + atomic multi-model commit journal), Tier 2 (`forgedb-txn` optimistic
 concurrent prepare / serialized commit), and Tier 3 (`forgedb-coordinator` multi-process control
@@ -41,9 +49,10 @@ identity-critical), and required **three structural guards** (coordinator no-col
 `-coordinator` public-API schema-agnosticism, strict-superset byte-identity) plus a broker-offset
 contiguity-across-abort assertion — all folded in below. Tier 1 is a clean PASS with zero new *substrate*
 artifacts (the journal reuses the published `forgedb-wal` `Raw` path); Tier 2's `forgedb-txn` is PASS
-conditioned on enforced schema-agnosticism. Fleshes out the **Direction C** section from
-[`mvcc-concurrency.md`](./mvcc-concurrency.md) (Directions A + B LANDED). This note is the design for
-the Direction-C rock: **transactions + concurrent writers**.
+conditioned on enforced schema-agnosticism. Fleshes out the **Direction C** section from the
+predecessor MVCC note (`mvcc-concurrency.md` — Directions A + B, now shipped and removed post-ship;
+see git history). This note is the design for the Direction-C rock: **transactions + concurrent
+writers**.
 **Issue:** [#75](https://github.com/hoodiecollin/forgedb/issues/75) (MVCC Direction C)
 **Date:** 2026-07-14
 
@@ -748,8 +757,8 @@ test (red line #6). The blessed/refined set:
 
 ## Identity verdict & the substrate/generated split
 
-Mapping to the guard (`CLAUDE.md` → "What ForgeDB is"; carries forward
-`mvcc-concurrency.md`'s Direction-C red lines):
+Mapping to the guard (`CLAUDE.md` → "What ForgeDB is"; carries forward the predecessor MVCC note's
+Direction-C red lines — `mvcc-concurrency.md`, now in git history):
 
 | Piece | Class | Where it lives |
 |---|---|---|
@@ -792,7 +801,7 @@ read the shared, growing columns via #56-B (schema-blind positional reads) and u
 frame only as a *which-ids-to-refresh signal*; the coordinator treats `opaque_row_bytes` as
 write-through-to-log payload it never decodes (constraint **T3-8**, the concrete tripwire).
 
-## Red lines (carried + sharpened from `mvcc-concurrency.md`)
+## Red lines (carried + sharpened from the predecessor MVCC note, now in git history)
 
 1. **No generic runtime transaction/query executor.** Transactions ship as a *generated* method on
    the tailored `Database`; the substrate is mechanism only (LSN, visibility, truncate, opaque
@@ -963,9 +972,10 @@ Ship M1a–M1d before Tier 2. Only after a Tier-1 caller exists does `forgedb-tx
 - `crates/storage-native/src/reader.rs` (#56-B) — shared-fd positional reads with live length: the
   Tier-3 peer read-currency primitive (read a file another process is appending to).
 - `src/commands/` — the future `coordinate` subcommand host for the `forgedb-coordinator` process.
-- `docs/proposals/mvcc-concurrency.md` — Directions A + B (landed) and the Direction-C red lines
-  this note fleshes out.
+- the predecessor MVCC note (`mvcc-concurrency.md`, in git history) — Directions A + B (landed) and
+  the Direction-C red lines this note fleshes out.
 - `docs/proposals/backup-restore.md` — the append-only-watermark invariant all three tiers preserve.
-- `docs/proposals/realtime-subscriptions.md` — #82 durable broker (Tier 3's symmetric inverse) + #110
-  replica apply (the fan-out Tier 3 feeds; the "apply path pointed inward" of rung 3).
+- the realtime-subscriptions note (`realtime-subscriptions.md`, shipped + removed; see git history) —
+  #82 durable broker (Tier 3's symmetric inverse) + #110 replica apply (the fan-out Tier 3 feeds; the
+  "apply path pointed inward" of rung 3).
 - `CLAUDE.md` → "What ForgeDB is" — the invariant this note is gated against.
