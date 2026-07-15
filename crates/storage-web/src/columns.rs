@@ -164,6 +164,17 @@ impl FixedColumn {
         Ok(())
     }
 
+    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3 peer
+    /// read-currency). On the arena backend `len()` is derived live from the
+    /// store on every call ("the path IS the key"), so there is no cached
+    /// `row_count` to re-derive — and a browser replica is a single-follower,
+    /// never a multi-process coordinated peer. Present so the shared generated
+    /// `database.rs` (which calls it in `__sync_columns_from_disk`) compiles for
+    /// `wasm32` identically to native.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     pub fn reader(&self) -> io::Result<FixedColumnReader> {
         Ok(FixedColumnReader {
             path: self.path.clone(),
@@ -250,6 +261,14 @@ impl VariableColumn {
         Ok(())
     }
 
+    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3). See
+    /// `FixedColumn::sync_from_disk` — arena length is always live, so there is
+    /// nothing to re-derive; present so the shared generated `database.rs`
+    /// compiles for `wasm32`.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
     pub fn reader(&self) -> io::Result<VariableColumnReader> {
         Ok(VariableColumnReader {
             data_path: self.data_path.clone(),
@@ -323,6 +342,13 @@ impl Tombstones {
             return Ok(());
         }
         store::with_bytes_mut(&self.path, |b| b.truncate(rows));
+        Ok(())
+    }
+
+    /// API-parity no-op for the native `sync_from_disk` (#84 MVCC Tier 3). See
+    /// `FixedColumn::sync_from_disk` — arena length is always live; present so
+    /// the shared generated `database.rs` compiles for `wasm32`.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
         Ok(())
     }
 
