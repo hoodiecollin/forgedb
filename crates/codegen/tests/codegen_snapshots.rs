@@ -3288,7 +3288,7 @@ User {
         "live-query re-runs on the coarse model signal"
     );
 
-    // Typed deltas + opaque membership.
+    // Typed deltas + TYPED membership (#84: no opaque stringify hash).
     assert!(
         code.contains("PostLiveDelta::Init") || code.contains("PostLiveDelta :: Init"),
         "handler streams the generated typed delta enum"
@@ -3297,14 +3297,108 @@ User {
         code.contains("PostLiveDelta::Removed") || code.contains("PostLiveDelta :: Removed"),
         "handler emits removal-aware deltas"
     );
+    // #84: membership stores the TYPED record and change-detection uses the
+    // generated typed comparator — not a `serde_json` stringify hash.
     assert!(
-        code.contains("HashMap<Uuid, String>"),
-        "membership tracks opaque id -> opaque hash"
+        code.contains("HashMap<Uuid, super::Post>"),
+        "membership tracks id -> typed record (not an opaque string hash)"
+    );
+    assert!(
+        code.contains("post_record_changed(prev, &r)"),
+        "live-query Updated diff uses the typed per-field comparator (#84)"
+    );
+    assert!(
+        !code.contains("serde_json::to_string(&r).unwrap_or_default()")
+            && !code.contains("serde_json :: to_string(& r)"),
+        "no whole-record stringify hashing remains in the diff (#84)"
     );
     // The relation field stays non-filterable (inherited from the shared filter).
     assert!(
         !code.contains("params.get(\"author\")"),
         "relation field is not a live-query filter key"
+    );
+}
+
+#[test]
+fn test_api_generation_typed_event_filter() {
+    // #84: the generated `<model>_event_matches` filter must compare TYPED values
+    // (parse the string param into the field's Rust type, then `==`), not the old
+    // `serde_json` stringify — so `?price=3` matches a stored `3.0`, and
+    // bool/enum/decimal/timestamp compare by value. And the live-query `Updated`
+    // diff must use a generated typed per-field change detector.
+    let src = r#"
+enum Status {
+  Active,
+  Pending,
+  Closed,
+}
+
+Widget {
+  id: +uuid
+  name: string
+  price: f64
+  discount: f64?
+  in_stock: bool
+  status: Status
+  cost: decimal
+  made_at: timestamp
+  quantity: i32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // TYPED filter parses per field type (#84).
+    assert!(
+        code.contains("want.parse::<f64>()"),
+        "f64 filter parses the param to f64 (so ?price=3 matches 3.0)"
+    );
+    assert!(
+        code.contains("want.parse::<bool>()"),
+        "bool filter parses the param to bool"
+    );
+    assert!(
+        code.contains("want.parse::<rust_decimal::Decimal>()"),
+        "decimal filter parses the param to Decimal"
+    );
+    assert!(
+        code.contains("want.parse::<i32>()"),
+        "i32 filter parses the param to i32"
+    );
+    assert!(
+        code.contains("forgedb_types::Timestamp::from_seconds"),
+        "timestamp filter parses seconds into Timestamp"
+    );
+    // (The generic path may wrap across lines in the formatted output, so match
+    // the pieces rather than one contiguous span.)
+    assert!(
+        code.contains("serde_json::from_value::<") && code.contains("super::Status"),
+        "enum filter reuses the canonical variant-name serde mapping"
+    );
+
+    // The OLD fragile stringify filter body is gone (#84).
+    assert!(
+        !code.contains("serde_json::to_value(record)")
+            && !code.contains("other.to_string() == *want"),
+        "no stringify-compare remains in the event filter"
+    );
+
+    // Typed per-field change detector for the live-query diff (#84): f64 by bits.
+    assert!(
+        code.contains("fn widget_record_changed"),
+        "generated typed change detector"
+    );
+    assert!(
+        code.contains(".to_bits() != ") ,
+        "f64 change-detection compares bit patterns (deterministic, NaN-stable)"
+    );
+
+    // The filterable set is unchanged — a relation-less scalar model still filters
+    // by every declared scalar; the id/enum keys are present.
+    assert!(
+        code.contains("params.get(\"status\")"),
+        "enum field is a filter key"
     );
 }
 

@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 159
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -417,32 +416,28 @@ fn post_apply_sort(
         rows.reverse();
     }
 }
-///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code; the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
+///Per-model change-feed filter for `User` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn user_event_matches(record: &super::User, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
     }
-    let value = match serde_json::to_value(record) {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => return true,
-    };
     if let Some(want) = params.get("id") {
-        let ok = obj
-            .get("id")
-            .map(|v| match v {
-                serde_json::Value::String(s) => s == want,
-                other => other.to_string() == *want,
-            })
-            .unwrap_or(false);
-        if !ok {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
             return false;
         }
     }
     true
+}
+/// Typed per-field change detector for the live-query `Updated` diff (#84).
+fn user_record_changed(a: &super::User, b: &super::User) -> bool {
+    if a.id != b.id {
+        return true;
+    }
+    false
 }
 ///WebSocket subscription for `User` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `UserInserted` / `UserUpdated` / `UserDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_user(
@@ -499,44 +494,40 @@ async fn handle_user_subscription(
         }
     }
 }
-///Per-model change-feed filter for `Post` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code; the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
+///Per-model change-feed filter for `Post` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
 fn post_event_matches(record: &super::Post, params: &HashMap<String, String>) -> bool {
     if params.is_empty() {
         return true;
     }
-    let value = match serde_json::to_value(record) {
-        Ok(v) => v,
-        Err(_) => return true,
-    };
-    let obj = match value.as_object() {
-        Some(o) => o,
-        None => return true,
-    };
     if let Some(want) = params.get("id") {
-        let ok = obj
-            .get("id")
-            .map(|v| match v {
-                serde_json::Value::String(s) => s == want,
-                other => other.to_string() == *want,
-            })
-            .unwrap_or(false);
-        if !ok {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
             return false;
         }
     }
     if let Some(want) = params.get("title") {
-        let ok = obj
-            .get("title")
-            .map(|v| match v {
-                serde_json::Value::String(s) => s == want,
-                other => other.to_string() == *want,
-            })
-            .unwrap_or(false);
-        if !ok {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.title == __w,
+            None => false,
+        };
+        if !__ok {
             return false;
         }
     }
     true
+}
+/// Typed per-field change detector for the live-query `Updated` diff (#84).
+fn post_record_changed(a: &super::Post, b: &super::Post) -> bool {
+    if a.id != b.id {
+        return true;
+    }
+    if a.title != b.title {
+        return true;
+    }
+    false
 }
 ///WebSocket subscription for `Post` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `PostInserted` / `PostUpdated` / `PostDeleted` JSON event per change, optionally narrowed by `?field=value`.
 async fn subscribe_post(
@@ -607,14 +598,14 @@ async fn handle_user_live_query(
     params: HashMap<String, String>,
 ) {
     let mut rx = { db.read().await.changefeed.subscribe() };
-    let mut members: HashMap<Uuid, String> = HashMap::new();
+    let mut members: HashMap<Uuid, super::User> = HashMap::new();
     {
         let rows: Vec<super::User> = {
             let g = db.read().await;
             g.user.all().into_iter().filter(|r| user_event_matches(r, &params)).collect()
         };
         for r in &rows {
-            members.insert(r.id, serde_json::to_string(r).unwrap_or_default());
+            members.insert(r.id, r.clone());
         }
         let init = super::UserLiveDelta::Init { rows };
         if let Ok(text) = serde_json::to_string(&init) {
@@ -637,11 +628,10 @@ async fn handle_user_live_query(
                         .filter(|r| user_event_matches(r, &params))
                         .collect()
                 };
-                let mut next: HashMap<Uuid, String> = HashMap::new();
+                let mut next: HashMap<Uuid, super::User> = HashMap::new();
                 let mut deltas: Vec<super::UserLiveDelta> = Vec::new();
                 for r in current {
                     let id = r.id;
-                    let hash = serde_json::to_string(&r).unwrap_or_default();
                     match members.get(&id) {
                         None => {
                             deltas
@@ -649,7 +639,7 @@ async fn handle_user_live_query(
                                     row: r.clone(),
                                 })
                         }
-                        Some(prev) if *prev != hash => {
+                        Some(prev) if user_record_changed(prev, &r) => {
                             deltas
                                 .push(super::UserLiveDelta::Updated {
                                     row: r.clone(),
@@ -657,7 +647,7 @@ async fn handle_user_live_query(
                         }
                         _ => {}
                     }
-                    next.insert(id, hash);
+                    next.insert(id, r);
                 }
                 for id in members.keys() {
                     if !next.contains_key(id) {
@@ -696,14 +686,14 @@ async fn handle_post_live_query(
     params: HashMap<String, String>,
 ) {
     let mut rx = { db.read().await.changefeed.subscribe() };
-    let mut members: HashMap<Uuid, String> = HashMap::new();
+    let mut members: HashMap<Uuid, super::Post> = HashMap::new();
     {
         let rows: Vec<super::Post> = {
             let g = db.read().await;
             g.post.all().into_iter().filter(|r| post_event_matches(r, &params)).collect()
         };
         for r in &rows {
-            members.insert(r.id, serde_json::to_string(r).unwrap_or_default());
+            members.insert(r.id, r.clone());
         }
         let init = super::PostLiveDelta::Init { rows };
         if let Ok(text) = serde_json::to_string(&init) {
@@ -726,11 +716,10 @@ async fn handle_post_live_query(
                         .filter(|r| post_event_matches(r, &params))
                         .collect()
                 };
-                let mut next: HashMap<Uuid, String> = HashMap::new();
+                let mut next: HashMap<Uuid, super::Post> = HashMap::new();
                 let mut deltas: Vec<super::PostLiveDelta> = Vec::new();
                 for r in current {
                     let id = r.id;
-                    let hash = serde_json::to_string(&r).unwrap_or_default();
                     match members.get(&id) {
                         None => {
                             deltas
@@ -738,7 +727,7 @@ async fn handle_post_live_query(
                                     row: r.clone(),
                                 })
                         }
-                        Some(prev) if *prev != hash => {
+                        Some(prev) if post_record_changed(prev, &r) => {
                             deltas
                                 .push(super::PostLiveDelta::Updated {
                                     row: r.clone(),
@@ -746,7 +735,7 @@ async fn handle_post_live_query(
                         }
                         _ => {}
                     }
-                    next.insert(id, hash);
+                    next.insert(id, r);
                 }
                 for id in members.keys() {
                     if !next.contains_key(id) {

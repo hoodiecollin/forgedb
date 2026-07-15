@@ -150,7 +150,7 @@ impl From<ValidationError> for TxError {
 }
 ///GeoPoint embedded struct
 #[repr(C)]
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct GeoPoint {
     pub latitude: f64,
     pub longitude: f64,
