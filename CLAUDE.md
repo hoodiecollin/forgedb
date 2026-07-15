@@ -897,11 +897,23 @@ across many domains live in `examples/` — see `examples/README.md`.**
   `init --template blog → generate rust+api → cargo build` whose generated `Cargo.lock` resolved
   `forgedb-coordinator 0.1.0` + `forgedb-txn 0.1.0` + `forgedb-storage 0.2.0` (→ `storage-native 0.1.1` +
   `storage-web 0.1.1`) + `forgedb-wal 0.2.2` (+ changefeed 0.2.0 / query-params / compaction / auth / types) all from
-  `registry+…/crates.io-index` and compiled the generated MVCC code (0 errors). **RESIDUAL (wasm):** the `storage-web`
-  `sync_from_disk` no-op was native-compiled + arena-parity-tested but the full `wasm-pack build` of the MVCC
-  `database.rs` was NOT run (this env's `wasm32-unknown-unknown` std is broken — same residual as #110); the method is
-  a trivial parity no-op. Minor: `forgedb-coordinator` ships a benign `CONNECT_TIMEOUT` dead-code warning (a follow-up
-  cleanup; published harmlessly).
+  `registry+…/crates.io-index` and compiled the generated MVCC code (0 errors). **WASM regression found + fixed
+  (2026-07-15):** compiling the generated `database.rs` to `wasm32` (the browser read-replica shares it, #110)
+  revealed MVCC had **broken the wasm replica build** — `database.rs` referenced `forgedb_txn` + `forgedb_coordinator`
+  **unconditionally**, but neither was a replica dep and `forgedb-coordinator` (Unix sockets + `fs2`) can't compile to
+  wasm at all (21 errors; native-only verification masked it, and the env's wasm toolchain was mis-PATHed — see below).
+  Fix (surgical, identity-clean — a read replica is read-only): (1) cfg-gate the **entire Tier-3 coordinator surface**
+  (`CoordinatedDatabase` + `impl` + `Database::connect` + `__peer_refresh`) to `#[cfg(not(target_arch = "wasm32"))]` —
+  the only `forgedb_coordinator` users; (2) add `forgedb-txn = "0.1"` to the `WasmGenerator` replica scaffold
+  (`forgedb-txn` is pure in-memory — zero deps, no fs/net — so it compiles to wasm; the Tier-2 `CommitSequencer` field
+  stays but the read-only `Replica` transport never exposes the transaction methods). **NOW PROVEN:** `cargo build
+  --target wasm32-unknown-unknown` AND a real `wasm-pack build --target web` both complete clean on the MVCC
+  `database.rs`, and native db+api still build (the cfg attrs are no-ops on native — Tier-3 surface unchanged there).
+  Guards: `test_rust_generation_coordinated_client` unchanged-green + insta snapshots re-accepted for the 3 cfg lines.
+  (The earlier "env wasm32 std broken" was a mis-diagnosis: Homebrew's `rustc` shadowed rustup's on PATH and had no
+  wasm std; `brew unlink rust` + `rustup default 1.96` fixed it — the wasm std was there all along under rustup.)
+  Minor: `forgedb-coordinator` ships a benign `CONNECT_TIMEOUT` dead-code warning (a follow-up cleanup; published
+  harmlessly).
 - **`@pattern`/`@regex` validation ENFORCED (#104 RESOLVED — 2026-07-14).** The generated `validate_<model>` now
   compiles a per-(model, field) `LazyLock<regex::Regex>` from the directive's pattern and **rejects a non-matching
   string** → field-`Constraint` `ValidationError` (HTTP **422**), fired at the top of `insert`/`update` alongside the
