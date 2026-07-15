@@ -590,6 +590,19 @@ impl FixedColumn {
         self.row_count == 0
     }
 
+    /// Refresh the in-memory `row_count` from the on-disk file length (#84).
+    ///
+    /// Reads `read_exact_at` the file positionally, bounded by `row_count`.  For
+    /// the Tier 3 multi-process writer path a *peer* process may have appended
+    /// values since this handle opened; `sync_from_disk` re-derives `row_count`
+    /// from the shared file so the peer's committed rows become readable (paired
+    /// with `Tombstones::sync_from_disk` and `VariableColumn::sync_from_disk`).
+    /// A no-op for the single-writer path, which maintains `row_count` in memory.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
+        self.row_count = self.file.metadata()?.len() as usize / self.value_size;
+        Ok(())
+    }
+
     /// Truncate the column to hold exactly `rows` rows, discarding everything
     /// after that point.
     ///
@@ -741,6 +754,19 @@ impl VariableColumn {
         self.row_count == 0
     }
 
+    /// Refresh the in-memory counters from the on-disk file lengths (#84).
+    ///
+    /// Re-derives `row_count` from the offsets file (16 bytes/row) and
+    /// `current_data_offset` from the data file, so a *peer* process's appended
+    /// rows (Tier 3 multi-process writer path) become readable through this
+    /// handle.  Paired with `FixedColumn::sync_from_disk` /
+    /// `Tombstones::sync_from_disk`.  A no-op for the single-writer path.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
+        self.row_count = self.offsets_file.metadata()?.len() as usize / 16;
+        self.current_data_offset = self.data_file.metadata()?.len();
+        Ok(())
+    }
+
     /// Truncate the column to hold exactly `rows` rows, discarding everything
     /// after that point.
     ///
@@ -880,6 +906,23 @@ impl Tombstones {
         }
         self.file.set_len(rows as u64)?;
         self.count = rows;
+        Ok(())
+    }
+
+    /// Re-read the on-disk tombstone count from the file metadata and update the
+    /// cached `count`.
+    ///
+    /// Normally `count` is maintained in memory by `append`/`truncate_to_rows`, so
+    /// this is a no-op for the single-writer path.  For the Tier 3 multi-process
+    /// writer path (#84) a peer process may have appended tombstone bytes since this
+    /// writer opened the file; calling `sync_from_disk` before `len()` lets the
+    /// writer see the peer's committed rows without reopening the storage.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from `file.metadata()`.
+    pub fn sync_from_disk(&mut self) -> io::Result<()> {
+        self.count = self.file.metadata()?.len() as usize;
         Ok(())
     }
 
