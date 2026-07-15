@@ -623,9 +623,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
   nginx `location /` forwards `Upgrade`. PM identity gate PASS (substrate schema-agnostic; all field-aware
   logic generated; no drift vectors). Honest limits: **single-process** only (no cross-process broker);
   Update/Delete events now exist via the mutation surface (#66, `ChangeKind::Updated`/`Deleted`); the
-  per-model filter compares via `serde_json` stringify (exact-match, fine for common scalars; fragile for
-  some float/bool encodings — typed per-field compare is a future refinement); Direction B (live queries)
-  + C (durable broker) deferred. Guards: substrate `changefeed` unit tests, `test_rust_generation_changefeed_emits`,
+  per-model filter compares **typed per-field** — it parses the `?field=value` string into the field's Rust
+  type and compares typed values (`?n=3` matches a stored `3.0`; bool/uuid/decimal/timestamp/enum by value),
+  the old `serde_json` stringify float/bool fragility resolved by #84 (see the #84 bullet); Direction B (live
+  queries) + C (durable broker) deferred. Guards: substrate `changefeed` unit tests, `test_rust_generation_changefeed_emits`,
   `test_api_generation_websocket_subscription`; **live WebSocket round-trip** E2E (client receives a
   filtered typed event) compile-tested through current codegen in `scratchpad/changefeed_compile`
   (ephemeral). Requires the `forgedb-changefeed 0.1.0` publish (see the publish gap).
@@ -677,8 +678,9 @@ across many domains live in `examples/` — see `examples/README.md`.**
   (`Init`/`Added`/`Updated`/`Removed`) deltas — `Removed` expressible thanks to #66's tombstone append.
   PM identity gate PASS (green-with-care): only generated code re-executes generated code on a coarse
   signal; never resolves `row_index→id` via the substrate. Honest limits: **O(rows) re-run per matched
-  event per connection**, no coalescing/debounce (the scaling cliff); `Updated` uses full-record
-  `serde_json` compare (#62-A fragility inherited); single-process. Guards:
+  event per connection**, no coalescing/debounce (the scaling cliff — #83); single-process. (`Updated`
+  detection is now a typed per-field compare via the generated `<model>_record_changed`, #84 — the old
+  full-record `serde_json` stringify fragility is gone.) Guards:
   `test_api_generation_live_query`, `test_rust_generation_live_delta_enums`; **live WS round-trip**
   (Init→Added→silent→Updated→Removed) in `scratchpad/directionb_compile` (ephemeral).
 - **Durable replication broker (#82 realtime Direction C) — Milestones A + B LANDED (publish-pending).**
@@ -924,6 +926,23 @@ across many domains live in `examples/` — see `examples/README.md`.**
   gains a plain `regex = "1"` dep (crates.io — **no substrate / publish gap**). Guard
   `test_rust_generation_pattern_validation`. This closes the last #91 "deferred" item (`@pattern`/`@regex` were the
   parsed-but-unenforced markers).
+- **Change-feed / live-query typed event compare (#84 RESOLVED — 2026-07-15).** The generated per-model
+  `<model>_event_matches` filter (used by the change-feed WS, live-query WS, **and** REST list) and the live-query
+  `Updated` diff no longer compare via `serde_json` stringify — the source of float/bool encoding fragility (a stored
+  `3.0` missed `?field=3`). Two pure-codegen changes, **no substrate / publish gap**: (1) the filter now parses each
+  `?field=value` string into the field's **Rust type** and compares typed values — `parse::<f64>()` (so `3`≡`3.0`),
+  `parse::<bool/i*/u*>()`, `parse::<Uuid>()`, `parse::<rust_decimal::Decimal>()` (value-equal, scale-invariant),
+  `i64→Timestamp::from_seconds`, enums via the canonical `serde_json::from_value::<Enum>(String)` variant-name mapping,
+  and `char(N)` by zero-padded byte buffer; an unparseable param matches nothing. The **filterable set is unchanged**
+  (same `is_filterable_field` predicate — only the per-field body changed). (2) The live-query membership now stores the
+  **typed record** (`HashMap<Id, Model>`, not a string hash) and detects `Updated` via a generated
+  `<model>_record_changed(a, b)` that compares **every stored field** — `f64` by `to_bits()` (deterministic, NaN-stable),
+  everything else by `==`, virtual relation collections excluded. Required deriving **`PartialEq` on generated structs**
+  (caught by the compile matrix — a struct-typed field must compare). Guards `test_api_generation_typed_event_filter` +
+  extended `test_api_generation_live_query`; compile-proven across the full type matrix (f64/enum/decimal/timestamp/
+  char/json/struct/FK + nullable variants + a virtual one-to-many correctly excluded) in
+  `scratchpad/typed_filter_compile` (ephemeral). **Honest limit:** the filter is still exact-match (`=`), not range/
+  prefix — the coalesce/debounce scaling gap is the separate #83.
 - **`json` scalar type — LANDED 2026-07-14.** New schema type: Rust `serde_json::Value` (stored as its serialized
   JSON bytes on the **variable-length string column** path), TS `unknown`, OpenAPI permissive. `json?` uses the same
   1-byte presence tag as `string?` (so `None` vs `Some(Value::Null)` round-trip distinctly). **No new dep**
