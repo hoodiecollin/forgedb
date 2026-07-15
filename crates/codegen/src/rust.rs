@@ -471,6 +471,12 @@ impl RustGenerator {
         let eager_tokens = Self::generate_eager_load(schema);
         tokens.extend(eager_tokens);
 
+        // Generate the Tier 3 coordinator client surface (#84): CoordinatedDatabase
+        // wraps SharedDatabase and routes the serialized commit section through the
+        // coordinator socket instead of the in-process sequencer.
+        let coord_tokens = Self::generate_coordinated_client(schema);
+        tokens.extend(coord_tokens);
+
         // Parse and format with prettyplease
         let syntax_tree = syn::parse_file(&tokens.to_string())
             .map_err(|e| crate::CodegenError::GenerationFailed(format!("Failed to parse generated code: {}", e)))?;
@@ -7679,6 +7685,261 @@ impl RustGenerator {
             result.push(c.to_ascii_lowercase());
         }
         result
+    }
+
+    /// Generate the Tier 3 coordinator client surface (#84, MVCC multi-process).
+    ///
+    /// Emits two items — `CoordinatedDatabase` and `Database::connect_coordinator`
+    /// — that are strictly ADDITIVE: no existing method body is touched.
+    ///
+    /// ## What is generated
+    ///
+    /// ```rust,ignore
+    /// pub struct CoordinatedDatabase {
+    ///     shared: SharedDatabase,
+    ///     coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
+    /// }
+    ///
+    /// impl CoordinatedDatabase {
+    ///     pub fn transaction_coordinated<T>(
+    ///         &self,
+    ///         retries: u32,
+    ///         f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+    ///     ) -> Result<T, TxError> { ... }
+    /// }
+    ///
+    /// impl Database {
+    ///     pub fn connect_coordinator(
+    ///         self,
+    ///         socket_path: std::path::PathBuf,
+    ///     ) -> Result<CoordinatedDatabase, TxError> { ... }
+    /// }
+    /// ```
+    ///
+    /// ## Identity red line
+    ///
+    /// `CoordinatedDatabase` sends only opaque byte keys to the coordinator and
+    /// calls the SAME `__apply_and_commit_concurrent_buffer` as `SharedDatabase`
+    /// for the data-plane write — no second apply path, no drift.  The
+    /// coordinator itself never receives a decoded field.
+    fn generate_coordinated_client(schema: &Schema) -> TokenStream {
+        // Only generate if there are transactable models.
+        let tx_models: Vec<&forgedb_parser::Model> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .collect();
+        if tx_models.is_empty() {
+            return quote! {};
+        }
+
+        quote! {
+            /// Tier 3 MVCC multi-process coordinator client (#84).
+            ///
+            /// Wraps a [`SharedDatabase`] (Tier 2 in-process concurrency) and
+            /// routes the serialized commit section through a running
+            /// `forgedb coordinate <root>` coordinator process over a Unix socket,
+            /// enabling multiple OS processes to share a single data directory
+            /// without corruption.
+            ///
+            /// Create via [`Database::connect_coordinator`].
+            pub struct CoordinatedDatabase {
+                shared: SharedDatabase,
+                coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
+            }
+
+            impl CoordinatedDatabase {
+                /// Run a transaction through the Tier 3 commit coordinator.
+                ///
+                /// ## Commit flow
+                ///
+                /// 1. Capture read snapshot (brief `RwLock` read, sequencer snapshot).
+                /// 2. Run prepare closure with `ConcurrentTxHandle` — no lock held.
+                /// 3. Build opaque write-set keys (same as Tier 2, identity red line).
+                /// 4. **`RequestTurn`** → coordinator: conflict-check + LSN assignment.
+                ///    - On `Grant`: proceed to data-plane write.
+                ///    - On `Nack` (conflict): release snapshot, retry from step 1.
+                ///    - On `Busy`: brief back-off then retry step 4.
+                /// 5. Data-plane write: `__apply_and_commit_concurrent_buffer` under
+                ///    the exclusive in-process `RwLock`.  Same path as Tier 2.
+                /// 6. **`Committed`** → coordinator: hand opaque row bytes for the
+                ///    durable replication log, receive `Ack { lsn }`.
+                /// 7. Release snapshot; return the prepared value.
+                pub fn transaction_coordinated<T>(
+                    &self,
+                    retries: u32,
+                    f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    use forgedb_changefeed::ChangeKind as __CK;
+                    let __coord = std::sync::Arc::clone(&self.coordinator);
+                    let __seq_arc = std::sync::Arc::clone(&self.shared.seq);
+                    let __inner = std::sync::Arc::clone(&self.shared.inner);
+
+                    let mut __last_lsn = __coord.last_known_lsn();
+
+                    for __attempt in 0..=retries {
+                        // Step 1 – register snapshot LSN (local; coordinator is the authority).
+                        let __snap_lsn = {
+                            let mut __seq = __seq_arc.lock().unwrap();
+                            __seq.register_snapshot()
+                        };
+
+                        // Step 2 – capture committed watermarks (brief read lock).
+                        let __snap = {
+                            let __db = __inner.read().unwrap();
+                            __db.snapshot()
+                        };
+
+                        // Step 3 – prepare closure with private-buffer staging (no lock held).
+                        let mut __tx = ConcurrentTxHandle {
+                            inner: std::sync::Arc::clone(&__inner),
+                            snap: __snap,
+                            buffer: Vec::new(),
+                            staged_unique_keys: std::collections::BTreeSet::new(),
+                            pending_events: Vec::new(),
+                        };
+                        let __out = f(&mut __tx);
+                        let __val = match __out {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                return Err(e);
+                            }
+                        };
+
+                        // Step 4 – build opaque write-set (identity red line: coordinator sees bytes only).
+                        let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
+                        for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
+                            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+                            k.extend_from_slice(__model.as_bytes());
+                            k.extend_from_slice(__id_bytes);
+                            __ws_keys.push(k);
+                        }
+                        for (__fname, __ekey) in &__tx.staged_unique_keys {
+                            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+                            k.extend_from_slice(__fname.as_bytes());
+                            k.extend_from_slice(__ekey.as_bytes());
+                            __ws_keys.push(k);
+                        }
+
+                        // Step 5 – RequestTurn: coordinator conflict-check + LSN assignment.
+                        let __turn = {
+                            let mut __busy_retries = 0u32;
+                            loop {
+                                match __coord.request_turn(__ws_keys.clone(), __last_lsn) {
+                                    Ok(grant) => break Ok(grant),
+                                    Err(forgedb_coordinator::client::ClientError::Conflict { conflict_key }) => {
+                                        break Err(forgedb_txn::CommitOutcome::Conflict {
+                                            key: conflict_key.into_boxed_slice(),
+                                        });
+                                    }
+                                    Err(forgedb_coordinator::client::ClientError::Busy) => {
+                                        if __busy_retries >= 5 {
+                                            break Err(forgedb_txn::CommitOutcome::Conflict {
+                                                key: b"__busy__".to_vec().into_boxed_slice(),
+                                            });
+                                        }
+                                        __busy_retries += 1;
+                                        std::thread::sleep(std::time::Duration::from_millis(20 * __busy_retries as u64));
+                                    }
+                                    Err(e) => {
+                                        let mut __seq = __seq_arc.lock().unwrap();
+                                        __seq.release_snapshot(__snap_lsn);
+                                        return Err(TxError::Io(e.to_string()));
+                                    }
+                                }
+                            }
+                        };
+
+                        match __turn {
+                            Err(_) => {
+                                // Conflict or busy exhaustion — retry.
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                __last_lsn = __coord.last_known_lsn();
+                                continue;
+                            }
+                            Ok((__turn_id, _reserved_lsn)) => {
+                                // Step 6 – data-plane write (same path as Tier 2).
+                                let __buf_copy: Vec<(&'static str, __CK, Vec<u8>, Vec<u8>, bool)> = __tx.buffer
+                                    .iter()
+                                    .map(|(m, k, id, b, d)| (*m, *k, id.clone(), b.clone(), *d))
+                                    .collect();
+                                let __apply_result = {
+                                    let mut __db = __inner.write().unwrap();
+                                    __db.__apply_and_commit_concurrent_buffer(
+                                        __tx.buffer,
+                                        __tx.pending_events,
+                                    )
+                                };
+
+                                // Step 7 – Committed: hand opaque bytes to coordinator.
+                                // Build coordinator payload (opaque; coordinator never decodes).
+                                let mut __model_tags: Vec<Vec<u8>> = Vec::new();
+                                let mut __row_indices: Vec<u64> = Vec::new();
+                                let mut __change_kinds: Vec<u8> = Vec::new();
+                                let mut __opaque_bytes: Vec<Vec<u8>> = Vec::new();
+                                for (__model, __kind, _id, __bytes, _del) in &__buf_copy {
+                                    __model_tags.push(__model.as_bytes().to_vec());
+                                    // Row index is not available post-apply without a second read;
+                                    // pass 0 as a placeholder — the coordinator's log is for
+                                    // same-machine turn sequencing (#84 scope).
+                                    // TODO: thread actual row indices for cross-machine follower support.
+                                    __row_indices.push(0);
+                                    __change_kinds.push(__kind.to_byte());
+                                    __opaque_bytes.push(__bytes.clone());
+                                }
+                                let __ack = __coord.committed(
+                                    __turn_id,
+                                    __model_tags,
+                                    __row_indices,
+                                    __change_kinds,
+                                    __opaque_bytes,
+                                );
+                                match __ack {
+                                    Ok(__lsn) => { __last_lsn = __lsn; }
+                                    Err(e) => {
+                                        // Best-effort: the commit is already durable (columns
+                                        // + WAL fsynced before Committed); a missed ack only
+                                        // leaves `__last_lsn` briefly stale.  Dependency-free
+                                        // diagnostic so the generated crate needs no `log` dep.
+                                        eprintln!("coordinator: Committed ack error: {e}");
+                                    }
+                                }
+
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+
+                                return __apply_result.map(|_| __val);
+                            }
+                        }
+                    }
+                    Err(TxError::Conflict)
+                }
+            }
+
+            impl Database {
+                /// Connect to a running `forgedb coordinate <root>` coordinator and
+                /// return a [`CoordinatedDatabase`] for multi-process Tier 3 transactions.
+                ///
+                /// The `Database` is promoted to a [`SharedDatabase`] (Tier 2) internally;
+                /// `CoordinatedDatabase` delegates the commit critical section to the
+                /// coordinator over the Unix socket at `socket_path`.
+                pub fn connect_coordinator(
+                    self,
+                    socket_path: std::path::PathBuf,
+                ) -> Result<CoordinatedDatabase, TxError> {
+                    let shared = self.shared();
+                    let coordinator = forgedb_coordinator::client::CoordinatorClient::connect(&socket_path)
+                        .map_err(|e| TxError::Io(e.to_string()))?;
+                    Ok(CoordinatedDatabase {
+                        shared,
+                        coordinator: std::sync::Arc::new(coordinator),
+                    })
+                }
+            }
+        }
     }
 }
 

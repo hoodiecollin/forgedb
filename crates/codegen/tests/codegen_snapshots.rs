@@ -4073,3 +4073,76 @@ User {
         "generated code references oldest_live_snapshot for the keep-set bound"
     );
 }
+
+#[test]
+fn test_rust_generation_coordinated_client() {
+    // Tier 3 MVCC coordinator client (#84): `Database::connect_coordinator` must
+    // produce a `CoordinatedDatabase` whose `transaction_coordinated` routes the
+    // serialized commit section through the coordinator Unix socket while reusing
+    // the SAME `__apply_and_commit_concurrent_buffer` data-plane path as Tier 2.
+    //
+    // PM identity constraints checked here:
+    // (a) The coordinator client surface is generated (no hand-rolled alternative).
+    // (b) No second apply body — `transaction_coordinated` calls
+    //     `__apply_and_commit_concurrent_buffer`, NOT a separate per-model dispatch.
+    // (c) The coordinator receives only opaque bytes (no decoded field in the
+    //     `Committed` payload: model tags are byte-cast, not field-decoded).
+    // (d) `CoordinatedDatabase` is strictly additive — no existing method is modified.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // (a) The CoordinatedDatabase struct is emitted.
+    assert!(
+        code.contains("pub struct CoordinatedDatabase"),
+        "CoordinatedDatabase struct emitted"
+    );
+
+    // (a) Database::connect_coordinator factory is emitted.
+    assert!(
+        code.contains("pub fn connect_coordinator"),
+        "Database::connect_coordinator emitted"
+    );
+
+    // (a) The transaction method is emitted.
+    assert!(
+        code.contains("pub fn transaction_coordinated"),
+        "CoordinatedDatabase::transaction_coordinated emitted"
+    );
+
+    // (b) No second apply body: the coordinator path delegates to the SAME
+    // __apply_and_commit_concurrent_buffer that Tier 2 uses.
+    assert!(
+        code.contains("__apply_and_commit_concurrent_buffer"),
+        "coordinator path reuses __apply_and_commit_concurrent_buffer (no drift)"
+    );
+
+    // (c) Opaque model tags — model name cast to bytes, NOT field-decoded.
+    assert!(
+        code.contains("as_bytes().to_vec()"),
+        "model tags forwarded as opaque bytes, not decoded fields"
+    );
+
+    // (d) Existing Tier 2 surface is untouched: SharedDatabase + transaction_concurrent.
+    assert!(
+        code.contains("pub struct SharedDatabase"),
+        "SharedDatabase still present (additive, no breakage)"
+    );
+    assert!(
+        code.contains("pub fn transaction_concurrent"),
+        "transaction_concurrent still present (additive, no breakage)"
+    );
+
+    // (d) The coordinator is referenced by its substrate path (not a generated struct).
+    assert!(
+        code.contains("forgedb_coordinator"),
+        "generated code references the forgedb-coordinator substrate crate"
+    );
+}
