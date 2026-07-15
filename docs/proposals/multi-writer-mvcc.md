@@ -1,11 +1,26 @@
 # Proposal: Multi-Writer Concurrency & Transactions (MVCC Direction C)
 
-**Status:** DESIGN NOTE — `forgedb-product-manager` verdict **PASS-WITH-CONSTRAINTS** (2026-07-14;
-3 binding constraints, folded in below — see "PM gate constraints"). Tier 1 is a clean PASS with
-zero new artifacts; Tier 2's `forgedb-txn` is PASS conditioned on enforced schema-agnosticism +
-caller-gating. Fleshes out the **Direction C** section deferred (no in-codebase caller) in
-[`mvcc-concurrency.md`](./mvcc-concurrency.md) (Directions A + B LANDED). This note is the design
-for the deferred rock: **transactions + concurrent writers**.
+**Status:** DESIGN NOTE — Tiers 1–2 carry a `forgedb-product-manager` verdict
+**PASS-WITH-CONSTRAINTS** (2026-07-14; 3 binding constraints, folded in below — see "PM gate
+constraints") and are now **deepened to implementation-ready** (2026-07-14, #83): the concrete
+`TxHandle` surface, the **atomic multi-model commit journal** (`_txn_journal.log`, the T3-4
+prerequisite), the precise commit/rollback/recovery sequences with crash-window analysis, the
+auto-checkpoint/compaction deferral + broker-offset buffering (PM constraint 1), the concrete
+`forgedb-txn` API + `try_commit` algorithm + retry loop, and four ship-in-order sub-milestones (M1a–d).
+**Tier 3 is fully designed** (2026-07-14, expanded from the earlier sketch at the user's direction —
+all three tiers thorough). **The full 3-tier note passed the PM re-gate (#84, 2026-07-14):
+PASS-WITH-CONSTRAINTS** — the control-plane/data-plane split is sound (no hidden path forces the
+coordinator to know column layout), the `_txn_journal.log` classification is a clean class-1 split
+(verified against `forgedb-wal`'s opaque `Raw` path), and the build order matches the in-codebase-caller
+test. The re-gate **blessed T3-1..T3-7 with refinements, added a required T3-8** (the `opaque_row_bytes`
+back-application tripwire = new drift vector 3), reclassified T3-6 as architecture-quality (not
+identity-critical), and required **three structural guards** (coordinator no-column-write, `forgedb-txn`/
+`-coordinator` public-API schema-agnosticism, strict-superset byte-identity) plus a broker-offset
+contiguity-across-abort assertion — all folded in below. Tier 1 is a clean PASS with zero new *substrate*
+artifacts (the journal reuses the published `forgedb-wal` `Raw` path); Tier 2's `forgedb-txn` is PASS
+conditioned on enforced schema-agnosticism. Fleshes out the **Direction C** section from
+[`mvcc-concurrency.md`](./mvcc-concurrency.md) (Directions A + B LANDED). This note is the design for
+the Direction-C rock: **transactions + concurrent writers**.
 **Issue:** [#75](https://github.com/hoodiecollin/forgedb/issues/75) (MVCC Direction C)
 **Date:** 2026-07-14
 
@@ -32,19 +47,28 @@ and *conflict detection is over in-flight transactions only* (in-memory, ephemer
   point** assigns a monotonic **commit LSN** and detects write-write conflicts against an in-memory
   id→last-committer map; losers roll back (Tier-1 truncate) and retry. Still no on-disk format
   break — commit remains serialized, so appends stay contiguous and the watermark stays valid.
-- **Tier 3 — Multi-process writers (held).** Removes single-process by giving one process the
-  commit point (a **write coordinator**, the symmetric inverse of #82's durable broker). This is
-  the only tier that breaks single-process scope and warrants a format/protocol commitment — a wire
-  protocol plus a durable 2-phase in-flight record — so it is deferred until an in-codebase caller
-  needs multi-process writes.
+- **Tier 3 — Multi-process writers (single-machine).** Removes single-process *within one machine*
+  by giving one process the commit point (a **write coordinator**, the symmetric inverse of #82's
+  durable broker). The coordinator is a **control plane** (conflict map + serialized commit turn +
+  LSN sequencer + owner of the opaque `_replication.log`) that **never writes columns**; the
+  schema-aware column write stays in **generated writer code** (the data plane), run under a granted
+  exclusive turn. Because of the forks below it adds **no new on-disk format** and **no distributed
+  2-phase record** — the coordinator *is* the single writer, so data recovery reuses #89/#96, and its
+  only state (the conflict map) is in-memory. Multi-*machine* (network + consensus) is explicitly a
+  separate future product (v2/v3), not this tier.
 
-**Recommendation:** design + build **Tier 1** (transactions) as the first milestone; it is
-independently valuable, append-only-preserving, and low identity-risk. **Tier 2** once a Tier-1
-caller (generated code or a crate) actually needs concurrent preparers — it is a strict superset of
-Tier 1, so building it before Tier 1 has a caller is machinery without a consumer. **Tier 3
-deferred** (breaks single-process scope; see below). The honest ceiling that bounds Tiers 1–2 —
-**one physical append point per column** → *concurrent prepare, serialized commit* — is named
-loudly below; true parallel append needs segmented columns (a separate, larger storage effort).
+**Recommendation:** all three tiers are now designed thoroughly. **Build order is Tier 1 → Tier 2 →
+Tier 3**, and it is a *technical* prerequisite chain, not a demand gate: Tier 2 extends Tier 1's
+transaction boundary with a serialized commit point, and Tier 3 replaces Tier 2's in-process commit
+mutex with the out-of-process coordinator (and inherits Tier 1's atomic multi-model commit for its
+crash story). So each tier is a strict superset of the one before, and building an outer tier before
+its inner tier exists is machinery without its own substrate. The legitimate sequencing test stays
+the **in-codebase-caller** one (does generated code / a crate actually link this path yet), never a
+market-demand one. The honest ceiling that bounds all three tiers — **one physical append point per
+column** → *concurrent prepare, serialized commit* (the serial section includes the writer's `fsync`)
+— is named loudly below; true parallel append needs segmented columns (a separate, larger storage
+effort), and the commit-side optimization ladder that raises the ceiling *without* segmenting is
+designed into Tier 3's assign-order/materialize-bytes seam.
 
 ## Where the engine already is (current-state anchor)
 
@@ -406,23 +430,297 @@ append needs **segmented columns** (each writer owns a segment file, merged on r
 larger storage redesign explicitly **out of this note**. Name this in every external description so
 "multi-writer" is never oversold.
 
-## Tier 3 — Multi-process writers (held)
+## Tier 3 — Multi-process writers (single-machine)
 
-Removes single-process. One process owns the commit point (holds `DirLock`, the append cursor, and
-the LSN sequencer) and acts as a **write coordinator**; other processes submit prepared
-transactions to it. This is the exact symmetric inverse of #82's durable broker (which broadcasts
-committed changes *out*; the coordinator accepts proposed changes *in*, serializes, appends,
-assigns LSNs) and of #110's replica follower. It is the only tier that:
+Removes single-process *within one machine*: N processes write concurrently to one data dir,
+coordinated by one process that owns the commit point. It is the symmetric inverse of #82's durable
+broker (the broker broadcasts committed changes *out*; the coordinator accepts proposed changes *in*,
+serializes them, and assigns LSNs) and it *reuses* that broker as its own commit log (fork #7). It is
+reached by extending Tier 2 — the coordinator replaces Tier 2's in-process commit mutex — and it
+inherits Tier 1's atomic multi-model commit for crash safety.
 
-- breaks the blessed **single-process scope**,
-- needs a wire protocol + a durable in-flight/2-phase record (so a coordinator crash mid-commit is
-  recoverable),
-- and plausibly a persisted commit-LSN (a format touch).
+### Locked design forks
 
-**Deferred** because it breaks the single-process scope and needs a durable 2-phase commit protocol
-plus a wire protocol — a format/protocol commitment no in-codebase caller requires yet. Reachable by
-extending Tier 2 (the coordinator replaces the in-process commit mutex). Recorded here so the staging
-is explicit, not designed in detail.
+The design rests on decisions taken deliberately (each cascades into the mechanism):
+
+1. **Single-machine only.** N processes on one host, shared filesystem, OS primitives. **Multi-machine
+   (network transport, no shared FS, consensus/partition-tolerance) is a separate future product
+   (v2/v3)** — it invalidates the shared-FS assumptions the whole engine rests on.
+2. **Dedicated coordinator process** (not shared-memory turn-taking). The value is in the *process*
+   (single-owner conflict map, fault isolation, trust boundary), not the transport — see
+   "Transport & placement."
+3. **Optimistic, concurrent-prepare / serialized-commit, snapshot isolation** — extends Tier 2's model
+   across processes. Serializable (SSI, read-set tracking) is a confirmed **future** enhancement.
+7. **Commit log unified with `_replication.log`** (#82 broker) — the coordinator's serialized commit
+   log *is* the broker log, so #82 followers and #110 replicas consume Tier 3's output unchanged, and
+   the monotonic broker offset is the commit LSN for free.
+9. **Strict superset of Tiers 1–2 (MANDATORY).** With no coordinator configured, a process takes the
+   in-process single-writer path **byte-identical to today**. The coordinator is opt-in; single-writer
+   deployments pay nothing.
+
+### The identity crux — control plane vs data plane
+
+A commit ultimately appends row bytes into **per-schema columns** (which columns, what types, what
+layout — all schema-aware). If the coordinator materialized columns, it would have to know the layout
+→ it becomes a schema-interpreting engine → identity violation. So the column write **cannot** live in
+the coordinator. The design splits the commit into two planes:
+
+- **Coordinator = control plane** (schema-agnostic, class-1 substrate). Owns the conflict map (#6), the
+  LSN sequence, the opaque `_replication.log` (#7), and grants **serialized exclusive commit turns**.
+  It moves opaque keys, opaque row bytes, and integer LSNs — it never touches a column, never decodes a
+  field, never dispatches on a model except as an opaque tag (same discipline as the #82 broker and
+  `DirLock`).
+- **Generated writer code = data plane** (schema-aware, tailored). Does the actual durable column + WAL
+  write, under a granted turn — the *same* code path as today's single-writer commit.
+
+The coordinator is thus a **lock manager + sequencer + conflict checker**, not a data-plane writer.
+This is what lets Tier 3 stay inside the generator identity while columns-as-truth holds (the writer's
+column+WAL fsync is the durable commit point). It is the single decision the PM re-gate will scrutinize
+hardest.
+
+### The commit handshake
+
+```
+prepare  (concurrent, no turn):  writer computes opaque write-set keys + committed row bytes @ snapshot S
+   │
+   ▼
+RequestTurn{ write_set_keys, snapshot_lsn S }  ──▶ coordinator
+   │                                                 conflict-check vs map (#6)
+   │            ◀── Nack{ conflict_key }  ── writer aborts, re-snapshots, retries (bounded, auto)
+   │            ◀── Grant{ turn_id, reserved_lsn L }   (exclusive turn held)
+   ▼
+writer does column + WAL fsync         ← columns-as-truth durable commit (existing #89 path)
+   │
+   ▼
+Committed{ turn_id, model_tags, row_indices, opaque_row_bytes }  ──▶ coordinator
+   │                                          append _replication.log @ L, release turn
+   │            ◀── Ack{ L }
+   ▼
+writer applies buffered index updates, returns
+```
+
+Crash windows all fall on the safe side of the locked invariants:
+
+- Writer dies **after Grant, before column commit** → torn/absent column tail truncated by existing
+  #89 recovery; the coordinator's reserved `L` was never logged → reclaimed on **turn timeout**; txn
+  aborts.
+- Writer dies **after column commit, before Committed** → columns durable (committed) but the log is
+  missing the entry → **reconcile-forward** on restart (log never ahead of durable data, #7).
+
+The serial section **includes the writer's fsync** — only one writer commits at a time. That is inherent
+to columns-as-truth + prefix recovery (narrowing it further is the deferred out-of-order-durability
+bridge), and it is exactly the "not raw throughput" ceiling in "Performance envelope." Parallel prepare
+stays *outside* the turn, so the prepare-heavy gain is intact.
+
+### Conflict detection (extends Tier 2 across processes)
+
+- **Prepare (client, concurrent):** the generated client runs the txn body at snapshot LSN `S` and
+  computes its **write set as opaque keys** — `(model_tag, id_bytes)` for every row it inserts /
+  supersedes / deletes, and `(model_tag, index_tag, key_bytes)` for every unique key it claims. The
+  field-aware "what did I touch" is generated; the coordinator sees only opaque bytes.
+- **Commit (coordinator, serialized):** validate that no key in the write set was committed by *another*
+  txn at `LSN > S`. Clean → assign `L`, append, ack. Conflict → nack; the client auto-retries.
+- **Isolation:** snapshot isolation, first-committer-wins. Write-skew is the disclosed SI anomaly
+  (documented, not hidden); serializable/SSI (read-set tracking) is a future enhancement, so prepare
+  does **not** report a read set (keeping the wire frame and client glue small).
+- **The conflict map is in-memory only, and bounded.** It catches conflicts among *concurrently live*
+  txns; after a coordinator restart there are none in-flight, so it rebuilds empty (no durable
+  commit-version column → no format touch). Prune any key whose `last_committed_LSN` is older than the
+  **oldest live snapshot** (no live txn can conflict against something already visible to it) — GC'd by
+  the oldest open snapshot.
+- **Abort/retry contract:** bounded **automatic** retry in the generated client (re-snapshot at the new
+  watermark, re-run the prepare closure — which composes with Tier 1's re-runnable
+  `transaction(|tx| …)` closure), falling back to a typed `ConflictError` after a small default `N`.
+  The default is app-overridable via config.
+- **FK-ordering conflicts** (delete-parent vs insert-child) are **not** a separate coordinator concern:
+  the #91 FK-existence check fires at the child's commit and nacks if the parent is gone — a generated
+  commit-time check, keeping the coordinator FK-blind.
+
+### Durability & crash recovery — no distributed 2-phase record
+
+The original sketch posited a durable 2-phase in-flight record. With the locked forks it is **not
+needed**, and the reason is precise: a durable prepare record exists to recover a commit spanning
+**multiple independently-failing resources** (distributed commit). Our commit is **single-node atomic**
+— one coordinator, one filesystem; clients hold no durable state. So:
+
+- **The coordinator *is* the single writer**, so committed-data crash recovery = the existing #89 WAL +
+  #96 checkpoint + column-length-prefix path, **unchanged**. A torn mid-append commit truncates to the
+  min-consistent prefix and the WAL tail replays, exactly as a single writer's torn write does today.
+  **No new durable data structure, no format touch.**
+- **The conflict map is non-durable** — rebuilt empty on restart.
+- **In-flight client txns abort on coordinator restart** — the client sees the disconnect, re-snapshots,
+  and retries. A txn is not durable until the serial commit's WAL fsync completes; anything short of that
+  is lost and retried. (The clean payoff of serialized commit: prepare is client-local and disposable.)
+- **Multi-model atomicity is inherited from Tier 1, not reinvented.** A txn spanning `User` + `Post`
+  needs an atomic multi-model commit across a crash — exactly Tier 1's transaction boundary (a txn-scoped
+  atomic commit journal listing all `(model, row_index)` appends, fsynced once, then applied). Tier 3's
+  coordinator drives that Tier-1 commit; it does not build its own. **Cross-tier dependency: Tier 3
+  requires Tier 1's atomic multi-model commit** (a concrete requirement handed to the Tier-1 deepening).
+- **#7 ordering (columns-as-truth):** the durable commit point is the writer's column + WAL fsync;
+  `_replication.log` is appended *after* (order: **WAL fsync → columns → log**) and, if a crash leaves it
+  behind, **reconciled forward** from the committed columns/WAL tail on restart. The log is never *ahead*
+  of durable data, so followers/#110 replicas never see an offset unbacked by committed rows.
+
+### Transport & placement
+
+- **Transport: unix domain socket** at `<root>/_coordinator.sock` (single-machine ⇒ no network;
+  filesystem-namespaced, permission-controlled). The frames are all opaque:
+  `RequestTurn{ write_set_keys:[(model_tag,opaque_key)], snapshot_lsn }` →
+  `Grant{ turn_id, reserved_lsn }` | `Nack{ conflict_key }`;
+  `Committed{ turn_id, model_tags, row_indices, opaque_row_bytes }` → `Ack{ lsn }`. Nothing on the wire
+  is a decoded field.
+- **Why a process (not shared-memory coordination):** the conflict-check is a whole-map
+  check-and-insert (not a single atomic op), so shared memory would need a **robust mutex** anyway —
+  inheriting crash-with-lock-held repair of a shared concurrent structure — without escaping
+  serialization. A process gives a **single-owner conflict map** in ordinary heap memory, **fault
+  isolation** (a writer crash can't corrupt coordinator state; only a coordinator restart matters, and
+  it's clean), and a **trust boundary** (writers submit opaque frames; they can't scribble on the
+  invariants). Decisively, the IPC latency shared memory would save is **dwarfed by the writer's fsync**
+  in the serial section, so it optimizes a non-bottleneck. Shared memory becomes attractive only in the
+  rung-3 regime (fsync amortized away) — the opaque-frame protocol keeps the transport swappable if that
+  day comes.
+- **Placement: a new class-1 substrate crate `forgedb-coordinator`** — owns the socket server, the
+  conflict map, and the turn/LSN sequencer; links `forgedb-changefeed` (the `_replication.log` / broker
+  it fans out) + `forgedb-wal`. It ships as a standalone process, a **`forgedb coordinate <root>`**
+  subcommand (or the generated server hosts it). The **client glue is generated per-schema**: it
+  materializes typed writes into opaque intents, runs the handshake, and does the data-plane column
+  write under the turn — same class as the generated `/replicate` endpoint. Substrate + generated glue =
+  the identity-clean split. (Chosen as a *separate* crate rather than folding into `forgedb-changefeed`
+  because the coordinator is a much larger concern than the broker.)
+
+### Peer read-currency — how one writer sees another's commits
+
+Single machine ⇒ **one set of column files**. When writer A commits, its rows are physically on disk in
+the shared columns; writer B does not re-materialize anything. B stays current by:
+
+- **Reading the shared, growing column files** — exactly #56-B (shared-fd positional reads with live
+  length; the read-under-live-append machinery already exists), driven by
+- **the coordinator's log tail as an index-refresh signal** — the log frame says "id X changed at row
+  `p`, model `M`, kind `K`," and B refreshes its in-memory `id_to_row`/indexes for those ids by reading
+  position `p` from the shared file.
+
+So a writer process is *also* a lightweight follower — but a **same-machine** peer uses the frame only as
+a **which-ids-to-refresh signal** (data comes from the shared columns via #56-B), *not* as a data channel
+(the frame's opaque bytes are what a **remote** #110 replica needs; a local peer ignores them and reads
+the shared file). A writer's **snapshot LSN `S` = the log offset it has refreshed up to**; it prepares
+against `S`, the coordinator conflict-checks against `S`, and offset-dedup means a writer never
+double-counts its own commit.
+
+### Operational model
+
+- **Lifecycle: an explicit supervised process** (`forgedb coordinate <root>` under systemd/container),
+  not auto-spawn (which brings ownership ambiguity, spawn races, and zombies). Multi-writer is an opt-in
+  topology you set up deliberately.
+- **Mode switch via the `DirLock`, for free:** the **coordinator holds the #89 `DirLock`** on behalf of
+  all clients. A client writer (coordinator socket configured) connects and does **not** take the lock; a
+  standalone writer (no coordinator) takes the lock itself — so a coordinator can't also run. The lock
+  makes "coordinated" and "standalone" modes **mutually exclusive** with zero new machinery, and the #9
+  strict-superset switch is literally "is a coordinator socket configured?"
+- **Coordinator-down behavior:** **reads keep working** at the writer's last-refreshed snapshot
+  (stale-but-consistent — reads hit local shared columns, which don't need the coordinator);
+  **commits block with bounded retry/backoff, then surface a typed `CoordinatorUnavailable`** (the app
+  decides whether to keep retrying or fail the request). The snapshot cannot advance while the
+  coordinator is down (no new log frames) → a frozen-but-consistent read view.
+- **Liveness both ways:** a writer detects coordinator loss via socket disconnect; the coordinator
+  detects a dead/stuck writer via socket close or a **turn timeout** — a granted-but-unfinished turn is
+  reclaimed and its LSN reservation dropped, so one stuck writer cannot wedge all commits (the #5 reclaim
+  doubling as the liveness mechanism).
+
+### The assign-order / materialize-bytes seam (keeps the commit side open)
+
+The coordinator serializes exactly one thing that *must* be serial: **the ordering decision** (assign
+LSN `L` and the append position). That decision is tiny and cheap; everything downstream — writing row
+bytes, fsyncing the K column files, checksums, index updates, log framing — is *materializing an order
+already decided*, and need not be single-threaded. Keeping this seam clean is a **design invariant**,
+because it is what leaves the commit side open to later optimization without touching the coordinator's
+contract. The optimization ladder (increasing size):
+
+1. **Intra-commit parallel column flush** — fan the K-column flush of one commit across helper workers.
+   Pure work parallelism, **no model change**.
+2. **Group commit** — assign `p..p+M` to a batch, write all rows, **one fsync** for the batch, advance
+   the watermark past the whole batch. The clean way to beat the fsync ceiling; **compatible, no model
+   change**.
+3. **Async materialization with the log as commit point** — the coordinator's log fsync becomes the
+   durability point and columns become a projection built by generated materializers (the #82/#110 apply
+   path pointed inward). This is a genuine architectural move (**log-as-truth**), with read-visibility and
+   durable-marker consequences — **deferred**.
+
+**Rungs 1 and 2 need neither bridge** — columns stay the source of truth, recovery stays column-length
+derived, no durable LSN marker becomes load-bearing. Only **rung 3** and **out-of-order durable commits**
+require crossing the durability-marker/format bridge; both are deferred, and the seam keeps them reachable
+without a redesign.
+
+### Performance envelope (honest)
+
+Tier 3 delivers **(1)** multi-process writers as a *capability* that does not exist today (a second writer
+is refused now), and **(2)** **parallel prepare** — validation, regex, serialization, FK-existence reads,
+and unique/index candidate lookups run concurrently across processes, with only the commit serialized.
+It does **not** deliver higher raw commit throughput: the commit is serialized and its serial section
+includes the per-commit **fsync**, so aggregate commit rate is bounded by a **single committer's fsync
+rate** regardless of process count, and mode-A adds a (negligible-vs-fsync) IPC round-trip per commit —
+which is exactly why the #9 strict-superset path must keep single-writer deployments off the coordinator.
+The win is real only when **prepare is the bottleneck**; a commit/fsync-bound workload gains the
+*capability* but not throughput until **group commit** (rung 2) lands. The *magnitude* depends on the
+workload's prepare/commit ratio and the disk's fsync latency (not quantifiable without measurement); the
+*shape* is fixed: parallel prepare, serial commit+fsync+IPC.
+
+### Honest limits (Tier 3)
+
+- **The coordinator is a single point of failure for writes** (reads survive on stale snapshots). A
+  highly-available coordinator (failover / leader election) is **multi-machine territory → v2/v3**. For
+  the single-machine cut, restart is cheap (rebuild the empty conflict map, reconcile the log forward) and
+  writes resume — the SPOF is a brief write-pause on restart, not data loss.
+- **The serial section includes the writer's fsync** until group commit (rung 2) or log-as-truth (rung 3)
+  land — so "multi-writer" buys safe concurrency and parallel prepare, *not* linear write throughput.
+- **Same-machine only** (fork #1); no cross-node writers.
+
+### Tier 3 — PM constraints (BLESSED / REFINED — PM re-gate #84, 2026-07-14)
+
+The `forgedb-product-manager` re-gate of the full 3-tier note returned **PASS-WITH-CONSTRAINTS**: the
+control-plane/data-plane split is sound (no hidden path forces the coordinator to know column layout),
+the `_txn_journal.log` classification is a clean class-1 split (verified against `forgedb-wal`'s `Raw`
+path — `[payload_len][payload_bytes]`, no decode step), and the build order matches the in-codebase-caller
+test (red line #6). The blessed/refined set:
+
+- **T3-1 — The coordinator never writes a column and never decodes a field.** All schema-aware
+  materialization stays in generated writer code (the data plane); the coordinator moves opaque keys,
+  opaque row bytes, and integer LSNs only. **Guard (refined — the model-name string-check alone is
+  necessary-not-sufficient, since the coordinator's real hazard is column *materialization from opaque
+  bytes*, not model-name dispatch):** the `no `match model_name`` discipline of
+  `test_rust_generation_replication_broker` **plus** the structural no-column-write guard of T3-8.
+- **T3-2 — `forgedb-coordinator` is class-1 schema-agnostic**, like `forgedb-txn` — rows, columns, opaque
+  keys, LSNs; the instant it knows a model's fields the boundary is violated. **Guard (refined to
+  structural, not documented):** assert the public API references only `Lsn`/`OpaqueKey`/`WriteSet`/
+  `CommitOutcome`-class types — no `&str` model-name parameter, no `Fn`-over-schema, no generic predicate
+  type (an API-signature / compile-fixture assertion, held to the same bar as `forgedb-txn`).
+- **T3-3 — Columns stay the source of truth; no new durable format artifact.** Data recovery reuses
+  #89/#96; the conflict map is non-durable; the `_replication.log` is appended last and reconciled forward
+  (never ahead of durable data). Rung-3 (log-as-truth) is a *separate future change* that must redesign
+  read-visibility + durability in the same commit (retraction-fork discipline). **(PM: the most important
+  T3 constraint — keep verbatim.)**
+- **T3-4 — Tier 3 depends on Tier 1's atomic multi-model commit**, inherited not reinvented; do not build
+  Tier 3 before that Tier-1 commit journal exists.
+- **T3-5 — Strict superset of Tiers 1–2 (the #9 mandate):** no coordinator configured ⇒ the in-process
+  single-writer path is byte-identical to today; the `DirLock` enforces coordinated-vs-standalone mutual
+  exclusion. **Guard (refined to byte-identity, matching #110's "zero codegen branches" proof):**
+  snapshot-assert the generated single-writer commit/`transaction` body with no coordinator configured
+  **equals the pre-Tier-3 baseline output** — so "pay nothing if single-writer" is enforced, not promised.
+- **T3-6 — The assign-order/materialize-bytes seam is preserved** so rungs 1–2 (intra-commit fan-out,
+  group commit) remain drop-in and rung 3 remains reachable without a coordinator-contract change.
+  **(PM reclassification: this is an architecture-quality / performance constraint, NOT identity-critical
+  — violating it does not make the coordinator schema-aware; no identity guard is required, only the
+  perf-envelope discipline.)**
+- **T3-7 — "Multi-writer" is never oversold:** every external description states the single-machine scope,
+  the write-SPOF, and the serial-commit-includes-fsync ceiling.
+- **T3-8 (NEW — REQUIRED by the re-gate) — The coordinator forwards `opaque_row_bytes` to the
+  `_replication.log` and NEVER decodes them.** The `Committed` frame's row bytes exist solely for remote
+  #110 replicas; the coordinator treats them as write-through-to-log payload only, and a local same-machine
+  peer reads the shared columns via #56-B and ignores the frame bytes. This is the precise seam where a
+  "helpful" optimization (coordinator applies the bytes itself to save the peer a read) would silently turn
+  the coordinator into a data-plane writer — see drift vector 3. **Guard:** assert `forgedb-coordinator`
+  contains **no** `forgedb-storage*` column-write dependency (`FixedColumn`/`VariableColumn`/`Tombstones`
+  append) and **no** decode of the `opaque_row_bytes` frame member (it may only append/forward them). This
+  is the drift-vector-2 tripwire made concrete — the one thing T3-1's model-name guard does not catch.
 
 ## Identity verdict & the substrate/generated split
 
@@ -433,19 +731,42 @@ Mapping to the guard (`CLAUDE.md` → "What ForgeDB is"; carries forward
 |---|---|---|
 | `db.transaction(\|tx\| …)` closure + `TxHandle` per-model methods | **Generated** (tailored) | `rust.rs` |
 | Rollback-by-truncate orchestration; which columns to truncate/append | **Generated** | `rust.rs` |
+| Commit-journal record contents (opaque `[(model_tag, post_len)]` vector) + recovery decode | **Generated** | `rust.rs` |
+| `_txn_journal.log` framing / fsync / torn-tail read (the atomic-commit marker, M1b) | **Substrate (published)** — reuses `forgedb-wal` `Raw` verbatim | `wal` |
 | Version/visibility resolution per id (LSN or watermark compare) | **Generated** | `rust.rs` (extends `get_at`) |
 | Conflict-key computation (id → opaque bytes) | **Generated** | `rust.rs` |
 | `truncate_to_rows`, watermark, WAL fsync | **Substrate (published)** — reused as-is | `storage-native`, `wal` |
 | Commit LSN sequencer + opaque-keyed conflict map (Tier 2) | **Substrate class-1** — new `forgedb-txn` (rows/keys/LSNs only) | new crate |
 | Visibility predicate "is version V visible to snapshot S" | **Substrate class-1** — pure integer compare | `forgedb-txn` / storage |
+| Write coordinator: socket server + serialized turn + LSN + opaque conflict map + owns `_replication.log` (Tier 3, control plane) | **Substrate class-1** — new `forgedb-coordinator` (opaque keys/bytes/LSNs; no column, no field) | new crate + `forgedb coordinate` process |
+| Client glue: materialize typed writes → opaque intents, run the handshake, do the data-plane column write under the turn (Tier 3) | **Generated** (tailored) | `rust.rs` |
+| Peer read-currency: which-ids-to-refresh from the log tail + shared-column reads (Tier 3) | **Generated** over #56-B reads + #82 fan-out | `rust.rs` |
 
-**The single drift vector (sharp):** MVCC arriving bundled with a **generic transaction/query
+**Drift vector 1 (Tiers 1–2, sharp):** MVCC arriving bundled with a **generic transaction/query
 executor** that takes predicates-as-data and interprets them against arbitrary tables at runtime.
 Guard-passing mirror image: the substrate only ever answers *"assign the next LSN," "is V visible
 to S," "truncate to mark,"* and *"has opaque-key K been committed since LSN L"*; the generated
 `Database` drives the transaction, computes keys, and resolves versions per model. The instant a
 shipped crate offers `db.transaction()` **over an arbitrary schema it reads at runtime**, the line
 is crossed.
+
+**Drift vector 2 (Tier 3, sharp):** the **write coordinator materializing columns** — the moment it
+knows the per-schema column layout to apply a write itself, it becomes a schema-interpreting engine.
+Guard-passing mirror image: the coordinator is *control plane only* (serialized turn + LSN + opaque
+conflict map + opaque log); the **generated writer** does the schema-aware column write, under a
+granted turn. The coordinator answers only *"grant a turn," "assign LSN L," "has opaque-key K been
+committed since LSN S," "append these opaque bytes to the log."* The instant `forgedb-coordinator`
+decodes a field or writes a column, the line is crossed (constraints T3-1/T3-2).
+
+**Drift vector 3 (Tier 3, introduced by the deepened design — flagged by the #84 re-gate):** the
+coordinator **back-applying `opaque_row_bytes`**. Because the `Committed` frame already carries the row
+bytes (for remote #110 replicas) and the coordinator already owns the log, there is a standing temptation
+to have it *apply* those bytes to bring local peers current — "it has them anyway, why make peer B
+re-read the file?" The instant it does, it must know the per-schema column layout to place them → it
+becomes a data-plane writer → identity violation. Guard-passing mirror image: local same-machine peers
+read the shared, growing columns via #56-B (schema-blind positional reads) and use the coordinator's log
+frame only as a *which-ids-to-refresh signal*; the coordinator treats `opaque_row_bytes` as
+write-through-to-log payload it never decodes (constraint **T3-8**, the concrete tripwire).
 
 ## Red lines (carried + sharpened from `mvcc-concurrency.md`)
 
@@ -460,19 +781,34 @@ is crossed.
    redesign backup + snapshot reads **in the same change** (the retraction-fork discipline).
 5. **Authoring surface stays "schema + CLI + config."** Isolation level / retry policy, if
    configurable, live in `forgedb.toml` or are generated defaults — **never new `.forge` syntax**.
-6. **Don't build Tier 2/3 machinery without a caller.** Ship Tier 1 (transactions) first; add
-   optimistic concurrency only once something in the codebase (generated code or a crate) actually
-   links it — no generated code or crate links a concurrent-writer path today. Building it first is
-   the machinery-without-consumers failure that killed `fulltext`/`crud-api`.
-7. **Single-process scope holds through Tiers 1–2.** Multi-process (Tier 3) is a separately
-   justified expansion, not silent scope creep.
-8. **"Multi-writer" is never oversold.** Every external description states the ceiling: concurrent
-   *prepare*, serialized *commit*, until segmented columns land.
+6. **Build outer tiers only after their inner tier's substrate exists (in-codebase-caller test).**
+   Ship Tier 1 (transactions) first; add Tier 2 optimistic concurrency once a Tier-1 caller links it;
+   add Tier 3 once Tier 2's commit point exists to be replaced by the coordinator. Each tier is a
+   strict superset of the one before, so building an outer tier first is machinery without its own
+   substrate — the failure that killed `fulltext`/`crud-api`. Sequencing is the internal-caller test,
+   never a market-demand one.
+7. **The write coordinator is control-plane-only and schema-agnostic.** It never writes a column, never
+   decodes a field (including **never decoding the `opaque_row_bytes` it forwards to the log** — T3-8),
+   and dispatches on a model only as an opaque tag; the schema-aware column write stays in generated
+   code. `forgedb-coordinator` is class-1 substrate (opaque keys/bytes/LSNs) — the moment it knows a
+   field or back-applies the row bytes it holds, the boundary is violated (constraints T3-1/T3-2/T3-8,
+   drift vectors 2 + 3).
+8. **Single-machine scope for Tier 3; multi-machine is a separate product.** Tiers 1–2 are
+   single-process; Tier 3 is single-*machine* multi-process (shared FS, OS primitives). Cross-node
+   writers (network + consensus) are v2/v3, not silent scope creep.
+9. **Columns stay the source of truth through all three tiers; no durable format artifact.** Recovery
+   stays column-length derived; the conflict map is non-durable; the `_replication.log` is never ahead
+   of durable data. A future rung-3 (log-as-truth) is a separate change that must redesign
+   read-visibility + durability together (retraction-fork discipline; see also red line #4).
+10. **"Multi-writer" is never oversold.** Every external description states the ceiling: single-machine
+    scope, write-SPOF, concurrent *prepare* / serialized *commit* (serial section includes fsync) until
+    group commit or segmented columns land.
 
-## PM gate constraints (binding — 2026-07-14)
+## PM gate constraints — Tiers 1–2 (binding — 2026-07-14)
 
-The identity gate passed the design and named three binding constraints. They close the gap between
-this note's *stated* discipline and *enforced* discipline; none require redesign:
+The identity gate passed the Tiers 1–2 design and named three binding constraints (Tier 3's proposed
+constraints are the T3-* set under "Tier 3 — PM constraints," pending the full-note re-gate). They
+close the gap between this note's *stated* discipline and *enforced* discipline; none require redesign:
 
 1. **Tier 1 rollback must be proven safe against auto-checkpoint (#96) and auto-compaction (#92)
    firing mid-transaction, and must leak zero broker/changefeed offsets on abort.** The first-
@@ -482,7 +818,10 @@ this note's *stated* discipline and *enforced* discipline; none require redesign
    checkpoint that truncated the WAL underneath it); (b) a rolled-back transaction consumes **no**
    `DurableBroker` offset and emits **no** changefeed event (staging must not consume a monotonic
    offset until commit, else rollback leaves an offset gap). Add codegen guards for both, beyond the
-   existing "truncates on error / emits only on commit" guard.
+   existing "truncates on error / emits only on commit" guard. **(#84 re-gate — extend to offset
+   *contiguity across an abort*:** a committed txn *following* an aborted one must leave **no** offset
+   gap — its offset run must be contiguous with the *last committed* run, not the aborted attempt (the
+   substrate-contract #82 followers / #110 replicas depend on).)
 2. **`forgedb-txn` (Tier 2) must be structurally schema-agnostic and guard-enforced, not merely
    documented.** Its public API may reference only rows, columns, opaque byte-keys, and integer
    LSNs — **no `&str` model name, no field, no generic predicate parameter, no `Fn`-over-schema.**
@@ -500,40 +839,93 @@ this note's *stated* discipline and *enforced* discipline; none require redesign
    observe a GC'd version. (Promotes the "GC vs live snapshot" deferral bullet to a correctness-and-
    identity constraint.)
 
-## First milestone (smallest useful slice)
+## Implementation plan — Tier 1 (implementation-ready sub-milestones)
 
-**Tier 1 transactions only.** Generated `db.transaction(|tx| …)` + `TxHandle` (scoped per-model
-write methods), commit = watermark advance + WAL fsync + batched event emit, rollback =
-`truncate_to_rows` to pre-txn marks + WAL-tail drop. **No new substrate, no format break, no
-publish gap.** Success = a transaction that creates a parent + child atomically, rolls back cleanly
-on an error in the middle (no partial rows survive, no changefeed event leaks), and is snapshot-
-isolated from a concurrent reader — proven E2E through current codegen (compile + run), with a
-codegen guard asserting the txn body truncates on the error path and emits events only on commit.
+Tier 1 decomposes into four ship-in-order slices, each with its guard(s). No new substrate crate, no
+column-format break; the only new artifact is the additive `_txn_journal.log` framed by
+`forgedb-wal`'s published `Raw` path.
+
+- **M1a — the generated handle + single-model commit/rollback.** Emit `Database::transaction` +
+  `TxHandle` (scoped `create_/update_/delete_/link_` + `get_/all_`), staged-append + read-your-writes
+  (raised watermark), commit = fsync + watermark advance + `pending_index`/`pending_events` apply,
+  rollback = `truncate_to_rows` to marks + WAL-tail drop. Guard `test_rust_generation_transaction`:
+  the txn body truncates on the error path, advances the watermark only on the `Ok` path, and reads
+  see staged rows. E2E: create-then-error rolls back to zero surviving rows.
+- **M1b — the atomic multi-model commit journal.** Add `_txn_journal.log` (reused `forgedb-wal`
+  `Raw`), the ordered commit sequence (columns fsync → journal fsync → watermark), and journal-driven
+  recovery in `open_at` (truncate every touched model to `committed_len`; absent journal ⇒ #89 path).
+  Guard `test_rust_generation_txn_commit_journal`: the emitted commit fsyncs columns *before* the
+  journal record and recovery truncates all touched models to the journalled length. E2E: kill mid-
+  commit **between** two models' column fsyncs and after some are durable → reopen shows **neither**
+  model's staged rows (all-or-nothing); kill *after* the journal fsync → reopen shows **both**.
+- **M1c — auto-checkpoint/compaction deferral + broker-offset buffering (PM constraint 1).** Gate the
+  #96/#92 auto-triggers behind `in_transaction`; run a pending trigger once on commit/rollback. Buffer
+  broker/changefeed records; consume offsets only in the commit burst. Guards
+  `test_rust_generation_txn_defers_maintenance` + extend the changefeed-emit guard: a txn crossing the
+  WAL-checkpoint / dead-row threshold still rolls back cleanly (no orphaned WAL tail), and a rolled-
+  back txn consumes **no** `DurableBroker` offset and emits **no** changefeed event — **and (#84 re-gate)
+  a commit *following* an abort has an offset run contiguous with the last committed run (no gap)**. E2E:
+  a rollback after crossing the checkpoint threshold leaves the WAL/columns consistent; broker offset
+  unchanged; the next commit's offsets are contiguous.
+- **M1d — compaction respects the live-transaction snapshot (PM constraint 3).** Generated keep-set
+  includes versions pinned by `oldest_live_snapshot()`; `forgedb-compaction` stays snapshot-unaware
+  (opaque indices). Guard: the generated compaction keep-set includes rows below the oldest live txn
+  snapshot. E2E: a long-lived txn's snapshot still resolves old versions after an intervening
+  auto-compaction.
+
+Ship M1a–M1d before Tier 2. Only after a Tier-1 caller exists does `forgedb-txn` (Tier 2) get created
+(red line #6).
 
 ## Honest deferrals
 
-- **Parallel column append** (segmented columns) — the only path past serialized commit; a
-  separate, larger storage redesign. Out of scope.
-- **Serializable isolation** (read-set tracking) — Tier 2 ships snapshot isolation; serializable is
-  a later knob.
-- **Multi-process / Tier 3 coordinator** — deferred; breaks single-process scope and needs a
-  durable 2-phase protocol. Reachable by extending Tier 2.
+- **Parallel column append** (segmented columns) — the only path to true parallel *append* (past even
+  group commit); a separate, larger storage redesign. Out of scope.
+- **Serializable isolation** (SSI / read-set tracking) — all tiers ship snapshot isolation;
+  serializable is a later knob (Tier 3 would add read-set reporting to the prepare frame).
+- **Group commit + intra-commit column fan-out (Tier 3 rungs 1–2)** — the throughput levers that beat
+  the single-committer fsync ceiling *without* a format change; designed into the assign-order seam but
+  not first-cut. **Log-as-truth async materialization (rung 3)** and **out-of-order durable commits** —
+  the larger levers that *do* need the durability-marker/format bridge; deferred, seam-reachable.
+- **Highly-available coordinator** (failover / leader election) and any **multi-machine / cross-node**
+  writers — multi-machine territory, a separate future product (v2/v3); Tier 3 is single-machine, so its
+  coordinator is a write-SPOF (reads survive on stale snapshots).
+- **Shared-memory coordinator transport** — reserved for the rung-3 regime (once fsync no longer
+  dominates the serial section); the unix-socket transport is the first cut, kept swappable behind the
+  opaque-frame protocol.
 - **Long-running / interactive transactions** holding a read snapshot for a long time — GC of
   superseded versions (compaction #92) must not reclaim versions a live snapshot still needs; a
-  transaction registers its snapshot LSN so compaction respects the oldest live reader (a small
-  addition to the #92 keep-set computation).
-- **Distributed / cross-node** anything — explicitly not ForgeDB's domain.
+  transaction registers its snapshot LSN so compaction respects the oldest live reader (constraint 3 /
+  a small addition to the #92 keep-set computation).
+- **Distributed / cross-node** anything — explicitly not ForgeDB's domain (see the multi-machine
+  deferral above).
+- **Size-bounded / streaming transactions** — because Tier 1 defers auto-checkpoint (#96) for a txn's
+  duration, a pathologically large single txn grows the per-model WAL until it commits. Acceptable at
+  the design-partner bar; a streaming/chunked-commit txn that lets checkpoint reclaim its committed
+  prefix mid-flight is a later refinement.
 
 ## Cross-issue dependencies
 
-- **Reuses #89/#96** WAL + fsync + checkpoint as the durability boundary (commit = existing fsync).
+- **Reuses #89/#96** WAL + fsync + checkpoint as the durability boundary (commit = existing fsync);
+  Tier 3's data crash-recovery is #89/#96 unchanged (the coordinator *is* the single writer). Tier 1's
+  atomic multi-model commit journal (`_txn_journal.log`, M1b) **reuses `forgedb-wal`'s published `Raw`
+  path verbatim** — no new substrate API, no column-format bump; it is an additive root-level file.
 - **Reuses #56-A/B** watermark `Snapshot` + reader handles (transactions generalize the watermark;
-  Tier 1 keeps it verbatim).
-- **Reuses #82** `DurableBroker` monotonic offset as the commit-LSN source (Tier 2).
+  Tier 1 keeps it verbatim; **Tier 3 peer read-currency is #56-B shared-column live reads** driven by
+  the log tail as a which-ids-to-refresh signal).
+- **Reuses #82** `DurableBroker` monotonic offset as the commit-LSN source (Tier 2), and its
+  `_replication.log` **as Tier 3's unified commit log** (fork #7) — so #82 followers and #110 replicas
+  consume Tier 3's output unchanged.
+- **Depends on Tier 1** — Tier 3's multi-model crash atomicity inherits Tier 1's atomic multi-model
+  commit journal (constraint T3-4); it does not build its own.
+- **New substrate `forgedb-coordinator` (Tier 3)** — class-1 control-plane crate (socket server +
+  serialized turn + LSN + opaque conflict map, owning `_replication.log`); links `forgedb-changefeed` +
+  `forgedb-wal`; ships as a `forgedb coordinate <root>` process. Publishes once before generated client
+  glue links it (the standard publish-gap discipline) — but adds **no on-disk format change**.
 - **Interacts with #92 compaction** — GC must respect the oldest live transaction snapshot (see
   deferrals). Coordinate the keep-set computation.
-- **Interacts with #74 migrations** — only Tier 3's optional persisted commit-LSN would touch the
-  on-disk format / `format_version`; Tiers 1–2 do not, so they need no migration.
+- **Interacts with #74 migrations** — **no tier touches the on-disk format** (Tier 3 keeps columns as
+  the source of truth, conflict map non-durable), so none needs a `format_version` bump or a migration;
+  only a *future* rung-3 (log-as-truth) or segmented columns would, and that is a separate change.
 
 ## Load-bearing references
 
