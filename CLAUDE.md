@@ -46,7 +46,7 @@ rather than a generic runtime that interprets schemas? If either fails → rejec
   from `[workspace.package]` in the root `Cargo.toml`. Requires Rust ≥ 1.85.
 - Toolchain pinned in `rust-toolchain.toml` (channel `1.96`, with `rustfmt` + `clippy`).
 - `Cargo.lock` **is committed** (this is a CLI/binary workspace).
-- JS/TS tooling (npm-package, vscode extension, Bun runtime): use **Bun**, not npm/node.
+- JS/TS tooling (vscode extension, inspector app, generated TS SDK): use **Bun**, not npm/node.
   TypeScript only, never plain JS.
 
 ## Build, test, run
@@ -59,7 +59,7 @@ cargo run   -- --help                # list commands
 cargo clippy --workspace             # no dead-code warnings (style lints remain, pre-existing)
 ```
 
-CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`, `serve`,
+CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`,
 `tenant` (`create|list|drop` — #59 multi-tenancy dir management),
 `coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
@@ -226,16 +226,19 @@ in `crates/`:
 **Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
 are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI
 from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates.
-`lsp-server` + `ffi` remain unpublished.)
+`lsp-server` remains unpublished.)
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
 - `validation`, `migrations`, `backup`, `changefeed`,
-  `watcher`, `lsp-server`, `ffi`  (`query-params` + `compaction` are now **published** — see the
+  `watcher`, `lsp-server`  (`query-params` + `compaction` are now **published** — see the
   published-crates list above)
   (`fulltext` + `crud-api` were removed in Phase 3b; `query-optimization` + `http-server` were
   removed by the legacy audit (#94) as zero-consumer dead code — the API existence/404 logic lives
-  in the generated handlers, and the generated `api.rs` builds its own router.)
+  in the generated handlers, and the generated `api.rs` builds its own router. `ffi` — the pre-v1
+  C-ABI bindings crate — and the legacy `npm-package/` Bun FFI runtime were removed 2026-07-15 as a
+  clean slate for the bindings phase (#50–#53); they predated the generator-identity discipline
+  (the npm-package shipped a generic runtime `QueryBuilder` — a red-line violation).)
   `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
   `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
   schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
