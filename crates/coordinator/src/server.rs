@@ -3,8 +3,17 @@
 //!
 //! ## What the server owns (schema-agnostic control plane)
 //!
-//! - An exclusive advisory lock on the data directory (`_coordinator.lock` via
-//!   `fs2`), so a second coordinator process is refused immediately.
+//! - The **#89 single-writer `DirLock`** on the data directory, held on behalf
+//!   of all coordinated clients (Tier 3 mode-switch, spec T3-5): an exclusive
+//!   advisory `fs2` lock on `<root>/.forgedb.lock` — the *exact same file*
+//!   `forgedb_storage::DirLock::acquire` locks. Holding it means (a) a second
+//!   coordinator is refused, and (b) a *standalone* writer (which self-acquires
+//!   the `DirLock` in `open_at`) is mutually excluded — so "coordinated" and
+//!   "standalone" modes can never both run. Coordinated clients therefore open
+//!   **lock-free** (`_lock: None`); their write mutual-exclusion comes from the
+//!   serialized turn-grant, not the file lock. This is pure filesystem interop
+//!   on an opaque path — the coordinator gains NO `forgedb-storage*` dependency
+//!   (T3-8): it never opens a column, it only advisory-locks a known path.
 //! - A [`CommitSequencer`] seeded from the broker watermark, so LSNs continue
 //!   monotonically across restarts.
 //! - A [`DurableBroker`] for `_coordinator_replication.log` — the cross-process
@@ -38,13 +47,28 @@ use crate::{ClientMsg, ServerMsg, decode_msg, encode_msg};
 /// this deadline, un-wedging all other writers.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The data-directory single-writer lock filename.
+///
+/// **Load-bearing cross-crate contract:** this MUST byte-match the filename
+/// `forgedb_storage::DirLock::acquire` locks (`storage-native/src/dir_lock.rs`,
+/// `<root>/.forgedb.lock`). The coordinator advisory-locks the *same* file so a
+/// standalone writer and a coordinator are mutually exclusive (spec T3-5). The
+/// constant is duplicated rather than imported because the coordinator must not
+/// depend on `forgedb-storage*` (T3-8) — a filesystem contract, the same class
+/// of coupling as the on-disk column format the backup crate reads. A parity
+/// test in each crate pins the string so a rename cannot silently desync.
+pub const DIR_LOCK_FILENAME: &str = ".forgedb.lock";
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("data directory is already locked by another coordinator process")]
+    #[error(
+        "data directory is already locked (another coordinator, or a standalone \
+         ForgeDB writer, already holds <root>/.forgedb.lock)"
+    )]
     DirAlreadyLocked,
     #[error("coordinator is shutting down")]
     Shutdown,
@@ -222,8 +246,11 @@ impl Coordinator {
     pub fn open(root: &Path, socket_path: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)?;
 
-        // Acquire exclusive advisory lock on the coordinator lock file.
-        let lock_path = root.join("_coordinator.lock");
+        // Acquire the #89 single-writer lock (spec T3-5): the SAME
+        // `<root>/.forgedb.lock` file `forgedb_storage::DirLock` locks. Holding
+        // it excludes both a second coordinator AND a standalone writer, so the
+        // two modes are mutually exclusive. Coordinated clients open lock-free.
+        let lock_path = root.join(DIR_LOCK_FILENAME);
         let lock_file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -424,6 +451,45 @@ mod tests {
         let _c1 = Coordinator::open(&root, &sock1).expect("first coordinator");
         let err = Coordinator::open(&root, &sock2).unwrap_err();
         assert!(matches!(err, ServerError::DirAlreadyLocked));
+    }
+
+    /// G2 (PM re-gate #84 guard) — the coordinator holds the SAME
+    /// `<root>/.forgedb.lock` a standalone writer's `DirLock` would take, so a
+    /// standalone writer is mutually excluded while a coordinator runs. We can't
+    /// depend on `forgedb-storage*` (T3-8), so we replay exactly what
+    /// `DirLock::acquire` does — an `fs2` exclusive advisory lock on that file —
+    /// and assert it is refused (`WouldBlock`).
+    #[test]
+    fn coordinator_lock_excludes_standalone_writer() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_owned();
+        let sock = tmp.path().join("coord.sock");
+        let _coord = Coordinator::open(&root, &sock).expect("open coordinator");
+
+        // Simulate `forgedb_storage::DirLock::acquire(root)` byte-for-byte.
+        let standalone = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(DIR_LOCK_FILENAME))
+            .unwrap();
+        let err = standalone.try_lock_exclusive().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::WouldBlock,
+            "a standalone writer must be refused while the coordinator holds the lock"
+        );
+    }
+
+    /// G3 (PM re-gate #84 guard) — the coordinator's lock filename MUST byte-match
+    /// the one `forgedb_storage::DirLock` uses (`storage-native/src/dir_lock.rs`:
+    /// `<root>/.forgedb.lock`). The two are duplicated (not imported) because the
+    /// coordinator must not depend on `forgedb-storage*` (T3-8); this test pins the
+    /// string so a rename on either side is caught. The mirror assertion lives in
+    /// `storage-native`'s `dir_lock` tests.
+    #[test]
+    fn lock_filename_matches_storage_dirlock() {
+        assert_eq!(DIR_LOCK_FILENAME, ".forgedb.lock");
     }
 
     #[test]
