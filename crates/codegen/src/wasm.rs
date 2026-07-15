@@ -685,6 +685,11 @@ forgedb-types = "0.2"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"
+# The generated database.rs embeds a Tier-2 CommitSequencer field (MVCC #75);
+# forgedb-txn is pure in-memory (no fs/net) so it compiles to wasm32. The Tier-3
+# coordinator surface is cfg-gated off wasm, so forgedb-coordinator is NOT a
+# replica dep. The read-only Replica transport exposes no write/transaction API.
+forgedb-txn = "0.1"
 rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"

@@ -4113,6 +4113,12 @@ impl Database {
 ///
 /// Create via [`Database::connect`] (connects to the coordinator, then
 /// opens the data dir lock-free — the coordinator holds the #89 lock).
+///
+/// Native-only: `forgedb-coordinator` uses Unix sockets + advisory
+/// file locks, so the whole Tier-3 coordinated surface is gated off
+/// the `wasm32` build (the browser read-replica is a read-only
+/// follower — it never coordinates multi-process writes).
+#[cfg(not(target_arch = "wasm32"))]
 pub struct CoordinatedDatabase {
     shared: SharedDatabase,
     coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
@@ -4121,6 +4127,7 @@ pub struct CoordinatedDatabase {
     /// is performed before the next prepare (peer read-currency, #84).
     last_refreshed_lsn: std::sync::atomic::AtomicU64,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl CoordinatedDatabase {
     /// Run a transaction through the Tier 3 commit coordinator.
     ///
@@ -4302,6 +4309,7 @@ impl CoordinatedDatabase {
         Err(TxError::Conflict)
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl Database {
     /// Peer read-currency refresh for Tier 3 multi-process writers (#84).
     ///
