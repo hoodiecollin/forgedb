@@ -26,3 +26,7 @@ apps/inspector/src-tauri/target/
 apps/inspector/src-tauri/gen/
 apps/inspector/next-env.d.ts
 apps/inspector/*.tsbuildinfo
+
+# VS Code extension build artifacts (source is tracked; outputs are not)
+vscode-forgedb/out/
+vscode-forgedb/*.vsix
