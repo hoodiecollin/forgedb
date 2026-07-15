@@ -17,6 +17,7 @@ members = [
     "crates/changefeed",
     "crates/auth",
     "crates/txn",
+    "crates/coordinator",
     "crates/lsp-server",
     "crates/ffi",
     "apps/inspector/src-tauri",
@@ -53,6 +54,7 @@ forgedb-watcher = { path = "crates/watcher", version = "0.1.0" }
 forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 forgedb-backup = { path = "crates/backup", version = "0.1.0" }
+forgedb-coordinator = { path = "crates/coordinator", version = "0.1.0" }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
 thiserror = "2.0"

@@ -1316,6 +1316,7 @@ dependencies = [
  "forgedb-backup",
  "forgedb-codegen",
  "forgedb-compaction",
+ "forgedb-coordinator",
  "forgedb-migrations",
  "forgedb-parser",
  "forgedb-query-params",
@@ -1388,6 +1389,20 @@ name = "forgedb-compaction"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "forgedb-coordinator"
+version = "0.1.0"
+dependencies = [
+ "forgedb-changefeed",
+ "forgedb-txn",
+ "fs2",
  "log",
  "serde",
  "serde_json",
