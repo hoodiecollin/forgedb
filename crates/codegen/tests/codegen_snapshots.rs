@@ -3611,3 +3611,632 @@ Order {
 
     insta::assert_snapshot!(code);
 }
+
+#[test]
+fn test_rust_generation_transaction() {
+    // MVCC Tier 1 (#83, M1a): the generated `Database` gains a transaction API — a
+    // `TxHandle` with scoped per-model `create_/update_/delete_` writes + `get_/all_`
+    // reads, `Database::transaction(|tx| ...)`, staged-append (no eager index/feed),
+    // read-your-writes via a raised watermark, commit = advance visibility, rollback
+    // = truncate to marks.  Entirely generated on the tailored Database — identity
+    // red line: no generic runtime transaction executor.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+}
+
+Post {
+  id: +uuid
+  author: *User
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The transaction entry point + handle are generated on the tailored Database.
+    assert!(
+        code.contains("pub fn transaction<T>(")
+            && code.contains("impl FnOnce(&mut TxHandle) -> Result<T, TxError>"),
+        "Database::transaction takes a closure over a scoped TxHandle"
+    );
+    assert!(
+        code.contains("pub struct TxHandle<'db>"),
+        "generated per-schema TxHandle struct"
+    );
+    assert!(
+        code.contains("pub enum TxError"),
+        "TxError type is generated"
+    );
+    assert!(
+        code.contains("impl From<ValidationError> for TxError"),
+        "a `?` on a staged validated write propagates a #91 ValidationError"
+    );
+
+    // Scoped per-model write + read methods exist on the handle.
+    assert!(
+        code.contains("pub fn create_user(&mut self, record: User) -> Result<Uuid, TxError>")
+            && code.contains("pub fn update_user(")
+            && code.contains("pub fn delete_user("),
+        "TxHandle exposes scoped create/update/delete per model"
+    );
+    assert!(
+        code.contains("pub fn get_user(&self, id: Uuid) -> Option<User>")
+            && code.contains("pub fn all_user(&self) -> Vec<User>"),
+        "TxHandle exposes scoped get/all per model"
+    );
+
+    // Read-your-writes: reads go through `get_at`/`all_at` with the watermark raised
+    // to the current staged physical length — ONE decode path, not a forked reader.
+    assert!(
+        code.contains("forgedb_storage::Snapshot::new(self.db.user.row_count)")
+            && code.contains("self.db.user.get_at(&__snap, id)"),
+        "txn reads resolve via get_at at the raised (staged) watermark"
+    );
+
+    // Staged writes use the low-level __stage_append (WAL + columns only — NO
+    // id_to_row/index/feed/broker), so rollback is a pure truncate.
+    assert!(
+        code.contains("pub fn __stage_append(&mut self, record: User, deleted: bool) -> usize"),
+        "generated low-level staged-append that skips index/feed/broker"
+    );
+    assert!(
+        code.contains("self.db.user.__stage_append(record, false)"),
+        "TxHandle::create stages via __stage_append"
+    );
+
+    // Rollback = truncate every touched collection's columns + WAL tail to the mark.
+    assert!(
+        code.contains("fn rollback_internal(&mut self)")
+            && code.contains("__truncate_all_to(__mark)")
+            && code.contains("wal.truncate_to("),
+        "rollback truncates staged rows + the staged WAL tail back to the mark"
+    );
+    // The Drop backstop rolls back an un-committed handle (panic safety).
+    assert!(
+        code.contains("impl<'db> Drop for TxHandle<'db>")
+            && code.contains("self.rollback_internal();"),
+        "an un-committed TxHandle rolls back on drop"
+    );
+
+    // Commit advances visibility ONLY on the Ok path (rebuild indexes) — never a
+    // mid-txn eager index write.  The buffered events drain to the broker on commit.
+    assert!(
+        code.contains("self.db.user.__reindex_committed();"),
+        "commit advances visibility by rebuilding id_to_row + indexes"
+    );
+    assert!(
+        code.contains("pending_events"),
+        "changefeed/broker events are buffered and drained on commit"
+    );
+
+    // Intra-txn `&unique` duplicate guard (M1a fix): the `staged_unique_keys` buffer
+    // catches two `create_<model>` calls with the same `&unique` value in ONE txn.
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
+        "TxHandle carries a staged-unique-key buffer for intra-txn duplicate detection"
+    );
+    assert!(
+        code.contains("self.staged_unique_keys.contains(") && code.contains("self.staged_unique_keys.insert("),
+        "staged write checks then claims unique keys in the buffer"
+    );
+
+    // Identity: no generic runtime executor — dispatch is on the OPAQUE model tag,
+    // never a decoded field (the same discipline as replication).
+    assert!(
+        !code.contains("match record.") && !code.contains("match field_name"),
+        "transaction machinery must never match on a decoded field"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_intra_unique() {
+    // MVCC Tier 1 (#83, M1a fix): two `create_<model>` calls with the same `&unique`
+    // field value inside a single transaction must be caught and rejected — the
+    // committed index cannot see staged rows, so a dedicated staged-unique buffer is
+    // required.  The buffer is discarded on rollback without touching the real index.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  username: &string
+  age: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The buffer is declared on TxHandle and initialized empty.
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
+        "TxHandle must carry a staged-unique buffer"
+    );
+    assert!(
+        code.contains("staged_unique_keys: std::collections::BTreeSet::new()"),
+        "TxHandle::begin initializes the buffer empty"
+    );
+
+    // BOTH `&unique` fields (email + username) are guarded against intra-txn duplicates.
+    // For each field the generated code checks `staged_unique_keys.contains(...)` then
+    // inserts on success; a second staged write with the same value hits the contains
+    // check and returns `Err(TxError::Validation(ValidationError::Unique{..}))`.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.matches("staged_unique_keys.contains(").count() >= 2,
+        "both &unique fields (email, username) have a staged-buffer contains-check"
+    );
+    assert!(
+        flat.matches("staged_unique_keys.insert(").count() >= 2,
+        "both &unique fields claim their key in the buffer on success"
+    );
+
+    // The check fires BEFORE the stage append — a rejected duplicate leaves no staged row.
+    let create_idx = code.find("pub fn create_user(").expect("create_user method");
+    let create_body = &code[create_idx..];
+    let contains_pos = create_body.find("staged_unique_keys.contains(").expect("contains check");
+    let stage_pos = create_body.find("__stage_append").expect("stage append");
+    assert!(
+        contains_pos < stage_pos,
+        "staged-unique check fires before the stage append (a rejected dup leaves no row)"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_commit_journal() {
+    // MVCC Tier 1 (#83, M1b): the atomic multi-model commit journal.  Commit fsyncs
+    // every touched collection's columns + WAL BEFORE appending the journal record
+    // (the ordering that makes the journal fsync the atomic commit point), and
+    // reopen truncates every touched model back to its journalled committed length.
+    // The journal reuses the published `forgedb-wal` `Raw` path — no new substrate.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Database holds the journal, opened at open_at via the published WAL Raw path.
+    assert!(
+        code.contains("_txn_journal: Option<forgedb_wal::WalManager>"),
+        "Database owns the transaction commit journal"
+    );
+    assert!(
+        code.contains("root.join(\"_txn_journal.log\")"),
+        "journal is a root-level append-only log"
+    );
+
+    // Commit order: columns + WAL fsync FIRST, then the journal record + fsync.
+    let commit_idx = code.find("pub fn commit(mut self) -> Result<(), TxError>").unwrap();
+    let commit_body = &code[commit_idx..];
+    let fsync_pos = commit_body.find(".commit();").expect("commit fsyncs columns");
+    let journal_pos = commit_body
+        .find("WalEntry::raw(\"_txn\"")
+        .expect("commit writes the journal record");
+    assert!(
+        fsync_pos < journal_pos,
+        "columns must be fsynced BEFORE the journal record (the atomic commit point)"
+    );
+    assert!(
+        commit_body[journal_pos..].contains(".flush()"),
+        "the journal record is fsynced (the single commit-point fsync)"
+    );
+
+    // Journal-driven recovery: open_at reads the last record and truncates each
+    // touched collection back to its committed length via __recover_to_committed.
+    assert!(
+        code.contains("pub fn __recover_to_committed(&mut self, committed_len: usize)"),
+        "generated per-model journal recovery"
+    );
+    assert!(
+        code.contains("__db.user.__recover_to_committed(__len as usize)"),
+        "open_at applies journalled committed lengths to each touched model"
+    );
+
+    // Identity: the journal payload is opaque bytes; recovery dispatches on the
+    // opaque model tag, never a decoded field.
+    assert!(
+        code.contains("serde_json::to_vec(&__journal)"),
+        "the journal record is opaque encoded bytes (length vector), not a decoded field"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_defers_maintenance() {
+    // MVCC Tier 1 (#83, M1c/M1d, PM constraint 1): auto-checkpoint (#96) and
+    // auto-compaction (#92) MUST NOT fire mid-transaction (a checkpoint would
+    // truncate the per-model WAL underneath the rollback; a compaction would
+    // renumber rows underneath the marks).  They are deferred behind an
+    // `in_transaction` guard and run once after commit/rollback.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: ^u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Storage carries the guard + deferred flags.
+    assert!(
+        code.contains("in_transaction: bool")
+            && code.contains("checkpoint_deferred: bool")
+            && code.contains("compact_deferred: bool"),
+        "storage carries the txn guard + deferred flags"
+    );
+
+    // Auto-checkpoint defers while in a transaction.
+    assert!(
+        code.contains("if self.in_transaction {")
+            && code.contains("self.checkpoint_deferred = true;"),
+        "auto-checkpoint defers to checkpoint_deferred while in a transaction"
+    );
+    // Auto-compaction defers while in a transaction.
+    assert!(
+        code.contains("self.compact_deferred = true;"),
+        "auto-compaction defers to compact_deferred while in a transaction"
+    );
+    // compact() itself early-returns mid-transaction (M1d).
+    let compact_idx = code.find("pub fn compact(&mut self) {").unwrap();
+    let compact_body = &code[compact_idx..compact_idx + 400];
+    assert!(
+        compact_body.contains("if self.in_transaction {")
+            && compact_body.contains("self.compact_deferred = true;")
+            && compact_body.contains("return;"),
+        "compact() early-returns (deferred) when called mid-transaction"
+    );
+
+    // Deferred maintenance runs once after the critical section closes.
+    assert!(
+        code.contains("pub fn run_deferred_maintenance(&mut self)"),
+        "a deferred checkpoint/compaction runs after commit/rollback"
+    );
+    assert!(
+        code.contains("self.db.user.run_deferred_maintenance();"),
+        "commit/rollback run the deferred maintenance per touched collection"
+    );
+}
+
+#[test]
+fn test_rust_generation_optimistic_commit() {
+    // MVCC Tier 2 (#83): the generated Database gains `transaction_retrying` — an
+    // optimistic, auto-retrying entry point with a sequencer-backed conflict map.
+    // PM identity red line: the commit/conflict path must contain NO `match
+    // model_name` (opaque-key discipline, same as the replication broker).
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+}
+
+Post {
+  id: +uuid
+  author: *User
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // transaction_retrying is generated on Database.
+    assert!(
+        flat.contains("pubfntransaction_retrying<T>(")
+            && flat.contains("retries:u32,")
+            && flat.contains("implFn(&mutTxHandle)->Result<T,TxError>"),
+        "Database::transaction_retrying is generated"
+    );
+
+    // The sequencer is on Database (for LSN assignment + conflict detection).
+    assert!(
+        flat.contains("seq:std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>"),
+        "Database carries the commit sequencer"
+    );
+
+    // Sequencer is seeded from the broker watermark on open_at.
+    assert!(
+        flat.contains("CommitSequencer::new(") && flat.contains("watermark()"),
+        "sequencer seeded from broker watermark on open_at"
+    );
+
+    // The commit path calls try_commit with a WriteSet.
+    assert!(
+        flat.contains(".try_commit(&__ws)"),
+        "transaction_retrying calls try_commit on the sequencer"
+    );
+
+    // The write-set is built via TxHandle::__write_set (opaque keys).
+    assert!(
+        flat.contains("fn__write_set(") || flat.contains("__write_set("),
+        "TxHandle exposes __write_set to build the opaque write-set"
+    );
+
+    // Retry loop: after exhausting retries, returns TxError::Conflict.
+    assert!(
+        flat.contains("TxError::Conflict"),
+        "exhausted retries return TxError::Conflict"
+    );
+
+    // transaction_optimistic is a convenience wrapper.
+    assert!(
+        flat.contains("pubfntransaction_optimistic<T>("),
+        "transaction_optimistic convenience wrapper is generated"
+    );
+
+    // DEFAULT_TXN_RETRIES const.
+    assert!(
+        flat.contains("DEFAULT_TXN_RETRIES:u32"),
+        "DEFAULT_TXN_RETRIES const is generated"
+    );
+
+    // PM identity red line: no match on model_name in the commit/conflict path.
+    // (same discipline as test_rust_generation_replication_broker)
+    let retrying_idx = flat.find("transaction_retrying").expect("transaction_retrying in generated code");
+    let retrying_body = &flat[retrying_idx..retrying_idx + 2000.min(flat.len() - retrying_idx)];
+    assert!(
+        !retrying_body.contains("matchmodel_name"),
+        "the commit/conflict path must never match on the model name"
+    );
+
+    // Tier 1 is intact: existing transaction() still generated.
+    assert!(
+        flat.contains("pubfntransaction<T>(")
+            && flat.contains("implFnOnce(&mutTxHandle)->Result<T,TxError>"),
+        "Tier 1 Database::transaction (FnOnce) is preserved"
+    );
+
+    // Tier 2 concurrent prepare: SharedDatabase, ConcurrentTxHandle, transaction_concurrent.
+    assert!(
+        flat.contains("pubstructSharedDatabase"),
+        "SharedDatabase struct is generated"
+    );
+    assert!(
+        flat.contains("pubstructConcurrentTxHandle"),
+        "ConcurrentTxHandle struct is generated"
+    );
+    assert!(
+        flat.contains("pubfntransaction_concurrent<T>("),
+        "SharedDatabase::transaction_concurrent is generated"
+    );
+    // Private buffer staging (not shared columns).
+    assert!(
+        flat.contains("buffer:Vec<("),
+        "ConcurrentTxHandle has a private buffer field"
+    );
+    // Write-set uses logical id bytes, not physical row index.
+    // The old approach used `(*__row as u64).to_le_bytes()` — that string must not appear.
+    assert!(
+        flat.contains("__id_bytes"),
+        "write-set uses logical id bytes"
+    );
+    assert!(
+        !flat.contains("(*__rowasu64).to_le_bytes()"),
+        "write-set must not use physical row index to_le_bytes"
+    );
+    // Database::shared() constructor.
+    assert!(
+        flat.contains("pubfnshared(self)->SharedDatabase"),
+        "Database::shared() is generated"
+    );
+    // The concurrent apply dispatch is in the APPLY path only.
+    assert!(
+        flat.contains("__apply_and_commit_concurrent_buffer"),
+        "Database::__apply_and_commit_concurrent_buffer is generated"
+    );
+}
+
+#[test]
+fn test_rust_generation_compaction_respects_live_snapshot() {
+    // MVCC Tier 2 (#83, PM constraint 3): auto-compaction must not GC row versions
+    // that a live transaction snapshot still needs.  In Tier 2 with &mut Database
+    // semantics, the existing `in_transaction` flag transitively defers compaction
+    // while any transaction is in flight (transaction_retrying takes &mut self and
+    // calls TxHandle::begin which sets in_transaction on each touched collection).
+    // This guard verifies that: (a) compact() still defers on in_transaction, and
+    // (b) the sequencer's oldest_live_snapshot is checked at the Database level so
+    // Tier 3 concurrent prepare is safe.
+    let src = r#"
+User {
+  id: +uuid
+  email: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The in_transaction deferred guard is present in compact().
+    assert!(
+        code.contains("if self.in_transaction {") && code.contains("self.compact_deferred = true;"),
+        "storage compact() defers while in_transaction is set"
+    );
+
+    // The sequencer is on Database; its oldest_live_snapshot transitively protects
+    // live snapshots.  Verify the sequencer is accessible and the oldest_live_snapshot
+    // method is referenced in the generated code (for the database-level compact guard).
+    assert!(
+        code.contains("oldest_live_snapshot"),
+        "generated code references oldest_live_snapshot for the keep-set bound"
+    );
+}
+
+#[test]
+fn test_rust_generation_coordinated_client() {
+    // Tier 3 MVCC coordinator client (#84): `Database::connect` must produce a
+    // `CoordinatedDatabase` whose `transaction_coordinated` routes the serialized
+    // commit section through the coordinator Unix socket while reusing the SAME
+    // `__apply_and_commit_concurrent_buffer` data-plane path as Tier 2.
+    //
+    // PM identity constraints checked here (incl. the #84 lock-skip re-gate):
+    // (a) The coordinator client surface is generated (no hand-rolled alternative).
+    // (b) No second apply body — `transaction_coordinated` calls
+    //     `__apply_and_commit_concurrent_buffer`, NOT a separate per-model dispatch.
+    // (c) The coordinator receives only opaque bytes (no decoded field in the
+    //     `Committed` payload: model tags are byte-cast, not field-decoded).
+    // (d) `CoordinatedDatabase` is strictly additive — no existing method is modified.
+    // (e) Real row indices forwarded — NOT placeholder 0 (T3-3/T3-8).
+    // (f) Peer read-currency: `__peer_refresh` is generated data-plane code that
+    //     reads shared column files; the coordinator has no column-write dep (T3-8).
+    // (g) T3-8 structural: no `forgedb_storage` write import in coordinator payload
+    //     build path (the generated Committed payload is opaque bytes only).
+    // (G1) Lock-skip (T3-5): the coordinated open (`connect`) opens LOCK-FREE via
+    //      `__open_with_lock(root, None)`; the standalone `open_at` DOES take the
+    //      #89 `DirLock::acquire`. This pins the exact bug the #84 data-plane fix
+    //      corrected (every client self-locking ⇒ concurrent multi-process
+    //      impossible), analogous to the `no match model_name` structural guards.
+    // (G3) T3-8 dependency: `forgedb-coordinator/Cargo.toml` has NO
+    //      `forgedb-storage*` dependency (checked below), so the coordinator can
+    //      never link the column-write machinery.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // (a) The CoordinatedDatabase struct is emitted.
+    assert!(
+        code.contains("pub struct CoordinatedDatabase"),
+        "CoordinatedDatabase struct emitted"
+    );
+
+    // (a) Database::connect factory is emitted; the old lock-taking
+    // connect_coordinator(self) form is GONE (it wrapped an already-locked
+    // Database, which broke concurrent multi-process — #84).
+    assert!(
+        code.contains("pub fn connect("),
+        "Database::connect emitted"
+    );
+    assert!(
+        !code.contains("connect_coordinator"),
+        "old lock-taking connect_coordinator removed (#84 lock-skip fix)"
+    );
+
+    // (a) The transaction method is emitted.
+    assert!(
+        code.contains("pub fn transaction_coordinated"),
+        "CoordinatedDatabase::transaction_coordinated emitted"
+    );
+
+    // (b) No second apply body: the coordinator path delegates to the SAME
+    // __apply_and_commit_concurrent_buffer that Tier 2 uses.
+    assert!(
+        code.contains("__apply_and_commit_concurrent_buffer"),
+        "coordinator path reuses __apply_and_commit_concurrent_buffer (no drift)"
+    );
+
+    // (c) Opaque model tags — model name cast to bytes, NOT field-decoded.
+    assert!(
+        code.contains("as_bytes().to_vec()"),
+        "model tags forwarded as opaque bytes, not decoded fields"
+    );
+
+    // (d) Existing Tier 2 surface is untouched: SharedDatabase + transaction_concurrent.
+    assert!(
+        code.contains("pub struct SharedDatabase"),
+        "SharedDatabase still present (additive, no breakage)"
+    );
+    assert!(
+        code.contains("pub fn transaction_concurrent"),
+        "transaction_concurrent still present (additive, no breakage)"
+    );
+
+    // (d) The coordinator is referenced by its substrate path (not a generated struct).
+    assert!(
+        code.contains("forgedb_coordinator"),
+        "generated code references the forgedb-coordinator substrate crate"
+    );
+
+    // (e) Real row indices: __apply_and_commit_concurrent_buffer returns Vec<(model_tag, row_index)>
+    // and those are threaded into the Committed payload — NOT a placeholder 0 literal.
+    assert!(
+        !code.contains("__row_indices.push(0)"),
+        "row_indices must NOT be placeholder 0 — real positions from __apply_and_commit (T3-3)"
+    );
+    // The pairs are used to build model_tags and row_indices from the Ok result.
+    assert!(
+        code.contains("__peer_refresh"),
+        "peer read-currency: __peer_refresh method emitted (T3-8)"
+    );
+
+    // (f) Peer refresh re-derives EVERY column's row_count from disk (not just the
+    // tombstone — that was the bug: a peer's row is unreadable until all columns'
+    // bounds are refreshed), then rebuilds the maps.
+    assert!(
+        code.contains("__sync_columns_from_disk"),
+        "peer refresh syncs ALL columns from disk (not tombstone-only) — #84"
+    );
+    assert!(
+        code.contains("sync_from_disk"),
+        "peer refresh reads shared column live length via sync_from_disk (T3-8)"
+    );
+    assert!(
+        code.contains("__reindex_committed"),
+        "peer refresh rebuilds id_to_row + indexes via __reindex_committed"
+    );
+
+    // (g) T3-8 structural: last_refreshed_lsn tracks the peer-refresh cursor.
+    assert!(
+        code.contains("last_refreshed_lsn"),
+        "last_refreshed_lsn tracks peer refresh cursor (T3-8)"
+    );
+
+    // T3-5: Tier 2 call site is byte-identical — the `?;` expression is unchanged.
+    // The apply function now returns Vec<...> but the Tier-2 caller still uses `?;`
+    // (semicolon drops the Ok value).  Confirm SharedDatabase::transaction_concurrent
+    // still calls __apply_and_commit_concurrent_buffer.
+    assert!(
+        code.contains("pub fn transaction_concurrent"),
+        "Tier 2 transaction_concurrent unchanged (T3-5)"
+    );
+
+    // (G1) Lock-skip structural guard (#84 PM re-gate). The coordinated open path
+    // is LOCK-FREE and the standalone path is NOT — the exact bug the data-plane
+    // fix corrected. `connect` opens via `__open_with_lock(root, None)`; `open_at`
+    // acquires the #89 DirLock.
+    assert!(
+        code.contains("__open_with_lock(root, None)"),
+        "G1: coordinated open (connect) is LOCK-FREE — __open_with_lock(root, None)"
+    );
+    assert!(
+        code.contains("DirLock::acquire"),
+        "G1: standalone open_at still self-acquires the #89 DirLock"
+    );
+    // The lock-free open must be reachable ONLY through connect (which first
+    // establishes a live coordinator) — surfaced as CoordinatorUnavailable if not.
+    assert!(
+        code.contains("CoordinatorUnavailable"),
+        "G1: connect surfaces CoordinatorUnavailable (never a lock-free standalone writer)"
+    );
+
+    // (G3) T3-8 dependency guard — `forgedb-coordinator` must NOT depend on any
+    // `forgedb-storage*` crate, so it can never link the column-write machinery
+    // (`FixedColumn`/`VariableColumn`/`Tombstones` append). Read its manifest.
+    let coord_manifest = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../coordinator/Cargo.toml"
+    ))
+    .expect("read forgedb-coordinator Cargo.toml");
+    assert!(
+        !coord_manifest.contains("forgedb-storage"),
+        "G3 (T3-8): forgedb-coordinator must have NO forgedb-storage* dependency"
+    );
+}

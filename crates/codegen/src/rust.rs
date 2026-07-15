@@ -327,6 +327,75 @@ impl RustGenerator {
             }
         });
 
+        // Transaction error type (MVCC Tier 1, #83).  A transaction's scoped
+        // write methods call the SAME generated validated write path
+        // (`validate_<model>` + FK / `&unique` checks), so a `?` on any staged
+        // write propagates a #91 `ValidationError` and the transaction rolls back
+        // — one validator, no second copy.  `Io` surfaces a WAL/journal write
+        // failure; `Conflict` is reserved for Tier 2 optimistic concurrency (the
+        // `try_commit` loser) and is unused in Tier 1.
+        tokens.extend(quote! {
+            /// A rejected or failed transaction (MVCC Tier 1, #83).  Wraps the #91
+            /// `ValidationError` (so `?` on a scoped write rolls the txn back),
+            /// plus an `Io` variant for a durable-write failure and a `Conflict`
+            /// variant reserved for Tier 2 optimistic concurrency.
+            #[derive(Debug)]
+            pub enum TxError {
+                /// A staged write failed the generated integrity validators
+                /// (field constraints / `&unique` / FK existence).  The whole
+                /// transaction rolls back.
+                Validation(ValidationError),
+                /// A durable-write failure while committing (WAL/journal fsync).
+                Io(String),
+                /// A write-write conflict lost the serialized commit (Tier 2).
+                /// Never produced by Tier 1's single-writer transactions.
+                Conflict,
+                /// The Tier-3 commit coordinator is unreachable — either
+                /// `Database::connect` could not establish the turn-channel, or a
+                /// live commit exhausted its retries against a down/stuck
+                /// coordinator.  The data dir is NOT opened lock-free unless the
+                /// coordinator is live (MVCC spec T3-5 / PM re-gate #84), so this
+                /// never leaves an unserialized writer running.
+                CoordinatorUnavailable(String),
+            }
+
+            impl TxError {
+                /// The HTTP status a generated boundary would return: a validation
+                /// failure maps to its #91 status (409/422); an I/O or conflict
+                /// failure is a 500/409 server-side condition.
+                pub fn status_code(&self) -> u16 {
+                    match self {
+                        TxError::Validation(e) => e.status_code(),
+                        TxError::Io(_) => 500,
+                        TxError::Conflict => 409,
+                        // Coordinator down ⇒ writes are temporarily unavailable.
+                        TxError::CoordinatorUnavailable(_) => 503,
+                    }
+                }
+            }
+
+            impl std::fmt::Display for TxError {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    match self {
+                        TxError::Validation(e) => write!(f, "transaction rejected: {}", e),
+                        TxError::Io(m) => write!(f, "transaction I/O failure: {}", m),
+                        TxError::Conflict => write!(f, "transaction conflict (retry)"),
+                        TxError::CoordinatorUnavailable(m) => {
+                            write!(f, "commit coordinator unavailable: {}", m)
+                        }
+                    }
+                }
+            }
+
+            impl std::error::Error for TxError {}
+
+            impl From<ValidationError> for TxError {
+                fn from(e: ValidationError) -> Self {
+                    TxError::Validation(e)
+                }
+            }
+        });
+
         // Generate embedded struct definitions before the models that reference
         // them.  Models store structs as raw fixed-size bytes, so the struct
         // types must exist for the emitted `size_of`/`read_unaligned` code to
@@ -390,6 +459,19 @@ impl RustGenerator {
         let validated_writes = Self::generate_validated_writes(schema);
         tokens.extend(validated_writes);
 
+        // Generate the transaction surface (MVCC Tier 1, #83): the `TxHandle`
+        // struct + its scoped per-model write/read methods, `Database::transaction`,
+        // and the commit/rollback machinery (atomic multi-model commit journal,
+        // deferred-maintenance run, buffered changefeed/broker emit).
+        let transaction_impl = Self::generate_transaction_impl(schema);
+        tokens.extend(transaction_impl);
+
+        // Generate the Tier 2 concurrent-prepare surface (#83): SharedDatabase +
+        // ConcurrentTxHandle for genuine concurrent prepare (multiple threads prepare
+        // concurrently, commit is serialized under the exclusive write lock).
+        let shared_db_impl = Self::generate_shared_database_impl(schema);
+        tokens.extend(shared_db_impl);
+
         // Generate the snapshot-scoped M2M traversal on the read-only
         // `DatabaseReader` (#56 Direction B), so a concurrent reader can resolve
         // cross-table many-to-many links consistently as of its snapshot.
@@ -400,6 +482,12 @@ impl RustGenerator {
         // Database getters, which resolve a record's forward references in one call.
         let eager_tokens = Self::generate_eager_load(schema);
         tokens.extend(eager_tokens);
+
+        // Generate the Tier 3 coordinator client surface (#84): CoordinatedDatabase
+        // wraps SharedDatabase and routes the serialized commit section through the
+        // coordinator socket instead of the in-process sequencer.
+        let coord_tokens = Self::generate_coordinated_client(schema);
+        tokens.extend(coord_tokens);
 
         // Parse and format with prettyplease
         let syntax_tree = syn::parse_file(&tokens.to_string())
@@ -528,6 +616,13 @@ impl RustGenerator {
         // under the writer lock, then reopen to rebuild the in-memory maps.
         let compact_method = Self::generate_compact_method(model);
 
+        // Generate the transaction storage helpers (MVCC Tier 1, #83): the
+        // `__stage_append` low-level staged-write path (WAL + columns + row_count,
+        // NO id_to_row / index / changefeed / broker) the `TxHandle` uses, plus
+        // `run_deferred_maintenance` (runs a checkpoint/compaction that the txn
+        // guard deferred).  `None`-skipped for a model with no id (cannot mutate).
+        let txn_storage_methods = Self::generate_txn_storage_methods(model);
+
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
@@ -640,6 +735,8 @@ impl RustGenerator {
                 #checkpoint_method
 
                 #compact_method
+
+                #txn_storage_methods
 
                 /// Materialize the record at a physical row index, or `None` if
                 /// the row is tombstoned.  Shared read path (#56): `get`,
@@ -1742,6 +1839,20 @@ impl RustGenerator {
             // `compact()` reclaims them under the writer lock.  Incremented by
             // update/delete only — an insert creates no dead version.
             dead_since_compaction: u64,
+            // Transaction critical-section guard (MVCC Tier 1, #83).  Set while a
+            // `TxHandle` stages into this collection.  Auto-checkpoint (#96) and
+            // auto-compaction (#92) MUST NOT fire mid-transaction — a checkpoint
+            // would truncate the per-model WAL underneath the rollback, and a
+            // compaction would renumber rows underneath the rollback marks.  While
+            // set, the auto-triggers only RECORD that they are due (`*_deferred`
+            // below); `TxHandle::commit`/rollback runs any pending trigger once
+            // after the critical section closes.
+            in_transaction: bool,
+            // A checkpoint became due while `in_transaction`; deferred (#96).
+            checkpoint_deferred: bool,
+            // A compaction became due while `in_transaction`; deferred (#92) so it
+            // never renumbers rows a live transaction's marks refer to.
+            compact_deferred: bool,
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -1842,6 +1953,10 @@ impl RustGenerator {
             // Remember the data root so `compact()` can rewrite + reopen files (#92).
             root: root.to_path_buf(),
             dead_since_compaction: 0,
+            // Not in a transaction on open; the txn guard sets these (MVCC Tier 1).
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
             changefeed: None,
             broker: None,
         }
@@ -2846,6 +2961,15 @@ impl RustGenerator {
             /// rewrite this model's files dropping dead rows, then reopen to
             /// rebuild `id_to_row` + secondary indexes from the compacted files.
             pub fn compact(&mut self) {
+                // MVCC Tier 1 (#83, M1d): never compact mid-transaction — the
+                // renumbering below would invalidate a live transaction's rollback
+                // marks (physical row lengths) and could reclaim a version the
+                // transaction's read snapshot still needs.  Record it as due and
+                // run it after the transaction closes (`run_deferred_maintenance`).
+                if self.in_transaction {
+                    self.compact_deferred = true;
+                    return;
+                }
                 // 1. Make columns durable + discard the WAL tail (no index-relative
                 //    replay may survive the renumbering below).
                 self.checkpoint();
@@ -2894,6 +3018,191 @@ impl RustGenerator {
         }
     }
 
+    /// Generate the transaction storage helpers on a model's `*Storage` (MVCC
+    /// Tier 1, #83): `__stage_append` (the low-level staged write the `TxHandle`
+    /// drives) and `run_deferred_maintenance` (runs a checkpoint/compaction the
+    /// txn guard deferred).  `None`-skipped for a model without an id (which
+    /// cannot be mutated, so it is never touched by a transaction).
+    ///
+    /// `__stage_append` is deliberately the SAME column + WAL write as the
+    /// committed `insert`/`update`/`delete` path (it reuses the shared
+    /// `generate_append_statements` and `generate_wal_record_write`), but it does
+    /// **not** advance `id_to_row`, maintain indexes, emit the changefeed / broker,
+    /// or checkpoint.  That is
+    /// exactly the split the note requires: staged rows are physically appended
+    /// (past the public watermark) and durable in the per-model WAL, but invisible
+    /// to outside readers and unindexed until the transaction's commit applies the
+    /// buffered index ops and advances the watermark.  Read-your-writes inside the
+    /// txn comes from `get_at` with the watermark raised to the staged length — one
+    /// decode path, no fork.
+    fn generate_txn_storage_methods(model: &forgedb_parser::Model) -> TokenStream {
+        if model.fields.iter().find(|f| f.name == "id" || f.auto_generate).is_none() {
+            return quote! {};
+        }
+        let model_name = format_ident!("{}", model.name);
+        let append_statements = Self::generate_append_statements(model);
+        let wal_write_live = Self::generate_wal_record_write(model, false);
+        let wal_write_deleted = Self::generate_wal_record_write(model, true);
+        let col_idents: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| {
+                Self::is_fixed_size_type(&f.field_type)
+                    || Self::is_variable_column_type(&f.field_type)
+            })
+            .map(|f| format_ident!("{}_col", f.name))
+            .collect();
+        // Reindex body: clear every in-memory map, then rebuild `id_to_row` +
+        // secondary indexes from the committed prefix via the SAME narrow decode
+        // path `new_at` uses (one body, no drift) — but on `self` in place.
+        let clear_indexes: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                quote! { self.#ident.clear(); }
+            })
+            .chain(Self::composite_indexes(model).iter().map(|(ident, _)| {
+                quote! { self.#ident.clear(); }
+            }))
+            .collect();
+        let rehydrate_self = Self::generate_rehydrate_body(model, &quote! { self });
+        quote! {
+            /// Rebuild `id_to_row` + secondary indexes from the committed prefix
+            /// in place (MVCC Tier 1, #83).  A transaction stages rows via
+            /// `__stage_append`, which deliberately does NOT touch the identity or
+            /// secondary index maps; its `commit` calls this once per touched
+            /// collection to make the newly-visible rows resolvable.  It clears the
+            /// maps and re-runs the SAME reopen-rehydration body `new_at` uses
+            /// (last-write-wins per id, tombstone-gated index keys), so the maps
+            /// end up exactly as a fresh reopen would build them — no incremental
+            /// remove-old/add-new bookkeeping to drift.
+            pub fn __reindex_committed(&mut self) {
+                self.id_to_row.clear();
+                #(#clear_indexes)*
+                #rehydrate_self
+            }
+
+            /// Refresh EVERY column + the tombstone's in-memory `row_count` from
+            /// the on-disk file lengths, then adopt the peer-visible row count
+            /// (MVCC Tier 3, #84 — peer read-currency).  Reads are positional and
+            /// bounded by each column's cached `row_count`; a *peer* process's
+            /// appended rows stay invisible until this re-derives those counts
+            /// from the shared files.  Syncing ONLY the tombstone (as an earlier
+            /// cut did) bumps the row count but leaves every data column bounded
+            /// at its open-time length, so `get`/`read_at` of a peer row reads out
+            /// of bounds — this syncs them all.  Uses the additive
+            /// `*::sync_from_disk` substrate (`storage-native`); writes nothing
+            /// (T3-8: generated data-plane read-refresh, no column append/flush).
+            /// Caller pairs this with `__reindex_committed` to rebuild the maps.
+            pub fn __sync_columns_from_disk(&mut self) {
+                #(
+                    let _ = self.#col_idents.sync_from_disk();
+                )*
+                let _ = self.tombstones.sync_from_disk();
+                self.row_count = self.tombstones.len();
+            }
+
+            /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
+            /// #83).  The transaction rollback primitive: erases staged ahead-rows
+            /// so the collection returns to its pre-txn physical length.  Reuses the
+            /// published `truncate_to_rows` on each column type (no substrate change).
+            /// A no-op past the current length (nothing staged).
+            pub fn __truncate_all_to(&mut self, rows: usize) -> std::io::Result<()> {
+                #(
+                    self.#col_idents.truncate_to_rows(rows)?;
+                )*
+                self.tombstones.truncate_to_rows(rows)?;
+                Ok(())
+            }
+
+            /// Journal-driven recovery to a committed row-count (MVCC Tier 1, #83,
+            /// M1b).  Called at `open_at` when the `_txn_journal` names a committed
+            /// length for this model that is BELOW the length the columns/WAL
+            /// recovered to — i.e. a transaction staged rows into this collection
+            /// but its journal commit record never landed (a torn / aborted
+            /// commit).  Truncate every column + the tombstone back to
+            /// `committed_len` (erasing the aborted ahead-rows), discard the WAL
+            /// (the committed prefix is already durable in the columns, and the
+            /// aborted staged WAL records must not replay), then reopen to rebuild
+            /// `id_to_row` + secondary indexes from the truncated committed prefix.
+            /// A no-op when `committed_len >= row_count` (nothing aborted).
+            pub fn __recover_to_committed(&mut self, committed_len: usize) {
+                if committed_len >= self.row_count {
+                    return;
+                }
+                #(
+                    self.#col_idents
+                        .truncate_to_rows(committed_len)
+                        .expect("Failed to truncate column on journal recovery");
+                )*
+                self.tombstones
+                    .truncate_to_rows(committed_len)
+                    .expect("Failed to truncate tombstones on journal recovery");
+                self.row_count = committed_len;
+                // Discard the WAL: its committed prefix is durable in the columns
+                // (which we just made authoritative at `committed_len`), and its
+                // aborted staged tail must NOT replay on the reopen below.
+                self.wal
+                    .truncate()
+                    .expect("Failed to truncate WAL on journal recovery");
+                // Reopen to rebuild the in-memory maps from the committed prefix,
+                // preserving the shared feed / broker (as compaction's reopen does).
+                let __root = self.root.clone();
+                let __feed = self.changefeed.take();
+                let __broker = self.broker.take();
+                *self = Self::new_at(&__root);
+                self.changefeed = __feed;
+                self.broker = __broker;
+            }
+
+            /// Stage one physically-appended row for a transaction (MVCC Tier 1,
+            /// #83).  WAL-records the row (durable, `FsyncPolicy::Always`) then
+            /// appends every column + the tombstone at the current physical row
+            /// index, bumps `row_count`, and returns that index — WITHOUT touching
+            /// `id_to_row`, secondary indexes, the change feed, the broker, or the
+            /// checkpoint counter.  The transaction's `commit` applies those
+            /// deferred effects once, atomically; a `rollback` truncates every
+            /// staged row + the staged WAL tail back to the pre-txn mark.  The row
+            /// is invisible to outside readers (whose `get`/`all` clamp at the
+            /// public watermark) until commit advances the watermark past it.
+            pub fn __stage_append(&mut self, record: #model_name, deleted: bool) -> usize {
+                let row_index = self.row_count;
+                // Durability boundary (#89): WAL-record the row before any column
+                // is touched, so a crash mid-stage is repaired on reopen and the
+                // aborted tail is dropped by journal-driven recovery.
+                if deleted {
+                    #wal_write_deleted
+                } else {
+                    #wal_write_live
+                }
+                // Append all columns from `record`, then the tombstone flag.
+                #(#append_statements)*
+                self.tombstones
+                    .append(deleted)
+                    .expect("Failed to append tombstone");
+                self.row_count += 1;
+                row_index
+            }
+
+            /// Run any checkpoint/compaction the transaction guard deferred (MVCC
+            /// Tier 1, #83).  Called by `TxHandle::commit`/rollback once the
+            /// critical section closes and `in_transaction` is cleared, so the
+            /// #96/#92 auto-maintenance still runs — just after the transaction,
+            /// never underneath its rollback marks.  Compaction subsumes a
+            /// checkpoint, so if both are due only compaction runs.
+            pub fn run_deferred_maintenance(&mut self) {
+                if self.compact_deferred {
+                    self.compact_deferred = false;
+                    self.checkpoint_deferred = false;
+                    self.compact();
+                } else if self.checkpoint_deferred {
+                    self.checkpoint_deferred = false;
+                    self.checkpoint();
+                }
+            }
+        }
+    }
+
     /// Emit the tail every mutation runs after its columns are appended and
     /// `row_count` is bumped: count the write and checkpoint once the interval is
     /// reached.  Placed AFTER the append + increment so the checkpoint always sees
@@ -2904,7 +3213,14 @@ impl RustGenerator {
             // and truncate the WAL so it never grows without limit.
             self.writes_since_checkpoint += 1;
             if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
-                self.checkpoint();
+                // MVCC Tier 1 (#83): a checkpoint mid-transaction would truncate
+                // the per-model WAL underneath the rollback — defer it to after
+                // the transaction commits/rolls back (`run_deferred_maintenance`).
+                if self.in_transaction {
+                    self.checkpoint_deferred = true;
+                } else {
+                    self.checkpoint();
+                }
             }
         }
     }
@@ -2921,7 +3237,14 @@ impl RustGenerator {
             // reclaim them in-process under the writer lock.
             self.dead_since_compaction += 1;
             if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
-                self.compact();
+                // MVCC Tier 1 (#83): compaction renumbers physical rows, which
+                // would invalidate a live transaction's rollback marks (physical
+                // lengths).  Defer it to after commit/rollback.
+                if self.in_transaction {
+                    self.compact_deferred = true;
+                } else {
+                    self.compact();
+                }
             }
         }
     }
@@ -4183,17 +4506,30 @@ impl RustGenerator {
     /// field only — reconstructing the identity map is all reopen needs; the
     /// remaining columns are read on demand by `get`.
     fn generate_rehydrate_logic(model: &forgedb_parser::Model) -> TokenStream {
+        Self::generate_rehydrate_body(model, &quote! { db })
+    }
+
+    /// The shared reopen-rehydration body (#65), parameterized over the receiver
+    /// binding so it can rebuild the in-memory maps of either a just-constructed
+    /// storage (`db`, used by `new_at`) or `self` (used by the transaction
+    /// `__reindex_committed`, MVCC Tier 1).  Sets `<recv>.row_count` from the
+    /// tombstone anchor and rebuilds `id_to_row` + the secondary indexes from the
+    /// committed prefix via the SAME narrow per-field decode path everywhere.
+    fn generate_rehydrate_body(
+        model: &forgedb_parser::Model,
+        recv: &TokenStream,
+    ) -> TokenStream {
         // Mirror `get`'s per-type read of the id field, but at loop index `i`, via
         // the shared id-read helper.  The overwriting insert in ascending physical
         // order yields last-occurrence-wins, which is exactly the superseding-version
         // resolution the mutation surface (#66) needs on reopen: the newest version
         // is the highest physical index for an id, so the reopened index resolves it.
         let i = format_ident!("i");
-        let id_scan = match Self::generate_id_read_expr(model, &quote! { db }, &i) {
+        let id_scan = match Self::generate_id_read_expr(model, recv, &i) {
             Some(read_expr) => quote! {
                 for i in 0..n {
                     let id = #read_expr;
-                    db.id_to_row.insert(id, i);
+                    #recv.id_to_row.insert(id, i);
                 }
             },
             // No id/auto field: nothing to index (such a model cannot `insert`
@@ -4216,7 +4552,6 @@ impl RustGenerator {
         // `field_read_stmt` decode path (same body `read_at` uses — no drift).
         // Collect ids first to avoid holding an immutable borrow of `id_to_row`
         // across the index mutation.
-        let recv = quote! { db };
         let id_tok = quote! { __id };
         let index_rebuild = {
             let indexed = Self::indexed_fields(model);
@@ -4245,7 +4580,7 @@ impl RustGenerator {
                 let field_reads: Vec<_> = read_fields
                     .iter()
                     .filter_map(|f| {
-                        Self::field_read_stmt(f, &recv, &row_tok).map(|(_, stmt)| stmt)
+                        Self::field_read_stmt(f, recv, &row_tok).map(|(_, stmt)| stmt)
                     })
                     .collect();
 
@@ -4257,7 +4592,7 @@ impl RustGenerator {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
                         let val = Self::index_value_expr(&f.field_type, quote! { #val });
-                        Self::index_add_block(&recv, &ident, val, &id_tok)
+                        Self::index_add_block(recv, &ident, val, &id_tok)
                     })
                     .collect();
                 // Composite index adds (#101), folded into the same scan.
@@ -4269,19 +4604,19 @@ impl RustGenerator {
                             Self::index_value_expr(&c.field_type, quote! { #val })
                         })
                         .collect();
-                    Self::composite_add_block(&recv, ident, &parts, &id_tok)
+                    Self::composite_add_block(recv, ident, &parts, &id_tok)
                 }));
                 quote! {
-                    let __ids: Vec<#id_type> = db.id_to_row.keys().copied().collect();
+                    let __ids: Vec<#id_type> = #recv.id_to_row.keys().copied().collect();
                     for __id in __ids {
-                        let __row = match db.id_to_row.get(&__id) {
+                        let __row = match #recv.id_to_row.get(&__id) {
                             Some(__r) => *__r,
                             None => continue,
                         };
                         // Skip deleted rows — the same tombstone gate `read_at`
                         // (and therefore `get`) applies, so the index keys only
                         // live values.
-                        if db.tombstones.is_deleted(__row).unwrap_or(true) {
+                        if #recv.tombstones.is_deleted(__row).unwrap_or(true) {
                             continue;
                         }
                         #(#field_reads)*
@@ -4292,8 +4627,8 @@ impl RustGenerator {
         };
 
         quote! {
-            let n = db.tombstones.len();
-            db.row_count = n;
+            let n = #recv.tombstones.len();
+            #recv.row_count = n;
             #id_scan
             #index_rebuild
         }
@@ -4490,6 +4825,25 @@ impl RustGenerator {
         // boundary — so it is just an fsync of both id columns) in `commit`.
         let junction_field_idents: Vec<_> = m2m.iter().map(Self::junction_field_ident).collect();
 
+        // Journal-driven recovery arms (MVCC Tier 1, #83, M1b): map a committed-
+        // txn journal record's OPAQUE model tag to that collection's
+        // `__recover_to_committed`, truncating any aborted ahead-rows down to the
+        // journalled committed length.  Only id-bearing models are transactable
+        // and so appear in a journal record.  A closed generated match on the
+        // opaque tag — no `.forge` read at runtime.
+        let journal_recover_arms: Vec<_> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .map(|model| {
+                let field = format_ident!("{}", Self::to_snake_case(&model.name));
+                let name = model.name.as_str();
+                quote! {
+                    #name => __db.#field.__recover_to_committed(__len as usize),
+                }
+            })
+            .collect();
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
@@ -4513,6 +4867,25 @@ impl RustGenerator {
                 /// only acquires-or-refuses; it is not a lease broker).  `None` on
                 /// the lock-free `new()` convenience path (standalone / tests).
                 _lock: Option<forgedb_storage::DirLock>,
+                /// Atomic multi-model commit journal (MVCC Tier 1, #83, M1b).  A
+                /// shared, CRC-framed, append-only log at the data-dir root holding
+                /// one opaque record per committed transaction: the touched
+                /// collections' post-commit row-counts `[(model_tag, post_len)]`.
+                /// Framed + fsynced by `forgedb-wal`'s published opaque `Raw` path
+                /// (no new substrate) — the single fsync that flips a transaction
+                /// from "aborted" to "committed" atomically across all its models.
+                /// `Some` on the `open_at` path (durable dir); `None` on the
+                /// lock-free `new()` convenience path, whose transactions are
+                /// in-process-atomic but not crash-atomic across models.
+                _txn_journal: Option<forgedb_wal::WalManager>,
+                /// Commit sequencer (MVCC Tier 2, #83): monotonic LSN source +
+                /// first-committer-wins conflict map.  In-memory, ephemeral;
+                /// rebuilds empty on restart (no in-flight txns survive a process
+                /// restart).  Shared behind `Arc<Mutex>` so prepare can be
+                /// concurrent and commit is serialized.  Seeded from the broker
+                /// watermark on `open_at` so the commit-LSN and broker offset form
+                /// one unified monotonic sequence.
+                seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
             }
 
             /// A read-only, lock-free view of the whole database (#56 Direction B).
@@ -4545,6 +4918,14 @@ impl RustGenerator {
                         // Standalone / test path: no durable replication broker.
                         broker: None,
                         _lock: None,
+                        // No durable dir → no crash-atomic multi-model commit
+                        // journal (transactions here are in-process-atomic only).
+                        _txn_journal: None,
+                        // Sequencer seeded at 0 on the standalone path (no broker
+                        // watermark to seed from; commit LSNs start at Lsn(1)).
+                        seq: std::sync::Arc::new(std::sync::Mutex::new(
+                            forgedb_txn::CommitSequencer::new(0),
+                        )),
                     }
                 }
 
@@ -4565,6 +4946,24 @@ impl RustGenerator {
                              (ForgeDB is single-writer-per-process, #89)",
                         ),
                     );
+                    Self::__open_with_lock(root, _lock)
+                }
+
+                /// Lock-free-capable open core shared by the standalone path
+                /// (`open_at`, `_lock = Some`) and the Tier-3 coordinated path
+                /// (`connect`, `_lock = None`).  MVCC spec T3-5: a coordinated
+                /// client does NOT take the #89 `DirLock` — the coordinator holds
+                /// it on every client's behalf, and write mutual-exclusion among
+                /// coordinated clients is the coordinator's serialized turn-grant.
+                /// There is deliberately NO public lock-free open: `None` is
+                /// reachable only through `connect`, which first establishes a live
+                /// coordinator turn-channel, so a lock-free open never occurs
+                /// without a coordinator actually serializing writers (the PM
+                /// re-gate's binding constraint — no unserialized lock-free write).
+                fn __open_with_lock(
+                    root: std::path::PathBuf,
+                    _lock: Option<forgedb_storage::DirLock>,
+                ) -> Self {
                     let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
                     // Durable replication broker (#82 Direction C): one offset-addressed
                     // log per tenant, under the data root, shared across all collections
@@ -4579,13 +4978,75 @@ impl RustGenerator {
                         Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
                         Err(_) => None,
                     };
+                    // MVCC Tier 2 (#83): seed the commit sequencer from the broker
+                    // watermark so the commit-LSN and the broker's global offset form
+                    // one unified monotonic sequence.  The broker watermark is the
+                    // highest offset recorded so far; seeding there means the first
+                    // Tier-2 commit LSN is broker_watermark + 1, guaranteeing the
+                    // two sequences never collide.  Falls back to 0 when there is no
+                    // broker (the `Err(_)` branch above), which is correct: the
+                    // standalone/test path has no broker to unify with.
+                    let __seq_start = match &broker {
+                        Some(b) => b.lock().map(|b| b.watermark()).unwrap_or(0),
+                        None => 0,
+                    };
+                    let seq = std::sync::Arc::new(std::sync::Mutex::new(
+                        forgedb_txn::CommitSequencer::new(__seq_start),
+                    ));
+                    // Atomic multi-model commit journal (MVCC Tier 1, #83, M1b):
+                    // open the CRC-framed append-only log at the data-dir root
+                    // (reusing `forgedb-wal`'s published opaque `Raw` path — no new
+                    // substrate).  Read its LAST CRC-valid record BEFORE building
+                    // the collections: it is the authoritative durable
+                    // { model_tag -> committed_len } map.  (An absent/empty journal
+                    // ⇒ the collections' own #89 per-model recovery is authoritative
+                    // and this loop is a no-op — backward compatible with a data dir
+                    // written before transactions existed.)
+                    let mut _txn_journal = forgedb_wal::WalManager::open(
+                        root.join("_txn_journal.log"),
+                        forgedb_wal::FsyncPolicy::Always,
+                    ).expect("Failed to open transaction journal");
+                    // The last valid record's decoded length vector (empty if none).
+                    let __journal_committed: Vec<(String, u64)> = {
+                        let __entries = _txn_journal
+                            .replay(|_| -> std::io::Result<()> { Ok(()) })
+                            .unwrap_or_default();
+                        match __entries.last() {
+                            Some(__e) => {
+                                if let forgedb_wal::WalOperation::Raw { payload } = &__e.operation {
+                                    serde_json::from_slice(payload).unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            None => Vec::new(),
+                        }
+                    };
                     #(#attach_stmts_at)*
-                    Self {
+                    let mut __db = Self {
                         #(#field_idents,)*
                         changefeed,
                         broker,
                         _lock,
+                        _txn_journal: Some(_txn_journal),
+                        seq,
+                    };
+                    // Journal-driven recovery (M1b): a transaction that staged rows
+                    // but whose journal commit record never landed left ahead-rows
+                    // in some columns; truncate every touched collection back to its
+                    // journalled committed length so the txn is all-or-nothing.  A
+                    // committed txn's columns were fsynced BEFORE its journal record,
+                    // so a present record ⟺ all its columns are durable ⟹ this is a
+                    // no-op for it (its recovered length already matches).
+                    for (__model, __len) in &__journal_committed {
+                        let __len = *__len;
+                        match __model.as_str() {
+                            #(#journal_recover_arms)*
+                            // Unknown tag (a model removed since the record) → skip.
+                            _ => {}
+                        }
                     }
+                    __db
                 }
 
                 /// Capture a consistent read snapshot across all collections.
@@ -4622,7 +5083,32 @@ impl RustGenerator {
                 /// `forgedb compact` CLI path).  Junctions are skipped — an
                 /// append-only link table accumulates no dead versions.  Single-
                 /// writer only.
+                ///
+                /// MVCC Tier 2 (#83, PM constraint 3): no row still visible as of
+                /// the oldest live snapshot may be GC'd.  With genuine concurrent
+                /// prepare (`SharedDatabase`/`Arc<RwLock<Database>>`), a
+                /// `ConcurrentTxHandle` registers a live snapshot on the sequencer
+                /// while another thread may take the write lock and call `compact()`,
+                /// so this guard is **load-bearing in Tier 2**: if any snapshot is
+                /// live, compaction is DEFERRED (skipped this pass) rather than
+                /// augmenting the keep-set — a conservative correctness guarantee
+                /// (never reclaims a pinned version) at the cost of compaction
+                /// liveness under sustained concurrent load.  `forgedb-compaction`
+                /// stays snapshot-unaware (opaque indices only).
                 pub fn compact(&mut self) {
+                    // MVCC Tier 2 (#83): if any snapshot is live in the sequencer,
+                    // defer compaction — a live prepare snapshot may still need the
+                    // versions a reclaim would drop.  Load-bearing under concurrent
+                    // prepare (SharedDatabase), where a snapshot can coexist with a
+                    // compaction call on another thread.
+                    if let Ok(__seq) = self.seq.lock() {
+                        if __seq.oldest_live_snapshot().as_u64() > 0 {
+                            // At least one snapshot is live — skip compaction this pass.
+                            // The per-model `in_transaction` flag separately defers
+                            // auto-compaction inside storage.
+                            return;
+                        }
+                    }
                     #(self.#model_field_idents.compact();)*
                 }
 
@@ -5115,6 +5601,1234 @@ impl RustGenerator {
         }
 
         out
+    }
+
+    /// Generate the transaction surface (MVCC Tier 1, #83): the `TxHandle` struct,
+    /// its scoped per-model write (`create_/update_/delete_`) + read (`get_/all_`)
+    /// methods, `Database::transaction`, and the commit/rollback machinery.
+    ///
+    /// Identity: this is entirely GENERATED per schema (a method on the tailored
+    /// `Database`) — not a shipped generic `db.begin()` over an arbitrary schema.
+    /// `TxHandle` exposes exactly the per-model methods codegen already emits,
+    /// scoped to a transaction; no predicate-as-data, no runtime schema.  The only
+    /// substrate used is the already-published `forgedb-wal` `Raw` path (the commit
+    /// journal), `truncate_to_rows`, and the watermark — no new crate, no format
+    /// change.  Skipped entirely for a schema with no id-bearing (transactable)
+    /// model.
+    fn generate_transaction_impl(schema: &Schema) -> TokenStream {
+        // Only id-bearing models are transactable (they can be inserted / mutated).
+        let tx_models: Vec<&forgedb_parser::Model> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .collect();
+        if tx_models.is_empty() {
+            return quote! {};
+        }
+
+        // Rollback arms: truncate every touched collection's columns + WAL tail
+        // back to its recorded pre-txn mark, and clear its txn guard.
+        let rollback_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        let __mark = *__mark;
+                        // Erase staged rows: truncate every column + tombstone.
+                        let _ = self.db.#field.__truncate_all_to(__mark);
+                        self.db.#field.row_count = __mark;
+                        // Drop the staged WAL tail back to the recorded byte mark.
+                        if let Some(__wm) = self.wal_marks.get(#tag) {
+                            let _ = self.db.#field.wal.truncate_to(*__wm);
+                        }
+                        // Leave the txn guard; run any deferred maintenance now.
+                        self.db.#field.in_transaction = false;
+                        self.db.#field.run_deferred_maintenance();
+                    }
+                }
+            })
+            .collect();
+
+        // Commit reindex arms: after the watermark is (already) advanced by the
+        // staged appends, rebuild each touched collection's id_to_row + indexes
+        // from the now-visible committed prefix, clear the guard, run deferred
+        // maintenance.
+        let commit_reindex_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        self.db.#field.__reindex_committed();
+                        self.db.#field.in_transaction = false;
+                        self.db.#field.run_deferred_maintenance();
+                    }
+                }
+            })
+            .collect();
+
+        // Commit fsync arms: make each touched collection's columns + WAL durable
+        // BEFORE the journal record (the ordering that makes the journal fsync the
+        // atomic commit point).
+        let commit_fsync_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        let _ = self.db.#field.commit();
+                        let _ = self.db.#field.wal.flush();
+                        // Record this collection's post-commit committed length for
+                        // the journal (the atomic multi-model commit marker).
+                        __journal.push((#tag.to_string(), self.db.#field.row_count as u64));
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model scoped write + read methods on TxHandle.
+        let mut tx_methods: Vec<TokenStream> = Vec::new();
+        for model in &tx_models {
+            tx_methods.push(Self::generate_txn_model_methods(model, schema));
+        }
+
+        // The `mark_<model>` helpers: record the pre-txn physical row count + WAL
+        // byte offset the first time a collection is written, and set its txn guard.
+        let mark_methods: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                let mark_fn = format_ident!("__mark_{}", Self::to_snake_case(&m.name));
+                quote! {
+                    /// Record `#tag`'s pre-txn rollback marks on first touch and set
+                    /// its transaction guard (so auto-checkpoint/compaction defer).
+                    fn #mark_fn(&mut self) {
+                        if !self.marks.contains_key(#tag) {
+                            let __rc = self.db.#field.row_count;
+                            let __wb = self.db.#field.wal.size().unwrap_or(0);
+                            self.marks.insert(#tag, __rc);
+                            self.wal_marks.insert(#tag, __wb);
+                            self.db.#field.in_transaction = true;
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        quote! {
+            /// A scoped transaction handle (MVCC Tier 1, #83).  Exposes exactly the
+            /// per-model write surface codegen already emits (`create_/update_/
+            /// delete_`), scoped to the transaction, plus a read surface
+            /// (`get_/all_`) with **read-your-writes**: reads resolve against the
+            /// staged physical length (the watermark raised past the public one),
+            /// so the transaction sees its own uncommitted appends over the
+            /// committed prefix — the same `get_at` decode path, just a raised
+            /// watermark (no forked decoder).  Outside readers still clamp at the
+            /// public watermark, so staged rows are invisible until commit.
+            pub struct TxHandle<'db> {
+                db: &'db mut Database,
+                /// Pre-txn physical row-count per touched collection (lazy, on first
+                /// write) — the rollback truncation target.
+                marks: std::collections::BTreeMap<&'static str, usize>,
+                /// Pre-txn per-model WAL byte offset per touched collection — the
+                /// rollback WAL-tail truncation target.
+                wal_marks: std::collections::BTreeMap<&'static str, u64>,
+                /// Buffered change-feed + durable-broker records, drained (offsets
+                /// consumed) only on commit — so a rolled-back txn consumes NO
+                /// broker offset and emits NO changefeed event (no offset gap).
+                pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, usize, Vec<u8>)>,
+                /// Unique keys claimed by staged writes in this transaction (M1a fix).
+                ///
+                /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
+                /// committed index so that two `create_<model>` calls with the SAME
+                /// `&unique` value in one transaction both see the conflict — the
+                /// committed index only reflects rows visible before the txn started.
+                /// Rollback discards the set automatically (it is owned by `TxHandle`
+                /// and never touches the real index maps, so no undo is needed).
+                staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+                /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
+                committed: bool,
+            }
+
+            impl<'db> TxHandle<'db> {
+                fn begin(db: &'db mut Database) -> Self {
+                    TxHandle {
+                        db,
+                        marks: std::collections::BTreeMap::new(),
+                        wal_marks: std::collections::BTreeMap::new(),
+                        pending_events: Vec::new(),
+                        staged_unique_keys: std::collections::BTreeSet::new(),
+                        committed: false,
+                    }
+                }
+
+                #(#mark_methods)*
+
+                #(#tx_methods)*
+
+                /// Commit the transaction (MVCC Tier 1, #83).  Ordering is
+                /// load-bearing (mirrors #96's checkpoint order): (1) fsync every
+                /// touched collection's columns + per-model WAL, (2) append + fsync
+                /// the atomic multi-model commit record to `_txn_journal.log` (THE
+                /// commit point — a present record ⟺ all its columns durable), (3)
+                /// advance visibility by rebuilding each touched collection's
+                /// id_to_row + indexes from the now-committed prefix, (4) drain the
+                /// buffered changefeed + broker events (offsets consumed HERE and
+                /// only here).  A crash before step 2 leaves no journal record → the
+                /// staged rows are truncated on reopen (all-or-nothing).
+                pub fn commit(mut self) -> Result<(), TxError> {
+                    // Step 1 + build the journal length vector.
+                    let mut __journal: Vec<(String, u64)> = Vec::new();
+                    // Iterate marks in a stable order (BTreeMap) so the journal is
+                    // deterministic; only touched collections appear.
+                    let __touched: Vec<&'static str> = self.marks.keys().copied().collect();
+                    for __tag in &__touched {
+                        match *__tag {
+                            #(#commit_fsync_arms)*
+                            _ => {}
+                        }
+                    }
+                    // Step 2: the atomic commit point.  Encode the length vector as
+                    // opaque bytes and write it via the WAL `Raw` path (fsync-always).
+                    if let Some(__jrnl) = self.db._txn_journal.as_mut() {
+                        let __payload = serde_json::to_vec(&__journal)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        __jrnl
+                            .write(&forgedb_wal::WalEntry::raw("_txn", __payload))
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        __jrnl.flush().map_err(|e| TxError::Io(e.to_string()))?;
+                    }
+                    // Step 3: advance visibility (rebuild maps) + close the guard +
+                    // run any deferred maintenance, per touched collection.
+                    for __tag in &__touched {
+                        match *__tag {
+                            #(#commit_reindex_arms)*
+                            _ => {}
+                        }
+                    }
+                    // Step 4: drain the buffered events to the shared broker +
+                    // change feed, consuming the contiguous offset run HERE (one
+                    // burst per commit).  A rolled-back txn never reaches this, so it
+                    // leaves no offset gap.
+                    for (__model, __kind, _id_bytes, __row, __bytes) in std::mem::take(&mut self.pending_events) {
+                        // Best-effort in-process change feed (owned by `Database`).
+                        self.db.changefeed.emit(__model, __row, __kind);
+                        // Durable replication broker (#82): consume the contiguous
+                        // offset run HERE — one burst per commit, no gap on abort.
+                        if let Some(__broker) = &self.db.broker {
+                            if let Ok(mut __b) = __broker.lock() {
+                                let _ = __b.record(__model, __row as u64, __kind, __bytes);
+                            }
+                        }
+                    }
+                    self.committed = true;
+                    Ok(())
+                }
+
+                /// Roll back the transaction: truncate every touched collection's
+                /// staged rows + WAL tail back to its pre-txn mark, discard the
+                /// buffered events (no broker offset consumed, no changefeed emit),
+                /// and clear each txn guard.  No journal record is written, no
+                /// watermark advanced — nothing outside the transaction ever
+                /// observed the staged rows.
+                pub fn rollback(mut self) {
+                    self.rollback_internal();
+                    self.committed = true; // prevent the Drop backstop double-running
+                }
+
+                fn rollback_internal(&mut self) {
+                    let __touched: Vec<&'static str> = self.marks.keys().copied().collect();
+                    for __tag in &__touched {
+                        if let Some(__mark) = self.marks.get(*__tag) {
+                            match *__tag {
+                                #(#rollback_arms)*
+                                _ => {}
+                            }
+                        }
+                    }
+                    self.pending_events.clear();
+                }
+
+                /// Compute the write-set for the commit sequencer (MVCC Tier 2, #83).
+                ///
+                /// Returns all opaque keys touched by this transaction: one per staged
+                /// row (`model_tag_bytes ++ logical_id_bytes`) and one per claimed
+                /// unique key (`field_name_bytes ++ encoded_key_bytes`).  The
+                /// sequencer sees only opaque bytes — no model name, no field, no
+                /// schema — preserving the identity red line.
+                pub fn __write_set(&self, snapshot_lsn: forgedb_txn::Lsn) -> forgedb_txn::WriteSet {
+                    let mut keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
+                    // Row-level opaque keys: model_tag_bytes ++ logical_id_bytes.
+                    // Using the logical entity id (not the physical row index) so two concurrent
+                    // transactions that both write the same logical entity conflict,
+                    // regardless of which physical rows they stage.
+                    for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
+                        let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+                        k.extend_from_slice(__model.as_bytes());
+                        k.extend_from_slice(__id_bytes);
+                        keys.push(k.into_boxed_slice());
+                    }
+                    // Unique-key opaque keys: field_name_bytes ++ encoded_key_bytes.
+                    // Capturing unique-key claims prevents two concurrent txns from
+                    // committing the same unique value even when they staged different
+                    // physical rows (which have different row-level keys above).
+                    for (__fname, __ekey) in &self.staged_unique_keys {
+                        let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+                        k.extend_from_slice(__fname.as_bytes());
+                        k.extend_from_slice(__ekey.as_bytes());
+                        keys.push(k.into_boxed_slice());
+                    }
+                    forgedb_txn::WriteSet { keys, snapshot_lsn }
+                }
+            }
+
+            impl<'db> Drop for TxHandle<'db> {
+                /// Panic-safety backstop: an un-committed handle (dropped via an
+                /// early `?`, a panic, or an explicit non-commit) rolls back, so a
+                /// half-staged transaction never becomes visible.
+                fn drop(&mut self) {
+                    if !self.committed {
+                        self.rollback_internal();
+                    }
+                }
+            }
+
+            /// Default retry count for `transaction_optimistic` (#83, Tier 2).
+            ///
+            /// Override per-call via `transaction_retrying(retries, f)`.
+            /// (`forgedb.toml` `[transaction] max_retries` wiring is a residual —
+            /// the knob is exposed via `transaction_retrying` for now.)
+            const DEFAULT_TXN_RETRIES: u32 = 3;
+
+            impl Database {
+                /// Run a transaction (MVCC Tier 1, #83).  The closure receives a
+                /// scoped `TxHandle` exposing the per-model `create_/update_/delete_`
+                /// writes + `get_/all_` reads; its writes are staged (physically
+                /// appended past the public watermark, durable in the per-model WAL,
+                /// but invisible outside) and made visible ATOMICALLY on `Ok`
+                /// (commit) or discarded on `Err`/panic (rollback-by-truncate).
+                /// Multi-model writes commit all-or-nothing across a crash via the
+                /// `_txn_journal.log` (M1b).
+                ///
+                /// ```ignore
+                /// let id = db.transaction(|tx| {
+                ///     let uid = tx.create_user(user)?;   // staged
+                ///     tx.create_post(post)?;             // atomic with the user
+                ///     Ok(uid)
+                /// })?;                                   // Ok → commit; Err → rollback
+                /// ```
+                pub fn transaction<T>(
+                    &mut self,
+                    f: impl FnOnce(&mut TxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    let mut tx = TxHandle::begin(self);
+                    match f(&mut tx) {
+                        Ok(v) => {
+                            tx.commit()?;
+                            Ok(v)
+                        }
+                        Err(e) => {
+                            tx.rollback();
+                            Err(e)
+                        }
+                    }
+                }
+
+                /// Run an optimistic transaction with auto-retry (MVCC Tier 2, #83).
+                ///
+                /// The closure `f` is `Fn` (re-runnable): it may be invoked up to
+                /// `retries + 1` times.  Each attempt: (1) registers a snapshot LSN
+                /// via the `CommitSequencer`, (2) runs the prepare closure staging
+                /// writes into private buffers via `TxHandle`, (3) at the serialized
+                /// commit point calls `CommitSequencer::try_commit` — on
+                /// `Committed`, applies via the Tier-1 commit; on `Conflict`, drops
+                /// the buffers and retries (snapshot re-registered).
+                ///
+                /// **Isolation:** snapshot isolation, first-committer-wins.  The
+                /// disclosed anomaly is write-skew (two txns read overlapping key
+                /// sets, each writes a disjoint subset; both may commit in SI).
+                /// Serializable snapshot isolation (SSI, read-set tracking) is Tier 3.
+                ///
+                /// **"Concurrent writers"** = concurrent *prepare*, serialized
+                /// *commit*.  In Tier 2, `transaction_retrying` takes `&mut self`,
+                /// so prepare is also serialized (only one `&mut` holder at a time).
+                /// The sequencer and conflict-map are structurally ready for
+                /// concurrent prepare; `&mut Database` makes it a no-op here.
+                /// Genuine concurrent prepare lands in Tier 3
+                /// (`Arc<RwLock<Database>>`).
+                pub fn transaction_retrying<T>(
+                    &mut self,
+                    retries: u32,
+                    f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    // Clone the Arc<Mutex<CommitSequencer>> BEFORE the loop so we
+                    // can call the sequencer while `tx` (which holds &mut Database)
+                    // is live — cloning the Arc does not require borrowing `self`.
+                    let __seq_arc = std::sync::Arc::clone(&self.seq);
+                    for __attempt in 0..=retries {
+                        // Step 1: register the read snapshot (current committed LSN).
+                        // This can still use `self.seq` because `tx` is not yet alive.
+                        let __snap_lsn = {
+                            let mut __seq = self.seq.lock().unwrap();
+                            __seq.register_snapshot()
+                        };
+                        // TxHandle::begin takes &mut Database (self), so no further
+                        // `self.seq` borrows are possible while `tx` lives.  All
+                        // sequencer calls below use the cloned Arc.
+                        let mut tx = TxHandle::begin(self);
+                        let __out = f(&mut tx);
+                        let __val = match __out {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tx.rollback();
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                return Err(e);
+                            }
+                        };
+                        // Step 2: build the write-set from the staged transaction,
+                        // then hand it to the sequencer for first-committer-wins check.
+                        let __ws = tx.__write_set(__snap_lsn);
+                        let __outcome = {
+                            let mut __seq = __seq_arc.lock().unwrap();
+                            __seq.try_commit(&__ws)
+                        };
+                        match __outcome {
+                            forgedb_txn::CommitOutcome::Committed(_l) => {
+                                // Apply the staged writes via Tier-1 commit.
+                                tx.commit()?;
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                let _ = __attempt; // suppress unused variable warning
+                                return Ok(__val);
+                            }
+                            forgedb_txn::CommitOutcome::Conflict { .. } => {
+                                // Drop the staged writes and retry.
+                                tx.rollback();
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                // Loop continues to next attempt.
+                            }
+                        }
+                    }
+                    Err(TxError::Conflict)
+                }
+
+                /// Run an optimistic transaction with the default retry count (#83).
+                ///
+                /// Uses `DEFAULT_TXN_RETRIES` (= 3 retries, 4 total attempts).  For
+                /// per-call control use `transaction_retrying(retries, f)`.
+                pub fn transaction_optimistic<T>(
+                    &mut self,
+                    f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    self.transaction_retrying(DEFAULT_TXN_RETRIES, f)
+                }
+            }
+        }
+    }
+
+    /// Generate the Tier 2 concurrent-prepare surface (#83): `SharedDatabase` wrapping
+    /// `Arc<RwLock<Database>>`, and `ConcurrentTxHandle` which stages into private
+    /// in-memory buffers (touching NO shared state during prepare).  The commit
+    /// critical section takes the exclusive write lock briefly to apply the buffer
+    /// via the Tier-1 apply path and advance visibility.
+    ///
+    /// Identity red line: the conflict-detection path (sequencer) sees only opaque
+    /// keys; model-tag dispatch only appears in the apply path (after conflict
+    /// resolution passes) — the same pattern as `apply_frame` for the follower.
+    fn generate_shared_database_impl(schema: &Schema) -> TokenStream {
+        let tx_models: Vec<&forgedb_parser::Model> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .collect();
+        if tx_models.is_empty() {
+            return quote! {};
+        }
+
+        // Per-model apply arms for __apply_and_commit_concurrent_buffer.
+        let concurrent_apply_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let model_name = format_ident!("{}", m.name);
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        let __record: #model_name = serde_json::from_slice(__bytes)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        let __row = self.#field.__stage_append(__record, *__deleted);
+                        __staged_events.push((*__model_tag, *__kind, __row, __bytes.clone()));
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model mark arms: record pre-txn row_count + wal byte offset, set in_transaction.
+        let concurrent_mark_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        if !__marks.contains_key(#tag) {
+                            let __rc = self.#field.row_count;
+                            let __wb = self.#field.wal.size().unwrap_or(0);
+                            __marks.insert(#tag, __rc);
+                            __wal_marks.insert(#tag, __wb);
+                            self.#field.in_transaction = true;
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model fsync arms.
+        let concurrent_fsync_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        let _ = self.#field.commit();
+                        let _ = self.#field.wal.flush();
+                        __journal.push((#tag.to_string(), self.#field.row_count as u64));
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model reindex arms.
+        let concurrent_reindex_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        self.#field.__reindex_committed();
+                        self.#field.in_transaction = false;
+                        self.#field.run_deferred_maintenance();
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model rollback arms for concurrent apply.
+        let concurrent_rollback_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let tag = m.name.as_str();
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    #tag => {
+                        if let Some(&__mark) = __marks.get(#tag) {
+                            let _ = self.#field.__truncate_all_to(__mark);
+                            self.#field.row_count = __mark;
+                            if let Some(&__wm) = __wal_marks.get(#tag) {
+                                let _ = self.#field.wal.truncate_to(__wm);
+                            }
+                            self.#field.in_transaction = false;
+                            self.#field.run_deferred_maintenance();
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Per-model concurrent methods on ConcurrentTxHandle.
+        let mut concurrent_model_methods: Vec<TokenStream> = Vec::new();
+        for model in &tx_models {
+            let model_name = format_ident!("{}", model.name);
+            let model_tag = model.name.as_str();
+            let snake = Self::to_snake_case(&model.name);
+            let field = format_ident!("{}", snake);
+            let id_type = Self::id_type_tokens(model);
+            let id_field = Self::id_field_ident(model);
+            let validate_fn = format_ident!("validate_{}", snake);
+            let create_fn = format_ident!("create_{}", snake);
+            let update_fn = format_ident!("update_{}", snake);
+            let delete_fn = format_ident!("delete_{}", snake);
+            let get_fn = format_ident!("get_{}", snake);
+            let all_fn = format_ident!("all_{}", snake);
+            let snap_field = format_ident!("{}", snake);
+
+            // Unique checks (insert) for ConcurrentTxHandle.
+            let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
+                .iter()
+                .filter(|f| f.unique)
+                .map(|f| {
+                    let ident = Self::index_field_ident(f);
+                    let fident = format_ident!("{}", f.name);
+                    let fname = f.name.as_str();
+                    let key = Self::index_key_expr(Self::index_value_expr(
+                        &f.field_type,
+                        quote! { record.#fident },
+                    ));
+                    quote! {
+                        {
+                            let __uk: String = { #key };
+                            if self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
+                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            }
+                            {
+                                let __db = self.inner.read().unwrap();
+                                if __db.#field.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
+                                    return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                                }
+                            }
+                            self.staged_unique_keys.insert((#fname, __uk));
+                        }
+                    }
+                })
+                .collect();
+
+            // Unique checks (update) for ConcurrentTxHandle.
+            let unique_checks_update: Vec<_> = Self::indexed_fields(model)
+                .iter()
+                .filter(|f| f.unique)
+                .map(|f| {
+                    let ident = Self::index_field_ident(f);
+                    let fident = format_ident!("{}", f.name);
+                    let fname = f.name.as_str();
+                    let key = Self::index_key_expr(Self::index_value_expr(
+                        &f.field_type,
+                        quote! { record.#fident },
+                    ));
+                    quote! {
+                        {
+                            let __uk: String = { #key };
+                            {
+                                let __db = self.inner.read().unwrap();
+                                if let Some(__ids) = __db.#field.#ident.get(&__uk) {
+                                    if __ids.iter().any(|__i| *__i != id) {
+                                        return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                                    }
+                                }
+                            }
+                            let __committed_owns = {
+                                let __db = self.inner.read().unwrap();
+                                __db.#field.#ident.get(&__uk).is_some_and(|__ids| __ids.contains(&id))
+                            };
+                            if !__committed_owns && self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
+                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            }
+                            self.staged_unique_keys.insert((#fname, __uk));
+                        }
+                    }
+                })
+                .collect();
+
+            // FK checks for ConcurrentTxHandle.
+            let fk_checks: Vec<_> = model
+                .fields
+                .iter()
+                .filter_map(|f| {
+                    let (target_name, optional) = match &f.field_type {
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::RequiredReference(t),
+                        ) => (t, false),
+                        forgedb_parser::FieldType::Relation(
+                            forgedb_parser::RelationType::OptionalReference(t),
+                        ) => (t, true),
+                        _ => return None,
+                    };
+                    let target = schema.find_model(target_name)?;
+                    if !Self::is_uuid_pk(target) {
+                        return None;
+                    }
+                    let target_get_fn = format_ident!("get_{}", Self::to_snake_case(&target.name));
+                    let fk_field = format_ident!("{}", f.name);
+                    let fname = f.name.as_str();
+                    let tname = target.name.as_str();
+                    Some(if optional {
+                        quote! {
+                            if let Some(__fk) = record.#fk_field {
+                                if self.#target_get_fn(__fk).is_none() {
+                                    return Err(TxError::Validation(ValidationError::DanglingReference {
+                                        field: #fname, target: #tname,
+                                    }));
+                                }
+                            }
+                        }
+                    } else {
+                        quote! {
+                            if self.#target_get_fn(record.#fk_field).is_none() {
+                                return Err(TxError::Validation(ValidationError::DanglingReference {
+                                    field: #fname, target: #tname,
+                                }));
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            concurrent_model_methods.push(quote! {
+                /// Stage the creation of a #model_name in a concurrent transaction.
+                pub fn #create_fn(&mut self, record: #model_name) -> Result<#id_type, TxError> {
+                    #validate_fn(&record)?;
+                    #(#unique_checks_insert)*
+                    #(#fk_checks)*
+                    let id = record.#id_field;
+                    let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                    let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                    self.buffer.push((#model_tag, forgedb_changefeed::ChangeKind::Inserted, __id_bytes.clone(), __bytes.clone(), false));
+                    self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Inserted, __id_bytes, __bytes));
+                    Ok(id)
+                }
+
+                /// Stage an update of a #model_name in a concurrent transaction.
+                pub fn #update_fn(&mut self, id: #id_type, record: #model_name) -> Result<bool, TxError> {
+                    if self.#get_fn(id).is_none() {
+                        return Ok(false);
+                    }
+                    #validate_fn(&record)?;
+                    #(#unique_checks_update)*
+                    #(#fk_checks)*
+                    let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                    let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                    self.buffer.push((#model_tag, forgedb_changefeed::ChangeKind::Updated, __id_bytes.clone(), __bytes.clone(), false));
+                    self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Updated, __id_bytes, __bytes));
+                    Ok(true)
+                }
+
+                /// Stage a delete of a #model_name in a concurrent transaction.
+                pub fn #delete_fn(&mut self, id: #id_type) -> bool {
+                    let record = match self.#get_fn(id) {
+                        Some(r) => r,
+                        None => return false,
+                    };
+                    let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                    let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                    self.buffer.push((#model_tag, forgedb_changefeed::ChangeKind::Deleted, __id_bytes.clone(), __bytes.clone(), true));
+                    self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Deleted, __id_bytes, __bytes));
+                    true
+                }
+
+                /// Read a #model_name within the concurrent transaction (read-your-writes).
+                pub fn #get_fn(&self, id: #id_type) -> Option<#model_name> {
+                    let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                    for (_, _kind, __ib, __bytes, __del) in self.buffer.iter().rev() {
+                        if __ib == &__id_bytes {
+                            if *__del { return None; }
+                            return serde_json::from_slice(__bytes).ok();
+                        }
+                    }
+                    let __db = self.inner.read().unwrap();
+                    __db.#field.get_at(&self.snap.#snap_field, id)
+                }
+
+                /// Read all live #model_name records visible to this concurrent transaction.
+                pub fn #all_fn(&self) -> Vec<#model_name> {
+                    let __db = self.inner.read().unwrap();
+                    let mut __rows = __db.#field.all_at(&self.snap.#snap_field);
+                    drop(__db);
+                    for (_, _kind, __ib, __bytes, __del) in &self.buffer {
+                        let __id_bytes_ref: &Vec<u8> = __ib;
+                        if *__del {
+                            __rows.retain(|r| {
+                                serde_json::to_vec(&r.#id_field).unwrap_or_default().as_slice() != __id_bytes_ref.as_slice()
+                            });
+                        } else if let Ok(__rec) = serde_json::from_slice::<#model_name>(__bytes) {
+                            let __staged_id = __rec.#id_field;
+                            if let Some(__pos) = __rows.iter().position(|r| r.#id_field == __staged_id) {
+                                __rows[__pos] = __rec;
+                            } else {
+                                __rows.push(__rec);
+                            }
+                        }
+                    }
+                    __rows
+                }
+            });
+        }
+
+        quote! {
+            /// A cloneable, thread-safe handle for concurrent transaction preparation
+            /// (#83 Tier 2).
+            ///
+            /// Multiple threads may prepare transactions concurrently — each calls
+            /// `transaction_concurrent` which holds the inner `RwLock` in **read mode**
+            /// only during snapshot-capture, then releases it entirely during prepare.
+            /// The serialized commit section takes the **exclusive write lock** to apply
+            /// the buffer atomically.
+            ///
+            /// Create via `Database::shared()`.
+            #[derive(Clone)]
+            pub struct SharedDatabase {
+                inner: std::sync::Arc<std::sync::RwLock<Database>>,
+                /// Sequencer Arc cloned from Database.seq at construction.
+                seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
+            }
+
+            impl SharedDatabase {
+                /// Run a transaction with genuine concurrent prepare (#83 Tier 2).
+                ///
+                /// The closure receives a `ConcurrentTxHandle` that stages writes into
+                /// **private in-memory buffers** — NO shared state is modified during
+                /// prepare.  The commit critical section takes the exclusive write lock
+                /// briefly to apply the buffer and advance visibility.
+                pub fn transaction_concurrent<T>(
+                    &self,
+                    retries: u32,
+                    f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    let __seq_arc = std::sync::Arc::clone(&self.seq);
+                    for __attempt in 0..=retries {
+                        // Step 1: register read snapshot (sequencer only, no write lock).
+                        let __snap_lsn = {
+                            let mut __seq = __seq_arc.lock().unwrap();
+                            __seq.register_snapshot()
+                        };
+                        // Step 2: capture committed watermarks (brief read lock).
+                        let __snap = {
+                            let __db = self.inner.read().unwrap();
+                            __db.snapshot()
+                        };
+                        // Step 3: run the prepare closure with private-buffer staging.
+                        // NO lock held during prepare.
+                        let mut __tx = ConcurrentTxHandle {
+                            inner: std::sync::Arc::clone(&self.inner),
+                            snap: __snap,
+                            buffer: Vec::new(),
+                            staged_unique_keys: std::collections::BTreeSet::new(),
+                            pending_events: Vec::new(),
+                        };
+                        let __out = f(&mut __tx);
+                        let __val = match __out {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                return Err(e);
+                            }
+                        };
+                        // Step 4: build the opaque write-set (logical id keys + unique claims).
+                        // Identity red line: the sequencer sees only opaque bytes.
+                        let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
+                        for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
+                            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+                            k.extend_from_slice(__model.as_bytes());
+                            k.extend_from_slice(__id_bytes);
+                            __ws_keys.push(k.into_boxed_slice());
+                        }
+                        for (__fname, __ekey) in &__tx.staged_unique_keys {
+                            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+                            k.extend_from_slice(__fname.as_bytes());
+                            k.extend_from_slice(__ekey.as_bytes());
+                            __ws_keys.push(k.into_boxed_slice());
+                        }
+                        let __ws = forgedb_txn::WriteSet { keys: __ws_keys, snapshot_lsn: __snap_lsn };
+                        // Step 5: serialized conflict check (sequencer mutex only, no RwLock).
+                        let __outcome = {
+                            let mut __seq = __seq_arc.lock().unwrap();
+                            __seq.try_commit(&__ws)
+                        };
+                        match __outcome {
+                            forgedb_txn::CommitOutcome::Committed(_l) => {
+                                // Step 6: apply the private buffer under exclusive write lock.
+                                {
+                                    let mut __db = self.inner.write().unwrap();
+                                    let __buf = __tx.buffer;
+                                    let __evts = __tx.pending_events;
+                                    __db.__apply_and_commit_concurrent_buffer(__buf, __evts)?;
+                                }
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                let _ = __attempt;
+                                return Ok(__val);
+                            }
+                            forgedb_txn::CommitOutcome::Conflict { .. } => {
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                // Loop continues to next attempt.
+                            }
+                        }
+                    }
+                    Err(TxError::Conflict)
+                }
+            }
+
+            /// Private-buffer transaction handle for concurrent preparation (#83 Tier 2).
+            ///
+            /// Unlike `TxHandle` (which stages into shared columns via `__stage_append`),
+            /// `ConcurrentTxHandle` stages into in-memory buffers that touch NO shared
+            /// state during prepare.
+            pub struct ConcurrentTxHandle {
+                inner: std::sync::Arc<std::sync::RwLock<Database>>,
+                /// Snapshot watermarks for reads (captured at transaction start).
+                snap: DatabaseSnapshot,
+                /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
+                buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
+                /// Claimed unique keys (field_name, encoded_key).
+                staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+                /// Pending events: (model_tag, kind, id_bytes, record_bytes).
+                pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
+            }
+
+            impl ConcurrentTxHandle {
+                #(#concurrent_model_methods)*
+            }
+
+            impl Database {
+                /// Create a cloneable shared handle for concurrent transactions (#83 Tier 2).
+                pub fn shared(self) -> SharedDatabase {
+                    let seq = std::sync::Arc::clone(&self.seq);
+                    SharedDatabase {
+                        inner: std::sync::Arc::new(std::sync::RwLock::new(self)),
+                        seq,
+                    }
+                }
+
+                /// Apply a concurrent-prepare private buffer under the exclusive write lock
+                /// (#83 Tier 2 apply path).
+                ///
+                /// The model-tag dispatch here is in the APPLY path (after conflict
+                /// resolution passed) — same pattern as `apply_frame` for the follower.
+                ///
+                /// Returns the physical `(model_tag_bytes, row_index)` for each row appended
+                /// so the Tier 3 caller can forward correct positions to the coordinator's
+                /// `_replication.log` (T3-3/T3-8 contract).  Tier 2 callers discard the
+                /// `Ok` value via `?;` — the call-site text is byte-identical (T3-5).
+                pub(crate) fn __apply_and_commit_concurrent_buffer(
+                    &mut self,
+                    buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
+                    events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
+                ) -> Result<Vec<(Vec<u8>, u64)>, TxError> {
+                    let mut __marks: std::collections::BTreeMap<&'static str, usize> =
+                        std::collections::BTreeMap::new();
+                    let mut __wal_marks: std::collections::BTreeMap<&'static str, u64> =
+                        std::collections::BTreeMap::new();
+
+                    // Mark all touched models in_transaction and record pre-apply row counts.
+                    for (__model_tag, _kind, _id_bytes, _bytes, _deleted) in &buffer {
+                        match *__model_tag {
+                            #(#concurrent_mark_arms)*
+                            _ => {}
+                        }
+                    }
+
+                    // Apply all staged rows via __stage_append.
+                    let mut __staged_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, usize, Vec<u8>)> = Vec::new();
+                    for (__model_tag, __kind, _id_bytes, __bytes, __deleted) in &buffer {
+                        let __result: Result<(), TxError> = (|| {
+                            match *__model_tag {
+                                #(#concurrent_apply_arms)*
+                                _ => {}
+                            }
+                            Ok(())
+                        })();
+                        if let Err(e) = __result {
+                            // Rollback all touched models on partial apply failure.
+                            let __touched: Vec<&'static str> = __marks.keys().copied().collect();
+                            for __tag in &__touched {
+                                match *__tag {
+                                    #(#concurrent_rollback_arms)*
+                                    _ => {}
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
+
+                    // Commit: fsync + journal + reindex + events.
+                    let mut __journal: Vec<(String, u64)> = Vec::new();
+                    let __touched: Vec<&'static str> = __marks.keys().copied().collect();
+                    for __tag in &__touched {
+                        match *__tag {
+                            #(#concurrent_fsync_arms)*
+                            _ => {}
+                        }
+                    }
+                    if let Some(__jrnl) = self._txn_journal.as_mut() {
+                        let __payload = serde_json::to_vec(&__journal)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        __jrnl
+                            .write(&forgedb_wal::WalEntry::raw("_txn", __payload))
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        __jrnl.flush().map_err(|e| TxError::Io(e.to_string()))?;
+                    }
+                    for __tag in &__touched {
+                        match *__tag {
+                            #(#concurrent_reindex_arms)*
+                            _ => {}
+                        }
+                    }
+                    // Drain events to changefeed + durable broker; collect (tag, row) pairs
+                    // for the Tier 3 coordinator `Committed` payload (T3-3/T3-8).
+                    let mut __row_index_pairs: Vec<(Vec<u8>, u64)> = Vec::with_capacity(__staged_events.len());
+                    for (__model, __kind, __row, __bytes) in __staged_events {
+                        __row_index_pairs.push((__model.as_bytes().to_vec(), __row as u64));
+                        self.changefeed.emit(__model, __row, __kind);
+                        if let Some(__broker) = &self.broker {
+                            if let Ok(mut __b) = __broker.lock() {
+                                let _ = __b.record(__model, __row as u64, __kind, __bytes);
+                            }
+                        }
+                    }
+                    let _ = events;
+                    Ok(__row_index_pairs)
+                }
+            }
+        }
+    }
+
+    /// Generate one model's scoped write + read methods on `TxHandle` (MVCC
+    /// Tier 1, #83).  Each write records the collection's rollback mark on first
+    /// touch, runs the SAME #91 validators (field constraints, `&unique` against
+    /// the committed index, FK existence against txn-visible target rows), stages
+    /// the row via `__stage_append`, and buffers the changefeed/broker event.
+    /// Each read resolves against the raised (staged) watermark for read-your-writes.
+    fn generate_txn_model_methods(
+        model: &forgedb_parser::Model,
+        schema: &Schema,
+    ) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let model_tag = model.name.as_str();
+        let snake = Self::to_snake_case(&model.name);
+        let field = format_ident!("{}", snake);
+        let id_type = Self::id_type_tokens(model);
+        let id_field = Self::id_field_ident(model);
+        let mark_fn = format_ident!("__mark_{}", snake);
+        let create_fn = format_ident!("create_{}", snake);
+        let update_fn = format_ident!("update_{}", snake);
+        let delete_fn = format_ident!("delete_{}", snake);
+        let get_fn = format_ident!("get_{}", snake);
+        let all_fn = format_ident!("all_{}", snake);
+        let validate_fn = format_ident!("validate_{}", snake);
+
+        // `&unique` checks: (1) against the committed index (same as the non-txn
+        // path) and (2) against the staged-unique buffer (`staged_unique_keys`) so
+        // two `create_<model>` calls with the SAME `&unique` value in ONE transaction
+        // both fail — the committed index only reflects pre-txn rows.
+        // On success, insert the key into `staged_unique_keys` so subsequent staged
+        // writes can see it.  Rollback discards the set (it never touches real maps).
+        let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .filter(|f| f.unique)
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fident = format_ident!("{}", f.name);
+                let fname = f.name.as_str();
+                let key = Self::index_key_expr(Self::index_value_expr(
+                    &f.field_type,
+                    quote! { record.#fident },
+                ));
+                quote! {
+                    {
+                        let __uk: String = { #key };
+                        // Check committed index.
+                        if self.db.#field.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
+                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                        }
+                        // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
+                        if self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
+                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                        }
+                        // Claim the key for this transaction.
+                        self.staged_unique_keys.insert((#fname, __uk));
+                    }
+                }
+            })
+            .collect();
+        let unique_checks_update: Vec<_> = Self::indexed_fields(model)
+            .iter()
+            .filter(|f| f.unique)
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let fident = format_ident!("{}", f.name);
+                let fname = f.name.as_str();
+                let key = Self::index_key_expr(Self::index_value_expr(
+                    &f.field_type,
+                    quote! { record.#fident },
+                ));
+                quote! {
+                    {
+                        let __uk: String = { #key };
+                        // Check committed index (exclude self-id).
+                        if let Some(__ids) = self.db.#field.#ident.get(&__uk) {
+                            if __ids.iter().any(|__i| *__i != id) {
+                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            }
+                        }
+                        // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
+                        // An update that keeps its own unique value is fine: the
+                        // staged_unique_keys set does NOT track the id owning each key,
+                        // so we can only block a staged update whose NEW value was
+                        // already claimed by a DIFFERENT staged write.  A prior
+                        // staged insert of the same id already put this key in the
+                        // buffer; an update by the same txn to a different value
+                        // should be blocked only if the new value was claimed by
+                        // someone else.  We use a conservative check: if the key is
+                        // in the staged buffer and the committed index does NOT
+                        // already hold it under this id, it was claimed by another
+                        // staged write.
+                        let __committed_owns = self.db.#field.#ident
+                            .get(&__uk)
+                            .is_some_and(|__ids| __ids.contains(&id));
+                        if !__committed_owns
+                            && self.staged_unique_keys.contains(&(#fname, __uk.clone()))
+                        {
+                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                        }
+                        // Claim the key for this transaction.
+                        self.staged_unique_keys.insert((#fname, __uk));
+                    }
+                }
+            })
+            .collect();
+
+        // FK-existence checks (txn-aware): each FK must resolve to a row VISIBLE to
+        // the transaction (committed OR staged in this txn), so a create-parent +
+        // create-child in one transaction is valid.  Reads through the scoped
+        // `get_<target>` so it sees the target's staged rows.
+        let fk_checks: Vec<_> = model
+            .fields
+            .iter()
+            .filter_map(|f| {
+                let (target_name, optional) = match &f.field_type {
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::RequiredReference(t),
+                    ) => (t, false),
+                    forgedb_parser::FieldType::Relation(
+                        forgedb_parser::RelationType::OptionalReference(t),
+                    ) => (t, true),
+                    _ => return None,
+                };
+                let target = schema.find_model(target_name)?;
+                if !Self::is_uuid_pk(target) {
+                    return None;
+                }
+                let target_get = format_ident!("get_{}", Self::to_snake_case(&target.name));
+                let fk_field = format_ident!("{}", f.name);
+                let fname = f.name.as_str();
+                let tname = target.name.as_str();
+                Some(if optional {
+                    quote! {
+                        if let Some(__fk) = record.#fk_field {
+                            if self.#target_get(__fk).is_none() {
+                                return Err(TxError::Validation(ValidationError::DanglingReference {
+                                    field: #fname, target: #tname,
+                                }));
+                            }
+                        }
+                    }
+                } else {
+                    quote! {
+                        if self.#target_get(record.#fk_field).is_none() {
+                            return Err(TxError::Validation(ValidationError::DanglingReference {
+                                field: #fname, target: #tname,
+                            }));
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let create_doc = format!(
+            "Stage the creation of a {} in this transaction (#83).  Validates field \
+             constraints + `&unique` (committed index) + FK existence (txn-visible \
+             targets), then stages the row; visible only after `commit`.",
+            model.name
+        );
+        let update_doc = format!(
+            "Stage an update of a {} in this transaction (#83).  `Ok(false)` if the \
+             id is not visible to the transaction.",
+            model.name
+        );
+        let delete_doc = format!(
+            "Stage a delete of a {} in this transaction (#83).  Appends a tombstoned \
+             version; `false` if the id is not visible to the transaction.",
+            model.name
+        );
+        let get_doc = format!(
+            "Read a {} within the transaction (#83) with read-your-writes: resolves \
+             the newest version over the committed prefix ∪ this txn's staged rows.",
+            model.name
+        );
+        let all_doc = format!(
+            "Read every live {} within the transaction (#83), including this txn's \
+             own staged rows (read-your-writes).",
+            model.name
+        );
+
+        quote! {
+            #[doc = #create_doc]
+            pub fn #create_fn(&mut self, record: #model_name) -> Result<#id_type, TxError> {
+                self.#mark_fn();
+                // #91 field constraints.
+                #validate_fn(&record)?;
+                // #91 `&unique` (committed index; within-txn duplicate = honest limit).
+                #(#unique_checks_insert)*
+                // #91 FK existence, txn-visible.
+                #(#fk_checks)*
+                let id = record.#id_field;
+                let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                // Opaque row bytes for the buffered broker record (same encoding the
+                // WAL / #82 broker journal — never a decoded field).
+                let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                // Stage the row (WAL + columns + tombstone; NO index/feed/broker).
+                let __row = self.db.#field.__stage_append(record, false);
+                self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Inserted, __id_bytes, __row, __bytes));
+                Ok(id)
+            }
+
+            #[doc = #update_doc]
+            pub fn #update_fn(&mut self, id: #id_type, record: #model_name) -> Result<bool, TxError> {
+                // Existence within the txn (committed ∪ staged) via read-your-writes.
+                if self.#get_fn(id).is_none() {
+                    return Ok(false);
+                }
+                self.#mark_fn();
+                #validate_fn(&record)?;
+                #(#unique_checks_update)*
+                #(#fk_checks)*
+                let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                let __row = self.db.#field.__stage_append(record, false);
+                self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Updated, __id_bytes, __row, __bytes));
+                Ok(true)
+            }
+
+            #[doc = #delete_doc]
+            pub fn #delete_fn(&mut self, id: #id_type) -> bool {
+                // Resolve the current (txn-visible) record to re-append under the
+                // tombstone and to supply the broker bytes.
+                let record = match self.#get_fn(id) {
+                    Some(r) => r,
+                    None => return false,
+                };
+                self.#mark_fn();
+                let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+                let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+                let __row = self.db.#field.__stage_append(record, true);
+                self.pending_events.push((#model_tag, forgedb_changefeed::ChangeKind::Deleted, __id_bytes, __row, __bytes));
+                true
+            }
+
+            #[doc = #get_doc]
+            pub fn #get_fn(&self, id: #id_type) -> Option<#model_name> {
+                // Read-your-writes: `get_at` with the watermark raised to the current
+                // physical (staged) length resolves the newest version per id over
+                // the committed prefix ∪ this txn's staged rows — one decode path.
+                let __snap = forgedb_storage::Snapshot::new(self.db.#field.row_count);
+                self.db.#field.get_at(&__snap, id)
+            }
+
+            #[doc = #all_doc]
+            pub fn #all_fn(&self) -> Vec<#model_name> {
+                let __snap = forgedb_storage::Snapshot::new(self.db.#field.row_count);
+                self.db.#field.all_at(&__snap)
+            }
+        }
     }
 
     /// Generate the persisted junction storage struct for each M2M relation.
@@ -6029,6 +7743,361 @@ impl RustGenerator {
             result.push(c.to_ascii_lowercase());
         }
         result
+    }
+
+    /// Generate the Tier 3 coordinator client surface (#84, MVCC multi-process).
+    ///
+    /// Emits `CoordinatedDatabase` and `Database::connect` — additive to the
+    /// existing method bodies (the only non-additive edit is factoring `open_at`
+    /// into the lock-free-capable `__open_with_lock` core the coordinated open
+    /// reuses; the single-writer commit/transaction bodies stay byte-identical —
+    /// T3-5).
+    ///
+    /// ## What is generated
+    ///
+    /// ```rust,ignore
+    /// pub struct CoordinatedDatabase {
+    ///     shared: SharedDatabase,
+    ///     coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
+    /// }
+    ///
+    /// impl CoordinatedDatabase {
+    ///     pub fn transaction_coordinated<T>(
+    ///         &self,
+    ///         retries: u32,
+    ///         f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+    ///     ) -> Result<T, TxError> { ... }
+    /// }
+    ///
+    /// impl Database {
+    ///     pub fn connect(
+    ///         root: std::path::PathBuf,
+    ///         socket_path: std::path::PathBuf,
+    ///     ) -> Result<CoordinatedDatabase, TxError> { ... }
+    /// }
+    /// ```
+    ///
+    /// ## Identity red line
+    ///
+    /// `CoordinatedDatabase` sends only opaque byte keys to the coordinator and
+    /// calls the SAME `__apply_and_commit_concurrent_buffer` as `SharedDatabase`
+    /// for the data-plane write — no second apply path, no drift.  The
+    /// coordinator itself never receives a decoded field.
+    fn generate_coordinated_client(schema: &Schema) -> TokenStream {
+        // Only generate if there are transactable models.
+        let tx_models: Vec<&forgedb_parser::Model> = schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .collect();
+        if tx_models.is_empty() {
+            return quote! {};
+        }
+
+        // Per-model peer-refresh arms: re-derive EVERY column's row_count from the
+        // shared on-disk files, then rebuild id_to_row + secondary indexes.
+        // `__sync_columns_from_disk` syncs all data columns + the tombstone (via
+        // the additive `*::sync_from_disk` substrate) — NOT just the tombstone: a
+        // peer's row is only readable once every column's bound is refreshed, so a
+        // tombstone-only sync would leave `get`/`read_at` reading out of bounds.
+        // T3-8: reads shared columns via the existing storage fds; writes no column
+        // (no append/flush). The coordinator never calls this — it is generated
+        // data-plane code, satisfying T3-8.
+        let peer_refresh_arms: Vec<_> = tx_models
+            .iter()
+            .map(|m| {
+                let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                quote! {
+                    self.#field.__sync_columns_from_disk();
+                    self.#field.__reindex_committed();
+                }
+            })
+            .collect();
+
+        quote! {
+            /// Tier 3 MVCC multi-process coordinator client (#84).
+            ///
+            /// Wraps a [`SharedDatabase`] (Tier 2 in-process concurrency) and
+            /// routes the serialized commit section through a running
+            /// `forgedb coordinate <root>` coordinator process over a Unix socket,
+            /// enabling multiple OS processes to share a single data directory
+            /// without corruption.
+            ///
+            /// Create via [`Database::connect`] (connects to the coordinator, then
+            /// opens the data dir lock-free — the coordinator holds the #89 lock).
+            pub struct CoordinatedDatabase {
+                shared: SharedDatabase,
+                coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
+                /// The coordinator LSN this writer has refreshed peer commits up to.
+                /// When `coordinator.last_known_lsn()` exceeds this, a peer refresh
+                /// is performed before the next prepare (peer read-currency, #84).
+                last_refreshed_lsn: std::sync::atomic::AtomicU64,
+            }
+
+            impl CoordinatedDatabase {
+                /// Run a transaction through the Tier 3 commit coordinator.
+                ///
+                /// ## Commit flow
+                ///
+                /// 0. **Peer refresh** (if coordinator LSN advanced): sync tombstone
+                ///    counts from disk + rebuild id_to_row/indexes under write lock.
+                ///    This is how a writer sees commits made by other processes while
+                ///    it was prepare-ing — peer read-currency via #56-B shared column
+                ///    files, driven by the coordinator log offset as the signal.
+                ///    T3-8: the coordinator never writes a column; this refresh is
+                ///    generated data-plane code reading the shared files.
+                /// 1. Capture read snapshot (brief `RwLock` read, sequencer snapshot).
+                /// 2. Run prepare closure with `ConcurrentTxHandle` — no lock held.
+                /// 3. Build opaque write-set keys (same as Tier 2, identity red line).
+                /// 4. **`RequestTurn`** → coordinator: conflict-check + LSN assignment.
+                ///    - On `Grant`: proceed to data-plane write.
+                ///    - On `Nack` (conflict): release snapshot, retry from step 0.
+                ///    - On `Busy`: brief back-off then retry step 4.
+                /// 5. Data-plane write: `__apply_and_commit_concurrent_buffer` under
+                ///    the exclusive in-process `RwLock`.  Same path as Tier 2.
+                ///    Returns the physical `(model_tag_bytes, row_index)` pairs for
+                ///    each row appended (T3-3/T3-8: correct positions in the log).
+                /// 6. **`Committed`** → coordinator: hand opaque row bytes + REAL
+                ///    row indices for the durable replication log, receive `Ack { lsn }`.
+                /// 7. Release snapshot; return the prepared value.
+                pub fn transaction_coordinated<T>(
+                    &self,
+                    retries: u32,
+                    f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+                ) -> Result<T, TxError> {
+                    use forgedb_changefeed::ChangeKind as __CK;
+                    use std::sync::atomic::Ordering;
+                    let __coord = std::sync::Arc::clone(&self.coordinator);
+                    let __seq_arc = std::sync::Arc::clone(&self.shared.seq);
+                    let __inner = std::sync::Arc::clone(&self.shared.inner);
+
+                    let mut __last_lsn = __coord.last_known_lsn();
+
+                    for __attempt in 0..=retries {
+                        // Step 0 – peer read-currency: if the coordinator has advanced
+                        // past our last-refreshed offset, a peer committed rows we have
+                        // not yet reflected in our in-memory id_to_row / indexes.
+                        // Refresh them now by re-reading the shared column files (T3-8:
+                        // generated data-plane code; coordinator has no column dep).
+                        {
+                            let __coord_lsn = __coord.last_known_lsn();
+                            let __refreshed = self.last_refreshed_lsn.load(Ordering::Acquire);
+                            if __coord_lsn > __refreshed {
+                                let mut __db = __inner.write().unwrap();
+                                __db.__peer_refresh();
+                                self.last_refreshed_lsn.store(__coord_lsn, Ordering::Release);
+                            }
+                        }
+
+                        // Step 1 – register snapshot LSN (local; coordinator is the authority).
+                        let __snap_lsn = {
+                            let mut __seq = __seq_arc.lock().unwrap();
+                            __seq.register_snapshot()
+                        };
+
+                        // Step 2 – capture committed watermarks (brief read lock).
+                        let __snap = {
+                            let __db = __inner.read().unwrap();
+                            __db.snapshot()
+                        };
+
+                        // Step 3 – prepare closure with private-buffer staging (no lock held).
+                        let mut __tx = ConcurrentTxHandle {
+                            inner: std::sync::Arc::clone(&__inner),
+                            snap: __snap,
+                            buffer: Vec::new(),
+                            staged_unique_keys: std::collections::BTreeSet::new(),
+                            pending_events: Vec::new(),
+                        };
+                        let __out = f(&mut __tx);
+                        let __val = match __out {
+                            Ok(v) => v,
+                            Err(e) => {
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                return Err(e);
+                            }
+                        };
+
+                        // Step 4 – build opaque write-set (identity red line: coordinator sees bytes only).
+                        let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
+                        for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
+                            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+                            k.extend_from_slice(__model.as_bytes());
+                            k.extend_from_slice(__id_bytes);
+                            __ws_keys.push(k);
+                        }
+                        for (__fname, __ekey) in &__tx.staged_unique_keys {
+                            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+                            k.extend_from_slice(__fname.as_bytes());
+                            k.extend_from_slice(__ekey.as_bytes());
+                            __ws_keys.push(k);
+                        }
+
+                        // Step 5 – RequestTurn: coordinator conflict-check + LSN assignment.
+                        let __turn = {
+                            let mut __busy_retries = 0u32;
+                            loop {
+                                match __coord.request_turn(__ws_keys.clone(), __last_lsn) {
+                                    Ok(grant) => break Ok(grant),
+                                    Err(forgedb_coordinator::client::ClientError::Conflict { conflict_key }) => {
+                                        break Err(forgedb_txn::CommitOutcome::Conflict {
+                                            key: conflict_key.into_boxed_slice(),
+                                        });
+                                    }
+                                    Err(forgedb_coordinator::client::ClientError::Busy) => {
+                                        if __busy_retries >= 5 {
+                                            break Err(forgedb_txn::CommitOutcome::Conflict {
+                                                key: b"__busy__".to_vec().into_boxed_slice(),
+                                            });
+                                        }
+                                        __busy_retries += 1;
+                                        std::thread::sleep(std::time::Duration::from_millis(20 * __busy_retries as u64));
+                                    }
+                                    Err(e) => {
+                                        let mut __seq = __seq_arc.lock().unwrap();
+                                        __seq.release_snapshot(__snap_lsn);
+                                        return Err(TxError::Io(e.to_string()));
+                                    }
+                                }
+                            }
+                        };
+
+                        match __turn {
+                            Err(_) => {
+                                // Conflict or busy exhaustion — retry.
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+                                __last_lsn = __coord.last_known_lsn();
+                                continue;
+                            }
+                            Ok((__turn_id, _reserved_lsn)) => {
+                                // Save buffer metadata before moving buffer into apply.
+                                let __kinds_copy: Vec<u8> = __tx.buffer
+                                    .iter()
+                                    .map(|(_, k, _, _, _)| k.to_byte())
+                                    .collect();
+                                let __bytes_copy: Vec<Vec<u8>> = __tx.buffer
+                                    .iter()
+                                    .map(|(_, _, _, b, _)| b.clone())
+                                    .collect();
+
+                                // Step 6 – data-plane write (same path as Tier 2).
+                                // __apply_and_commit_concurrent_buffer now returns
+                                // Vec<(model_tag_bytes, row_index)> — the real physical
+                                // positions for the coordinator's replication log (T3-3/T3-8).
+                                let __apply_result = {
+                                    let mut __db = __inner.write().unwrap();
+                                    __db.__apply_and_commit_concurrent_buffer(
+                                        __tx.buffer,
+                                        __tx.pending_events,
+                                    )
+                                };
+
+                                // Step 7 – Committed: hand opaque bytes + REAL row indices.
+                                // Build coordinator payload (opaque; coordinator never decodes).
+                                let (__model_tags, __row_indices) = match &__apply_result {
+                                    Ok(__pairs) => {
+                                        let tags: Vec<Vec<u8>> = __pairs.iter().map(|(t, _)| t.clone()).collect();
+                                        let rows: Vec<u64> = __pairs.iter().map(|(_, r)| *r).collect();
+                                        (tags, rows)
+                                    }
+                                    Err(_) => {
+                                        // Apply failed — still send Committed with empty payload
+                                        // so the coordinator releases the turn (T3-5: data-plane
+                                        // error must not wedge the coordinator turn slot).
+                                        (Vec::new(), Vec::new())
+                                    }
+                                };
+                                let __ack = __coord.committed(
+                                    __turn_id,
+                                    __model_tags,
+                                    __row_indices,
+                                    __kinds_copy,
+                                    __bytes_copy,
+                                );
+                                match __ack {
+                                    Ok(__lsn) => { __last_lsn = __lsn; }
+                                    Err(e) => {
+                                        // Best-effort: the commit is already durable (columns
+                                        // + WAL fsynced before Committed); a missed ack only
+                                        // leaves `__last_lsn` briefly stale.  Dependency-free
+                                        // diagnostic so the generated crate needs no `log` dep.
+                                        eprintln!("coordinator: Committed ack error: {e}");
+                                    }
+                                }
+
+                                let mut __seq = __seq_arc.lock().unwrap();
+                                __seq.release_snapshot(__snap_lsn);
+
+                                return __apply_result.map(|_| __val);
+                            }
+                        }
+                    }
+                    Err(TxError::Conflict)
+                }
+            }
+
+            impl Database {
+                /// Peer read-currency refresh for Tier 3 multi-process writers (#84).
+                ///
+                /// Re-reads the on-disk tombstone byte counts (the row-count anchor)
+                /// for each model, updates the in-memory `row_count`, then rebuilds
+                /// `id_to_row` + secondary indexes from the shared column files.
+                ///
+                /// Called under the exclusive write lock (`RwLock`) before each
+                /// `transaction_coordinated` prepare step whenever the coordinator's
+                /// committed LSN has advanced past `last_refreshed_lsn` — meaning a
+                /// peer process committed rows that this writer has not yet seen.
+                ///
+                /// T3-8 contract: this method reads shared column files via the
+                /// #56-B substrate (`sync_from_disk` / `__reindex_committed`); it
+                /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
+                /// dependency and never calls this.
+                pub(crate) fn __peer_refresh(&mut self) {
+                    #(#peer_refresh_arms)*
+                }
+
+                /// Open a data dir as a **coordinated Tier-3 client** of a running
+                /// `forgedb coordinate <root>` coordinator, returning a
+                /// [`CoordinatedDatabase`] that lets multiple OS processes share one
+                /// data directory safely (#84).
+                ///
+                /// ## Lock discipline (MVCC spec T3-5 / PM re-gate #84 — load-bearing)
+                ///
+                /// This connects to the coordinator **FIRST** and only then opens the
+                /// data dir **lock-free** (`_lock: None`): the coordinator holds the
+                /// #89 `DirLock` on `<root>/.forgedb.lock` on behalf of every client,
+                /// and write mutual-exclusion among coordinated clients is the
+                /// coordinator's serialized turn-grant — NOT the file lock.  If the
+                /// coordinator is unreachable, this returns
+                /// [`TxError::CoordinatorUnavailable`] and **no lock-free open
+                /// happens**, so there is never an unserialized lock-free writer
+                /// (the binding PM constraint).  Contrast `open_at`, which takes the
+                /// `DirLock` itself for the standalone single-writer path — the two
+                /// modes are mutually exclusive because both contend for the same
+                /// lock file.
+                pub fn connect(
+                    root: std::path::PathBuf,
+                    socket_path: std::path::PathBuf,
+                ) -> Result<CoordinatedDatabase, TxError> {
+                    // Establish the live coordinator turn-channel BEFORE any
+                    // lock-free open, so a socket-configured-but-coordinator-down
+                    // misconfiguration surfaces as CoordinatorUnavailable rather
+                    // than silently opening a second unserialized writer.
+                    let coordinator = forgedb_coordinator::client::CoordinatorClient::connect(&socket_path)
+                        .map_err(|e| TxError::CoordinatorUnavailable(e.to_string()))?;
+                    // Coordinator is live and holds the #89 DirLock for us → open
+                    // WITHOUT taking the lock ourselves (T3-5).
+                    let shared = Self::__open_with_lock(root, None).shared();
+                    Ok(CoordinatedDatabase {
+                        shared,
+                        coordinator: std::sync::Arc::new(coordinator),
+                        last_refreshed_lsn: std::sync::atomic::AtomicU64::new(0),
+                    })
+                }
+            }
+        }
     }
 }
 

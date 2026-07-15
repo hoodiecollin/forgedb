@@ -125,6 +125,22 @@ impl WalManager {
         Ok(())
     }
 
+    /// Truncate the WAL to a specific byte `offset`, dropping every byte after it
+    /// (MVCC Tier 1 transaction rollback).
+    ///
+    /// Unlike [`truncate`] (which clears the whole log), this rolls the file back
+    /// to a previously-recorded [`size`] mark, so a committed WAL prefix survives
+    /// and only the aborted transaction's staged records are discarded.
+    /// A no-op if `offset` is already `>=` the current length.
+    ///
+    /// [`truncate`]: WalManager::truncate
+    /// [`size`]: WalManager::size
+    pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
+        self.writer.truncate_to(offset)?;
+        self.reader = WalReader::new(&self.path)?;
+        Ok(())
+    }
+
     /// Rotate the WAL: archive the current file under a timestamped name and
     /// start a fresh, empty WAL at the original path.
     ///
@@ -229,6 +245,16 @@ impl WalManager {
     /// Clear the in-memory log.
     pub fn truncate(&mut self) -> io::Result<()> {
         self.buffer.clear();
+        Ok(())
+    }
+
+    /// Truncate the in-memory log to a specific byte `offset` (MVCC Tier 1
+    /// transaction rollback).  A no-op if `offset >=` the current length.
+    pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
+        let offset = offset as usize;
+        if offset < self.buffer.len() {
+            self.buffer.truncate(offset);
+        }
         Ok(())
     }
 

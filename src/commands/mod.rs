@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod build;
 pub mod compact;
+pub mod coordinate;
 pub mod dev;
 pub mod generate;
 pub mod init;

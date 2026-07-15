@@ -152,6 +152,16 @@ enum Commands {
     #[command(subcommand)]
     Tenant(TenantCommands),
 
+    /// Start the Tier 3 MVCC commit coordinator (multi-process writers, #84)
+    Coordinate {
+        /// Data root directory to coordinate.
+        root: std::path::PathBuf,
+
+        /// Unix socket path.  Default: <root>/_coord.sock
+        #[arg(short, long)]
+        socket: Option<std::path::PathBuf>,
+    },
+
     /// Start ForgeDB server (Rust API + Bun Runtime + nginx)
     Serve {
         /// Host address
@@ -466,6 +476,10 @@ fn run(cli: Cli) -> Result<()> {
                 commands::migrate::down(commands::migrate::MigrateDownOptions { steps })
             }
         },
+
+        Commands::Coordinate { root, socket } => {
+            commands::coordinate::run(commands::coordinate::CoordinateOptions { root, socket })
+        }
 
         Commands::Serve {
             host,
