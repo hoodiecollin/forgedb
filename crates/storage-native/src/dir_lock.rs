@@ -19,6 +19,16 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::Path;
 
+/// The single-writer lock filename under a data directory (`<root>/.forgedb.lock`).
+///
+/// **Cross-crate contract:** `forgedb-coordinator` advisory-locks this same file
+/// (by a duplicated constant, since it must not depend on `forgedb-storage*` —
+/// MVCC spec T3-8) so a coordinator and a standalone writer are mutually
+/// exclusive (T3-5). Renaming it here without updating
+/// `forgedb_coordinator::server::DIR_LOCK_FILENAME` breaks that exclusion; a
+/// parity test in each crate pins the string.
+pub const LOCK_FILENAME: &str = ".forgedb.lock";
+
 /// An advisory exclusive lock on a ForgeDB data directory.
 ///
 /// Holds an open `File` to `<root>/.forgedb.lock` with an OS-level exclusive
@@ -85,7 +95,7 @@ impl DirLock {
     /// - Any other `io::Error` from creating the directory or opening the file.
     pub fn acquire(root: &Path) -> io::Result<DirLock> {
         fs::create_dir_all(root)?;
-        let lock_path = root.join(".forgedb.lock");
+        let lock_path = root.join(LOCK_FILENAME);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -129,4 +139,18 @@ fn libc_ewouldblock() -> i32 {
     // On non-Unix targets fs2 should already set the kind to WouldBlock.
     // Return an impossible value so the fallback branch is never taken.
     i32::MAX
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G3 mirror (PM re-gate #84) — pins the lock filename so the coordinator's
+    /// duplicated `DIR_LOCK_FILENAME` constant cannot silently desync from the
+    /// file `DirLock` actually locks. The other half lives in
+    /// `forgedb_coordinator::server::tests::lock_filename_matches_storage_dirlock`.
+    #[test]
+    fn lock_filename_is_stable() {
+        assert_eq!(LOCK_FILENAME, ".forgedb.lock");
+    }
 }
