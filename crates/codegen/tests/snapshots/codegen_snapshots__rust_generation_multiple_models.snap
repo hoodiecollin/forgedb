@@ -1812,6 +1812,14 @@ pub struct Database {
     /// lock-free `new()` convenience path, whose transactions are
     /// in-process-atomic but not crash-atomic across models.
     _txn_journal: Option<forgedb_wal::WalManager>,
+    /// Commit sequencer (MVCC Tier 2, #83): monotonic LSN source +
+    /// first-committer-wins conflict map.  In-memory, ephemeral;
+    /// rebuilds empty on restart (no in-flight txns survive a process
+    /// restart).  Shared behind `Arc<Mutex>` so prepare can be
+    /// concurrent and commit is serialized.  Seeded from the broker
+    /// watermark on `open_at` so the commit-LSN and broker offset form
+    /// one unified monotonic sequence.
+    seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
 }
 /// A read-only, lock-free view of the whole database (#56 Direction B).
 /// One per reader thread; each field shares the writer's column files
@@ -1847,6 +1855,9 @@ impl Database {
             broker: None,
             _lock: None,
             _txn_journal: None,
+            seq: std::sync::Arc::new(
+                std::sync::Mutex::new(forgedb_txn::CommitSequencer::new(0)),
+            ),
         }
     }
     /// Open the whole database rooted at `root` (#59): every model and
@@ -1873,6 +1884,13 @@ impl Database {
             Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
             Err(_) => None,
         };
+        let __seq_start = match &broker {
+            Some(b) => b.lock().map(|b| b.watermark()).unwrap_or(0),
+            None => 0,
+        };
+        let seq = std::sync::Arc::new(
+            std::sync::Mutex::new(forgedb_txn::CommitSequencer::new(__seq_start)),
+        );
         let mut _txn_journal = forgedb_wal::WalManager::open(
                 root.join("_txn_journal.log"),
                 forgedb_wal::FsyncPolicy::Always,
@@ -1906,6 +1924,7 @@ impl Database {
             broker,
             _lock,
             _txn_journal: Some(_txn_journal),
+            seq,
         };
         for (__model, __len) in &__journal_committed {
             let __len = *__len;
@@ -1951,7 +1970,24 @@ impl Database {
     /// `forgedb compact` CLI path).  Junctions are skipped — an
     /// append-only link table accumulates no dead versions.  Single-
     /// writer only.
+    ///
+    /// MVCC Tier 2 (#83, PM constraint 3): no row still visible as of
+    /// the oldest live snapshot may be GC'd.  With genuine concurrent
+    /// prepare (`SharedDatabase`/`Arc<RwLock<Database>>`), a
+    /// `ConcurrentTxHandle` registers a live snapshot on the sequencer
+    /// while another thread may take the write lock and call `compact()`,
+    /// so this guard is **load-bearing in Tier 2**: if any snapshot is
+    /// live, compaction is DEFERRED (skipped this pass) rather than
+    /// augmenting the keep-set — a conservative correctness guarantee
+    /// (never reclaims a pinned version) at the cost of compaction
+    /// liveness under sustained concurrent load.  `forgedb-compaction`
+    /// stays snapshot-unaware (opaque indices only).
     pub fn compact(&mut self) {
+        if let Ok(__seq) = self.seq.lock() {
+            if __seq.oldest_live_snapshot().as_u64() > 0 {
+                return;
+            }
+        }
         self.user.compact();
         self.post.compact();
     }
@@ -2178,7 +2214,9 @@ pub struct TxHandle<'db> {
     /// Buffered change-feed + durable-broker records, drained (offsets
     /// consumed) only on commit — so a rolled-back txn consumes NO
     /// broker offset and emits NO changefeed event (no offset gap).
-    pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, usize, Vec<u8>)>,
+    pending_events: Vec<
+        (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, usize, Vec<u8>),
+    >,
     /// Unique keys claimed by staged writes in this transaction (M1a fix).
     ///
     /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
@@ -2229,10 +2267,17 @@ impl<'db> TxHandle<'db> {
         self.__mark_user();
         validate_user(&record)?;
         let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.user.__stage_append(record, false);
         self.pending_events
-            .push(("User", forgedb_changefeed::ChangeKind::Inserted, __row, __bytes));
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         Ok(id)
     }
     ///Stage an update of a User in this transaction (#83).  `Ok(false)` if the id is not visible to the transaction.
@@ -2242,10 +2287,17 @@ impl<'db> TxHandle<'db> {
         }
         self.__mark_user();
         validate_user(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.user.__stage_append(record, false);
         self.pending_events
-            .push(("User", forgedb_changefeed::ChangeKind::Updated, __row, __bytes));
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         Ok(true)
     }
     ///Stage a delete of a User in this transaction (#83).  Appends a tombstoned version; `false` if the id is not visible to the transaction.
@@ -2255,10 +2307,17 @@ impl<'db> TxHandle<'db> {
             None => return false,
         };
         self.__mark_user();
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.user.__stage_append(record, true);
         self.pending_events
-            .push(("User", forgedb_changefeed::ChangeKind::Deleted, __row, __bytes));
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         true
     }
     ///Read a User within the transaction (#83) with read-your-writes: resolves the newest version over the committed prefix ∪ this txn's staged rows.
@@ -2276,10 +2335,17 @@ impl<'db> TxHandle<'db> {
         self.__mark_post();
         validate_post(&record)?;
         let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.post.__stage_append(record, false);
         self.pending_events
-            .push(("Post", forgedb_changefeed::ChangeKind::Inserted, __row, __bytes));
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         Ok(id)
     }
     ///Stage an update of a Post in this transaction (#83).  `Ok(false)` if the id is not visible to the transaction.
@@ -2289,10 +2355,17 @@ impl<'db> TxHandle<'db> {
         }
         self.__mark_post();
         validate_post(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.post.__stage_append(record, false);
         self.pending_events
-            .push(("Post", forgedb_changefeed::ChangeKind::Updated, __row, __bytes));
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         Ok(true)
     }
     ///Stage a delete of a Post in this transaction (#83).  Appends a tombstoned version; `false` if the id is not visible to the transaction.
@@ -2302,10 +2375,17 @@ impl<'db> TxHandle<'db> {
             None => return false,
         };
         self.__mark_post();
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
         let __row = self.db.post.__stage_append(record, true);
         self.pending_events
-            .push(("Post", forgedb_changefeed::ChangeKind::Deleted, __row, __bytes));
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
         true
     }
     ///Read a Post within the transaction (#83) with read-your-writes: resolves the newest version over the committed prefix ∪ this txn's staged rows.
@@ -2369,7 +2449,7 @@ impl<'db> TxHandle<'db> {
                 _ => {}
             }
         }
-        for (__model, __kind, __row, __bytes) in std::mem::take(
+        for (__model, __kind, _id_bytes, __row, __bytes) in std::mem::take(
             &mut self.pending_events,
         ) {
             self.db.changefeed.emit(__model, __row, __kind);
@@ -2423,6 +2503,32 @@ impl<'db> TxHandle<'db> {
         }
         self.pending_events.clear();
     }
+    /// Compute the write-set for the commit sequencer (MVCC Tier 2, #83).
+    ///
+    /// Returns all opaque keys touched by this transaction: one per staged
+    /// row (`model_tag_bytes ++ logical_id_bytes`) and one per claimed
+    /// unique key (`field_name_bytes ++ encoded_key_bytes`).  The
+    /// sequencer sees only opaque bytes — no model name, no field, no
+    /// schema — preserving the identity red line.
+    pub fn __write_set(&self, snapshot_lsn: forgedb_txn::Lsn) -> forgedb_txn::WriteSet {
+        let mut keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
+        for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
+            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+            k.extend_from_slice(__model.as_bytes());
+            k.extend_from_slice(__id_bytes);
+            keys.push(k.into_boxed_slice());
+        }
+        for (__fname, __ekey) in &self.staged_unique_keys {
+            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+            k.extend_from_slice(__fname.as_bytes());
+            k.extend_from_slice(__ekey.as_bytes());
+            keys.push(k.into_boxed_slice());
+        }
+        forgedb_txn::WriteSet {
+            keys,
+            snapshot_lsn,
+        }
+    }
 }
 impl<'db> Drop for TxHandle<'db> {
     /// Panic-safety backstop: an un-committed handle (dropped via an
@@ -2434,6 +2540,12 @@ impl<'db> Drop for TxHandle<'db> {
         }
     }
 }
+/// Default retry count for `transaction_optimistic` (#83, Tier 2).
+///
+/// Override per-call via `transaction_retrying(retries, f)`.
+/// (`forgedb.toml` `[transaction] max_retries` wiring is a residual —
+/// the knob is exposed via `transaction_retrying` for now.)
+const DEFAULT_TXN_RETRIES: u32 = 3;
 impl Database {
     /// Run a transaction (MVCC Tier 1, #83).  The closure receives a
     /// scoped `TxHandle` exposing the per-model `create_/update_/delete_`
@@ -2466,5 +2578,574 @@ impl Database {
                 Err(e)
             }
         }
+    }
+    /// Run an optimistic transaction with auto-retry (MVCC Tier 2, #83).
+    ///
+    /// The closure `f` is `Fn` (re-runnable): it may be invoked up to
+    /// `retries + 1` times.  Each attempt: (1) registers a snapshot LSN
+    /// via the `CommitSequencer`, (2) runs the prepare closure staging
+    /// writes into private buffers via `TxHandle`, (3) at the serialized
+    /// commit point calls `CommitSequencer::try_commit` — on
+    /// `Committed`, applies via the Tier-1 commit; on `Conflict`, drops
+    /// the buffers and retries (snapshot re-registered).
+    ///
+    /// **Isolation:** snapshot isolation, first-committer-wins.  The
+    /// disclosed anomaly is write-skew (two txns read overlapping key
+    /// sets, each writes a disjoint subset; both may commit in SI).
+    /// Serializable snapshot isolation (SSI, read-set tracking) is Tier 3.
+    ///
+    /// **"Concurrent writers"** = concurrent *prepare*, serialized
+    /// *commit*.  In Tier 2, `transaction_retrying` takes `&mut self`,
+    /// so prepare is also serialized (only one `&mut` holder at a time).
+    /// The sequencer and conflict-map are structurally ready for
+    /// concurrent prepare; `&mut Database` makes it a no-op here.
+    /// Genuine concurrent prepare lands in Tier 3
+    /// (`Arc<RwLock<Database>>`).
+    pub fn transaction_retrying<T>(
+        &mut self,
+        retries: u32,
+        f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
+    ) -> Result<T, TxError> {
+        let __seq_arc = std::sync::Arc::clone(&self.seq);
+        for __attempt in 0..=retries {
+            let __snap_lsn = {
+                let mut __seq = self.seq.lock().unwrap();
+                __seq.register_snapshot()
+            };
+            let mut tx = TxHandle::begin(self);
+            let __out = f(&mut tx);
+            let __val = match __out {
+                Ok(v) => v,
+                Err(e) => {
+                    tx.rollback();
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                    return Err(e);
+                }
+            };
+            let __ws = tx.__write_set(__snap_lsn);
+            let __outcome = {
+                let mut __seq = __seq_arc.lock().unwrap();
+                __seq.try_commit(&__ws)
+            };
+            match __outcome {
+                forgedb_txn::CommitOutcome::Committed(_l) => {
+                    tx.commit()?;
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                    let _ = __attempt;
+                    return Ok(__val);
+                }
+                forgedb_txn::CommitOutcome::Conflict { .. } => {
+                    tx.rollback();
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                }
+            }
+        }
+        Err(TxError::Conflict)
+    }
+    /// Run an optimistic transaction with the default retry count (#83).
+    ///
+    /// Uses `DEFAULT_TXN_RETRIES` (= 3 retries, 4 total attempts).  For
+    /// per-call control use `transaction_retrying(retries, f)`.
+    pub fn transaction_optimistic<T>(
+        &mut self,
+        f: impl Fn(&mut TxHandle) -> Result<T, TxError>,
+    ) -> Result<T, TxError> {
+        self.transaction_retrying(DEFAULT_TXN_RETRIES, f)
+    }
+}
+/// A cloneable, thread-safe handle for concurrent transaction preparation
+/// (#83 Tier 2).
+///
+/// Multiple threads may prepare transactions concurrently — each calls
+/// `transaction_concurrent` which holds the inner `RwLock` in **read mode**
+/// only during snapshot-capture, then releases it entirely during prepare.
+/// The serialized commit section takes the **exclusive write lock** to apply
+/// the buffer atomically.
+///
+/// Create via `Database::shared()`.
+#[derive(Clone)]
+pub struct SharedDatabase {
+    inner: std::sync::Arc<std::sync::RwLock<Database>>,
+    /// Sequencer Arc cloned from Database.seq at construction.
+    seq: std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>,
+}
+impl SharedDatabase {
+    /// Run a transaction with genuine concurrent prepare (#83 Tier 2).
+    ///
+    /// The closure receives a `ConcurrentTxHandle` that stages writes into
+    /// **private in-memory buffers** — NO shared state is modified during
+    /// prepare.  The commit critical section takes the exclusive write lock
+    /// briefly to apply the buffer and advance visibility.
+    pub fn transaction_concurrent<T>(
+        &self,
+        retries: u32,
+        f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
+    ) -> Result<T, TxError> {
+        let __seq_arc = std::sync::Arc::clone(&self.seq);
+        for __attempt in 0..=retries {
+            let __snap_lsn = {
+                let mut __seq = __seq_arc.lock().unwrap();
+                __seq.register_snapshot()
+            };
+            let __snap = {
+                let __db = self.inner.read().unwrap();
+                __db.snapshot()
+            };
+            let mut __tx = ConcurrentTxHandle {
+                inner: std::sync::Arc::clone(&self.inner),
+                snap: __snap,
+                buffer: Vec::new(),
+                staged_unique_keys: std::collections::BTreeSet::new(),
+                pending_events: Vec::new(),
+            };
+            let __out = f(&mut __tx);
+            let __val = match __out {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                    return Err(e);
+                }
+            };
+            let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
+            for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
+                let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
+                k.extend_from_slice(__model.as_bytes());
+                k.extend_from_slice(__id_bytes);
+                __ws_keys.push(k.into_boxed_slice());
+            }
+            for (__fname, __ekey) in &__tx.staged_unique_keys {
+                let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
+                k.extend_from_slice(__fname.as_bytes());
+                k.extend_from_slice(__ekey.as_bytes());
+                __ws_keys.push(k.into_boxed_slice());
+            }
+            let __ws = forgedb_txn::WriteSet {
+                keys: __ws_keys,
+                snapshot_lsn: __snap_lsn,
+            };
+            let __outcome = {
+                let mut __seq = __seq_arc.lock().unwrap();
+                __seq.try_commit(&__ws)
+            };
+            match __outcome {
+                forgedb_txn::CommitOutcome::Committed(_l) => {
+                    {
+                        let mut __db = self.inner.write().unwrap();
+                        let __buf = __tx.buffer;
+                        let __evts = __tx.pending_events;
+                        __db.__apply_and_commit_concurrent_buffer(__buf, __evts)?;
+                    }
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                    let _ = __attempt;
+                    return Ok(__val);
+                }
+                forgedb_txn::CommitOutcome::Conflict { .. } => {
+                    let mut __seq = __seq_arc.lock().unwrap();
+                    __seq.release_snapshot(__snap_lsn);
+                }
+            }
+        }
+        Err(TxError::Conflict)
+    }
+}
+/// Private-buffer transaction handle for concurrent preparation (#83 Tier 2).
+///
+/// Unlike `TxHandle` (which stages into shared columns via `__stage_append`),
+/// `ConcurrentTxHandle` stages into in-memory buffers that touch NO shared
+/// state during prepare.
+pub struct ConcurrentTxHandle {
+    inner: std::sync::Arc<std::sync::RwLock<Database>>,
+    /// Snapshot watermarks for reads (captured at transaction start).
+    snap: DatabaseSnapshot,
+    /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
+    buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
+    /// Claimed unique keys (field_name, encoded_key).
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    /// Pending events: (model_tag, kind, id_bytes, record_bytes).
+    pending_events: Vec<
+        (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>),
+    >,
+}
+impl ConcurrentTxHandle {
+    /// Stage the creation of a #model_name in a concurrent transaction.
+    pub fn create_user(&mut self, record: User) -> Result<Uuid, TxError> {
+        validate_user(&record)?;
+        let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __bytes,
+            ));
+        Ok(id)
+    }
+    /// Stage an update of a #model_name in a concurrent transaction.
+    pub fn update_user(&mut self, id: Uuid, record: User) -> Result<bool, TxError> {
+        if self.get_user(id).is_none() {
+            return Ok(false);
+        }
+        validate_user(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes,
+                __bytes,
+            ));
+        Ok(true)
+    }
+    /// Stage a delete of a #model_name in a concurrent transaction.
+    pub fn delete_user(&mut self, id: Uuid) -> bool {
+        let record = match self.get_user(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                true,
+            ));
+        self.pending_events
+            .push((
+                "User",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes,
+                __bytes,
+            ));
+        true
+    }
+    /// Read a #model_name within the concurrent transaction (read-your-writes).
+    pub fn get_user(&self, id: Uuid) -> Option<User> {
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        for (_, _kind, __ib, __bytes, __del) in self.buffer.iter().rev() {
+            if __ib == &__id_bytes {
+                if *__del {
+                    return None;
+                }
+                return serde_json::from_slice(__bytes).ok();
+            }
+        }
+        let __db = self.inner.read().unwrap();
+        __db.user.get_at(&self.snap.user, id)
+    }
+    /// Read all live #model_name records visible to this concurrent transaction.
+    pub fn all_user(&self) -> Vec<User> {
+        let __db = self.inner.read().unwrap();
+        let mut __rows = __db.user.all_at(&self.snap.user);
+        drop(__db);
+        for (_, _kind, __ib, __bytes, __del) in &self.buffer {
+            let __id_bytes_ref: &Vec<u8> = __ib;
+            if *__del {
+                __rows
+                    .retain(|r| {
+                        serde_json::to_vec(&r.id).unwrap_or_default().as_slice()
+                            != __id_bytes_ref.as_slice()
+                    });
+            } else if let Ok(__rec) = serde_json::from_slice::<User>(__bytes) {
+                let __staged_id = __rec.id;
+                if let Some(__pos) = __rows.iter().position(|r| r.id == __staged_id) {
+                    __rows[__pos] = __rec;
+                } else {
+                    __rows.push(__rec);
+                }
+            }
+        }
+        __rows
+    }
+    /// Stage the creation of a #model_name in a concurrent transaction.
+    pub fn create_post(&mut self, record: Post) -> Result<Uuid, TxError> {
+        validate_post(&record)?;
+        let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __bytes,
+            ));
+        Ok(id)
+    }
+    /// Stage an update of a #model_name in a concurrent transaction.
+    pub fn update_post(&mut self, id: Uuid, record: Post) -> Result<bool, TxError> {
+        if self.get_post(id).is_none() {
+            return Ok(false);
+        }
+        validate_post(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes,
+                __bytes,
+            ));
+        Ok(true)
+    }
+    /// Stage a delete of a #model_name in a concurrent transaction.
+    pub fn delete_post(&mut self, id: Uuid) -> bool {
+        let record = match self.get_post(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                true,
+            ));
+        self.pending_events
+            .push((
+                "Post",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes,
+                __bytes,
+            ));
+        true
+    }
+    /// Read a #model_name within the concurrent transaction (read-your-writes).
+    pub fn get_post(&self, id: Uuid) -> Option<Post> {
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        for (_, _kind, __ib, __bytes, __del) in self.buffer.iter().rev() {
+            if __ib == &__id_bytes {
+                if *__del {
+                    return None;
+                }
+                return serde_json::from_slice(__bytes).ok();
+            }
+        }
+        let __db = self.inner.read().unwrap();
+        __db.post.get_at(&self.snap.post, id)
+    }
+    /// Read all live #model_name records visible to this concurrent transaction.
+    pub fn all_post(&self) -> Vec<Post> {
+        let __db = self.inner.read().unwrap();
+        let mut __rows = __db.post.all_at(&self.snap.post);
+        drop(__db);
+        for (_, _kind, __ib, __bytes, __del) in &self.buffer {
+            let __id_bytes_ref: &Vec<u8> = __ib;
+            if *__del {
+                __rows
+                    .retain(|r| {
+                        serde_json::to_vec(&r.id).unwrap_or_default().as_slice()
+                            != __id_bytes_ref.as_slice()
+                    });
+            } else if let Ok(__rec) = serde_json::from_slice::<Post>(__bytes) {
+                let __staged_id = __rec.id;
+                if let Some(__pos) = __rows.iter().position(|r| r.id == __staged_id) {
+                    __rows[__pos] = __rec;
+                } else {
+                    __rows.push(__rec);
+                }
+            }
+        }
+        __rows
+    }
+}
+impl Database {
+    /// Create a cloneable shared handle for concurrent transactions (#83 Tier 2).
+    pub fn shared(self) -> SharedDatabase {
+        let seq = std::sync::Arc::clone(&self.seq);
+        SharedDatabase {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(self)),
+            seq,
+        }
+    }
+    /// Apply a concurrent-prepare private buffer under the exclusive write lock
+    /// (#83 Tier 2 apply path).
+    ///
+    /// The model-tag dispatch here is in the APPLY path (after conflict
+    /// resolution passed) — same pattern as `apply_frame` for the follower.
+    pub(crate) fn __apply_and_commit_concurrent_buffer(
+        &mut self,
+        buffer: Vec<
+            (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool),
+        >,
+        events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), TxError> {
+        let mut __marks: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
+        let mut __wal_marks: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+        for (__model_tag, _kind, _id_bytes, _bytes, _deleted) in &buffer {
+            match *__model_tag {
+                "User" => {
+                    if !__marks.contains_key("User") {
+                        let __rc = self.user.row_count;
+                        let __wb = self.user.wal.size().unwrap_or(0);
+                        __marks.insert("User", __rc);
+                        __wal_marks.insert("User", __wb);
+                        self.user.in_transaction = true;
+                    }
+                }
+                "Post" => {
+                    if !__marks.contains_key("Post") {
+                        let __rc = self.post.row_count;
+                        let __wb = self.post.wal.size().unwrap_or(0);
+                        __marks.insert("Post", __rc);
+                        __wal_marks.insert("Post", __wb);
+                        self.post.in_transaction = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut __staged_events: Vec<
+            (&'static str, forgedb_changefeed::ChangeKind, usize, Vec<u8>),
+        > = Vec::new();
+        for (__model_tag, __kind, _id_bytes, __bytes, __deleted) in &buffer {
+            let __result: Result<(), TxError> = (|| {
+                match *__model_tag {
+                    "User" => {
+                        let __record: User = serde_json::from_slice(__bytes)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        let __row = self.user.__stage_append(__record, *__deleted);
+                        __staged_events
+                            .push((*__model_tag, *__kind, __row, __bytes.clone()));
+                    }
+                    "Post" => {
+                        let __record: Post = serde_json::from_slice(__bytes)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        let __row = self.post.__stage_append(__record, *__deleted);
+                        __staged_events
+                            .push((*__model_tag, *__kind, __row, __bytes.clone()));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })();
+            if let Err(e) = __result {
+                let __touched: Vec<&'static str> = __marks.keys().copied().collect();
+                for __tag in &__touched {
+                    match *__tag {
+                        "User" => {
+                            if let Some(&__mark) = __marks.get("User") {
+                                let _ = self.user.__truncate_all_to(__mark);
+                                self.user.row_count = __mark;
+                                if let Some(&__wm) = __wal_marks.get("User") {
+                                    let _ = self.user.wal.truncate_to(__wm);
+                                }
+                                self.user.in_transaction = false;
+                                self.user.run_deferred_maintenance();
+                            }
+                        }
+                        "Post" => {
+                            if let Some(&__mark) = __marks.get("Post") {
+                                let _ = self.post.__truncate_all_to(__mark);
+                                self.post.row_count = __mark;
+                                if let Some(&__wm) = __wal_marks.get("Post") {
+                                    let _ = self.post.wal.truncate_to(__wm);
+                                }
+                                self.post.in_transaction = false;
+                                self.post.run_deferred_maintenance();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Err(e);
+            }
+        }
+        let mut __journal: Vec<(String, u64)> = Vec::new();
+        let __touched: Vec<&'static str> = __marks.keys().copied().collect();
+        for __tag in &__touched {
+            match *__tag {
+                "User" => {
+                    let _ = self.user.commit();
+                    let _ = self.user.wal.flush();
+                    __journal.push(("User".to_string(), self.user.row_count as u64));
+                }
+                "Post" => {
+                    let _ = self.post.commit();
+                    let _ = self.post.wal.flush();
+                    __journal.push(("Post".to_string(), self.post.row_count as u64));
+                }
+                _ => {}
+            }
+        }
+        if let Some(__jrnl) = self._txn_journal.as_mut() {
+            let __payload = serde_json::to_vec(&__journal)
+                .map_err(|e| TxError::Io(e.to_string()))?;
+            __jrnl
+                .write(&forgedb_wal::WalEntry::raw("_txn", __payload))
+                .map_err(|e| TxError::Io(e.to_string()))?;
+            __jrnl.flush().map_err(|e| TxError::Io(e.to_string()))?;
+        }
+        for __tag in &__touched {
+            match *__tag {
+                "User" => {
+                    self.user.__reindex_committed();
+                    self.user.in_transaction = false;
+                    self.user.run_deferred_maintenance();
+                }
+                "Post" => {
+                    self.post.__reindex_committed();
+                    self.post.in_transaction = false;
+                    self.post.run_deferred_maintenance();
+                }
+                _ => {}
+            }
+        }
+        for (__model, __kind, __row, __bytes) in __staged_events {
+            self.changefeed.emit(__model, __row, __kind);
+            if let Some(__broker) = &self.broker {
+                if let Ok(mut __b) = __broker.lock() {
+                    let _ = __b.record(__model, __row as u64, __kind, __bytes);
+                }
+            }
+        }
+        let _ = events;
+        Ok(())
     }
 }

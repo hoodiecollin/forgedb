@@ -3909,3 +3909,167 @@ User {
         "commit/rollback run the deferred maintenance per touched collection"
     );
 }
+
+#[test]
+fn test_rust_generation_optimistic_commit() {
+    // MVCC Tier 2 (#83): the generated Database gains `transaction_retrying` — an
+    // optimistic, auto-retrying entry point with a sequencer-backed conflict map.
+    // PM identity red line: the commit/conflict path must contain NO `match
+    // model_name` (opaque-key discipline, same as the replication broker).
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+}
+
+Post {
+  id: +uuid
+  author: *User
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // transaction_retrying is generated on Database.
+    assert!(
+        flat.contains("pubfntransaction_retrying<T>(")
+            && flat.contains("retries:u32,")
+            && flat.contains("implFn(&mutTxHandle)->Result<T,TxError>"),
+        "Database::transaction_retrying is generated"
+    );
+
+    // The sequencer is on Database (for LSN assignment + conflict detection).
+    assert!(
+        flat.contains("seq:std::sync::Arc<std::sync::Mutex<forgedb_txn::CommitSequencer>>"),
+        "Database carries the commit sequencer"
+    );
+
+    // Sequencer is seeded from the broker watermark on open_at.
+    assert!(
+        flat.contains("CommitSequencer::new(") && flat.contains("watermark()"),
+        "sequencer seeded from broker watermark on open_at"
+    );
+
+    // The commit path calls try_commit with a WriteSet.
+    assert!(
+        flat.contains(".try_commit(&__ws)"),
+        "transaction_retrying calls try_commit on the sequencer"
+    );
+
+    // The write-set is built via TxHandle::__write_set (opaque keys).
+    assert!(
+        flat.contains("fn__write_set(") || flat.contains("__write_set("),
+        "TxHandle exposes __write_set to build the opaque write-set"
+    );
+
+    // Retry loop: after exhausting retries, returns TxError::Conflict.
+    assert!(
+        flat.contains("TxError::Conflict"),
+        "exhausted retries return TxError::Conflict"
+    );
+
+    // transaction_optimistic is a convenience wrapper.
+    assert!(
+        flat.contains("pubfntransaction_optimistic<T>("),
+        "transaction_optimistic convenience wrapper is generated"
+    );
+
+    // DEFAULT_TXN_RETRIES const.
+    assert!(
+        flat.contains("DEFAULT_TXN_RETRIES:u32"),
+        "DEFAULT_TXN_RETRIES const is generated"
+    );
+
+    // PM identity red line: no match on model_name in the commit/conflict path.
+    // (same discipline as test_rust_generation_replication_broker)
+    let retrying_idx = flat.find("transaction_retrying").expect("transaction_retrying in generated code");
+    let retrying_body = &flat[retrying_idx..retrying_idx + 2000.min(flat.len() - retrying_idx)];
+    assert!(
+        !retrying_body.contains("matchmodel_name"),
+        "the commit/conflict path must never match on the model name"
+    );
+
+    // Tier 1 is intact: existing transaction() still generated.
+    assert!(
+        flat.contains("pubfntransaction<T>(")
+            && flat.contains("implFnOnce(&mutTxHandle)->Result<T,TxError>"),
+        "Tier 1 Database::transaction (FnOnce) is preserved"
+    );
+
+    // Tier 2 concurrent prepare: SharedDatabase, ConcurrentTxHandle, transaction_concurrent.
+    assert!(
+        flat.contains("pubstructSharedDatabase"),
+        "SharedDatabase struct is generated"
+    );
+    assert!(
+        flat.contains("pubstructConcurrentTxHandle"),
+        "ConcurrentTxHandle struct is generated"
+    );
+    assert!(
+        flat.contains("pubfntransaction_concurrent<T>("),
+        "SharedDatabase::transaction_concurrent is generated"
+    );
+    // Private buffer staging (not shared columns).
+    assert!(
+        flat.contains("buffer:Vec<("),
+        "ConcurrentTxHandle has a private buffer field"
+    );
+    // Write-set uses logical id bytes, not physical row index.
+    // The old approach used `(*__row as u64).to_le_bytes()` — that string must not appear.
+    assert!(
+        flat.contains("__id_bytes"),
+        "write-set uses logical id bytes"
+    );
+    assert!(
+        !flat.contains("(*__rowasu64).to_le_bytes()"),
+        "write-set must not use physical row index to_le_bytes"
+    );
+    // Database::shared() constructor.
+    assert!(
+        flat.contains("pubfnshared(self)->SharedDatabase"),
+        "Database::shared() is generated"
+    );
+    // The concurrent apply dispatch is in the APPLY path only.
+    assert!(
+        flat.contains("__apply_and_commit_concurrent_buffer"),
+        "Database::__apply_and_commit_concurrent_buffer is generated"
+    );
+}
+
+#[test]
+fn test_rust_generation_compaction_respects_live_snapshot() {
+    // MVCC Tier 2 (#83, PM constraint 3): auto-compaction must not GC row versions
+    // that a live transaction snapshot still needs.  In Tier 2 with &mut Database
+    // semantics, the existing `in_transaction` flag transitively defers compaction
+    // while any transaction is in flight (transaction_retrying takes &mut self and
+    // calls TxHandle::begin which sets in_transaction on each touched collection).
+    // This guard verifies that: (a) compact() still defers on in_transaction, and
+    // (b) the sequencer's oldest_live_snapshot is checked at the Database level so
+    // Tier 3 concurrent prepare is safe.
+    let src = r#"
+User {
+  id: +uuid
+  email: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The in_transaction deferred guard is present in compact().
+    assert!(
+        code.contains("if self.in_transaction {") && code.contains("self.compact_deferred = true;"),
+        "storage compact() defers while in_transaction is set"
+    );
+
+    // The sequencer is on Database; its oldest_live_snapshot transitively protects
+    // live snapshots.  Verify the sequencer is accessible and the oldest_live_snapshot
+    // method is referenced in the generated code (for the database-level compact guard).
+    assert!(
+        code.contains("oldest_live_snapshot"),
+        "generated code references oldest_live_snapshot for the keep-set bound"
+    );
+}
