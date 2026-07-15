@@ -93,8 +93,8 @@ uncomment what you need.
 
 ## Multi-tenancy (process-per-tenant)
 
-ForgeDB v1 multi-tenancy is **physical**: one `forgedb serve` / one generated
-process serves **one** tenant's data directory. Each tenant's data lives under
+ForgeDB v1 multi-tenancy is **physical**: one generated server process serves
+**one** tenant's data directory. Each tenant's data lives under
 `<FORGEDB_DATA>/<tenant>/`; you run N processes behind a host/subdomain proxy
 that routes each tenant to its process.
 

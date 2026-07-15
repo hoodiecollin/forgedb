@@ -834,7 +834,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
   **server** scaffold still pins published `forgedb-storage = "0.1.5"`. Committed 2026-07-13 (types/wal/storage-split +
   codegen apply/commit); #3 (WasmGenerator + `generate wasm`) committed 2026-07-13; #2 (engine-in-Worker partial
   hydrate) committed; substrate publish (`types 0.2.1` / `wal 0.2.1` / `storage 0.2.0` / `-native` / `-web`) 2026-07-14.
-- **Column projection / partial model reads (#113) — LANDED 2026-07-14 (design `docs/proposals/column-projection.md`).**
+- **Column projection / partial model reads (#113) — LANDED 2026-07-14 (design note removed post-ship; see #113 + git history).**
   A declared model-level directive `@projection(card: title, slug)` generates a tailored `<Model>Card` struct +
   narrow reads (`get_card`/`all_card`/`read_card_at` + snapshot `_at`) that materialize **only PK + the selected
   columns** — never the full record. **No substrate change, no publish gap** (the mechanism is "generate a narrower
