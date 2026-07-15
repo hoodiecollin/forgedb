@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "forgedb-wal",
  "fs2",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-web"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "forgedb-wal",
  "js-sys",
@@ -1519,7 +1519,7 @@ version = "0.1.0"
 
 [[package]]
 name = "forgedb-wal"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crc32fast",
  "tempfile",
