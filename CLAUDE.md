@@ -60,7 +60,8 @@ cargo clippy --workspace             # no dead-code warnings (style lints remain
 ```
 
 CLI commands: `init`, `generate`, `validate`, `build`, `dev`, `migrate`, `compact`, `backup`, `serve`,
-`tenant` (`create|list|drop` — #59 multi-tenancy dir management).
+`tenant` (`create|list|drop` — #59 multi-tenancy dir management),
+`coordinate <root>` (#75/#84 MVCC Tier 3 — run the multi-process write coordinator for a data dir).
 Example: `cargo run -- generate all --output ./generated`.
 
 ### Test baseline
@@ -85,7 +86,14 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 455 tests pass** (workspace, incl. doctests). 450→455 with delete semantics (`@on_delete` + M2M unlink):
+**Baseline: 486 tests pass** (workspace, incl. doctests). 455→486 with MVCC Tiers 1–3 (#75/#84 —
+transactions → optimistic concurrency → multi-process coordinator): two NEW substrate crates
+`forgedb-txn` (Tier 2 commit sequencer, 7 unit tests) + `forgedb-coordinator` (Tier 3 control plane,
+8 unit tests incl. the DirLock-parity guards), storage-native `sync_from_disk`/DirLock-const unit
+tests (+5), a wal `truncate_to` test (+1 — `test_wal_size_and_truncate_to`), +3 codegen guards
+(`test_rust_generation_transaction` / `test_rust_generation_optimistic_commit` /
+`test_rust_generation_coordinated_client`), plus a coordinator doctest and the intervening tree drift
+(the 455 line predated the branch base). 450→455 with delete semantics (`@on_delete` + M2M unlink):
 +5 codegen guards (`test_rust_generation_delete_*` — restrict/cascade/set_null enforcement in the generated
 `Database::delete_<model>` wrappers + junction `unlink`/`unlink_all` + set-null-on-required-FK codegen error).
 442→450 with the user-declared `enum` type: +7 `forgedb-parser` unit tests (`enum` decl parses / rejects
@@ -202,6 +210,18 @@ in `crates/`:
   `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **reclose PROVEN** by an outside-repo
   `init → generate rust+api → cargo build` resolving `forgedb-compaction 0.1.0` (+ the rest) from crates.io. Was
   internal; promoted to published substrate by #92 W1.
+- `txn` — Tier 2 optimistic-concurrency commit sequencer (#75 MVCC) — **0.1.0 (publish-pending)**. Schema-agnostic:
+  a `CommitSequencer` that assigns a monotonic commit LSN and detects write-write conflicts over an in-memory
+  `id → last-committer` map (rebuilt empty on open — conflict state is over in-flight txns only, never persisted).
+  Knows no model/field; generated `Database::transaction` + concurrent-prepare code links `try_commit`/retry.
+  Generated code requires it (scaffold pins `forgedb-txn = "0.1"`) → **publish gap OPEN**.
+- `coordinator` — Tier 3 multi-process write **control plane** (#75/#84 MVCC) — **0.1.0 (publish-pending)**. A
+  standalone coordinator process (`forgedb coordinate <root>`) that holds the #89 `DirLock` on `<root>/.forgedb.lock`
+  on behalf of all coordinated clients, serializes the commit turn, and sequences the LSN — the symmetric inverse of
+  #82's durable broker. **NO `forgedb-storage*` dep (T3-8)** — it never writes columns or decodes opaque row bytes;
+  the schema-aware column write stays in generated data-plane code run under a granted turn (coordinated clients open
+  LOCK-FREE, `_lock: None`, mutually exclusive with a standalone self-locking writer — T3-5). Generated code links it
+  (scaffold pins `forgedb-coordinator = "0.1"`) → **publish gap OPEN**.
 
 **Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
 are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI
@@ -518,8 +538,13 @@ across many domains live in `examples/` — see `examples/README.md`.**
   2026-07-09: `forgedb-auth 0.1.0` published + PROVEN by an outside-repo `forgedb init → generate rust+api
   → cargo build` resolving `forgedb-auth 0.1.0` + `forgedb-storage 0.1.4` + `forgedb-changefeed 0.1.1` +
   `forgedb-types 0.2.0` from crates.io and compiling the generated code **and** the env-driven scaffold
-  `main.rs` (which links `forgedb-auth`). **Next thing that will reopen it:** any new substrate-crate dep or
-  additive substrate API the generated code starts requiring — publish before the scaffold pins it.
+  `main.rs` (which links `forgedb-auth`). **REOPENED 2026-07-14 by MVCC Tiers 1–3 (#75/#84):** generated code now
+  links two NEW substrate crates `forgedb-txn 0.1.0` + `forgedb-coordinator 0.1.0` (scaffold pins both `= "0.1"`) and
+  additive substrate methods `WalManager::truncate_to` (`forgedb-wal`) + `sync_from_disk` (`forgedb-storage-native`) —
+  all four **publish-pending**, so the native `init → build` reclose is NOT yet proven from crates.io. Publish order:
+  `forgedb-txn` + `forgedb-coordinator` (leaves) and the `wal`/`storage-native` republish, then prove the reclose the
+  usual way (outside-repo `init → generate → cargo build` resolving them). **Next thing that will reopen it:** any new
+  substrate-crate dep or additive substrate API the generated code starts requiring — publish before the scaffold pins it.
 - **Generated code now compiles for the whole `examples/` corpus.** The three codegen gaps
   that a full-corpus compile-test exposed are FIXED: nullable variable-length strings
   (`string?` → `Option<String>`, encoded with a 1-byte presence tag so `None` vs `Some("")`
@@ -826,6 +851,41 @@ across many domains live in `examples/` — see `examples/README.md`.**
   browser-proven for #110's `Tag.label`) + the wasm32 build — the full Playwright harness was NOT re-run for a
   projection-specific fault-in log. Also: REST `list` projection shrinks only the **wire** (filter/sort need full
   rows, so the server still reads them); the point-`get` and wasm paths get the full column-skip.
+- **MVCC Tiers 1–3 — transactions + concurrent writers — LANDED 2026-07-14 (#75/#84; merged to `main` 2026-07-15;
+  design `docs/proposals/multi-writer-mvcc.md`, all three tiers).** The Direction-C rock: an atomic transaction
+  boundary and multi-writer coordination, built as three strict-superset tiers over the existing append-only/watermark
+  engine (no `xmin`/`xmax`, no on-disk format break). PM identity gates PASS / PASS-WITH-CONSTRAINTS throughout.
+  - **Tier 1 — generated transactions (single writer, atomic commit/rollback).** `db.transaction(|tx| … )` stages
+    appends and makes them visible atomically at commit (advance watermark + WAL fsync); rollback truncates every
+    touched column back to its pre-txn length (`truncate_to_rows`) **and** rolls the per-model WAL tail back via a NEW
+    additive `WalManager::truncate_to(offset)` (the design's "WAL fsync alone" was insufficient). Atomic **multi-model**
+    commit rides a `_txn_journal.log` (class-1, reusing `forgedb-wal`'s opaque `Raw` framing). Guard
+    `test_rust_generation_transaction`.
+  - **Tier 2 — optimistic concurrent writers (serialized commit).** NEW substrate crate **`forgedb-txn`**
+    (`CommitSequencer`): many txns *prepare* concurrently, a serialized commit point assigns a monotonic LSN and detects
+    write-write conflicts over an in-memory `id → last-committer` map (rebuilt empty on open — never persisted, no
+    format break); losers roll back (Tier-1 truncate) + retry. Guard `test_rust_generation_optimistic_commit`.
+  - **Tier 3 — multi-process writers (single-machine).** NEW substrate crate **`forgedb-coordinator`** (control plane,
+    **no `forgedb-storage*` dep** — T3-8): a `forgedb coordinate <root>` process holds the #89 `DirLock` on
+    `<root>/.forgedb.lock` for all clients + serializes the commit turn + sequences the LSN. Coordinated clients open
+    **LOCK-FREE** (`Database::connect(root, socket)` → connect-first, `CoordinatorUnavailable` → 503 if no coordinator;
+    `_lock: None`) and are mutually exclusive with a standalone self-locking writer (T3-5). A coordinated writer is also
+    a lightweight follower — peer read-currency via a NEW additive `sync_from_disk` on all three storage-native column
+    types (re-derive each column's `row_count` from disk so a peer's appends become visible), driven by
+    `__sync_columns_from_disk` + `__reindex_committed` on the coordinator log-tail signal. Guard
+    `test_rust_generation_coordinated_client` (asserts lock-free open + coordinator has no `forgedb-storage` dep). The
+    coordinator *is* the single writer, so data recovery reuses #89/#96 — no distributed 2-phase record.
+  Verified: 486 workspace tests green; generated code compile-tested single- **and** multi-model; **genuine two-live-
+  process concurrent-writer E2E** (`scratchpad/t3_e2e`, ephemeral) proving no `DirLock` panic, monotonic LSNs, and
+  deterministic peer read-currency across two lock-free instances (this caught a real bug the agent's sequential-handoff
+  E2E masked — peer refresh had synced only the tombstone count, leaving data-column rows out of bounds/invisible; fixed
+  by syncing ALL columns). **Honest limits / deferred:** the ceiling is **one physical append point per column** →
+  *concurrent prepare, serialized commit* (the serial section includes the writer's fsync); true parallel append needs
+  segmented columns (separate, larger storage effort). Multi-**machine** (network + consensus) is a separate future
+  product (v2/v3), not this tier. **PUBLISH GAP OPEN:** generated code links `forgedb-txn 0.1.0` + `forgedb-coordinator
+  0.1.0` (scaffold pins both `= "0.1"`) and the additive `WalManager::truncate_to` + storage-native `sync_from_disk` —
+  all four are additive (no format break) but must publish before an outside-repo `init → build` resolves from crates.io
+  (mirrors the wal/storage/compaction publish sequence).
 - **`@pattern`/`@regex` validation ENFORCED (#104 RESOLVED — 2026-07-14).** The generated `validate_<model>` now
   compiles a per-(model, field) `LazyLock<regex::Regex>` from the directive's pattern and **rejects a non-matching
   string** → field-`Constraint` `ValidationError` (HTTP **422**), fired at the top of `insert`/`update` alongside the
