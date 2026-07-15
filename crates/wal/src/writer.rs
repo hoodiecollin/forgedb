@@ -78,6 +78,22 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Truncate the WAL to `offset` bytes, dropping any tail past it (MVCC Tier 1
+    /// transaction rollback).  A no-op if `offset` is already at or past the
+    /// current length.  The file is opened in append mode, so no cursor reset is
+    /// needed — the next write still appends at the (new, shorter) end.
+    pub fn truncate_to(&mut self, offset: u64) -> io::Result<()> {
+        let current = self.file.metadata()?.len();
+        if offset >= current {
+            return Ok(());
+        }
+        self.file.set_len(offset)?;
+        self.file.sync_all()?;
+        self.last_fsync = Instant::now();
+        self.bytes_since_fsync = 0;
+        Ok(())
+    }
+
     /// Get the current fsync policy
     pub fn fsync_policy(&self) -> FsyncPolicy {
         self.fsync_policy

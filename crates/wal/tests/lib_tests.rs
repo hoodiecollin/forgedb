@@ -107,3 +107,53 @@ fn test_wal_rotate() {
 
     std::fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+#[test]
+fn test_wal_size_and_truncate_to() {
+    // MVCC Tier 1 (#83): `size()` records a rollback mark; `truncate_to` rolls the
+    // WAL back to it, dropping the staged tail while keeping the committed prefix.
+    let temp_dir = std::env::temp_dir().join("forgedb_wal_test_truncate_to");
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let wal_path = temp_dir.join("test.wal");
+
+    let mut wal = WalManager::open(&wal_path, FsyncPolicy::Always).unwrap();
+    // Write two "committed" records, then record the mark via `size()`.
+    wal.write(&WalEntry::raw("m", b"committed-a".to_vec())).unwrap();
+    wal.write(&WalEntry::raw("m", b"committed-b".to_vec())).unwrap();
+    let mark = wal.size().unwrap();
+    assert!(mark > 0, "size() reflects the committed prefix size");
+
+    // Write two "staged" records past the mark.
+    wal.write(&WalEntry::raw("m", b"staged-c".to_vec())).unwrap();
+    wal.write(&WalEntry::raw("m", b"staged-d".to_vec())).unwrap();
+    assert!(wal.size().unwrap() > mark, "staged records grew the WAL");
+
+    // Truncate back to the mark: only the two committed records remain.
+    wal.truncate_to(mark).unwrap();
+    assert_eq!(wal.size().unwrap(), mark, "truncate_to rolled back to the mark");
+    let entries = wal.replay(|_| Ok(())).unwrap();
+    assert_eq!(entries.len(), 2, "only the committed prefix survives");
+    if let WalOperation::Raw { payload } = &entries[0].operation {
+        assert_eq!(payload, b"committed-a");
+    } else {
+        panic!("expected Raw");
+    }
+    if let WalOperation::Raw { payload } = &entries[1].operation {
+        assert_eq!(payload, b"committed-b");
+    } else {
+        panic!("expected Raw");
+    }
+
+    // truncate_to past the end is a no-op.
+    let now = wal.size().unwrap();
+    wal.truncate_to(now + 100).unwrap();
+    assert_eq!(wal.size().unwrap(), now, "truncate_to past the end is a no-op");
+
+    // A fresh write still appends at the (shorter) end after truncation.
+    wal.write(&WalEntry::raw("m", b"new-e".to_vec())).unwrap();
+    let entries = wal.replay(|_| Ok(())).unwrap();
+    assert_eq!(entries.len(), 3, "a post-truncate write appends cleanly");
+
+    std::fs::remove_dir_all(&temp_dir).unwrap();
+}
