@@ -1,6 +1,25 @@
 # Proposal: Multi-Writer Concurrency & Transactions (MVCC Direction C)
 
-**Status:** DESIGN NOTE — Tiers 1–2 carry a `forgedb-product-manager` verdict
+**Status:** **ALL THREE TIERS LANDED (2026-07-14, #75/#84; merged to `main` 2026-07-15).** Tier 1
+(generated transactions + atomic multi-model commit journal), Tier 2 (`forgedb-txn` optimistic
+concurrent prepare / serialized commit), and Tier 3 (`forgedb-coordinator` multi-process control
+plane + generated lock-free coordinated data plane) all shipped, PM identity gates PASS/PASS-WITH-
+CONSTRAINTS, verified E2E (incl. a genuine two-live-process concurrent-writer run) and compile-tested
+single- + multi-model. **Correction to the design's "zero substrate change" claim below:** the tiers
+landed with **two _additive_ substrate methods** the design under-counted — `WalManager::truncate_to`
+in `forgedb-wal` (partial WAL-tail rollback on transaction abort — Tier 1/2; the design assumed WAL
+fsync alone sufficed) and `sync_from_disk` on all three `forgedb-storage-native` column types (Tier 3
+peer read-currency: re-derive each column's `row_count` from disk so a coordinated peer's appends
+become visible) — plus **two new substrate crates** `forgedb-txn 0.1.0` (Tier 2 commit sequencer) and
+`forgedb-coordinator 0.1.0` (Tier 3 control plane, **no `forgedb-storage*` dep** — T3-8). All four are
+**additive** (no on-disk format break), so the design's core claim — *no `xmin`/`xmax`, no format
+break, watermark stays valid* — holds; but they **do open a publish gap**: generated code links
+`forgedb-txn`/`-coordinator` (scaffold pins `= "0.1"`) and the additive `wal`/`storage-native` methods,
+so those must publish before an outside-repo `init → build` resolves from crates.io. **Publish gap
+OPEN** (new crates + `wal`/`storage-native` republish pending). The design reasoning below is preserved
+as-authored; where it says "zero substrate change," read it against this correction.
+
+**Original design-gate status:** DESIGN NOTE — Tiers 1–2 carried a `forgedb-product-manager` verdict
 **PASS-WITH-CONSTRAINTS** (2026-07-14; 3 binding constraints, folded in below — see "PM gate
 constraints") and are now **deepened to implementation-ready** (2026-07-14, #83): the concrete
 `TxHandle` surface, the **atomic multi-model commit journal** (`_txn_journal.log`, the T3-4
@@ -104,12 +123,13 @@ concurrency:
    there are no in-flight transactions, so the conflict state does not need to survive reopen and
    therefore needs **no on-disk commit-version column**. The map is rebuilt empty on open.
 
-**Consequence:** Tier 1 needs *zero* storage-substrate change (rollback = existing
-`truncate_to_rows`, commit = existing watermark advance + WAL fsync). Tier 2 adds only an in-memory
-commit sequencer + conflict map — still no format break, so **no storage publish gap** (like
-column-projection #113, the mechanism is "generate an orchestration over primitives the substrate
-already ships"). This is the single biggest reason to prefer this staging over a textbook
-`xmin`/`xmax` engine.
+**Consequence:** Tier 1 needs *zero on-disk-format* change (rollback = existing `truncate_to_rows` +
+WAL-tail `truncate_to`, commit = existing watermark advance + WAL fsync). Tier 2 adds only an in-memory
+commit sequencer + conflict map — still no format break. This is the single biggest reason to prefer
+this staging over a textbook `xmin`/`xmax` engine. **(Implementation correction — see the Status
+header:** Tier 1 rollback also needed an _additive_ `WalManager::truncate_to`, so the "no publish gap"
+originally claimed here does **not** hold as-implemented; the additive methods + the two new crates are
+a publish gap. The *format*-stability claim — the actual load-bearing point — is unaffected.)
 
 ## Tier 1 — Transactions (first milestone)
 
