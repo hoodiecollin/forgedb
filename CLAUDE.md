@@ -858,6 +858,31 @@ across many domains live in `examples/` — see `examples/README.md`.**
   browser-proven for #110's `Tag.label`) + the wasm32 build — the full Playwright harness was NOT re-run for a
   projection-specific fault-in log. Also: REST `list` projection shrinks only the **wire** (filter/sort need full
   rows, so the server still reads them); the point-`get` and wasm paths get the full column-skip.
+- **Point-in-time (snapshot) REST reads + Inspector scrubber (#85) — LANDED 2026-07-15 (design
+  `docs/proposals/snapshot-reads-rest.md`).** Exposes the engine's watermark snapshot reads (#56-A) over the
+  generated REST API so the Inspector's decorative "as of" affordances do real time-travel. **No substrate change,
+  no publish gap** (`forgedb_storage::Snapshot` already published — the mechanism is "generate a few more per-model
+  handlers over read methods the generated `Database` already has"). PM-gated **ALIGNED** (2 binding constraints:
+  (1) the `as_of` branch swaps ONLY the row source and routes through the SAME generated filter/sort/paginate body —
+  no parallel handler; (2) the wire token stays an opaque `usize` watermark, never a wall-clock instant → non-numeric
+  → 400). Codegen (`crates/codegen/src/api.rs`): `GET /api/<model>?as_of=<w>` → `all_at(&Snapshot::new(w))`,
+  `GET /api/<model>/{id}?as_of=<w>` → `get_at`, and a schema-wide `GET /snapshot` → `{ "watermarks": { "<Model>":
+  <row_count> } }` (models-only; junctions deferred), the read-side peer of `/metrics` in `__ops_routes`
+  (unauthenticated — a process serves one tenant). The get handler now ALWAYS owns its `Query(params)` extractor
+  (`generate_projection_rest` no longer emits one — it returns `(get_block, list_block)`). Guard
+  `test_api_generation_snapshot_reads`. E2E `scratchpad/snapshot_compile` (native db+api compile + **live
+  `tower::oneshot`** proving `?as_of` reads a 2-of-3 prefix, `get_at` 404-at-old-watermark vs 200-live, `/snapshot`
+  watermarks, non-numeric `as_of` → 400); all 18 `examples/` generate clean; integer-PK `iot-sensors` (u64)
+  compile-checked. Inspector (`apps/inspector`): `live.ts` `asOf` on `listRows`/`getRow` + `getSnapshotToken`;
+  `snapshotTokenAtom`/`pinnedSnapshotsAtom`/`pinSnapshotAtom`; `useLiveRows` passes the active model's watermark and
+  suspends the live-query when pinned; top-bar "as of" dropdown (live + pinned) + Console snapshot tab with a
+  discrete live/pinned selector + "Pin current…" (real `GET /snapshot`) + honest row-count-watermark readout
+  (replaced the fake-clock slider). `tsc --noEmit` clean. **Honest limits:** the "as of" token is a **row-count
+  watermark, not a wall-clock instant** (no wall-clock→watermark index — a separate, heavier feature); watermarks are
+  valid only within a compaction epoch (an in-process `compact()` renumbers rows — the client must discard pinned
+  tokens on a detected reopen); REST `list ?as_of` still reads full rows server-side (only the point-`get` is cheap);
+  the Inspector data-path is **type-checked, not runtime-tested in the Tauri shell** (needs a running generated server
+  + desktop build); the compare-vs-current diff is a labeled inspector-level marker, not yet a rendered diff.
 - **MVCC Tiers 1–3 — transactions + concurrent writers — LANDED 2026-07-14 (#75/#84; merged to `main` 2026-07-15;
   design `docs/proposals/multi-writer-mvcc.md`, all three tiers).** The Direction-C rock: an atomic transaction
   boundary and multi-writer coordination, built as three strict-superset tiers over the existing append-only/watermark
