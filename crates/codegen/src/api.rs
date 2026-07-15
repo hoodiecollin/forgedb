@@ -557,6 +557,163 @@ impl ApiGenerator {
         }
     }
 
+    /// Split a field type into `(base, is_nullable)` — peeling a single
+    /// `Nullable(..)` wrapper.  Used by the typed comparison generators (#84).
+    fn peel_nullable(
+        field_type: &forgedb_parser::FieldType,
+    ) -> (&forgedb_parser::FieldType, bool) {
+        match field_type {
+            forgedb_parser::FieldType::Nullable(inner) => (inner.as_ref(), true),
+            other => (other, false),
+        }
+    }
+
+    /// Emit one **typed** equality check for a filterable field inside
+    /// `<model>_event_matches` (#84).  Parses the string query param into the
+    /// field's Rust type and compares it to the typed record field, so
+    /// `?price=3` matches a stored `3.0` and bool/uuid/decimal/enum/timestamp
+    /// values compare by value — not by the fragile `serde_json` stringify the
+    /// old filter used (`3.0` != `"3"`).  An unparseable param matches nothing.
+    ///
+    /// The caller guarantees `field` is filterable (`is_filterable_field`); any
+    /// other type yields an empty check.
+    fn generate_filter_check(field: &forgedb_parser::Field) -> TokenStream {
+        use forgedb_parser::FieldType;
+        let fname_str = &field.name;
+        let fname = format_ident!("{}", field.name);
+        let (base, nullable) = Self::peel_nullable(&field.field_type);
+
+        // char(N) is a fixed `[u8; N]`: compare the param's bytes, zero-padded to
+        // N (a param longer than N can never match).  Handled inline because it
+        // parses into a buffer rather than a single `T`.
+        if let FieldType::Char(n) = base {
+            let cmp = if nullable {
+                quote! { record.#fname == Some(__buf) }
+            } else {
+                quote! { record.#fname == __buf }
+            };
+            return quote! {
+                if let Some(want) = params.get(#fname_str) {
+                    let __wb = want.as_bytes();
+                    let __ok = if __wb.len() > #n {
+                        false
+                    } else {
+                        let mut __buf = [0u8; #n];
+                        __buf[..__wb.len()].copy_from_slice(__wb);
+                        #cmp
+                    };
+                    if !__ok { return false; }
+                }
+            };
+        }
+
+        // `<parse> -> Option<T>`; `None` means the param can't match this typed
+        // field (unparseable / wrong shape).
+        let parse: TokenStream = match base {
+            FieldType::U32 => quote! { want.parse::<u32>().ok() },
+            FieldType::U64 => quote! { want.parse::<u64>().ok() },
+            FieldType::I32 => quote! { want.parse::<i32>().ok() },
+            FieldType::I64 => quote! { want.parse::<i64>().ok() },
+            FieldType::F64 => quote! { want.parse::<f64>().ok() },
+            FieldType::Bool => quote! { want.parse::<bool>().ok() },
+            FieldType::String => quote! { Some(want.clone()) },
+            FieldType::Uuid => quote! { want.parse::<Uuid>().ok() },
+            FieldType::Decimal => quote! { want.parse::<rust_decimal::Decimal>().ok() },
+            FieldType::Timestamp => {
+                quote! { want.parse::<i64>().ok().map(forgedb_types::Timestamp::from_seconds) }
+            }
+            FieldType::Enum(name) => {
+                let en = format_ident!("{}", name);
+                // Reuse the canonical variant-name <-> enum serde mapping so the
+                // wire form matches REST/TS exactly (no second name table).
+                quote! {
+                    serde_json::from_value::<super::#en>(
+                        serde_json::Value::String(want.clone())
+                    ).ok()
+                }
+            }
+            // Not filterable (caller guards); emit nothing.
+            _ => return quote! {},
+        };
+
+        let cmp = if nullable {
+            quote! { record.#fname == Some(__w) }
+        } else {
+            quote! { record.#fname == __w }
+        };
+
+        quote! {
+            if let Some(want) = params.get(#fname_str) {
+                let __ok = match #parse {
+                    Some(__w) => #cmp,
+                    None => false,
+                };
+                if !__ok { return false; }
+            }
+        }
+    }
+
+    /// Is this field compared for change-detection in the live-query diff (#84)?
+    /// Everything the record actually stores/serializes — scalars, `json`,
+    /// `decimal`, enums, `char(N)`, structs, and FK scalars — but NOT the virtual
+    /// relation collections (one-to-many / many-to-many) or component refs, which
+    /// map to `()` and carry no per-record value.
+    fn is_comparable_field(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::{FieldType, RelationType};
+        match field_type {
+            FieldType::Relation(RelationType::RequiredReference(_))
+            | FieldType::Relation(RelationType::OptionalReference(_)) => true,
+            FieldType::Relation(_) | FieldType::Component(_) => false,
+            FieldType::Nullable(inner) => Self::is_comparable_field(inner),
+            _ => true,
+        }
+    }
+
+    /// Generate `<model>_record_changed(a, b) -> bool` — a **typed, per-field**
+    /// change detector for the live-query `Updated` diff (#84), replacing the old
+    /// whole-record `serde_json` stringify comparison.  `f64` fields compare by
+    /// `to_bits()` (deterministic — two `NaN`s are equal, so an unchanged record
+    /// never reports a spurious update); every other stored field compares with
+    /// `==`.  Returns `true` on the first differing field.
+    fn generate_record_changed(model: &forgedb_parser::Model) -> TokenStream {
+        use forgedb_parser::FieldType;
+        let model_name = format_ident!("{}", model.name);
+        let changed_fn = format_ident!("{}_record_changed", Self::to_snake_case(&model.name));
+
+        let field_cmps: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| Self::is_comparable_field(&f.field_type))
+            .map(|f| {
+                let fname = format_ident!("{}", f.name);
+                let (base, nullable) = Self::peel_nullable(&f.field_type);
+                match (base, nullable) {
+                    (FieldType::F64, false) => quote! {
+                        if a.#fname.to_bits() != b.#fname.to_bits() { return true; }
+                    },
+                    (FieldType::F64, true) => quote! {
+                        if match (a.#fname, b.#fname) {
+                            (Some(__x), Some(__y)) => __x.to_bits() != __y.to_bits(),
+                            (None, None) => false,
+                            _ => true,
+                        } { return true; }
+                    },
+                    _ => quote! {
+                        if a.#fname != b.#fname { return true; }
+                    },
+                }
+            })
+            .collect();
+
+        quote! {
+            /// Typed per-field change detector for the live-query `Updated` diff (#84).
+            fn #changed_fn(a: &super::#model_name, b: &super::#model_name) -> bool {
+                #(#field_cmps)*
+                false
+            }
+        }
+    }
+
     /// Generate the change-feed WebSocket subscription handler + per-model filter
     /// for a model (#62 Direction A).  The handler subscribes to the shared feed,
     /// keeps only this model's `Inserted` signals, materializes the typed record
@@ -576,31 +733,28 @@ impl ApiGenerator {
         // The `&'static str` the generated `insert` emits for this model.
         let model_name_str = &model.name;
 
-        // One equality check per declared scalar field — named explicitly so the
-        // set of filterable keys is closed and per-model (never a generic scan).
+        // One TYPED equality check per declared scalar field — named explicitly so
+        // the set of filterable keys is closed and per-model (never a generic
+        // scan).  Each check parses the string param into the field's Rust type
+        // and compares typed values (#84), not fragile `serde_json` stringify.
         let field_checks: Vec<_> = model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
-            .map(|f| {
-                let fname = &f.name;
-                quote! {
-                    if let Some(want) = params.get(#fname) {
-                        let ok = obj.get(#fname).map(|v| match v {
-                            serde_json::Value::String(s) => s == want,
-                            other => other.to_string() == *want,
-                        }).unwrap_or(false);
-                        if !ok { return false; }
-                    }
-                }
-            })
+            .map(Self::generate_filter_check)
             .collect();
+
+        // Typed per-field change detector for the live-query `Updated` diff (#84),
+        // defined here (once per model) and reused by `generate_live_query`.
+        let record_changed = Self::generate_record_changed(model);
 
         let filter_doc = format!(
             "Per-model change-feed filter for `{}` (#62): narrow by exact-match \
              `?field=value` query params. Each declared scalar field is checked by \
-             name in generated code; the substrate feed never inspects a field. An \
-             empty param set matches everything; unknown keys are ignored.",
+             name in generated code, parsing the param into the field's type and \
+             comparing typed values (#84 — `?n=3` matches a stored `3.0`); the \
+             substrate feed never inspects a field. An empty param set matches \
+             everything; unknown keys are ignored.",
             model.name
         );
         let subscribe_doc = format!(
@@ -616,17 +770,11 @@ impl ApiGenerator {
                 if params.is_empty() {
                     return true;
                 }
-                let value = match serde_json::to_value(record) {
-                    Ok(v) => v,
-                    Err(_) => return true,
-                };
-                let obj = match value.as_object() {
-                    Some(o) => o,
-                    None => return true,
-                };
                 #(#field_checks)*
                 true
             }
+
+            #record_changed
 
             #[doc = #subscribe_doc]
             async fn #subscribe_fn(
@@ -804,9 +952,9 @@ impl ApiGenerator {
     /// signal," not a runtime predicate interpreter.
     ///
     /// Honest limits: O(rows) full re-run per matched event per connection (no
-    /// coalescing/debounce yet); `Updated` detection uses full-record
-    /// `serde_json` stringify comparison, inheriting #62-A's exact-match
-    /// fragility for some float/bool encodings; single-process.
+    /// coalescing/debounce yet — #83); single-process.  `Updated` detection now
+    /// uses a typed per-field comparison (`<model>_record_changed`, #84), so the
+    /// old `serde_json` stringify float/bool fragility is gone.
     fn generate_live_query(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
@@ -817,6 +965,10 @@ impl ApiGenerator {
         // Reuse the EXACT generated closed-set filter emitted by
         // `generate_subscription` — do not define a second filtering path.
         let filter_fn = format_ident!("{}_event_matches", snake);
+        // Typed per-field change detector (#84), also defined by
+        // `generate_subscription` — reused here so there is one change-detection
+        // body per model, never a second (stringify) path.
+        let changed_fn = format_ident!("{}_record_changed", snake);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(model);
         let model_name_str = &model.name;
@@ -849,8 +1001,9 @@ impl ApiGenerator {
                 // channel), then release the DB lock.  We consult only event.model.
                 let mut rx = { db.read().await.changefeed.subscribe() };
 
-                // Result-set membership: id -> opaque hash of the record in the set.
-                let mut members: HashMap<#id_type, String> = HashMap::new();
+                // Result-set membership: id -> the typed record currently in the
+                // set.  Change-detection compares these field-by-field (#84).
+                let mut members: HashMap<#id_type, super::#model_name> = HashMap::new();
 
                 // Initial matching set via the GENERATED closed-set query.
                 {
@@ -863,7 +1016,7 @@ impl ApiGenerator {
                             .collect()
                     };
                     for r in &rows {
-                        members.insert(r.#id_field, serde_json::to_string(r).unwrap_or_default());
+                        members.insert(r.#id_field, r.clone());
                     }
                     let init = super::#delta_name::Init { rows };
                     if let Ok(text) = serde_json::to_string(&init) {
@@ -892,20 +1045,21 @@ impl ApiGenerator {
                                     .collect()
                             };
 
-                            // Diff by id over opaque hashes → removal-aware deltas.
-                            let mut next: HashMap<#id_type, String> = HashMap::new();
+                            // Diff by id over the typed records → removal-aware
+                            // deltas.  `Updated` fires only when a stored field
+                            // actually changed (typed compare, #84 — no stringify).
+                            let mut next: HashMap<#id_type, super::#model_name> = HashMap::new();
                             let mut deltas: Vec<super::#delta_name> = Vec::new();
                             for r in current {
                                 let id = r.#id_field;
-                                let hash = serde_json::to_string(&r).unwrap_or_default();
                                 match members.get(&id) {
                                     None => deltas.push(super::#delta_name::Added { row: r.clone() }),
-                                    Some(prev) if *prev != hash => {
+                                    Some(prev) if #changed_fn(prev, &r) => {
                                         deltas.push(super::#delta_name::Updated { row: r.clone() })
                                     }
                                     _ => {}
                                 }
-                                next.insert(id, hash);
+                                next.insert(id, r);
                             }
                             for id in members.keys() {
                                 if !next.contains_key(id) {
