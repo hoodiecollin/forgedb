@@ -16,6 +16,7 @@ members = [
     "crates/backup",
     "crates/changefeed",
     "crates/auth",
+    "crates/txn",
     "crates/lsp-server",
     "crates/ffi",
     "apps/inspector/src-tauri",

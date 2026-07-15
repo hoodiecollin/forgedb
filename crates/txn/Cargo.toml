@@ -1,0 +1,9 @@
+[package]
+name = "forgedb-txn"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "MVCC Tier 2 commit sequencer for ForgeDB — monotonic LSN source and first-committer-wins conflict detection over opaque byte keys"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "mvcc", "transactions", "forgedb"]
+categories = ["database"]
