@@ -8,19 +8,21 @@
 
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import { toast } from "sonner";
-import { RefreshCw, Star } from "lucide-react";
+import { Clock, RefreshCw, Star } from "lucide-react";
 import {
   connectedAtom,
   consoleTabAtom,
+  pinnedSnapshotsAtom,
+  pinSnapshotAtom,
   predicatesAtom,
   screenAtom,
-  snapPosAtom,
+  snapshotTokenAtom,
   streamAtom,
   studioModelAtom,
 } from "@/lib/inspector/atoms";
+import { isTauri } from "@/lib/inspector/data-source";
 import { GRID, SAVED, SNAPS, TAILS } from "@/lib/inspector/mock";
 import { Button } from "@/components/ui/button";
-import { Slider } from "@/components/ui/slider";
 import {
   Table,
   TableBody,
@@ -40,9 +42,12 @@ export function ConsoleScreen() {
   const predicates = useAtomValue(predicatesAtom);
   const stream = useAtomValue(streamAtom);
   const connected = useAtomValue(connectedAtom);
-  const [snapPos, setSnapPos] = useAtom(snapPosAtom);
+  const [snapshotToken, setSnapshotToken] = useAtom(snapshotTokenAtom);
+  const pinned = useAtomValue(pinnedSnapshotsAtom);
+  const pinSnapshot = useSetAtom(pinSnapshotAtom);
   const setScreen = useSetAtom(screenAtom);
   const setStudioModel = useSetAtom(studioModelAtom);
+  const studioModel = useAtomValue(studioModelAtom);
 
   const rows = (GRID.User?.rows ?? []).slice(0, 5);
   const idxCount = predicates.filter((p) => p.idx).length;
@@ -55,10 +60,33 @@ export function ConsoleScreen() {
     )
     .join(",\n")}\n}`;
 
-  const snapReadout =
-    snapPos > 90
-      ? "now (live)"
-      : `Nov 8 · ${String(Math.floor(6 + snapPos / 8)).padStart(2, "0")}:${String(Math.floor((snapPos * 7) % 60)).padStart(2, "0")}`;
+  // #85: honest "as of" readout — the active lens is either live (newest) or a
+  // pinned snapshot's row-count **watermark** for the current model. There is no
+  // wall-clock instant; the token is a row-count position.
+  const activePinName =
+    snapshotToken &&
+    pinned.find((p) => JSON.stringify(p.token) === JSON.stringify(snapshotToken))
+      ?.name;
+  const activeWatermark = snapshotToken ? snapshotToken[studioModel] : undefined;
+  const snapReadout = !snapshotToken
+    ? "now (live)"
+    : `${activePinName ?? "snapshot"} · ${studioModel} @ ${activeWatermark ?? "?"} rows`;
+
+  // Pin the server's current watermarks under an auto-numbered name (live-lens
+  // only — a capture needs the running API).
+  const pinCurrent = async () => {
+    if (!isTauri() || !connected) {
+      toast.error("Attach to a running API to pin a snapshot");
+      return;
+    }
+    const name = `snapshot ${pinned.length + 1}`;
+    try {
+      await pinSnapshot(name);
+      toast(`Pinned "${name}"`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   return (
     <div className="flex h-full min-h-0">
@@ -128,7 +156,7 @@ export function ConsoleScreen() {
           </TabBtn>
           <TabBtn active={tab === "snap"} onClick={() => setTab("snap")}>
             <RefreshCw className="size-3 text-info" />
-            Snapshot @ 14:03
+            Snapshot
           </TabBtn>
         </div>
 
@@ -272,27 +300,67 @@ export function ConsoleScreen() {
                   reading as of <span className="text-info">{snapReadout}</span>
                 </span>
               </div>
-              <Slider
-                value={[snapPos]}
-                onValueChange={(v) => setSnapPos(v[0] ?? snapPos)}
-                min={0}
-                max={100}
-              />
-              <div className="mt-1.5 flex justify-between font-mono text-[10.5px] text-muted-foreground">
-                <span>Nov 6 22:10</span>
-                <span>pre-compaction</span>
-                <span>before-migration</span>
-                <span>now</span>
+              {/* #85: discrete snapshot selector (live + pinned captures). A
+                  ForgeDB snapshot is a row-count watermark, not a wall-clock
+                  instant, so this is a set of captured points — not a continuous
+                  time slider. */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setSnapshotToken(null)}
+                  className={cn(
+                    "flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 font-mono text-[12px]",
+                    !snapshotToken
+                      ? "border-ok/40 bg-ok/10 text-ok"
+                      : "border-border text-muted-foreground hover:bg-muted",
+                  )}
+                >
+                  <span
+                    className={cn(
+                      "size-1.5 rounded-full",
+                      !snapshotToken ? "bg-ok" : "bg-muted-foreground/40",
+                    )}
+                  />
+                  now (live)
+                </button>
+                {pinned.map((p) => (
+                  <button
+                    key={p.name}
+                    type="button"
+                    onClick={() => setSnapshotToken(p.token)}
+                    title={`${studioModel} @ ${p.token[studioModel] ?? "?"} rows`}
+                    className={cn(
+                      "flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 font-mono text-[12px]",
+                      activePinName === p.name
+                        ? "border-info/40 bg-info/10 text-info"
+                        : "border-border text-muted-foreground hover:bg-muted",
+                    )}
+                  >
+                    <RefreshCw className="size-3" />
+                    {p.name}
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={pinCurrent}
+                  className="ml-auto flex items-center gap-1.5 rounded-[7px] border border-dashed border-border px-2.5 py-1 text-[12px] text-muted-foreground hover:bg-muted"
+                >
+                  <Clock className="size-3.5" />
+                  Pin current…
+                </button>
               </div>
               <div className="mt-2.5 text-[12px] text-muted-foreground">
-                A snapshot is a consistent point-in-time view across{" "}
-                <b>all</b> models — a read taken here shows the data exactly as
-                it was, even after later changes.
+                A snapshot is a consistent point-in-time view across <b>all</b>{" "}
+                models, captured as each model&rsquo;s row-count watermark — a
+                read taken here shows the data exactly as it was, even after later
+                changes. The Studio grid follows the selected snapshot.
               </div>
             </div>
             <div className="flex items-center gap-2.5 border-b border-border px-4 py-2.5 font-mono text-[12px] text-muted-foreground">
-              User · as of snapshot
-              <span className="ml-auto text-info">compare vs current →</span>
+              {studioModel} · {snapReadout}
+              <span className="ml-auto text-info">
+                compare vs current → (tool builds this)
+              </span>
             </div>
             <ResultsTable rows={rows} />
           </div>

@@ -100,6 +100,39 @@ export const lensAtom = atom<Lens>("live");
 /** currently-selected model on the Atlas map */
 export const selModelAtom = atom("User");
 
+// ---- snapshot / time-travel (#85) --------------------------------------------
+// A snapshot token is the server's per-model row-count watermark map, frozen at
+// `GET /snapshot`. `null` = live (read the newest committed version). When a
+// token is active, reads pass the current model's watermark as `as_of` and the
+// live-query subscription is suspended (a point-in-time view is not a live tail).
+export type SnapshotToken = Record<string, number>;
+/** the active snapshot token, or null for the live "as of: now" lens */
+export const snapshotTokenAtom = atom<SnapshotToken | null>(null);
+/** named point-in-time captures the user has pinned */
+export interface PinnedSnapshot {
+  name: string;
+  token: SnapshotToken;
+}
+export const pinnedSnapshotsAtom = atom<PinnedSnapshot[]>([]);
+
+/**
+ * Capture the server's current watermarks (`GET /snapshot`) and pin them under a
+ * name, then activate the pinned token. Tauri live-lens only (guarded by the
+ * caller); throws with a surfaced message if the API is unreachable.
+ */
+export const pinSnapshotAtom = atom(
+  null,
+  async (get, set, name: string): Promise<void> => {
+    const { getSnapshotToken } = await import("./live");
+    const token = await getSnapshotToken(get(apiBaseAtom));
+    set(pinnedSnapshotsAtom, [
+      ...get(pinnedSnapshotsAtom).filter((p) => p.name !== name),
+      { name, token },
+    ]);
+    set(snapshotTokenAtom, token);
+  },
+);
+
 // ---- studio ----
 export const studioModelAtom = atom("User");
 /** pivot breadcrumb (set when following a relation into another model) */
@@ -113,7 +146,6 @@ export const predicatesAtom = atom<Predicate[]>(DEFAULT_PREDICATES);
 
 // ---- console ----
 export const consoleTabAtom = atom<ConsoleTab>("q1");
-export const snapPosAtom = atom(68);
 
 // ---- record editor ----
 export type EditorMode = "edit" | "create";

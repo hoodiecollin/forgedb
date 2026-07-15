@@ -24,11 +24,21 @@ import {
   connectedAtom,
   dbNameAtom,
   openProjectAtom,
+  pinnedSnapshotsAtom,
   projectErrorAtom,
   screenAtom,
+  snapshotTokenAtom,
 } from "@/lib/inspector/atoms";
 import { isTauri } from "@/lib/inspector/data-source";
 import type { Screen } from "@/lib/inspector/types";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 
 const NAV: { screen: Screen; label: string; icon: typeof Network }[] = [
@@ -45,7 +55,18 @@ export function TopBar() {
   const [apiBase, setApiBase] = useAtom(apiBaseAtom);
   const openProject = useSetAtom(openProjectAtom);
   const [projectError, setProjectError] = useAtom(projectErrorAtom);
+  const [snapshotToken, setSnapshotToken] = useAtom(snapshotTokenAtom);
+  const pinned = useAtomValue(pinnedSnapshotsAtom);
   const desktop = isTauri();
+
+  // Label for the active "as of" lens: live, a matching pinned name, or a
+  // generic frozen marker (a token captured elsewhere, e.g. the Console).
+  const activePinName =
+    snapshotToken &&
+    pinned.find(
+      (p) => JSON.stringify(p.token) === JSON.stringify(snapshotToken),
+    )?.name;
+  const asOfLabel = !snapshotToken ? "now" : (activePinName ?? "snapshot");
 
   // Editable API base (#71): a local draft committed on blur/Enter, validated to
   // an http(s) URL; an invalid draft reverts to the persisted value.
@@ -135,14 +156,65 @@ export function TopBar() {
             placeholder="http://localhost:3000"
           />
         </div>
-        <button
-          type="button"
-          className="flex items-center gap-1.5 rounded-[7px] border border-dashed border-border px-2.5 py-1 text-[12px] text-muted-foreground hover:bg-muted"
-        >
-          <Clock className="size-3.5" />
-          as of: <span className="font-mono text-foreground">now</span>
-          <ChevronDown className="size-3" />
-        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              title="Read the database as of a pinned snapshot (#85)"
+              className={cn(
+                "flex items-center gap-1.5 rounded-[7px] border px-2.5 py-1 text-[12px] hover:bg-muted",
+                snapshotToken
+                  ? "border-info/40 bg-info/10 text-info"
+                  : "border-dashed border-border text-muted-foreground",
+              )}
+            >
+              <Clock className="size-3.5" />
+              as of:{" "}
+              <span
+                className={cn(
+                  "font-mono",
+                  snapshotToken ? "text-info" : "text-foreground",
+                )}
+              >
+                {asOfLabel}
+              </span>
+              <ChevronDown className="size-3" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-44">
+            <DropdownMenuLabel>Read as of</DropdownMenuLabel>
+            <DropdownMenuItem onClick={() => setSnapshotToken(null)}>
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  !snapshotToken ? "bg-ok" : "bg-muted-foreground/40",
+                )}
+              />
+              now (live)
+            </DropdownMenuItem>
+            {pinned.length > 0 ? <DropdownMenuSeparator /> : null}
+            {pinned.map((p) => (
+              <DropdownMenuItem
+                key={p.name}
+                onClick={() => setSnapshotToken(p.token)}
+                className="font-mono text-[12px]"
+              >
+                <span
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    activePinName === p.name ? "bg-info" : "bg-muted-foreground/40",
+                  )}
+                />
+                {p.name}
+              </DropdownMenuItem>
+            ))}
+            {pinned.length === 0 ? (
+              <div className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                No pinned snapshots — pin one in the Console.
+              </div>
+            ) : null}
+          </DropdownMenuContent>
+        </DropdownMenu>
         <button
           type="button"
           title="Toggle attached database"

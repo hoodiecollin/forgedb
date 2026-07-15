@@ -48,28 +48,67 @@ async function tauriFetch(
   });
 }
 
-/** `GET /api/<model>?filters` → the record array (unwraps `{ data: [...] }`). */
+/**
+ * Merge the point-in-time `as_of` watermark (#85) into a filter map. The
+ * watermark is an opaque row-count position — the wire token the generated
+ * snapshot endpoints accept (`?as_of=<n>`); `undefined` reads live (newest).
+ */
+function withAsOf(
+  filters: Record<string, string>,
+  asOf?: number,
+): Record<string, string> {
+  return asOf === undefined ? filters : { ...filters, as_of: String(asOf) };
+}
+
+/**
+ * `GET /api/<model>?filters` → the record array (unwraps `{ data: [...] }`).
+ * With `asOf` (a row-count watermark, #85) the generated endpoint reads
+ * `all_at` — the rows as of that point in time — instead of the live newest.
+ */
 export async function listRows(
   base: string,
   model: string,
   filters: Record<string, string> = {},
+  asOf?: number,
 ): Promise<LiveRow[]> {
-  const res = await tauriFetch(`${base}/api/${kebab(model)}${q(filters)}`);
+  const res = await tauriFetch(`${base}/api/${kebab(model)}${q(withAsOf(filters, asOf))}`);
   if (!res.ok) throw new Error(`GET ${model} → ${res.status}`);
   const json = (await res.json()) as { data?: LiveRow[] };
   return json.data ?? [];
 }
 
-/** `GET /api/<model>/<id>` → the full record, or null on 404. */
+/**
+ * `GET /api/<model>/<id>` → the full record, or null on 404. With `asOf` the
+ * generated endpoint reads `get_at` (the version visible at that watermark);
+ * a row not yet present at the watermark reads as 404 → null (#85).
+ */
 export async function getRow(
   base: string,
   model: string,
   id: string,
+  asOf?: number,
 ): Promise<LiveRow | null> {
-  const res = await tauriFetch(`${base}/api/${kebab(model)}/${encodeURIComponent(id)}`);
+  const res = await tauriFetch(
+    `${base}/api/${kebab(model)}/${encodeURIComponent(id)}${q(withAsOf({}, asOf))}`,
+  );
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(`GET ${model}/${id} → ${res.status}`);
   return (await res.json()) as LiveRow;
+}
+
+/**
+ * `GET /snapshot` → the current per-model row-count **watermarks** (#85): a
+ * `{ "<Model>": <rowCount> }` map captured atomically on the server. The client
+ * freezes this as a snapshot token and passes a model's watermark back as `asOf`
+ * to read that model as of this instant. Keys are PascalCase model names.
+ */
+export async function getSnapshotToken(
+  base: string,
+): Promise<Record<string, number>> {
+  const res = await tauriFetch(`${base}/snapshot`);
+  if (!res.ok) throw new Error(`GET /snapshot → ${res.status}`);
+  const json = (await res.json()) as { watermarks?: Record<string, number> };
+  return json.watermarks ?? {};
 }
 
 /** `POST /api/<model>` → the new row id. */

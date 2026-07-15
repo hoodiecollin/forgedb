@@ -18,6 +18,7 @@ import {
   predicatesAtom,
   projectSourceAtom,
   schemaAtom,
+  snapshotTokenAtom,
   studioModelAtom,
 } from "./atoms";
 import { isTauri } from "./data-source";
@@ -75,6 +76,7 @@ export function useLiveRows(): LiveRowsState {
   const predicates = useAtomValue(predicatesAtom);
   const base = useAtomValue(apiBaseAtom);
   const schema = useAtomValue(schemaAtom);
+  const snapshotToken = useAtomValue(snapshotTokenAtom);
 
   const active = isTauri() && source === "project" && connected;
   const [rows, setRows] = useState<LiveRow[]>([]);
@@ -89,6 +91,11 @@ export function useLiveRows(): LiveRowsState {
         .map((p) => [p.field, unquote(p.val)]),
     ),
   );
+  // #85: point-in-time read. A pinned snapshot supplies this model's row-count
+  // watermark as `as_of`; `undefined` = live. Keyed by PascalCase model name to
+  // match the `/snapshot` token. When pinned, the live-query subscription is
+  // suspended below — a snapshot is a frozen view, not a live tail.
+  const asOf = snapshotToken ? snapshotToken[model] : undefined;
 
   useEffect(() => {
     if (!active) {
@@ -102,7 +109,7 @@ export function useLiveRows(): LiveRowsState {
     setLoading(true);
     setError(null);
 
-    listRows(base, model, filters)
+    listRows(base, model, filters, asOf)
       .then((r) => {
         if (!cancelled) {
           setRows(r);
@@ -116,18 +123,21 @@ export function useLiveRows(): LiveRowsState {
         }
       });
 
-    liveQuery(base, model, filters, (d) => {
-      if (!cancelled) setRows((cur) => applyDelta(cur, d));
-    }).then((s) => {
-      if (cancelled) s.close();
-      else sub = s;
-    });
+    // Live tail only in the live lens; a pinned snapshot is a static view.
+    if (asOf === undefined) {
+      liveQuery(base, model, filters, (d) => {
+        if (!cancelled) setRows((cur) => applyDelta(cur, d));
+      }).then((s) => {
+        if (cancelled) s.close();
+        else sub = s;
+      });
+    }
 
     return () => {
       cancelled = true;
       sub?.close();
     };
-  }, [active, base, model, filterKey]);
+  }, [active, base, model, filterKey, asOf]);
 
   return { active, loading, error, cols, rows };
 }
