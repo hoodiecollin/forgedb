@@ -4076,18 +4076,31 @@ User {
 
 #[test]
 fn test_rust_generation_coordinated_client() {
-    // Tier 3 MVCC coordinator client (#84): `Database::connect_coordinator` must
-    // produce a `CoordinatedDatabase` whose `transaction_coordinated` routes the
-    // serialized commit section through the coordinator Unix socket while reusing
-    // the SAME `__apply_and_commit_concurrent_buffer` data-plane path as Tier 2.
+    // Tier 3 MVCC coordinator client (#84): `Database::connect` must produce a
+    // `CoordinatedDatabase` whose `transaction_coordinated` routes the serialized
+    // commit section through the coordinator Unix socket while reusing the SAME
+    // `__apply_and_commit_concurrent_buffer` data-plane path as Tier 2.
     //
-    // PM identity constraints checked here:
+    // PM identity constraints checked here (incl. the #84 lock-skip re-gate):
     // (a) The coordinator client surface is generated (no hand-rolled alternative).
     // (b) No second apply body — `transaction_coordinated` calls
     //     `__apply_and_commit_concurrent_buffer`, NOT a separate per-model dispatch.
     // (c) The coordinator receives only opaque bytes (no decoded field in the
     //     `Committed` payload: model tags are byte-cast, not field-decoded).
     // (d) `CoordinatedDatabase` is strictly additive — no existing method is modified.
+    // (e) Real row indices forwarded — NOT placeholder 0 (T3-3/T3-8).
+    // (f) Peer read-currency: `__peer_refresh` is generated data-plane code that
+    //     reads shared column files; the coordinator has no column-write dep (T3-8).
+    // (g) T3-8 structural: no `forgedb_storage` write import in coordinator payload
+    //     build path (the generated Committed payload is opaque bytes only).
+    // (G1) Lock-skip (T3-5): the coordinated open (`connect`) opens LOCK-FREE via
+    //      `__open_with_lock(root, None)`; the standalone `open_at` DOES take the
+    //      #89 `DirLock::acquire`. This pins the exact bug the #84 data-plane fix
+    //      corrected (every client self-locking ⇒ concurrent multi-process
+    //      impossible), analogous to the `no match model_name` structural guards.
+    // (G3) T3-8 dependency: `forgedb-coordinator/Cargo.toml` has NO
+    //      `forgedb-storage*` dependency (checked below), so the coordinator can
+    //      never link the column-write machinery.
     let src = r#"
 User {
   id: +uuid
@@ -4105,10 +4118,16 @@ User {
         "CoordinatedDatabase struct emitted"
     );
 
-    // (a) Database::connect_coordinator factory is emitted.
+    // (a) Database::connect factory is emitted; the old lock-taking
+    // connect_coordinator(self) form is GONE (it wrapped an already-locked
+    // Database, which broke concurrent multi-process — #84).
     assert!(
-        code.contains("pub fn connect_coordinator"),
-        "Database::connect_coordinator emitted"
+        code.contains("pub fn connect("),
+        "Database::connect emitted"
+    );
+    assert!(
+        !code.contains("connect_coordinator"),
+        "old lock-taking connect_coordinator removed (#84 lock-skip fix)"
     );
 
     // (a) The transaction method is emitted.
@@ -4144,5 +4163,80 @@ User {
     assert!(
         code.contains("forgedb_coordinator"),
         "generated code references the forgedb-coordinator substrate crate"
+    );
+
+    // (e) Real row indices: __apply_and_commit_concurrent_buffer returns Vec<(model_tag, row_index)>
+    // and those are threaded into the Committed payload — NOT a placeholder 0 literal.
+    assert!(
+        !code.contains("__row_indices.push(0)"),
+        "row_indices must NOT be placeholder 0 — real positions from __apply_and_commit (T3-3)"
+    );
+    // The pairs are used to build model_tags and row_indices from the Ok result.
+    assert!(
+        code.contains("__peer_refresh"),
+        "peer read-currency: __peer_refresh method emitted (T3-8)"
+    );
+
+    // (f) Peer refresh re-derives EVERY column's row_count from disk (not just the
+    // tombstone — that was the bug: a peer's row is unreadable until all columns'
+    // bounds are refreshed), then rebuilds the maps.
+    assert!(
+        code.contains("__sync_columns_from_disk"),
+        "peer refresh syncs ALL columns from disk (not tombstone-only) — #84"
+    );
+    assert!(
+        code.contains("sync_from_disk"),
+        "peer refresh reads shared column live length via sync_from_disk (T3-8)"
+    );
+    assert!(
+        code.contains("__reindex_committed"),
+        "peer refresh rebuilds id_to_row + indexes via __reindex_committed"
+    );
+
+    // (g) T3-8 structural: last_refreshed_lsn tracks the peer-refresh cursor.
+    assert!(
+        code.contains("last_refreshed_lsn"),
+        "last_refreshed_lsn tracks peer refresh cursor (T3-8)"
+    );
+
+    // T3-5: Tier 2 call site is byte-identical — the `?;` expression is unchanged.
+    // The apply function now returns Vec<...> but the Tier-2 caller still uses `?;`
+    // (semicolon drops the Ok value).  Confirm SharedDatabase::transaction_concurrent
+    // still calls __apply_and_commit_concurrent_buffer.
+    assert!(
+        code.contains("pub fn transaction_concurrent"),
+        "Tier 2 transaction_concurrent unchanged (T3-5)"
+    );
+
+    // (G1) Lock-skip structural guard (#84 PM re-gate). The coordinated open path
+    // is LOCK-FREE and the standalone path is NOT — the exact bug the data-plane
+    // fix corrected. `connect` opens via `__open_with_lock(root, None)`; `open_at`
+    // acquires the #89 DirLock.
+    assert!(
+        code.contains("__open_with_lock(root, None)"),
+        "G1: coordinated open (connect) is LOCK-FREE — __open_with_lock(root, None)"
+    );
+    assert!(
+        code.contains("DirLock::acquire"),
+        "G1: standalone open_at still self-acquires the #89 DirLock"
+    );
+    // The lock-free open must be reachable ONLY through connect (which first
+    // establishes a live coordinator) — surfaced as CoordinatorUnavailable if not.
+    assert!(
+        code.contains("CoordinatorUnavailable"),
+        "G1: connect surfaces CoordinatorUnavailable (never a lock-free standalone writer)"
+    );
+
+    // (G3) T3-8 dependency guard — `forgedb-coordinator` must NOT depend on any
+    // `forgedb-storage*` crate, so it can never link the column-write machinery
+    // (`FixedColumn`/`VariableColumn`/`Tombstones` append). Read its manifest.
+    let coord_manifest = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../coordinator/Cargo.toml"
+    ))
+    .expect("read forgedb-coordinator Cargo.toml");
+    assert!(
+        !coord_manifest.contains("forgedb-storage"),
+        "G3 (T3-8): forgedb-coordinator must have NO forgedb-storage* dependency"
     );
 }

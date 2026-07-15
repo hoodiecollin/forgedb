@@ -109,6 +109,13 @@ pub enum TxError {
     /// A write-write conflict lost the serialized commit (Tier 2).
     /// Never produced by Tier 1's single-writer transactions.
     Conflict,
+    /// The Tier-3 commit coordinator is unreachable — either
+    /// `Database::connect` could not establish the turn-channel, or a
+    /// live commit exhausted its retries against a down/stuck
+    /// coordinator.  The data dir is NOT opened lock-free unless the
+    /// coordinator is live (MVCC spec T3-5 / PM re-gate #84), so this
+    /// never leaves an unserialized writer running.
+    CoordinatorUnavailable(String),
 }
 impl TxError {
     /// The HTTP status a generated boundary would return: a validation
@@ -119,6 +126,7 @@ impl TxError {
             TxError::Validation(e) => e.status_code(),
             TxError::Io(_) => 500,
             TxError::Conflict => 409,
+            TxError::CoordinatorUnavailable(_) => 503,
         }
     }
 }
@@ -128,6 +136,9 @@ impl std::fmt::Display for TxError {
             TxError::Validation(e) => write!(f, "transaction rejected: {}", e),
             TxError::Io(m) => write!(f, "transaction I/O failure: {}", m),
             TxError::Conflict => write!(f, "transaction conflict (retry)"),
+            TxError::CoordinatorUnavailable(m) => {
+                write!(f, "commit coordinator unavailable: {}", m)
+            }
         }
     }
 }
@@ -598,6 +609,23 @@ impl UserStorage {
             };
             self.id_to_row.insert(id, i);
         }
+    }
+    /// Refresh EVERY column + the tombstone's in-memory `row_count` from
+    /// the on-disk file lengths, then adopt the peer-visible row count
+    /// (MVCC Tier 3, #84 — peer read-currency).  Reads are positional and
+    /// bounded by each column's cached `row_count`; a *peer* process's
+    /// appended rows stay invisible until this re-derives those counts
+    /// from the shared files.  Syncing ONLY the tombstone (as an earlier
+    /// cut did) bumps the row count but leaves every data column bounded
+    /// at its open-time length, so `get`/`read_at` of a peer row reads out
+    /// of bounds — this syncs them all.  Uses the additive
+    /// `*::sync_from_disk` substrate (`storage-native`); writes nothing
+    /// (T3-8: generated data-plane read-refresh, no column append/flush).
+    /// Caller pairs this with `__reindex_committed` to rebuild the maps.
+    pub fn __sync_columns_from_disk(&mut self) {
+        let _ = self.id_col.sync_from_disk();
+        let _ = self.tombstones.sync_from_disk();
+        self.row_count = self.tombstones.len();
     }
     /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
     /// #83).  The transaction rollback primitive: erases staged ahead-rows
@@ -1393,6 +1421,24 @@ impl PostStorage {
             self.id_to_row.insert(id, i);
         }
     }
+    /// Refresh EVERY column + the tombstone's in-memory `row_count` from
+    /// the on-disk file lengths, then adopt the peer-visible row count
+    /// (MVCC Tier 3, #84 — peer read-currency).  Reads are positional and
+    /// bounded by each column's cached `row_count`; a *peer* process's
+    /// appended rows stay invisible until this re-derives those counts
+    /// from the shared files.  Syncing ONLY the tombstone (as an earlier
+    /// cut did) bumps the row count but leaves every data column bounded
+    /// at its open-time length, so `get`/`read_at` of a peer row reads out
+    /// of bounds — this syncs them all.  Uses the additive
+    /// `*::sync_from_disk` substrate (`storage-native`); writes nothing
+    /// (T3-8: generated data-plane read-refresh, no column append/flush).
+    /// Caller pairs this with `__reindex_committed` to rebuild the maps.
+    pub fn __sync_columns_from_disk(&mut self) {
+        let _ = self.id_col.sync_from_disk();
+        let _ = self.title_col.sync_from_disk();
+        let _ = self.tombstones.sync_from_disk();
+        self.row_count = self.tombstones.len();
+    }
     /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
     /// #83).  The transaction rollback primitive: erases staged ahead-rows
     /// so the collection returns to its pre-txn physical length.  Reuses the
@@ -1875,6 +1921,23 @@ impl Database {
                              (ForgeDB is single-writer-per-process, #89)",
                 ),
         );
+        Self::__open_with_lock(root, _lock)
+    }
+    /// Lock-free-capable open core shared by the standalone path
+    /// (`open_at`, `_lock = Some`) and the Tier-3 coordinated path
+    /// (`connect`, `_lock = None`).  MVCC spec T3-5: a coordinated
+    /// client does NOT take the #89 `DirLock` — the coordinator holds
+    /// it on every client's behalf, and write mutual-exclusion among
+    /// coordinated clients is the coordinator's serialized turn-grant.
+    /// There is deliberately NO public lock-free open: `None` is
+    /// reachable only through `connect`, which first establishes a live
+    /// coordinator turn-channel, so a lock-free open never occurs
+    /// without a coordinator actually serializing writers (the PM
+    /// re-gate's binding constraint — no unserialized lock-free write).
+    fn __open_with_lock(
+        root: std::path::PathBuf,
+        _lock: Option<forgedb_storage::DirLock>,
+    ) -> Self {
         let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
         let broker = match forgedb_changefeed::durable::DurableBroker::open(
             root.join("_replication.log"),
@@ -3009,13 +3072,18 @@ impl Database {
     ///
     /// The model-tag dispatch here is in the APPLY path (after conflict
     /// resolution passed) — same pattern as `apply_frame` for the follower.
+    ///
+    /// Returns the physical `(model_tag_bytes, row_index)` for each row appended
+    /// so the Tier 3 caller can forward correct positions to the coordinator's
+    /// `_replication.log` (T3-3/T3-8 contract).  Tier 2 callers discard the
+    /// `Ok` value via `?;` — the call-site text is byte-identical (T3-5).
     pub(crate) fn __apply_and_commit_concurrent_buffer(
         &mut self,
         buffer: Vec<
             (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool),
         >,
         events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
-    ) -> Result<(), TxError> {
+    ) -> Result<Vec<(Vec<u8>, u64)>, TxError> {
         let mut __marks: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
         let mut __wal_marks: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
         for (__model_tag, _kind, _id_bytes, _bytes, _deleted) in &buffer {
@@ -3137,7 +3205,11 @@ impl Database {
                 _ => {}
             }
         }
+        let mut __row_index_pairs: Vec<(Vec<u8>, u64)> = Vec::with_capacity(
+            __staged_events.len(),
+        );
         for (__model, __kind, __row, __bytes) in __staged_events {
+            __row_index_pairs.push((__model.as_bytes().to_vec(), __row as u64));
             self.changefeed.emit(__model, __row, __kind);
             if let Some(__broker) = &self.broker {
                 if let Ok(mut __b) = __broker.lock() {
@@ -3146,7 +3218,7 @@ impl Database {
             }
         }
         let _ = events;
-        Ok(())
+        Ok(__row_index_pairs)
     }
 }
 /// Tier 3 MVCC multi-process coordinator client (#84).
@@ -3157,27 +3229,41 @@ impl Database {
 /// enabling multiple OS processes to share a single data directory
 /// without corruption.
 ///
-/// Create via [`Database::connect_coordinator`].
+/// Create via [`Database::connect`] (connects to the coordinator, then
+/// opens the data dir lock-free — the coordinator holds the #89 lock).
 pub struct CoordinatedDatabase {
     shared: SharedDatabase,
     coordinator: std::sync::Arc<forgedb_coordinator::client::CoordinatorClient>,
+    /// The coordinator LSN this writer has refreshed peer commits up to.
+    /// When `coordinator.last_known_lsn()` exceeds this, a peer refresh
+    /// is performed before the next prepare (peer read-currency, #84).
+    last_refreshed_lsn: std::sync::atomic::AtomicU64,
 }
 impl CoordinatedDatabase {
     /// Run a transaction through the Tier 3 commit coordinator.
     ///
     /// ## Commit flow
     ///
+    /// 0. **Peer refresh** (if coordinator LSN advanced): sync tombstone
+    ///    counts from disk + rebuild id_to_row/indexes under write lock.
+    ///    This is how a writer sees commits made by other processes while
+    ///    it was prepare-ing — peer read-currency via #56-B shared column
+    ///    files, driven by the coordinator log offset as the signal.
+    ///    T3-8: the coordinator never writes a column; this refresh is
+    ///    generated data-plane code reading the shared files.
     /// 1. Capture read snapshot (brief `RwLock` read, sequencer snapshot).
     /// 2. Run prepare closure with `ConcurrentTxHandle` — no lock held.
     /// 3. Build opaque write-set keys (same as Tier 2, identity red line).
     /// 4. **`RequestTurn`** → coordinator: conflict-check + LSN assignment.
     ///    - On `Grant`: proceed to data-plane write.
-    ///    - On `Nack` (conflict): release snapshot, retry from step 1.
+    ///    - On `Nack` (conflict): release snapshot, retry from step 0.
     ///    - On `Busy`: brief back-off then retry step 4.
     /// 5. Data-plane write: `__apply_and_commit_concurrent_buffer` under
     ///    the exclusive in-process `RwLock`.  Same path as Tier 2.
-    /// 6. **`Committed`** → coordinator: hand opaque row bytes for the
-    ///    durable replication log, receive `Ack { lsn }`.
+    ///    Returns the physical `(model_tag_bytes, row_index)` pairs for
+    ///    each row appended (T3-3/T3-8: correct positions in the log).
+    /// 6. **`Committed`** → coordinator: hand opaque row bytes + REAL
+    ///    row indices for the durable replication log, receive `Ack { lsn }`.
     /// 7. Release snapshot; return the prepared value.
     pub fn transaction_coordinated<T>(
         &self,
@@ -3185,11 +3271,21 @@ impl CoordinatedDatabase {
         f: impl Fn(&mut ConcurrentTxHandle) -> Result<T, TxError>,
     ) -> Result<T, TxError> {
         use forgedb_changefeed::ChangeKind as __CK;
+        use std::sync::atomic::Ordering;
         let __coord = std::sync::Arc::clone(&self.coordinator);
         let __seq_arc = std::sync::Arc::clone(&self.shared.seq);
         let __inner = std::sync::Arc::clone(&self.shared.inner);
         let mut __last_lsn = __coord.last_known_lsn();
         for __attempt in 0..=retries {
+            {
+                let __coord_lsn = __coord.last_known_lsn();
+                let __refreshed = self.last_refreshed_lsn.load(Ordering::Acquire);
+                if __coord_lsn > __refreshed {
+                    let mut __db = __inner.write().unwrap();
+                    __db.__peer_refresh();
+                    self.last_refreshed_lsn.store(__coord_lsn, Ordering::Release);
+                }
+            }
             let __snap_lsn = {
                 let mut __seq = __seq_arc.lock().unwrap();
                 __seq.register_snapshot()
@@ -3268,10 +3364,15 @@ impl CoordinatedDatabase {
                     continue;
                 }
                 Ok((__turn_id, _reserved_lsn)) => {
-                    let __buf_copy: Vec<(&'static str, __CK, Vec<u8>, Vec<u8>, bool)> = __tx
+                    let __kinds_copy: Vec<u8> = __tx
                         .buffer
                         .iter()
-                        .map(|(m, k, id, b, d)| (*m, *k, id.clone(), b.clone(), *d))
+                        .map(|(_, k, _, _, _)| k.to_byte())
+                        .collect();
+                    let __bytes_copy: Vec<Vec<u8>> = __tx
+                        .buffer
+                        .iter()
+                        .map(|(_, _, _, b, _)| b.clone())
                         .collect();
                     let __apply_result = {
                         let mut __db = __inner.write().unwrap();
@@ -3280,23 +3381,27 @@ impl CoordinatedDatabase {
                             __tx.pending_events,
                         )
                     };
-                    let mut __model_tags: Vec<Vec<u8>> = Vec::new();
-                    let mut __row_indices: Vec<u64> = Vec::new();
-                    let mut __change_kinds: Vec<u8> = Vec::new();
-                    let mut __opaque_bytes: Vec<Vec<u8>> = Vec::new();
-                    for (__model, __kind, _id, __bytes, _del) in &__buf_copy {
-                        __model_tags.push(__model.as_bytes().to_vec());
-                        __row_indices.push(0);
-                        __change_kinds.push(__kind.to_byte());
-                        __opaque_bytes.push(__bytes.clone());
-                    }
+                    let (__model_tags, __row_indices) = match &__apply_result {
+                        Ok(__pairs) => {
+                            let tags: Vec<Vec<u8>> = __pairs
+                                .iter()
+                                .map(|(t, _)| t.clone())
+                                .collect();
+                            let rows: Vec<u64> = __pairs
+                                .iter()
+                                .map(|(_, r)| *r)
+                                .collect();
+                            (tags, rows)
+                        }
+                        Err(_) => (Vec::new(), Vec::new()),
+                    };
                     let __ack = __coord
                         .committed(
                             __turn_id,
                             __model_tags,
                             __row_indices,
-                            __change_kinds,
-                            __opaque_bytes,
+                            __kinds_copy,
+                            __bytes_copy,
                         );
                     match __ack {
                         Ok(__lsn) => {
@@ -3316,24 +3421,59 @@ impl CoordinatedDatabase {
     }
 }
 impl Database {
-    /// Connect to a running `forgedb coordinate <root>` coordinator and
-    /// return a [`CoordinatedDatabase`] for multi-process Tier 3 transactions.
+    /// Peer read-currency refresh for Tier 3 multi-process writers (#84).
     ///
-    /// The `Database` is promoted to a [`SharedDatabase`] (Tier 2) internally;
-    /// `CoordinatedDatabase` delegates the commit critical section to the
-    /// coordinator over the Unix socket at `socket_path`.
-    pub fn connect_coordinator(
-        self,
+    /// Re-reads the on-disk tombstone byte counts (the row-count anchor)
+    /// for each model, updates the in-memory `row_count`, then rebuilds
+    /// `id_to_row` + secondary indexes from the shared column files.
+    ///
+    /// Called under the exclusive write lock (`RwLock`) before each
+    /// `transaction_coordinated` prepare step whenever the coordinator's
+    /// committed LSN has advanced past `last_refreshed_lsn` — meaning a
+    /// peer process committed rows that this writer has not yet seen.
+    ///
+    /// T3-8 contract: this method reads shared column files via the
+    /// #56-B substrate (`sync_from_disk` / `__reindex_committed`); it
+    /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
+    /// dependency and never calls this.
+    pub(crate) fn __peer_refresh(&mut self) {
+        self.user.__sync_columns_from_disk();
+        self.user.__reindex_committed();
+        self.post.__sync_columns_from_disk();
+        self.post.__reindex_committed();
+    }
+    /// Open a data dir as a **coordinated Tier-3 client** of a running
+    /// `forgedb coordinate <root>` coordinator, returning a
+    /// [`CoordinatedDatabase`] that lets multiple OS processes share one
+    /// data directory safely (#84).
+    ///
+    /// ## Lock discipline (MVCC spec T3-5 / PM re-gate #84 — load-bearing)
+    ///
+    /// This connects to the coordinator **FIRST** and only then opens the
+    /// data dir **lock-free** (`_lock: None`): the coordinator holds the
+    /// #89 `DirLock` on `<root>/.forgedb.lock` on behalf of every client,
+    /// and write mutual-exclusion among coordinated clients is the
+    /// coordinator's serialized turn-grant — NOT the file lock.  If the
+    /// coordinator is unreachable, this returns
+    /// [`TxError::CoordinatorUnavailable`] and **no lock-free open
+    /// happens**, so there is never an unserialized lock-free writer
+    /// (the binding PM constraint).  Contrast `open_at`, which takes the
+    /// `DirLock` itself for the standalone single-writer path — the two
+    /// modes are mutually exclusive because both contend for the same
+    /// lock file.
+    pub fn connect(
+        root: std::path::PathBuf,
         socket_path: std::path::PathBuf,
     ) -> Result<CoordinatedDatabase, TxError> {
-        let shared = self.shared();
         let coordinator = forgedb_coordinator::client::CoordinatorClient::connect(
                 &socket_path,
             )
-            .map_err(|e| TxError::Io(e.to_string()))?;
+            .map_err(|e| TxError::CoordinatorUnavailable(e.to_string()))?;
+        let shared = Self::__open_with_lock(root, None).shared();
         Ok(CoordinatedDatabase {
             shared,
             coordinator: std::sync::Arc::new(coordinator),
+            last_refreshed_lsn: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
