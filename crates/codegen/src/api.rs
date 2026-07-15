@@ -160,13 +160,17 @@ impl ApiGenerator {
     /// through the narrow `get_<name>` read (full server-side skip of unselected
     /// columns); on `list` we field-copy the already-filtered/sorted page to the
     /// projection struct (filter/sort need full rows, so only the wire shrinks).
+    /// Returns `(get_block, list_block)` — both empty when the model declares no
+    /// projections.  The `get` handler always owns its own `Query(params)`
+    /// extractor (needed for `?as_of=` even without projections, #85), so this
+    /// function no longer emits one.
     fn generate_projection_rest(
         model: &forgedb_parser::Model,
         storage_field: &proc_macro2::Ident,
         id_type: &TokenStream,
-    ) -> (TokenStream, TokenStream, TokenStream) {
+    ) -> (TokenStream, TokenStream) {
         if model.projections.is_empty() {
-            return (quote! {}, quote! {}, quote! {});
+            return (quote! {}, quote! {});
         }
 
         let mut get_arms = Vec::new();
@@ -202,9 +206,6 @@ impl ApiGenerator {
             });
         }
 
-        let get_query_param = quote! {
-            Query(params): Query<HashMap<String, String>>,
-        };
         let get_block = quote! {
             // #113: named-projection point read (closed set of declared names).
             if let Some(__proj) = params.get("projection") {
@@ -235,14 +236,14 @@ impl ApiGenerator {
                 })));
             }
         };
-        (get_query_param, get_block, list_block)
+        (get_block, list_block)
     }
 
     fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
         let id_type = Self::id_parse_type(model);
         let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
-        let (proj_get_query, proj_get_block, proj_list_block) =
+        let (proj_get_block, proj_list_block) =
             Self::generate_projection_rest(model, &storage_field, &id_type);
         let list_fn = format_ident!("list_{}", Self::to_snake_case(&model.name));
         let get_fn = format_ident!("get_{}", Self::to_snake_case(&model.name));
@@ -271,6 +272,7 @@ impl ApiGenerator {
                     ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
                     ("sort" = Option<String>, Query, description = "Field to sort by"),
                     ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+                    ("as_of" = Option<usize>, Query, description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"),
                 ),
                 responses(
                     (status = 200, description = #list_summary, body = Vec<#model_name>)
@@ -290,12 +292,34 @@ impl ApiGenerator {
                 // Parse the generic query params (sort/order/limit/offset); the
                 // remaining `?field=value` pairs stay in `params` for the filter.
                 let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+                // #85: optional point-in-time read.  `as_of=<watermark>` is an
+                // opaque row-count position (a `usize`, same class as
+                // limit/offset) — present ⇒ read `all_at(&Snapshot::new(w))`
+                // instead of the live `all()`; a non-numeric value is a 400 (never
+                // silently fall back to live — a client asking for a snapshot and
+                // getting live data is a correctness trap).  `as_of` is not a model
+                // field, so the closed-set filter below ignores it.
+                let __as_of: Option<usize> = match params.get("as_of") {
+                    Some(__w) => match __w.parse::<usize>() {
+                        Ok(__n) => Some(__n),
+                        Err(_) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({ "error": "as_of must be a non-negative integer watermark" })),
+                            );
+                        }
+                    },
+                    None => None,
+                };
                 let db = db.read().await;
-                // 1. Live rows, then the closed-set field filter (ignores the
-                //    special sort/limit/offset keys — they are not model fields).
-                let mut rows: Vec<super::#model_name> = db
-                    .#storage_field
-                    .all()
+                // 1. Rows (live newest-version, or as-of the watermark snapshot),
+                //    then the closed-set field filter (ignores the special
+                //    sort/limit/offset/as_of keys — they are not model fields).
+                let __source = match __as_of {
+                    Some(__w) => db.#storage_field.all_at(&forgedb_storage::Snapshot::new(__w)),
+                    None => db.#storage_field.all(),
+                };
+                let mut rows: Vec<super::#model_name> = __source
                     .into_iter()
                     .filter(|r| #filter_fn(r, &params))
                     .collect();
@@ -320,7 +344,8 @@ impl ApiGenerator {
                 path = "/{id}",
                 tag = #model_tag,
                 params(
-                    ("id" = String, Path, description = #model_name_str)
+                    ("id" = String, Path, description = #model_name_str),
+                    ("as_of" = Option<usize>, Query, description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400")
                 ),
                 responses(
                     (status = 200, description = #get_summary, body = #model_name),
@@ -329,16 +354,35 @@ impl ApiGenerator {
             )]
             async fn #get_fn(
                 Path(id): Path<String>,
-                #proj_get_query
+                Query(params): Query<HashMap<String, String>>,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> (StatusCode, Json<serde_json::Value>) {
+                // #113 projection takes precedence (a projected read is live-only);
+                // `?as_of=` below applies to the full-record point read.
                 #proj_get_block
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
                     Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
                 };
+                // #85: optional point-in-time read (see the list handler note).
+                let __as_of: Option<usize> = match params.get("as_of") {
+                    Some(__w) => match __w.parse::<usize>() {
+                        Ok(__n) => Some(__n),
+                        Err(_) => {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({ "error": "as_of must be a non-negative integer watermark" })),
+                            );
+                        }
+                    },
+                    None => None,
+                };
                 let db = db.read().await;
-                match db.#storage_field.get(key) {
+                let __found = match __as_of {
+                    Some(__w) => db.#storage_field.get_at(&forgedb_storage::Snapshot::new(__w), key),
+                    None => db.#storage_field.get(key),
+                };
+                match __found {
                     Some(record) => {
                         let data = serde_json::to_value(&record).unwrap_or(json!(null));
                         (StatusCode::OK, Json(data))
@@ -1145,6 +1189,26 @@ impl ApiGenerator {
                 });
                 (StatusCode::OK, Json(body))
             }
+
+            /// Snapshot token (#85): the current per-model row-count **watermark**
+            /// of every model, captured atomically under one read guard on the
+            /// single writer — a coherent "as of now" instant.  The client freezes
+            /// this map and passes a model's watermark back as `?as_of=<w>` to that
+            /// model's list/get for a point-in-time read.  Read-side peer of
+            /// `/metrics`: opaque `usize` watermarks, a fixed per-schema key set,
+            /// no field/relation/value decoded — so it is wired unauthenticated
+            /// alongside the other ops routes (a process serves one tenant).  These
+            /// watermarks are valid only within a compaction epoch: an in-process
+            /// `compact()` renumbers physical rows, after which an older token is
+            /// no longer comparable (the client must discard pinned tokens on a
+            /// detected reopen).
+            async fn __snapshot(
+                State(db): State<Arc<RwLock<super::Database>>>,
+            ) -> (StatusCode, Json<serde_json::Value>) {
+                let db = db.read().await;
+                let watermarks = json!({ #(#metric_entries)* });
+                (StatusCode::OK, Json(json!({ "watermarks": watermarks })))
+            }
         }
     }
 
@@ -1272,6 +1336,8 @@ impl ApiGenerator {
                     .route("/health", get(__health))
                     .route("/ready", get(__ready))
                     .route("/metrics", get(__metrics))
+                    // Snapshot "as of now" token (#85): per-model watermarks.
+                    .route("/snapshot", get(__snapshot))
             }
 
             /// Create the API router with all endpoints (no auth).  A
