@@ -86,7 +86,24 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 486 tests pass** (workspace, incl. doctests). 455→486 with MVCC Tiers 1–3 (#75/#84 —
+**Baseline: 498 tests pass** (workspace, incl. doctests). 493→498 with #74 Phase 3 (the offline transformer
+bin): +5 `forgedb-codegen` guards (`test_transform_bin_has_no_schema_runtime` / `_replay_is_straightline` /
+`_deps_are_provider_free` / `_embeds_frozen_authored_body` / `test_transform_generation_snapshot`); the two
+deleted `forgedb-migrations` executor workflow tests were replaced in place by
+`test_migration_generate_and_load_roundtrip` + `test_migration_tracker_mark_and_rollback` (net 0 there).
+490→493 with #74 Phase 2 (schema-migrations hop
+classification + lineage): +3 `forgedb-migrations` unit tests (`test_diff_classifies_authored_body_residue`
+— `hop_body_class()` tags each change `Auto`/`Authored`, distinct from `is_breaking()`;
+`test_migration_lineage_expands_range` — `MigrationLineage` orders records + `expand_range` walks a
+contiguous version span; `test_scaffold_authored_body_only_for_residue` — authored-body scaffold written
+only for `Authored` residue, never clobbered). The `test_rust_generation_version_guard` codegen guard was
+extended in place (asserts `EXPECTED_FORMAT_VERSION` is lineage-threaded, not hardcoded). 488→490 with #74
+Phase 1 (schema-migrations version guard): +2 codegen guards (`test_rust_generation_version_guard` —
+generated `open_at` reads one opaque `manifest.format_version`, compares it to a codegen-baked
+`EXPECTED_FORMAT_VERSION`, and fail-fast refuses a mismatch without reading column shape;
+`test_rust_generation_manifest_preserves_format_version` — `write_manifest` load-preserves `format_version`
+on reopen instead of clobbering it to `1`). (The 486→488 drift predated the branch base.) 455→486 with MVCC
+Tiers 1–3 (#75/#84 —
 transactions → optimistic concurrency → multi-process coordinator): two NEW substrate crates
 `forgedb-txn` (Tier 2 commit sequencer, 7 unit tests) + `forgedb-coordinator` (Tier 3 control plane,
 8 unit tests incl. the DirLock-parity guards), storage-native `sync_from_disk`/DirLock-const unit
@@ -440,11 +457,108 @@ across many domains live in `examples/` — see `examples/README.md`.**
     reopen), and **refuses any breaking change** (type change, field/model removal, non-null add, `&unique` add) with
     the dump→reload guidance and a **non-zero exit** (CI-detectable). Wiring only — the `SchemaDiffer` + `is_breaking()`
     already existed; W3 added the AST→`SimpleSchema` converter + snapshot persistence in `src/commands/migrate.rs`.
-    Integration test `test_migrate_auto_diff_additive_and_breaking_gate`.
+    **SUPERSEDED by #74 Phase 4:** the breaking gate no longer refuses — it records + classifies + scaffolds (see
+    the #74 Phase 4 bullet); the integration test was renamed + repurposed to
+    `test_migrate_auto_records_and_scaffolds_authored_hop`.
   - **Breaking-change reload path documented + tested (v1 Phase 4 W4 — #92 LANDED).** `docs/MIGRATIONS.md` documents
     the v1 answer for breaking changes: dump (`all()` → JSON via the generated `Serialize`), regenerate, reload into a
     fresh dir through `Database::create_<model>` with an app-level transform. Proven E2E (`scratchpad/reload_compile`:
     a `u32 → string` type change round-trips, ids preserved). **The data-transform migration engine stays out of v1.**
+- **Schema-migrations version guard (#74 Phase 1 — LANDED 2026-07-15).** The first milestone of the unified
+  regenerate + evolve-data + version-guard workflow (design `docs/proposals/schema-migrations-impl-plan.md`,
+  product-gated ALIGNED-WITH-CONSTRAINTS). Turns a **silent byte mis-decode** of a stale data dir (written under an
+  old schema, opened by regenerated code) into a **fail-fast refusal**. Three pure-codegen changes in
+  `crates/codegen/src/rust.rs`, **no substrate change / no publish gap** (`Manifest.format_version` already
+  published): (1) `write_manifest` (model + junction) load-preserves the on-disk `format_version` on reopen (same
+  pattern as `compaction_epoch`) instead of the old hardcoded `format_version: 1` that would clobber a
+  migration's bump; a fresh dir baselines to `EXPECTED_FORMAT_VERSION`. (2) An opaque per-schema
+  `const EXPECTED_FORMAT_VERSION: u32 = 1` (baseline 1 until the Phase 2 lineage wires the derivation from the
+  migration snapshot — red line #8). (3) `__open_with_lock` runs a guard BEFORE opening any column/WAL file: for
+  every model/junction manifest that exists it loads exactly `format_version` and **panics** on mismatch with
+  guidance pointing at the migration bin — it reads **one opaque integer, never column names/types to self-heal**
+  (red line DV-6: refuse, don't adapt). Guards `test_rust_generation_version_guard` +
+  `test_rust_generation_manifest_preserves_format_version`; E2E (throwaway path-dep crate `scratchpad/vguard`,
+  ephemeral): write at v1 → reopen OK → externally bump manifest to v2 → reopen **refused**.
+- **Schema-migrations hop classification + lineage (#74 Phase 2 — LANDED 2026-07-16).** The `migrate create`-time
+  machinery that freezes each hop's body class and records the serial version lineage — the dev-time inputs the
+  transformer bin (Phase 3) and `EXPECTED_FORMAT_VERSION` (Phase 1) consume. **No substrate change, no publish
+  gap** (all in `crates/migrations/` + the `generate` CLI wiring). Three parts: (1) **Classifier (C8/C9):**
+  `HopBodyClass::{Auto, Authored}` + `SchemaChange::hop_body_class()` — DISTINCT from `is_breaking()`; only the
+  residue the differ cannot prove a value for (`ChangeFieldType`, nullable→NOT-NULL narrowing,
+  required-add-without-default) is `Authored`, while breaking-but-provable changes (drop field/model, `&unique`
+  add) stay `Auto`. (2) **Lineage (`lineage.rs`):** `Migration` gains serial `from_version`/`to_version`
+  (`#[serde(default)]`, checksum-covered); `MigrationLineage::{load, current_format_version, next_version_span,
+  expand_range}` — `expand_range` walks the ordered contiguous hop span a `--from B --to G` transformer replays
+  (refuses a non-contiguous/out-of-range span — C1, never a synthesized jump); `scaffold_authored_body` writes
+  `migrations/{id}/transform.rs` only for `Authored` residue and **never clobbers a frozen body** (C13). (3)
+  **Wiring:** `migrate create --auto` stamps each additive migration `v_n→v_{n+1}`; `EXPECTED_FORMAT_VERSION` is
+  now **lineage-sourced** (red line #8) — the `generate` CLI threads `current_format_version("migrations")` into
+  the new `RustGenerator::generate_with_format_version` (`generate(&schema)` still baselines to 1 so the 72
+  codegen snapshots stay byte-identical). Guards `test_diff_classifies_authored_body_residue` +
+  `test_migration_lineage_expands_range` + `test_scaffold_authored_body_only_for_residue` + extended
+  `test_rust_generation_version_guard`. E2E (`scratchpad/phase2`, ephemeral): baseline →
+  `EXPECTED_FORMAT_VERSION = 1`; add nullable field + `migrate create` → migration JSON records `from_version:1,
+  to_version:2`; regenerate → `EXPECTED_FORMAT_VERSION = 2`. **Deferred:** the offline transformer bin that
+  actually rewrites data + deletes the stubbed/buggy `executor.rs` byte-op surface (Phase 3), and workflow
+  unification + per-tenant sweep (Phase 4). The breaking-change `--auto` path still refuses with the reload
+  guidance in Phase 2 (the gate is unchanged; the scaffolder is a tested library capability the Phase 3 CLI
+  invokes once the transformer can run authored bodies).
+- **Schema-migrations transformer bin — uniform typed replay (#74 Phase 3 — LANDED 2026-07-16).** The offline
+  **transformer bin** that actually rewrites data-at-rest from an old schema version to a new one — the one
+  operator artifact, generated per origin→destination range. **No substrate change, no publish gap** (the
+  mechanism is "generate a per-version `database.rs` per version in the range + a straight-line replay over
+  them"). New generator `crates/codegen/src/transform.rs` (`TransformGenerator`, joining
+  Rust/TS/Api/Stub/OpenApi/Wasm) emits the crate: `Cargo.toml` (**provider-free** — links the app's substrate
+  but NO `forgedb-parser` / `forgedb-migrations`), one `src/vN.rs` per version (each a
+  `RustGenerator::generate_with_format_version(schema, N)` emission, so its open-guard enforces the version
+  interlock — C5/C11), an embedded `src/authored_<id>.rs` per `Authored` hop (**frozen verbatim** — C13), and
+  `src/main.rs` = a **fixed straight-line** chain of named `transform_vN_to_vM` hop fns (**no `Vec<Step>`
+  interpreter, no runtime dispatch** — C2/C8/DV-11). Each hop reads every row via the `vN` typed structs,
+  applies the frozen structural JSON ops (rename / remove / additive-add — field-name keys baked from the
+  diff, **never a schema read at runtime** — C1) then the hop's authored transform, decodes into the `vM`
+  struct, and writes via `vM`'s `insert` (which **preserves the record's id**). Multi-hop ranges replay
+  through intermediate temp dirs and **atomic-rename once at the end** (all-or-nothing; retained source =
+  rollback). Per-version schemas are self-describing: `migrate create` now snapshots each version's full
+  `.forge` under `migrations/schemas/vN.forge`, which the generator loads for its range. The buggy/stubbed
+  `executor.rs` byte-op surface is **DELETED** (its two workflow tests too). CLI: **`forgedb generate transform
+  --from F --to T`**, **`forgedb migrate build --from F --to T`** (generate + `cargo build`), **`forgedb
+  migrate run --src <data> --dest <migrated>`** (run the built bin); the old executor-backed `migrate up`/`down`
+  are removed. Guards (identity trio + more): `test_transform_bin_has_no_schema_runtime` (C1),
+  `test_transform_bin_replay_is_straightline` (C2/C8/DV-11), `test_transform_bin_deps_are_provider_free`
+  (C4/DV-7), `test_transform_bin_embeds_frozen_authored_body` (C13), `test_transform_generation_snapshot`. E2E
+  (`scratchpad/transform_e2e`, ephemeral — **compile-test discipline**): a real 3-version lineage (v1→v2
+  additive `bio: string?` = `AutoBody`; v2→v3 `age` u32→string = `AuthoredBody`) → `generate transform --from 1
+  --to 3` → **the emitted crate compiles** (all 3 version modules + hop code + substrate) → seed 2 v1 users →
+  run the bin → reopen at v3: `age` re-encoded to a string, `bio` additive-defaulted to `None`, ids preserved,
+  **source dir retained**; feeding a v3 dir to the v1-expecting bin is **refused** by the open-guard (the
+  interlock). **All the prior "Deferred to Phase 4" items now LANDED — see the Phase 4 bullet below.**
+  **Honest limit:** the transformer copies id-bearing model rows +
+  M2M junction pairs; non-id value tables are out of scope (as they are for the mutation surface), and awkward
+  serde-repr non-null additive defaults (char(N), timestamp) are best-effort.
+- **Schema-migrations workflow unification + per-tenant sweep (#74 Phase 4 — LANDED 2026-07-16). The #74 epic
+  is now COMPLETE.** The one-CLI operator lifecycle over the Phase 3 transformer. **No substrate change, no
+  publish gap** (all in `src/commands/migrate.rs` + the migrate CLI + docs). Three parts: (1) **`migrate create
+  --auto` breaking gate FLIPPED.** It no longer refuses breaking changes with reload guidance — every non-empty
+  diff is recorded as a versioned hop and classified `Auto`/`Authored` (`SchemaChange::hop_body_class()`);
+  `Authored` residue (type change / nullable→NOT-NULL / required-add-without-default) is scaffolded at
+  `migrations/{id}/transform.rs` via `scaffold_authored_body` (never clobbers a frozen body). Purely-additive
+  keeps the cheap reopen-backfill fast path (prints the backfill advice); anything that rewrites data-at-rest
+  prints the `migrate up` next steps. (2) **`forgedb migrate up`** — the one-CLI lifecycle: resolves the range
+  (`--from` defaults to the version read from the source dir's `<model>/manifest.json`, `--to` to
+  `MigrationLineage::current_format_version()`), builds the transformer once (`compile_transformer`), and runs
+  it (`run_transformer`) over `--src`/`--dest` **or** every data dir under `--tenant-root` (rolling per-tenant
+  sweep → `<root>/<t>-migrated-v<to>`; a failed/wrong-version tenant is reported + skipped, source unchanged,
+  non-zero exit if any failed). The lower-level `migrate build` / `migrate run` / `generate transform` stay as
+  primitives (both share `compile_transformer`/`run_transformer`). (3) **Docs:** `docs/MIGRATIONS.md` rewritten
+  around the single lifecycle (retired the stale "no engine / dump→reload / `migrate up --steps`" framing); the
+  `forgedb-migrations` module doc de-references the deleted `MigrationExecutor`. Guard: the #92-W3 integration
+  test was renamed + repurposed in place `test_migrate_auto_diff_additive_and_breaking_gate` →
+  **`test_migrate_auto_records_and_scaffolds_authored_hop`** (asserts additive succeeds with backfill advice,
+  a `u32→string` type change is now RECORDED + `[authored]`-marked + scaffolded + prints `migrate up`, and the
+  authored `transform.rs` stub is written — net-0 test count, still 498). **Deferred (documented in
+  `MIGRATIONS.md`):** `compaction_epoch` verification before apply (C11 — the format-version guard is the
+  interlock today); `@default` on additive backfill; cheap in-place byte-op hops; online (live-writer)
+  migration.
 
   Phases 1–4 of the v1 spine are now LANDED (Phase 4 W1's `forgedb-compaction 0.1.0` published + reclose proven).
   **Phase 5 (#93 — ship) is COMPLETE: all six workstreams landed — WS1 (observability), WS2 (deploy),

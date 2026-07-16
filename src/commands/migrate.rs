@@ -1,7 +1,7 @@
 use crate::{error::CliError, ui, Result};
 use colored::Colorize;
-use forgedb_migrations::{MigrationExecutor, MigrationGenerator, MigrationTracker, SchemaChange};
-use std::path::PathBuf;
+use forgedb_migrations::{HopBodyClass, MigrationGenerator, MigrationTracker, SchemaChange};
+use std::path::{Path, PathBuf};
 
 // Helper to convert String errors to CliError
 fn map_err(e: String) -> CliError {
@@ -16,12 +16,18 @@ pub struct MigrateCreateOptions {
 
 pub struct MigrateStatusOptions;
 
-pub struct MigrateUpOptions {
-    pub steps: Option<usize>,
+pub struct MigrateBuildOptions {
+    pub from: u32,
+    pub to: u32,
+    /// Where to emit + build the transformer crate (default `migrations/transform`).
+    pub output: Option<PathBuf>,
 }
 
-pub struct MigrateDownOptions {
-    pub steps: Option<usize>,
+pub struct MigrateRunOptions {
+    pub src: PathBuf,
+    pub dest: PathBuf,
+    /// The transformer crate dir (default `migrations/transform`).
+    pub bin_dir: Option<PathBuf>,
 }
 
 /// Create a new migration
@@ -30,11 +36,14 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
 
     if opts.auto {
         // Auto-detect changes by diffing the current schema against the recorded
-        // snapshot.  v1 Phase 4 (#92) scope: **additive changes only** are
-        // auto-applied (new models, new nullable fields — existing rows are
-        // backfilled on reopen by generated code).  Any breaking change is refused
-        // here with the dump→regenerate→reload guidance (no data-transform engine
-        // ships in v1).
+        // snapshot.  Since #74 Phase 4 the gate no longer REFUSES breaking changes:
+        // every non-empty diff is recorded as a versioned hop (`from -> to`), and
+        // any residue the differ cannot prove a value for (a type change, a
+        // nullable→NOT-NULL narrowing, a required-add-without-default) is
+        // classified `Authored` and gets a `migrations/{id}/transform.rs` scaffold
+        // the operator fills in.  Purely-additive changes still get the cheap
+        // reopen-backfill fast path; anything that rewrites data-at-rest routes
+        // through the offline transformer (`forgedb migrate up`).
         let schema_path = opts.schema.clone().unwrap_or_else(|| PathBuf::from("schema.forge"));
         ui::info(&format!(
             "Auto-detecting schema changes ({})...",
@@ -53,45 +62,105 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
 
         if changes.is_empty() {
             // First run records a baseline snapshot with no prior schema to diff.
+            // Also record the full-schema snapshot for the CURRENT format version
+            // (the baseline is v1 for a fresh lineage) so the transformer (#74
+            // Phase 3) has every version's `.forge` in its range.
             save_schema_snapshot(&migrations_dir, &new_src)?;
+            let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
+                .map_err(map_err)?;
+            forgedb_migrations::save_versioned_schema(
+                &migrations_dir,
+                lineage.current_format_version(),
+                &new_src,
+            )
+            .map_err(map_err)?;
             ui::success("No schema changes detected (snapshot up to date)");
             return Ok(());
         }
 
-        // Split into breaking vs additive.  A breaking change means we STOP — v1
-        // has no data-transform engine, so the answer is the reload path.
-        let breaking: Vec<_> = changes.iter().filter(|c| c.is_breaking()).collect();
-        if !breaking.is_empty() {
-            ui::warning("\n⚠️  Breaking schema changes detected — auto-migration refused");
-            println!("\nBreaking changes:");
-            for change in &breaking {
-                println!("  • {}", change.description().red());
-            }
-            print_reload_guidance();
-            return Err(CliError::Migration(
-                "breaking schema changes require the dump → regenerate → reload path \
-                 (see guidance above); v1 ships no data-transform migration engine"
-                    .to_string(),
-            ));
-        }
+        // Classify the diff.  `Authored` residue is the semantic mapping the differ
+        // cannot synthesize; a "breaking" change may still be fully `Auto` (drop a
+        // field/model, add `&unique`) — the row transform is provable, uniqueness
+        // is *validated* during replay.  The two classifications are independent.
+        let authored: Vec<_> = changes
+            .iter()
+            .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
+            .collect();
+        let has_breaking = changes.iter().any(|c| c.is_breaking());
+        let authored_count = authored.len();
 
-        // Purely additive — safe to record.
-        ui::info(&format!("Detected {} additive change(s)", changes.len()));
+        ui::info(&format!("Detected {} change(s)", changes.len()));
         for change in &changes {
-            println!("  • {}", change.description());
+            let marker = if change.hop_body_class() == HopBodyClass::Authored {
+                " [authored]".yellow()
+            } else {
+                "".normal()
+            };
+            println!("  • {}{}", change.description(), marker);
         }
 
-        let migration =
-            MigrationGenerator::generate(migrations_dir, opts.description, changes.clone())
-                .map_err(map_err)?;
-        save_schema_snapshot(&PathBuf::from("migrations"), &new_src)?;
-        ui::success(&format!("Created migration: {}", migration.filename()));
+        // Assign the serial version interlock (#74 Phase 2) from the committed
+        // lineage: this migration bumps the on-disk format version by one, so a
+        // regenerated app expects the new version and refuses a not-yet-migrated
+        // data dir (the Phase 1 open guard).  `EXPECTED_FORMAT_VERSION` is derived
+        // from this lineage at `generate` time — never hand-edited (red line #8).
+        let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
+            .map_err(map_err)?;
+        let (from_version, to_version) = lineage.next_version_span();
 
+        let migration = MigrationGenerator::generate_versioned(
+            &migrations_dir,
+            opts.description,
+            changes.clone(),
+            from_version,
+            to_version,
+        )
+        .map_err(map_err)?;
+        save_schema_snapshot(&migrations_dir, &new_src)?;
+        // Record the destination version's full-schema snapshot so the transformer
+        // (#74 Phase 3) can emit this version's typed structs for the range.
+        forgedb_migrations::save_versioned_schema(&migrations_dir, to_version, &new_src)
+            .map_err(map_err)?;
+
+        // Scaffold an authored-transform stub for any `Authored` residue (#74 Phase
+        // 2/4).  Never clobbers a frozen body — an existing `transform.rs` is left
+        // untouched.
+        let scaffold = forgedb_migrations::scaffold_authored_body(&migrations_dir, &migration)
+            .map_err(map_err)?;
+
+        ui::success(&format!(
+            "Created migration: {} (format v{} → v{})",
+            migration.filename(),
+            from_version,
+            to_version
+        ));
         println!("\n{}", MigrationGenerator::generate_report(&migration));
-        ui::info(
-            "Additive change: run `forgedb generate` and restart your app — existing \
-             rows are backfilled with defaults on reopen (no data step needed).",
-        );
+
+        // A change needs the offline transformer when it rewrites data-at-rest:
+        // any `Authored` residue, or any breaking-but-`Auto` change (drop/unique).
+        // A purely-additive diff keeps the cheap reopen-backfill path.
+        let needs_transform = has_breaking || authored_count > 0;
+        if !needs_transform {
+            ui::info(
+                "Additive change: run `forgedb generate` and restart your app — existing \
+                 rows are backfilled with defaults on reopen (no data step needed).",
+            );
+        } else {
+            if let Some((path, created)) = &scaffold {
+                if *created {
+                    ui::warning(&format!(
+                        "Authored transform scaffolded at {} — fill in every TODO before building.",
+                        path.display()
+                    ));
+                } else {
+                    ui::info(&format!(
+                        "Authored transform already present at {} (left unchanged).",
+                        path.display()
+                    ));
+                }
+            }
+            print_migration_next_steps(from_version, to_version, authored_count > 0);
+        }
     } else {
         // Manual migration - create empty template
         ui::warning("Manual migration mode - you'll need to edit the migration file manually");
@@ -178,128 +247,561 @@ pub fn status(_opts: MigrateStatusOptions) -> Result<()> {
     Ok(())
 }
 
-/// Run pending migrations
-pub fn up(opts: MigrateUpOptions) -> Result<()> {
+/// Generate + compile the offline transformer bin for a version range (#74 Phase
+/// 3).  One operator artifact that migrates a data dir from `--from` to `--to`.
+pub fn build(opts: MigrateBuildOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
-    let data_dir = PathBuf::from("data");
+    let output = opts
+        .output
+        .unwrap_or_else(|| migrations_dir.join("transform"));
 
-    // Load all migrations
-    let all_migrations =
-        MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
-
-    if all_migrations.is_empty() {
-        ui::info("No migrations found");
-        return Ok(());
-    }
-
-    // Load tracker
-    let mut tracker = MigrationTracker::new(&migrations_dir).map_err(map_err)?;
-
-    // Get pending migrations
-    let migration_ids: Vec<_> = all_migrations.iter().map(|m| m.id.clone()).collect();
-    let pending = tracker.pending_migrations(&migration_ids);
-
-    if pending.is_empty() {
-        ui::success("All migrations are up to date");
-        return Ok(());
-    }
-
-    // Determine how many to run
-    let to_run = if let Some(steps) = opts.steps {
-        pending.iter().take(steps).cloned().collect::<Vec<_>>()
-    } else {
-        pending
-    };
-
-    ui::info(&format!("Running {} migration(s)...", to_run.len()));
-
-    for migration_id in to_run {
-        let migration = all_migrations
-            .iter()
-            .find(|m| m.id == migration_id)
-            .ok_or_else(|| anyhow::anyhow!("Migration {} not found", migration_id))?;
-
-        println!("\n{} {}", "→".cyan(), migration.description.bold());
-
-        // Check for breaking changes
-        if migration.has_breaking_changes() {
-            ui::warning("This migration contains breaking changes!");
-
-            // In interactive mode, we'd ask for confirmation here
-            println!("Breaking changes:");
-            for change in migration.breaking_changes() {
-                println!("  • {}", change.description().yellow());
-            }
-        }
-
-        // Execute migration
-        MigrationExecutor::execute_up(migration, &data_dir).map_err(map_err)?;
-
-        // Mark as applied
-        tracker
-            .mark_applied(migration.id.clone(), migration.checksum.clone())
-            .map_err(map_err)?;
-
-        ui::success(&format!("Applied migration {}", migration.id));
-    }
-
-    ui::success("\n✓ All migrations completed successfully");
-
+    let bin = compile_transformer(opts.from, opts.to, &output)?;
+    ui::success(&format!("Built transformer: {}", bin.display()));
+    ui::info(&format!(
+        "Run it with the app STOPPED: `forgedb migrate up --from {} --to {} --src <data> --dest <migrated>` \
+         (or directly: `{} <src> <dest>`)",
+        opts.from,
+        opts.to,
+        bin.display()
+    ));
     Ok(())
 }
 
-/// Rollback migrations
-pub fn down(opts: MigrateDownOptions) -> Result<()> {
+/// Emit + `cargo build --release` the transformer crate for a version range,
+/// returning the built binary's path (#74 Phase 3/4).  Shared by `migrate build`
+/// and `migrate up`.
+fn compile_transformer(from: u32, to: u32, output: &Path) -> Result<PathBuf> {
+    ui::info(&format!(
+        "Generating transformer for format v{from} → v{to} into {}",
+        output.display()
+    ));
+    emit_transform(from, to, output, true)?;
+
+    ui::info("Compiling the transformer (cargo build --release)...");
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(output)
+        .status()
+        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
+    if !status.success() {
+        return Err(CliError::Migration(
+            "transformer build failed (see cargo output above)".to_string(),
+        ));
+    }
+    Ok(output.join("target/release/forgedb-transform"))
+}
+
+/// Run a built transformer bin over a single `src → dest` data dir (#74 Phase
+/// 3/4).  The bin writes `dest` atomically and leaves `src` untouched (rollback).
+fn run_transformer(bin: &Path, src: &Path, dest: &Path) -> Result<()> {
+    let status = std::process::Command::new(bin)
+        .arg(src)
+        .arg(dest)
+        .status()
+        .map_err(|e| CliError::Migration(format!("failed to run transformer: {e}")))?;
+    if !status.success() {
+        return Err(CliError::Migration(
+            "transformer exited non-zero (see output above); the source dir is unchanged"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Run a previously-built transformer bin over a src→dest data dir (#74 Phase 3).
+/// The app must be stopped (offline, exclusive-writer migration — C12).
+pub fn run(opts: MigrateRunOptions) -> Result<()> {
+    let bin_dir = opts
+        .bin_dir
+        .unwrap_or_else(|| PathBuf::from("migrations/transform"));
+    let bin = bin_dir.join("target/release/forgedb-transform");
+    if !bin.exists() {
+        return Err(CliError::Migration(format!(
+            "transformer bin not found at {} — run `forgedb migrate build --from <F> --to <T>` first",
+            bin.display()
+        )));
+    }
+
+    ui::info(&format!(
+        "Migrating {} → {} via {}",
+        opts.src.display(),
+        opts.dest.display(),
+        bin.display()
+    ));
+    run_transformer(&bin, &opts.src, &opts.dest)?;
+    ui::success("Migration complete — point the regenerated app at the destination dir");
+    Ok(())
+}
+
+/// Options for the one-CLI `migrate up` orchestration (#74 Phase 4).
+pub struct MigrateUpOptions {
+    /// Origin format version.  Defaults to the version detected from the source
+    /// data dir's manifests.
+    pub from: Option<u32>,
+    /// Destination format version.  Defaults to the lineage's current version.
+    pub to: Option<u32>,
+    /// Source data directory (single-dir mode).
+    pub src: Option<PathBuf>,
+    /// Destination directory to materialize (single-dir mode).
+    pub dest: Option<PathBuf>,
+    /// Transformer crate dir (default `migrations/transform`).
+    pub output: Option<PathBuf>,
+    /// Per-tenant sweep: migrate every data dir directly under this root.
+    pub tenant_root: Option<PathBuf>,
+    /// Destination-name suffix for the per-tenant sweep (default
+    /// `-migrated-v<to>`): tenant `t`'s output is `<root>/t<suffix>`.
+    pub dest_suffix: Option<String>,
+}
+
+/// One-CLI migration lifecycle (#74 Phase 4): generate + `cargo build` the
+/// transformer for the resolved version range, then run it over one data dir
+/// (`--src`/`--dest`) or every tenant dir under `--tenant-root` (a rolling,
+/// independent sweep — a failed tenant is reported and skipped, its source
+/// unchanged).  The app must be STOPPED (offline, exclusive-writer — C12).
+pub fn up(opts: MigrateUpOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
-    let data_dir = PathBuf::from("data");
+    let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+    let to = opts.to.unwrap_or_else(|| lineage.current_format_version());
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| migrations_dir.join("transform"));
 
-    // Load tracker
-    let mut tracker = MigrationTracker::new(&migrations_dir).map_err(map_err)?;
+    // Enumerate the (src, dest) jobs: a per-tenant sweep, or a single dir.
+    let jobs: Vec<(PathBuf, PathBuf)> = if let Some(root) = &opts.tenant_root {
+        collect_tenant_jobs(root, to, opts.dest_suffix.as_deref())?
+    } else {
+        let src = opts.src.clone().ok_or_else(|| {
+            CliError::Migration(
+                "`migrate up` needs --src and --dest (or --tenant-root for a per-tenant sweep)"
+                    .to_string(),
+            )
+        })?;
+        let dest = opts
+            .dest
+            .clone()
+            .ok_or_else(|| CliError::Migration("`migrate up` needs --dest".to_string()))?;
+        vec![(src, dest)]
+    };
 
-    let applied = tracker.applied_migrations();
+    // Resolve the origin version once: explicit --from, else detect it from the
+    // first job's source manifests.  A tenant at a different version is refused by
+    // the built bin's open-guard (counted as a per-tenant failure, sweep continues).
+    let from = match opts.from {
+        Some(f) => f,
+        None => {
+            let first = &jobs[0].0;
+            detect_src_format_version(first)?.ok_or_else(|| {
+                CliError::Migration(format!(
+                    "could not detect the source format version of {} — pass --from explicitly",
+                    first.display()
+                ))
+            })?
+        }
+    };
 
-    if applied.is_empty() {
-        ui::info("No migrations to roll back");
+    if from == to {
+        ui::success(&format!(
+            "Data is already at format v{to} — nothing to migrate."
+        ));
         return Ok(());
     }
-
-    // Determine how many to roll back
-    let steps = opts.steps.unwrap_or(1);
-
-    ui::warning(&format!("Rolling back {} migration(s)...", steps));
-
-    // Load all migrations
-    let all_migrations =
-        MigrationGenerator::load_all_migrations(&migrations_dir).map_err(map_err)?;
-
-    for _ in 0..steps {
-        let last_record = tracker.last_migration();
-
-        if last_record.is_none() {
-            ui::info("No more migrations to roll back");
-            break;
-        }
-
-        let record = last_record.unwrap();
-        let migration = all_migrations
-            .iter()
-            .find(|m| m.id == record.migration_id)
-            .ok_or_else(|| anyhow::anyhow!("Migration {} not found", record.migration_id))?;
-
-        println!("\n{} {}", "←".yellow(), migration.description.bold());
-
-        // Execute rollback
-        MigrationExecutor::execute_down(migration, &data_dir).map_err(map_err)?;
-
-        // Mark as rolled back
-        tracker.mark_rolled_back().map_err(map_err)?;
-
-        ui::success(&format!("Rolled back migration {}", migration.id));
+    if to < from {
+        return Err(CliError::Migration(format!(
+            "refusing to migrate backwards: source is at v{from}, target is v{to} \
+             (the transformer only replays forward)"
+        )));
     }
 
-    ui::success("\n✓ Rollback completed successfully");
+    ui::info(&format!(
+        "Migrating {} data dir(s): format v{from} → v{to}",
+        jobs.len()
+    ));
 
+    // Build the transformer once for the whole range, then run it per job.
+    let bin = compile_transformer(from, to, &output)?;
+
+    let mut failures = Vec::new();
+    for (src, dest) in &jobs {
+        ui::info(&format!("→ {} ⇒ {}", src.display(), dest.display()));
+        match run_transformer(&bin, src, dest) {
+            Ok(()) => ui::success(&format!("  migrated {}", dest.display())),
+            Err(e) => {
+                ui::error(&format!("  FAILED {}: {}", src.display(), e));
+                failures.push(src.clone());
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(CliError::Migration(format!(
+            "{} of {} data dir(s) failed to migrate (their originals are unchanged): {}",
+            failures.len(),
+            jobs.len(),
+            failures
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    ui::success(&format!(
+        "Migration complete ({} dir(s)) — regenerate your app and point it at the destination(s).",
+        jobs.len()
+    ));
     Ok(())
+}
+
+/// Enumerate the per-tenant sweep jobs under `root` (#74 Phase 4): one
+/// `(src, dest)` per immediate subdirectory that looks like a data dir (has a
+/// `<model>/manifest.json`), skipping any dir already named like a migration
+/// output.  `dest` is `<root>/<tenant><suffix>`.
+fn collect_tenant_jobs(
+    root: &Path,
+    to: u32,
+    dest_suffix: Option<&str>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let suffix = dest_suffix
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("-migrated-v{to}"));
+
+    let mut jobs = Vec::new();
+    let entries = std::fs::read_dir(root).map_err(|e| {
+        CliError::Migration(format!(
+            "failed to read tenant root {}: {}",
+            root.display(),
+            e
+        ))
+    })?;
+    for entry in entries {
+        let path = entry.map_err(|e| CliError::Migration(e.to_string()))?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        // Skip outputs of a prior sweep.
+        if name.ends_with(&suffix) {
+            continue;
+        }
+        // Only sweep dirs that actually hold data (a model manifest).
+        if detect_src_format_version(&path)?.is_none() {
+            continue;
+        }
+        jobs.push((path, root.join(format!("{name}{suffix}"))));
+    }
+    jobs.sort();
+    if jobs.is_empty() {
+        return Err(CliError::Migration(format!(
+            "no tenant data dirs found under {} (a data dir has a <model>/manifest.json)",
+            root.display()
+        )));
+    }
+    Ok(jobs)
+}
+
+/// Detect the on-disk `format_version` of a data directory by reading the first
+/// `<model>/manifest.json` under it (#74 Phase 4).  Every model/junction manifest
+/// in a consistent dir carries the same version (the app open-guard enforces it),
+/// so the first one found is authoritative.  `None` when the dir holds no manifest
+/// (not a data dir, or empty).
+fn detect_src_format_version(data_dir: &Path) -> Result<Option<u32>> {
+    if !data_dir.is_dir() {
+        return Ok(None);
+    }
+    let entries = std::fs::read_dir(data_dir)
+        .map_err(|e| CliError::Migration(format!("failed to read {}: {}", data_dir.display(), e)))?;
+    for entry in entries {
+        let manifest = entry
+            .map_err(|e| CliError::Migration(e.to_string()))?
+            .path()
+            .join("manifest.json");
+        if manifest.is_file() {
+            let txt = std::fs::read_to_string(&manifest).map_err(|e| {
+                CliError::Migration(format!("failed to read {}: {}", manifest.display(), e))
+            })?;
+            if let Some(fv) = serde_json::from_str::<serde_json::Value>(&txt)
+                .ok()
+                .and_then(|v| v.get("format_version").and_then(|x| x.as_u64()))
+            {
+                return Ok(Some(fv as u32));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Generate the transformer crate for a version range into `output` (#74 Phase 3).
+/// Shared by `migrate build` and `generate transform`.  Loads the committed
+/// lineage, expands the contiguous range (C1), parses each version's committed
+/// full schema, builds the frozen per-hop plan, and emits the crate.
+pub fn emit_transform(from: u32, to: u32, output: &Path, force: bool) -> Result<()> {
+    use forgedb_codegen::{HopPlan, TransformGenerator, TransformPlan, VersionSchema};
+    use forgedb_migrations::MigrationLineage;
+
+    let migrations_dir = PathBuf::from("migrations");
+    let lineage = MigrationLineage::load(&migrations_dir).map_err(map_err)?;
+    let hop_migrations = lineage.expand_range(from, to).map_err(map_err)?;
+    if hop_migrations.is_empty() {
+        return Err(CliError::Migration(format!(
+            "empty migration range (v{from} → v{to}): nothing to transform"
+        )));
+    }
+
+    // Parse each version's committed full schema (from..=to).  These own the
+    // parsed ASTs the plan borrows, so they must outlive the plan.
+    let mut parsed: Vec<(u32, forgedb_parser::Schema)> = Vec::new();
+    for v in from..=to {
+        let src = forgedb_migrations::load_versioned_schema(&migrations_dir, v).map_err(map_err)?;
+        let schema = forgedb_parser::Parser::new(&src)
+            .and_then(|mut p| p.parse())
+            .map_err(|e| {
+                CliError::Migration(format!("failed to parse committed schema v{v}: {e}"))
+            })?;
+        parsed.push((v, schema));
+    }
+
+    // Build one frozen hop plan per recorded migration in the range.
+    let mut hops = Vec::new();
+    for m in &hop_migrations {
+        let dest_schema = &parsed
+            .iter()
+            .find(|(v, _)| *v == m.to_version)
+            .expect("range parsed every version")
+            .1;
+        let model_ops = build_model_ops(&m.changes, dest_schema);
+        let authored_src = if m.authored_changes().is_empty() {
+            None
+        } else {
+            let p = forgedb_migrations::authored_body_path(&migrations_dir, &m.id);
+            Some(std::fs::read_to_string(&p).map_err(|e| {
+                CliError::Migration(format!(
+                    "migration {} has authored residue but its transform {:?} is missing: {}. \
+                     Author the body (see the scaffold `forgedb migrate create` wrote), then rebuild.",
+                    m.id, p, e
+                ))
+            })?)
+        };
+        hops.push(HopPlan {
+            from_version: m.from_version,
+            to_version: m.to_version,
+            migration_id: m.id.clone(),
+            model_ops,
+            authored_src,
+        });
+    }
+
+    let versions: Vec<VersionSchema> = parsed
+        .iter()
+        .map(|(v, s)| VersionSchema {
+            version: *v,
+            schema: s,
+        })
+        .collect();
+    let plan = TransformPlan { versions, hops };
+
+    let crate_out = TransformGenerator::generate(&plan, "forgedb-transform")
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+
+    // Write the crate.  `Cargo.toml` is a user-editable scaffold (only-if-absent);
+    // the `src/*.rs` are always (re)written.
+    std::fs::create_dir_all(output)?;
+    let cargo_path = output.join("Cargo.toml");
+    if !cargo_path.exists() {
+        std::fs::write(&cargo_path, &crate_out.cargo_toml)?;
+    }
+    for (rel, content) in &crate_out.sources {
+        let path = output.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if path.exists() && !force {
+            return Err(CliError::Other(format!(
+                "File exists: {}. Use --force to overwrite",
+                path.display()
+            )));
+        }
+        std::fs::write(&path, content)?;
+    }
+
+    ui::success(&format!(
+        "Generated transformer crate ({} source files) at {}",
+        crate_out.sources.len(),
+        output.display()
+    ));
+    Ok(())
+}
+
+/// Build the frozen per-model structural ops for one hop from its recorded schema
+/// changes + the destination schema's field types (#74 Phase 3).  Only the
+/// provable structural ops (rename / remove / additive add) are emitted here;
+/// semantic residue is carried by the hop's embedded authored transform.
+fn build_model_ops(
+    changes: &[SchemaChange],
+    dest_schema: &forgedb_parser::Schema,
+) -> Vec<forgedb_codegen::ModelOp> {
+    use std::collections::BTreeMap;
+
+    // Accumulate ops per destination model name.
+    #[derive(Default)]
+    struct Acc {
+        source_model: Option<String>,
+        renames: Vec<(String, String)>,
+        removes: Vec<String>,
+        adds: Vec<(String, String)>,
+    }
+    let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
+
+    for change in changes {
+        match change {
+            SchemaChange::RenameModel { old_name, new_name } => {
+                // Copy from the old collection into the renamed one.
+                acc.entry(new_name.clone()).or_default().source_model = Some(old_name.clone());
+            }
+            SchemaChange::RenameField {
+                model_name,
+                old_name,
+                new_name,
+            } => {
+                acc.entry(model_name.clone())
+                    .or_default()
+                    .renames
+                    .push((old_name.clone(), new_name.clone()));
+            }
+            SchemaChange::RemoveField {
+                model_name,
+                field_name,
+            } => {
+                acc.entry(model_name.clone())
+                    .or_default()
+                    .removes
+                    .push(field_name.clone());
+            }
+            SchemaChange::AddField {
+                model_name,
+                field_name,
+                nullable,
+                default_value,
+                ..
+            } => {
+                let json = add_field_default_json(
+                    dest_schema,
+                    model_name,
+                    field_name,
+                    *nullable,
+                    default_value.as_deref(),
+                );
+                acc.entry(model_name.clone())
+                    .or_default()
+                    .adds
+                    .push((field_name.clone(), json));
+            }
+            // Structural no-ops for the row body (index/constraint/type changes):
+            // index & constraint changes leave the row bytes identical; a type
+            // change / nullable-narrowing is Authored residue carried separately.
+            _ => {}
+        }
+    }
+
+    acc.into_iter()
+        .map(|(model, a)| forgedb_codegen::ModelOp {
+            source_model: a.source_model.unwrap_or_else(|| model.clone()),
+            model,
+            field_renames: a.renames,
+            field_removes: a.removes,
+            field_adds: a.adds,
+        })
+        .collect()
+}
+
+/// Compute the JSON default literal for an additive field, resolving the field's
+/// real type from the destination schema (#74 Phase 3).  A nullable add with no
+/// default is `null`; a defaulted add is encoded to match the field's serde
+/// representation (numbers for numeric types, quoted strings for string-repr
+/// types like `string`/`uuid`/`decimal`/enum).
+fn add_field_default_json(
+    dest_schema: &forgedb_parser::Schema,
+    model_name: &str,
+    field_name: &str,
+    nullable: bool,
+    default_value: Option<&str>,
+) -> String {
+    use forgedb_parser::FieldType;
+
+    // Resolve the (non-nullable) base type of the field from the dest schema.
+    fn base(ft: &FieldType) -> &FieldType {
+        match ft {
+            FieldType::Nullable(inner) => base(inner),
+            other => other,
+        }
+    }
+    let ftype = dest_schema
+        .models
+        .iter()
+        .find(|m| m.name == model_name)
+        .and_then(|m| m.fields.iter().find(|f| f.name == field_name))
+        .map(|f| base(&f.field_type));
+
+    let quote_str = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+
+    match default_value {
+        None => {
+            if nullable {
+                return "null".to_string();
+            }
+            // Non-null add with no default is Authored residue, not Auto — but be
+            // defensive: emit a type-zero so a mis-tagged hop still compiles.
+            match ftype {
+                Some(FieldType::Bool) => "false".to_string(),
+                Some(FieldType::F64) => "0.0".to_string(),
+                Some(
+                    FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
+                    | FieldType::Timestamp,
+                ) => "0".to_string(),
+                Some(FieldType::String | FieldType::Char(_)) => "\"\"".to_string(),
+                _ => "null".to_string(),
+            }
+        }
+        Some(d) => match ftype {
+            Some(FieldType::Bool) => {
+                if d == "true" || d == "false" {
+                    d.to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            Some(FieldType::F64) => {
+                if d.parse::<f64>().is_ok() {
+                    d.to_string()
+                } else {
+                    "0.0".to_string()
+                }
+            }
+            Some(
+                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
+                | FieldType::Timestamp,
+            ) => {
+                if d.parse::<i64>().is_ok() {
+                    d.to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            Some(FieldType::Json) => {
+                // A raw JSON default is used verbatim; otherwise quote it.
+                if serde_json::from_str::<serde_json::Value>(d).is_ok() {
+                    d.to_string()
+                } else {
+                    quote_str(d)
+                }
+            }
+            // string / uuid / decimal / enum: string serde repr → quote.
+            _ => quote_str(d),
+        },
+    }
 }
 
 /// Path of the recorded schema snapshot (the last schema a migration was created
@@ -370,13 +872,27 @@ fn to_simple_schema(schema: &forgedb_parser::Schema) -> forgedb_migrations::Simp
     forgedb_migrations::SimpleSchema { models }
 }
 
-/// Print the v1 answer for breaking schema changes: dump → regenerate → reload.
-fn print_reload_guidance() {
-    println!("\n{}", "The v1 path for breaking changes (no data-transform engine ships in v1):".bold());
-    println!("  1. Export data with the CURRENT binary (before changing the schema).");
-    println!("  2. Edit the schema and run `forgedb generate` to regenerate the code.");
-    println!("  3. Re-import the exported data into the freshly-generated database.");
-    println!("  See docs/MIGRATIONS.md for the worked reload procedure.");
+/// Print the offline data-migration next steps for a recorded hop that rewrites
+/// data-at-rest (#74 Phase 4).  `has_authored` toggles the "author the body" step.
+fn print_migration_next_steps(from: u32, to: u32, has_authored: bool) {
+    println!("\n{}", "Next steps (offline data migration):".bold());
+    let mut step = 1;
+    if has_authored {
+        println!(
+            "  {step}. Author the transform body in migrations/<id>/transform.rs \
+             (fill in each TODO)."
+        );
+        step += 1;
+    }
+    println!("  {step}. Regenerate your app:  forgedb generate");
+    step += 1;
+    println!(
+        "  {step}. Migrate the data with the app STOPPED:\n         \
+         forgedb migrate up --from {from} --to {to} --src <data-dir> --dest <migrated-dir>"
+    );
+    step += 1;
+    println!("  {step}. Point the regenerated app at <migrated-dir>.");
+    println!("  See docs/MIGRATIONS.md for the full lifecycle.");
 }
 
 /// Detect schema changes by diffing the new schema source against the recorded

@@ -1,6 +1,16 @@
 # forgedb-migrations
 
-Schema migration system for ForgeDB with automated diffing, generation, execution, and tracking.
+Schema migration system for ForgeDB with automated diffing, generation, and tracking.
+
+> **Note (#74, complete):** the in-crate `MigrationExecutor` (the old direct-column byte-op
+> path) has been **removed**. This crate is the **dev-time** half only — it records and
+> classifies the version lineage (`SchemaDiffer` → `MigrationGenerator` → `MigrationLineage`).
+> Applying a migration to data-at-rest is the job of the offline, per-version-range
+> **transformer bin** that `forgedb-codegen`'s `TransformGenerator` emits, driven end-to-end
+> by **`forgedb migrate up`** (`create --auto` → author any `transform.rs` → `up`).
+> **The canonical operator guide is [`docs/MIGRATIONS.md`](../../docs/MIGRATIONS.md).** Any
+> `MigrationExecutor::execute_up`/`execute_down` snippets remaining below are stale — ignore
+> them in favor of that guide.
 
 ## Overview
 
@@ -9,13 +19,16 @@ Schema migration system for ForgeDB with automated diffing, generation, executio
 ## Features
 
 - **Schema diffing algorithm** - Automatically detect changes between schema versions
-- **Migration generation** - Create timestamped migration files with checksums
-- **Migration execution** - Apply or rollback migrations with proper ordering
+- **Migration generation** - Create timestamped, versioned (`from -> to`) migration records
+- **Hop classification** - Tag each change `Auto` (differ-provable) or `Authored` (needs a body)
+- **Lineage** - Order the serial version chain + expand a `--from`/`--to` range for the transformer
 - **Migration tracking** - Persistent state tracking of applied migrations
 - **Breaking change detection** - Automatic identification of potentially dangerous operations
 - **Checksum verification** - Ensure migration file integrity
-- **Rollback support** - Undo applied migrations (where possible)
 - **Detailed reporting** - Human-readable descriptions of all changes
+
+> Data-at-rest is rewritten by the generated transformer bin, not this crate — see the note
+> above and [`docs/MIGRATIONS.md`](../../docs/MIGRATIONS.md).
 
 ## Installation
 

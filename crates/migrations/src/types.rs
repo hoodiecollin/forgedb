@@ -89,7 +89,89 @@ pub enum SchemaChange {
     },
 }
 
+/// How the transformer generator (#74 Phase 3) will produce the new-row body for
+/// a single schema change ("hop"), decided ONCE at `migrate create` time and
+/// frozen into the migration record (C8/C9).  This is a **dev-time codegen
+/// classification** — the transformer bin has no runtime mechanism-selection
+/// site; it just runs whichever body was baked in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HopBodyClass {
+    /// The differ can PROVE the new-row body from the diff alone —
+    /// **additive / constant / structural**: set a field's default, omit a
+    /// removed column, rename a field/model, or an index/constraint change that
+    /// leaves the row bytes identical.  The transformer generator emits the body
+    /// automatically; no developer authoring is required.
+    Auto,
+    /// The new-row body needs **semantic understanding the diff cannot supply** —
+    /// re-encode a value whose type changed, choose a fill value when narrowing a
+    /// nullable field to NOT NULL, or supply a value for a newly-required field
+    /// with no default.  Scaffolded at `migrate create` for the developer to
+    /// author + freeze (`migrations/{id}/transform.rs`); the transformer embeds
+    /// that frozen source verbatim (C13).
+    Authored,
+}
+
 impl SchemaChange {
+    /// Classify how this hop's new-row body is produced (#74 Phase 2, C8/C9).
+    ///
+    /// This is deliberately **distinct from [`is_breaking`](Self::is_breaking)**:
+    /// a change can be breaking yet still `Auto` (dropping a column or a model is
+    /// breaking for readers but the row transform is a pure structural omit; a
+    /// `&unique` add may fail on duplicates but the row bytes are identity —
+    /// uniqueness is *validated* during replay, not *transformed*).  Only the
+    /// residue the differ genuinely cannot PROVE a value for is `Authored`.
+    pub fn hop_body_class(&self) -> HopBodyClass {
+        match self {
+            // Re-encoding a value from one type to another is semantic — the
+            // differ cannot know the mapping (e.g. `u32 -> string`, `string ->
+            // enum`), so the developer authors it.
+            SchemaChange::ChangeFieldType { .. } => HopBodyClass::Authored,
+            // Narrowing nullable -> NOT NULL needs a fill value for the existing
+            // `None`s; the differ has none to offer.
+            SchemaChange::ChangeFieldNullability {
+                old_nullable: true,
+                new_nullable: false,
+                ..
+            } => HopBodyClass::Authored,
+            // A newly-required field with no default has no value the differ can
+            // synthesize for existing rows.
+            SchemaChange::AddField {
+                nullable: false,
+                default_value: None,
+                ..
+            } => HopBodyClass::Authored,
+            // Everything else is provable structural/constant: additive nullable/
+            // defaulted adds (backfill), removes (omit), renames (name map), and
+            // index/constraint changes (identity row body).
+            _ => HopBodyClass::Auto,
+        }
+    }
+
+    /// The model this change targets, if it is a single-model change.  Used by the
+    /// authored-body scaffold (#74 Phase 2/3) to group `Authored` hops per model.
+    /// `RenameModel` reports its *new* name (the destination shape); `AddModel`/
+    /// `RemoveModel` report the model itself.
+    pub fn target_model(&self) -> &str {
+        match self {
+            SchemaChange::AddModel { model_name }
+            | SchemaChange::RemoveModel { model_name }
+            | SchemaChange::AddField { model_name, .. }
+            | SchemaChange::RemoveField { model_name, .. }
+            | SchemaChange::ChangeFieldType { model_name, .. }
+            | SchemaChange::ChangeFieldNullability { model_name, .. }
+            | SchemaChange::RenameField { model_name, .. }
+            | SchemaChange::AddIndex { model_name, .. }
+            | SchemaChange::RemoveIndex { model_name, .. }
+            | SchemaChange::AddUniqueConstraint { model_name, .. }
+            | SchemaChange::RemoveUniqueConstraint { model_name, .. }
+            | SchemaChange::AddCompositeIndex { model_name, .. }
+            | SchemaChange::RemoveCompositeIndex { model_name, .. }
+            | SchemaChange::AddConstraint { model_name, .. }
+            | SchemaChange::RemoveConstraint { model_name, .. } => model_name,
+            SchemaChange::RenameModel { new_name, .. } => new_name,
+        }
+    }
+
     /// Returns true if this change is considered breaking (requires manual intervention)
     pub fn is_breaking(&self) -> bool {
         match self {
@@ -276,11 +358,37 @@ pub struct Migration {
     pub changes: Vec<SchemaChange>,
     /// Checksum of the migration file for integrity
     pub checksum: String,
+    /// On-disk `format_version` this migration expects BEFORE it runs (#74
+    /// Phase 2 — the serial version interlock).  `0` for a legacy record written
+    /// before versioning existed; a real lineage is contiguous (`to_version` of
+    /// one migration == `from_version` of the next).
+    #[serde(default)]
+    pub from_version: u32,
+    /// On-disk `format_version` this migration stamps AFTER it runs.  The current
+    /// expected version of the whole database is the highest `to_version` in the
+    /// lineage (see [`MigrationLineage`](crate::MigrationLineage)); that is what
+    /// codegen bakes into `EXPECTED_FORMAT_VERSION` (red line #8 — lineage-sourced,
+    /// never hand-edited).
+    #[serde(default)]
+    pub to_version: u32,
 }
 
 impl Migration {
-    /// Create a new migration
+    /// Create a new migration (version fields defaulted to `0` — used by callers
+    /// that do not track the lineage, and by the crate's own unit tests).
     pub fn new(description: String, changes: Vec<SchemaChange>) -> Self {
+        Self::new_versioned(description, changes, 0, 0)
+    }
+
+    /// Create a new migration stamped with its serial version interlock (#74
+    /// Phase 2).  `from_version`/`to_version` come from the committed lineage at
+    /// `migrate create` time; the checksum covers them like every other field.
+    pub fn new_versioned(
+        description: String,
+        changes: Vec<SchemaChange>,
+        from_version: u32,
+        to_version: u32,
+    ) -> Self {
         let now = Utc::now();
         let id = format!("{}", now.format("%Y%m%d%H%M%S"));
 
@@ -290,11 +398,25 @@ impl Migration {
             created_at: now,
             changes,
             checksum: String::new(),
+            from_version,
+            to_version,
         };
 
         // Calculate checksum
         migration.checksum = migration.calculate_checksum();
         migration
+    }
+
+    /// Classify each change's hop body (#74 Phase 2).  A migration is "fully
+    /// automatic" when every hop is [`HopBodyClass::Auto`]; any [`Authored`]
+    /// residue must be authored + frozen before the transformer can be generated.
+    ///
+    /// [`Authored`]: HopBodyClass::Authored
+    pub fn authored_changes(&self) -> Vec<&SchemaChange> {
+        self.changes
+            .iter()
+            .filter(|c| c.hop_body_class() == HopBodyClass::Authored)
+            .collect()
     }
 
     /// Calculate checksum for migration integrity

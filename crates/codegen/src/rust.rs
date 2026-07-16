@@ -36,7 +36,23 @@ impl RustGenerator {
     ///
     /// Generated Rust code as a string
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
-        let code = Self::generate_code(schema)?;
+        // Baseline on-disk format version (#74 Phase 1): a schema with no migration
+        // lineage is at version 1.  The CLI threads the lineage-derived version via
+        // `generate_with_format_version`; snapshot tests use this baseline so their
+        // output is stable.
+        Self::generate_with_format_version(schema, 1)
+    }
+
+    /// Generate the Rust database implementation, baking `format_version` into the
+    /// app's `EXPECTED_FORMAT_VERSION` (#74 Phase 1/2).  The version is **derived
+    /// from the committed migration lineage** by the `generate` CLI command (red
+    /// line #8: lineage-sourced, never hand-edited); it is an opaque integer the
+    /// generated open guard compares and refuses on mismatch — nothing more.
+    pub fn generate_with_format_version(
+        schema: &Schema,
+        format_version: u32,
+    ) -> Result<GeneratedCode> {
+        let code = Self::generate_code(schema, format_version)?;
 
         Ok(GeneratedCode {
             code,
@@ -169,7 +185,7 @@ impl RustGenerator {
     }
 
     /// Generate the Rust code as a string
-    fn generate_code(schema: &Schema) -> Result<String> {
+    fn generate_code(schema: &Schema, format_version: u32) -> Result<String> {
         Self::validate_projections(schema)?;
         Self::validate_on_delete(schema)?;
 
@@ -219,6 +235,24 @@ impl RustGenerator {
         // this many dead versions between compactions.
         tokens.extend(quote! {
             const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+        });
+
+        // On-disk format version this binary was generated for (#74 Phase 1 —
+        // version guard).  An OPAQUE lineage-derived integer: it is compared, on
+        // open, against the `format_version` stamped in each collection's
+        // `manifest.json`, and a mismatch is a fail-fast refusal — never a
+        // self-healing reshape (red line DV-6: the guard reads ONE integer and
+        // refuses; it never inspects column names/types to adapt).  A migration
+        // bin (the offline transformer, #74 Phase 3) is what rewrites a data dir
+        // from an old version to a new one; the app never migrates in place.
+        // Derived from the committed migration lineage (#74 Phase 2 — the CLI
+        // threads `MigrationLineage::current_format_version`); baseline `1` for a
+        // schema with no lineage.  A fresh data dir is stamped with exactly this
+        // value, so a dir this binary wrote always matches its own expectation.
+        let __expected_format_version =
+            proc_macro2::Literal::u32_unsuffixed(format_version);
+        tokens.extend(quote! {
+            const EXPECTED_FORMAT_VERSION: u32 = #__expected_format_version;
         });
 
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
@@ -1026,7 +1060,9 @@ impl RustGenerator {
 
     /// Database field / storage-path name for an M2M junction, e.g.
     /// `author_book_link`.
-    fn junction_field_ident(m: &forgedb_parser::ast::ManyToManyRelation) -> proc_macro2::Ident {
+    pub(crate) fn junction_field_ident(
+        m: &forgedb_parser::ast::ManyToManyRelation,
+    ) -> proc_macro2::Ident {
         format_ident!(
             "{}_{}_link",
             Self::to_snake_case(&m.model1),
@@ -2232,6 +2268,15 @@ impl RustGenerator {
                 let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
                     .map(|m| m.compaction_epoch)
                     .unwrap_or(0);
+                // Preserve the on-disk format version (#74 Phase 1) exactly as the
+                // `compaction_epoch` above: a reopen must NOT clobber a version a
+                // migration bumped (that would silently defeat the open-time guard
+                // and let stale bytes be mis-decoded).  A fresh directory is stamped
+                // with this binary's `EXPECTED_FORMAT_VERSION` baseline, so a dir
+                // this binary writes always matches its own expectation.
+                let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                    .map(|m| m.format_version)
+                    .unwrap_or(EXPECTED_FORMAT_VERSION);
                 let manifest = forgedb_storage::Manifest {
                     schema_version: 1,
                     row_count: self.row_count,
@@ -2242,7 +2287,7 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                     compaction_epoch: __compaction_epoch,
-                    format_version: 1,
+                    format_version: __format_version,
                     row_anchor: Some(forgedb_storage::RowAnchor {
                         relative_path: "tombstones.bin".to_string(),
                         bytes_per_row: 1usize,
@@ -4717,6 +4762,50 @@ impl RustGenerator {
             .chain(m2m.iter().map(Self::junction_field_ident))
             .collect();
 
+        // Open-time format-version guard (#74 Phase 1).  For every collection that
+        // has already been written (its `manifest.json` exists), load exactly the
+        // opaque `format_version` integer and refuse to open the dir when it does
+        // not match this binary's codegen-baked `EXPECTED_FORMAT_VERSION`.  This is
+        // the fail-fast that turns a stale data dir (written under an older schema,
+        // now opened by regenerated code) from a SILENT byte mis-decode into a
+        // clear panic pointing at the migration bin.  Red line DV-6: it reads one
+        // integer and refuses — it NEVER inspects column names/types to self-heal.
+        // A collection with no manifest yet (a fresh, never-written dir) is skipped
+        // — there is nothing stale to guard against.
+        let version_guard_stmts: Vec<_> = schema
+            .models
+            .iter()
+            .map(|model| format!("{}/manifest.json", Self::to_snake_case(&model.name)))
+            .chain(m2m.iter().map(|m| {
+                format!(
+                    "{}_{}_link/manifest.json",
+                    Self::to_snake_case(&m.model1),
+                    Self::to_snake_case(&m.model2)
+                )
+            }))
+            .map(|manifest_rel| {
+                quote! {
+                    {
+                        let __mf = root.join(#manifest_rel);
+                        if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
+                            if __m.format_version != EXPECTED_FORMAT_VERSION {
+                                panic!(
+                                    "ForgeDB: data dir at {} is on-disk format v{}, \
+                                     but this binary expects v{} — the schema changed \
+                                     since this dir was written.  Run the migration bin \
+                                     to evolve the data (the app never migrates in \
+                                     place); do NOT open stale data with mismatched code.",
+                                    __mf.display(),
+                                    __m.format_version,
+                                    EXPECTED_FORMAT_VERSION,
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+
         // Model-only field idents (#92 Phase 4): `Database::compact()` compacts
         // model storages, not junctions — a junction is an append-only link table
         // with no update/delete, so it accumulates no dead versions to reclaim.
@@ -4966,6 +5055,12 @@ impl RustGenerator {
                     root: std::path::PathBuf,
                     _lock: Option<forgedb_storage::DirLock>,
                 ) -> Self {
+                    // Format-version guard (#74 Phase 1): refuse a data dir whose
+                    // stamped `format_version` differs from this binary's baked
+                    // `EXPECTED_FORMAT_VERSION`, BEFORE opening any column/WAL file.
+                    // Reads one opaque integer per existing manifest and fails fast
+                    // on mismatch — never reshapes (DV-6).  Skipped for a fresh dir.
+                    #(#version_guard_stmts)*
                     let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
                     // Durable replication broker (#82 Direction C): one offset-addressed
                     // log per tenant, under the data root, shared across all collections
@@ -6973,6 +7068,13 @@ impl RustGenerator {
                         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
                             .map(|m| m.compaction_epoch)
                             .unwrap_or(0);
+                        // Preserve the on-disk format version across reopen (#74
+                        // Phase 1), same as the model path — a reopen must never
+                        // clobber a migration-bumped version.  Fresh dir → this
+                        // binary's `EXPECTED_FORMAT_VERSION` baseline.
+                        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                            .map(|m| m.format_version)
+                            .unwrap_or(EXPECTED_FORMAT_VERSION);
                         let manifest = forgedb_storage::Manifest {
                             schema_version: 1,
                             row_count: self.row_count,
@@ -6983,7 +7085,7 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                             compaction_epoch: __compaction_epoch,
-                            format_version: 1,
+                            format_version: __format_version,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: 16usize,

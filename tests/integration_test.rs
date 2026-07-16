@@ -289,22 +289,28 @@ fn test_generate_check_mode() {
     );
 }
 
-/// v1 Phase 4 (#92) Workstream 3: `migrate create --auto` diffs the schema against
-/// a recorded snapshot and gates on additive-vs-breaking.  Additive (new nullable
-/// field) is accepted; breaking (new non-null field) is refused with a non-zero
-/// exit so CI catches it.  Hermetic: runs the real binary with an explicit cwd.
+/// #74 Phase 4: `migrate create --auto` diffs the schema against a recorded
+/// snapshot, records EVERY non-empty diff as a versioned hop, and classifies the
+/// hop body.  A purely-additive change (new nullable field) succeeds with the
+/// reopen-backfill fast-path advice; a change whose new-row value the differ
+/// cannot prove (a type change) succeeds too but is classified `Authored`, gets a
+/// `migrations/<id>/transform.rs` scaffold, and prints the `migrate up` next
+/// steps.  The old refuse-breaking gate is gone.  Hermetic: real binary, explicit
+/// cwd.
 #[test]
-fn test_migrate_auto_diff_additive_and_breaking_gate() {
+fn test_migrate_auto_records_and_scaffolds_authored_hop() {
     let temp_dir = setup_test_dir();
     let dir = temp_dir.path();
 
     let v1 = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n}\n";
     let v2_additive = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n}\n";
-    let v3_breaking =
-        "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: string?\n  priority: u32\n}\n";
+    // Breaking + Authored: `qty` changes u32 -> string (the differ cannot know the
+    // re-encoding, so the developer must author it).
+    let v3_authored =
+        "Widget {\n  id: +uuid\n  sku: &string\n  qty: string\n  note: string?\n}\n";
     fs::write(dir.join("v1.forge"), v1).unwrap();
     fs::write(dir.join("v2.forge"), v2_additive).unwrap();
-    fs::write(dir.join("v3.forge"), v3_breaking).unwrap();
+    fs::write(dir.join("v3.forge"), v3_authored).unwrap();
 
     // 1. Baseline records a snapshot with nothing to diff (succeeds, no migration).
     let out = forgedb_cmd(dir)
@@ -313,8 +319,10 @@ fn test_migrate_auto_diff_additive_and_breaking_gate() {
         .expect("run migrate baseline");
     assert!(out.status.success(), "baseline should succeed");
     assert!(dir.join("migrations/.schema-snapshot.forge").exists(), "snapshot recorded");
+    assert!(dir.join("migrations/schemas/v1.forge").exists(), "baseline versioned schema recorded");
 
-    // 2. Additive (new nullable field) is accepted and a migration is written.
+    // 2. Additive (new nullable field) succeeds; the fast-path advice mentions
+    //    backfill-on-reopen, and the destination version schema is recorded.
     let out = forgedb_cmd(dir)
         .args(["migrate", "create", "add_note", "--auto", "--schema", "v2.forge"])
         .output()
@@ -322,20 +330,46 @@ fn test_migrate_auto_diff_additive_and_breaking_gate() {
     assert!(out.status.success(), "additive migration should succeed");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("note"), "reports the added field: {stdout}");
+    assert!(
+        stdout.to_lowercase().contains("backfill"),
+        "additive prints the reopen fast-path advice: {stdout}"
+    );
+    assert!(dir.join("migrations/schemas/v2.forge").exists(), "v2 versioned schema recorded");
 
-    // 3. Breaking (new non-null field, no default) is refused with a non-zero exit.
+    // 3. A type change (u32 -> string) is now RECORDED (non-zero exit gone),
+    //    classified Authored, scaffolded, and prints the `migrate up` steps.
     let out = forgedb_cmd(dir)
-        .args(["migrate", "create", "add_priority", "--auto", "--schema", "v3.forge"])
+        .args(["migrate", "create", "qty_to_string", "--auto", "--schema", "v3.forge"])
         .output()
-        .expect("run migrate breaking");
-    assert!(!out.status.success(), "breaking change must be refused (non-zero exit)");
+        .expect("run migrate authored");
+    assert!(
+        out.status.success(),
+        "authored migration is recorded, not refused: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    assert!(combined.contains("[authored]"), "marks the authored hop: {combined}");
     assert!(
-        combined.contains("Breaking") && combined.to_lowercase().contains("reload"),
-        "refusal explains the breaking change + reload path: {combined}"
+        combined.contains("migrate up"),
+        "prints the migrate up next steps: {combined}"
+    );
+    assert!(dir.join("migrations/schemas/v3.forge").exists(), "v3 versioned schema recorded");
+
+    // The authored scaffold was written under migrations/<id>/transform.rs.
+    let scaffolds: Vec<_> = fs::read_dir(dir.join("migrations"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("transform.rs").exists())
+        .collect();
+    assert_eq!(scaffolds.len(), 1, "exactly one authored-body scaffold written");
+    let body = fs::read_to_string(scaffolds[0].join("transform.rs")).unwrap();
+    assert!(
+        body.contains("authored_transform") && body.contains("TODO"),
+        "scaffold is the fill-in-the-TODO authored transform: {body}"
     );
 }

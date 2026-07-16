@@ -3,7 +3,8 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, OpenApiGenerator, RustGenerator, TypeScriptGenerator, WasmGenerator,
+    ApiGenerator, HopPlan, ModelOp, OpenApiGenerator, RustGenerator, TransformGenerator,
+    TransformPlan, TypeScriptGenerator, VersionSchema, WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -1818,6 +1819,115 @@ Tag {
     assert!(
         code.contains("Failed to fsync junction left column on checkpoint"),
         "junction checkpoint fsyncs its id columns (no WAL to truncate)"
+    );
+}
+
+#[test]
+fn test_rust_generation_version_guard() {
+    // Format-version guard (#74 Phase 1): the generated app, on open, compares the
+    // manifest's stamped `format_version` against a codegen-baked
+    // `EXPECTED_FORMAT_VERSION` and FAIL-FAST refuses a stale data dir — it never
+    // reshapes/self-heals (red line DV-6).  This turns a silent byte mis-decode of
+    // a dir written under an old schema into a clear refusal pointing at the
+    // migration bin.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  users: [User]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // An opaque, codegen-baked expected version constant is emitted.
+    assert!(
+        code.contains("const EXPECTED_FORMAT_VERSION: u32 = 1"),
+        "generated app bakes in the version it expects"
+    );
+
+    // The guard reads exactly the one opaque integer and compares it — it must NOT
+    // inspect column names/types to decide anything (DV-6: refuse, don't adapt).
+    assert!(
+        code.contains("__m.format_version != EXPECTED_FORMAT_VERSION"),
+        "open compares the manifest format_version against the expected version"
+    );
+    assert!(
+        code.contains("but this binary expects v"),
+        "the mismatch panic fails fast with migration guidance"
+    );
+
+    // The guard runs in the open path, over each collection's manifest (models and
+    // junctions), loading the manifest and reading only its version field.
+    assert!(
+        code.contains("root.join(\"user/manifest.json\")")
+            && code.contains("root.join(\"tag/manifest.json\")")
+            && code.contains("root.join(\"tag_user_link/manifest.json\")"),
+        "the guard covers every model and junction manifest"
+    );
+
+    // Identity: the guard branch must not read column shape to self-heal — the ONLY
+    // manifest field it touches in the guard is `format_version`.  (It must never
+    // resolve a decoder from column names/types the way a schema engine would.)
+    assert!(
+        !code.contains("__m.columns") && !code.contains("m.column_type"),
+        "the version guard reads no column shape (never self-heals — DV-6)"
+    );
+
+    // #74 Phase 2: the baked version is LINEAGE-SOURCED, not hardcoded — the CLI
+    // threads `MigrationLineage::current_format_version` via
+    // `generate_with_format_version`.  A schema with no lineage baselines to 1
+    // (the default `generate`); a lineage at version N bakes N.
+    let code_v7 = RustGenerator::generate_with_format_version(&schema, 7)
+        .unwrap()
+        .code;
+    assert!(
+        code_v7.contains("const EXPECTED_FORMAT_VERSION: u32 = 7"),
+        "the expected version is threaded from the migration lineage, not hardcoded"
+    );
+}
+
+#[test]
+fn test_rust_generation_manifest_preserves_format_version() {
+    // Version writer preservation (#74 Phase 1 prerequisite): `write_manifest`
+    // runs on EVERY open, so it must load any existing manifest and carry its
+    // `format_version` forward (exactly as it already does for `compaction_epoch`)
+    // — otherwise a reopen would clobber a migration's version bump back to the
+    // baseline and silently defeat the open-time guard.  A fresh dir (no manifest)
+    // is stamped with `EXPECTED_FORMAT_VERSION`.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The manifest is written with a preserved-or-baseline version, NOT a hardcoded
+    // constant that would clobber a bumped version on reopen.
+    assert!(
+        code.contains("let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
+            && code.contains(".map(|m| m.format_version)")
+            && code.contains(".unwrap_or(EXPECTED_FORMAT_VERSION)"),
+        "write_manifest preserves an existing format_version, baselining a fresh dir"
+    );
+    assert!(
+        code.contains("format_version: __format_version"),
+        "the manifest is stamped with the preserved-or-baseline version"
+    );
+    // The old clobbering hardcode is gone.
+    assert!(
+        !code.contains("format_version: 1,"),
+        "no hardcoded format_version left to clobber a bumped version on reopen"
     );
 }
 
@@ -4374,4 +4484,176 @@ User {
         !coord_manifest.contains("forgedb-storage"),
         "G3 (T3-8): forgedb-coordinator must have NO forgedb-storage* dependency"
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// #74 Phase 3 — the offline transformer bin (uniform typed replay).
+// The identity trio (DV-1): no schema at runtime (C1), straight-line replay with
+// no interpreter (C2/C8/DV-11), provider-free deps (C4/DV-7).
+// ---------------------------------------------------------------------------
+
+/// Parse a `.forge` source into a schema (test helper).
+fn parse_forge(src: &str) -> Schema {
+    let mut p = forgedb_parser::Parser::new(src).unwrap();
+    p.parse().unwrap()
+}
+
+/// A 3-version lineage mixing an additive `AutoBody` hop (v1→v2: add `bio:
+/// string?`) and a semantic `AuthoredBody` hop (v2→v3: `age` u32→string). This is
+/// exactly the E2E shape from the impl plan; the guards below inspect the emitted
+/// transformer crate for it.
+fn sample_transform_crate() -> (String, forgedb_codegen::TransformCrate) {
+    let v1 = parse_forge("User {\n  id: +uuid\n  age: u32\n}\n");
+    let v2 = parse_forge("User {\n  id: +uuid\n  age: u32\n  bio: string?\n}\n");
+    let v3 = parse_forge("User {\n  id: +uuid\n  age: string\n  bio: string?\n}\n");
+    // Keep the parsed schemas alive by leaking them for the borrow — this is a
+    // one-shot test helper, so the leak is harmless.
+    let v1: &'static Schema = Box::leak(Box::new(v1));
+    let v2: &'static Schema = Box::leak(Box::new(v2));
+    let v3: &'static Schema = Box::leak(Box::new(v3));
+
+    let plan = TransformPlan {
+        versions: vec![
+            VersionSchema { version: 1, schema: v1 },
+            VersionSchema { version: 2, schema: v2 },
+            VersionSchema { version: 3, schema: v3 },
+        ],
+        hops: vec![
+            HopPlan {
+                from_version: 1,
+                to_version: 2,
+                migration_id: "m1".to_string(),
+                model_ops: vec![ModelOp {
+                    model: "User".to_string(),
+                    source_model: "User".to_string(),
+                    field_renames: vec![],
+                    field_removes: vec![],
+                    field_adds: vec![("bio".to_string(), "null".to_string())],
+                }],
+                authored_src: None,
+            },
+            HopPlan {
+                from_version: 2,
+                to_version: 3,
+                migration_id: "m2".to_string(),
+                model_ops: vec![],
+                authored_src: Some(
+                    "pub fn authored_transform(model: &str, mut row: serde_json::Value) \
+                     -> serde_json::Value {\n    if model == \"User\" {\n        if let Some(v) = \
+                     row.get(\"age\").and_then(|x| x.as_u64()) {\n            row[\"age\"] = \
+                     serde_json::Value::String(v.to_string());\n        }\n    }\n    row\n}\n"
+                        .to_string(),
+                ),
+            },
+        ],
+    };
+    let crate_out = TransformGenerator::generate(&plan, "forgedb-transform").unwrap();
+    let main = crate_out
+        .sources
+        .iter()
+        .find(|(p, _)| p == "src/main.rs")
+        .map(|(_, c)| c.clone())
+        .expect("main.rs emitted");
+    (main, crate_out)
+}
+
+#[test]
+fn test_transform_bin_has_no_schema_runtime() {
+    // C1 / DV-1: the transformer embeds fixed typed version modules; its replay
+    // path constructs no decoder from runtime input — no `.forge` parse, no
+    // parser/migrations symbol.
+    let (main, _crate_out) = sample_transform_crate();
+    assert!(
+        !main.contains("forgedb_parser") && !main.contains("forgedb_migrations"),
+        "transformer main must not link the parser / migration engine at runtime"
+    );
+    assert!(
+        !main.contains("SimpleSchema")
+            && !main.contains("Parser::new")
+            && !main.contains("schema.forge"),
+        "transformer must not read or interpret a schema at runtime"
+    );
+    // It DOES call into the embedded per-version typed databases.
+    assert!(
+        main.contains("v1::Database") && main.contains("v3::Database"),
+        "replay reads/writes via the embedded per-version typed structs"
+    );
+}
+
+#[test]
+fn test_transform_bin_replay_is_straightline() {
+    // C2 / C8 / DV-11: `run` is a fixed named-hop call-chain, not a loop over a
+    // persisted plan descriptor and not a runtime mechanism-selection branch.
+    let (main, _crate_out) = sample_transform_crate();
+    assert!(main.contains("fn run("), "a fixed run() entrypoint");
+    assert!(
+        main.contains("fn transform_v1_to_v2(") && main.contains("fn transform_v2_to_v3("),
+        "one named hop fn per adjacent version pair"
+    );
+    assert!(
+        main.contains("transform_v1_to_v2(") && main.contains("transform_v2_to_v3("),
+        "run() calls the named hops directly (straight-line chain)"
+    );
+    // No descriptor interpreter / no runtime hop-class dispatch.
+    for forbidden in [
+        "Vec<Step",
+        "HopDescriptor",
+        "for step in",
+        "match change",
+        "match hop",
+        "match from",
+    ] {
+        assert!(
+            !main.contains(forbidden),
+            "replay must not interpret a persisted plan / dispatch a mechanism at runtime (found {forbidden:?})"
+        );
+    }
+}
+
+#[test]
+fn test_transform_bin_deps_are_provider_free() {
+    // C4 / DV-7: the emitted Cargo.toml links the schema-agnostic substrate the
+    // app links, and NOTHING that interprets a schema — no parser, no migration
+    // engine.
+    let (_main, crate_out) = sample_transform_crate();
+    let toml = &crate_out.cargo_toml;
+    assert!(
+        !toml.contains("forgedb-migrations =") && !toml.contains("forgedb-parser ="),
+        "transformer must be provider-free (no parser / migration crate dependency)"
+    );
+    assert!(
+        toml.contains("forgedb-storage") && toml.contains("forgedb-types"),
+        "transformer links the same substrate the generated app links"
+    );
+}
+
+#[test]
+fn test_transform_bin_embeds_frozen_authored_body() {
+    // C13: an authored hop embeds its frozen `transform.rs` verbatim as a module
+    // and the hop calls it; an auto hop does not.
+    let (main, crate_out) = sample_transform_crate();
+    assert!(
+        crate_out.sources.iter().any(|(p, _)| p == "src/authored_m2.rs"),
+        "the authored hop's frozen body is embedded as its own module"
+    );
+    assert!(
+        main.contains("mod authored_m2;") && main.contains("authored_m2::authored_transform"),
+        "the v2→v3 hop declares + calls the frozen authored transform"
+    );
+    assert!(
+        !main.contains("authored_m1"),
+        "the auto v1→v2 hop embeds no authored body"
+    );
+    // The additive hop bakes the frozen field-add op (bio defaults to null).
+    assert!(
+        main.contains("\"bio\"") && main.contains("v2::User"),
+        "the additive hop inserts the new field's default and decodes v2::User"
+    );
+}
+
+#[test]
+fn test_transform_generation_snapshot() {
+    let (main, _crate_out) = sample_transform_crate();
+    insta::assert_snapshot!(main);
 }
