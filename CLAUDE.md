@@ -1172,8 +1172,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
 ## Conventions
 
 - No time estimates (hours/days/weeks) anywhere — describe scope, not duration.
-- Never `git commit`/`push` unless explicitly asked; then split into small focused,
-  conventional commits and include related lockfiles.
+- Don't `git commit` without the user's consent (an in-the-moment "commit when done"
+  counts as consent for that scope; it doesn't carry to follow-up changes). When you do
+  commit, split into small focused, conventional commits and include related lockfiles —
+  and ALWAYS `git push` after a batch of commits (never leave the local branch ahead of
+  origin). See the user's global git rules for the authoritative wording.
 - When closing a TODO item, delete it (git history is the audit trail).
 - All workflows runnable from the repo root — no `cd` into subdirs.
 
