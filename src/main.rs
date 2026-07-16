@@ -50,7 +50,7 @@ enum Commands {
 
     /// Generate code from schema
     Generate {
-        /// Generation target (all, rust, typescript, api, openapi, stubs)
+        /// Generation target (all, rust, typescript, api, openapi, stubs, wasm, transform)
         #[arg(default_value = "all")]
         target: String,
 
@@ -69,6 +69,14 @@ enum Commands {
         /// Force regeneration even if up-to-date
         #[arg(short, long)]
         force: bool,
+
+        /// Origin format version for the `transform` target (#74)
+        #[arg(long)]
+        from: Option<u32>,
+
+        /// Destination format version for the `transform` target (#74)
+        #[arg(long)]
+        to: Option<u32>,
     },
 
     /// Validate schema and check implementations
@@ -182,18 +190,67 @@ enum MigrateCommands {
     /// Show migration status
     Status,
 
-    /// Run pending migrations
-    Up {
-        /// Number of migrations to run (default: all)
+    /// Generate + compile the offline transformer bin for a version range (#74).
+    /// The one operator artifact that migrates data-at-rest from --from to --to.
+    Build {
+        /// Origin (current on-disk) format version
+        #[arg(long)]
+        from: u32,
+
+        /// Destination format version
+        #[arg(long)]
+        to: u32,
+
+        /// Where to emit + build the transformer (default: migrations/transform)
         #[arg(short, long)]
-        steps: Option<usize>,
+        output: Option<std::path::PathBuf>,
     },
 
-    /// Rollback migrations
-    Down {
-        /// Number of migrations to rollback (default: 1)
+    /// Run a built transformer over a src→dest data dir (app must be stopped).
+    Run {
+        /// Source data directory (at the origin format version)
+        #[arg(long)]
+        src: std::path::PathBuf,
+
+        /// Destination directory to materialize (must not exist / be empty)
+        #[arg(long)]
+        dest: std::path::PathBuf,
+
+        /// The transformer crate dir (default: migrations/transform)
+        #[arg(long)]
+        bin_dir: Option<std::path::PathBuf>,
+    },
+
+    /// One-CLI migration: build the transformer + run it over a data dir (or every
+    /// tenant dir under --tenant-root).  The app must be STOPPED.  #74 Phase 4.
+    Up {
+        /// Origin format version (default: detected from the source manifests)
+        #[arg(long)]
+        from: Option<u32>,
+
+        /// Destination format version (default: the lineage's current version)
+        #[arg(long)]
+        to: Option<u32>,
+
+        /// Source data directory (single-dir mode)
+        #[arg(long)]
+        src: Option<std::path::PathBuf>,
+
+        /// Destination directory to materialize (single-dir mode)
+        #[arg(long)]
+        dest: Option<std::path::PathBuf>,
+
+        /// Transformer crate dir (default: migrations/transform)
         #[arg(short, long)]
-        steps: Option<usize>,
+        output: Option<std::path::PathBuf>,
+
+        /// Migrate every data dir directly under this root (per-tenant sweep)
+        #[arg(long)]
+        tenant_root: Option<std::path::PathBuf>,
+
+        /// Per-tenant destination suffix (default: -migrated-v<to>)
+        #[arg(long)]
+        dest_suffix: Option<String>,
     },
 }
 
@@ -370,6 +427,8 @@ fn run(cli: Cli) -> Result<()> {
             output,
             schema,
             force,
+            from,
+            to,
         } => {
             // Precedence: CLI flag > config > built-in default
             let resolved_output = output.or_else(|| forge_config.generate.output.clone());
@@ -381,6 +440,8 @@ fn run(cli: Cli) -> Result<()> {
                 schema: resolved_schema,
                 config_targets: forge_config.generate.targets.clone(),
                 force,
+                from,
+                to,
             })
         }
 
@@ -442,12 +503,37 @@ fn run(cli: Cli) -> Result<()> {
             MigrateCommands::Status => {
                 commands::migrate::status(commands::migrate::MigrateStatusOptions)
             }
-            MigrateCommands::Up { steps } => {
-                commands::migrate::up(commands::migrate::MigrateUpOptions { steps })
+            MigrateCommands::Build { from, to, output } => {
+                commands::migrate::build(commands::migrate::MigrateBuildOptions {
+                    from,
+                    to,
+                    output,
+                })
             }
-            MigrateCommands::Down { steps } => {
-                commands::migrate::down(commands::migrate::MigrateDownOptions { steps })
+            MigrateCommands::Run { src, dest, bin_dir } => {
+                commands::migrate::run(commands::migrate::MigrateRunOptions {
+                    src,
+                    dest,
+                    bin_dir,
+                })
             }
+            MigrateCommands::Up {
+                from,
+                to,
+                src,
+                dest,
+                output,
+                tenant_root,
+                dest_suffix,
+            } => commands::migrate::up(commands::migrate::MigrateUpOptions {
+                from,
+                to,
+                src,
+                dest,
+                output,
+                tenant_root,
+                dest_suffix,
+            }),
         },
 
         Commands::Coordinate { root, socket } => {

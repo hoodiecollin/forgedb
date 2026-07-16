@@ -34,6 +34,8 @@ pub fn run(options: BuildOptions) -> Result<()> {
                 schema: options.schema.clone(),
                 config_targets: None,
                 force: true,
+                from: None,
+                to: None,
             })?;
         }
     } else {
@@ -46,6 +48,8 @@ pub fn run(options: BuildOptions) -> Result<()> {
             schema: options.schema.clone(),
             config_targets: None,
             force: true,
+            from: None,
+            to: None,
         })?;
     }
 

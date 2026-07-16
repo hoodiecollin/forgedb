@@ -19,10 +19,33 @@ pub struct GenerateOptions {
     /// Ignored for explicit single-target invocations.
     pub config_targets: Option<Vec<String>>,
     pub force: bool,
+    /// Origin format version for the `transform` target (#74 Phase 3).
+    pub from: Option<u32>,
+    /// Destination format version for the `transform` target (#74 Phase 3).
+    pub to: Option<u32>,
 }
 
 pub fn run(options: GenerateOptions) -> Result<()> {
     ui::header("🔨", "Generating code from schema");
+
+    // The `transform` target (#74 Phase 3) is special: it reads the committed
+    // per-version schemas under `migrations/` for its `--from`/`--to` range, not
+    // the single app schema — so it short-circuits before schema discovery.
+    if options.target.to_lowercase() == "transform" {
+        let from = options.from.ok_or_else(|| {
+            CliError::Other("generate transform requires --from <version>".to_string())
+        })?;
+        let to = options.to.ok_or_else(|| {
+            CliError::Other("generate transform requires --to <version>".to_string())
+        })?;
+        let output = PathBuf::from(
+            options
+                .output
+                .as_deref()
+                .unwrap_or("migrations/transform"),
+        );
+        return crate::commands::migrate::emit_transform(from, to, &output, options.force);
+    }
 
     // Find schema file — explicit path takes priority over auto-discovery.
     let schema_path = match options.schema.as_deref() {
@@ -48,6 +71,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         schema.models.iter().map(|m| m.fields.len()).sum::<usize>()
     ));
 
+    // On-disk format version (#74 Phase 1/2): derive it from the committed
+    // migration lineage under `migrations/` and bake it into the generated app's
+    // `EXPECTED_FORMAT_VERSION` (red line #8 — lineage-sourced, never hand-edited).
+    // Baseline `1` when there is no lineage (a project that has authored no
+    // migrations yet).  The open guard compares this opaque integer and refuses a
+    // stale data dir; it is threaded into every `database.rs` emission (the server
+    // and the wasm replica share one lineage).
+    let format_version = forgedb_migrations::current_format_version("migrations");
+
     // Determine output directory
     let output_dir = options.output.as_deref().unwrap_or("./generated");
     let output_path = PathBuf::from(output_dir);
@@ -72,10 +104,16 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             // When config restricts which targets to emit, honour that list;
             // otherwise generate everything.
             let allowed = options.config_targets.as_deref();
-            generated_files.extend(generate_all(&schema, &output_path, options.force, allowed)?);
+            generated_files.extend(generate_all(
+                &schema,
+                &output_path,
+                options.force,
+                allowed,
+                format_version,
+            )?);
         }
         "rust" => {
-            let result = RustGenerator::generate(&schema)
+            let result = RustGenerator::generate_with_format_version(&schema, format_version)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("database.rs");
             write_file(&path, &result.code, options.force)?;
@@ -113,11 +151,16 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.push((path, result));
         }
         "wasm" => {
-            generated_files.extend(generate_wasm_replica(&schema, &output_path, options.force)?);
+            generated_files.extend(generate_wasm_replica(
+                &schema,
+                &output_path,
+                options.force,
+                format_version,
+            )?);
         }
         _ => {
             return Err(CliError::Other(format!(
-                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm",
+                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm, transform",
                 target
             )));
         }
@@ -147,6 +190,7 @@ fn generate_all(
     output_path: &PathBuf,
     force: bool,
     target_filter: Option<&[String]>,
+    format_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let enabled = |name: &str| -> bool {
         target_filter.map_or(true, |ts| ts.iter().any(|t| t.as_str() == name))
@@ -156,7 +200,7 @@ fn generate_all(
 
     // Generate Rust database code
     if enabled("rust") {
-        let rust_result = RustGenerator::generate(schema)
+        let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let rust_path = output_path.join("database.rs");
         write_file(&rust_path, &rust_result.code, force)?;
@@ -207,7 +251,7 @@ fn generate_all(
     // browser crate most projects don't need; a project enables it by listing
     // `wasm` in `[generate].targets`.
     if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "wasm")) {
-        files.extend(generate_wasm_replica(schema, output_path, force)?);
+        files.extend(generate_wasm_replica(schema, output_path, force, format_version)?);
     }
 
     Ok(files)
@@ -221,6 +265,7 @@ fn generate_wasm_replica(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
+    format_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let replica_dir = output_path.join("replica");
     let src_dir = replica_dir.join("src");
@@ -236,8 +281,10 @@ fn generate_wasm_replica(
     files.push((lib_path, wasm_result));
 
     // The generated database the transport compiles against (same generator as
-    // the `rust` target — the follower is the same data logic, recompiled).
-    let rust_result = RustGenerator::generate(schema)
+    // the `rust` target — the follower is the same data logic, recompiled).  It
+    // shares the server's lineage version so the replica's `EXPECTED_FORMAT_VERSION`
+    // matches the data it follows.
+    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let db_path = src_dir.join("database.rs");
     write_file(&db_path, &rust_result.code, force)?;
