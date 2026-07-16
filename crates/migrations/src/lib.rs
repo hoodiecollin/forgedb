@@ -4,22 +4,30 @@
 //!
 //! # Overview
 //!
-//! This crate provides a complete migration system for ForgeDB, enabling safe schema
-//! evolution over time. It handles:
+//! This crate provides the **dev-time** half of ForgeDB's schema-migration system
+//! (#74): it records how a schema evolves and classifies each hop, so the codegen
+//! can emit a per-range offline **transformer bin** that rewrites data-at-rest.
+//! It handles:
 //!
 //! - **Schema diffing** - Compare old and new schemas to detect changes
-//! - **Migration generation** - Create migration files from schema differences
+//! - **Migration generation** - Create versioned migration records from differences
+//! - **Lineage** - The serial `from -> to` version chain the transformer replays
 //! - **Migration tracking** - Track which migrations have been applied
-//! - **Migration execution** - Apply or rollback migrations safely
+//!
+//! Note: this crate does **not** apply changes to data at runtime.  There is no
+//! `MigrationExecutor`; the actual byte rewrite is done by generated code — the
+//! transformer bin `forgedb-codegen`'s `TransformGenerator` emits (Phase 3) — so
+//! the schema is never a runtime input to a generic engine (the generator-identity
+//! red line).
 //!
 //! # Architecture
 //!
-//! The migration system consists of four main components:
+//! The migration system consists of these components:
 //!
 //! 1. **SchemaDiffer** - Compares schemas and identifies changes
-//! 2. **MigrationGenerator** - Generates migration files from diffs
-//! 3. **MigrationTracker** - Tracks applied migrations
-//! 4. **MigrationExecutor** - Applies or rolls back migrations
+//! 2. **MigrationGenerator** - Generates versioned migration records from diffs
+//! 3. **MigrationLineage** - Orders the serial version chain + expands a range
+//! 4. **MigrationTracker** - Tracks applied migrations
 //!
 //! ## Migration Flow
 //!
@@ -28,11 +36,11 @@
 //!     ↓
 //! SchemaDiffer (detect changes)
 //!     ↓
-//! Migration { up, down }
+//! Migration { changes, from_version, to_version }  ← recorded + classified
 //!     ↓
-//! MigrationExecutor (apply changes)
+//! TransformGenerator (codegen) → offline transformer bin
 //!     ↓
-//! Database updated
+//! `forgedb migrate up`  → data rewritten v1 → v2
 //! ```
 //!
 //! # Examples
@@ -101,16 +109,14 @@
 //! ## Applying Migrations
 //!
 //! ```rust,no_run
-//! use forgedb_migrations::{MigrationExecutor, MigrationTracker, Migration, SchemaChange};
+//! use forgedb_migrations::{MigrationTracker, Migration, SchemaChange};
 //!
 //! // MigrationTracker::new returns Result<Self, String>
 //! let mut tracker = MigrationTracker::new("./migrations").expect("tracker init");
 //!
-//! // MigrationExecutor is a unit struct; call execute_up() as a static method
 //! let migration = Migration::new("add email".to_string(), vec![
 //!     SchemaChange::AddModel { model_name: "Post".to_string() },
 //! ]);
-//! MigrationExecutor::execute_up(&migration, "./data").unwrap_or(());
 //!
 //! // pending_migrations takes a slice of migration id strings
 //! let all_ids = vec!["20240101_add_email".to_string()];
@@ -129,7 +135,7 @@
 //!
 //! - [`SchemaDiffer`] - Schema comparison and change detection
 //! - [`MigrationGenerator`] - Migration file generation
-//! - [`MigrationExecutor`] - Migration application and rollback
+//! - [`MigrationLineage`] - Serial version lineage for the offline transformer bin
 //! - [`MigrationTracker`] - Track applied migrations
 //!
 //! ## Schema Representation
@@ -141,9 +147,9 @@
 //!
 //! ## Migration Types
 //!
-//! - [`Migration`] - A migration with up and down operations
-//! - [`MigrationChange`] - Individual schema change operation
-//! - [`MigrationStatus`] - Applied, pending, or rolled back
+//! - [`Migration`] - A recorded, versioned (`from -> to`) set of schema changes
+//! - [`SchemaChange`] - An individual schema change operation
+//! - [`HopBodyClass`] - Whether a hop's new-row body is `Auto` or `Authored`
 //!
 //! # Supported Changes
 //!
@@ -168,43 +174,43 @@
 //!
 //! # Migration Files
 //!
-//! Migrations are stored as JSON files:
+//! Each migration is a JSON record under `migrations/`, carrying its serial
+//! version span (`from_version -> to_version`) and its detected changes:
 //!
 //! ```json
 //! {
-//!   "name": "20240101_add_user_email",
-//!   "timestamp": 1704067200,
-//!   "up": [
-//!     {
-//!       "type": "AddField",
-//!       "model": "User",
-//!       "field": "email",
-//!       "field_type": "string"
-//!     }
+//!   "id": "20240101120000",
+//!   "description": "add user email",
+//!   "changes": [
+//!     { "AddField": { "model_name": "User", "field_name": "email",
+//!                     "field_type": "string", "nullable": true,
+//!                     "default_value": null } }
 //!   ],
-//!   "down": [
-//!     {
-//!       "type": "RemoveField",
-//!       "model": "User",
-//!       "field": "email"
-//!     }
-//!   ]
+//!   "from_version": 1,
+//!   "to_version": 2
 //! }
 //! ```
+//!
+//! The full `.forge` source of each version is snapshotted alongside under
+//! `migrations/schemas/v{n}.forge`, and any `Authored` hop's frozen transform
+//! lives at `migrations/{id}/transform.rs`.
 //!
 //! # Safety
 //!
 //! The migration system includes safety features:
 //!
-//! - **Reversibility** - Every migration has up and down operations
+//! - **Version interlock** - A regenerated app refuses a data dir at the wrong
+//!   `format_version` rather than mis-decoding it (fail-fast, never self-heals)
+//! - **Rollback by retention** - The transformer writes a fresh destination dir
+//!   and leaves the source untouched, so the original is the rollback
 //! - **Tracking** - Applied migrations are tracked to prevent duplicate application
-//! - **Validation** - Migrations are validated before execution
-//! - **Atomic Operations** - Changes are applied atomically where possible
+//! - **Atomic publish** - A multi-hop range materializes via temp dirs and a
+//!   single final rename (all-or-nothing)
 //!
 //! # Related Crates
 //!
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schema files
-//! - [`forgedb-storage`](../forgedb_storage) - Applies migration changes to storage
+//! - [`forgedb-codegen`](../forgedb_codegen) - Emits the offline transformer bin
 //! - [`forgedb-validation`](../forgedb_validation) - Validates schema changes
 //!
 //! # See Also
@@ -213,14 +219,18 @@
 //! - [SPRINT10_MIGRATIONS.md](../../archive/sprint-summaries/SPRINT10_MIGRATIONS.md) - Migration system implementation
 
 pub mod diff;
-mod executor;
 mod generator;
+pub mod lineage;
 mod tracker;
 mod types;
 
 pub use diff::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
-pub use executor::MigrationExecutor;
 pub use generator::MigrationGenerator;
+pub use lineage::{
+    authored_body_path, current_format_version, load_versioned_schema, migration_body_dir,
+    save_versioned_schema, scaffold_authored_body, versioned_schema_dir, versioned_schema_path,
+    MigrationLineage, BASELINE_FORMAT_VERSION,
+};
 pub use tracker::MigrationTracker;
 pub use types::*;
 

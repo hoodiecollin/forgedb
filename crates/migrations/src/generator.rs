@@ -6,11 +6,26 @@ use std::path::Path;
 pub struct MigrationGenerator;
 
 impl MigrationGenerator {
-    /// Generate a new migration file
+    /// Generate a new migration file (version fields defaulted to `0`).
     pub fn generate<P: AsRef<Path>>(
         migrations_dir: P,
         description: String,
         changes: Vec<SchemaChange>,
+    ) -> Result<Migration, String> {
+        Self::generate_versioned(migrations_dir, description, changes, 0, 0)
+    }
+
+    /// Generate a new migration file stamped with its serial version interlock
+    /// (#74 Phase 2).  The caller derives `from_version`/`to_version` from the
+    /// committed lineage ([`MigrationLineage::next_version_span`]).
+    ///
+    /// [`MigrationLineage::next_version_span`]: crate::MigrationLineage::next_version_span
+    pub fn generate_versioned<P: AsRef<Path>>(
+        migrations_dir: P,
+        description: String,
+        changes: Vec<SchemaChange>,
+        from_version: u32,
+        to_version: u32,
     ) -> Result<Migration, String> {
         let migrations_dir = migrations_dir.as_ref();
 
@@ -21,7 +36,8 @@ impl MigrationGenerator {
         }
 
         // Create migration
-        let migration = Migration::new(description, changes);
+        let migration =
+            Migration::new_versioned(description, changes, from_version, to_version);
 
         // Write migration file
         let migration_path = migrations_dir.join(migration.filename());
