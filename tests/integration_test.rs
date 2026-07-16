@@ -89,6 +89,55 @@ fn test_init_with_blog_template() {
     assert!(schema_content.contains("Tag"));
 }
 
+/// #115 on-host deploy: the Rust scaffold path emits the systemd unit, its
+/// `EnvironmentFile`, and an install README under `deploy/`, alongside the Docker
+/// artifacts. All name-templated only (identity: inert ops packaging), so the
+/// unit's `StateDirectory` and the env file's `FORGEDB_DATA` must agree.
+#[test]
+fn test_init_emits_onhost_systemd_deploy() {
+    use forgedb::commands::init::{run, InitOptions};
+
+    let temp_dir = setup_test_dir();
+    let project_name = "acme_svc";
+    let project_path = temp_dir.path().join(project_name);
+
+    let options = InitOptions {
+        project_name: project_path.to_string_lossy().to_string(),
+        template: None,
+        rust: true,
+        api_only: false,
+    };
+    run(options).expect("init should succeed");
+
+    // The Docker path still emits (parity, not replaced).
+    assert!(project_path.join("Dockerfile").exists());
+
+    let deploy = project_path.join("deploy");
+    let service =
+        fs::read_to_string(deploy.join("acme_svc.service")).expect("systemd unit emitted");
+    let env = fs::read_to_string(deploy.join("acme_svc.env")).expect("EnvironmentFile emitted");
+    assert!(deploy.join("README.md").exists(), "install README emitted");
+
+    // Load-bearing unit directives.
+    assert!(service.contains("ExecStart=/usr/local/bin/acme_svc"));
+    assert!(service.contains("EnvironmentFile=/etc/acme_svc/acme_svc.env"));
+    assert!(service.contains("Type=exec"), "readiness model is exec, not notify");
+    assert!(service.contains("DynamicUser=yes"), "non-root without a manual useradd");
+    assert!(service.contains("StateDirectory=acme_svc"), "managed data dir");
+    assert!(service.contains("KillSignal=SIGTERM"), "pairs with graceful shutdown");
+    assert!(service.contains("NoNewPrivileges=yes"), "hardening present");
+    assert!(service.contains("WantedBy=multi-user.target"));
+
+    // The env file's data dir must match the unit's StateDirectory (/var/lib/<name>).
+    assert!(env.contains("FORGEDB_DATA=/var/lib/acme_svc"), "env data dir agrees with StateDirectory");
+    assert!(env.contains("FORGEDB_HOST=0.0.0.0"));
+
+    // Identity guard: a single plain unit, never a templated <name>@.service that
+    // would invite two writers against one data dir (the per-tenant template is
+    // documented-only). No models/fields leak into the emitted artifacts.
+    assert!(!deploy.join("acme_svc@.service").exists(), "no instance-template unit scaffolded");
+}
+
 #[test]
 fn test_generate_command_creates_rust_code() {
     let temp_dir = setup_test_dir();

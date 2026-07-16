@@ -415,5 +415,221 @@ volumes:
     fs::write(project_path.join("docker-compose.yml"), compose)?;
 
     ui::step("🐳", "Created Dockerfile, .dockerignore, docker-compose.yml");
+
+    // The symmetric on-host (non-container) path (#115): a systemd unit template
+    // + EnvironmentFile + a short install README, grouped under deploy/. Same
+    // class of artifact as the Docker files above — inert ops packaging around
+    // the already-generated binary; nothing reads schema.forge at runtime.
+    create_systemd_files(options)?;
+
+    Ok(())
+}
+
+/// Emit the on-host (non-container) deploy path (#115): a systemd unit template,
+/// an `EnvironmentFile`, and an install README, under `deploy/`.  The unit runs
+/// the generated binary as a non-root `DynamicUser` with a managed
+/// `StateDirectory` (the on-host analogue of the container's non-root user +
+/// `/data` VOLUME), reads config from the env file (12-factor, same knobs as the
+/// compose file), and relies on the scaffold `main.rs` graceful-shutdown path for
+/// a clean `systemctl stop`.  systemd goes under `deploy/` (not the project root
+/// like the `Dockerfile`) because a unit has no build-context root requirement —
+/// it is installed to `/etc/systemd/system/`.  Nothing here reads `schema.forge`.
+fn create_systemd_files(options: &InitOptions) -> Result<()> {
+    let project_path = Path::new(&options.project_name);
+    // The service/binary name is the project's final path component (the operator
+    // installs the binary as `<name>`), not the full project_name string — which
+    // may be a path. Used for the emitted file NAMES + the in-unit references.
+    let bin = project_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(options.project_name.as_str());
+    let deploy_dir = project_path.join("deploy");
+    fs::create_dir_all(&deploy_dir)?;
+
+    // The unit template. `Type=exec` (not `notify`) is the honest readiness model
+    // — the binary does not `sd_notify`; proxy/LB readiness is `GET /ready`.
+    // `DynamicUser=yes` + `StateDirectory=<name>` give a non-root, isolated,
+    // persistent data dir (/var/lib/<name>) without a manual useradd/chown; the
+    // env file below points FORGEDB_DATA at it.  `KillSignal=SIGTERM` +
+    // `TimeoutStopSec=30` pair with the graceful-shutdown drain in main.rs.
+    let service = format!(
+        r#"# systemd unit for the {bin} ForgeDB generated server (#115 on-host deploy).
+#
+# Install:
+#   cargo build --release
+#   sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+#   sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
+#   sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now {bin}
+#
+# One writer per data directory (v1 single-writer contract): do NOT run two units
+# against the same FORGEDB_DATA. For multi-tenant scale-out, run one unit per
+# tenant, each with its own FORGEDB_TENANT + StateDirectory (see deploy/README.md).
+[Unit]
+Description={bin} — ForgeDB generated server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/{bin}
+EnvironmentFile=/etc/{bin}/{bin}.env
+
+# Non-root without a manual useradd; StateDirectory is created + chowned to the
+# transient user and persists across restarts. The env file sets
+# FORGEDB_DATA=/var/lib/{bin} to match.
+DynamicUser=yes
+StateDirectory={bin}
+
+Restart=on-failure
+RestartSec=2
+# main.rs drains in-flight requests on SIGTERM (graceful shutdown).
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Hardening — the server needs only its state dir and a TCP socket.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target
+"#
+    );
+    fs::write(deploy_dir.join(format!("{bin}.service")), service)?;
+
+    // The EnvironmentFile — the on-host mirror of the compose `environment:` block.
+    // Uncomment/edit to change a default. FORGEDB_DATA points at the unit's
+    // StateDirectory so it works out of the box.
+    let env_file = format!(
+        r#"# EnvironmentFile for the {bin} systemd unit (#115). Installed to
+# /etc/{bin}/{bin}.env. All config is 12-factor (no runtime config file).
+
+# Bind on all interfaces so a reverse proxy in front can reach it.
+FORGEDB_HOST=0.0.0.0
+FORGEDB_PORT=3000
+
+# Data directory — the systemd StateDirectory (/var/lib/{bin}), created + owned
+# by the service user. This is the whole database; back it up with `forgedb
+# backup create`.
+FORGEDB_DATA=/var/lib/{bin}
+
+# Log level (tracing env-filter). Uncomment for JSON lines to the journal:
+RUST_LOG=info
+# FORGEDB_LOG_FORMAT=json
+
+# Multi-tenancy (#59): one process serves ONE tenant. Set FORGEDB_TENANT to serve
+# <FORGEDB_DATA>/<tenant>, and run one unit per tenant behind a host/subdomain
+# proxy.
+# FORGEDB_TENANT=my-tenant
+
+# Verify-only JWT tenant guard — set the IdP public key path to enable:
+# FORGEDB_JWT_PUBKEY=/etc/{bin}/idp.pem
+# FORGEDB_JWT_ISSUER=https://issuer.example.com
+# FORGEDB_JWT_AUDIENCE={bin}
+# FORGEDB_TENANT_CLAIM=tenant
+"#
+    );
+    fs::write(deploy_dir.join(format!("{bin}.env")), env_file)?;
+
+    // The install README — copy/enable/start + per-tenant + BYO-proxy pointers.
+    let readme = format!(
+        r#"# On-host deployment ({bin})
+
+The symmetric on-host (non-container) path to the `Dockerfile` (#115). The
+generated app is a single self-contained binary configured entirely from the
+environment — an ideal systemd citizen.
+
+## systemd (Linux — the scaffolded path)
+
+```bash
+cargo build --release
+sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
+sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now {bin}
+
+systemctl status {bin}
+journalctl -u {bin} -f          # logs (add FORGEDB_LOG_FORMAT=json for JSON)
+curl -fsS http://localhost:3000/health   # liveness
+curl -fsS http://localhost:3000/ready    # readiness
+```
+
+Edit config in `/etc/{bin}/{bin}.env`, then `sudo systemctl restart {bin}`.
+
+The unit runs as a non-root `DynamicUser` with a managed `StateDirectory`
+(`/var/lib/{bin}`, the data dir) and drains in-flight requests on stop (SIGTERM →
+the graceful-shutdown path in `main.rs`).
+
+## One writer per data directory
+
+The v1 contract is one writer per data dir (an advisory lock on open; a second
+writer refuses to start, it does not corrupt). Do **not** point two units at the
+same `FORGEDB_DATA`. To scale across tenants, run **one unit per tenant** — copy
+`{bin}.service` to `{bin}@.service` (a systemd template), set
+`FORGEDB_TENANT=%i` and `StateDirectory={bin}/%i` in it, and
+`systemctl enable --now {bin}@acme`.
+
+## Reverse proxy / TLS (bring your own)
+
+Terminate TLS and route hosts/subdomains with nginx or Caddy in front of the
+bound port. Forward the `Upgrade`/`Connection` headers so the change-feed /
+live-query / replication **WebSocket** routes work, and forward `Authorization`
+for the JWT guard.
+
+```caddy
+db.example.com {{
+    reverse_proxy 127.0.0.1:3000
+}}
+```
+
+```nginx
+location / {{
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Authorization $http_authorization;
+}}
+```
+
+## Other init systems
+
+systemd is scaffolded; the rest are a hand-portable copy of the same idea —
+`exec` the binary as a non-root user with the env from `{bin}.env`, auto-restart,
+stop with SIGTERM:
+
+- **OpenRC** (Alpine/Gentoo): a `/etc/init.d/{bin}` `supervise-daemon` script +
+  `/etc/conf.d/{bin}` for the env.
+- **runit / s6** (Void/minimal): a `run` script `exec chpst -u {bin} <binary>`
+  (runit) or `s6-setuidgid` (s6); restart is intrinsic.
+- **launchd** (macOS): a `.plist` with `ProgramArguments`, `EnvironmentVariables`,
+  and `KeepAlive`.
+- **supervisord** (systemd-less/shared hosts): a `[program:{bin}]` block with
+  `environment=`, `autorestart=true`, `stopsignal=TERM`.
+- **Windows service**: wrap the console binary with WinSW/NSSM (SIGTERM semantics
+  differ; graceful shutdown rides Ctrl-C on Windows).
+
+`nohup`/`tmux`/`screen` are **not** deployment targets — no restart, no boot
+persistence, no log management.
+
+See `docs/DEPLOYMENT.md` for the full landscape and the container path.
+"#
+    );
+    fs::write(deploy_dir.join("README.md"), readme)?;
+
+    ui::step(
+        "🐧",
+        &format!("Created deploy/{bin}.service, deploy/{bin}.env, deploy/README.md"),
+    );
     Ok(())
 }
