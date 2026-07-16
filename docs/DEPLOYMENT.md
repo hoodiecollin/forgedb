@@ -91,6 +91,90 @@ The generated `docker-compose.yml` maps `3000:3000`, mounts a named
 Tenancy, JSON logs, and JWT knobs are present as commented environment entries —
 uncomment what you need.
 
+## On-host (systemd — non-container)
+
+Many operators run the binary directly under an init system. `forgedb init` emits
+the symmetric on-host artifacts to the Docker path, under `deploy/`:
+
+- `deploy/<name>.service` — a systemd unit template.
+- `deploy/<name>.env` — the `EnvironmentFile` (the same `FORGEDB_*` knobs as the
+  compose file).
+- `deploy/README.md` — the install steps + the other-init-system notes.
+
+Build, install, enable:
+
+```bash
+cargo build --release
+sudo install -Dm755 target/release/myblog /usr/local/bin/myblog
+sudo install -Dm644 deploy/myblog.env     /etc/myblog/myblog.env
+sudo install -Dm644 deploy/myblog.service /etc/systemd/system/myblog.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now myblog
+
+systemctl status myblog
+journalctl -u myblog -f      # logs (FORGEDB_LOG_FORMAT=json for JSON lines)
+```
+
+The unit runs the server as a non-root `DynamicUser` with a managed
+`StateDirectory` (`/var/lib/<name>` — the on-host analogue of the container's
+non-root user + `/data` VOLUME; the env file's `FORGEDB_DATA` points at it), and
+`KillSignal=SIGTERM` + `TimeoutStopSec=30` let `systemctl stop` drain in-flight
+requests via the graceful-shutdown path. It ships a standard hardening block
+(`NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp`, …). Edit config in
+`/etc/<name>/<name>.env`, then `systemctl restart <name>`.
+
+**Readiness:** the unit is `Type=exec` (started once the binary execs) — the
+server does not `sd_notify`. Point a proxy/LB readiness check at `GET /ready`
+(true socket-notify readiness is a deferred enhancement — it would need an
+`sd-notify` dependency in the binary).
+
+**One unit per data directory.** The single-writer contract holds on-host: do not
+point two units at the same `FORGEDB_DATA`. For per-tenant scale-out, run one unit
+per tenant — copy `<name>.service` to a systemd **template** `<name>@.service`,
+set `FORGEDB_TENANT=%i` and `StateDirectory=<name>/%i`, then
+`systemctl enable --now <name>@acme`.
+
+### Other init systems
+
+systemd is the scaffolded path. The rest follow the same shape — `exec` the
+binary as a non-root user with the env from `<name>.env`, auto-restart, stop with
+`SIGTERM` — and are documented, not emitted:
+
+| Init system | Platform | Shape |
+|---|---|---|
+| **OpenRC** | Alpine, Gentoo | `/etc/init.d/<name>` `supervise-daemon` script + `/etc/conf.d/<name>` env |
+| **runit** | Void, minimal | a `run` script `exec chpst -u <name> <binary>` (restart intrinsic) |
+| **s6 / s6-rc** | minimal/embedded | a `run` script with `s6-setuidgid` |
+| **launchd** | macOS | a `.plist` with `ProgramArguments` + `EnvironmentVariables` + `KeepAlive` |
+| **supervisord** | any (systemd-less) | a `[program:<name>]` block: `environment=`, `autorestart=true`, `stopsignal=TERM` |
+| **Windows service** | Windows | wrap the console binary with WinSW/NSSM (SIGTERM semantics differ — graceful shutdown rides Ctrl-C) |
+
+`nohup`/`tmux`/`screen` are **not** deployment targets (no restart, no boot
+persistence, no log management).
+
+### Reverse proxy / TLS (bring your own)
+
+The bundled-nginx model is gone. Terminate TLS and route hosts/subdomains with
+nginx or Caddy in front of the bound port. Forward the `Upgrade`/`Connection`
+headers so the change-feed / live-query / replication **WebSocket** routes work,
+and forward `Authorization` for the JWT guard:
+
+```caddy
+db.example.com {
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Authorization $http_authorization;
+}
+```
+
 ## Multi-tenancy (process-per-tenant)
 
 ForgeDB v1 multi-tenancy is **physical**: one generated server process serves
