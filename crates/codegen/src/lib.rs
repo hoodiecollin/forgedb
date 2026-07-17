@@ -56,10 +56,12 @@ pub mod transform;
 pub mod wasm;
 pub mod ffi;
 pub mod pyo3;
+pub mod napi;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use ffi::FfiGenerator;
+pub use napi::NapiGenerator;
 pub use openapi::OpenApiGenerator;
 pub use pyo3::PyO3Generator;
 pub use rust::RustGenerator;
