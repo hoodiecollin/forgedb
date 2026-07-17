@@ -1,7 +1,7 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
-    ApiGenerator, OpenApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator,
-    WasmGenerator,
+    ApiGenerator, FfiGenerator, OpenApiGenerator, RustGenerator, StubGenerator,
+    TypeScriptGenerator, WasmGenerator,
 };
 use forgedb_parser::Parser;
 use std::fs;
@@ -158,9 +158,17 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 format_version,
             )?);
         }
+        "ffi" => {
+            generated_files.extend(generate_ffi_engine(
+                &schema,
+                &output_path,
+                options.force,
+                format_version,
+            )?);
+        }
         _ => {
             return Err(CliError::Other(format!(
-                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm, transform",
+                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm, ffi, transform",
                 target
             )));
         }
@@ -254,7 +262,64 @@ fn generate_all(
         files.extend(generate_wasm_replica(schema, output_path, force, format_version)?);
     }
 
+    // Generate the native FFI engine crate (the Layer-0 C-ABI spine every
+    // language binding hangs off).  Also OPT-IN — the default `all` skips it; a
+    // project enables it by listing `ffi` in `[generate].targets`.
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "ffi")) {
+        files.extend(generate_ffi_engine(schema, output_path, force, format_version)?);
+    }
+
     Ok(files)
+}
+
+/// Generate the native FFI engine crate (language bindings #51/#52/#117): the
+/// Layer-0 C-ABI spine (`ffi/src/ffi.rs`) over the SAME generated `database.rs`
+/// (`ffi/src/database.rs`), plus a `Cargo.toml` scaffold written only when
+/// absent.  Build it with `cargo build --release` to produce the `cdylib` a
+/// Python/Node/Bun binding loads.
+fn generate_ffi_engine(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+    format_version: u32,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let ffi_dir = output_path.join("ffi");
+    let src_dir = ffi_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let mut files = Vec::new();
+
+    // The Layer-0 C-ABI spine (lifecycle + error surface).  Emitted as the crate
+    // root `lib.rs` so its `mod database;` resolves to `src/database.rs` (same
+    // shape as the wasm replica's `lib.rs`).
+    let ffi_result = FfiGenerator::generate(schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let lib_path = src_dir.join("lib.rs");
+    write_file(&lib_path, &ffi_result.code, force)?;
+    files.push((lib_path, ffi_result));
+
+    // The generated database the spine wraps (same generator as the `rust`
+    // target — the FFI engine is the same data logic, exposed over the C-ABI).
+    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let db_path = src_dir.join("database.rs");
+    write_file(&db_path, &rust_result.code, force)?;
+    files.push((db_path, rust_result));
+
+    write_ffi_engine_scaffold(&ffi_dir)?;
+    Ok(files)
+}
+
+/// Write the FFI engine crate's `Cargo.toml`.  User-editable config, so it is
+/// written ONLY when absent — a regenerate (even `--force`, which overwrites the
+/// `.rs` files) never clobbers it, mirroring the wasm replica scaffold.
+fn write_ffi_engine_scaffold(ffi_dir: &Path) -> Result<()> {
+    let path = ffi_dir.join("Cargo.toml");
+    if !path.exists() {
+        fs::write(&path, FfiGenerator::cargo_toml_scaffold("forgedb-ffi-engine"))?;
+        ui::info(&format!("  ✓ {} (native FFI engine scaffold)", path.display()));
+    }
+    Ok(())
 }
 
 /// Generate the `wasm32` browser read-replica crate (#110 Milestone C): the
