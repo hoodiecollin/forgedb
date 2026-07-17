@@ -28,6 +28,7 @@ impl PyO3Generator {
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         let row_classes = Self::generate_row_classes(schema);
         let db_methods = Self::generate_db_methods(schema);
+        let relation_methods = Self::generate_relation_methods(schema);
         let registrations = Self::generate_registrations(schema);
 
         let tokens = quote! {
@@ -125,6 +126,8 @@ impl PyO3Generator {
                 }
 
                 #(#db_methods)*
+
+                #(#relation_methods)*
             }
 
             /// The generated Python module — registers the row classes, `ForgeDb`,
@@ -341,6 +344,240 @@ impl PyO3Generator {
                 }
             })
             .collect()
+    }
+
+    /// Whether a model has a materialized identity (an `id` field or an
+    /// auto-generated PK) — hence a generated row class (`Py<Model>`) and an
+    /// id-addressable storage read. A traversal that would return / start from a
+    /// model without one is skipped (there is no row class to marshal into).
+    fn is_identity_model(model: &forgedb_parser::Model) -> bool {
+        model.fields.iter().any(|f| f.name == "id" || f.auto_generate)
+    }
+
+    /// The relation-traversal methods on `ForgeDb`, mirroring the generated
+    /// `Database` traversal getters **one-for-one** — same names, derived from the
+    /// same schema in the same order, sharing a `seen` dedup set that tracks
+    /// `RustGenerator::generate_traversal_impl` exactly (so a method is never
+    /// emitted for a getter that was deduped away). Three families, all id-keyed
+    /// (a fixed generated edge walk, never a runtime predicate):
+    ///   * **Forward FK** `<model>_<field>(id) -> Option<Py<Target>>` — fetch the
+    ///     source by id, resolve the `*Target`/`?Target` FK (flattened: `None` if
+    ///     the source is absent OR the FK is unset);
+    ///   * **Reverse 1:M** `<parent>_<field>[_by_<child_field>](id) -> [Py<Child>]`
+    ///     — every child whose FK references the (UUID) parent id;
+    ///   * **M2M** `link_<a>_<b>(l, r)` / `unlink_<a>_<b>(l, r) -> bool` + the
+    ///     query getters `<a>_<field1>(id) -> [Py<B>]` / `<b>_<field2>(id) ->
+    ///     [Py<A>]`.
+    ///
+    /// Rows marshal through the generated Py row classes (`Py<Model>::from_record`);
+    /// a traversal to/from a **non-identity** model (no row class) is skipped — an
+    /// honest limit, not a drift (the `seen` slot is still consumed so ordering is
+    /// unchanged). The one snapshot-scoped M2M `_at` traversal is deferred (there
+    /// is no `Snapshot` class on the ergonomic wrapper yet). Identity: no generic
+    /// query surface — each getter is a fixed, generated edge walk by name.
+    fn generate_relation_methods(schema: &Schema) -> Vec<TokenStream> {
+        use forgedb_parser::{FieldType, RelationType};
+        use std::collections::{HashMap, HashSet};
+
+        let mut methods = Vec::new();
+        // ONE `seen` set spanning all three families, inserted in the SAME order as
+        // `generate_traversal_impl`, so first-occurrence-wins agrees exactly.
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
+        for model in &schema.models {
+            let model_snake = RustGenerator::to_snake_case(&model.name);
+            let model_has_id = Self::is_identity_model(model);
+            let source_id_ty = RustGenerator::id_type_tokens(model);
+            let storage = format_ident!("{}", model_snake);
+            for field in &model.fields {
+                let target_name = match &field.field_type {
+                    FieldType::Relation(RelationType::RequiredReference(t))
+                    | FieldType::Relation(RelationType::OptionalReference(t)) => t,
+                    _ => continue,
+                };
+                let Some(target) = schema.find_model(target_name) else {
+                    continue;
+                };
+                if !RustGenerator::is_uuid_pk(target) {
+                    continue;
+                }
+                let method_name = format!("{model_snake}_{}", field.name);
+                if !seen.insert(method_name.clone()) {
+                    continue;
+                }
+                // Needs the source id-addressable (to `get` it) and the target to
+                // have a row class (identity). Either missing → skip emission; the
+                // `seen` slot is already consumed, matching the impl's ordering.
+                if !model_has_id || !Self::is_identity_model(target) {
+                    continue;
+                }
+                let method_ident = format_ident!("{}", method_name);
+                let py_target = format_ident!("Py{}", target.name);
+                let doc = format!(
+                    "Resolve the `{}` foreign key of a `{}` (by id) to its record, or `None`.",
+                    field.name, model.name
+                );
+                methods.push(quote! {
+                    #[doc = #doc]
+                    fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Option<#py_target>> {
+                        let id: #source_id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            self.inner.#storage.get(id).and_then(|__rec| self.inner.#method_ident(&__rec))
+                        })) {
+                            Ok(opt) => Ok(opt.map(#py_target::from_record)),
+                            Err(p) => Err(panic_to_py_err(p)),
+                        }
+                    }
+                });
+            }
+        }
+
+        // --- B. Reverse one-to-many collection getters ------------------------
+        let pairs = schema.detect_relations();
+        let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
+        for p in &pairs {
+            *group_counts
+                .entry((p.parent_model.clone(), p.parent_field.clone()))
+                .or_default() += 1;
+        }
+        for p in &pairs {
+            let Some(parent) = schema.find_model(&p.parent_model) else {
+                continue;
+            };
+            if !RustGenerator::is_uuid_pk(parent) {
+                continue;
+            }
+            let ambiguous = group_counts
+                .get(&(p.parent_model.clone(), p.parent_field.clone()))
+                .is_some_and(|&c| c > 1);
+            let method_name = if ambiguous {
+                format!(
+                    "{}_{}_by_{}",
+                    RustGenerator::to_snake_case(&p.parent_model),
+                    p.parent_field,
+                    p.child_field
+                )
+            } else {
+                format!("{}_{}", RustGenerator::to_snake_case(&p.parent_model), p.parent_field)
+            };
+            if !seen.insert(method_name.clone()) {
+                continue;
+            }
+            // The child needs a row class to marshal into (identity).
+            let Some(child) = schema.find_model(&p.child_model) else {
+                continue;
+            };
+            if !Self::is_identity_model(child) {
+                continue;
+            }
+            let method_ident = format_ident!("{}", method_name);
+            let py_child = format_ident!("Py{}", child.name);
+            let doc = format!(
+                "All `{}` whose `{}` references the given `{}` id.",
+                p.child_model, p.child_field, p.parent_model
+            );
+            methods.push(quote! {
+                #[doc = #doc]
+                fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_child>> {
+                    let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                    match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
+                        Ok(rows) => Ok(rows.into_iter().map(#py_child::from_record).collect()),
+                        Err(p) => Err(panic_to_py_err(p)),
+                    }
+                }
+            });
+        }
+
+        // --- C. Many-to-many link / unlink + query getters --------------------
+        for m in RustGenerator::valid_m2m(schema) {
+            let snake1 = RustGenerator::to_snake_case(&m.model1);
+            let snake2 = RustGenerator::to_snake_case(&m.model2);
+            let model1 = schema.find_model(&m.model1);
+            let model2 = schema.find_model(&m.model2);
+
+            // link_<a>_<b> — no row class needed (UUID ids in, unit out).
+            let link_name = format!("link_{snake1}_{snake2}");
+            if seen.insert(link_name.clone()) {
+                let link_ident = format_ident!("{}", link_name);
+                let doc = format!("Link a `{}` (left) and a `{}` (right) in the junction.", m.model1, m.model2);
+                methods.push(quote! {
+                    #[doc = #doc]
+                    fn #link_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<()> {
+                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        match catch_unwind(AssertUnwindSafe(|| self.inner.#link_ident(left, right))) {
+                            Ok(()) => Ok(()),
+                            Err(p) => Err(panic_to_py_err(p)),
+                        }
+                    }
+                });
+            }
+
+            // unlink_<a>_<b> — no row class needed (UUID ids in, bool out).
+            let unlink_name = format!("unlink_{snake1}_{snake2}");
+            if seen.insert(unlink_name.clone()) {
+                let unlink_ident = format_ident!("{}", unlink_name);
+                let doc = format!("Unlink a `{}` (left) / `{}` (right); `True` if a pair was removed.", m.model1, m.model2);
+                methods.push(quote! {
+                    #[doc = #doc]
+                    fn #unlink_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
+                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        match catch_unwind(AssertUnwindSafe(|| self.inner.#unlink_ident(left, right))) {
+                            Ok(removed) => Ok(removed),
+                            Err(p) => Err(panic_to_py_err(p)),
+                        }
+                    }
+                });
+            }
+
+            // model1.field1 -> Vec<model2>  (forward M2M query)
+            let fwd_name = format!("{snake1}_{}", m.field1);
+            if seen.insert(fwd_name.clone()) {
+                if let Some(model2) = model2 {
+                    if Self::is_identity_model(model2) {
+                        let fwd_ident = format_ident!("{}", fwd_name);
+                        let py_b = format_ident!("Py{}", model2.name);
+                        let doc = format!("All linked `{}` for the given `{}` id.", m.model2, m.model1);
+                        methods.push(quote! {
+                            #[doc = #doc]
+                            fn #fwd_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_b>> {
+                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
+                                    Ok(rows) => Ok(rows.into_iter().map(#py_b::from_record).collect()),
+                                    Err(p) => Err(panic_to_py_err(p)),
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // model2.field2 -> Vec<model1>  (reverse M2M query)
+            let rev_name = format!("{snake2}_{}", m.field2);
+            if seen.insert(rev_name.clone()) {
+                if let Some(model1) = model1 {
+                    if Self::is_identity_model(model1) {
+                        let rev_ident = format_ident!("{}", rev_name);
+                        let py_a = format_ident!("Py{}", model1.name);
+                        let doc = format!("All linked `{}` for the given `{}` id.", m.model1, m.model2);
+                        methods.push(quote! {
+                            #[doc = #doc]
+                            fn #rev_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_a>> {
+                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
+                                    Ok(rows) => Ok(rows.into_iter().map(#py_a::from_record).collect()),
+                                    Err(p) => Err(panic_to_py_err(p)),
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+
+        methods
     }
 
     /// `m.add_class::<Py<Model>>()?` for each row class.
