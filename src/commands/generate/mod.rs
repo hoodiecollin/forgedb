@@ -1,6 +1,6 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, OpenApiGenerator, RustGenerator, StubGenerator,
+    ApiGenerator, FfiGenerator, OpenApiGenerator, PyO3Generator, RustGenerator, StubGenerator,
     TypeScriptGenerator, WasmGenerator,
 };
 use forgedb_parser::Parser;
@@ -199,10 +199,12 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         // `python --runtime` / `node|bun --runtime`; the generators land in their
         // own phases.
         "pyo3" => {
-            return Err(CliError::Other(
-                "`generate python --runtime` (PyO3 binding) is not yet implemented"
-                    .to_string(),
-            ));
+            generated_files.extend(generate_pyo3_binding(
+                &schema,
+                &output_path,
+                options.force,
+                format_version,
+            )?);
         }
         "napi" => {
             return Err(CliError::Other(
@@ -354,6 +356,81 @@ fn generate_ffi_engine(
     write_ffi_engine_scaffold(&ffi_dir)?;
     Ok(files)
 }
+
+/// Generate the PyO3 Python binding crate (#51): the `#[pyclass]` wrapper
+/// (`pyo3/src/lib.rs`) over the SAME generated `database.rs`
+/// (`pyo3/src/database.rs`), plus a `Cargo.toml` scaffold written only when
+/// absent.  Build it with `maturin develop` / `maturin build` (or a plain
+/// `cargo build` for the compile check) to produce the `forgedb` extension
+/// module Python imports.
+fn generate_pyo3_binding(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+    format_version: u32,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let pyo3_dir = output_path.join("pyo3");
+    let src_dir = pyo3_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let mut files = Vec::new();
+
+    // The PyO3 wrapper (crate root `lib.rs` so its `mod database;` resolves to
+    // `src/database.rs`, same shape as the FFI engine / wasm replica).
+    let py_result =
+        PyO3Generator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let lib_path = src_dir.join("lib.rs");
+    write_file(&lib_path, &py_result.code, force)?;
+    files.push((lib_path, py_result));
+
+    // The generated database the wrapper binds (same generator as the `rust`
+    // target — the binding is the same data logic, exposed to Python).
+    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let db_path = src_dir.join("database.rs");
+    write_file(&db_path, &rust_result.code, force)?;
+    files.push((db_path, rust_result));
+
+    let cargo_path = pyo3_dir.join("Cargo.toml");
+    if !cargo_path.exists() {
+        fs::write(
+            &cargo_path,
+            PyO3Generator::cargo_toml_scaffold("forgedb-python"),
+        )?;
+        ui::info(&format!(
+            "  ✓ {} (PyO3 binding scaffold)",
+            cargo_path.display()
+        ));
+    }
+
+    // pyproject.toml so `maturin` can build a wheel out of the box. User-editable
+    // — written only when absent.
+    let pyproject_path = pyo3_dir.join("pyproject.toml");
+    if !pyproject_path.exists() {
+        fs::write(&pyproject_path, PYO3_PYPROJECT_SCAFFOLD)?;
+        ui::info(&format!(
+            "  ✓ {} (maturin pyproject)",
+            pyproject_path.display()
+        ));
+    }
+
+    Ok(files)
+}
+
+/// The `maturin` build config for the generated PyO3 binding.
+const PYO3_PYPROJECT_SCAFFOLD: &str = r#"[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "forgedb"
+version = "0.1.0"
+requires-python = ">=3.8"
+description = "Generated ForgeDB Python binding"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+"#;
 
 /// Write the FFI engine crate's `Cargo.toml`.  User-editable config, so it is
 /// written ONLY when absent — a regenerate (even `--force`, which overwrites the
