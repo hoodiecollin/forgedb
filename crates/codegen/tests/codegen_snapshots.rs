@@ -3504,6 +3504,13 @@ Post {
   id: +uuid
   title: string
   author: *User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  label: string
+  posts: [Post]
 }
 
 Reading {
@@ -3567,6 +3574,34 @@ Reading {
     assert!(flat.contains("m.add_class::<ForgeDb>()"), "ForgeDb is registered");
     assert!(flat.contains("m.add_class::<PyUser>()"), "the User row class is registered");
 
+    // Relation traversal (Phase 5b) — forward FK / reverse 1:M / M2M, mirroring the
+    // generated `Database` getters by name, marshalling into the Py row classes.
+    assert!(
+        flat.contains("fnpost_author(&self,id:&Bound<'_,PyAny>)->PyResult<Option<PyUser>>"),
+        "forward FK post_author resolves to Option<PyUser>"
+    );
+    assert!(
+        flat.contains("self.inner.post.get(id).and_then(|__rec|self.inner.post_author(&__rec))"),
+        "forward FK fetches the source then resolves the generated getter"
+    );
+    assert!(
+        flat.contains("fnuser_posts(&self,id:&Bound<'_,PyAny>)->PyResult<Vec<PyPost>>"),
+        "reverse 1:M user_posts returns Vec<PyPost>"
+    );
+    assert!(flat.contains("fnlink_post_tag(&mutself"), "M2M link_post_tag exists");
+    assert!(
+        flat.contains("fnunlink_post_tag(&mutself") && flat.contains("PyResult<bool>"),
+        "M2M unlink_post_tag returns bool"
+    );
+    assert!(
+        flat.contains("fnpost_tags(&self,id:&Bound<'_,PyAny>)->PyResult<Vec<PyTag>>"),
+        "M2M forward query post_tags returns Vec<PyTag>"
+    );
+    assert!(
+        flat.contains("fntag_posts(&self,id:&Bound<'_,PyAny>)->PyResult<Vec<PyPost>>"),
+        "M2M reverse query tag_posts returns Vec<PyPost>"
+    );
+
     // IDENTITY: no generic query surface / runtime schema dispatch.
     for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
         assert!(
@@ -3595,6 +3630,13 @@ Post {
   id: +uuid
   title: string
   author: *User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  label: string
+  posts: [Post]
 }
 
 Reading {
@@ -3647,6 +3689,28 @@ Reading {
     // (a panic must not unwind across the Node-API boundary).
     assert!(flat.contains("Error::from_reason"), "errors surface as a thrown JS Error");
     assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
+
+    // Relation traversal (Phase 6b) — forward FK / reverse 1:M / M2M, mirroring the
+    // generated `Database` getters by name, marshalling via the napi serde bridge.
+    assert!(
+        flat.contains("pubfnpost_author(&self,env:Env,id:JsUnknown)->Result<JsUnknown>"),
+        "forward FK post_author exists"
+    );
+    assert!(
+        flat.contains("self.inner.post.get(id).and_then(|__rec|self.inner.post_author(&__rec))"),
+        "forward FK fetches the source then resolves the generated getter"
+    );
+    assert!(
+        flat.contains("pubfnuser_posts(&self,env:Env,id:JsUnknown)->Result<JsUnknown>"),
+        "reverse 1:M user_posts exists"
+    );
+    assert!(flat.contains("pubfnlink_post_tag(&mutself"), "M2M link_post_tag exists");
+    assert!(
+        flat.contains("pubfnunlink_post_tag(&mutself") && flat.contains("->Result<bool>"),
+        "M2M unlink_post_tag returns bool"
+    );
+    assert!(flat.contains("pubfnpost_tags(&self,env:Env,id:JsUnknown)"), "M2M forward query post_tags exists");
+    assert!(flat.contains("pubfntag_posts(&self,env:Env,id:JsUnknown)"), "M2M reverse query tag_posts exists");
 
     // IDENTITY: no generic query surface / runtime schema dispatch.
     for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
