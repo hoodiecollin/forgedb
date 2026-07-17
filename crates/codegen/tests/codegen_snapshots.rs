@@ -3,7 +3,7 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, HopPlan, ModelOp, OpenApiGenerator, RustGenerator,
+    ApiGenerator, FfiGenerator, HopPlan, ModelOp, OpenApiGenerator, PyO3Generator, RustGenerator,
     TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema, WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
@@ -3481,6 +3481,96 @@ Post {
         assert!(
             !flat.contains(forbidden),
             "Arrow export must invent no generic query surface (found `{forbidden}`)"
+        );
+    }
+}
+
+#[test]
+fn test_pyo3_generation_binding() {
+    // PyO3 Python binding (#51) — the ergonomic per-runtime wrapper over the SAME
+    // generated `database.rs`.  A `#[pyclass]` row type per identity model + a
+    // `ForgeDb` whose methods mirror the generated CRUD 1:1, calling the integrity
+    // wrappers + storage reads by name.  Rows marshal natively through the struct's
+    // own serde via pythonize — no generic query builder, no `match model`.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Reading {
+  id: +u64
+  value: i64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = PyO3Generator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // One `#[pyclass]` row type per identity model, named for the model (the
+    // Python-visible name), a newtype over the generated struct.
+    for model in ["User", "Post", "Reading"] {
+        assert!(
+            flat.contains(&format!("#[pyclass(name=\"{model}\")]")),
+            "missing #[pyclass] row type for {model}"
+        );
+        assert!(
+            flat.contains(&format!("structPy{model}")),
+            "row class Py{model} is a newtype over the generated struct"
+        );
+    }
+
+    // The `ForgeDb` handle + its schema-invariant lifecycle.
+    assert!(flat.contains("structForgeDb"), "the ForgeDb handle exists");
+    assert!(flat.contains("Database::open_at("), "open wraps Database::open_at");
+    assert!(flat.contains("self.inner.commit()"), "commit wraps the generated commit");
+
+    // Per-model CRUD, each keyed by the model's snake name, going through the
+    // generated integrity wrappers + storage reads (not a reimplementation).
+    for m in ["user", "post", "reading"] {
+        for op in ["create", "get", "all", "count", "update", "delete"] {
+            assert!(
+                flat.contains(&format!("fn{op}_{m}")),
+                "missing per-model method {op}_{m}"
+            );
+        }
+    }
+    assert!(flat.contains("self.inner.create_user("), "create uses the create_<m> integrity wrapper");
+    assert!(flat.contains("self.inner.update_post("), "update uses the update_<m> wrapper");
+    assert!(flat.contains("self.inner.delete_user("), "delete uses the delete_<m> referential wrapper");
+    assert!(flat.contains("self.inner.user.get("), "get uses the generated storage read");
+    assert!(flat.contains("self.inner.reading.row_count("), "count uses the generated row_count");
+    assert!(flat.contains("self.inner.post.all()"), "all uses the generated storage read");
+
+    // Rows/ids marshal through the generated struct's serde via pythonize (native
+    // Python objects, one source of truth — no second per-field matrix).
+    assert!(flat.contains("database::User"), "rows decode into the generated User struct");
+    assert!(flat.contains("pythonize::depythonize"), "inbound rows/ids via pythonize");
+    assert!(flat.contains("pythonize::pythonize"), "outbound rows/ids via pythonize");
+
+    // Integrity failures raise the Python-visible ForgeDbError; engine calls are
+    // catch_unwind-guarded (a panic must not unwind into the interpreter).
+    assert!(flat.contains("ForgeDbError"), "errors surface as a Python ForgeDbError");
+    assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
+
+    // The module registers every row class + the handle.
+    assert!(flat.contains("#[pymodule]"), "a #[pymodule] entry point is generated");
+    assert!(flat.contains("m.add_class::<ForgeDb>()"), "ForgeDb is registered");
+    assert!(flat.contains("m.add_class::<PyUser>()"), "the User row class is registered");
+
+    // IDENTITY: no generic query surface / runtime schema dispatch.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
+        assert!(
+            !flat.contains(forbidden),
+            "the PyO3 binding must invent no generic query surface (found `{forbidden}`)"
         );
     }
 }
