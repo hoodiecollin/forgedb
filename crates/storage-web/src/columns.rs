@@ -17,6 +17,41 @@ fn oob() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "Index out of bounds")
 }
 
+/// The backing of one columnar export batch — the browser twin of the native
+/// [`forgedb_storage_native::ColumnExport`](../../forgedb_storage_native).
+///
+/// The native backend can hand out a zero-copy `mmap` alias of a dense prefix;
+/// this backend is **gather-only** (constraint 7 — no aliasing into the wasm
+/// arena / `thread_local` store), so an export is always an owned copy. The
+/// public surface (`as_ptr` / `len` / `is_empty` / `as_slice`) matches the
+/// native type exactly, so the shared generated columnar-export code links
+/// unchanged across targets.
+pub struct ColumnExport {
+    bytes: Vec<u8>,
+}
+
+impl ColumnExport {
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
 /// Fixed-size column storage backed by an in-memory arena.
 pub struct FixedColumn {
     path: PathBuf,
@@ -150,6 +185,21 @@ impl FixedColumn {
                 out[slot * vs..slot * vs + vs].copy_from_slice(&b[src..src + vs]);
             }
             Ok(out)
+        })
+    }
+
+    /// Export the physical rows at `indices` as a [`ColumnExport`]. Arena-backed
+    /// twin of the native [`FixedColumn::export`](../../forgedb_storage_native) —
+    /// same signature, but **gather-only** (this target never aliases the arena),
+    /// so it always returns an owned copy. Schema-agnostic: `indices` are opaque
+    /// physical row positions the caller (generated code) computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
+    pub fn export(&self, indices: &[usize]) -> io::Result<ColumnExport> {
+        Ok(ColumnExport {
+            bytes: self.gather(indices)?,
         })
     }
 

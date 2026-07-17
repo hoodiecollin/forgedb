@@ -335,6 +335,78 @@ impl Snapshot {
 /// any other file descriptor to the same file, but a crash before [`flush`](FixedColumn::flush)
 /// may lose the most recent appends. Call `flush()` at commit boundaries or before
 /// advancing the WAL checkpoint.
+/// The backing of one columnar export batch — the substrate half of the
+/// language bindings' Arrow / columnar-export path.
+///
+/// A columnar export hands the caller (generated FFI glue) a single contiguous,
+/// stable-pointer byte buffer for one column at one live-row selection. This
+/// type owns that buffer through *whichever* of the two production paths
+/// produced it, behind an identical `as_ptr()` / `len()` surface so the consumer
+/// (e.g. an Arrow `ArrowArray`) is **alias-or-gather transparent**:
+///
+/// - [`ColumnExport::Mapped`] — a **zero-copy `mmap` alias** of the column
+///   file's dense prefix, taken when the live selection is exactly the
+///   contiguous prefix `[0, n)` (no updates, no tombstones). No bytes are
+///   copied; the pointer aliases the page cache directly. Because numeric
+///   columns are stored little-endian (`to_le_bytes`), the mapped prefix *is* a
+///   valid Arrow primitive buffer as-is.
+/// - [`ColumnExport::Owned`] — a gathered contiguous copy (`FixedColumn::gather`),
+///   the fallback whenever the selection is not an aliasable dense prefix
+///   (update-heavy or tombstoned tables), or is empty.
+///
+/// # Safety / aliasing invariant (`Mapped`)
+///
+/// The mapped prefix aliases live file pages, so it relies on the same
+/// single-writer, append-only discipline the reader handles already assume:
+/// prefix rows `[0, n)` are committed and immutable (appends only ever extend
+/// past `n`, never rewrite mapped bytes), and a compaction/rollback that would
+/// renumber or truncate below `n` does not run while an export is outstanding
+/// (exports are synchronous reads taken on the single writer). Under that
+/// discipline the alias observes a stable snapshot.
+pub enum ColumnExport {
+    /// A gathered / copied contiguous buffer.
+    Owned(Vec<u8>),
+    /// A zero-copy read-only `mmap` alias of the column file's dense prefix.
+    Mapped(memmap2::Mmap),
+}
+
+impl ColumnExport {
+    /// Pointer to the first byte of the exported buffer. Stable across moving
+    /// the `ColumnExport` (both a `Vec`'s heap allocation and an `Mmap`'s mapped
+    /// address are independent of where the owner struct itself lives), so the
+    /// FFI layer can capture it, then move `self` into an owner box.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const u8 {
+        match self {
+            ColumnExport::Owned(v) => v.as_ptr(),
+            ColumnExport::Mapped(m) => m.as_ptr(),
+        }
+    }
+
+    /// Total exported byte length (`live_rows * value_size`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            ColumnExport::Owned(v) => v.len(),
+            ColumnExport::Mapped(m) => m.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The exported bytes as a slice.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            ColumnExport::Owned(v) => v.as_slice(),
+            ColumnExport::Mapped(m) => &m[..],
+        }
+    }
+}
+
 pub struct FixedColumn {
     file: File,
     row_count: usize,
@@ -601,6 +673,42 @@ impl FixedColumn {
                 .read_exact_at(&mut out[dst..dst + self.value_size], src)?;
         }
         Ok(out)
+    }
+
+    /// Export the physical rows at `indices` as a [`ColumnExport`], taking the
+    /// **zero-copy `mmap` alias** fast path when `indices` is the contiguous
+    /// dense prefix `[0, n)` and falling back to [`gather`](Self::gather)
+    /// (an owned copy) otherwise. The returned buffer is identical bytes either
+    /// way (`indices.len() * value_size`), so the FFI / Arrow consumer is
+    /// alias-or-gather transparent.
+    ///
+    /// This is the class-1 columnar-read primitive the language bindings' Arrow
+    /// export links: `indices` are opaque physical row positions the caller
+    /// (generated code) computed from the live set; `export` reads no field
+    /// name, type, or schema — it only inspects the indices' shape to decide
+    /// whether they alias a prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`, or an I/O
+    /// error if the `mmap` of the aliasable prefix fails.
+    pub fn export(&self, indices: &[usize]) -> io::Result<ColumnExport> {
+        let n = indices.len();
+        // A dense prefix is `indices == [0, 1, ..., n-1]`, entirely within the
+        // committed rows. Empty selections take the trivial owned path.
+        let is_dense_prefix =
+            n > 0 && n <= self.row_count && indices.iter().enumerate().all(|(i, &x)| x == i);
+
+        if is_dense_prefix {
+            // Alias exactly the first `n * value_size` bytes of the column file
+            // — no copy. Safe under the single-writer/append-only invariant
+            // documented on `ColumnExport`.
+            let map_len = n * self.value_size;
+            let mmap = unsafe { memmap2::MmapOptions::new().len(map_len).map(&self.file)? };
+            return Ok(ColumnExport::Mapped(mmap));
+        }
+
+        Ok(ColumnExport::Owned(self.gather(indices)?))
     }
 
     /// Flush all pending writes to disk (fsync).

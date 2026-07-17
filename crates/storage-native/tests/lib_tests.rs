@@ -1204,3 +1204,63 @@ fn test_fixed_column_gather_full_prefix_matches_reads() {
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+// export(): the alias-or-gather columnar-export primitive (the zero-copy fast
+// path behind the bindings' Arrow export). A contiguous dense prefix `[0, n)`
+// aliases the column file via mmap (`ColumnExport::Mapped`); any other selection
+// falls back to a gathered owned copy (`ColumnExport::Owned`). Both expose the
+// same bytes through the same `as_ptr`/`len`/`as_slice` surface.
+#[test]
+fn test_fixed_column_export_aliases_dense_prefix_else_gathers() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_export_alias");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("e.bin"), 8).unwrap();
+    for v in [100u64, 101, 102, 103, 104] {
+        col.append_u64(v).unwrap();
+    }
+
+    // A dense prefix [0, 3) → zero-copy mmap alias, exact prefix bytes.
+    let prefix = col.export(&[0, 1, 2]).unwrap();
+    assert!(
+        matches!(prefix, ColumnExport::Mapped(_)),
+        "a contiguous [0, n) prefix must alias via mmap"
+    );
+    assert_eq!(prefix.len(), 3 * 8);
+    let s = prefix.as_slice();
+    for i in 0..3usize {
+        assert_eq!(u64::from_le_bytes(s[i * 8..i * 8 + 8].try_into().unwrap()), 100 + i as u64);
+    }
+
+    // The FULL prefix [0, len) also aliases.
+    let full = col.export(&[0, 1, 2, 3, 4]).unwrap();
+    assert!(matches!(full, ColumnExport::Mapped(_)), "the whole-column prefix aliases too");
+    assert_eq!(full.len(), 5 * 8);
+
+    // A reordered / non-prefix selection → gathered owned copy.
+    let gathered = col.export(&[3, 0, 4]).unwrap();
+    assert!(
+        matches!(gathered, ColumnExport::Owned(_)),
+        "a non-prefix selection must gather an owned copy"
+    );
+    let g = gathered.as_slice();
+    assert_eq!(u64::from_le_bytes(g[0..8].try_into().unwrap()), 103);
+    assert_eq!(u64::from_le_bytes(g[8..16].try_into().unwrap()), 100);
+    assert_eq!(u64::from_le_bytes(g[16..24].try_into().unwrap()), 104);
+
+    // A prefix that stops short but is still contiguous-from-0 aliases; a subset
+    // NOT starting at 0 does not.
+    assert!(matches!(col.export(&[0, 1]).unwrap(), ColumnExport::Mapped(_)));
+    assert!(matches!(col.export(&[1, 2, 3]).unwrap(), ColumnExport::Owned(_)));
+
+    // Empty selection → owned empty buffer (no zero-length mmap).
+    let empty = col.export(&[]).unwrap();
+    assert!(matches!(empty, ColumnExport::Owned(_)));
+    assert!(empty.is_empty());
+
+    // Out-of-bounds → error (bytes-identical to gather's contract).
+    assert!(col.export(&[0, 5]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}

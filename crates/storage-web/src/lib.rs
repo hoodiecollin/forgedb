@@ -27,7 +27,7 @@ pub mod store;
 pub mod persist;
 
 pub use columns::{
-    FixedColumn, FixedColumnReader, Tombstones, TombstonesReader, VariableColumn,
+    ColumnExport, FixedColumn, FixedColumnReader, Tombstones, TombstonesReader, VariableColumn,
     VariableColumnReader,
 };
 pub use dir_lock::DirLock;
