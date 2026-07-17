@@ -3196,16 +3196,22 @@ Reading {
     let code = FfiGenerator::generate(&schema).unwrap().code;
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-    // Every identity model gets the six OLTP entry points, each `extern "C"`
-    // `#[no_mangle]`, keyed by the model's snake name.
+    // Every identity model gets the OLTP entry points + the point-in-time (#56)
+    // `_at` reads, each `extern "C"` `#[no_mangle]`, keyed by the model's snake
+    // name.
     for model in ["user", "post", "reading"] {
-        for op in ["insert", "get", "count", "all", "update", "delete"] {
+        for op in ["insert", "get", "count", "all", "update", "delete", "get_at", "all_at"] {
             assert!(
                 flat.contains(&format!("fnforgedb_{model}_{op}(")),
                 "missing per-model op forgedb_{model}_{op}"
             );
         }
     }
+
+    // The schema-invariant snapshot lifecycle spine (capture + free) exists once.
+    assert!(flat.contains("fnforgedb_snapshot("), "snapshot capture entry point");
+    assert!(flat.contains("fnforgedb_snapshot_free("), "snapshot free entry point");
+    assert!(flat.contains(".inner.snapshot()"), "capture wraps Database::snapshot()");
 
     // Ops go through the generated integrity wrappers + storage reads — not a
     // reimplementation of the write/read path.
@@ -3214,6 +3220,11 @@ Reading {
     assert!(flat.contains(".inner.delete_user("), "delete uses the delete_<m> referential wrapper");
     assert!(flat.contains(".inner.user.get("), "get uses the generated storage read");
     assert!(flat.contains(".inner.reading.row_count("), "count uses the generated row_count");
+
+    // The `_at` reads resolve as of the captured snapshot's per-model watermark
+    // (`snap.inner.<model>`), through the generated `get_at`/`all_at`.
+    assert!(flat.contains(".inner.user.get_at(&snap.inner.user,"), "get_at clamps to the model's watermark");
+    assert!(flat.contains(".inner.post.all_at(&snap.inner.post)"), "all_at clamps to the model's watermark");
 
     // Rows decode into the GENERATED struct at a compile-time type (serde over
     // opaque JSON bytes) — the schema-tailored, identity-clean marshalling.
@@ -3286,8 +3297,13 @@ Tag {
     assert!(flat.contains(".inner.link_post_tag("), "wraps the generated link_post_tag");
     assert!(flat.contains(".inner.post_tags("), "wraps the generated post_tags query");
 
-    // The snapshot-scoped `_at` traversal is deferred — not emitted yet.
-    assert!(!flat.contains("forgedb_post_tags_at"), "snapshot `_at` traversal is a later phase");
+    // The one snapshot-scoped traversal (#56) is now emitted, mirroring
+    // `Database::post_tags_at` and clamping both sides of the join to `snap`.
+    assert!(flat.contains("fnforgedb_post_tags_at("), "snapshot `_at` M2M traversal getter");
+    assert!(flat.contains(".inner.post_tags_at(&snap.inner,"), "wraps the generated post_tags_at");
+    // The reverse direction has no `_at` on Database (only the forward M2M is
+    // snapshot-scoped), so no reverse `_at` wrapper is emitted.
+    assert!(!flat.contains("forgedb_tag_posts_at"), "only the forward M2M traversal is snapshot-scoped");
 
     // Every engine call is catch_unwind-guarded.
     assert!(flat.contains("catch_unwind"), "traversal engine calls are catch_unwind-guarded");
