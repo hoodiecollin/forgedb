@@ -3399,6 +3399,86 @@ Reading {
 }
 
 #[test]
+fn test_ffi_generation_arrow_export() {
+    // Native FFI Arrow columnar export (the zero-copy selling point): each
+    // identity model gets, per Arrow-exportable non-null fixed-width column, a
+    // `forgedb_<m>_<f>_export_arrow` filling the Arrow C-Data-Interface structs.
+    // The exportable set + formats come from the shared `arrow_export_format`
+    // source of truth; bool / nullable / variable columns are skipped (they need
+    // a transform).  Still no generic query surface.
+    let src = r#"
+User {
+  id: +uuid
+  age: i64
+  score: f64
+  active: bool
+  bio: string?
+  created_at: timestamp
+}
+
+Post {
+  id: +uuid
+  views: i32
+  author: *User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = FfiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The schema-invariant Arrow spine: the two C-Data-Interface structs, the
+    // owner box + both release callbacks, and the fill helper.
+    assert!(flat.contains("structArrowSchema"), "the Arrow schema struct is defined");
+    assert!(flat.contains("structArrowArray"), "the Arrow array struct is defined");
+    assert!(flat.contains("structArrowArrayOwner"), "the gathered-buffer owner box is defined");
+    assert!(flat.contains("fnarrow_array_release("), "the array release callback exists");
+    assert!(flat.contains("fnarrow_schema_release("), "the schema release callback exists");
+    assert!(flat.contains("fnfill_arrow_primitive("), "the fill helper exists");
+    // Release reclaims the owner box; a non-null validity buffer count of 2.
+    assert!(flat.contains("Box::from_raw"), "the array release reclaims + drops the owner box");
+    assert!(flat.contains("n_buffers:2"), "a primitive array has two buffers (validity + data)");
+
+    // Every Arrow-exportable column gets an export op, keyed by the model's snake
+    // name and the field name.
+    for sym in [
+        "forgedb_user_id_export_arrow(",       // uuid -> w:16
+        "forgedb_user_age_export_arrow(",      // i64  -> l
+        "forgedb_user_score_export_arrow(",    // f64  -> g
+        "forgedb_user_created_at_export_arrow(", // timestamp -> l
+        "forgedb_post_id_export_arrow(",       // uuid -> w:16
+        "forgedb_post_views_export_arrow(",    // i32  -> i
+        "forgedb_post_author_export_arrow(",   // required FK (uuid) -> w:16
+    ] {
+        assert!(flat.contains(&format!("fn{sym}")), "missing Arrow export op {sym}");
+    }
+
+    // The Arrow format strings are baked from the schema at codegen time (never a
+    // runtime column list): w:16 (uuid / FK) and g (f64) are distinctive.
+    assert!(flat.contains("w:16"), "uuid / FK columns export as Arrow FixedSizeBinary(16)");
+
+    // Columns needing a transform are SKIPPED (bool bit-packs; nullable/variable
+    // need a validity/offset transform — a later increment).
+    assert!(!flat.contains("forgedb_user_active_export_arrow"), "bool column must be skipped");
+    assert!(!flat.contains("forgedb_user_bio_export_arrow"), "nullable string column must be skipped");
+
+    // The export routes through the generated live-set + column gather (the
+    // live-set decision stays in generated code), then fills the Arrow structs.
+    assert!(flat.contains(".inner.user.export_live_indices()"), "the live row set comes from generated code");
+    assert!(flat.contains(".inner.user.export_col_age("), "the column is gathered via the generated export_col_<f>");
+    assert!(flat.contains("fill_arrow_primitive("), "the gathered buffer fills the Arrow structs");
+    assert!(flat.contains("catch_unwind"), "the export is catch_unwind-guarded");
+
+    // IDENTITY: no generic query surface / runtime schema dispatch.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
+        assert!(
+            !flat.contains(forbidden),
+            "Arrow export must invent no generic query surface (found `{forbidden}`)"
+        );
+    }
+}
+
+#[test]
 fn test_api_generation_replication_endpoint() {
     // The generated replication WS endpoint (#82 Direction C): one schema-wide
     // /replicate route behind the tenant-auth guard, a resumable handshake
