@@ -3153,22 +3153,87 @@ Post {
     assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
 
     // IDENTITY RED LINE: no generic runtime query/filter symbol, and no schema
-    // dispatch — the spine references only the Database type + lifecycle, never a
-    // model/field name or a `match model`.
+    // dispatch — the ABI has per-model ops (the fat tailored half) but NEVER a
+    // generic `forgedb_query(model, predicate)` or a `match model` router.
     for forbidden in [
         "forgedb_query", "match model", "matchmodel", "predicate", "where(",
-        "orderBy", "User", "Post", "email", "title",
+        "orderBy",
     ] {
         assert!(
             !flat.contains(forbidden),
-            "spine must be schema-invariant with no generic query surface (found `{forbidden}`)"
+            "the ABI must invent no generic query surface (found `{forbidden}`)"
         );
     }
-    // No per-model row op has leaked into the spine yet (that's a later phase).
-    for per_model in ["forgedb_user_", "forgedb_post_", "forgedb_create_"] {
+}
+
+#[test]
+fn test_ffi_generation_model_ops() {
+    // Native FFI Phase 3 — the schema-TAILORED half of the fat C-ABI: per-model
+    // OLTP row ops in the SAME generated lib.rs as the spine.  They reference the
+    // generated structs + integrity wrappers by name (that is the tailoring) but
+    // marshal rows/ids as OPAQUE JSON bytes decoded via serde at a compile-time
+    // type — no generic query builder, no `match model` dispatch.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Reading {
+  id: +u64
+  value: i64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = FfiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Every identity model gets the six OLTP entry points, each `extern "C"`
+    // `#[no_mangle]`, keyed by the model's snake name.
+    for model in ["user", "post", "reading"] {
+        for op in ["insert", "get", "count", "all", "update", "delete"] {
+            assert!(
+                flat.contains(&format!("fnforgedb_{model}_{op}(")),
+                "missing per-model op forgedb_{model}_{op}"
+            );
+        }
+    }
+
+    // Ops go through the generated integrity wrappers + storage reads — not a
+    // reimplementation of the write/read path.
+    assert!(flat.contains(".inner.create_user("), "insert uses the create_<m> integrity wrapper");
+    assert!(flat.contains(".inner.update_post("), "update uses the update_<m> wrapper");
+    assert!(flat.contains(".inner.delete_user("), "delete uses the delete_<m> referential wrapper");
+    assert!(flat.contains(".inner.user.get("), "get uses the generated storage read");
+    assert!(flat.contains(".inner.reading.row_count("), "count uses the generated row_count");
+
+    // Rows decode into the GENERATED struct at a compile-time type (serde over
+    // opaque JSON bytes) — the schema-tailored, identity-clean marshalling.
+    assert!(flat.contains("database::User"), "records decode into the generated User struct");
+    assert!(flat.contains("database::Post"), "records decode into the generated Post struct");
+    assert!(flat.contains("serde_json::from_slice"), "opaque JSON bytes → typed record via serde");
+
+    // Integer-PK models thread their own id type through the id decode.
+    assert!(flat.contains("id:u64"), "integer-PK model decodes a u64 id (not a forced Uuid)");
+
+    // A rejected write becomes a validation error, and every engine call is
+    // catch_unwind-guarded (an unwind across extern \"C\" is UB).
+    assert!(flat.contains("FORGEDB_ERR_VALIDATION"), "integrity failures map to a validation code");
+    assert!(flat.contains("catch_unwind"), "per-model engine calls are catch_unwind-guarded");
+
+    // IDENTITY: still no generic query surface / runtime schema dispatch.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
         assert!(
-            !flat.contains(per_model),
-            "the spine phase emits no per-model op (found `{per_model}`)"
+            !flat.contains(forbidden),
+            "per-model ops must invent no generic query surface (found `{forbidden}`)"
         );
     }
 }
