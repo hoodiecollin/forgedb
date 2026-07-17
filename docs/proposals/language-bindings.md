@@ -1,0 +1,173 @@
+# Language Bindings — Python / Node / Bun (design note)
+
+**Status:** design conversation complete; decisions locked; **both Bun spikes DONE (2026-07-16)** — Node+Bun unified on NAPI-RS (Option A). **Not yet PM-gated, not yet committed to a milestone.**
+
+**Issues:** #51 (Python runtime binding), #52 (Node/NAPI-RS runtime binding), #117 (Bun runtime binding). Bundled — shared boundary. #53 (Deno) deferred indefinitely; #50 (WASM browser) landed via #110. Separate but adjacent: #118 (Python HTTP SDK) — a `--sdk` deliverable, not a runtime binding. Fallback/complement experiments: #119 (fd-wakeup + shared-mem ring), #120 (track Bun `JSCallback` maturity), #121 (server-side WASM replica).
+
+This note captures the decisions reached in design conversation. Implementation is phased *after* a `forgedb-product-manager` gate.
+
+---
+
+## What these are (and the identity framing)
+
+In-process, native **runtime bindings** that let people build ForgeDB apps in Python / Node / Bun by calling straight into the compiled per-app engine — **no HTTP hop** (that's the `--sdk` path, which already exists for TS and is tracked separately).
+
+**Identity:** bindings are **class-2 access/transport glue**. The generator-identity invariant forbids only a *generic runtime that reflects over an arbitrary schema*. Schema-specific **generated** bindings are blessed — exactly like the generated TS SDK and the generated wasm replica. So `forgedb generate python|node|bun --runtime` emitting per-schema typed binding code is fully in-bounds. The one red line is the old `npm-package` failure: a hand-shipped *generic* `QueryBuilder` reflecting at runtime (which is why the legacy FFI was torn out). Do **not** over-constrain the design as "the binding must be schema-agnostic" — it must be *generated*, not generic.
+
+---
+
+## CLI taxonomy (breaking change — accepted)
+
+The flat `generate` target list conflates two orthogonal axes. Fix it:
+
+- **Axis A — runtime/language:** `python`, `node`, `bun`, `browser`, `rust`, … (deno deferred)
+- **Axis B — mode:** `--sdk` (network REST client), `--runtime` (in-process FFI binding), `--replica` (in-process read-replica follower)
+
+Consequences (backward-compat **not** kept — clean break accepted):
+- `generate typescript` → decomposes into `generate node --sdk` / `generate bun --sdk` (runtime-specific emitters over a shared typed core — they legitimately differ in preferred std modules).
+- `generate node --runtime` and `generate bun --runtime` emit the **same** NAPI-RS `.node` artifact (Option A — Bun runs Node-API); the `--runtime` emitter is shared, and any Node-vs-Bun difference is packaging/loader glue only, not a second binding. (This is *not* symmetric with the `--sdk` split above, where the two emit genuinely different HTTP-client code.)
+- `generate wasm` → `generate browser --replica`. `wasm` is a *compile target*, not a runtime.
+- **`node --replica` / `bun --replica`** — a **server-side WASM replica**: the *same* #110 browser-replica engine (compiled to wasm) hosted under a server JS runtime instead of a browser tab. One portable `.wasm` across every JS runtime (browser + Node + Bun + Deno), no per-platform native build. `--runtime` (native NAPI-RS, full primary) and `--replica` (portable WASM follower) are complementary, not competing — see "Server-side WASM replica" below. (Supersedes the older "server-side wasm = `wasm --runtime`" framing: it's a `--replica`, not a `--runtime`, because the wasm engine is read-mostly.)
+
+Follow-up issues to file: (1) a "generate = runtime × mode" taxonomy umbrella that #51/#52/#117/#118 reference; (2) server-side-WASM-replica (**filed — see #121**).
+
+---
+
+## Core architecture (locked)
+
+1. **In-process FFI**, not a sidecar. The whole reason these exist vs. the REST SDK is *no HTTP hop*. Cost (a per-app native artifact per platform) is inherent and accepted.
+2. **Fat generated ABI** — per-model, schema-tailored entry points (not a thin opaque generic ABI).
+3. **Arrow / zero-copy columnar export is the selling point** — the reason to pick ForgeDB bindings over a row-oriented driver. ForgeDB *is* columnar; expose it as Arrow → Pandas/Polars/NumPy.
+
+### Binding mechanism — hybrid (Node+Bun unified on NAPI-RS)
+
+Schema-tailored **logic lives in one shared generated engine crate**; a **thin per-runtime native wrapper** sits over it (don't triplicate logic; do specialize marshalling):
+
+- **Python → PyO3** (overrides #51's "ctypes/cffi" — PyO3 gives native types, abi3 version-independence, real pyarrow interop; update #51 body).
+- **Node AND Bun → NAPI-RS, ONE `.node` artifact** (auto-generates the `.d.ts` #52 asks for). **Decided 2026-07-16 (Option A)** after the spike proved Bun runs Node-API from scratch: Bun `require()`s the *same* NAPI-RS addon as Node — same `napi_threadsafe_function` completion, same `napi_create_external_arraybuffer` zero-copy, same `.d.ts`. The earlier "Bun → C-ABI + `bun:ffi`" split is **retired** (its premise "Bun has no Rust-side framework" is false — Bun runs the framework's output). See "Resolved spike 2" below.
+
+---
+
+## Interface layering
+
+- **Layer 0 — fat generated C-ABI (the boundary).** Per-model row ops + a per-**column** Arrow export op filling the Arrow **C Data Interface** structs (alias-or-gather chosen internally, transparent to caller). **Owns the single-writer turn serialization**; async execution rides either the runtime's own pool (P1, v1) or an L0-owned pool (P2) — see "NAPI-RS async interface" below (pool ownership ≠ turn ownership).
+- **Layer 1 — low-level typed binding (generated, ~1:1 with the ABI).** Honest: never hides a copy; exposes the copy reality (`is_dense(snapshot)`, `export_arrow(...)`). **Also owns the per-runtime completion bridge** (the only irreducibly runtime-specific async piece).
+- **Layer 2 — convenience / ergonomics (generated).** `to_pandas()` / `to_polars()` / `<col>.to_numpy()` / `toArrow()`. **This is where "gather until compaction" hides.** **Layer 2 NEVER triggers compaction** — compaction is *always* an explicit caller act.
+
+---
+
+## Storage support (no format pivot)
+
+The gather is a read-*shape*, not a format change — the engine already computes the live set for `all()`/`all_at()`. Add **one small schema-agnostic columnar-read primitive** to `forgedb-storage`:
+
+- `gather(col, indices) -> OwnedBuffer` — copy the selected physical rows contiguously.
+- `dense_prefix(col, snapshot) -> Option<&[u8]>` — `Some` iff the live selection is already a contiguous prefix (aliasable).
+
+Class-1 substrate (byte ranges + opaque indices; knows no schema). **Explicitly deferred:** a materialized dense "live mirror" (always-zero-copy at the cost of write-amplification) — future escape hatch, not v1.
+
+**Where zero-copy actually lands** (export op is **per-column** so hot columns alias while others transform):
+- **True alias:** non-null fixed-width primitives — `u32/i32/u64/i64/f64` → Int/Float, `uuid` → FixedSizeBinary(16), `timestamp` → Timestamp, `decimal` → Decimal128, `char(N)` → FixedSizeBinary(N), `enum` disc → Dictionary(Int8,Utf8). (These are the analytics-hot columns.)
+- **Always a transform:** `bool` (Arrow bit-packs 1 bit/value; we store 1 byte — deliberate, to keep columns append-only/positional), nullable anything (Arrow packed validity bitmap vs our presence tag), `string`/`json` (variable → gather).
+
+Honest position: **zero-copy for append-mostly analytical tables; gather for update-heavy until `compact()`.** That aligns with the audience.
+
+---
+
+## Row marshalling (OLTP path — distinct from the columnar OLAP path; do not unify)
+
+- **PyO3** → `#[pyclass]` per model; native field marshalling, no serialization.
+- **NAPI-RS (Node + Bun)** → `#[napi(object)]` per model + auto `.d.ts`; native marshalling, no serialization. **The planned Bun-specific fixed-struct + `DataView` reader is dropped** — with the unified NAPI-RS artifact, Bun marshals rows through `#[napi(object)]` exactly like Node (Option A moots the separate Bun row path).
+- **Errors:** PyO3 raises, NAPI-RS throws (Node + Bun); maps `ValidationError` 422/409 to a thrown `ForgeDBError`.
+
+---
+
+## Concurrency
+
+Engine per-row API is **synchronous + blocking** (`fsync` on writes); contract is **single-writer + concurrent readers** (#56-B).
+
+- **Sync is the primitive** (always generated, faithful).
+- **Async is a generated overlay** offloading the blocking call to the **Layer 0 native thread pool**.
+- **Writes serialize** at the Layer 0 writer turn; **reads parallelize** lock-free. Async = *stall-avoidance + read parallelism*, **not** write concurrency — real multi-writer is Tier 2/3 (`forgedb-txn` / coordinator), a separate deployment, never conjured by a binding.
+- **Per-runtime defaults:** Python **sync-first, async opt-in**; Node/Bun **async-first, sync escape-hatch**.
+- **Completion delivery** (the hard, runtime-specific half — marshalling a pool-thread result back onto the event loop) lives in Layer 1: **Node AND Bun → `napi_threadsafe_function`** (NAPI-RS `ThreadsafeFunction`, the one unified bridge — proven reliable in Bun, see spike 2); Python → GIL + `pyo3-async-runtimes`. The `bun:ffi` fd/pipe wakeup is **retired with the `bun:ffi` route** (kept below only as the archived fallback should the Node-API dependency ever need to be dropped).
+- **Workers are rejected as the async primitive** (heavyweight isolates; a native pool is correct and unifying).
+
+### Resolved spike 1 — `bun:ffi` completion bridge (2026-07-16) — SUPERSEDED by spike 2 / Option A
+
+> **Status:** the finding stands, but the `bun:ffi` route it informs is **retired** — Option A (spike 2 below) unifies Bun onto NAPI-RS. Kept as the archived fallback: if the Node-API dependency ever had to be dropped, fd/pipe wakeup is the proven `bun:ffi` completion mechanism. **Fallback-lane experiments logged:** #119 (fd-wakeup + shared-memory ring, zero-copy batched completions) and #120 (track Bun threadsafe-`JSCallback` maturity + preserve the crash repro; Worker/`cc`/sync-only ideas folded in there).
+
+**Question:** does `bun:ffi`'s threadsafe `JSCallback` (or an fd wakeup) reliably marshal a native-pool completion onto Bun's event loop? **Outcome: fd wakeup YES, threadsafe `JSCallback` NO.**
+
+Empirical harness (Bun 1.3.14, macOS arm64; real Rust cdylib spawning `std::thread`s that call back through a C-ABI function pointer — precisely the "threads Bun is not aware of" case the `bun:ffi` docs flag as not-yet-supported):
+
+- **Direct threadsafe `JSCallback` from pool threads → UNSAFE.** A *race*, not a threshold: crash rate rises with concurrency but is nonzero at the floor — N=2 threads 20%, N=8 53%, N=32 73% (SIGTRAP/SIGSEGV, hard native crash inside Bun's own crash handler). No safe concurrency level exists.
+- **Single notifier-thread serialization (MPSC → one thread → `cb`) → still UNSAFE.** Lowers the rate but never eliminates it (N=8 7%, N=100 40%, N=500 100%); the residual crash tracks *live native-thread count*, not just callback concurrency.
+- **Raw `JSCallback` also fails keepalive** — the process drains and exits before a pending native callback lands (no event-loop handle keeps the loop alive).
+- **fd/pipe wakeup → ROCK SOLID.** Native pool writes fixed 12-byte completion records to a pipe (≤ PIPE_BUF ⇒ atomic per-write, no interleave); Bun reads the read-fd on its own event loop. **15/15 trials at every N from 8 to 5000, exactly-once, correct values, zero crashes.** Never invokes a `JSCallback` from a foreign thread. Bonus: the open pipe-read handle is a first-class Bun I/O source, so it provides **event-loop keepalive for free** (delivery at ~300ms with no timer) — the exact thing the callback path fails.
+
+**Design consequence (`bun:ffi` route):** Layer 0's native pool + `_async` entry points are unchanged. If Bun stays on `bun:ffi`, its Layer 1 completion bridge is **fd-based**: `_async` ops enqueue on the L0 pool with a completion token; the pool writes `{token, status, payload-ptr/len}` records to a pipe; the Bun runtime reads the pipe on the event loop and resolves the matching Promise. Node keeps `ThreadsafeFunction`, Python keeps GIL + `pyo3-async-runtimes`. Workers stay rejected. (Reproduction harness archived under `scratchpad/bun_jscallback_spike/`; ephemeral.)
+
+### Resolved spike 2 — Bun runs Node-API → Option A CHOSEN (2026-07-16)
+
+Bun implements Node-API "from scratch" and loads `.node` addons. Tested a hand-written C addon (the NAPI-RS mechanism) in **both node and bun** (node = control):
+
+- **`napi_threadsafe_function` from native `pthread`s → 100% reliable in BOTH.** 15/15 trials at N=8/100/1000/5000, exactly-once, zero crashes — the *exact* native-thread → event-loop marshalling that `bun:ffi`'s `JSCallback` crashes on. It is the purpose-built Node-API contract (queue + `uv_async_t` wakeup), and Bun honors it.
+- **`napi_create_external_arraybuffer` → works in BOTH** — aliases native memory zero-copy (the Arrow columnar-export path for the Node-API route).
+- **tsfn keepalive** — a pending tsfn keeps Bun's loop alive with no timer (~40ms delivery).
+
+**Consequence:** Bun can run the **same NAPI-RS `.node` artifact as Node** — same completion mechanism, same zero-copy path, same auto-`.d.ts`.
+
+**Decision — Option A (unify Node+Bun on one NAPI-RS artifact), chosen by user 2026-07-16.** One Rust NAPI-RS crate → one `.node`, `require()`d by both runtimes; `napi_threadsafe_function` completion; `#[napi(object)]` row marshalling (the planned Bun DataView-struct reader is dropped); external-ArrayBuffer zero-copy. Collapses Bun from a bespoke third path into "Node's addon also runs here" — one artifact, one emitter, one marshalling path, one completion bridge. Accepted cost: Bun leans on its Node-API compat layer rather than native `bun:ffi` (the zero-copy *result* is equivalent — proven). The rejected alternative (keep the `bun:ffi` split) is preserved as spike 1's archived fallback.
+
+**Residual check — DONE 2026-07-16.** Built a real NAPI-RS 2.16.17 crate (`#[napi] fn start_work(cb: ThreadsafeFunction<..>, n)` firing from N `std::thread`s), compiled to a `.node`, loaded in **both node and bun**: 12/12 trials each at N=8/100/1000, exactly-once, zero crashes. **No NAPI-RS-specific symbol is unimplemented in Bun** — Option A is confirmed on the actual framework, not just raw Node-API. (Harness `scratchpad/bun_jscallback_spike/napirs_spike/`; ephemeral.)
+
+---
+
+## NAPI-RS async interface — the three surfaces (clarification)
+
+NAPI-RS offers three distinct interfaces; the binding uses all three for different jobs (this is *not* one mechanism):
+
+1. **Sync** — `#[napi] fn get(id) -> Row`. Runs on the JS thread, **blocks it** (incl. `fsync`). The faithful primitive.
+2. **Async request/response** — `#[napi] fn get(id) -> AsyncTask<Row>` (or `async fn`). Returns a **Promise**; the blocking work runs on a **pool the *runtime* owns** (libuv for `AsyncTask`, tokio for `async fn`) and completion is marshalled to the event loop **automatically**. This — not `ThreadsafeFunction` — is what plain `await`ed CRUD uses. It was **never at risk on Bun** (the pool is the runtime's own; no foreign thread), which is why it needed no spike.
+3. **Streaming/push** — `ThreadsafeFunction`: native code (its own threads) pushes *many* callbacks into JS over time. This is what the **subscription / live-query / change-feed / replication** surfaces need — and the one genuinely-uncertain mechanism on Bun, which is exactly what "Resolved spike 2" de-risked.
+
+**Consequence for Layer 0.** "L0 owns the native thread pool" is a *choice*, and it separates from owning the **writer turn** (a lock/queue in the shared engine — reads parallelize lock-free regardless of whose pool runs them):
+- **P1 — ride each runtime's machinery** (Node/Bun `AsyncTask`/libuv, Python `pyo3-async-runtimes`/tokio). Minimal code, idiomatic. Risk: a serialized write blocked on the writer turn **occupies a libuv pool thread** (default pool = 4) → can starve other async work under write bursts.
+- **P2 — L0 owns one pool + a dedicated writer thread**; the runtime's async fn awaits an engine-signalled completion. Uniform, avoids libuv starvation — but delivering that completion back to JS on Node/Bun then **needs `ThreadsafeFunction`** (native thread → loop), i.e. P2 leans on spike 2; P1 barely needs it. **v1 = P1 (simplest); P2 is a scaling-follow-up.**
+
+### Completion-bridge wakeup: event-driven vs. polling (for the `bun:ffi` fallback + any custom bridge)
+
+A completion bridge = **wakeup axis** (how JS learns of a completion) × **payload axis** (how data reaches JS). `napi_threadsafe_function` and the validated fd-wakeup are both **event-driven** (`uv_async_send` / pipe-readiness → the loop *sleeps* when idle, wakes in µs; wakeups coalesce — N completions ≈ 1 wakeup + drain-N). A **tick-polled shared-memory mailbox** (JS checks shared mem each tick) keeps the good zero-copy payload half (= #119's ring) but swaps the wakeup to **polling**, which for a DB is the wrong default: an idle connection **can't let the loop sleep** → burns a core/constant cadence forever. Polling only wins in the **saturated / low-latency** regime (loop never idles anyway). **Decision:** event-driven wakeup + zero-copy ring is the design; polling is an opt-in "saturated-drain" **knob**, ideally **spin-then-park** (poll briefly after activity, park when idle). **Locking:** the JS event-loop thread must **never block** on a native-held lock (priority inversion → whole-loop stall) → use a **lock-free ring** (atomic `head`/`tail`, SPSC or MPSC-CAS; JS does non-blocking atomic *loads* only). `Atomics.load/store` work on a non-shared (aliased) `ArrayBuffer`; only `Atomics.wait` needs a real `SharedArrayBuffer` — so a polling-loads design can stay pure `bun:ffi` (no SAB). Folded into #119.
+
+---
+
+## Hosting architectures — Workers (revisited)
+
+The earlier "reject Workers" verdict was specifically **"Worker as the *per-call* async primitive"** (structured-clone-per-call is absurd; `AsyncTask` does off-thread async better). A **persistent Worker that hosts the engine** is a *different, open* question (we already do it in the WASM replica #110/#2 for sync OPFS):
+
+- **W0 — no Worker (v1 default).** Engine as a NAPI-RS addon in the main isolate; sync fns block, async via `AsyncTask`, streaming via `ThreadsafeFunction`.
+- **W1 — dedicated *writer* Worker.** Write path in one persistent Worker → single-writer serialization **by construction** (one isolate/thread, no lock), blocking `fsync` off the main loop; reads stay in the main isolate (lock-free, #56-B). Completion via `postMessage`/SAB.
+- **W2 — whole engine in a Worker, main isolate = thin RPC client.** Total isolation, symmetric with the WASM replica — but **every read crosses an isolate boundary**.
+
+**Deciding tension:** the zero-copy Arrow selling point wants column memory **directly addressable by the analytics isolate**. A Worker puts it in a *different* isolate → keeping zero-copy needs **SharedArrayBuffer**-backed columns (native) — doable but a real commitment. **Caveat (common trap):** a Worker is a **thread, not a process** — a native segfault in a Worker still crashes the whole process; true fault isolation needs a *subprocess* (= the rejected sidecar). **Read:** the promising one is **W1 (writer Worker, reads in main), SAB-backed columns** — maps the engine's actual single-writer/many-reader model onto isolates — but it's a **v2+ optimization; v1 = W0.**
+
+## Server-side WASM replica (`node|bun --replica`) — the synthesis
+
+The Worker reconsideration and "Bun (and Node/Deno) run WASM/WASI" converge on one coherent alternative artifact: **host the existing #110 browser-replica engine (already compiled to wasm) under a server-side JS runtime.**
+
+- **Why it's compelling:** ONE portable `.wasm` across every JS runtime (browser + Node + Bun + Deno), **no per-platform native build** (NAPI-RS needs a `.node` per platform); reuses #110 wholesale; WASI is capability-sandboxed.
+- **Why it's a *complement*, not a replacement for `--runtime`:** wasm32 is **single-threaded** (no native pool → no async read-parallelism; the engine *must* live in a **Worker** to keep the loop free — WASM doesn't dodge the Worker question, it *mandates* W1/W2); **WASI `fd_sync` durability fidelity is unverified** (risk to the #89 crash-safety contract); slower than native; and the wasm engine is **read-mostly** — #110 already **cfg-gates out the Tier-3 coordinator** (`forgedb-coordinator` uses Unix sockets + `fs2`, doesn't compile to wasm) and is a read-only follower. So `--replica` scope = read-replica / single-threaded embedded, *not* the full multi-writer primary that native `--runtime` delivers.
+- **Elegant payoff:** wasm linear memory **is** a host-addressable `ArrayBuffer`, so the cross-Worker zero-copy problem that needs SharedArrayBuffer gymnastics in the *native* Worker case (W1/W2) is **free** here (`new Uint8Array(wasmMemory.buffer, ptr, len)` — exactly how #110 already does zero-copy reads). **So if we ever want the Worker architecture, the WASM engine is its natural vehicle — not native.**
+- **Runtime-agnostic:** this is *not* Bun-special (Node/Deno run WASM too); the interesting framing is "one wasm engine for all JS runtimes."
+- **Honest cost:** #110 uses `wasm32-unknown-unknown` + wasm-bindgen + an IndexedDB/OPFS arena backend; server-side wants a host shim + an fs (or WASI) storage backend — highly reusable but not literally free.
+
+Filed as **#121** (`idea` — needs a design note before impl), cross-referencing #117/#119/#120.
+
+---
+
+## Remaining before phased impl
+
+1. ~~Run the Bun `JSCallback` spike~~ — **DONE 2026-07-16** (fd-wakeup path pinned; see Resolved spike above).
+2. `forgedb-product-manager` gate on this note.
+3. File the two taxonomy follow-up issues; update #51 body (ctypes → PyO3).
+4. Pin exact ABI symbol naming.
