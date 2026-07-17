@@ -1149,3 +1149,58 @@ fn test_dir_lock_creates_parent_dir() {
 
     fs::remove_dir_all(std::env::temp_dir().join("forgedb_test_dirlock_mkdir")).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// gather(): the class-1 columnar-read primitive for the bindings' Arrow /
+// columnar-export gather path (#51/#52/#117). Copies selected physical rows
+// contiguously; schema-agnostic (opaque indices, never a field/type/schema).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixed_column_gather_selects_and_orders() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_gather_fixed");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("g.bin"), 8).unwrap();
+    for v in [10u64, 11, 12, 13, 14] {
+        col.append_u64(v).unwrap();
+    }
+
+    // A non-contiguous, reordered subset — the update-heavy live set the
+    // dense-prefix alias path can't cover.
+    let out = col.gather(&[3, 0, 4]).unwrap();
+    assert_eq!(out.len(), 3 * 8);
+    assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 13);
+    assert_eq!(u64::from_le_bytes(out[8..16].try_into().unwrap()), 10);
+    assert_eq!(u64::from_le_bytes(out[16..24].try_into().unwrap()), 14);
+
+    // Empty selection → empty buffer.
+    assert!(col.gather(&[]).unwrap().is_empty());
+
+    // Out-of-bounds index → error.
+    assert!(col.gather(&[0, 5]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_fixed_column_gather_full_prefix_matches_reads() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_gather_prefix");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("g.bin"), 4).unwrap();
+    for v in [1u32, 2, 3, 4] {
+        col.append_u32(v).unwrap();
+    }
+
+    // Gathering the whole [0, len) prefix must equal reading each row in order.
+    let out = col.gather(&[0, 1, 2, 3]).unwrap();
+    for i in 0..4usize {
+        let got = u32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!(got, col.read_u32(i).unwrap());
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}

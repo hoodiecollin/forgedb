@@ -105,6 +105,25 @@ mod tests {
     }
 
     #[test]
+    fn fixed_column_gather_matches_native_semantics() {
+        store::clear();
+        let mut c = FixedColumn::new(p("g/u64.bin"), 8).unwrap();
+        for v in [10u64, 11, 12, 13, 14] {
+            c.append_u64(v).unwrap();
+        }
+
+        // Reordered non-contiguous subset — the gather (non-alias) path.
+        let out = c.gather(&[3, 0, 4]).unwrap();
+        assert_eq!(out.len(), 3 * 8);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 13);
+        assert_eq!(u64::from_le_bytes(out[8..16].try_into().unwrap()), 10);
+        assert_eq!(u64::from_le_bytes(out[16..24].try_into().unwrap()), 14);
+
+        assert!(c.gather(&[]).unwrap().is_empty()); // empty selection
+        assert!(c.gather(&[0, 5]).is_err()); // out of bounds
+    }
+
+    #[test]
     fn tombstones_roundtrip() {
         store::clear();
         let mut t = Tombstones::new(p("m/tomb.bin")).unwrap();

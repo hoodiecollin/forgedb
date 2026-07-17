@@ -128,6 +128,31 @@ impl FixedColumn {
         self.read_raw(index, self.value_size)
     }
 
+    /// Copy the physical rows at `indices` into one contiguous owned buffer, in
+    /// the order given (`indices.len() * value_size` bytes). Arena-backed twin of
+    /// the native [`FixedColumn::gather`](../../forgedb_storage_native) — same
+    /// signature and byte semantics, so the shared generated columnar-export code
+    /// links unchanged across targets. Schema-agnostic: `indices` are opaque
+    /// physical row positions the caller (generated code) computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
+    pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
+        let vs = self.value_size;
+        store::with_bytes(&self.path, |b| {
+            let mut out = vec![0u8; indices.len() * vs];
+            for (slot, &index) in indices.iter().enumerate() {
+                let src = index * vs;
+                if src + vs > b.len() {
+                    return Err(oob());
+                }
+                out[slot * vs..slot * vs + vs].copy_from_slice(&b[src..src + vs]);
+            }
+            Ok(out)
+        })
+    }
+
     /// No-op on this target — durability is at the [`crate::store::dump`] commit
     /// boundary, not per append.
     pub fn flush(&mut self) -> io::Result<()> {

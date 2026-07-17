@@ -571,6 +571,38 @@ impl FixedColumn {
         Ok(buf)
     }
 
+    /// Copy the physical rows at `indices` into one contiguous owned buffer, in
+    /// the order given (`indices.len() * value_size` bytes).
+    ///
+    /// This is the class-1 columnar-read primitive behind the language bindings'
+    /// Arrow / columnar-export **gather** path — the fallback taken whenever the
+    /// live selection is *not* an aliasable dense prefix (update-heavy or
+    /// tombstoned tables) and a contiguous copy of exactly the live rows is
+    /// needed. It is schema-agnostic: `indices` are opaque physical row
+    /// positions the caller computed (generated code derives the live set from
+    /// `id_to_row` + tombstone liveness, exactly as `all()` / `all_at()` do
+    /// today); `gather` never reads a field name, type, or schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
+    pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
+        let mut out = vec![0u8; indices.len() * self.value_size];
+        for (slot, &index) in indices.iter().enumerate() {
+            if index >= self.row_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Index out of bounds",
+                ));
+            }
+            let src = (index * self.value_size) as u64;
+            let dst = slot * self.value_size;
+            self.file
+                .read_exact_at(&mut out[dst..dst + self.value_size], src)?;
+        }
+        Ok(out)
+    }
+
     /// Flush all pending writes to disk (fsync).
     ///
     /// This is the explicit durability checkpoint: after `flush()` returns `Ok(())`,
