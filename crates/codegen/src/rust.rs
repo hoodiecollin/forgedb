@@ -1077,7 +1077,7 @@ impl RustGenerator {
     /// type.  Keeping this in one place makes the `id_to_row` map key, the
     /// `insert` return type, and the `get` parameter type all agree with
     /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
-    fn id_type_tokens(model: &forgedb_parser::Model) -> TokenStream {
+    pub(crate) fn id_type_tokens(model: &forgedb_parser::Model) -> TokenStream {
         match model
             .fields
             .iter()
