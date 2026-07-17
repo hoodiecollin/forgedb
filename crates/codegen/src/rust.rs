@@ -632,6 +632,11 @@ impl RustGenerator {
         // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
         let index_lookups = Self::generate_index_lookups(model);
 
+        // Generate the columnar-export helpers (language bindings #51/#52): live
+        // physical row indices + per Arrow-exportable column `export_col_<f>` that
+        // gathers exactly those rows.  Consumed by the FFI `..._export_arrow` ops.
+        let columnar_export = Self::generate_columnar_export(model);
+
         // Generate reopen/rehydration logic (#65): rebuild the in-memory
         // `row_count` + `id_to_row` index from the persisted columns so a fresh
         // process can read data written by a previous one.
@@ -816,6 +821,10 @@ impl RustGenerator {
                 }
 
                 #index_lookups
+
+                // Columnar-export helpers (#51/#52): live row indices + per
+                // Arrow-exportable column gather, consumed by the FFI Arrow ops.
+                #columnar_export
 
                 // Declared column projections (#113): narrow reads over PK +
                 // selected columns, plus their snapshot `_at` variants.
@@ -1085,6 +1094,91 @@ impl RustGenerator {
         {
             Some(f) => Self::map_field_type_ident(&f.field_type),
             None => quote! { Uuid },
+        }
+    }
+
+    /// The Arrow C-Data-Interface `format` string for a field whose column can be
+    /// exported **without a per-element transform** — i.e. a copy of the physical
+    /// column bytes is already a valid Arrow buffer. `Some(fmt)` iff exportable.
+    ///
+    /// The single source of truth shared by the columnar-export codegen: the Rust
+    /// generator emits `export_col_<f>` iff this is `Some`, and the FFI generator
+    /// emits `forgedb_<m>_<f>_export_arrow` for the SAME set (using the returned
+    /// format), so the two can never drift.
+    ///
+    /// Only **non-null fixed-width** types where our on-disk layout already IS the
+    /// Arrow layout qualify. Numerics are stored little-endian (`to_le_bytes`), so
+    /// a contiguous copy is a valid Arrow primitive buffer on any host; `uuid` and
+    /// a required FK are raw `[u8; 16]` → Arrow `FixedSizeBinary(16)`; `timestamp`
+    /// is an `i64` seconds column → Arrow `int64`. Deliberately excluded (each
+    /// needs a transform, a later increment): `bool` (Arrow bit-packs; we store 1
+    /// byte), any nullable field (Arrow validity bitmap vs our presence tag),
+    /// `string`/`json` (variable → offsets), `decimal` (rust_decimal's internal
+    /// 16-byte repr ≠ Arrow decimal128), `enum` (1-byte discriminant loses the
+    /// variant-name mapping), `char(N)` / `struct` / arrays.
+    pub(crate) fn arrow_export_format(ft: &forgedb_parser::FieldType) -> Option<&'static str> {
+        use forgedb_parser::{FieldType, RelationType};
+        match ft {
+            FieldType::I32 => Some("i"),
+            FieldType::I64 => Some("l"),
+            FieldType::U32 => Some("I"),
+            FieldType::U64 => Some("L"),
+            FieldType::F64 => Some("g"),
+            FieldType::Timestamp => Some("l"),
+            FieldType::Uuid | FieldType::Relation(RelationType::RequiredReference(_)) => {
+                Some("w:16")
+            }
+            _ => None,
+        }
+    }
+
+    /// Generate the per-model columnar-export helpers consumed by the FFI Arrow
+    /// export (language bindings #51/#52): `export_live_indices()` (the live
+    /// physical row indices, the same live set `all()` materializes — a row is
+    /// live iff its newest version, the one `id_to_row` points at, is not
+    /// tombstoned) and, per Arrow-exportable non-null fixed-width column, an
+    /// `export_col_<f>(indices)` that hands the private column's class-1 `gather`
+    /// the caller-computed opaque indices. The live-set decision stays in
+    /// generated code (as `all()` does); `gather` reads only byte ranges.
+    fn generate_columnar_export(model: &forgedb_parser::Model) -> TokenStream {
+        let col_gathers: Vec<TokenStream> = model
+            .fields
+            .iter()
+            .filter(|f| Self::arrow_export_format(&f.field_type).is_some())
+            .map(|f| {
+                let field_col_name = format_ident!("{}_col", f.name);
+                let method = format_ident!("export_col_{}", f.name);
+                quote! {
+                    /// Gather this column's bytes at the given physical row indices
+                    /// into one contiguous buffer (the Arrow columnar-export path).
+                    pub fn #method(&self, indices: &[usize]) -> std::io::Result<Vec<u8>> {
+                        self.#field_col_name.gather(indices)
+                    }
+                }
+            })
+            .collect();
+
+        if col_gathers.is_empty() {
+            return quote! {};
+        }
+
+        quote! {
+            /// The live physical row indices (newest, non-tombstoned version per
+            /// id) — the row set the Arrow columnar export gathers. Same liveness
+            /// as `all()`, but tombstone-only (no full-record decode). Order
+            /// follows the id map (unspecified), consistent across every
+            /// `export_col_*` call within one export batch.
+            pub fn export_live_indices(&self) -> Vec<usize> {
+                let mut indices = Vec::new();
+                for &row in self.id_to_row.values() {
+                    if !self.tombstones.is_deleted(row).unwrap_or(true) {
+                        indices.push(row);
+                    }
+                }
+                indices
+            }
+
+            #(#col_gathers)*
         }
     }
 
