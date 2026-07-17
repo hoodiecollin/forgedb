@@ -55,11 +55,13 @@ pub mod stubs;
 pub mod transform;
 pub mod wasm;
 pub mod ffi;
+pub mod pyo3;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use ffi::FfiGenerator;
 pub use openapi::OpenApiGenerator;
+pub use pyo3::PyO3Generator;
 pub use rust::RustGenerator;
 pub use stubs::StubGenerator;
 pub use transform::{HopPlan, ModelOp, TransformCrate, TransformGenerator, TransformPlan, VersionSchema};
