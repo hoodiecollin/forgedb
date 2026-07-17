@@ -54,9 +54,11 @@ pub mod openapi;
 pub mod stubs;
 pub mod transform;
 pub mod wasm;
+pub mod ffi;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
+pub use ffi::FfiGenerator;
 pub use openapi::OpenApiGenerator;
 pub use rust::RustGenerator;
 pub use stubs::StubGenerator;
