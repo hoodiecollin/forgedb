@@ -7,8 +7,34 @@ use forgedb_parser::Parser;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The `--sdk`/`--runtime`/`--replica` mode axis (#122). Orthogonal to the
+/// runtime/language axis (`python`, `node`, `bun`, `browser`): a target names a
+/// runtime, a mode names *how* to bind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerateMode {
+    /// Network REST client (`--sdk`).
+    Sdk,
+    /// In-process native FFI binding (`--runtime`).
+    Runtime,
+    /// In-process read-replica follower (`--replica`).
+    Replica,
+}
+
+impl GenerateMode {
+    fn flag(self) -> &'static str {
+        match self {
+            GenerateMode::Sdk => "--sdk",
+            GenerateMode::Runtime => "--runtime",
+            GenerateMode::Replica => "--replica",
+        }
+    }
+}
+
 pub struct GenerateOptions {
     pub target: String,
+    /// The mode axis from `--sdk`/`--runtime`/`--replica` (#122). `None` for a
+    /// standalone artifact target.
+    pub mode: Option<GenerateMode>,
     pub check: bool,
     pub output: Option<String>,
     /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).
@@ -95,8 +121,11 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Generate based on target
-    let target = options.target.to_lowercase();
+    // Resolve the (runtime/language, mode) axes (#122) into a single canonical
+    // internal target. Standalone artifacts (rust/api/…) pass through unchanged;
+    // a runtime target (python/node/bun/browser) requires a mode and maps to the
+    // matching generator.
+    let target = resolve_target(&options.target, options.mode)?;
     let mut generated_files = Vec::new();
 
     match target.as_str() {
@@ -166,9 +195,25 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 format_version,
             )?);
         }
+        // Per-runtime ergonomic wrappers (#51/#52/#117). Resolved here from
+        // `python --runtime` / `node|bun --runtime`; the generators land in their
+        // own phases.
+        "pyo3" => {
+            return Err(CliError::Other(
+                "`generate python --runtime` (PyO3 binding) is not yet implemented"
+                    .to_string(),
+            ));
+        }
+        "napi" => {
+            return Err(CliError::Other(
+                "`generate node|bun --runtime` (NAPI-RS binding) is not yet implemented"
+                    .to_string(),
+            ));
+        }
         _ => {
             return Err(CliError::Other(format!(
-                "Unknown target: {}. Valid targets: all, rust, typescript, api, openapi, stubs, wasm, ffi, transform",
+                "Unknown target: {}. Valid: standalone (all, rust, api, openapi, stubs, ffi, transform) \
+                 or runtime × mode (python|node|bun|browser with --sdk/--runtime/--replica)",
                 target
             )));
         }
@@ -426,6 +471,88 @@ fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {
     fs::write(path, content)?;
 
     Ok(())
+}
+
+/// Resolve the `generate` CLI's two axes (#122) into one canonical internal
+/// target string the dispatcher understands.
+///
+/// - **Standalone artifacts** (`all`, `rust`, `api`, `openapi`, `stubs`, `ffi`,
+///   `transform`) take **no** mode; passing one is an error.
+/// - **Runtime targets** (`python`, `node`, `bun`, `browser`) **require** a mode
+///   and map `(runtime, mode)` to the matching generator.
+/// - The pre-#122 flat verbs `typescript`/`wasm` are a **clean break**: they
+///   error with a pointer to the new form (this CLI is pre-1.0; see docs/SEMVER).
+fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
+    let target = raw.to_lowercase();
+
+    // Standalone artifacts — the mode axis does not apply.
+    const STANDALONE: &[&str] = &[
+        "all", "rust", "api", "openapi", "stubs", "ffi", "transform",
+    ];
+    if STANDALONE.contains(&target.as_str()) {
+        if let Some(m) = mode {
+            return Err(CliError::Other(format!(
+                "`generate {target}` is a standalone artifact and takes no mode flag ({} was given)",
+                m.flag()
+            )));
+        }
+        return Ok(target);
+    }
+
+    // Retired pre-#122 verbs — redirect to the runtime × mode form.
+    match target.as_str() {
+        "typescript" => {
+            return Err(CliError::Other(
+                "`generate typescript` was renamed — use `generate node --sdk` or `generate bun --sdk`"
+                    .to_string(),
+            ));
+        }
+        "wasm" => {
+            return Err(CliError::Other(
+                "`generate wasm` was renamed — use `generate browser --replica`".to_string(),
+            ));
+        }
+        _ => {}
+    }
+
+    // Runtime targets — a mode is mandatory.
+    let runtimes = ["python", "node", "bun", "browser"];
+    if !runtimes.contains(&target.as_str()) {
+        return Err(CliError::Other(format!(
+            "Unknown target: {target}. Valid: standalone (all, rust, api, openapi, stubs, ffi, transform) \
+             or a runtime (python, node, bun, browser) with --sdk/--runtime/--replica"
+        )));
+    }
+    let mode = mode.ok_or_else(|| {
+        CliError::Other(format!(
+            "`generate {target}` needs a mode — one of --sdk, --runtime, --replica"
+        ))
+    })?;
+
+    // Map (runtime, mode) to the canonical internal target.
+    match (target.as_str(), mode) {
+        // Node/Bun REST SDK — the decomposed `generate typescript`.
+        ("node", GenerateMode::Sdk) | ("bun", GenerateMode::Sdk) => Ok("typescript".to_string()),
+        // Node/Bun native binding — one shared NAPI-RS `.node` (Option A).
+        ("node", GenerateMode::Runtime) | ("bun", GenerateMode::Runtime) => Ok("napi".to_string()),
+        // Python native binding — PyO3.
+        ("python", GenerateMode::Runtime) => Ok("pyo3".to_string()),
+        // Browser read-replica follower — the decomposed `generate wasm`.
+        ("browser", GenerateMode::Replica) => Ok("wasm".to_string()),
+
+        // Recognised-but-not-in-this-milestone combinations.
+        ("python", GenerateMode::Sdk) => Err(CliError::Other(
+            "`generate python --sdk` (Python HTTP SDK, #118) is not yet implemented".to_string(),
+        )),
+        ("node", GenerateMode::Replica) | ("bun", GenerateMode::Replica) => Err(CliError::Other(
+            "`generate node|bun --replica` (server-side WASM replica, #121) is not yet implemented"
+                .to_string(),
+        )),
+        (rt, m) => Err(CliError::Other(format!(
+            "`generate {rt} {}` is not a supported runtime × mode combination",
+            m.flag()
+        ))),
+    }
 }
 
 fn find_schema_file() -> Result<String> {

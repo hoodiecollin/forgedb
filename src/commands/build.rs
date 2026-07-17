@@ -26,9 +26,17 @@ pub fn run(options: BuildOptions) -> Result<()> {
     ui::info("Generating code...");
     if options.no_api {
         ui::info("Skipping API generation (--no-api)");
-        for target in &["rust", "typescript", "stubs"] {
+        // (target, mode) pairs in the #122 taxonomy — the TS SDK is now
+        // `node --sdk`, the rest are standalone artifacts.
+        let targets: &[(&str, Option<crate::commands::generate::GenerateMode>)] = &[
+            ("rust", None),
+            ("node", Some(crate::commands::generate::GenerateMode::Sdk)),
+            ("stubs", None),
+        ];
+        for (target, mode) in targets {
             crate::commands::generate::run(crate::commands::generate::GenerateOptions {
                 target: target.to_string(),
+                mode: *mode,
                 check: false,
                 output: options.output.clone(),
                 schema: options.schema.clone(),
@@ -43,6 +51,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
         // second consecutive `build` does not fail on "File exists".
         crate::commands::generate::run(crate::commands::generate::GenerateOptions {
             target: "all".to_string(),
+            mode: None,
             check: false,
             output: options.output.clone(),
             schema: options.schema.clone(),

@@ -50,9 +50,23 @@ enum Commands {
 
     /// Generate code from schema
     Generate {
-        /// Generation target (all, rust, typescript, api, openapi, stubs, wasm, transform)
+        /// Target: a runtime (`python`, `node`, `bun`, `browser`) paired with a
+        /// `--sdk`/`--runtime`/`--replica` mode, or a standalone artifact
+        /// (`all`, `rust`, `api`, `openapi`, `stubs`, `ffi`, `transform`).
         #[arg(default_value = "all")]
         target: String,
+
+        /// Mode (runtime targets): network REST client
+        #[arg(long, group = "gen_mode")]
+        sdk: bool,
+
+        /// Mode (runtime targets): in-process native FFI binding
+        #[arg(long, group = "gen_mode")]
+        runtime: bool,
+
+        /// Mode (runtime targets): in-process read-replica follower
+        #[arg(long, group = "gen_mode")]
+        replica: bool,
 
         /// Verify nothing needs regeneration (CI mode)
         #[arg(long)]
@@ -423,6 +437,9 @@ fn run(cli: Cli) -> Result<()> {
 
         Commands::Generate {
             target,
+            sdk,
+            runtime,
+            replica,
             check,
             output,
             schema,
@@ -433,8 +450,20 @@ fn run(cli: Cli) -> Result<()> {
             // Precedence: CLI flag > config > built-in default
             let resolved_output = output.or_else(|| forge_config.generate.output.clone());
             let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            // The `--sdk`/`--runtime`/`--replica` flags are a clap ArgGroup, so at
+            // most one is set — collapse them into the mode axis (#122).
+            let mode = if sdk {
+                Some(commands::generate::GenerateMode::Sdk)
+            } else if runtime {
+                Some(commands::generate::GenerateMode::Runtime)
+            } else if replica {
+                Some(commands::generate::GenerateMode::Replica)
+            } else {
+                None
+            };
             commands::generate::run(commands::generate::GenerateOptions {
                 target,
+                mode,
                 check,
                 output: resolved_output,
                 schema: resolved_schema,
