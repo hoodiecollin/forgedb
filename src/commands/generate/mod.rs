@@ -1,7 +1,7 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, OpenApiGenerator, PyO3Generator, RustGenerator, StubGenerator,
-    TypeScriptGenerator, WasmGenerator,
+    ApiGenerator, FfiGenerator, NapiGenerator, OpenApiGenerator, PyO3Generator, RustGenerator,
+    StubGenerator, TypeScriptGenerator, WasmGenerator,
 };
 use forgedb_parser::Parser;
 use std::fs;
@@ -207,10 +207,12 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             )?);
         }
         "napi" => {
-            return Err(CliError::Other(
-                "`generate node|bun --runtime` (NAPI-RS binding) is not yet implemented"
-                    .to_string(),
-            ));
+            generated_files.extend(generate_napi_binding(
+                &schema,
+                &output_path,
+                options.force,
+                format_version,
+            )?);
         }
         _ => {
             return Err(CliError::Other(format!(
@@ -412,6 +414,63 @@ fn generate_pyo3_binding(
             "  ✓ {} (maturin pyproject)",
             pyproject_path.display()
         ));
+    }
+
+    Ok(files)
+}
+
+/// Generate the NAPI-RS Node/Bun binding crate (#52/#117): the `#[napi]` wrapper
+/// (`napi/src/lib.rs`) over the SAME generated `database.rs`
+/// (`napi/src/database.rs`), plus `Cargo.toml` / `build.rs` / `package.json`
+/// scaffolds written only when absent.  Build it with `napi build` (or a plain
+/// `cargo build` for the compile check) to produce the `forgedb` `.node` addon
+/// both Node and Bun `require()` (Option A — one artifact for both runtimes).
+fn generate_napi_binding(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+    format_version: u32,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let napi_dir = output_path.join("napi");
+    let src_dir = napi_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let mut files = Vec::new();
+
+    // The NAPI-RS wrapper (crate root `lib.rs` so its `mod database;` resolves to
+    // `src/database.rs`, same shape as the FFI engine / PyO3 / wasm replica).
+    let napi_result =
+        NapiGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let lib_path = src_dir.join("lib.rs");
+    write_file(&lib_path, &napi_result.code, force)?;
+    files.push((lib_path, napi_result));
+
+    // The generated database the wrapper binds (same generator as the `rust`
+    // target — the binding is the same data logic, exposed to Node/Bun).
+    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let db_path = src_dir.join("database.rs");
+    write_file(&db_path, &rust_result.code, force)?;
+    files.push((db_path, rust_result));
+
+    // User-editable config scaffolds — written only when absent (a regenerate,
+    // even `--force` which overwrites the `.rs` files, never clobbers them).
+    let cargo_path = napi_dir.join("Cargo.toml");
+    if !cargo_path.exists() {
+        fs::write(&cargo_path, NapiGenerator::cargo_toml_scaffold("forgedb-node"))?;
+        ui::info(&format!("  ✓ {} (NAPI-RS binding scaffold)", cargo_path.display()));
+    }
+
+    let build_path = napi_dir.join("build.rs");
+    if !build_path.exists() {
+        fs::write(&build_path, NapiGenerator::build_rs_scaffold())?;
+        ui::info(&format!("  ✓ {} (napi-build script)", build_path.display()));
+    }
+
+    let package_path = napi_dir.join("package.json");
+    if !package_path.exists() {
+        fs::write(&package_path, NapiGenerator::package_json_scaffold())?;
+        ui::info(&format!("  ✓ {} (@napi-rs/cli package)", package_path.display()));
     }
 
     Ok(files)
