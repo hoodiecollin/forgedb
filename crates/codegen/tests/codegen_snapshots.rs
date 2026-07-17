@@ -3,8 +3,9 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, HopPlan, ModelOp, OpenApiGenerator, PyO3Generator, RustGenerator,
-    TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema, WasmGenerator,
+    ApiGenerator, FfiGenerator, HopPlan, ModelOp, NapiGenerator, OpenApiGenerator, PyO3Generator,
+    RustGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
+    WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -3571,6 +3572,87 @@ Reading {
         assert!(
             !flat.contains(forbidden),
             "the PyO3 binding must invent no generic query surface (found `{forbidden}`)"
+        );
+    }
+}
+
+#[test]
+fn test_napi_generation_binding() {
+    // NAPI-RS Node/Bun binding (#52/#117) — the ergonomic per-runtime wrapper over
+    // the SAME generated `database.rs`.  A `ForgeDb` #[napi] class whose methods
+    // mirror the generated CRUD 1:1, calling the integrity wrappers + storage reads
+    // by name.  Node and Bun share ONE `.node` (Option A).  Rows marshal natively
+    // through the struct's own serde via Env::to_js_value — no generic query
+    // builder, no `match model`.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Reading {
+  id: +u64
+  value: i64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = NapiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The `ForgeDb` #[napi] class + its schema-invariant lifecycle. Node and Bun
+    // both load this one addon (Option A).
+    assert!(
+        flat.contains("#[napi(js_name=\"ForgeDb\")]"),
+        "the ForgeDb #[napi] class exists"
+    );
+    assert!(flat.contains("structForgeDb"), "the ForgeDb handle exists");
+    assert!(flat.contains("Database::open_at("), "open wraps Database::open_at");
+    assert!(flat.contains("self.inner.commit()"), "commit wraps the generated commit");
+    // The factory constructor + method annotations are emitted.
+    assert!(flat.contains("#[napi(factory)]"), "open is a #[napi] factory");
+
+    // Per-model CRUD, each keyed by the model's snake name, going through the
+    // generated integrity wrappers + storage reads (not a reimplementation).
+    for m in ["user", "post", "reading"] {
+        for op in ["create", "get", "all", "count", "update", "delete"] {
+            assert!(
+                flat.contains(&format!("fn{op}_{m}(")),
+                "missing per-model method {op}_{m}"
+            );
+        }
+    }
+    assert!(flat.contains("self.inner.create_user("), "create uses the create_<m> integrity wrapper");
+    assert!(flat.contains("self.inner.update_post("), "update uses the update_<m> wrapper");
+    assert!(flat.contains("self.inner.delete_user("), "delete uses the delete_<m> referential wrapper");
+    assert!(flat.contains("self.inner.user.get("), "get uses the generated storage read");
+    assert!(flat.contains("self.inner.reading.row_count("), "count uses the generated row_count");
+    assert!(flat.contains("self.inner.post.all()"), "all uses the generated storage read");
+
+    // Rows/ids marshal through the generated struct's serde via NAPI-RS's
+    // serde bridge (native JS objects, one source of truth — no second per-field
+    // matrix).
+    assert!(flat.contains("database::User"), "rows decode into the generated User struct");
+    assert!(flat.contains("env.from_js_value"), "inbound rows/ids via Env::from_js_value");
+    assert!(flat.contains("env.to_js_value"), "outbound rows/ids via Env::to_js_value");
+
+    // Integrity failures throw a JS Error; engine calls are catch_unwind-guarded
+    // (a panic must not unwind across the Node-API boundary).
+    assert!(flat.contains("Error::from_reason"), "errors surface as a thrown JS Error");
+    assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
+
+    // IDENTITY: no generic query surface / runtime schema dispatch.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
+        assert!(
+            !flat.contains(forbidden),
+            "the NAPI-RS binding must invent no generic query surface (found `{forbidden}`)"
         );
     }
 }
