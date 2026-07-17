@@ -3318,6 +3318,87 @@ Tag {
 }
 
 #[test]
+fn test_ffi_generation_async_ops() {
+    // Native FFI Phase 3 (`_async` completion bridge): each identity model gets
+    // `_async` variants of the OLTP ops in the SAME lib.rs, over a schema-INVARIANT
+    // spine (one background worker + a caller-registered completion callback keyed
+    // by `token`).  The async path calls the SAME generated integrity wrappers /
+    // storage reads as the sync path — no second write/read path, no generic query.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+
+Reading {
+  id: +u64
+  value: i64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = FfiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The schema-invariant async spine: callback registration + the executor +
+    // the completion + the Send-asserted db wrapper.
+    assert!(flat.contains("fnforgedb_set_completion_callback("), "async completion-callback registration");
+    assert!(flat.contains("typeForgeCompletion"), "the completion callback type is defined");
+    assert!(flat.contains("staticCOMPLETION_CB"), "the process-wide callback slot exists");
+    assert!(flat.contains("structSendDb"), "the Send db-pointer wrapper exists");
+    assert!(flat.contains("unsafeimplSendforSendDb"), "SendDb is unsafe-Send for the worker thread");
+    assert!(flat.contains("fnfire_completion("), "the completion delivery helper exists");
+    assert!(flat.contains("fnasync_executor("), "the single background worker executor exists");
+    assert!(flat.contains("fnspawn_async"), "jobs are enqueued on the worker");
+    // Static proof the engine is Send (a non-Send engine fails the FFI build).
+    assert!(flat.contains("assert_send::<Db>("), "Db is statically asserted Send");
+
+    // Every identity model gets every OLTP op's `_async` variant, each taking the
+    // completion `token: u64` and returning void, keyed by the model's snake name.
+    for model in ["user", "post", "reading"] {
+        for op in ["get", "all", "count", "insert", "update", "delete"] {
+            assert!(
+                flat.contains(&format!("fnforgedb_{model}_{op}_async(")),
+                "missing async op forgedb_{model}_{op}_async"
+            );
+        }
+    }
+    assert!(flat.contains("token:u64"), "async ops carry the completion token");
+
+    // The async path routes through the SAME generated wrappers/reads as the sync
+    // path — never a second write/read implementation.
+    assert!(flat.contains(".inner.create_user("), "async insert uses the create_<m> integrity wrapper");
+    assert!(flat.contains(".inner.update_post("), "async update uses the update_<m> wrapper");
+    assert!(flat.contains(".inner.delete_user("), "async delete uses the delete_<m> referential wrapper");
+    assert!(flat.contains(".inner.user.get(id)"), "async get uses the generated storage read");
+    assert!(flat.contains(".inner.reading.row_count("), "async count uses the generated row_count");
+
+    // The work is offloaded (spawn_async) and every engine call stays
+    // catch_unwind-guarded so a panic keeps the worker alive as a completion.
+    assert!(flat.contains("spawn_async(move||"), "async ops enqueue their engine call off the caller thread");
+    assert!(flat.contains("catch_unwind"), "async engine calls are catch_unwind-guarded");
+
+    // A rejected write is delivered through the callback (a validation code), not a
+    // panic — same integrity mapping as the sync ops.
+    assert!(flat.contains("FORGEDB_ERR_VALIDATION"), "async integrity failures map to a validation code");
+
+    // IDENTITY: still no generic query surface / runtime schema dispatch.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
+        assert!(
+            !flat.contains(forbidden),
+            "async ops must invent no generic query surface (found `{forbidden}`)"
+        );
+    }
+}
+
+#[test]
 fn test_api_generation_replication_endpoint() {
     // The generated replication WS endpoint (#82 Direction C): one schema-wide
     // /replicate route behind the tenant-auth guard, a resumable handshake
