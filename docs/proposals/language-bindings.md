@@ -1,6 +1,6 @@
 # Language Bindings — Python / Node / Bun (design note)
 
-**Status:** design conversation complete; decisions locked; **both Bun spikes DONE (2026-07-16)** — Node+Bun unified on NAPI-RS (Option A). **Not yet PM-gated, not yet committed to a milestone.**
+**Status:** design conversation complete; decisions locked; **both Bun spikes DONE (2026-07-16)** — Node+Bun unified on NAPI-RS (Option A). **PM-gated 2026-07-17: PASS-WITH-CONSTRAINTS** (see "Acceptance criteria" below — the 10 binding constraints are the impl bar). Not yet committed to a milestone.
 
 **Issues:** #51 (Python runtime binding), #52 (Node/NAPI-RS runtime binding), #117 (Bun runtime binding). Bundled — shared boundary. #53 (Deno) deferred indefinitely; #50 (WASM browser) landed via #110. Separate but adjacent: #118 (Python HTTP SDK) — a `--sdk` deliverable, not a runtime binding. Fallback/complement experiments: #119 (fd-wakeup + shared-mem ring), #120 (track Bun `JSCallback` maturity), #121 (server-side WASM replica).
 
@@ -165,9 +165,26 @@ Filed as **#121** (`idea` — needs a design note before impl), cross-referencin
 
 ---
 
+## Acceptance criteria (PM gate 2026-07-17 — PASS-WITH-CONSTRAINTS)
+
+The `forgedb-product-manager` gate confirmed the design is identity-sound: no published artifact becomes a generic schema-reading runtime; all schema-specific data logic stays generated per-schema at compile time; the fat ABI is *wide + generated* (not narrow + interpretive), `#[napi(object)]`/`#[pyclass]` rows are generated per-model marshalling, and L2 (`to_pandas`/`toArrow`) is a format projection over already-generated columns. `gather`/`dense_prefix` are genuine class-1 additions. The following **binding constraints are the impl acceptance bar:**
+
+1. **No generic runtime query/filter/predicate builder in any binding artifact.** No shipped code (Python/Node/Bun) may accept a stringly model or field name, or a predicate/`where`/`orderBy` expression, and interpret it against a schema at runtime. All query/filter/relation logic stays generated per-model. *(This is the removed-`QueryBuilder` red line — the single hardest line.)*
+2. **Every schema-specific surface is generated, never hand-shipped generic.** L0 ABI symbols, L1 typed methods, L2 convenience, and the row structs (`#[napi(object)]` / `#[pyclass]`) are all emitted by `forgedb generate <runtime> --runtime` per schema. Any hand-written runtime library must be schema-agnostic (class-1 substrate or class-2 transport glue only).
+3. **`gather` / `dense_prefix` stay class-1.** They take opaque byte ranges + row indices computed by generated code; they must never accept or read a field name, type, or schema. The live-set decision stays in generated code (as `all()`/`all_at()` do today).
+4. **Layer 2 never triggers compaction.** `to_pandas`/`toArrow`/`to_polars`/`to_numpy` and any "gather until compaction" path must never invoke `compact()`. Compaction is always an explicit caller act. Add a guard/test asserting no convenience read path reaches compaction.
+5. **Writer-turn serialization lives in the shared generated engine, not the binding.** Async is stall-avoidance + read parallelism only. No binding may conjure write concurrency; real multi-writer stays Tier-2/3 (`forgedb-txn`/coordinator), a separate deployment.
+6. **`--replica` stays a read-only follower.** No mutator surface on the server-side WASM replica; keep the Tier-3 coordinator `cfg`-gated off `wasm32` (as #110 already does). #121 remains a separately-gated design note, out of the v1 bindings milestone.
+7. **Substrate publish discipline.** `gather`/`dense_prefix` are additive class-1 additions to `forgedb-storage(-native/-web)` — publish them (and bump the scaffold pins) *before* an outside-repo `generate --runtime → build` can resolve them, mirroring the wal/storage/txn/coordinator sequence. Mirror both primitives across the native and web backends (API parity — even if web's is gather-only) so the shared generated engine compiles to both targets.
+8. **Honest zero-copy contract ships with v1.** Document per-column which paths alias vs. gather (non-null fixed-width primitives alias; bool/nullable/string/json transform) and the "zero-copy for append-mostly analytical tables, gather for update-heavy until `compact()`" boundary — user-facing, at ship, not retrofitted.
+9. **CLI break is documented and lands pre-1.0.** Ship the old→new target mapping (`typescript → node|bun --sdk`, `wasm → browser --replica`) in the taxonomy umbrella issue + `docs/`; no silent behavior change.
+10. **Red-line housekeeping — DONE 2026-07-17.** The stale legacy generic runtime under `runtime/bun/` (a `where(modelName)` `QueryBuilder` + generic `Database`/`db-client` over the removed `libforgedb_ffi`) survived the 2026-07-15 `crates/ffi`+`npm-package/` sweep; it was removed so the exact anti-pattern this phase forbids can't be copy-pasted back.
+
+---
+
 ## Remaining before phased impl
 
 1. ~~Run the Bun `JSCallback` spike~~ — **DONE 2026-07-16** (fd-wakeup path pinned; see Resolved spike above).
-2. `forgedb-product-manager` gate on this note.
+2. ~~`forgedb-product-manager` gate on this note~~ — **DONE 2026-07-17: PASS-WITH-CONSTRAINTS** (see "Acceptance criteria" above).
 3. File the two taxonomy follow-up issues; update #51 body (ctypes → PyO3).
 4. Pin exact ABI symbol naming.
