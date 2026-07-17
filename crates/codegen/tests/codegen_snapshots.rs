@@ -3239,6 +3239,69 @@ Reading {
 }
 
 #[test]
+fn test_ffi_generation_relation_ops() {
+    // Native FFI Phase 3 (relation traversal): the C-ABI getters that mirror the
+    // generated `Database` traversal methods one-for-one — forward FK, reverse
+    // 1:M, and M2M link/unlink/query — each a fixed generated edge walk keyed on
+    // an id, never a runtime predicate.
+    let src = r#"
+User {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  label: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = FfiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Forward FK getter: resolve a Post's *User author.
+    assert!(flat.contains("fnforgedb_post_author("), "forward-FK getter forgedb_post_author");
+    assert!(flat.contains(".inner.post_author("), "wraps the generated post_author getter");
+    assert!(flat.contains(".inner.post.get("), "forward-FK fetches the source record by id first");
+
+    // Reverse 1:M getter: all Posts of a User.
+    assert!(flat.contains("fnforgedb_user_posts("), "reverse-1:M getter forgedb_user_posts");
+    assert!(flat.contains(".inner.user_posts("), "wraps the generated user_posts getter");
+
+    // M2M: link/unlink + both query directions.
+    assert!(flat.contains("fnforgedb_link_post_tag("), "M2M link forgedb_link_post_tag");
+    assert!(flat.contains("fnforgedb_unlink_post_tag("), "M2M unlink forgedb_unlink_post_tag");
+    assert!(flat.contains("fnforgedb_post_tags("), "M2M forward query forgedb_post_tags");
+    assert!(flat.contains("fnforgedb_tag_posts("), "M2M reverse query forgedb_tag_posts");
+    assert!(flat.contains(".inner.link_post_tag("), "wraps the generated link_post_tag");
+    assert!(flat.contains(".inner.post_tags("), "wraps the generated post_tags query");
+
+    // The snapshot-scoped `_at` traversal is deferred — not emitted yet.
+    assert!(!flat.contains("forgedb_post_tags_at"), "snapshot `_at` traversal is a later phase");
+
+    // Every engine call is catch_unwind-guarded.
+    assert!(flat.contains("catch_unwind"), "traversal engine calls are catch_unwind-guarded");
+
+    // IDENTITY: fixed edge walks, no generic query surface.
+    for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
+        assert!(
+            !flat.contains(forbidden),
+            "relation ops must invent no generic query surface (found `{forbidden}`)"
+        );
+    }
+}
+
+#[test]
 fn test_api_generation_replication_endpoint() {
     // The generated replication WS endpoint (#82 Direction C): one schema-wide
     // /replicate route behind the tenant-auth guard, a resumable handshake
