@@ -1149,10 +1149,16 @@ impl RustGenerator {
                 let field_col_name = format_ident!("{}_col", f.name);
                 let method = format_ident!("export_col_{}", f.name);
                 quote! {
-                    /// Gather this column's bytes at the given physical row indices
-                    /// into one contiguous buffer (the Arrow columnar-export path).
-                    pub fn #method(&self, indices: &[usize]) -> std::io::Result<Vec<u8>> {
-                        self.#field_col_name.gather(indices)
+                    /// Export this column's bytes at the given physical row indices
+                    /// (the Arrow columnar-export path). Returns a
+                    /// `forgedb_storage::ColumnExport` that is a **zero-copy mmap
+                    /// alias** of the on-disk column when `indices` is a dense
+                    /// prefix `[0, n)` (no updates/tombstones) and a gathered copy
+                    /// otherwise — the ABI is identical either way. The alias-or-copy
+                    /// decision over the opaque indices is the storage primitive's;
+                    /// the live-set decision stays here (`export_live_indices`).
+                    pub fn #method(&self, indices: &[usize]) -> std::io::Result<forgedb_storage::ColumnExport> {
+                        self.#field_col_name.export(indices)
                     }
                 }
             })
@@ -1164,10 +1170,14 @@ impl RustGenerator {
 
         quote! {
             /// The live physical row indices (newest, non-tombstoned version per
-            /// id) — the row set the Arrow columnar export gathers. Same liveness
-            /// as `all()`, but tombstone-only (no full-record decode). Order
-            /// follows the id map (unspecified), consistent across every
-            /// `export_col_*` call within one export batch.
+            /// id) in **ascending physical order** — the row set the Arrow
+            /// columnar export reads. Same liveness as `all()`, but tombstone-only
+            /// (no full-record decode). Sorting is load-bearing: on a clean table
+            /// (all inserts, no updates/deletes) the live set is exactly the dense
+            /// prefix `[0, n)`, which lets `export_col_<f>` take the zero-copy
+            /// `mmap` alias fast path; an update/delete-scattered live set sorts to
+            /// a non-prefix and falls back to a gathered copy. Deterministic and
+            /// consistent across every `export_col_*` call within one export batch.
             pub fn export_live_indices(&self) -> Vec<usize> {
                 let mut indices = Vec::new();
                 for &row in self.id_to_row.values() {
@@ -1175,6 +1185,7 @@ impl RustGenerator {
                         indices.push(row);
                     }
                 }
+                indices.sort_unstable();
                 indices
             }
 
