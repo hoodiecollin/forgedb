@@ -3431,13 +3431,19 @@ Post {
     // owner box + both release callbacks, and the fill helper.
     assert!(flat.contains("structArrowSchema"), "the Arrow schema struct is defined");
     assert!(flat.contains("structArrowArray"), "the Arrow array struct is defined");
-    assert!(flat.contains("structArrowArrayOwner"), "the gathered-buffer owner box is defined");
+    assert!(flat.contains("structArrowArrayOwner"), "the export-buffer owner box is defined");
     assert!(flat.contains("fnarrow_array_release("), "the array release callback exists");
     assert!(flat.contains("fnarrow_schema_release("), "the schema release callback exists");
     assert!(flat.contains("fnfill_arrow_primitive("), "the fill helper exists");
     // Release reclaims the owner box; a non-null validity buffer count of 2.
     assert!(flat.contains("Box::from_raw"), "the array release reclaims + drops the owner box");
     assert!(flat.contains("n_buffers:2"), "a primitive array has two buffers (validity + data)");
+    // The buffer is carried by the alias-or-gather-transparent ColumnExport, so
+    // the release path frees a copy OR munmaps an alias with no ABI difference.
+    assert!(
+        flat.contains("forgedb_storage::ColumnExport"),
+        "the export buffer is a forgedb_storage::ColumnExport (mmap alias or gathered copy)"
+    );
 
     // Every Arrow-exportable column gets an export op, keyed by the model's snake
     // name and the field name.
@@ -3462,11 +3468,12 @@ Post {
     assert!(!flat.contains("forgedb_user_active_export_arrow"), "bool column must be skipped");
     assert!(!flat.contains("forgedb_user_bio_export_arrow"), "nullable string column must be skipped");
 
-    // The export routes through the generated live-set + column gather (the
-    // live-set decision stays in generated code), then fills the Arrow structs.
+    // The export routes through the generated live-set + column export (the
+    // live-set decision stays in generated code; the alias-vs-gather decision is
+    // the storage primitive's), then fills the Arrow structs.
     assert!(flat.contains(".inner.user.export_live_indices()"), "the live row set comes from generated code");
-    assert!(flat.contains(".inner.user.export_col_age("), "the column is gathered via the generated export_col_<f>");
-    assert!(flat.contains("fill_arrow_primitive("), "the gathered buffer fills the Arrow structs");
+    assert!(flat.contains(".inner.user.export_col_age("), "the column is exported via the generated export_col_<f>");
+    assert!(flat.contains("fill_arrow_primitive("), "the exported buffer fills the Arrow structs");
     assert!(flat.contains("catch_unwind"), "the export is catch_unwind-guarded");
 
     // IDENTITY: no generic query surface / runtime schema dispatch.
