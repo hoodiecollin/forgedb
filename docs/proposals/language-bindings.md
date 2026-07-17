@@ -56,6 +56,39 @@ Schema-tailored **logic lives in one shared generated engine crate**; a **thin p
 
 ---
 
+## ABI symbol naming (pinned)
+
+The Layer-0 fat C-ABI is the **language-neutral contract**. Convention: every symbol is `extern "C"` + `#[no_mangle]`, prefixed `forgedb_`; **model names lower to `snake_case`** (`BlogPost` → `blog_post`), field/relation names are already `snake_case`. The ergonomic layers (PyO3 `#[pyclass]`, NAPI-RS `#[napi]`) mirror these operations **1:1** — whether they wrap the C-ABI or bind the shared engine crate directly with equivalent per-model calls is an impl detail deferred to the phase; the *naming scheme* is the pinned part.
+
+**Schema-invariant lifecycle / control:**
+- `forgedb_version() -> *const c_char`
+- `forgedb_open(root: *const c_char, flags: u32, err_out: *mut *mut Error) -> *mut Db`
+- `forgedb_close(db: *mut Db)`
+- `forgedb_commit(db, err_out) -> bool` · `forgedb_checkpoint(db, err_out) -> bool`
+- `forgedb_compact(db, err_out) -> bool` — **explicit only** (constraint 4; never reached from a read/convenience path)
+- `forgedb_error_code(err) -> i32` · `forgedb_error_message(err) -> *const c_char` · `forgedb_error_free(err)`
+- `forgedb_free_buffer(ptr, len)` + the Arrow C-Data-Interface `release` callbacks (free a gathered buffer / no-op an alias)
+
+**Per-model row ops** (`<m>` = snake_case model; `<M>Row` = generated `#[repr(C)]` row struct):
+- `forgedb_<m>_insert(db, row: *const <M>Row, err_out) -> Id`
+- `forgedb_<m>_get(db, id, out: *mut <M>Row, err_out) -> bool` *(false = absent)* · `forgedb_<m>_update(db, id, row, err_out) -> bool` · `forgedb_<m>_delete(db, id, err_out) -> bool`
+- `forgedb_<m>_count(db) -> u64` · `forgedb_<m>_all(db, out: *mut <M>RowList, err_out) -> bool`
+- indexed probes: `forgedb_<m>_find_by_<field>(...)` · `forgedb_<m>_get_by_<field>(...)` · composite `forgedb_<m>_find_by_<a>_and_<b>(...)`
+- **snapshot forms** suffix `_at`, taking a `watermark: u64`: `forgedb_<m>_get_at` · `forgedb_<m>_all_at` · `forgedb_<m>_find_by_<field>_at`
+- **integrity wrappers** (FK-checked, mirror the generated `Database::create_<model>` path): `forgedb_create_<m>` · `forgedb_update_<m>` · `forgedb_delete_<m>` (the `@on_delete` enforcement point)
+
+**Relation traversal:**
+- forward FK: `forgedb_<m>_<fkfield>` (e.g. `forgedb_post_author`)
+- reverse one-to-many: `forgedb_<m>_<children>` (e.g. `forgedb_user_posts`; multi-FK disambiguates `forgedb_user_posts_by_author`)
+- M2M: `forgedb_link_<a>_<b>` · `forgedb_unlink_<a>_<b>` · `forgedb_unlink_all_<a>_<b>` · `forgedb_<a>_<b>s` · snapshot `forgedb_<a>_<b>s_at`
+
+**Columnar Arrow export (per-column — the zero-copy path):**
+- `forgedb_<m>_<col>_export_arrow(db, snapshot: u64, out_array: *mut ArrowArray, out_schema: *mut ArrowSchema, err_out) -> bool` — fills the Arrow **C Data Interface** structs; **aliases** when `dense_prefix` is `Some`, else **gathers** (transparent to caller). The Arrow `release` callback frees a gathered buffer or no-ops an alias.
+
+**Async variants:** append `_async`, drop the out-param, take a completion `token: u64`: `forgedb_<m>_get_async(db, id, token) -> void`. Reads run on the pool; **writes serialize at the L0 writer turn** (constraint 5). Completion is marshalled to the event loop by the Layer-1 per-runtime bridge (Node/Bun `napi_threadsafe_function`; Python GIL + `pyo3-async-runtimes`); the token resolves the pending Promise/future. There is **no** generic `forgedb_query(model, predicate)` symbol — that shape is the removed-`QueryBuilder` red line (constraint 1).
+
+---
+
 ## Storage support (no format pivot)
 
 The gather is a read-*shape*, not a format change — the engine already computes the live set for `all()`/`all_at()`. Add **one small schema-agnostic columnar-read primitive** to `forgedb-storage`:
@@ -186,5 +219,7 @@ The `forgedb-product-manager` gate confirmed the design is identity-sound: no pu
 
 1. ~~Run the Bun `JSCallback` spike~~ — **DONE 2026-07-16** (fd-wakeup path pinned; see Resolved spike above).
 2. ~~`forgedb-product-manager` gate on this note~~ — **DONE 2026-07-17: PASS-WITH-CONSTRAINTS** (see "Acceptance criteria" above).
-3. File the two taxonomy follow-up issues; update #51 body (ctypes → PyO3).
-4. Pin exact ABI symbol naming.
+3. ~~File the taxonomy umbrella issue; update #51 body (ctypes → PyO3)~~ — **DONE 2026-07-17** (umbrella = **#122**; #51 updated to PyO3).
+4. ~~Pin exact ABI symbol naming~~ — **DONE 2026-07-17** (see "ABI symbol naming (pinned)" above).
+
+**Next: phased implementation** against the 10 acceptance-criteria constraints.
