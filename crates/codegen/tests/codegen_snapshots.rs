@@ -3,8 +3,8 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, HopPlan, ModelOp, OpenApiGenerator, RustGenerator, TransformGenerator,
-    TransformPlan, TypeScriptGenerator, VersionSchema, WasmGenerator,
+    ApiGenerator, FfiGenerator, HopPlan, ModelOp, OpenApiGenerator, RustGenerator,
+    TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema, WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -3091,6 +3091,84 @@ Tag {
         assert!(
             !worker.contains(schema_token),
             "worker bootstrap must be schema-agnostic (found `{schema_token}`)"
+        );
+    }
+}
+
+#[test]
+fn test_ffi_generation_spine() {
+    // Native FFI Layer-0 C-ABI spine (language bindings #51/#52/#117, Phase 2):
+    // the schema-invariant lifecycle + error surface every binding hangs off.
+    // Generated per schema (it links the per-schema `Database`) but its SYMBOL
+    // SET is schema-invariant — no per-model op, no field name, and above all no
+    // generic `forgedb_query(model, predicate)` (the removed-QueryBuilder red
+    // line, acceptance constraint 1).
+    let src = r#"
+User {
+  id: +uuid
+  email: string
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = FfiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The spine wraps the generated Database — same shape as the wasm replica.
+    assert!(flat.contains("moddatabase;"), "spine links the generated database module");
+    assert!(flat.contains("usedatabase::Database;"), "spine uses the generated Database");
+    assert!(flat.contains("pubstructDb"), "opaque C-ABI Db handle");
+    assert!(flat.contains("pubstructForgeError"), "C-ABI error object");
+
+    // Every pinned schema-invariant lifecycle / control symbol is present, each
+    // an `extern "C"` `#[unsafe(no_mangle)]` entry point.
+    for sym in [
+        "forgedb_version", "forgedb_open", "forgedb_close", "forgedb_commit",
+        "forgedb_checkpoint", "forgedb_compact", "forgedb_error_code",
+        "forgedb_error_message", "forgedb_error_free", "forgedb_free_buffer",
+    ] {
+        assert!(
+            flat.contains(&format!("fn{sym}(")),
+            "missing pinned ABI symbol {sym}"
+        );
+    }
+    assert!(flat.contains("extern\"C\""), "symbols are extern \"C\"");
+    assert!(flat.contains("no_mangle"), "symbols are #[no_mangle]");
+
+    // The spine calls the generated Database lifecycle — never a reimplementation.
+    assert!(flat.contains("Database::open_at("), "open wraps the generated open_at");
+    assert!(flat.contains(".inner.commit()"), "commit wraps the generated commit");
+    assert!(flat.contains(".inner.checkpoint()"), "checkpoint wraps the generated checkpoint");
+    assert!(flat.contains(".inner.compact()"), "compact wraps the generated compact");
+
+    // PANIC DISCIPLINE: engine calls are wrapped so a panic becomes a ForgeError
+    // instead of unwinding across the C-ABI boundary into a foreign caller (UB).
+    assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
+
+    // IDENTITY RED LINE: no generic runtime query/filter symbol, and no schema
+    // dispatch — the spine references only the Database type + lifecycle, never a
+    // model/field name or a `match model`.
+    for forbidden in [
+        "forgedb_query", "match model", "matchmodel", "predicate", "where(",
+        "orderBy", "User", "Post", "email", "title",
+    ] {
+        assert!(
+            !flat.contains(forbidden),
+            "spine must be schema-invariant with no generic query surface (found `{forbidden}`)"
+        );
+    }
+    // No per-model row op has leaked into the spine yet (that's a later phase).
+    for per_model in ["forgedb_user_", "forgedb_post_", "forgedb_create_"] {
+        assert!(
+            !flat.contains(per_model),
+            "the spine phase emits no per-model op (found `{per_model}`)"
         );
     }
 }
