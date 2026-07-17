@@ -89,6 +89,19 @@ impl FfiGenerator {
                 message: CString,
             }
 
+            /// An owned point-in-time read snapshot captured by
+            /// `forgedb_snapshot` — a cross-model-consistent bundle of per-
+            /// collection row-count watermarks (#56, Direction A).  Passed by
+            /// `*const Snapshot` to the `_at` read/traversal entry points and
+            /// freed by the caller via `forgedb_snapshot_free`.  Because the
+            /// capture is routed through `Database::snapshot()` (taken on the
+            /// single writer between mutations), the watermarks are atomic as of
+            /// one commit boundary: rows appended after capture are invisible and
+            /// no reader can observe a torn row.
+            pub struct Snapshot {
+                inner: database::DatabaseSnapshot,
+            }
+
             /// A null or non-UTF-8 argument reached an entry point.
             const FORGEDB_ERR_INVALID_ARG: i32 = 1;
             /// The engine returned an `io::Error` (e.g. a failed `commit` fsync).
@@ -375,6 +388,50 @@ impl FfiGenerator {
                 drop(Vec::from_raw_parts(ptr, len, len));
             }
 
+            /// Capture a cross-model-consistent read snapshot (#56, Direction A):
+            /// a row-count watermark for every model and junction, taken together
+            /// on the single writer so the view is atomic as of one commit
+            /// boundary.  Returns an owned `*mut Snapshot` the caller frees with
+            /// `forgedb_snapshot_free`, or null with `*err_out` set on panic.
+            /// Pass it to a `forgedb_<m>_get_at` / `_all_at` / M2M `_at` entry
+            /// point for a point-in-time read (the wire token is opaque — the
+            /// caller never sees or forges a watermark integer).
+            ///
+            /// # Safety
+            /// `db` must be a live handle from `forgedb_open`; `err_out`, when
+            /// non-null, must point to writable storage for one `*mut ForgeError`.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn forgedb_snapshot(
+                db: *mut Db,
+                err_out: *mut *mut ForgeError,
+            ) -> *mut Snapshot {
+                clear_err(err_out);
+                let Some(db) = db.as_ref() else {
+                    set_error(err_out, FORGEDB_ERR_INVALID_ARG, "db handle is null".to_string());
+                    return ptr::null_mut();
+                };
+                match catch_unwind(AssertUnwindSafe(|| db.inner.snapshot())) {
+                    Ok(inner) => Box::into_raw(Box::new(Snapshot { inner })),
+                    Err(payload) => {
+                        set_error(err_out, FORGEDB_ERR_PANIC, panic_message(payload));
+                        ptr::null_mut()
+                    }
+                }
+            }
+
+            /// Free a snapshot captured by `forgedb_snapshot`.  A null pointer is
+            /// a no-op; the handle is invalid afterward.
+            ///
+            /// # Safety
+            /// `snap` must be a handle from `forgedb_snapshot`, freed once.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn forgedb_snapshot_free(snap: *mut Snapshot) {
+                if snap.is_null() {
+                    return;
+                }
+                drop(Box::from_raw(snap));
+            }
+
             // --- Per-model row ops (the schema-tailored half of the fat ABI) ---
             // These reference the generated per-model structs + integrity wrappers
             // by name — they ARE tailored per schema (that is the point) — but they
@@ -425,7 +482,12 @@ impl FfiGenerator {
     ///     `1` updated / `0` absent / `-1` error;
     ///   * `forgedb_<m>_delete(db, id, id_len, err)` → `i32`: `1` deleted /
     ///     `0` absent / `-1` error, through the referential-integrity
-    ///     `Database::delete_<m>` wrapper.
+    ///     `Database::delete_<m>` wrapper;
+    ///   * `forgedb_<m>_get_at(db, snap, id, id_len, out, out_len, err)` /
+    ///     `forgedb_<m>_all_at(db, snap, out, out_len, err)` → the point-in-time
+    ///     (#56) reads: same as `_get`/`_all` but resolved as of a
+    ///     `forgedb_snapshot`-captured watermark (`db.<m>.get_at`/`all_at`), so a
+    ///     row appended after the capture is invisible.
     ///
     /// Rows/ids cross as opaque JSON bytes and are decoded into the generated
     /// struct / id type via serde — schema-tailored at a compile-time-known type,
@@ -452,6 +514,12 @@ impl FfiGenerator {
                 let all_sym = format_ident!("forgedb_{}_all", snake);
                 let update_sym = format_ident!("forgedb_{}_update", snake);
                 let delete_sym = format_ident!("forgedb_{}_delete", snake);
+                let get_at_sym = format_ident!("forgedb_{}_get_at", snake);
+                let all_at_sym = format_ident!("forgedb_{}_all_at", snake);
+                // The `DatabaseSnapshot` field for this model is named by its
+                // snake name (same as the storage field), so `snap.inner.<snake>`
+                // is this collection's captured watermark.
+                let snap_field = format_ident!("{}", snake);
 
                 let insert_doc =
                     format!("Insert a `{}` (JSON record → new id JSON) via the integrity wrapper.", model.name);
@@ -463,6 +531,12 @@ impl FfiGenerator {
                     format!("Update a `{}` by id (1 updated / 0 absent / -1 error).", model.name);
                 let delete_doc =
                     format!("Delete a `{}` by id with referential integrity (1 / 0 / -1).", model.name);
+                let get_at_doc = format!(
+                    "Fetch a `{}` by id as of a snapshot (JSON → record JSON; `*out` null if absent then).",
+                    model.name
+                );
+                let all_at_doc =
+                    format!("Every live `{}` as of a snapshot, as a JSON array.", model.name);
 
                 quote! {
                     #[doc = #insert_doc]
@@ -731,6 +805,106 @@ impl FfiGenerator {
                             }
                         }
                     }
+
+                    #[doc = #get_at_doc]
+                    ///
+                    /// # Safety
+                    /// `db`/`snap` are live handles; `id`/`id_len` a readable JSON
+                    /// id buffer; `out`/`out_len`/`err_out`, when non-null,
+                    /// writable.  On a hit `*out` is a buffer freed with
+                    /// `forgedb_free_buffer`.
+                    #[unsafe(no_mangle)]
+                    pub unsafe extern "C" fn #get_at_sym(
+                        db: *mut Db,
+                        snap: *const Snapshot,
+                        id: *const u8,
+                        id_len: usize,
+                        out: *mut *mut u8,
+                        out_len: *mut usize,
+                        err_out: *mut *mut ForgeError,
+                    ) -> bool {
+                        clear_err(err_out);
+                        if !out.is_null() { *out = ptr::null_mut(); }
+                        if !out_len.is_null() { *out_len = 0; }
+                        let Some(db) = db.as_ref() else {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "db handle is null".to_string());
+                            return false;
+                        };
+                        let Some(snap) = snap.as_ref() else {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "snapshot handle is null".to_string());
+                            return false;
+                        };
+                        let Some(id_bytes) = read_bytes(id, id_len) else {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "id buffer is null".to_string());
+                            return false;
+                        };
+                        let id: #id_ty = match serde_json::from_slice(id_bytes) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                set_error(err_out, FORGEDB_ERR_INVALID_ARG, format!("invalid id JSON: {e}"));
+                                return false;
+                            }
+                        };
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            db.inner.#storage.get_at(&snap.inner.#snap_field, id)
+                        })) {
+                            Ok(Some(record)) => match serde_json::to_vec(&record) {
+                                Ok(json) => { emit_bytes(json, out, out_len); true }
+                                Err(e) => {
+                                    set_error(err_out, FORGEDB_ERR_IO, format!("record serialize: {e}"));
+                                    false
+                                }
+                            },
+                            // Absent as of the snapshot: success, `*out` left null.
+                            Ok(None) => true,
+                            Err(payload) => {
+                                set_error(err_out, FORGEDB_ERR_PANIC, panic_message(payload));
+                                false
+                            }
+                        }
+                    }
+
+                    #[doc = #all_at_doc]
+                    ///
+                    /// # Safety
+                    /// `db`/`snap` are live handles; `out`/`out_len`/`err_out`,
+                    /// when non-null, writable.  On success `*out` is a buffer
+                    /// freed with `forgedb_free_buffer`.
+                    #[unsafe(no_mangle)]
+                    pub unsafe extern "C" fn #all_at_sym(
+                        db: *mut Db,
+                        snap: *const Snapshot,
+                        out: *mut *mut u8,
+                        out_len: *mut usize,
+                        err_out: *mut *mut ForgeError,
+                    ) -> bool {
+                        clear_err(err_out);
+                        if !out.is_null() { *out = ptr::null_mut(); }
+                        if !out_len.is_null() { *out_len = 0; }
+                        let Some(db) = db.as_ref() else {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "db handle is null".to_string());
+                            return false;
+                        };
+                        let Some(snap) = snap.as_ref() else {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "snapshot handle is null".to_string());
+                            return false;
+                        };
+                        match catch_unwind(AssertUnwindSafe(|| {
+                            db.inner.#storage.all_at(&snap.inner.#snap_field)
+                        })) {
+                            Ok(records) => match serde_json::to_vec(&records) {
+                                Ok(json) => { emit_bytes(json, out, out_len); true }
+                                Err(e) => {
+                                    set_error(err_out, FORGEDB_ERR_IO, format!("records serialize: {e}"));
+                                    false
+                                }
+                            },
+                            Err(payload) => {
+                                set_error(err_out, FORGEDB_ERR_PANIC, panic_message(payload));
+                                false
+                            }
+                        }
+                    }
                 }
             })
             .collect()
@@ -749,10 +923,12 @@ impl FfiGenerator {
     ///     — every child whose FK references the (UUID) parent id, as a JSON array;
     ///   * **M2M** `forgedb_link_<a>_<b>` / `forgedb_unlink_<a>_<b>` (both UUID ids)
     ///     + the query getters `forgedb_<a>_<field1>` / `forgedb_<b>_<field2>`
-    ///     (linked records as a JSON array).
+    ///     (linked records as a JSON array), plus the one snapshot-scoped
+    ///     traversal `forgedb_<a>_<field1>_at(db, snap, id, ...)` mirroring
+    ///     `Database::<a>_<field1>_at` (junction + target both clamped to `snap`).
     ///
-    /// The snapshot-scoped `_at` traversal + eager-load bundles are deferred to a
-    /// later phase (they land here too).
+    /// The eager-load bundles (`*_with_relations`) are deferred to a later phase
+    /// (they land here too).
     fn generate_relation_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
         use std::collections::{HashMap, HashSet};
 
@@ -794,6 +970,69 @@ impl FfiGenerator {
                         return false;
                     };
                     let id: #id_ty = match serde_json::from_slice(id_bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, format!("invalid id JSON: {e}"));
+                            return false;
+                        }
+                    };
+                    match catch_unwind(AssertUnwindSafe(|| #call)) {
+                        Ok(value) => match serde_json::to_vec(&value) {
+                            Ok(json) => { emit_bytes(json, out, out_len); true }
+                            Err(e) => {
+                                set_error(err_out, FORGEDB_ERR_IO, format!("serialize: {e}"));
+                                false
+                            }
+                        },
+                        Err(payload) => {
+                            set_error(err_out, FORGEDB_ERR_PANIC, panic_message(payload));
+                            false
+                        }
+                    }
+                }
+            }
+        };
+
+        // The snapshot-scoped sibling of `vec_getter`: a `Vec`-returning getter
+        // over a decoded `Uuid` id AND a `*const Snapshot` handle:
+        // `forgedb_<name>(db, snap, id, ...)`.  `call` uses the borrowed `snap`.
+        let snap_vec_getter = |sym: &proc_macro2::Ident,
+                               call: proc_macro2::TokenStream,
+                               doc: &str| {
+            quote! {
+                #[doc = #doc]
+                ///
+                /// # Safety
+                /// `db`/`snap` are live handles; `id`/`id_len` a readable JSON
+                /// UUID buffer; `out`/`out_len`/`err_out`, when non-null, writable.
+                /// On success `*out` is a JSON buffer freed with
+                /// `forgedb_free_buffer`.
+                #[unsafe(no_mangle)]
+                pub unsafe extern "C" fn #sym(
+                    db: *mut Db,
+                    snap: *const Snapshot,
+                    id: *const u8,
+                    id_len: usize,
+                    out: *mut *mut u8,
+                    out_len: *mut usize,
+                    err_out: *mut *mut ForgeError,
+                ) -> bool {
+                    clear_err(err_out);
+                    if !out.is_null() { *out = ptr::null_mut(); }
+                    if !out_len.is_null() { *out_len = 0; }
+                    let Some(db) = db.as_ref() else {
+                        set_error(err_out, FORGEDB_ERR_INVALID_ARG, "db handle is null".to_string());
+                        return false;
+                    };
+                    let Some(snap) = snap.as_ref() else {
+                        set_error(err_out, FORGEDB_ERR_INVALID_ARG, "snapshot handle is null".to_string());
+                        return false;
+                    };
+                    let Some(id_bytes) = read_bytes(id, id_len) else {
+                        set_error(err_out, FORGEDB_ERR_INVALID_ARG, "id buffer is null".to_string());
+                        return false;
+                    };
+                    let id: Uuid = match serde_json::from_slice(id_bytes) {
                         Ok(v) => v,
                         Err(e) => {
                             set_error(err_out, FORGEDB_ERR_INVALID_ARG, format!("invalid id JSON: {e}"));
@@ -1065,9 +1304,26 @@ impl FfiGenerator {
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model2, m.model1);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#fwd_ident(id) }, &doc));
 
-                // Mirror the impl's `_at` insert so subsequent `seen` state agrees
-                // (the snapshot-scoped variant itself is deferred — not emitted).
-                seen.insert(format!("{snake1}_{}_at", m.field1));
+                // The ONE snapshot-scoped traversal on `Database` (#56): the
+                // junction and each resolved target are both clamped to the same
+                // captured watermark, so a link or target row appended after the
+                // snapshot is excluded on both sides of the join.  Emitted here,
+                // at the exact point the impl inserts `<a>_<field1>_at` into the
+                // shared `seen`, so this wrapper and the impl method agree.
+                let fwd_at_name = format!("{snake1}_{}_at", m.field1);
+                if seen.insert(fwd_at_name.clone()) {
+                    let fwd_at_ident = format_ident!("{}", fwd_at_name);
+                    let at_sym = format_ident!("forgedb_{}", fwd_at_name);
+                    let at_doc = format!(
+                        "All linked `{}` for the given `{}` id, consistent as of `snap` (JSON array).",
+                        m.model2, m.model1
+                    );
+                    ops.push(snap_vec_getter(
+                        &at_sym,
+                        quote! { db.inner.#fwd_at_ident(&snap.inner, id) },
+                        &at_doc,
+                    ));
+                }
             }
 
             // model2.field2 -> Vec<model1>  (reverse M2M query)
