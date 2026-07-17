@@ -88,7 +88,7 @@ many-to-many. The full grammar is in [SCHEMA.md](./SCHEMA.md).
 ```bash
 forgedb generate rust         # → generated/database.rs
 forgedb generate api          # → generated/api.rs (+ package.json, tsconfig.json)
-forgedb generate typescript   # → generated/types.ts  (the SDK)
+forgedb generate node --sdk   # → generated/types.ts  (the REST SDK; `bun --sdk` is equivalent)
 ```
 
 Or `forgedb generate all` for everything at once (adds OpenAPI + React stubs).
@@ -180,7 +180,7 @@ Full route set per model: `GET /api/<model>` (list, with
 
 ## 7. Use the typed TypeScript SDK
 
-`forgedb generate typescript` emits `generated/types.ts` plus a `package.json`
+`forgedb generate node --sdk` (or `bun --sdk`) emits `generated/types.ts` plus a `package.json`
 and `tsconfig.json` (only if absent — regeneration never clobbers your edits),
 so it's npm-publishable as-is. The client is full CRUD, faithful to the REST
 contract:

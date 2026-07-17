@@ -31,6 +31,8 @@ Consequences (backward-compat **not** kept — clean break accepted):
 
 Follow-up issues to file: (1) a "generate = runtime × mode" taxonomy umbrella that #51/#52/#117/#118 reference; (2) server-side-WASM-replica (**filed — see #121**).
 
+> **Impl status (CLI taxonomy #122 — LANDED 2026-07-17).** `generate` now parses the two orthogonal axes: a positional **target** (runtime `python`/`node`/`bun`/`browser`, or a standalone artifact `all`/`rust`/`api`/`openapi`/`stubs`/`ffi`/`transform`) × a **mode** flag (`--sdk`/`--runtime`/`--replica`, a clap `ArgGroup` so at most one). `resolve_target(raw, mode)` (`src/commands/generate/mod.rs`) collapses the pair into one canonical internal target: `node|bun --sdk` → the TS SDK (`typescript`), `browser --replica` → the wasm replica (`wasm`), `python --runtime` → PyO3 (`pyo3`), `node|bun --runtime` → NAPI-RS (`napi`). A standalone artifact with a mode flag errors; a runtime target without a mode errors; **the pre-#122 flat verbs `typescript`/`wasm` are a clean break** — they error with a pointer to the new form (pre-1.0 CLI, `docs/SEMVER.md`). Recognised-but-later combinations report "not yet implemented" against their issue: `python --sdk` (#118), `node|bun --replica` (#121), and the two wrapper targets `pyo3`/`napi` (their own phases). `build --no-api` was migrated to the taxonomy (`node --sdk` for the SDK; rust/stubs standalone). Docs (`GETTING_STARTED.md`) updated to `node --sdk`. Verified: CLI build clean + every resolution path exercised by hand (`browser --replica`/`node --sdk` emit; retired verbs + misuse + not-yet combos all error with guidance). **Deferred to the wrapper phases:** the `pyo3` / `napi` generators themselves.
+
 ---
 
 ## Core architecture (locked)
