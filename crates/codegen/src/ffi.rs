@@ -31,9 +31,12 @@
 //! Arrow columnar export (the zero-copy selling point) also lands here
 //! (`generate_arrow_ops` + the schema-invariant Arrow C-Data-Interface spine):
 //! for each Arrow-exportable non-null fixed-width column, a
-//! `forgedb_<m>_<f>_export_arrow` gathers exactly the live rows of that one
-//! column into a caller-owned Arrow array. v1 gathers (a copy); the alias fast
-//! path (`dense_prefix`) slots in behind the same ABI + release contract later.
+//! `forgedb_<m>_<f>_export_arrow` exports exactly the live rows of that one
+//! column into a caller-owned Arrow array — a **zero-copy `mmap` alias** of the
+//! on-disk column when the live rows are a dense prefix `[0, n)` (no
+//! updates/tombstones), a gathered copy otherwise. Both paths ride the same ABI
+//! + `release` contract (`forgedb_storage::ColumnExport` behind
+//! `fill_arrow_primitive`), so the consumer is alias-or-gather transparent.
 //!
 //! **Panic discipline.** Every entry point that can run engine code wraps it in
 //! `catch_unwind` and converts a panic into a `ForgeError` — an unwind across the
@@ -601,12 +604,11 @@ impl FfiGenerator {
             // The zero-copy selling point: hand a whole live column to the caller
             // as an Arrow C-Data-Interface array (importable by pyarrow / arrow-js
             // / polars with no per-row JSON).  These two structs are the Arrow ABI
-            // verbatim (`arrow/c/abi.h`); the per-column ops below fill them.  v1
-            // GATHERS (a contiguous copy of exactly the live rows) — the buffer is
-            // heap-owned and freed by the Arrow `release` callback.  The alias
-            // (`dense_prefix`) fast path is a drop-in behind this SAME release
-            // contract (the export ABI is alias-or-gather transparent), a later
-            // increment.
+            // verbatim (`arrow/c/abi.h`); the per-column ops below fill them.  The
+            // buffer is a zero-copy `mmap` ALIAS of the on-disk column when the
+            // live rows are a dense prefix `[0, n)`, and a gathered heap copy
+            // otherwise — the `forgedb_storage::ColumnExport` owner carries either
+            // behind one `release` callback (drop = free copy / `munmap` alias).
 
             /// Arrow C Data Interface schema struct (`struct ArrowSchema`).
             #[repr(C)]
@@ -637,15 +639,18 @@ impl FfiGenerator {
                 private_data: *mut c_void,
             }
 
-            /// Owns everything an exported `ArrowArray` points at: the gathered
-            /// column bytes (`buffers[1]`) and the two-element buffer pointer array
-            /// itself.  The `release` callback reclaims this box and drops it.
+            /// Owns everything an exported `ArrowArray` points at: the column
+            /// export backing `buffers[1]` (either a zero-copy `mmap` alias or a
+            /// gathered `Vec` — a `forgedb_storage::ColumnExport`, transparent to
+            /// this box) and the two-element buffer pointer array itself.  The
+            /// `release` callback reclaims this box and drops it — dropping the
+            /// `ColumnExport` frees the copy *or* `munmap`s the alias, as needed.
             struct ArrowArrayOwner {
-                _data: Vec<u8>,
+                _export: forgedb_storage::ColumnExport,
                 _buffers: Vec<*const c_void>,
             }
 
-            /// Arrow `release` for a gathered array: reclaim + drop the owner box,
+            /// Arrow `release` for an exported array: reclaim + drop the owner box,
             /// then null `release` (the Arrow protocol's released marker).
             unsafe extern "C" fn arrow_array_release(array: *mut ArrowArray) {
                 if array.is_null() {
@@ -675,22 +680,24 @@ impl FfiGenerator {
 
             /// Fill `out_schema`/`out_array` for a non-null fixed-width primitive
             /// column: two buffers (validity = null since `null_count == 0`, then
-            /// the gathered data), `length` values, no children.  `format` is a
-            /// `'static` Arrow format C-string; `data`'s heap allocation backs
-            /// `buffers[1]` and outlives the call inside the owner box.
+            /// the exported data), `length` values, no children.  `format` is a
+            /// `'static` Arrow format C-string; `export`'s buffer (mmap alias or
+            /// gathered heap `Vec`) backs `buffers[1]` and outlives the call inside
+            /// the owner box.
             unsafe fn fill_arrow_primitive(
                 out_schema: *mut ArrowSchema,
                 out_array: *mut ArrowArray,
                 format: *const c_char,
-                data: Vec<u8>,
+                export: forgedb_storage::ColumnExport,
                 length: usize,
             ) {
-                // Heap pointers are stable across the moves into the owner box, so
-                // capturing them first is sound.
-                let data_ptr = data.as_ptr() as *const c_void;
+                // The export's pointer (mmap address or `Vec` heap allocation) is
+                // stable across the move into the owner box, so capturing it first
+                // is sound.
+                let data_ptr = export.as_ptr() as *const c_void;
                 let buffers: Vec<*const c_void> = vec![ptr::null(), data_ptr];
                 let buffers_ptr = buffers.as_ptr() as *mut *const c_void;
-                let owner = Box::new(ArrowArrayOwner { _data: data, _buffers: buffers });
+                let owner = Box::new(ArrowArrayOwner { _export: export, _buffers: buffers });
 
                 *out_array = ArrowArray {
                     length: length as i64,
@@ -1938,16 +1945,18 @@ impl FfiGenerator {
     /// the set + the Arrow format string), one entry point
     /// `forgedb_<m>_<f>_export_arrow(db, out_schema, out_array, err_out) -> bool`
     /// that: computes the live physical row indices in generated code
-    /// (`export_live_indices`), gathers exactly those rows of the one column
-    /// (`export_col_<f>` → the class-1 `gather`), and fills the caller's Arrow
-    /// `ArrowSchema`/`ArrowArray` (heap-owned buffer, freed by the Arrow
-    /// `release` callback).
+    /// (`export_live_indices`), exports exactly those rows of the one column
+    /// (`export_col_<f>` → the class-1 `ColumnExport` — a zero-copy `mmap` alias
+    /// when the live rows are a dense prefix, else a gathered copy), and fills the
+    /// caller's Arrow `ArrowSchema`/`ArrowArray` (buffer freed / `munmap`ed by the
+    /// Arrow `release` callback).
     ///
     /// Identity clean: the exported set + formats are fixed by the schema at
-    /// codegen time (never a runtime column list), the gather takes opaque row
+    /// codegen time (never a runtime column list), the export takes opaque row
     /// indices, and there is no `forgedb_query` / predicate / `match model`.
-    /// v1 always gathers (a copy); the `dense_prefix` alias fast path slots in
-    /// behind this same ABI + release contract later.
+    /// The export is a **zero-copy `mmap` alias** of the on-disk column when the
+    /// live rows are a dense prefix and a gathered copy otherwise — same ABI +
+    /// release contract either way (`fill_arrow_primitive` / `ColumnExport`).
     fn generate_arrow_ops(schema: &Schema) -> Vec<proc_macro2::TokenStream> {
         let mut ops = Vec::new();
         for model in schema
@@ -1973,11 +1982,13 @@ impl FfiGenerator {
                     #[doc = #doc]
                     ///
                     /// Fills `out_schema`/`out_array` (the Arrow C Data Interface
-                    /// pair) with a copy of exactly the live rows of this column.
-                    /// The caller owns the result and MUST release it via the
-                    /// Arrow `release` callback on the array (which frees the
-                    /// gathered buffer).  Returns `false` with `*err_out` set on a
-                    /// null argument, an I/O error, or a caught panic.
+                    /// pair) with exactly the live rows of this column — a zero-copy
+                    /// `mmap` alias of the column's dense prefix when possible, a
+                    /// gathered copy otherwise.  The caller owns the result and MUST
+                    /// release it via the Arrow `release` callback on the array
+                    /// (which frees the copy or `munmap`s the alias).  Returns
+                    /// `false` with `*err_out` set on a null argument, an I/O error,
+                    /// or a caught panic.
                     ///
                     /// # Safety
                     /// `db` is a live handle; `out_schema`/`out_array` point to
@@ -2016,7 +2027,7 @@ impl FfiGenerator {
                                 true
                             }
                             Ok(Err(e)) => {
-                                set_error(err_out, FORGEDB_ERR_IO, format!("column gather failed: {e}"));
+                                set_error(err_out, FORGEDB_ERR_IO, format!("column export failed: {e}"));
                                 false
                             }
                             Err(payload) => {
