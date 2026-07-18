@@ -1,6 +1,15 @@
 # ForgeDB Internal Crates
 
-**Last Updated:** October 2025  
+> ⚠️ **STALE — do not rely on this document (2026-07-17).** It predates the v1
+> core-close and everything after it: the code-generation pipeline, crate roster,
+> and migration system described below no longer match the code. Crates named here
+> as live may have been pruned (`query-optimization`, `http-server`, `fulltext`,
+> `crud-api`, `ffi`) and generators added since (Transform, Wasm, PyO3, NAPI) are
+> absent. For the current picture use **`docs/ARCHITECTURE.md`**, **`docs/PUBLIC_CRATES.md`**,
+> the root **`CLAUDE.md`** (authoritative crate/status ledger), and the code itself.
+> A full rewrite is tracked separately.
+
+**Last Updated:** October 2025 *(stale — see banner above)*  
 **Audience:** ForgeDB developers, contributors
 
 ## Table of Contents
