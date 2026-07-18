@@ -183,7 +183,15 @@ in `crates/`:
   opaque row bytes; the schema-aware column write stays in generated data-plane code run under a granted
   turn (coordinated clients open LOCK-FREE, `_lock: None`, mutually exclusive with a standalone
   self-locking writer — T3-5). Native-only (Unix sockets + `fs2`); the wasm replica cfg-gates the entire
-  coordinator surface out.
+  coordinator surface out. **#156 perf (2026-07-18):** the replication-log append + fsync barrier now runs
+  under a **separate broker mutex, off the turn/condvar critical section** (Option A) — a committing client's
+  disk barrier no longer blocks other writers from being granted a turn (broker appends stay in commit order
+  because the handler holds the broker lock across the turn release, and only one turn is ever outstanding).
+  The broker is opened `FsyncPolicy::Never` and the coordinator drives the barrier via a configurable
+  **`CoordFsync`** (`forgedb coordinate --fsync always|never|periodic` / `FORGEDB_COORDINATOR_FSYNC`, default
+  `always`; Option C) — which also fixed a latent N+1-fsyncs-per-commit (per-record + explicit flush) down to
+  ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
+  so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
 **Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
 are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI

@@ -148,6 +148,15 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#156 — coordinator fsync off the turn lock (2026-07-18).** The Tier-3 coordinator's replication-log
+  append + fsync now runs under a separate broker mutex, OUTSIDE the turn/condvar critical section (Option A),
+  so a committing client's barrier no longer blocks other writers from a turn; the next writer's turn +
+  client I/O overlap the barrier. The barrier is also configurable — `forgedb coordinate --fsync
+  always|never|periodic` (Option C, default `always`) — and the broker is opened `Never` so the coordinator
+  drives ≤1 barrier per commit (was N+1: per-record + explicit flush). `never`/`periodic` never risk committed
+  client data (the log is resumable; clients fsync their own columns+WAL first).
+- **#155 — M2M cascade-unlink (2026-07-18).** Fell out of #154: `unlink_all_*` + `unlink` now use the
+  junction index (O(degree)) instead of O(link_rows²) scans.
 - **#153 — single-barrier checkpoint (2026-07-18).** `checkpoint()`/`commit()` push every column
   to the drive cache with a plain `fsync` (macOS `libc::fsync`, ~27 µs) then issue ONE device
   barrier (`F_FULLFSYNC`), instead of an `F_FULLFSYNC` per column — one barrier per collection
