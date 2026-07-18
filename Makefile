@@ -25,7 +25,7 @@ bench-sqlite:
 ## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
 ## Run this after any codegen change so the bench links current generated output.
 bench-regen:
-	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen
+	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen --force
 
 ## Install the inspector app's JS dependencies.
 inspector-install:

@@ -140,6 +140,23 @@ levels — `default` (plain fsync, SQLite's out-of-box guarantee) and `fullfsync
 barrier) — so every write comparison is explicit about which durability it's at. ForgeDB
 is always at the barrier level (its fsync policy is fixed `Always`, no relaxed tier).
 
+## Performance-triage sweep — status
+
+The seeded candidates below were promoted to the tracked sweep **#152** (12 children).
+**Landed:**
+
+- **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
+  `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
+  Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#153 — single-barrier checkpoint (2026-07-18).** `checkpoint()`/`commit()` push every column
+  to the drive cache with a plain `fsync` (macOS `libc::fsync`, ~27 µs) then issue ONE device
+  barrier (`F_FULLFSYNC`), instead of an `F_FULLFSYNC` per column — one barrier per collection
+  checkpoint, not N. Substrate `forgedb-storage-native` gains `sync_to_drive()`/`barrier()`
+  (no-ops on `storage-web`); publish gap open until storage-native/web/facade republish. (The
+  userspace-`BufWriter` half of the original direction was rejected: buffered appends break
+  positional `read_exact_at`/mmap read-after-write and the lock-free Direction-B reader view —
+  unbuffered page-cache writes are load-bearing.)
+
 ## Performance-triage candidates (seeded from the fsync work)
 
 Feed these into the broader perf sweep (not fixes — triage items):

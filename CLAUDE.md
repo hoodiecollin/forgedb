@@ -590,6 +590,14 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
+- **`init → build` publish gap — OPEN again (#153, 2026-07-18):** the perf single-barrier checkpoint made
+  generated `database.rs` (`checkpoint()`/`commit()`/junction `checkpoint()`) call the NEW additive
+  `sync_to_drive()` + `barrier()` on the storage columns, so it now requires **`forgedb-storage-native 0.1.3`** +
+  **`forgedb-storage-web 0.1.3`** (no-op parity impls) behind the **`forgedb-storage 0.2.2`** facade (all bumped
+  in-tree; `storage-native 0.1.2` is the published ceiling). Additive (no format break), but must republish
+  `storage-native`/`storage-web`/`storage` before an outside-repo `init → build` resolves from crates.io — same
+  discipline as the wal/compaction bumps. The scaffold pin stays `forgedb-storage = "0.2"` (semver-compatible with
+  0.2.2). No other crate changed. #154 (M2M index) is pure generated code → **no** publish gap.
 - **`init → build` publish gap — CLOSED again 2026-07-10 (#90):** Phase 2 made generated `api.rs` require
   **`forgedb-query-params 0.1.0`** (list-endpoint filter/sort/paginate parsing); it is **now published**, and the
   reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust+api → cargo build` resolving
@@ -654,10 +662,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
   **eager-load** structs (`PostWithRelations { post, author: Option<User>, … }` +
   `post_with_relations(id)`). Honest limits: traversal is generated only between **UUID-keyed**
   models (FK scalars are always `Uuid`, so integer-PK targets are skipped with a comment);
-  **M2M** junction lookups (`post_tags`) are still **linear scans** (junction-column indexing is a #100
-  follow-up step); there is **no M2M `unlink`** (storage
-  is append-only — `Tombstones` has no in-place setter, the same reason generated models have
-  no `delete`); and the `OneToMany`/`ManyToMany` fields *inside* the model struct remain virtual
+  **M2M** junction lookups (`post_tags`/`tag_posts`) are now **O(degree) in-memory index probes**
+  (#154 perf — each junction holds `left_index`/`right_index` `HashMap<Uuid, Vec<Uuid>>` maps of the
+  LIVE edges, maintained in lockstep with `link`/`unlink` and rebuilt on reopen, like the FK
+  `find_by_*` indexes; the old full latest-wins `pairs()` scan per lookup is gone — writer-only, readers/
+  snapshots still use the `_at` scans); the `OneToMany`/`ManyToMany` fields *inside* the model struct remain virtual
   `()` (the collection lives in the traversal helpers / junction table, not the record).
   Proven compile-clean + insert→link→traverse across the whole `examples/` corpus by the
   `scratchpad/corpus_compile` harness, and snapshot+assertion-tested by
