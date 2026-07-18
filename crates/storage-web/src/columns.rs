@@ -209,6 +209,19 @@ impl FixedColumn {
         Ok(())
     }
 
+    /// No-op on the wasm arena backend (#153): there is no device barrier;
+    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
+    /// the [`crate::store::dump`] boundary. Present for API parity with
+    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
+    pub fn barrier(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         store::byte_len(&self.path) / self.value_size
@@ -303,6 +316,19 @@ impl VariableColumn {
         Ok(())
     }
 
+    /// No-op on the wasm arena backend (#153): there is no device barrier;
+    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
+    /// the [`crate::store::dump`] boundary. Present for API parity with
+    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
+    pub fn barrier(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         store::byte_len(&self.offsets_path) / 16
@@ -391,6 +417,19 @@ impl Tombstones {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// No-op on the wasm arena backend (#153): there is no device barrier;
+    /// durability comes from the transport writing arenas to IndexedDB/OPFS at
+    /// the [`crate::store::dump`] boundary. Present for API parity with
+    /// `storage-native`, since the generated `checkpoint()` calls it ungated.
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// No-op on the wasm arena backend (#153): see [`Self::sync_to_drive`].
+    pub fn barrier(&self) -> io::Result<()> {
         Ok(())
     }
 

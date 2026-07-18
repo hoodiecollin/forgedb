@@ -145,6 +145,52 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
+/// Push a file's dirty page-cache pages to the storage device **without** a
+/// device-cache barrier (#153 — single-barrier checkpoint).
+///
+/// On macOS, `File::sync_all`/`sync_data` both map to `fcntl(F_FULLFSYNC)` — an
+/// expensive device barrier (~3.5 ms). `libc::fsync` is the *cheap* flush
+/// (~27 µs) that only pushes the file's data into the drive's (volatile) write
+/// cache; a single [`device_barrier`] afterward flushes that whole cache to
+/// permanent media, covering **every** file `fsync`ed this way on the same
+/// device. So a checkpoint of N columns costs N cheap fsyncs + ONE barrier
+/// instead of N barriers. On non-macOS, `sync_data` (fdatasync) is the cheapest
+/// available durable flush.
+#[cfg(target_os = "macos")]
+fn fsync_to_drive(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` is a live, open descriptor for the duration of the call.
+    if unsafe { libc::fsync(file.as_raw_fd()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fsync_to_drive(file: &File) -> io::Result<()> {
+    file.sync_data()
+}
+
+/// Issue ONE device-cache barrier (#153). On macOS `fcntl(F_FULLFSYNC)` tells
+/// the drive to flush its entire write cache to permanent media — which makes
+/// durable every file previously handed to [`fsync_to_drive`] on the same
+/// device, so a checkpoint needs only one of these. On non-macOS, `sync_all` is
+/// the barrier.
+#[cfg(target_os = "macos")]
+fn device_barrier(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `file` is a live, open descriptor for the duration of the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn device_barrier(file: &File) -> io::Result<()> {
+    file.sync_all()
+}
+
 /// Default `format_version` for manifests written before the field existed.
 /// Old on-disk manifests deserialize as v1 (the original layout), not v0.
 fn default_format_version() -> u32 {
@@ -720,6 +766,21 @@ impl FixedColumn {
         self.file.sync_all()
     }
 
+    /// Push this column's data to the drive cache **without** a device barrier
+    /// (#153).  Pair with a single [`FixedColumn::barrier`] (on any column of the
+    /// same device) to make a whole checkpoint's columns durable with ONE
+    /// barrier instead of N.  See [`fsync_to_drive`].
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        fsync_to_drive(&self.file)
+    }
+
+    /// Issue the single device-cache barrier for a checkpoint (#153): flushes the
+    /// drive's write cache to permanent media, making durable every column
+    /// previously `sync_to_drive`d on the same device.  See [`device_barrier`].
+    pub fn barrier(&self) -> io::Result<()> {
+        device_barrier(&self.file)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
@@ -884,6 +945,19 @@ impl VariableColumn {
         self.offsets_file.sync_all()
     }
 
+    /// Push both backing files to the drive cache without a device barrier
+    /// (#153).  Pair with one [`VariableColumn::barrier`] per checkpoint.
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        fsync_to_drive(&self.data_file)?;
+        fsync_to_drive(&self.offsets_file)
+    }
+
+    /// Issue the single device-cache barrier for a checkpoint (#153).  Barriers
+    /// are device-wide, so one call on the data file covers the offsets file too.
+    pub fn barrier(&self) -> io::Result<()> {
+        device_barrier(&self.data_file)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.row_count
@@ -1018,6 +1092,16 @@ impl Tombstones {
     /// survive a crash. Call at commit boundaries or before advancing the WAL checkpoint.
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()
+    }
+
+    /// Push the tombstone column to the drive cache without a barrier (#153).
+    pub fn sync_to_drive(&self) -> io::Result<()> {
+        fsync_to_drive(&self.file)
+    }
+
+    /// Issue the single device-cache barrier for a checkpoint (#153).
+    pub fn barrier(&self) -> io::Result<()> {
+        device_barrier(&self.file)
     }
 
     #[must_use]

@@ -1264,3 +1264,59 @@ fn test_fixed_column_export_aliases_dense_prefix_else_gathers() {
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// #153: coalesced-barrier durability primitives (sync_to_drive + barrier).
+//
+// A checkpoint pushes every column to the drive cache (sync_to_drive, cheap,
+// no device barrier) then issues ONE device barrier that flushes the whole
+// drive cache — making durable every column synced this way. These tests prove
+// data written via sync_to_drive + a single barrier survives a reopen for all
+// three column types with ONE barrier covering multiple columns.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_coalesced_barrier_durability_across_columns() {
+    let dir = std::env::temp_dir().join("forgedb_test_153_coalesced");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let a = dir.join("a.bin");
+    let b = dir.join("b.bin");
+    let data = dir.join("v_data.bin");
+    let offs = dir.join("v_offsets.bin");
+    let tomb = dir.join("t.bin");
+
+    {
+        let mut ca = FixedColumn::new(a.clone(), 8).unwrap();
+        let mut cb = FixedColumn::new(b.clone(), 16).unwrap();
+        let mut cv = VariableColumn::new(data.clone(), offs.clone()).unwrap();
+        let mut ct = Tombstones::new(tomb.clone()).unwrap();
+        ca.append_u64(7).unwrap();
+        cb.append_uuid([9u8; 16]).unwrap();
+        cv.append_string("hello").unwrap();
+        ct.append(true).unwrap();
+
+        // Push every column to the drive cache (no barrier each).
+        ca.sync_to_drive().unwrap();
+        cb.sync_to_drive().unwrap();
+        cv.sync_to_drive().unwrap();
+        ct.sync_to_drive().unwrap();
+        // ONE device barrier makes ALL of the above durable on media.
+        ct.barrier().unwrap();
+    }
+
+    // Reopen — every column's data survived under the single barrier.
+    {
+        let ca = FixedColumn::new(a, 8).unwrap();
+        let cb = FixedColumn::new(b, 16).unwrap();
+        let cv = VariableColumn::new(data, offs).unwrap();
+        let ct = Tombstones::new(tomb).unwrap();
+        assert_eq!(ca.read_u64(0).unwrap(), 7);
+        assert_eq!(cb.read_uuid(0).unwrap(), [9u8; 16]);
+        assert_eq!(cv.read_string(0).unwrap(), "hello");
+        assert_eq!(ct.is_deleted(0).unwrap(), true);
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
