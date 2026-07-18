@@ -261,6 +261,66 @@ impl ApiGenerator {
 
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
         let filter_fn = format_ident!("{}_event_matches", Self::to_snake_case(&model.name));
+        // #160: narrow scan filter/sort for the live list path (id-bearing models).
+        let has_id = crate::rust::RustGenerator::identity_field(model).is_some();
+        let id_field = Self::id_field_ident(model);
+        let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
+        let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
+        // The live list source+filter+sort+page-materialize.  For an id-bearing
+        // model this is the #160 narrow path: filter/sort a scan record (only the
+        // filterable/sortable columns), then full-materialize ONLY the page.  A
+        // model with no id keeps the original full `all()` scan (it has no
+        // `id_to_row`-driven narrow scan and cannot be mutated anyway).
+        // #160 (C): index pushdown — if the filter names an eligible indexed field,
+        // resolve candidates from that field's index (O(matches)) instead of
+        // scanning every row; else scan all narrow rows.  A parse failure falls
+        // back to the full scan (`unwrap_or_else`), so a match is never missed.
+        let pushdown_fields = crate::rust::RustGenerator::scan_pushdown_fields(model);
+        let scan_source = if pushdown_fields.is_empty() {
+            quote! { db.#storage_field.__scan_all() }
+        } else {
+            let branches = pushdown_fields.iter().map(|f| {
+                let fname = &f.name;
+                let scan_by = format_ident!("__scan_by_{}", f.name);
+                quote! {
+                    if let Some(__v) = params.get(#fname) {
+                        db.#storage_field.#scan_by(__v)
+                            .unwrap_or_else(|| db.#storage_field.__scan_all())
+                    }
+                }
+            });
+            quote! { #(#branches else)* { db.#storage_field.__scan_all() } }
+        };
+        let live_list_block = if has_id {
+            quote! {
+                let mut __scan_rows = #scan_source;
+                __scan_rows.retain(|r| #scan_matches_fn(r, &params));
+                #scan_sort_fn(&mut __scan_rows, &qp.sort);
+                let total = __scan_rows.len();
+                let __page_ids: Vec<_> = qp.pagination
+                    .apply(&__scan_rows)
+                    .iter()
+                    .map(|r| r.#id_field)
+                    .collect();
+                // Full-materialize only the paginated page (or 404-skip a row that
+                // was deleted between the scan and here — the read lock makes that
+                // impossible, but `filter_map` is the honest primitive).
+                let page: Vec<super::#model_name> = __page_ids
+                    .iter()
+                    .filter_map(|__id| db.#storage_field.get(*__id))
+                    .collect();
+            }
+        } else {
+            quote! {
+                let mut rows: Vec<super::#model_name> = db.#storage_field.all()
+                    .into_iter()
+                    .filter(|r| #filter_fn(r, &params))
+                    .collect();
+                #sort_fn(&mut rows, &qp.sort);
+                let total = rows.len();
+                let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+            }
+        };
 
         let tokens = quote! {
             #[utoipa::path(
@@ -312,23 +372,31 @@ impl ApiGenerator {
                     None => None,
                 };
                 let db = db.read().await;
-                // 1. Rows (live newest-version, or as-of the watermark snapshot),
-                //    then the closed-set field filter (ignores the special
-                //    sort/limit/offset/as_of keys — they are not model fields).
-                let __source = match __as_of {
-                    Some(__w) => db.#storage_field.all_at(&forgedb_storage::Snapshot::new(__w)),
-                    None => db.#storage_field.all(),
+                // Materialize `page` (Vec<Model>) + `total`.  Two paths:
+                //  - live (no `as_of`): the #160 narrow path — filter/sort a scan
+                //    record (only filterable/sortable columns), full-materialize
+                //    ONLY the paginated page.
+                //  - `as_of` snapshot: the original full-record path over
+                //    `all_at(&Snapshot)` (a rarer inspector read; #159 already made
+                //    its newest-version resolution sub-linear).
+                let (page, total) = match __as_of {
+                    Some(__w) => {
+                        let mut rows: Vec<super::#model_name> = db
+                            .#storage_field
+                            .all_at(&forgedb_storage::Snapshot::new(__w))
+                            .into_iter()
+                            .filter(|r| #filter_fn(r, &params))
+                            .collect();
+                        #sort_fn(&mut rows, &qp.sort);
+                        let total = rows.len();
+                        let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                        (page, total)
+                    }
+                    None => {
+                        #live_list_block
+                        (page, total)
+                    }
                 };
-                let mut rows: Vec<super::#model_name> = __source
-                    .into_iter()
-                    .filter(|r| #filter_fn(r, &params))
-                    .collect();
-                // 2. Generated per-model sort (no-op if `sort` is absent/unknown).
-                #sort_fn(&mut rows, &qp.sort);
-                // 3. Total after filtering (pre-pagination), useful to clients.
-                let total = rows.len();
-                // 4. Substrate-clamped pagination.
-                let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
                 #proj_list_block
                 let body = json!({
                     "data": page,
@@ -505,7 +573,8 @@ impl ApiGenerator {
         };
 
         let sort_tokens = Self::generate_list_sort(model);
-        Ok(quote! { #tokens #sort_tokens })
+        let scan_helpers = Self::generate_list_scan_helpers(model);
+        Ok(quote! { #tokens #sort_tokens #scan_helpers })
     }
 
     /// Generate the per-model `<model>_apply_sort` comparator used by the list
@@ -517,8 +586,32 @@ impl ApiGenerator {
     fn generate_list_sort(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
+        let arms = Self::list_sort_arms(model);
 
-        let arms: Vec<_> = model
+        quote! {
+            fn #sort_fn(
+                rows: &mut Vec<super::#model_name>,
+                sort: &Option<forgedb_query_params::Sort>,
+            ) {
+                let Some(sort) = sort.as_ref() else { return; };
+                match sort.field.as_str() {
+                    #(#arms)*
+                    _ => return,
+                }
+                if sort.is_descending() {
+                    rows.reverse();
+                }
+            }
+        }
+    }
+
+    /// The per-field `match`-arm comparators for the list sort (#90) — shared by
+    /// the full-record `<model>_apply_sort` and the #160 narrow
+    /// `__<model>_scan_sort`, so both order identically (each arm accesses
+    /// `a.<field>`/`b.<field>`, which compiles against any struct carrying the
+    /// filterable/sortable fields).
+    fn list_sort_arms(model: &forgedb_parser::Model) -> Vec<TokenStream> {
+        model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
@@ -542,11 +635,47 @@ impl ApiGenerator {
                     }
                 }
             })
-            .collect();
+            .collect()
+    }
 
+    /// #160: the narrow list helpers — `__<model>_scan_matches` and
+    /// `__<model>_scan_sort` over the internal `<Model>ScanRow` (id +
+    /// filterable/sortable columns).  Emitted from the SAME `generate_filter_check`
+    /// per-field checks and `list_sort_arms` as the full-record `_event_matches` /
+    /// `_apply_sort`, so filtering + ordering are byte-identical — only the operand
+    /// type is narrower.  Lets the list endpoint filter/sort without decoding every
+    /// column, then full-materialize only the paginated page.  Empty for a model
+    /// with no id field (no list to optimize).
+    fn generate_list_scan_helpers(model: &forgedb_parser::Model) -> TokenStream {
+        if crate::rust::RustGenerator::identity_field(model).is_none() {
+            return quote! {};
+        }
+        let scan_ident = format_ident!("{}ScanRow", model.name);
+        let snake = Self::to_snake_case(&model.name);
+        let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        let scan_sort_fn = format_ident!("__{}_scan_sort", snake);
+        let field_checks: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| Self::is_filterable_field(&f.field_type))
+            .map(Self::generate_filter_check)
+            .collect();
+        let arms = Self::list_sort_arms(model);
         quote! {
-            fn #sort_fn(
-                rows: &mut Vec<super::#model_name>,
+            /// Narrow closed-set filter over the scan record (#160) — same per-field
+            /// checks as `_event_matches`, only the operand type is narrower.
+            fn #scan_matches_fn(record: &super::#scan_ident, params: &HashMap<String, String>) -> bool {
+                if params.is_empty() {
+                    return true;
+                }
+                #(#field_checks)*
+                true
+            }
+
+            /// Narrow list sort over the scan record (#160) — same arms as
+            /// `_apply_sort`.
+            fn #scan_sort_fn(
+                rows: &mut Vec<super::#scan_ident>,
                 sort: &Option<forgedb_query_params::Sort>,
             ) {
                 let Some(sort) = sort.as_ref() else { return; };
@@ -577,7 +706,7 @@ impl ApiGenerator {
     /// Relations/components have no scalar JSON value; structs/arrays serialize to
     /// composites that a `?field=value` param would never sensibly match, so both
     /// are excluded from the generated per-model filter.
-    fn is_filterable_field(field_type: &forgedb_parser::FieldType) -> bool {
+    pub(crate) fn is_filterable_field(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
             FieldType::U32

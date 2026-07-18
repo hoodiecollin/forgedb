@@ -165,6 +165,13 @@ pub struct Place {
     pub description: Option<String>,
     pub location: GeoPoint,
 }
+///Internal narrow scan record for `Place` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct PlaceScanRow {
+    pub id: u64,
+    pub name: String,
+    pub description: Option<String>,
+}
 ///Storage for Place model
 pub struct PlaceStorage {
     id_to_row: std::sync::Arc<HashMap<u64, usize>>,
@@ -1084,6 +1091,48 @@ impl PlaceStorage {
         indices: &[usize],
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
+    }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<PlaceScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = self
+            .id_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let name_value = self
+            .name_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let description_value = {
+            let raw = self
+                .description_col
+                .read_string(row_index)
+                .expect("Failed to read string");
+            if raw.as_bytes().first() == Some(&1u8) {
+                Some(raw[1..].to_string())
+            } else {
+                None
+            }
+        };
+        Some(PlaceScanRow {
+            id: id_value,
+            name: name_value,
+            description: description_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<PlaceScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

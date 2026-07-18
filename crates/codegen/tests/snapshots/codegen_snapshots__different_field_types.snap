@@ -160,6 +160,15 @@ pub struct ComplexModel {
     #[schema(value_type = i64)]
     pub created_at: Timestamp,
 }
+///Internal narrow scan record for `ComplexModel` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct ComplexModelScanRow {
+    pub id: Uuid,
+    pub count: i64,
+    pub price: f64,
+    pub active: bool,
+    pub created_at: Timestamp,
+}
 ///Storage for ComplexModel model
 pub struct ComplexModelStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -1094,6 +1103,56 @@ impl ComplexModelStorage {
         indices: &[usize],
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
+    }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<ComplexModelScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let count_value = self
+            .count_col
+            .read_i64(row_index)
+            .expect("Failed to read from column");
+        let price_value = self
+            .price_col
+            .read_f64(row_index)
+            .expect("Failed to read from column");
+        let active_value = self
+            .active_col
+            .read_bool(row_index)
+            .expect("Failed to read from column");
+        let created_at_value = Timestamp::from(
+            self
+                .created_at_col
+                .read_timestamp(row_index)
+                .expect("Failed to read from column"),
+        );
+        Some(ComplexModelScanRow {
+            id: id_value,
+            count: count_value,
+            price: price_value,
+            active: active_value,
+            created_at: created_at_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<ComplexModelScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

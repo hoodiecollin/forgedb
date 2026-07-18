@@ -161,6 +161,13 @@ pub struct Product {
     #[serde(with = "rust_decimal::serde::str_option")]
     pub discount: Option<rust_decimal::Decimal>,
 }
+///Internal narrow scan record for `Product` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct ProductScanRow {
+    pub id: Uuid,
+    pub price: rust_decimal::Decimal,
+    pub discount: Option<rust_decimal::Decimal>,
+}
 ///Storage for Product model
 pub struct ProductStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -1277,6 +1284,89 @@ impl ProductStorage {
         indices: &[usize],
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
+    }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<ProductScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let price_value = {
+            let bytes = self
+                .price_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            rust_decimal::Decimal::deserialize(bytes)
+        };
+        let discount_value: Option<rust_decimal::Decimal> = {
+            let bytes = self
+                .discount_col
+                .read_bytes(row_index)
+                .expect("Failed to read from column");
+            unsafe {
+                std::ptr::read_unaligned(
+                    bytes.as_ptr() as *const Option<rust_decimal::Decimal>,
+                )
+            }
+        };
+        Some(ProductScanRow {
+            id: id_value,
+            price: price_value,
+            discount: discount_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<ProductScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
+    }
+    /// #160 (C): resolve list candidates for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
+    /// param did not parse; the caller falls back to `__scan_all`.
+    pub fn __scan_by_price(&self, value: &str) -> Option<Vec<ProductScanRow>> {
+        let __typed = value.parse::<rust_decimal::Decimal>().ok()?;
+        let __k: String = {
+            match serde_json::to_value(&((__typed).normalize())) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.price_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Some(Vec::new()),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(&__row) = self.id_to_row.get(&__id) {
+                if let Some(__r) = self.__scan_row_at(__row) {
+                    __out.push(__r);
+                }
+            }
+        }
+        Some(__out)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

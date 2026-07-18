@@ -155,6 +155,11 @@ impl From<ValidationError> for TxError {
 pub struct User {
     pub id: Uuid,
 }
+///Internal narrow scan record for `User` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct UserScanRow {
+    pub id: Uuid,
+}
 ///Storage for User model
 pub struct UserStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -864,6 +869,32 @@ impl UserStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        Some(UserScanRow { id: id_value })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<UserScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
@@ -956,6 +987,12 @@ fn validate_user(record: &User) -> Result<(), ValidationError> {
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Post {
+    pub id: Uuid,
+    pub title: String,
+}
+///Internal narrow scan record for `Post` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct PostScanRow {
     pub id: Uuid,
     pub title: String,
 }
@@ -1706,6 +1743,39 @@ impl PostStorage {
         indices: &[usize],
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
+    }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<PostScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let title_value = self
+            .title_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        Some(PostScanRow {
+            id: id_value,
+            title: title_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<PostScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

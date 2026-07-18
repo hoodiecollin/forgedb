@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 152
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -68,17 +67,41 @@ async fn list_user(
         None => None,
     };
     let db = db.read().await;
-    let __source = match __as_of {
-        Some(__w) => db.user.all_at(&forgedb_storage::Snapshot::new(__w)),
-        None => db.user.all(),
+    let (page, total) = match __as_of {
+        Some(__w) => {
+            let mut rows: Vec<super::User> = db
+                .user
+                .all_at(&forgedb_storage::Snapshot::new(__w))
+                .into_iter()
+                .filter(|r| user_event_matches(r, &params))
+                .collect();
+            user_apply_sort(&mut rows, &qp.sort);
+            let total = rows.len();
+            let page: Vec<super::User> = qp.pagination.apply(&rows).to_vec();
+            (page, total)
+        }
+        None => {
+            let mut __scan_rows = if let Some(__v) = params.get("email") {
+                db.user.__scan_by_email(__v).unwrap_or_else(|| db.user.__scan_all())
+            } else {
+                db.user.__scan_all()
+            };
+            __scan_rows.retain(|r| __user_scan_matches(r, &params));
+            __user_scan_sort(&mut __scan_rows, &qp.sort);
+            let total = __scan_rows.len();
+            let __page_ids: Vec<_> = qp
+                .pagination
+                .apply(&__scan_rows)
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            let page: Vec<super::User> = __page_ids
+                .iter()
+                .filter_map(|__id| db.user.get(*__id))
+                .collect();
+            (page, total)
+        }
     };
-    let mut rows: Vec<super::User> = __source
-        .into_iter()
-        .filter(|r| user_event_matches(r, &params))
-        .collect();
-    user_apply_sort(&mut rows, &qp.sort);
-    let total = rows.len();
-    let page: Vec<super::User> = qp.pagination.apply(&rows).to_vec();
     let body = json!(
         { "data" : page, "total" : total, "limit" : qp.pagination.limit, "offset" : qp
         .pagination.offset, }
@@ -263,6 +286,53 @@ async fn delete_user(
 }
 fn user_apply_sort(
     rows: &mut Vec<super::User>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
+}
+/// Narrow closed-set filter over the scan record (#160) — same per-field
+/// checks as `_event_matches`, only the operand type is narrower.
+fn __user_scan_matches(
+    record: &super::UserScanRow,
+    params: &HashMap<String, String>,
+) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("email") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.email == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
+/// Narrow list sort over the scan record (#160) — same arms as
+/// `_apply_sort`.
+fn __user_scan_sort(
+    rows: &mut Vec<super::UserScanRow>,
     sort: &Option<forgedb_query_params::Sort>,
 ) {
     let Some(sort) = sort.as_ref() else {

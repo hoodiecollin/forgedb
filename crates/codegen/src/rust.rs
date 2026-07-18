@@ -684,6 +684,11 @@ impl RustGenerator {
         let (projection_structs, projection_methods) =
             Self::generate_projections(model, &id_type, id_read_at_row.as_ref());
 
+        // #160: internal narrow scan record + reads for the list endpoint (filter/
+        // sort touch only filterable/sortable columns; the page is materialized
+        // fully).  Empty for a model with no id field.
+        let (scan_struct, scan_methods) = Self::generate_list_scan(model);
+
         // Generate the secondary-index probe methods (#90): find_by_* / get_by_*
         // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
         let index_lookups = Self::generate_index_lookups(model);
@@ -749,6 +754,8 @@ impl RustGenerator {
             }
 
             #projection_structs
+
+            #scan_struct
 
             #[doc = #storage_doc]
             pub struct #storage_name {
@@ -885,6 +892,9 @@ impl RustGenerator {
                 // Declared column projections (#113): narrow reads over PK +
                 // selected columns, plus their snapshot `_at` variants.
                 #projection_methods
+
+                // #160: internal narrow scan reads for the list endpoint.
+                #scan_methods
 
                 /// Open a read-only handle over this storage (#56 Direction B).
                 /// The handle shares this storage's column files via independent
@@ -4532,6 +4542,210 @@ impl RustGenerator {
                 continue;
             }
             if let Some(f) = model.fields.iter().find(|f| &f.name == fname) {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    /// #160: the internal narrow "scan record" for the REST list path — the id
+    /// field plus every filterable/sortable column (the only columns a `?field=`
+    /// filter or `?sort=` can touch; the sortable set is a subset of the
+    /// filterable set).  The list handler filters + sorts these narrow records and
+    /// full-materializes ONLY the paginated page, instead of decoding every column
+    /// of every row through `all()`.  Reuses the shared `generate_row_read_body`
+    /// decoder (the same body `read_at` uses — no drift) and stays internal: never
+    /// wired to REST `?projection=` / the TS SDK / OpenAPI.  Returns
+    /// `(struct, methods)`; empty for a model with no id field (no `all()`-driven
+    /// list to optimize).
+    fn generate_list_scan(
+        model: &forgedb_parser::Model,
+    ) -> (TokenStream, TokenStream) {
+        if Self::identity_field(model).is_none() {
+            return (quote! {}, quote! {});
+        }
+        let scan_ident = format_ident!("{}ScanRow", model.name);
+        let scan_fields = Self::scan_field_set(model);
+        // Minimal struct: plain field decls (no ToSchema/Serialize — never on the
+        // wire), same names + types as the model fields so the reused list
+        // filter/sort (`record.<field>` / `a.<field>`) compile against it.
+        let field_decls = scan_fields.iter().map(|f| {
+            let fname = format_ident!("{}", f.name);
+            let base = Self::map_field_type_ident(&f.field_type);
+            // `map_field_type_ident` returns the inner type for a nullable field —
+            // the `Option<>` wrapper is added here (matching the model struct and
+            // the `field_read_stmt` decode output, which binds `Option<inner>`).
+            let fty = if f.is_nullable() {
+                quote! { Option<#base> }
+            } else {
+                base
+            };
+            quote! { pub #fname: #fty }
+        });
+        let read_body = Self::generate_row_read_body(&scan_ident, &scan_fields);
+        let doc = format!(
+            "Internal narrow scan record for `{}` (#160): id + filterable/sortable \
+             columns, used to filter + sort the list endpoint without decoding \
+             every column of every row.  Not a wire type.",
+            model.name
+        );
+        let struct_tokens = quote! {
+            #[doc = #doc]
+            #[derive(Debug, Clone)]
+            pub struct #scan_ident {
+                #(#field_decls,)*
+            }
+        };
+        // #160 (C): per eligible indexed field, a narrow scan that resolves
+        // candidates through the secondary index instead of scanning every row —
+        // O(matches) not O(rows) when the list filters on an indexed field.
+        let pushdown: Vec<_> = Self::scan_pushdown_fields(model)
+            .into_iter()
+            .map(|f| Self::generate_scan_by_index(f, &scan_ident))
+            .collect();
+
+        let methods = quote! {
+            /// Narrow-decode the scan columns at a physical row (#160).
+            fn __scan_row_at(&self, row_index: usize) -> Option<#scan_ident> {
+                #read_body
+            }
+            /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+            /// source, decoding only the filterable/sortable columns.  The page is
+            /// full-materialized separately, so only `limit` rows pay a full decode.
+            pub fn __scan_all(&self) -> Vec<#scan_ident> {
+                let mut rows = Vec::new();
+                for &__row in self.id_to_row.values() {
+                    if let Some(__r) = self.__scan_row_at(__row) {
+                        rows.push(__r);
+                    }
+                }
+                rows
+            }
+            #(#pushdown)*
+        };
+        (struct_tokens, methods)
+    }
+
+    /// #160 (C): the single-field indexed columns a list `?field=value` filter can
+    /// be *pushed down* to — resolving candidates from the secondary index instead
+    /// of scanning every row.  Restricted to non-nullable, non-float, exactly
+    /// value-parseable scalars (string / uuid / required-FK / integer / bool /
+    /// decimal / timestamp / enum) so the string param maps cleanly to the index
+    /// key; anything else (nullable, char(N), float, optional FK) falls back to the
+    /// full narrow scan.  `pub(crate)` so the api handler emits the matching branch.
+    pub(crate) fn scan_pushdown_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        use forgedb_parser::{FieldType, RelationType};
+        Self::indexed_fields(model)
+            .into_iter()
+            .filter(|f| crate::api::ApiGenerator::is_filterable_field(&f.field_type))
+            .filter(|f| {
+                matches!(
+                    &f.field_type,
+                    FieldType::String
+                        | FieldType::Uuid
+                        | FieldType::U32
+                        | FieldType::U64
+                        | FieldType::I32
+                        | FieldType::I64
+                        | FieldType::Bool
+                        | FieldType::Decimal
+                        | FieldType::Timestamp
+                        | FieldType::Enum(_)
+                        | FieldType::Relation(RelationType::RequiredReference(_))
+                )
+            })
+            .collect()
+    }
+
+    /// Emit `__scan_by_<field>(&self, value: &str) -> Option<Vec<ScanRow>>` for an
+    /// eligible indexed field (#160 C).  Parses the raw param, derives the SAME
+    /// index key as `find_by_<field>` (via `index_key_expr`/`index_value_expr` —
+    /// one derivation, so an index hit is self-consistent), probes the field index,
+    /// and narrow-reads the candidate rows.  Returns `None` when the param does not
+    /// parse (the caller falls back to the full scan, so a match is never missed);
+    /// `Some(vec![])` when the value parses but no row holds it.
+    fn generate_scan_by_index(
+        field: &forgedb_parser::Field,
+        scan_ident: &proc_macro2::Ident,
+    ) -> TokenStream {
+        use forgedb_parser::{FieldType, RelationType};
+        let index_ident = Self::index_field_ident(field);
+        let scan_by = format_ident!("__scan_by_{}", field.name);
+        // Parse the raw `value: &str` into the typed value the index key derives
+        // from, binding `__typed`.  String needs no parse (the key derives from the
+        // &str directly, matching `find_by`'s `&str` param).
+        let (parse_stmt, key_value): (TokenStream, TokenStream) = match &field.field_type {
+            FieldType::String => (quote! {}, quote! { value }),
+            FieldType::Uuid | FieldType::Relation(RelationType::RequiredReference(_)) => (
+                quote! { let __typed = value.parse::<Uuid>().ok()?; },
+                quote! { __typed },
+            ),
+            FieldType::U32 => (quote! { let __typed = value.parse::<u32>().ok()?; }, quote! { __typed }),
+            FieldType::U64 => (quote! { let __typed = value.parse::<u64>().ok()?; }, quote! { __typed }),
+            FieldType::I32 => (quote! { let __typed = value.parse::<i32>().ok()?; }, quote! { __typed }),
+            FieldType::I64 => (quote! { let __typed = value.parse::<i64>().ok()?; }, quote! { __typed }),
+            FieldType::Bool => (quote! { let __typed = value.parse::<bool>().ok()?; }, quote! { __typed }),
+            FieldType::Decimal => (
+                quote! { let __typed = value.parse::<rust_decimal::Decimal>().ok()?; },
+                quote! { __typed },
+            ),
+            FieldType::Timestamp => (
+                quote! { let __typed = value.parse::<i64>().ok().map(Timestamp::from_seconds)?; },
+                quote! { __typed },
+            ),
+            FieldType::Enum(name) => {
+                let en = format_ident!("{}", name);
+                (
+                    quote! {
+                        let __typed = serde_json::from_value::<#en>(
+                            serde_json::Value::String(value.to_string())
+                        ).ok()?;
+                    },
+                    quote! { __typed },
+                )
+            }
+            // scan_pushdown_fields guarantees eligibility; other types are excluded.
+            _ => return quote! {},
+        };
+        let key = Self::index_key_expr(Self::index_value_expr(&field.field_type, key_value));
+        quote! {
+            /// #160 (C): resolve list candidates for this indexed field from the
+            /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
+            /// param did not parse; the caller falls back to `__scan_all`.
+            pub fn #scan_by(&self, value: &str) -> Option<Vec<#scan_ident>> {
+                #parse_stmt
+                let __k: String = { #key };
+                let __ids = match self.#index_ident.get(&__k) {
+                    Some(__s) => __s,
+                    None => return Some(Vec::new()),
+                };
+                let mut __out = Vec::new();
+                for &__id in __ids {
+                    if let Some(&__row) = self.id_to_row.get(&__id) {
+                        if let Some(__r) = self.__scan_row_at(__row) {
+                            __out.push(__r);
+                        }
+                    }
+                }
+                Some(__out)
+            }
+        }
+    }
+
+    /// #160: the columns the list filter/sort can touch — the id field plus every
+    /// filterable field (mirrors the api-side `is_filterable_field` predicate, so
+    /// the scan record always carries exactly the fields the reused filter/sort
+    /// bodies access).  Deduped, in declared order.
+    pub(crate) fn scan_field_set(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        let mut out: Vec<&forgedb_parser::Field> = Vec::new();
+        if let Some(id_field) = Self::identity_field(model) {
+            out.push(id_field);
+        }
+        for f in &model.fields {
+            if out.iter().any(|o| o.name == f.name) {
+                continue;
+            }
+            if crate::api::ApiGenerator::is_filterable_field(&f.field_type) {
                 out.push(f);
             }
         }
