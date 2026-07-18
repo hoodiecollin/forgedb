@@ -1797,35 +1797,99 @@ impl RustGenerator {
         }
     }
 
-    /// Emit an "add `id` under the key of `value_expr`" statement for one index.
+    /// The field key token for index maintenance (#157 part B): reuse a hoisted
+    /// per-field key local (`__ik_*`, a `String`) when the field participates in
+    /// **more than one** index structure (single + composites), else derive it
+    /// inline. Hoisting a shared field's key computes the expensive
+    /// `serde_json::to_value` + tagged-string derivation ONCE per mutation and
+    /// reuses it (a cheap `String` clone) across every index that needs it; a
+    /// field in only one structure stays inline (byte-identical, no clone).
+    fn field_key_token(
+        field: &forgedb_parser::Field,
+        record_expr: &TokenStream,
+        hoisted: &std::collections::HashMap<String, proc_macro2::Ident>,
+    ) -> TokenStream {
+        if let Some(ident) = hoisted.get(&field.name) {
+            quote! { #ident.clone() }
+        } else {
+            let fname = format_ident!("{}", field.name);
+            let val = Self::index_value_expr(&field.field_type, quote! { #record_expr.#fname });
+            Self::index_key_expr(val)
+        }
+    }
+
+    /// Fields whose per-mutation index key is derived more than once — i.e. fields
+    /// appearing in ≥2 index structures (a single index counts as one, each
+    /// composite it's a component of counts as one). These are exactly the fields
+    /// worth hoisting (#157 part B); a field in a single structure has no
+    /// redundancy to eliminate. Returns them in `model.fields` order.
+    fn shared_index_key_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        let singles: std::collections::HashSet<&str> =
+            Self::indexed_fields(model).iter().map(|f| f.name.as_str()).collect();
+        model
+            .fields
+            .iter()
+            .filter(|f| {
+                let mut count = if singles.contains(f.name.as_str()) { 1 } else { 0 };
+                for (_ident, comps) in Self::composite_indexes(model) {
+                    if comps.iter().any(|c| c.name == f.name) {
+                        count += 1;
+                    }
+                }
+                count >= 2
+            })
+            .collect()
+    }
+
+    /// Emit the hoisted `let __ik_… = { <key> };` bindings for a mutation's shared
+    /// index-key fields (#157 part B), keyed off `record_expr`, plus the name→ident
+    /// map `field_key_token` consults. `prefix` disambiguates the add-direction
+    /// (new values) from the remove-direction (old values) within one `update`.
+    fn hoist_index_keys(
+        model: &forgedb_parser::Model,
+        record_expr: &TokenStream,
+        prefix: &str,
+    ) -> (Vec<TokenStream>, std::collections::HashMap<String, proc_macro2::Ident>) {
+        let mut binds = Vec::new();
+        let mut map = std::collections::HashMap::new();
+        for f in Self::shared_index_key_fields(model) {
+            let ident = format_ident!("__ik_{}_{}", prefix, f.name);
+            let fname = format_ident!("{}", f.name);
+            let val = Self::index_value_expr(&f.field_type, quote! { #record_expr.#fname });
+            let key = Self::index_key_expr(val);
+            binds.push(quote! { let #ident: String = { #key }; });
+            map.insert(f.name.clone(), ident);
+        }
+        (binds, map)
+    }
+
+    /// Emit an "add `id` under `key_token`" statement for one index (#157: the key
+    /// is pre-built by the caller — hoisted or inline — not derived here).
     fn index_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
-        value_expr: TokenStream,
+        key_token: TokenStream,
         id_expr: &TokenStream,
     ) -> TokenStream {
-        let key = Self::index_key_expr(value_expr);
         quote! {
             {
-                let __k: String = { #key };
+                let __k: String = { #key_token };
                 #receiver.#index_ident.entry(__k).or_default().insert(#id_expr);
             }
         }
     }
 
-    /// Emit a "remove `id` from the key of `value_expr`" statement for one index,
-    /// pruning the bucket when it empties (structured to avoid a double mutable
-    /// borrow of the map).
+    /// Emit a "remove `id` from `key_token`" statement for one index, pruning the
+    /// bucket when it empties (structured to avoid a double mutable borrow).
     fn index_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
-        value_expr: TokenStream,
+        key_token: TokenStream,
         id_expr: &TokenStream,
     ) -> TokenStream {
-        let key = Self::index_key_expr(value_expr);
         quote! {
             {
-                let __k: String = { #key };
+                let __k: String = { #key_token };
                 let mut __empty = false;
                 if let Some(__set) = #receiver.#index_ident.get_mut(&__k) {
                     __set.remove(&(#id_expr));
@@ -1922,18 +1986,15 @@ impl RustGenerator {
         }
     }
 
-    /// Emit an "add `id` under the composite key of the component value exprs".
+    /// Emit an "add `id` under the composite key" statement (#157: the per-part
+    /// key tokens are pre-built by the caller — hoisted or inline).
     fn composite_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
-        part_value_exprs: &[TokenStream],
+        part_key_tokens: &[TokenStream],
         id_expr: &TokenStream,
     ) -> TokenStream {
-        let part_keys: Vec<_> = part_value_exprs
-            .iter()
-            .map(|v| Self::index_key_expr(v.clone()))
-            .collect();
-        let key = Self::composite_key_build(&part_keys);
+        let key = Self::composite_key_build(part_key_tokens);
         quote! {
             {
                 let __k: String = #key;
@@ -1946,14 +2007,10 @@ impl RustGenerator {
     fn composite_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
-        part_value_exprs: &[TokenStream],
+        part_key_tokens: &[TokenStream],
         id_expr: &TokenStream,
     ) -> TokenStream {
-        let part_keys: Vec<_> = part_value_exprs
-            .iter()
-            .map(|v| Self::index_key_expr(v.clone()))
-            .collect();
-        let key = Self::composite_key_build(&part_keys);
+        let key = Self::composite_key_build(part_key_tokens);
         quote! {
             {
                 let __k: String = #key;
@@ -3533,13 +3590,16 @@ impl RustGenerator {
         // durable row.
         let recv = quote! { self };
         let id_tok = quote! { id };
+        let rec = quote! { record };
+        // #157 part B: hoist the key of any field used in ≥2 index structures so
+        // it is derived once and reused across the single + composite adds.
+        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
         let index_adds: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let fname = format_ident!("{}", f.name);
-                let val = Self::index_value_expr(&f.field_type, quote! { record.#fname });
-                Self::index_add_block(&recv, &ident, val, &id_tok)
+                let key = Self::field_key_token(f, &rec, &add_map);
+                Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
         // Composite-index maintenance (#101): same timing, keyed by the tuple.
@@ -3548,10 +3608,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| {
-                        let cf = format_ident!("{}", c.name);
-                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
-                    })
+                    .map(|c| Self::field_key_token(c, &rec, &add_map))
                     .collect();
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
@@ -3585,6 +3642,8 @@ impl RustGenerator {
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): index the committed row.
+            // #157 part B: derive shared-field keys once, then reuse below.
+            #(#add_hoist)*
             #(#index_adds)*
             // Composite-index maintenance (#101).
             #(#composite_adds)*
@@ -3643,60 +3702,71 @@ impl RustGenerator {
         };
         let recv = quote! { self };
         let id_tok = quote! { id };
-        let index_updates: Vec<_> = indexed
+        let rec = quote! { record };
+        let old = quote! { __old_rec };
+        // #157 part B: hoist shared-field keys once per direction — the new-value
+        // keys (from `record`) and the old-value keys (from `__old_rec`) — so a
+        // field in a single index AND a composite derives each key once, not per
+        // index structure. Removes are grouped under one `if let Some(__old_rec)`
+        // (the old hoist lives inside it, since `__old_rec` is bound there); adds
+        // run unconditionally after.
+        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &old, "rem");
+        let single_removes: Vec<_> = indexed
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let fname = format_ident!("{}", f.name);
-                let remove_old = Self::index_remove_block(
-                    &recv,
-                    &ident,
-                    Self::index_value_expr(&f.field_type, quote! { __old_rec.#fname }),
-                    &id_tok,
-                );
-                let add_new = Self::index_add_block(
-                    &recv,
-                    &ident,
-                    Self::index_value_expr(&f.field_type, quote! { record.#fname }),
-                    &id_tok,
-                );
-                quote! {
-                    if let Some(__old_rec) = &__old {
-                        #remove_old
-                    }
-                    #add_new
-                }
+                let key = Self::field_key_token(f, &old, &rem_map);
+                Self::index_remove_block(&recv, &ident, key, &id_tok)
+            })
+            .collect();
+        let single_adds: Vec<_> = indexed
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let key = Self::field_key_token(f, &rec, &add_map);
+                Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
         // Composite-index update maintenance (#101): remove the old tuple key
         // (from `__old`), add the new one (from `record`).
-        let composite_updates: Vec<_> = composites
+        let composite_removes: Vec<_> = composites
             .iter()
             .map(|(ident, comps)| {
-                let old_parts: Vec<_> = comps
+                let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| {
-                        let cf = format_ident!("{}", c.name);
-                        Self::index_value_expr(&c.field_type, quote! { __old_rec.#cf })
-                    })
+                    .map(|c| Self::field_key_token(c, &old, &rem_map))
                     .collect();
-                let new_parts: Vec<_> = comps
-                    .iter()
-                    .map(|c| {
-                        let cf = format_ident!("{}", c.name);
-                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
-                    })
-                    .collect();
-                let remove_old = Self::composite_remove_block(&recv, ident, &old_parts, &id_tok);
-                let add_new = Self::composite_add_block(&recv, ident, &new_parts, &id_tok);
-                quote! {
-                    if let Some(__old_rec) = &__old {
-                        #remove_old
-                    }
-                    #add_new
-                }
+                Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
+        let composite_adds: Vec<_> = composites
+            .iter()
+            .map(|(ident, comps)| {
+                let parts: Vec<_> = comps
+                    .iter()
+                    .map(|c| Self::field_key_token(c, &rec, &add_map))
+                    .collect();
+                Self::composite_add_block(&recv, ident, &parts, &id_tok)
+            })
+            .collect();
+        // The remove side runs only when there is a pre-update record to remove
+        // keys from — and `__old` is only bound (by `fetch_old`) when the model has
+        // an index. Emit the whole `if let Some(__old_rec)` block only then, so an
+        // index-free model neither references an undefined `__old` nor emits a dead
+        // empty guard.
+        let index_remove_maint = if indexed.is_empty() && composites.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                if let Some(__old_rec) = &__old {
+                    #(#rem_hoist)*
+                    #(#single_removes)*
+                    // Composite-index maintenance (#101): drop stale tuple keys.
+                    #(#composite_removes)*
+                }
+            }
+        };
 
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
@@ -3728,9 +3798,12 @@ impl RustGenerator {
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop stale value keys, add new.
-            #(#index_updates)*
-            // Composite-index maintenance (#101): drop stale tuple keys, add new.
-            #(#composite_updates)*
+            // #157 part B: old-value key derivation is hoisted once inside the
+            // `if let Some(__old_rec)` guard; new-value keys once after.
+            #index_remove_maint
+            #(#add_hoist)*
+            #(#single_adds)*
+            #(#composite_adds)*
 
             // #62: an Updated event carries the new live row index.
             if let Some(feed) = &self.changefeed {
@@ -3777,13 +3850,15 @@ impl RustGenerator {
         // the pre-delete live version — its field values are the keys to remove.
         let recv = quote! { self };
         let id_tok = quote! { id };
+        let rec = quote! { record };
+        // #157 part B: hoist shared-field keys once (from the pre-delete `record`).
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &rec, "rem");
         let index_removes: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let fname = format_ident!("{}", f.name);
-                let val = Self::index_value_expr(&f.field_type, quote! { record.#fname });
-                Self::index_remove_block(&recv, &ident, val, &id_tok)
+                let key = Self::field_key_token(f, &rec, &rem_map);
+                Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
         // Composite-index removal (#101): drop the deleted id's tuple key.
@@ -3792,10 +3867,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| {
-                        let cf = format_ident!("{}", c.name);
-                        Self::index_value_expr(&c.field_type, quote! { record.#cf })
-                    })
+                    .map(|c| Self::field_key_token(c, &rec, &rem_map))
                     .collect();
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
@@ -3833,6 +3905,8 @@ impl RustGenerator {
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop the deleted id's value keys.
+            // #157 part B: shared-field keys derived once, then reused.
+            #(#rem_hoist)*
             #(#index_removes)*
             // Composite-index removal (#101).
             #(#composite_removes)*
@@ -4863,13 +4937,18 @@ impl RustGenerator {
 
                 // Single-field index adds (#90 + #100/#102 via `indexed_fields`),
                 // keyed off the just-decoded `<field>_value` locals.
+                // #157: build the key tokens inline from the decoded `_value`
+                // locals (reopen is a one-shot scan, not the hot write path, so no
+                // hoisting here — the block builders now take pre-built keys).
                 let mut adds: Vec<_> = indexed
                     .iter()
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
-                        let val = Self::index_value_expr(&f.field_type, quote! { #val });
-                        Self::index_add_block(recv, &ident, val, &id_tok)
+                        let key = Self::index_key_expr(
+                            Self::index_value_expr(&f.field_type, quote! { #val }),
+                        );
+                        Self::index_add_block(recv, &ident, key, &id_tok)
                     })
                     .collect();
                 // Composite index adds (#101), folded into the same scan.
@@ -4878,7 +4957,9 @@ impl RustGenerator {
                         .iter()
                         .map(|c| {
                             let val = format_ident!("{}_value", c.name);
-                            Self::index_value_expr(&c.field_type, quote! { #val })
+                            Self::index_key_expr(
+                                Self::index_value_expr(&c.field_type, quote! { #val }),
+                            )
                         })
                         .collect();
                     Self::composite_add_block(recv, ident, &parts, &id_tok)

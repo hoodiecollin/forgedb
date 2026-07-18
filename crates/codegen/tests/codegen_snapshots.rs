@@ -2941,6 +2941,66 @@ Author {
 }
 
 #[test]
+fn test_rust_generation_index_key_hoisting() {
+    // #157 part A: the record is serialized once (WAL borrows, broker moves).
+    // #157 part B: a field in ≥2 index structures (single index + composite) has
+    // its index key derived ONCE per mutation and reused across both.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  status: ^string
+  region: string
+  @index(status, region)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Part A: exactly one serialize per mutation, shared. The WAL extends its
+    // framed payload with the shared buffer; no second serialize call remains for
+    // the broker (it moves `__record_json`).
+    assert!(
+        flat.contains("let__record_json=serde_json::to_vec(&record)"),
+        "the record is serialized once into __record_json (#157 A)"
+    );
+    assert!(
+        flat.contains("__wal_payload.extend_from_slice(&__record_json)"),
+        "the WAL reuses the shared serialized buffer (#157 A)"
+    );
+    // The broker MOVES the shared buffer instead of re-serializing: its `record`
+    // call is passed `__record_json` (the ChangeKind + the moved bytes).
+    assert!(
+        flat.contains("ChangeKind::Inserted,__record_json,"),
+        "the broker record moves the shared buffer, not a fresh serialize (#157 A)"
+    );
+
+    // Part B: `status` (single index ^ + composite component) is HOISTED — its key
+    // is bound once per direction and reused; `region` (composite-only, one
+    // structure) is NOT hoisted (stays inline).
+    assert!(
+        flat.contains("let__ik_add_status:String=")
+            && flat.contains("let__ik_rem_status:String="),
+        "the shared field's key is hoisted for both add and remove directions (#157 B)"
+    );
+    assert!(
+        flat.contains("__ik_add_status.clone()"),
+        "hoisted key is reused (cloned) across single + composite adds (#157 B)"
+    );
+    assert!(
+        !flat.contains("let__ik_add_region:String="),
+        "a single-structure field (region) is not hoisted — inline, no clone (#157 B)"
+    );
+    // Update groups all removes under one guarded `if let Some(__old_rec)`.
+    assert!(
+        flat.contains("ifletSome(__old_rec)=&__old{"),
+        "update groups removes under one old-record guard (#157 B)"
+    );
+}
+
+#[test]
 fn test_rust_generation_replica_apply_path() {
     // Browser read-replica follower apply path (#110 Milestone C): the same
     // generated data logic recompiles for wasm and gains a follower entry point

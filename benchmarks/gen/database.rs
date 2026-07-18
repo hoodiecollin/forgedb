@@ -2041,27 +2041,6 @@ impl PostStorage {
                     self.views_index.remove(&__k);
                 }
             }
-        }
-        {
-            let __k: String = {
-                match serde_json::to_value(&(record.views)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
-                }
-            };
-            self.views_index.entry(__k).or_default().insert(id);
-        }
-        if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
                     match serde_json::to_value(&(__old_rec.author)) {
@@ -2088,6 +2067,25 @@ impl PostStorage {
                     self.author_index.remove(&__k);
                 }
             }
+        }
+        {
+            let __k: String = {
+                match serde_json::to_value(&(record.views)) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            };
+            self.views_index.entry(__k).or_default().insert(id);
         }
         {
             let __k: String = {
