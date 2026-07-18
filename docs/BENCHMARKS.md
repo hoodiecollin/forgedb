@@ -148,6 +148,14 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#158 — reader() index-map sharing (2026-07-18, Option A).** `Database::reader()` no longer deep-clones
+  every secondary/composite index map + `id_to_row` per call (was O(total live rows across the DB)). The maps
+  are `Arc<HashMap<..>>`, so `reader()` capture is an O(1) `Arc::clone` (refcount bump); the single writer
+  mutates via `Arc::make_mut` — copy-on-write, cloning a map once only while a reader still holds the prior
+  snapshot, then in place. Probe reads are unchanged (`Arc` derefs to `HashMap`). Honest limit: a
+  **persistently-held reader under continuous writes** degrades to a whole-map CoW clone per write — the
+  cliff a persistent HAMT (Option B) would avoid, filed as the **#166** explore/experiment (needs an A-vs-B
+  bench across both reader profiles before adoption).
 - **#157 — redundant write-path serialization (2026-07-18).** Part A: serialize the record ONCE per
   insert/update/delete (WAL borrows the buffer, the broker moves it) instead of twice. Part B: a field in
   ≥2 index structures (single + composite) derives its tagged index key once per mutation and reuses it. No

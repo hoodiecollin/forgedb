@@ -363,7 +363,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
     current codegen in `scratchpad/followups_compile` (ephemeral); full 18-schema `examples/` corpus (incl.
     integer-PK `iot-sensors`, multi-composite `food-delivery`, composite `ecommerce-store`) compile-checked in
     `scratchpad/corpus_check2`. **Honest limits (still deferred):** the hash index is exact-match only (no
-    prefix/range); the reader index clone is O(rows) per `reader()` (an `Arc`-swap is the escape hatch if it matters).
+    prefix/range); **`reader()` shares the index maps via `Arc` (#158 — O(1) capture, writer mutates copy-on-write
+    via `Arc::make_mut`)**, so the old O(rows)-per-`reader()` clone is gone — the residual cliff is a persistently-held
+    reader under continuous writes (whole-map CoW per write), which a persistent HAMT (Option B, #166 explore/experiment)
+    would avoid.
     **Publish gap CLOSED (2026-07-10):** generated `api.rs` depends on **`forgedb-query-params` 0.1.0** (scaffold
     pins `= "0.1"`, published); reclose PROVEN by an outside-repo `init → generate rust+api → cargo build` resolving
     `forgedb-query-params 0.1.0` + `forgedb-storage 0.1.5` + `forgedb-wal 0.2.0` + changefeed/auth/types from
