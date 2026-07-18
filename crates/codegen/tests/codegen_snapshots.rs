@@ -1554,18 +1554,25 @@ Tag {
     // #66 mutation surface: for id-bearing models `get_at`/`all_at` resolve the
     // newest version *within the watermark* per id (not a plain prefix scan), so a
     // snapshot captured before a later update/delete still sees the version live
-    // as-of capture. Both bind the watermark once and track the newest row.
+    // as-of capture.  #159: resolution is a binary search over the id's ascending
+    // version list (`id_versions`), not an O(watermark) id-column scan.
     assert!(
         code.contains("let watermark = snap.watermark();"),
         "snapshot accessors bind the watermark once"
     );
     assert!(
-        code.contains("let mut newest: Option<usize> = None;"),
-        "get_at must resolve the newest version within the watermark"
+        code.contains("let versions = self.id_versions.get(&id)?;")
+            && code.contains("let pos = versions.partition_point(|&r| r < watermark);"),
+        "#159: get_at binary-searches id_versions for the newest version < watermark"
     );
     assert!(
-        code.contains("let mut newest: HashMap<Uuid, usize> = HashMap::new();"),
-        "all_at must resolve the newest version per id within the watermark"
+        code.contains("for versions in self.id_versions.values() {"),
+        "#159: all_at resolves each id via its version list (no O(watermark) scan)"
+    );
+    // The old O(watermark) id-column scan must be gone from the snapshot path.
+    assert!(
+        !code.contains("let mut newest: Option<usize> = None;"),
+        "#159: the O(watermark) get_at scan is replaced by a binary search"
     );
     // The junction pairs_at resolves latest-wins over exactly the committed
     // prefix (delete semantics added a per-pair tombstone; `unlink`ed pairs are
@@ -2200,6 +2207,51 @@ User {
             "#158: `{needle}` must route through Arc::make_mut, not a bare deref"
         );
     }
+}
+
+#[test]
+fn test_rust_generation_version_index() {
+    // #159: id-bearing models carry a per-id ascending version list `id_versions`
+    // so snapshot reads binary-search for the newest version < watermark (O(log v))
+    // instead of an O(watermark) id-column scan (which made the FK snapshot-probe
+    // quadratic).  Guards the field, the write-path maintenance, and the reopen
+    // rebuild.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  status: ^string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // The version index is a per-id ascending Vec of physical rows, Arc-shared
+    // (#158) so readers capture it O(1).
+    assert!(
+        code.contains("id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>"),
+        "#159: id_versions is an Arc<HashMap<Id, Vec<row>>>"
+    );
+    // Write-path maintenance: every mutation appends the new row via Arc::make_mut.
+    // (prettyplease wraps the `.entry(..).or_default().push(..)` chain onto separate
+    // lines, so we assert on the receiver + the push arg independently.)
+    assert!(
+        code.contains("std::sync::Arc::make_mut(&mut self.id_versions)")
+            && code.contains(".push(row_index);"),
+        "#159: insert/update/delete push the new version index"
+    );
+    // Reopen rebuild folds into the ascending id-scan (keeps each vec sorted).
+    assert!(
+        code.contains("std::sync::Arc::make_mut(&mut db.id_versions)")
+            && code.contains(".push(i);"),
+        "#159: reopen rebuilds id_versions in the id-scan"
+    );
+    // Snapshot resolution is a binary search, not a scan.
+    assert!(
+        code.contains("versions.partition_point(|&r| r < watermark)"),
+        "#159: get_at/all_at binary-search the version list"
+    );
 }
 
 #[test]
