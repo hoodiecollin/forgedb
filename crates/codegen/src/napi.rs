@@ -68,9 +68,10 @@ impl NapiGenerator {
             mod database;
 
             use napi::bindgen_prelude::*;
-            use napi::{Env, JsUnknown};
+            use napi::{Env, JsUnknown, Task};
             use napi_derive::napi;
             use std::panic::{AssertUnwindSafe, catch_unwind};
+            use std::sync::{Arc, RwLock};
 
             use database::Database;
             // Names the primary-key type of UUID-keyed models (`id_type_tokens`
@@ -95,13 +96,58 @@ impl NapiGenerator {
                 Error::from_reason(msg)
             }
 
+            /// A generic asynchronous engine op run on the libuv thread-pool.
+            ///
+            /// Holds a boxed closure that locks the shared `Arc<RwLock<Database>>`,
+            /// runs exactly one engine call (panic-guarded), and yields its result
+            /// as a `serde_json::Value` — all on the pool thread, so a slow op never
+            /// blocks the JS event loop. `resolve` marshals that value to JS on the
+            /// JS thread. Ops serialize on the single `RwLock`: read ops take a
+            /// shared guard (concurrent), write ops the exclusive guard — the
+            /// single-writer contract lives in the engine, not here (the async layer
+            /// only avoids event-loop stalls and lets reads run in parallel; it never
+            /// conjures write concurrency). Returned as an `AsyncTask` → a JS Promise.
+            pub struct AsyncOp {
+                op: Option<Box<dyn FnOnce() -> std::result::Result<serde_json::Value, String> + Send>>,
+            }
+
+            impl AsyncOp {
+                fn new(
+                    op: impl FnOnce() -> std::result::Result<serde_json::Value, String> + Send + 'static,
+                ) -> Self {
+                    Self { op: Some(Box::new(op)) }
+                }
+            }
+
+            impl Task for AsyncOp {
+                type Output = serde_json::Value;
+                type JsValue = JsUnknown;
+
+                fn compute(&mut self) -> Result<serde_json::Value> {
+                    let op = self.op.take().expect("AsyncOp computed exactly once");
+                    match catch_unwind(AssertUnwindSafe(move || op())) {
+                        Ok(Ok(v)) => Ok(v),
+                        Ok(Err(e)) => Err(Error::from_reason(e)),
+                        Err(p) => Err(panic_to_napi_err(p)),
+                    }
+                }
+
+                fn resolve(&mut self, env: Env, output: serde_json::Value) -> Result<JsUnknown> {
+                    env.to_js_value(&output).map_err(to_napi_err)
+                }
+            }
+
             #(#row_structs)*
 
             /// A ForgeDB database handle — one single-writer process over a data
             /// directory. Methods mirror the generated `Database` surface 1:1.
             #[napi(js_name = "ForgeDb")]
             pub struct ForgeDb {
-                inner: Database,
+                // Shared behind an `RwLock` so async ops (which run on a libuv
+                // pool thread) can hold the SAME single engine handle: read ops
+                // take a shared guard and run concurrently, write ops the exclusive
+                // guard. `Arc` lets each `AsyncOp` clone the handle onto its thread.
+                inner: Arc<RwLock<Database>>,
             }
 
             #[napi]
@@ -112,15 +158,15 @@ impl NapiGenerator {
                 pub fn open(root: String) -> Result<Self> {
                     let root = std::path::PathBuf::from(root);
                     match catch_unwind(AssertUnwindSafe(|| Database::open_at(root))) {
-                        Ok(inner) => Ok(Self { inner }),
+                        Ok(inner) => Ok(Self { inner: Arc::new(RwLock::new(inner)) }),
                         Err(p) => Err(panic_to_napi_err(p)),
                     }
                 }
 
                 /// Flush every column to disk (fsync on native).
                 #[napi]
-                pub fn commit(&mut self) -> Result<()> {
-                    match catch_unwind(AssertUnwindSafe(|| self.inner.commit())) {
+                pub fn commit(&self) -> Result<()> {
+                    match catch_unwind(AssertUnwindSafe(|| self.write().commit())) {
                         Ok(r) => r.map_err(to_napi_err),
                         Err(p) => Err(panic_to_napi_err(p)),
                     }
@@ -128,8 +174,8 @@ impl NapiGenerator {
 
                 /// Force a WAL checkpoint (fsync columns, then truncate the WAL).
                 #[napi]
-                pub fn checkpoint(&mut self) -> Result<()> {
-                    match catch_unwind(AssertUnwindSafe(|| self.inner.checkpoint())) {
+                pub fn checkpoint(&self) -> Result<()> {
+                    match catch_unwind(AssertUnwindSafe(|| self.write().checkpoint())) {
                         Ok(()) => Ok(()),
                         Err(p) => Err(panic_to_napi_err(p)),
                     }
@@ -138,11 +184,22 @@ impl NapiGenerator {
                 /// Reclaim dead (superseded/tombstoned) row versions in-process.
                 /// Explicit only — never reached from a read path (constraint 4).
                 #[napi]
-                pub fn compact(&mut self) -> Result<()> {
-                    match catch_unwind(AssertUnwindSafe(|| self.inner.compact())) {
+                pub fn compact(&self) -> Result<()> {
+                    match catch_unwind(AssertUnwindSafe(|| self.write().compact())) {
                         Ok(()) => Ok(()),
                         Err(p) => Err(panic_to_napi_err(p)),
                     }
+                }
+
+                /// Flush every column to disk asynchronously (resolves to `null`).
+                #[napi(js_name = "commitAsync")]
+                pub fn commit_async(&self) -> AsyncTask<AsyncOp> {
+                    let inner = self.inner.clone();
+                    AsyncTask::new(AsyncOp::new(move || {
+                        let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                        db.commit().map_err(|e| e.to_string())?;
+                        Ok(serde_json::Value::Null)
+                    }))
                 }
 
                 #(#db_methods)*
@@ -150,6 +207,21 @@ impl NapiGenerator {
                 #(#relation_methods)*
 
                 #(#arrow_methods)*
+            }
+
+            impl ForgeDb {
+                /// A shared (concurrent) read guard over the engine, recovering from
+                /// a poisoned lock (a caught panic still poisons on unwind — every
+                /// engine call is `catch_unwind`-wrapped, so the state is intact).
+                fn read(&self) -> std::sync::RwLockReadGuard<'_, Database> {
+                    self.inner.read().unwrap_or_else(|e| e.into_inner())
+                }
+
+                /// The exclusive write guard over the engine, with the same poison
+                /// recovery as [`read`].
+                fn write(&self) -> std::sync::RwLockWriteGuard<'_, Database> {
+                    self.inner.write().unwrap_or_else(|e| e.into_inner())
+                }
             }
         };
 
@@ -487,6 +559,19 @@ impl NapiGenerator {
                 let update_m = format_ident!("update_{}", snake);
                 let delete_m = format_ident!("delete_{}", snake);
 
+                // Async (Promise-returning) variants. `js_name` gives them a camelCase
+                // JS name (`createUserAsync`); the Rust ident stays snake for clarity.
+                let create_async_m = format_ident!("create_{}_async", snake);
+                let get_async_m = format_ident!("get_{}_async", snake);
+                let all_async_m = format_ident!("all_{}_async", snake);
+                let update_async_m = format_ident!("update_{}_async", snake);
+                let delete_async_m = format_ident!("delete_{}_async", snake);
+                let create_async_js = format!("create{}Async", model.name);
+                let get_async_js = format!("get{}Async", model.name);
+                let all_async_js = format!("all{}Async", model.name);
+                let update_async_js = format!("update{}Async", model.name);
+                let delete_async_js = format!("delete{}Async", model.name);
+
                 let create_doc = format!(
                     "Insert a `{}` (FK-checked + validated); returns the new id.",
                     model.name
@@ -507,10 +592,10 @@ impl NapiGenerator {
                 quote! {
                     #[doc = #create_doc]
                     #[napi]
-                    pub fn #create_m(&mut self, env: Env, record: JsUnknown) -> Result<JsUnknown> {
+                    pub fn #create_m(&self, env: Env, record: JsUnknown) -> Result<JsUnknown> {
                         let record: database::#model_ident =
                             env.from_js_value(record).map_err(to_napi_err)?;
-                        let id = match catch_unwind(AssertUnwindSafe(|| self.inner.#create_fn(record))) {
+                        let id = match catch_unwind(AssertUnwindSafe(|| self.write().#create_fn(record))) {
                             Ok(r) => r.map_err(to_napi_err)?,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
@@ -521,7 +606,7 @@ impl NapiGenerator {
                     #[napi]
                     pub fn #get_m(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_ident>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
-                        let opt = match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.get(id))) {
+                        let opt = match catch_unwind(AssertUnwindSafe(|| self.read().#storage.get(id))) {
                             Ok(opt) => opt,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
@@ -531,7 +616,7 @@ impl NapiGenerator {
                     #[doc = #all_doc]
                     #[napi]
                     pub fn #all_m(&self) -> Result<Vec<#napi_ident>> {
-                        let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.all())) {
+                        let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#storage.all())) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
@@ -541,7 +626,7 @@ impl NapiGenerator {
                     #[doc = #count_doc]
                     #[napi]
                     pub fn #count_m(&self) -> Result<i64> {
-                        match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.row_count())) {
+                        match catch_unwind(AssertUnwindSafe(|| self.read().#storage.row_count())) {
                             Ok(n) => Ok(n as i64),
                             Err(p) => Err(panic_to_napi_err(p)),
                         }
@@ -550,7 +635,7 @@ impl NapiGenerator {
                     #[doc = #update_doc]
                     #[napi]
                     pub fn #update_m(
-                        &mut self,
+                        &self,
                         env: Env,
                         id: JsUnknown,
                         record: JsUnknown,
@@ -558,7 +643,7 @@ impl NapiGenerator {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                         let record: database::#model_ident =
                             env.from_js_value(record).map_err(to_napi_err)?;
-                        match catch_unwind(AssertUnwindSafe(|| self.inner.#update_fn(id, record))) {
+                        match catch_unwind(AssertUnwindSafe(|| self.write().#update_fn(id, record))) {
                             Ok(r) => r.map_err(to_napi_err),
                             Err(p) => Err(panic_to_napi_err(p)),
                         }
@@ -566,12 +651,80 @@ impl NapiGenerator {
 
                     #[doc = #delete_doc]
                     #[napi]
-                    pub fn #delete_m(&mut self, env: Env, id: JsUnknown) -> Result<bool> {
+                    pub fn #delete_m(&self, env: Env, id: JsUnknown) -> Result<bool> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
-                        match catch_unwind(AssertUnwindSafe(|| self.inner.#delete_fn(id))) {
+                        match catch_unwind(AssertUnwindSafe(|| self.write().#delete_fn(id))) {
                             Ok(r) => r.map_err(to_napi_err),
                             Err(p) => Err(panic_to_napi_err(p)),
                         }
+                    }
+
+                    // --- Async (Promise-returning) CRUD variants ------------------
+                    // Args decode on the JS thread; the engine call runs on a libuv
+                    // pool thread under the shared lock (reads concurrent, writes
+                    // exclusive) and yields serde JSON, so a slow op never stalls the
+                    // event loop. These resolve to the JSON shape (snake_case, same as
+                    // the sync serde bridge) — typed async structs are a follow-up.
+                    #[doc = "Async insert; resolves to the new id."]
+                    #[napi(js_name = #create_async_js)]
+                    pub fn #create_async_m(&self, env: Env, record: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
+                        let record: database::#model_ident =
+                            env.from_js_value(record).map_err(to_napi_err)?;
+                        let inner = self.inner.clone();
+                        Ok(AsyncTask::new(AsyncOp::new(move || {
+                            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                            let id = db.#create_fn(record).map_err(|e| e.to_string())?;
+                            serde_json::to_value(&id).map_err(|e| e.to_string())
+                        })))
+                    }
+
+                    #[doc = "Async fetch by id; resolves to the row or `null`."]
+                    #[napi(js_name = #get_async_js)]
+                    pub fn #get_async_m(&self, env: Env, id: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
+                        let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
+                        let inner = self.inner.clone();
+                        Ok(AsyncTask::new(AsyncOp::new(move || {
+                            let db = inner.read().unwrap_or_else(|e| e.into_inner());
+                            let opt = db.#storage.get(id);
+                            serde_json::to_value(&opt).map_err(|e| e.to_string())
+                        })))
+                    }
+
+                    #[doc = "Async list of every live row."]
+                    #[napi(js_name = #all_async_js)]
+                    pub fn #all_async_m(&self) -> AsyncTask<AsyncOp> {
+                        let inner = self.inner.clone();
+                        AsyncTask::new(AsyncOp::new(move || {
+                            let db = inner.read().unwrap_or_else(|e| e.into_inner());
+                            let rows = db.#storage.all();
+                            serde_json::to_value(&rows).map_err(|e| e.to_string())
+                        }))
+                    }
+
+                    #[doc = "Async update by id; resolves to `true`/`false`."]
+                    #[napi(js_name = #update_async_js)]
+                    pub fn #update_async_m(&self, env: Env, id: JsUnknown, record: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
+                        let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
+                        let record: database::#model_ident =
+                            env.from_js_value(record).map_err(to_napi_err)?;
+                        let inner = self.inner.clone();
+                        Ok(AsyncTask::new(AsyncOp::new(move || {
+                            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                            let ok = db.#update_fn(id, record).map_err(|e| e.to_string())?;
+                            serde_json::to_value(ok).map_err(|e| e.to_string())
+                        })))
+                    }
+
+                    #[doc = "Async delete by id; resolves to `true`/`false`."]
+                    #[napi(js_name = #delete_async_js)]
+                    pub fn #delete_async_m(&self, env: Env, id: JsUnknown) -> Result<AsyncTask<AsyncOp>> {
+                        let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
+                        let inner = self.inner.clone();
+                        Ok(AsyncTask::new(AsyncOp::new(move || {
+                            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                            let ok = db.#delete_fn(id).map_err(|e| e.to_string())?;
+                            serde_json::to_value(ok).map_err(|e| e.to_string())
+                        })))
                     }
                 }
             })
@@ -640,7 +793,10 @@ impl NapiGenerator {
                     pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_target>> {
                         let id: #source_id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                         let resolved = match catch_unwind(AssertUnwindSafe(|| {
-                            self.inner.#storage.get(id).and_then(|__rec| self.inner.#method_ident(&__rec))
+                            // ONE read guard for both hops — two `self.read()` calls
+                            // in a single expression could same-thread deadlock.
+                            let __db = self.read();
+                            __db.#storage.get(id).and_then(|__rec| __db.#method_ident(&__rec))
                         })) {
                             Ok(opt) => opt,
                             Err(p) => return Err(panic_to_napi_err(p)),
@@ -696,7 +852,7 @@ impl NapiGenerator {
                 #[napi]
                 pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_child>> {
                     let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
-                    let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
+                    let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#method_ident(id))) {
                         Ok(rows) => rows,
                         Err(p) => return Err(panic_to_napi_err(p)),
                     };
@@ -718,10 +874,10 @@ impl NapiGenerator {
                 methods.push(quote! {
                     #[doc = #doc]
                     #[napi]
-                    pub fn #link_ident(&mut self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<()> {
+                    pub fn #link_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<()> {
                         let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
                         let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
-                        match catch_unwind(AssertUnwindSafe(|| self.inner.#link_ident(left, right))) {
+                        match catch_unwind(AssertUnwindSafe(|| self.write().#link_ident(left, right))) {
                             Ok(()) => Ok(()),
                             Err(p) => Err(panic_to_napi_err(p)),
                         }
@@ -737,10 +893,10 @@ impl NapiGenerator {
                 methods.push(quote! {
                     #[doc = #doc]
                     #[napi]
-                    pub fn #unlink_ident(&mut self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<bool> {
+                    pub fn #unlink_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<bool> {
                         let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
                         let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
-                        match catch_unwind(AssertUnwindSafe(|| self.inner.#unlink_ident(left, right))) {
+                        match catch_unwind(AssertUnwindSafe(|| self.write().#unlink_ident(left, right))) {
                             Ok(removed) => Ok(removed),
                             Err(p) => Err(panic_to_napi_err(p)),
                         }
@@ -759,7 +915,7 @@ impl NapiGenerator {
                     #[napi]
                     pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_b>> {
                         let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
-                        let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
+                        let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#fwd_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
@@ -779,7 +935,7 @@ impl NapiGenerator {
                     #[napi]
                     pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_a>> {
                         let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
-                        let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
+                        let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#rev_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
@@ -828,9 +984,10 @@ impl NapiGenerator {
                     #[napi]
                     pub fn #method_ident(&self, env: Env) -> Result<JsUnknown> {
                         let (export, length) = match catch_unwind(AssertUnwindSafe(|| {
-                            let live = self.inner.#storage.export_live_indices();
+                            let __db = self.read();
+                            let live = __db.#storage.export_live_indices();
                             let n = live.len();
-                            self.inner.#storage.#export_method(&live).map(|e| (e, n))
+                            __db.#storage.#export_method(&live).map(|e| (e, n))
                         })) {
                             Ok(Ok(pair)) => pair,
                             Ok(Err(e)) => return Err(to_napi_err(e)),
