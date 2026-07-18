@@ -4,9 +4,28 @@
 
 BUN := /Users/collin/.bun/bin/bun
 INSPECTOR := apps/inspector
+BENCH := benchmarks/Cargo.toml
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
-        inspector-app inspector-app-build
+        inspector-app inspector-app-build \
+        bench bench-forgedb bench-sqlite bench-regen
+
+## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
+bench:
+	cargo bench --manifest-path $(BENCH)
+
+## Benchmark the ForgeDB generated code only.
+bench-forgedb:
+	cargo bench --manifest-path $(BENCH) --bench forgedb_bench
+
+## Benchmark SQLite only.
+bench-sqlite:
+	cargo bench --manifest-path $(BENCH) --bench sqlite_bench
+
+## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
+## Run this after any codegen change so the bench links current generated output.
+bench-regen:
+	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen
 
 ## Install the inspector app's JS dependencies.
 inspector-install:
