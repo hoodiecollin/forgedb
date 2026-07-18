@@ -301,11 +301,12 @@ fn test_api_generation_snapshot_reads() {
     assert!(code.contains("StatusCode::BAD_REQUEST"));
     assert!(code.contains("as_of must be a non-negative integer watermark"));
 
-    // Constraint 1: no parallel snapshot handler — the `as_of` branch only swaps
-    // the row source (`__source`), then feeds the SINGLE existing closed-set
-    // filter (`<model>_event_matches`) shared with the live path. There must be
-    // no second filter body keyed on a snapshot.
-    assert!(code.contains("let __source = match __as_of"));
+    // Constraint 1: no parallel snapshot handler — `page`/`total` are produced by
+    // a single `match __as_of` whose `as_of` arm reads `all_at(&Snapshot)` and
+    // feeds the SAME closed-set `<model>_event_matches` filter.  (#160: the live
+    // arm uses the narrow `__<model>_scan_matches`, generated from the SAME
+    // per-field checks — one predicate source, no drift.)
+    assert!(code.contains("match __as_of"));
     assert!(code.contains("_event_matches"));
 
     // `/snapshot` token: a schema-wide handler + route reporting the per-model
@@ -315,6 +316,69 @@ fn test_api_generation_snapshot_reads() {
     assert!(code.contains("\"/snapshot\""));
     assert!(code.contains("\"watermarks\""));
     assert!(!code.contains("match model_name"));
+}
+
+#[test]
+fn test_rust_generation_list_scan_narrow() {
+    // #160 (A): the live list path filters/sorts a narrow scan record (id +
+    // filterable/sortable columns) and full-materializes ONLY the paginated page,
+    // instead of decoding every column of every row via `all()`.  The narrow
+    // filter/sort reuse the SAME per-field checks/arms as `_event_matches` /
+    // `_apply_sort` (one predicate source, no drift).
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  status: ^string
+  region: string
+  age: u32
+  @index(status, region)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let db_code = RustGenerator::generate(&schema).unwrap().code;
+    let api_code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // database.rs: an internal narrow scan record + reads, NOT a wire type
+    // (no Serialize/ToSchema derive).
+    assert!(db_code.contains("pub struct UserScanRow"), "#160: narrow scan struct emitted");
+    assert!(db_code.contains("fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow>"),
+        "#160: narrow row decoder");
+    assert!(db_code.contains("pub fn __scan_all(&self) -> Vec<UserScanRow>"),
+        "#160: narrow scan of live rows");
+    // The scan record carries filterable columns but NOT the model's derives.
+    let scan_struct = &db_code[db_code.find("pub struct UserScanRow").unwrap()..];
+    let scan_struct = &scan_struct[..scan_struct.find('}').unwrap()];
+    assert!(scan_struct.contains("status") && scan_struct.contains("age"),
+        "#160: scan record carries filterable fields");
+
+    // api.rs: narrow filter/sort helpers, and the live list uses them + materializes
+    // only the page ids (never `all()` on the live path).
+    assert!(api_code.contains("fn __user_scan_matches("), "#160: narrow filter helper");
+    assert!(api_code.contains("fn __user_scan_sort("), "#160: narrow sort helper");
+    assert!(api_code.contains("db.user.__scan_all()"), "#160: live list scans narrowly");
+    assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
+    assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
+        "#160: only the paginated page is full-materialized");
+    // The as_of branch keeps the full-record path (unchanged correctness).
+    assert!(api_code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"),
+        "#160: as_of retains the full snapshot read");
+
+    // #160 (C): index pushdown — an eligible indexed field's list filter resolves
+    // candidates from that field's index instead of scanning every row.
+    assert!(db_code.contains("pub fn __scan_by_status(&self, value: &str) -> Option<Vec<UserScanRow>>"),
+        "#160 C: indexed field gets a pushdown scan");
+    assert!(db_code.contains("pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>>"),
+        "#160 C: unique-indexed field gets a pushdown scan");
+    assert!(api_code.contains("db.user.__scan_by_status(__v)"),
+        "#160 C: live list tries index pushdown");
+    assert!(api_code.contains(".unwrap_or_else(|| db.user.__scan_all())"),
+        "#160 C: a parse-failure falls back to the full scan (never misses a match)");
+    // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
+    // pushdown field — it falls through to the narrow scan.
+    assert!(!db_code.contains("fn __scan_by_region("),
+        "#160 C: a composite-only field is not a single-field pushdown");
 }
 
 #[test]
