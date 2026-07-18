@@ -388,15 +388,13 @@ impl UserStorage {
         }
         let row_index = self.row_count;
         let id = record.id;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -435,14 +433,13 @@ impl UserStorage {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "User",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Inserted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -497,15 +494,13 @@ impl UserStorage {
         }
         let __old = self.get(id);
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -572,14 +567,13 @@ impl UserStorage {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "User",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Updated,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -615,15 +609,13 @@ impl UserStorage {
             .get(&id)
             .expect("id present: get succeeded above");
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(1u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -669,14 +661,13 @@ impl UserStorage {
             feed.emit("User", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "User",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Deleted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -1001,16 +992,14 @@ impl UserStorage {
     /// public watermark) until commit advances the watermark past it.
     pub fn __stage_append(&mut self, record: User, deleted: bool) -> usize {
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         if deleted {
             {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(1u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -1020,11 +1009,7 @@ impl UserStorage {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(0u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -1895,15 +1880,13 @@ impl PostStorage {
         validate_post(&record)?;
         let row_index = self.row_count;
         let id = record.id;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -1967,14 +1950,13 @@ impl PostStorage {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Post",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Inserted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -2004,15 +1986,13 @@ impl PostStorage {
         validate_post(&record)?;
         let __old = self.get(id);
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -2132,14 +2112,13 @@ impl PostStorage {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Post",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Updated,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -2175,15 +2154,13 @@ impl PostStorage {
             .get(&id)
             .expect("id present: get succeeded above");
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(1u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -2261,14 +2238,13 @@ impl PostStorage {
             feed.emit("Post", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Post",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Deleted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -2656,16 +2632,14 @@ impl PostStorage {
     /// public watermark) until commit advances the watermark past it.
     pub fn __stage_append(&mut self, record: Post, deleted: bool) -> usize {
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         if deleted {
             {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(1u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -2675,11 +2649,7 @@ impl PostStorage {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(0u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -3568,15 +3538,13 @@ impl TagStorage {
         }
         let row_index = self.row_count;
         let id = record.id;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -3611,14 +3579,13 @@ impl TagStorage {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Tag",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Inserted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -3673,15 +3640,13 @@ impl TagStorage {
         }
         let __old = self.get(id);
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -3744,14 +3709,13 @@ impl TagStorage {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Tag",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Updated,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -3787,15 +3751,13 @@ impl TagStorage {
             .get(&id)
             .expect("id present: get succeeded above");
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(1u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -3837,14 +3799,13 @@ impl TagStorage {
             feed.emit("Tag", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Tag",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Deleted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -4131,16 +4092,14 @@ impl TagStorage {
     /// public watermark) until commit advances the watermark past it.
     pub fn __stage_append(&mut self, record: Tag, deleted: bool) -> usize {
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         if deleted {
             {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(1u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -4150,11 +4109,7 @@ impl TagStorage {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(0u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                     .expect("Failed to write WAL record");

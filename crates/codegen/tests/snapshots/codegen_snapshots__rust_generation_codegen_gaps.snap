@@ -336,15 +336,13 @@ impl PlaceStorage {
         validate_place(&record)?;
         let row_index = self.row_count;
         let id = record.id;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Place", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -381,14 +379,13 @@ impl PlaceStorage {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Place",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Inserted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -417,15 +414,13 @@ impl PlaceStorage {
         }
         validate_place(&record)?;
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(0u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Place", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -462,14 +457,13 @@ impl PlaceStorage {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Updated);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Place",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Updated,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -505,15 +499,13 @@ impl PlaceStorage {
             .get(&id)
             .expect("id present: get succeeded above");
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         {
             let mut __wal_payload = Vec::new();
             __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
             __wal_payload.push(1u8);
-            __wal_payload
-                .extend_from_slice(
-                    &serde_json::to_vec(&record)
-                        .expect("Failed to serialize record for WAL"),
-                );
+            __wal_payload.extend_from_slice(&__record_json);
             self.wal
                 .write(&forgedb_wal::WalEntry::raw("Place", __wal_payload))
                 .expect("Failed to write WAL record");
@@ -550,14 +542,13 @@ impl PlaceStorage {
             feed.emit("Place", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
         }
         if let Some(__broker) = &self.broker {
-            let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
             if let Ok(mut __b) = __broker.lock() {
                 let _ = __b
                     .record(
                         "Place",
                         row_index as u64,
                         forgedb_changefeed::ChangeKind::Deleted,
-                        __row_bytes,
+                        __record_json,
                     );
             }
         }
@@ -864,16 +855,14 @@ impl PlaceStorage {
     /// public watermark) until commit advances the watermark past it.
     pub fn __stage_append(&mut self, record: Place, deleted: bool) -> usize {
         let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
         if deleted {
             {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(1u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Place", __wal_payload))
                     .expect("Failed to write WAL record");
@@ -883,11 +872,7 @@ impl PlaceStorage {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(0u8);
-                __wal_payload
-                    .extend_from_slice(
-                        &serde_json::to_vec(&record)
-                            .expect("Failed to serialize record for WAL"),
-                    );
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw("Place", __wal_payload))
                     .expect("Failed to write WAL record");

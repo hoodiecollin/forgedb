@@ -2741,13 +2741,30 @@ impl RustGenerator {
                 let mut __wal_payload = Vec::new();
                 __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
                 __wal_payload.push(#deleted_tok);
-                __wal_payload.extend_from_slice(
-                    &serde_json::to_vec(&record).expect("Failed to serialize record for WAL")
-                );
+                // #157: reuse the once-serialized `__record_json` (emitted by
+                // `generate_shared_record_json` before this block) instead of
+                // re-serializing the whole record. The WAL frames it with an 8-byte
+                // row-index + 1-byte deleted header, so it copies the bytes into its
+                // own payload; the broker later MOVES `__record_json` (no clone).
+                __wal_payload.extend_from_slice(&__record_json);
                 self.wal
                     .write(&forgedb_wal::WalEntry::raw(#model_name_str, __wal_payload))
                     .expect("Failed to write WAL record");
             }
+        }
+    }
+
+    /// Emit `let __record_json = serde_json::to_vec(&record)…` — the single
+    /// serialization of the record shared by the WAL payload and the durable
+    /// broker record (#157). Placed at the top of each mutation (before the WAL
+    /// write), so both consumers reuse it and the record need not survive the
+    /// column appends. Records are composed of primitive/serde fields, so
+    /// serialization cannot fail in practice — `expect` matches the WAL's prior
+    /// durability semantics (the stricter of the two old call sites).
+    fn generate_shared_record_json() -> TokenStream {
+        quote! {
+            let __record_json = serde_json::to_vec(&record)
+                .expect("Failed to serialize record");
         }
     }
 
@@ -2769,14 +2786,17 @@ impl RustGenerator {
         let model_name_str = model.name.clone();
         quote! {
             if let Some(__broker) = &self.broker {
-                // Reuse the WAL's opaque row encoding; the broker never decodes it.
-                let __row_bytes = serde_json::to_vec(&record).unwrap_or_default();
+                // #157: MOVE the once-serialized `__record_json` (shared with the
+                // WAL, which only borrowed it) into the broker — no re-serialize,
+                // no clone. The broker is the last consumer of these bytes. When
+                // replication is off (#130 default) this block is never entered and
+                // `__record_json` is simply dropped after the WAL borrowed it.
                 if let Ok(mut __b) = __broker.lock() {
                     let _ = __b.record(
                         #model_name_str,
                         row_index as u64,
                         #kind,
-                        __row_bytes,
+                        __record_json,
                     );
                 }
             }
@@ -3269,6 +3289,7 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let wal_write_live = Self::generate_wal_record_write(model, false);
         let wal_write_deleted = Self::generate_wal_record_write(model, true);
+        let shared_record_json = Self::generate_shared_record_json();
         let col_idents: Vec<_> = model
             .fields
             .iter()
@@ -3393,6 +3414,9 @@ impl RustGenerator {
             /// public watermark) until commit advances the watermark past it.
             pub fn __stage_append(&mut self, record: #model_name, deleted: bool) -> usize {
                 let row_index = self.row_count;
+                // #157: serialize the record once (this path has no broker — the
+                // WAL is the only consumer — so it is just borrowed).
+                #shared_record_json
                 // Durability boundary (#89): WAL-record the row before any column
                 // is touched, so a crash mid-stage is repaired on reopen and the
                 // aborted tail is dropped by journal-driven recovery.
@@ -3494,6 +3518,7 @@ impl RustGenerator {
         let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let shared_record_json = Self::generate_shared_record_json();
         let broker_record =
             Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Inserted });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
@@ -3540,6 +3565,10 @@ impl RustGenerator {
 
             let row_index = self.row_count;
             let id = record.#id_field_name;
+
+            // #157: serialize the record ONCE; the WAL borrows it and the broker
+            // (if attached) moves it — no second serialize, no clone.
+            #shared_record_json
 
             // Durability boundary (#89): record + fsync the row in the WAL before
             // any column is touched, so a crash mid-append is recovered on reopen.
@@ -3588,6 +3617,7 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
+        let shared_record_json = Self::generate_shared_record_json();
         let broker_record =
             Self::generate_broker_record(model, quote! { forgedb_changefeed::ChangeKind::Updated });
         let maybe_checkpoint = Self::generate_maybe_checkpoint();
@@ -3680,6 +3710,9 @@ impl RustGenerator {
             #fetch_old
             let row_index = self.row_count;
 
+            // #157: serialize the record once, shared by the WAL + broker.
+            #shared_record_json
+
             // Durability boundary (#89): WAL-record the superseding version first.
             #wal_write
 
@@ -3729,6 +3762,7 @@ impl RustGenerator {
         let append_statements = Self::generate_append_statements(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
+        let shared_record_json = Self::generate_shared_record_json();
         // The broker records the *tombstoned* physical row (`row_index`), so a
         // follower applies the tombstone at the same position; `record` (the
         // pre-delete values re-appended under the tombstone) supplies the bytes.
@@ -3782,6 +3816,9 @@ impl RustGenerator {
                 .expect("id present: get succeeded above");
 
             let row_index = self.row_count;
+
+            // #157: serialize the record once, shared by the WAL + broker.
+            #shared_record_json
 
             // Durability boundary (#89): WAL-record the tombstoned version first.
             #wal_write
