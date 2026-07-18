@@ -3714,9 +3714,23 @@ Reading {
     );
     assert!(flat.contains("structForgeDb"), "the ForgeDb handle exists");
     assert!(flat.contains("Database::open_at("), "open wraps Database::open_at");
-    assert!(flat.contains("self.inner.commit()"), "commit wraps the generated commit");
+    assert!(flat.contains("self.write().commit()"), "commit wraps the generated commit under the write guard");
     // The factory constructor + method annotations are emitted.
     assert!(flat.contains("#[napi(factory)]"), "open is a #[napi] factory");
+
+    // The engine is shared behind an `Arc<RwLock<Database>>` so async ops can run
+    // on a libuv pool thread over the SAME handle; reads take a shared guard, writes
+    // the exclusive guard, both poison-recovering.
+    assert!(flat.contains("inner:Arc<RwLock<Database>>"), "engine is shared behind Arc<RwLock>");
+    assert!(
+        flat.contains("fnread(&self)->std::sync::RwLockReadGuard")
+            && flat.contains("fnwrite(&self)->std::sync::RwLockWriteGuard"),
+        "poison-recovering read()/write() guard helpers are generated"
+    );
+    assert!(
+        flat.contains("unwrap_or_else(|e|e.into_inner())"),
+        "guards recover from a poisoned lock"
+    );
 
     // Per-model CRUD, each keyed by the model's snake name, going through the
     // generated integrity wrappers + storage reads (not a reimplementation).
@@ -3728,12 +3742,34 @@ Reading {
             );
         }
     }
-    assert!(flat.contains("self.inner.create_user("), "create uses the create_<m> integrity wrapper");
-    assert!(flat.contains("self.inner.update_post("), "update uses the update_<m> wrapper");
-    assert!(flat.contains("self.inner.delete_user("), "delete uses the delete_<m> referential wrapper");
-    assert!(flat.contains("self.inner.user.get("), "get uses the generated storage read");
-    assert!(flat.contains("self.inner.reading.row_count("), "count uses the generated row_count");
-    assert!(flat.contains("self.inner.post.all()"), "all uses the generated storage read");
+    assert!(flat.contains("self.write().create_user("), "create uses the create_<m> integrity wrapper under the write guard");
+    assert!(flat.contains("self.write().update_post("), "update uses the update_<m> wrapper under the write guard");
+    assert!(flat.contains("self.write().delete_user("), "delete uses the delete_<m> referential wrapper under the write guard");
+    assert!(flat.contains("self.read().user.get("), "get uses the generated storage read under the read guard");
+    assert!(flat.contains("self.read().reading.row_count("), "count uses the generated row_count under the read guard");
+    assert!(flat.contains("self.read().post.all()"), "all uses the generated storage read under the read guard");
+
+    // Async (Promise-returning) CRUD variants — return `AsyncTask<AsyncOp>` (a JS
+    // Promise) and run the engine call on a libuv pool thread under the shared lock.
+    assert!(
+        flat.contains("implTaskforAsyncOp") && flat.contains("typeJsValue=JsUnknown"),
+        "the generic AsyncOp implements napi::Task"
+    );
+    for m in ["user", "post", "reading"] {
+        for op in ["create", "get", "all", "update", "delete"] {
+            assert!(
+                flat.contains(&format!("fn{op}_{m}_async(")),
+                "missing async variant {op}_{m}_async"
+            );
+        }
+    }
+    assert!(flat.contains("commit_async(&self)->AsyncTask<AsyncOp>"), "schema-wide commit_async exists");
+    assert!(flat.contains("->Result<AsyncTask<AsyncOp>>"), "async ops return an AsyncTask (a JS Promise)");
+    assert!(
+        flat.contains("inner.write().unwrap_or_else(|e|e.into_inner())")
+            && flat.contains("inner.read().unwrap_or_else(|e|e.into_inner())"),
+        "async ops lock the shared handle on the pool thread",
+    );
 
     // Typed row structs (Phase 5b/6b follow-up) — one `#[napi(object)]` struct per
     // identity model so napi-rs auto-emits a typed TypeScript interface in the
@@ -3800,16 +3836,16 @@ Reading {
         "forward FK post_author returns typed Option<NapiUser>"
     );
     assert!(
-        flat.contains("self.inner.post.get(id).and_then(|__rec|self.inner.post_author(&__rec))"),
+        flat.contains("let__db=self.read();__db.post.get(id).and_then(|__rec|__db.post_author(&__rec))"),
         "forward FK fetches the source then resolves the generated getter"
     );
     assert!(
         flat.contains("pubfnuser_posts(&self,env:Env,id:JsUnknown)->Result<Vec<NapiPost>>"),
         "reverse 1:M user_posts returns typed Vec<NapiPost>"
     );
-    assert!(flat.contains("pubfnlink_post_tag(&mutself"), "M2M link_post_tag exists");
+    assert!(flat.contains("pubfnlink_post_tag(&self"), "M2M link_post_tag exists");
     assert!(
-        flat.contains("pubfnunlink_post_tag(&mutself") && flat.contains("->Result<bool>"),
+        flat.contains("pubfnunlink_post_tag(&self") && flat.contains("->Result<bool>"),
         "M2M unlink_post_tag returns bool"
     );
     assert!(
@@ -3833,7 +3869,7 @@ Reading {
         "the export aliases the column bytes into an external ArrayBuffer (zero-copy)"
     );
     assert!(
-        flat.contains("self.inner.reading.export_live_indices()") && flat.contains(".export_col_value("),
+        flat.contains("__db.reading.export_live_indices()") && flat.contains(".export_col_value("),
         "the export computes the live set in generated code + gathers the one column"
     );
     assert!(flat.contains("set_named_property(\"format\""), "the result carries the Arrow format string");
