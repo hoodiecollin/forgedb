@@ -69,7 +69,7 @@ Example: `cargo run -- generate all --output ./generated`.
 Plain `cargo test --workspace --no-fail-fast` is **green**:
 
 ```bash
-cargo test --workspace --no-fail-fast   # 434 pass, 0 fail (incl. doctests)
+cargo test --workspace --no-fail-fast   # run the whole suite; read the `test result:` lines
 cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
 ```
 
@@ -86,84 +86,22 @@ cargo build --workspace --examples      # exit 0 — ALWAYS check examples too
   `api.rs`) in a throwaway crate; snapshot pass ≠ output compiles. This discipline caught
   3 real codegen bugs during Phase 3b.
 
-**Baseline: 498 tests pass** (workspace, incl. doctests). 493→498 with #74 Phase 3 (the offline transformer
-bin): +5 `forgedb-codegen` guards (`test_transform_bin_has_no_schema_runtime` / `_replay_is_straightline` /
-`_deps_are_provider_free` / `_embeds_frozen_authored_body` / `test_transform_generation_snapshot`); the two
-deleted `forgedb-migrations` executor workflow tests were replaced in place by
-`test_migration_generate_and_load_roundtrip` + `test_migration_tracker_mark_and_rollback` (net 0 there).
-490→493 with #74 Phase 2 (schema-migrations hop
-classification + lineage): +3 `forgedb-migrations` unit tests (`test_diff_classifies_authored_body_residue`
-— `hop_body_class()` tags each change `Auto`/`Authored`, distinct from `is_breaking()`;
-`test_migration_lineage_expands_range` — `MigrationLineage` orders records + `expand_range` walks a
-contiguous version span; `test_scaffold_authored_body_only_for_residue` — authored-body scaffold written
-only for `Authored` residue, never clobbered). The `test_rust_generation_version_guard` codegen guard was
-extended in place (asserts `EXPECTED_FORMAT_VERSION` is lineage-threaded, not hardcoded). 488→490 with #74
-Phase 1 (schema-migrations version guard): +2 codegen guards (`test_rust_generation_version_guard` —
-generated `open_at` reads one opaque `manifest.format_version`, compares it to a codegen-baked
-`EXPECTED_FORMAT_VERSION`, and fail-fast refuses a mismatch without reading column shape;
-`test_rust_generation_manifest_preserves_format_version` — `write_manifest` load-preserves `format_version`
-on reopen instead of clobbering it to `1`). (The 486→488 drift predated the branch base.) 455→486 with MVCC
-Tiers 1–3 (#75/#84 —
-transactions → optimistic concurrency → multi-process coordinator): two NEW substrate crates
-`forgedb-txn` (Tier 2 commit sequencer, 7 unit tests) + `forgedb-coordinator` (Tier 3 control plane,
-8 unit tests incl. the DirLock-parity guards), storage-native `sync_from_disk`/DirLock-const unit
-tests (+5), a wal `truncate_to` test (+1 — `test_wal_size_and_truncate_to`), +3 codegen guards
-(`test_rust_generation_transaction` / `test_rust_generation_optimistic_commit` /
-`test_rust_generation_coordinated_client`), plus a coordinator doctest and the intervening tree drift
-(the 455 line predated the branch base). 450→455 with delete semantics (`@on_delete` + M2M unlink):
-+5 codegen guards (`test_rust_generation_delete_*` — restrict/cascade/set_null enforcement in the generated
-`Database::delete_<model>` wrappers + junction `unlink`/`unlink_all` + set-null-on-required-FK codegen error).
-442→450 with the user-declared `enum` type: +7 `forgedb-parser` unit tests (`enum` decl parses / rejects
-non-PascalCase name or variant / duplicate variant / empty / bare-name field ref resolves / unknown bare name errors)
-+1 codegen guard (`test_rust_generation_enum_type` — 1-byte discriminant column, variant-name string serde, filter/
-sort/index by name). 440→442 with the `decimal` scalar type: +1 `forgedb-parser` unit test + 1 codegen guard
-(`test_rust_generation_decimal_type` — 16-byte column, string serde, scale-invariant normalized index key).
-438→440 with the `json` scalar type: +1 `forgedb-parser` unit test + 1 codegen guard (`test_rust_generation_json_type`
-— rides the variable-length column, `serde_json::Value`, not indexable/filterable/sortable). 437→438 with #104
-`@pattern`/`@regex` enforcement (+1 codegen guard `test_rust_generation_pattern_validation` — per-field `LazyLock<Regex>`,
-non-match → 422). #105 offline-compact deprecation is test-count-neutral (the prior `--force` guard test was rewritten
-in place as `test_offline_compact_is_deprecated_and_mutates_nothing`). 432→437 with column projection (#113): +3 `forgedb-parser`
-unit tests (`@projection` parses / rejects unknown field / rejects duplicate name) + 2 codegen guards
-(`test_rust_generation_column_projection` — tight struct = PK+selected, narrow decoder touches only selected columns,
-no full `db.get()`, snapshot `_at` present; `test_rust_generation_projection_rejects_relation_field`).
-431→432 with the narrow index rehydrate (#110 follow-up):
-+1 codegen guard (`test_rust_generation_reopen_index_rebuild_is_narrow` — reopen rebuilds indexes reading only the
-indexed columns, not the full record via `db.get()`). 425→431 with #110 follow-up #2 (engine-in-Worker
-partial hydrate): +5 `forgedb-storage-web` unit tests (lazy fault-in: len-without-read, alignment-preserving
-append, incremental tail diff, no-op-truncate-skips-fault-in, plus an eager-path regression) and +1 codegen
-guard (`test_wasm_generation_async_client_and_worker` — the async `ReplicaClient` strict-mirrors the `Replica`
-read surface + the Worker bootstrap stays schema-agnostic). 424→425 with #110 Milestone C follow-up #3
-(the wasm-bindgen browser-replica transport is now GENERATED per-schema, not hand-written): +1 codegen
-guard (`test_wasm_generation_transport`). 414→424 with #110 Milestone C (browser
-read-replica follower): +9 `forgedb-storage-web` arena-parity unit tests and +1 codegen guard
-(`test_rust_generation_replica_apply_path`). (The moved `forgedb-storage-native` tests — 45 unit + 4 doctests —
-were already counted under the old `storage` crate, so the facade split is test-count-neutral.) 400→414 with #82 realtime Direction C (durable
-replication broker): +9 `forgedb-changefeed` `durable` unit tests (offsets / opaque round-trip / reopen /
-torn-tail / prune / catch-up / wire codec) and +2 codegen guards (`test_rust_generation_replication_broker`
-+ `test_api_generation_replication_endpoint`). 399→400 with v1 Phase 5 WS1 observability (1 codegen
-guard `test_api_generation_observability_endpoints`; the TS SDK rewrite (WS5) extended `test_typescript_generation_snapshot`
-in place). 398→399 with #105 offline-compact deprecation guard (1 test
-`test_offline_compact_is_deprecated_and_mutates_nothing` — offline `compact`/`vacuum` return the #105 deprecation
-error and mutate nothing; test-count-neutral, the prior `--force` guard test was rewritten in place).
-395→398 with v1 Phase 4 (#92): +2 codegen guards
-(`test_rust_generation_auto_compaction` W1 + `test_rust_generation_additive_backfill` W2) and +1 integration test
-(`test_migrate_auto_diff_additive_and_breaking_gate` W3). 394→395 with v1 Phase 3 (#91) data integrity (1 codegen
-guard `test_rust_generation_data_integrity`). 393→394 with the #100–#103 index follow-ups (1 codegen
-guard `test_rust_generation_index_followups`). 391→393 with #90 Phase 2 (2 codegen guards:
-`test_rust_generation_secondary_indexes` + `test_api_generation_list_endpoint`). 461→391 with the legacy-audit prunes
-(#94): −70 from deleting the two dead crates `query-optimization` (32 unit + doctests, incl. the
-former #48 join-predicate pushdown) and `http-server` (30 unit + doctests) plus the dead
-`storage::Database` wrapper's 1 test — all zero-consumer dead code, no production regression. Prior
-history (pre-prune, at 461): 434→447 with #48 join predicate pushdown + #49 restored OpenAPI
-generation (4 codegen tests; #49 OpenAPI stays, in codegen); 447→460 with #89
-durable write path + #95 wal prune (net +13: new `forgedb-wal` `Raw`-path + `forgedb-storage`
-`truncate_to_rows`/`DirLock` tests + 1 `test_rust_generation_durable_write_path` codegen guard, minus
-the deleted structured/transaction wal tests); 460→461 with #96 WAL checkpoint (1
-`test_rust_generation_wal_checkpoint` codegen guard). Earlier: 419→432 with #59 multi-tenancy (11
-`forgedb-auth` verify tests + 2 codegen guards); 432→434 with #69 generated REST update/delete
-(1 codegen guard) + #71 inspector db-name (1 src-tauri test). Dropped from 531
-when the orphaned `fulltext` + `crud-api` crates were removed in Phase 3b. Ignore older claims of
-"531"/"521"/"466"/"447"/"434"/"432"/"419"/"417"/"411"/"409"/"403"/"399"/"398"/"395"/"394"/"393"/"380".
+**The exact pass count is intentionally NOT pinned here** — it changes every time a guard is
+added and has been a chronic drift source (this doc has claimed 531 / 521 / 498 / 434 / … over
+time; all were stale within a session or two). To get the *current* baseline, RUN it — the
+runner is ground truth, prose is not:
+
+```bash
+# total passed/failed across the whole workspace (unit + integration + doctests)
+cargo test --workspace --no-fail-fast 2>&1 \
+  | awk '/^test result:/ {p+=$4; f+=$6} END {print p" passed, "f" failed"}'
+```
+
+(or read the per-binary `test result: ok. N passed; M failed; …` lines directly). What each
+landed feature is guarded by is recorded in that feature's bullet under **Known issues** below
+(guard test names like `test_rust_generation_*` / `test_api_generation_*`) — that named list is
+the durable record of *what* is tested; a running total is not. If a number ever looks off,
+trust the runner output, never a count written in prose.
 
 ## Workspace layout
 
@@ -171,74 +109,81 @@ Root crate `forgedb` (`src/`) is the CLI: `src/main.rs` (clap), `src/commands/*`
 (one module per subcommand), `src/{templates,ui,error}.rs`. It orchestrates the crates
 in `crates/`:
 
-**Published to crates.io (independent version lines, do NOT normalize):**
-- `types` — core type system (uuid, timestamp, primitives) — **0.2.1 (published 2026-07-14)** — 0.2.1 adds the
-  `cfg(wasm32)` uuid `js`/getrandom feature for the browser build (additive; native unchanged).
-- `storage` — columnar storage **facade** (#110 Milestone C): `crates/storage` is now a thin `cfg` re-export —
-  `forgedb-storage-native` on host targets, `forgedb-storage-web` on `wasm32` — **0.2.0 (published 2026-07-14)**.
-  Generated code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};`
-  verbatim and stays byte-identical across targets. The historical engine moved verbatim into **`storage-native`
-  0.1.0 (published 2026-07-14)** (native public surface unchanged — the 0.2.0 facade is surface-compatible for host
-  consumers); the browser arena backend is **`storage-web` 0.1.0 (published 2026-07-14)** (in-memory arenas +
-  IndexedDB/OPFS `persist`). The wasm publish gap is now CLOSED (see the #110 bullet). Details of the pre-split
-  engine (still the native backend):
-  0.1.5 (published 2026-07-10; 0.1.4 published 2026-07-08) — 0.1.5 adds `truncate_to_rows` on the three column types +
-  `DirLock` single-writer advisory lock, both for #89 durable writes; 0.1.4 adds read-only column reader handles
-  `FixedColumnReader`/`VariableColumnReader`/`TombstonesReader` + `*::reader()` for #56-B single-writer/
-  many-reader; 0.1.3 added `Manifest` layout fields + `Manifest::save_to/load_from` + `Snapshot` for #57
-  backup / #56-A snapshot reads). **In-tree since 0.1.5 published:** the legacy audit (#94/#99) removed the
-  dead `Database` directory-manager wrapper (`open_with_wal`/`wal_mut`/`has_wal`/`save_manifest`/… — zero
-  production consumers; generated code drives `FixedColumn`/`VariableColumn`/`Tombstones`/`Manifest`/`DirLock`
-  directly). Published 0.1.5 still contains it harmlessly; removing it is breaking, so the **next** storage
-  publish bumps accordingly (do not republish 0.1.5).
+**Published to crates.io — schema-agnostic substrate (independent version lines, do NOT normalize):**
+
+> **Do not trust any version number, publish date, or publish-gap status written inline below —
+> they drift. Derive the ground truth instead:**
+> - *In-tree version* (source of truth for the working copy): `grep -H '^version' crates/*/Cargo.toml`
+>   (or `cargo metadata --format-version 1`).
+> - *What is actually published*: `cargo search forgedb-<crate>`, or the crates.io page.
+> - *What generated code requires*: the scaffold pins emitted into the generated project's
+>   `Cargo.toml` — grep the scaffolders for `forgedb-` dep lines (`src/commands/init.rs` for the
+>   server scaffold; `crates/codegen/src/{wasm,napi,pyo3,transform,ffi}.rs` for the per-runtime ones).
+>
+> The invariant is the **publish-gap rule** (see the publish-gap bullet under "Known issues"): when
+> generated code starts requiring a new substrate dep or additive substrate API, publish it *before*
+> the scaffold pins it, then prove the reclose with an outside-repo `init → generate → cargo build`.
+> The notes below describe each crate's **role and identity class**, which do not drift.
+
+- `types` — core type system (uuid, timestamp, primitives). Carries a `cfg(wasm32)` uuid
+  `js`/getrandom feature for the browser build (additive; native unchanged).
+- `storage` — columnar storage **facade** (#110 Milestone C): `crates/storage` is a thin `cfg`
+  re-export — `forgedb-storage-native` on host targets, `forgedb-storage-web` on `wasm32`. Generated
+  code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};` verbatim and stays
+  byte-identical across targets. The historical monolithic engine is the native backend
+  (`storage-native`, public surface unchanged — the facade is surface-compatible for host consumers);
+  the browser arena backend is `storage-web` (in-memory arenas + IndexedDB/OPFS `persist`). Native
+  capabilities the generated code drives directly (over `FixedColumn`/`VariableColumn`/`Tombstones`/
+  `Manifest`/`DirLock`): `truncate_to_rows` + `DirLock` single-writer lock (#89), read-only column
+  reader handles `*Reader` + `*::reader()` (#56-B), `Manifest` layout + `save_to/load_from` + `Snapshot`
+  (#57 / #56-A), `sync_from_disk` peer read-currency (#75/#84). The legacy `Database` directory-manager
+  wrapper was removed as zero-consumer dead code (#94/#99).
 - `changefeed` — field-blind change-feed broadcast + **durable replication broker** substrate
-  (#62-A / #82) — **0.2.0 (published 2026-07-13)**. 0.2.0 adds the
-  `durable` module for #82 realtime Direction C: a `DurableBroker` that records each change to a
-  CRC-framed, append-only log at a **monotonic global offset** (the opaque cross-model ordering
-  token) + a resumable subscription (`read_from`/`subscribe`/`catch_up_from`, idempotent by absolute
-  offset) — the substrate the WASM read-replica follower (#110) resumes from. Field-blind:
-  `PersistedEvent { offset, model, row_index, kind, bytes }` carries the model name as an opaque tag
-  and the committed row bytes verbatim (same class as the in-process feed). The generated `/replicate`
-  WS endpoint streams its `to_wire()` binary frames. (0.1.1 added `ChangeKind::Updated`/`Deleted` for
-  #66 — published 2026-07-08; 0.1.0 published 2026-07-07.)
-- `auth` — verify-only JWT + tenant cross-check substrate (#59) — **0.1.0 (published 2026-07-09)**.
-  Schema-agnostic axum extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM,
-  algorithm-pinned, `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it
-  against the process's tenant → 403, injects an opaque `Principal`. Knows nothing of
-  models/rows/schema — same class as `changefeed`.
-- `wal` — write-ahead log — **0.2.1 (published 2026-07-14; 0.2.0 published 2026-07-10)**. 0.2.1 splits `WalManager`
-  per-target for the browser build — the file impl is `cfg(not wasm32)`, an in-memory impl is `cfg(wasm32)` (durable
-  at commit granularity), `FsyncPolicy` hoisted to the crate root (shared) — and drops the unused uuid dep (native
-  surface unchanged). The generated durable write path (#89) links only the **opaque `Raw`** record path
-  (schema-agnostic bytes + CRC framing + fsync policy + torn-tail `read_all` + `replay`); the pre-existing
-  structured/field-decoding API (`WalValue`, `WalOperation::{Insert,Update,Delete}`, `Transaction`/`replay_committed`)
-  was **pruned as a drift vector** (#95, legacy-audit epic #94) — 0.2.0 was that breaking removal.
-- `query-params` — REST query-string parser (#90) — **0.1.0 (published 2026-07-10)**. Schema-agnostic:
-  parses a URL query string into generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated
-  `api.rs` list endpoint links it for filter/sort/paginate. Interprets no schema — all field-aware filtering/sorting
-  is generated per-model — so it is class-1 substrate, same class as `changefeed`/`auth`.
-- `compaction` — in-process dead-row reclaim (#92 Phase 4 W1) — **0.1.0 (published 2026-07-11)**.
-  Schema-agnostic byte GC keyed by model *directory name*: `Compactor::compact_model_keeping(model, live_rows)` keeps
-  exactly the caller-supplied opaque row indices (the generated code computes the live set); `compact_model` is the
-  legacy tombstone path (resurrection-prone against #66) — now **DEPRECATED** (doc-noted, not `#[deprecated]` to keep
-  the published 0.1.0 API stable): the offline `forgedb compact`/`vacuum` CLI no longer calls it and just returns a
-  deprecation error pointing to in-process `Database::compact()` (#105 RESOLVED). Deps are serde/chrono/thiserror/log only —
-  reads no `.forge`. Generated `Database`/`Storage::compact()` link **only** `compact_model_keeping` (never
-  `BackgroundCompactor`). Scaffold pins `forgedb-compaction = "0.1"`; **reclose PROVEN** by an outside-repo
-  `init → generate rust+api → cargo build` resolving `forgedb-compaction 0.1.0` (+ the rest) from crates.io. Was
-  internal; promoted to published substrate by #92 W1.
-- `txn` — Tier 2 optimistic-concurrency commit sequencer (#75 MVCC) — **0.1.0 (publish-pending)**. Schema-agnostic:
-  a `CommitSequencer` that assigns a monotonic commit LSN and detects write-write conflicts over an in-memory
-  `id → last-committer` map (rebuilt empty on open — conflict state is over in-flight txns only, never persisted).
-  Knows no model/field; generated `Database::transaction` + concurrent-prepare code links `try_commit`/retry.
-  Generated code requires it (scaffold pins `forgedb-txn = "0.1"`) → **publish gap OPEN**.
-- `coordinator` — Tier 3 multi-process write **control plane** (#75/#84 MVCC) — **0.1.0 (publish-pending)**. A
-  standalone coordinator process (`forgedb coordinate <root>`) that holds the #89 `DirLock` on `<root>/.forgedb.lock`
-  on behalf of all coordinated clients, serializes the commit turn, and sequences the LSN — the symmetric inverse of
-  #82's durable broker. **NO `forgedb-storage*` dep (T3-8)** — it never writes columns or decodes opaque row bytes;
-  the schema-aware column write stays in generated data-plane code run under a granted turn (coordinated clients open
-  LOCK-FREE, `_lock: None`, mutually exclusive with a standalone self-locking writer — T3-5). Generated code links it
-  (scaffold pins `forgedb-coordinator = "0.1"`) → **publish gap OPEN**.
+  (#62-A / #82). The `durable` module (#82) is a `DurableBroker` that records each change to a
+  CRC-framed, append-only log at a **monotonic global offset** (the opaque cross-model ordering token)
+  + a resumable subscription (`read_from`/`subscribe`/`catch_up_from`, idempotent by absolute offset) —
+  the substrate the WASM read-replica follower (#110) resumes from. Field-blind:
+  `PersistedEvent { offset, model, row_index, kind, bytes }` carries the model name as an opaque tag and
+  the committed row bytes verbatim (same class as the in-process feed). The generated `/replicate` WS
+  endpoint streams its `to_wire()` binary frames. In-process feed carries
+  `ChangeKind::{Inserted,Linked,Updated,Deleted}` (#66).
+- `auth` — verify-only JWT + tenant cross-check substrate (#59). Schema-agnostic axum
+  extractor/middleware: verifies an asymmetric JWT (JWKS or static PEM, algorithm-pinned,
+  `exp`/`nbf`/`iss`/`aud`+skew), extracts a configured tenant claim, cross-checks it against the
+  process's tenant → 403, injects an opaque `Principal`. Knows nothing of models/rows/schema — same
+  class as `changefeed`.
+- `wal` — write-ahead log. The generated durable write path (#89) links only the **opaque `Raw`**
+  record path (schema-agnostic bytes + CRC framing + fsync policy + torn-tail `read_all` + `replay`);
+  the pre-existing structured/field-decoding API (`WalValue`, `WalOperation`, `Transaction`/
+  `replay_committed`) was **pruned as a drift vector** (#95, epic #94). `WalManager` is split per-target
+  for the browser build — file impl `cfg(not wasm32)`, in-memory impl `cfg(wasm32)` (durable at commit
+  granularity), `FsyncPolicy` at the crate root (shared). Additive `truncate_to` for MVCC Tier-1 txn
+  rollback (#75/#84).
+- `query-params` — REST query-string parser (#90). Schema-agnostic: parses a URL query string into
+  generic `Filter`/`Sort`/`Pagination` (limit clamped to `MAX_LIMIT`); the generated `api.rs` list
+  endpoint links it. Interprets no schema — all field-aware filtering/sorting is generated per-model —
+  class-1 substrate, same class as `changefeed`/`auth`.
+- `compaction` — in-process dead-row reclaim (#92 Phase 4 W1). Schema-agnostic byte GC keyed by model
+  *directory name*: `Compactor::compact_model_keeping(model, live_rows)` keeps exactly the
+  caller-supplied opaque row indices (generated code computes the live set). Generated
+  `Database`/`Storage::compact()` link **only** `compact_model_keeping` (never `BackgroundCompactor`).
+  The legacy tombstone path `compact_model` (resurrection-prone against #66) is **DEPRECATED** (doc-noted
+  to keep the published API stable): the offline `forgedb compact`/`vacuum` CLI returns a deprecation
+  error pointing to in-process `Database::compact()` (#105 RESOLVED). Deps serde/chrono/thiserror/log
+  only — reads no `.forge`.
+- `txn` — Tier 2 optimistic-concurrency commit sequencer (#75 MVCC). Schema-agnostic: a
+  `CommitSequencer` that assigns a monotonic commit LSN and detects write-write conflicts over an
+  in-memory `id → last-committer` map (rebuilt empty on open — conflict state is over in-flight txns
+  only, never persisted). Knows no model/field; generated `Database::transaction` + concurrent-prepare
+  code links `try_commit`/retry. Pure in-memory (no fs/net) → also linked by the wasm replica scaffold.
+- `coordinator` — Tier 3 multi-process write **control plane** (#75/#84 MVCC). A standalone coordinator
+  process (`forgedb coordinate <root>`) that holds the #89 `DirLock` on `<root>/.forgedb.lock` on behalf
+  of all coordinated clients, serializes the commit turn, and sequences the LSN — the symmetric inverse
+  of #82's durable broker. **NO `forgedb-storage*` dep (T3-8)** — it never writes columns or decodes
+  opaque row bytes; the schema-aware column write stays in generated data-plane code run under a granted
+  turn (coordinated clients open LOCK-FREE, `_lock: None`, mutually exclusive with a standalone
+  self-locking writer — T3-5). Native-only (Unix sockets + `fs2`); the wasm replica cfg-gates the entire
+  coordinator surface out.
 
 **Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
 are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI
