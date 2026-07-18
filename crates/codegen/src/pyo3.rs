@@ -9,6 +9,33 @@
 //! methods mirror the generated `Database` CRUD **1:1**, calling the integrity
 //! wrappers (`create_<m>`/`update_<m>`/`delete_<m>`) and storage reads by name.
 //!
+//! **Typed field getters (Phase 5b follow-up).** Each `#[pyclass]` already has a
+//! `#[getter]` per stored field.  This release makes those getters return native
+//! Python-typed values rather than `Bound<'py, PyAny>` wherever a clean Rust↔Python
+//! type mapping exists:
+//!
+//! | `.forge` type            | Getter return type  | Notes                               |
+//! |--------------------------|---------------------|-------------------------------------|
+//! | `u32`                    | `u32`               | Python `int`                        |
+//! | `u64`                    | `u64`               | Python `int`                        |
+//! | `i32`                    | `i32`               | Python `int`                        |
+//! | `i64`                    | `i64`               | Python `int`                        |
+//! | `f64`                    | `f64`               | Python `float`                      |
+//! | `bool`                   | `bool`              | Python `bool`                       |
+//! | `string`                 | `String`            | Python `str`                        |
+//! | `uuid`                   | `String`            | Hyphenated UUID string              |
+//! | `timestamp`              | `i64`               | Seconds since epoch (`i64::from`)   |
+//! | `decimal`                | `String`            | Decimal string (serde-with-str)     |
+//! | `enum(X)`                | `String`            | Variant-name string (serde default) |
+//! | `*Target` (req. FK)      | `String`            | UUID string                         |
+//! | `?Target` (opt. FK)      | `Option<String>`    | UUID string or None                 |
+//! | Nullable(T)              | `Option<inner>`     | None when absent                    |
+//! | `json`, `char(N)`, struct | `Bound<'py, PyAny>` | pythonize (no single-type mapping) |
+//!
+//! The `to_dict` / `__repr__` / `__init__` paths are unchanged (still use
+//! `pythonize`/`depythonize`), so existing callers that relied on the dict API
+//! remain unaffected.
+//!
 //! Identity: every schema-specific surface is generated per-model (constraint 2);
 //! there is **no** generic `query`/`filter`/`predicate` entry point and no
 //! `match model` dispatch (constraint 1). The row types and methods are named
@@ -174,9 +201,182 @@ impl PyO3Generator {
             .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
     }
 
+    /// The PyO3 getter return type and body for a given `.forge` field type.
+    ///
+    /// Returns `(return_type_tokens, body_tokens)` where `body_tokens` is the
+    /// expression returned from `fn #fname(&self, py: Python<'py>) -> PyResult<...>`.
+    /// For types with a clean Rust↔Python mapping (primitives, string, uuid,
+    /// timestamp, decimal, enum, FK scalars, nullable variants) we return a concrete
+    /// type so PyO3 emits typed Python stubs.  For types without a natural single
+    /// Python type (`json`, `char(N)`, inline `struct`) we fall back to pythonize
+    /// and return `Bound<'py, PyAny>`.
+    fn pyo3_getter(
+        field_type: &forgedb_parser::FieldType,
+        field_name: &proc_macro2::Ident,
+    ) -> (TokenStream, TokenStream) {
+        use forgedb_parser::{FieldType, RelationType};
+        match field_type {
+            // Primitives — returned as native Rust types; PyO3 converts to Python int/float/bool.
+            FieldType::U32 => (
+                quote! { u32 },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::U64 => (
+                quote! { u64 },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::I32 => (
+                quote! { i32 },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::I64 => (
+                quote! { i64 },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::F64 => (
+                quote! { f64 },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::Bool => (
+                quote! { bool },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+
+            // String — clone; Python `str`.
+            FieldType::String => (
+                quote! { String },
+                quote! { Ok(self.inner.#field_name.clone()) },
+            ),
+
+            // uuid → hyphenated string (matches serde and the REST wire shape).
+            FieldType::Uuid => (
+                quote! { String },
+                quote! { Ok(self.inner.#field_name.to_string()) },
+            ),
+
+            // timestamp (forgedb_types::Timestamp, newtype over i64) → i64.
+            FieldType::Timestamp => (
+                quote! { i64 },
+                quote! { Ok(i64::from(self.inner.#field_name)) },
+            ),
+
+            // decimal → string (serde-with-str produces a decimal string).
+            FieldType::Decimal => (
+                quote! { String },
+                quote! { Ok(self.inner.#field_name.to_string()) },
+            ),
+
+            // enum → variant-name string (serde default serialization).
+            FieldType::Enum(_) => (
+                quote! { String },
+                quote! {
+                    serde_json::to_value(&self.inner.#field_name)
+                        .map_err(to_py_err)
+                        .map(|__v| __v.as_str().unwrap_or_default().to_string())
+                },
+            ),
+
+            // Required FK (Uuid) → hyphenated string.
+            FieldType::Relation(RelationType::RequiredReference(_)) => (
+                quote! { String },
+                quote! { Ok(self.inner.#field_name.to_string()) },
+            ),
+
+            // Optional FK (Option<Uuid>) → Option<String>.
+            FieldType::Relation(RelationType::OptionalReference(_)) => (
+                quote! { Option<String> },
+                quote! { Ok(self.inner.#field_name.map(|__u| __u.to_string())) },
+            ),
+
+            // Nullable(inner) — recurse; the outer getter wraps in Option.
+            FieldType::Nullable(inner) => {
+                let (inner_ret, inner_body) = Self::pyo3_nullable_getter(inner, field_name);
+                (inner_ret, inner_body)
+            }
+
+            // Complex types: json, char(N), inline struct — fall back to pythonize.
+            // These have no single clean Python type; the Bound<'py, PyAny> from
+            // pythonize is the correct ergonomic choice.
+            _ => (
+                quote! { Bound<'py, PyAny> },
+                quote! { pythonize::pythonize(py, &self.inner.#field_name).map_err(to_py_err) },
+            ),
+        }
+    }
+
+    /// Typed getter for a nullable field; `self.inner.#field_name` is `Option<T>`.
+    fn pyo3_nullable_getter(
+        inner: &forgedb_parser::FieldType,
+        field_name: &proc_macro2::Ident,
+    ) -> (TokenStream, TokenStream) {
+        use forgedb_parser::FieldType;
+        match inner {
+            FieldType::U32 => (
+                quote! { Option<u32> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::U64 => (
+                quote! { Option<u64> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::I32 => (
+                quote! { Option<i32> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::I64 => (
+                quote! { Option<i64> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::F64 => (
+                quote! { Option<f64> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::Bool => (
+                quote! { Option<bool> },
+                quote! { Ok(self.inner.#field_name) },
+            ),
+            FieldType::String => (
+                quote! { Option<String> },
+                quote! { Ok(self.inner.#field_name.clone()) },
+            ),
+            FieldType::Uuid => (
+                quote! { Option<String> },
+                quote! { Ok(self.inner.#field_name.map(|__u| __u.to_string())) },
+            ),
+            FieldType::Timestamp => (
+                quote! { Option<i64> },
+                quote! { Ok(self.inner.#field_name.map(i64::from)) },
+            ),
+            FieldType::Decimal => (
+                quote! { Option<String> },
+                quote! { Ok(self.inner.#field_name.map(|__d| __d.to_string())) },
+            ),
+            FieldType::Enum(_) => (
+                quote! { Option<String> },
+                quote! {
+                    self.inner.#field_name.as_ref()
+                        .map(|__e| serde_json::to_value(__e)
+                            .map(|__v| __v.as_str().unwrap_or_default().to_string())
+                            .map_err(to_py_err))
+                        .transpose()
+                },
+            ),
+            // Fallback for nullable complex types.
+            _ => (
+                quote! { Bound<'py, PyAny> },
+                quote! { pythonize::pythonize(py, &self.inner.#field_name).map_err(to_py_err) },
+            ),
+        }
+    }
+
     /// One `#[pyclass]` per identity model: a newtype over the generated struct
     /// with a dict/mapping `__init__`, `to_dict`, `__repr__`, and per-field
-    /// getters — all marshalled through the struct's serde impl via `pythonize`.
+    /// typed getters. Virtual relation collections (`OneToMany`/`ManyToMany`)
+    /// carry no data and are excluded.
+    ///
+    /// Getter return types are concrete Python-typed values wherever a clean
+    /// mapping exists (see `pyo3_getter`); complex types fall back to pythonize
+    /// and return `Bound<'py, PyAny>`.
     fn generate_row_classes(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
@@ -184,9 +384,7 @@ impl PyO3Generator {
                 let py_ident = format_ident!("Py{}", model.name);
                 let name_str = model.name.as_str();
 
-                // Per-field getters, marshalled natively via pythonize. Virtual
-                // relation collections (`OneToMany`/`ManyToMany` → `()`) carry no
-                // data and are skipped.
+                // Per-field typed getters. Virtual relation collections are skipped.
                 let getters: Vec<TokenStream> = model
                     .fields
                     .iter()
@@ -194,11 +392,39 @@ impl PyO3Generator {
                     .map(|f| {
                         let fname = format_ident!("{}", f.name);
                         let doc = format!("The `{}` field.", f.name);
-                        quote! {
-                            #[doc = #doc]
-                            #[getter]
-                            fn #fname<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-                                pythonize::pythonize(py, &self.inner.#fname).map_err(to_py_err)
+                        let (ret_ty, body) = Self::pyo3_getter(&f.field_type, &fname);
+                        // Whether the return type references the `'py` lifetime
+                        // (only for the pythonize fallback path).
+                        let needs_py_lifetime = matches!(
+                            f.field_type,
+                            forgedb_parser::FieldType::Json
+                            | forgedb_parser::FieldType::Char(_)
+                            | forgedb_parser::FieldType::StructType(_)
+                            | forgedb_parser::FieldType::OptionalStructType(_)
+                            | forgedb_parser::FieldType::FixedArray(_, _)
+                        ) || (matches!(&f.field_type, forgedb_parser::FieldType::Nullable(inner)
+                            if matches!(inner.as_ref(),
+                                forgedb_parser::FieldType::Json
+                                | forgedb_parser::FieldType::Char(_)
+                                | forgedb_parser::FieldType::StructType(_)
+                                | forgedb_parser::FieldType::OptionalStructType(_)
+                            )
+                        ));
+                        if needs_py_lifetime {
+                            quote! {
+                                #[doc = #doc]
+                                #[getter]
+                                fn #fname<'py>(&self, py: Python<'py>) -> PyResult<#ret_ty> {
+                                    #body
+                                }
+                            }
+                        } else {
+                            quote! {
+                                #[doc = #doc]
+                                #[getter]
+                                fn #fname(&self) -> PyResult<#ret_ty> {
+                                    #body
+                                }
                             }
                         }
                     })

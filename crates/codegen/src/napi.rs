@@ -14,16 +14,22 @@
 //! (`create_<m>`/`update_<m>`/`delete_<m>`) and storage reads (`get`/`row_count`/
 //! `all`) by name.
 //!
-//! **Marshalling (design deviation, documented — mirrors the PyO3 wrapper).** The
-//! design pinned `#[napi(object)]` typed row structs ("native marshalling, no
-//! serialization"); v1 instead marshals rows/ids through the generated struct's
-//! **own serde impl via `Env::to_js_value`/`from_js_value`** (the napi `serde-json`
-//! feature — serde↔JS value, *not* a JSON string). The caller gets native JS
-//! objects, and there is exactly ONE marshalling contract (the same serde the
-//! WAL / broker / FFI / PyO3 paths use), so no second per-field matrix can drift.
-//! Typed `#[napi(object)]` rows (per-field native marshalling + a fully-typed
-//! `.d.ts` for row shapes) are a strict ergonomic follow-up, exactly like the
-//! typed-field `#[pyclass]` follow-up on the Python side.
+//! **Typed row structs (Phase 5b/6b follow-up).** Each identity model gets a
+//! `#[napi(object)]` struct (`Napi<Model>`) with typed `pub` fields so napi-rs
+//! auto-emits a fully-typed TypeScript interface in the `.d.ts`. Row-returning
+//! methods (`get_<m>`, `all_<m>`, relation getters) return the typed struct (or
+//! `Vec<struct>` / `Option<struct>`) instead of `JsUnknown`. Input methods
+//! (`create_<m>`, `update_<m>`) continue to accept `JsUnknown` via the serde
+//! bridge (`from_js_value`) — the existing single marshalling contract for input.
+//!
+//! Field-type mapping for `#[napi(object)]` matches the serde JSON wire shape so
+//! values are identical whether reached through the typed or serde path:
+//! `uuid`/`timestamp`→`i64`/`decimal`/`enum` serialize as strings in serde and are
+//! typed `String` in the napi struct; `bool`/`f64`/`i32`/`i64`/`u32` are native;
+//! `u64` is mapped to `i64` (serde emits a JSON number, napi `u64` would emit
+//! `BigInt` — incompatible shapes); `json` uses `serde_json::Value`; `char(N)` uses
+//! `Vec<u8>`. Virtual relation fields (`OneToMany`/`ManyToMany`) carry no stored
+//! value and are excluded from the napi object.
 //!
 //! Identity: every schema-specific surface is generated per-model (constraint 2);
 //! there is **no** generic `query`/`filter`/`predicate` entry point and no
@@ -43,6 +49,7 @@ pub struct NapiGenerator;
 impl NapiGenerator {
     /// Generate the NAPI-RS wrapper (`napi/src/lib.rs`) for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
+        let row_structs = Self::generate_row_structs(schema);
         let db_methods = Self::generate_db_methods(schema);
         let relation_methods = Self::generate_relation_methods(schema);
         let arrow_methods = Self::generate_arrow_methods(schema);
@@ -87,6 +94,8 @@ impl NapiGenerator {
                     .unwrap_or_else(|| "engine panic".to_string());
                 Error::from_reason(msg)
             }
+
+            #(#row_structs)*
 
             /// A ForgeDB database handle — one single-writer process over a data
             /// directory. Methods mirror the generated `Database` surface 1:1.
@@ -166,15 +175,296 @@ impl NapiGenerator {
             .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
     }
 
+    /// Whether a field type is a virtual relation (no stored column).
+    fn is_virtual_relation(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::{FieldType, RelationType};
+        matches!(
+            field_type,
+            FieldType::Relation(RelationType::OneToMany(_))
+                | FieldType::Relation(RelationType::ManyToMany(_))
+        )
+    }
+
+    /// The napi-object field type for a `.forge` field type, matching the serde
+    /// JSON wire shape so values are identical through the typed and serde paths.
+    ///
+    /// * `uuid` → `String` (serde: hyphenated UUID string)
+    /// * `timestamp` → `i64`  (serde: i64 seconds since epoch)
+    /// * `decimal` → `String` (serde: decimal string via `serde-with-str`)
+    /// * `enum(X)` → `String` (serde: variant name string)
+    /// * `u64` → `i64`        (serde: JSON number — napi `u64` maps to `BigInt`,
+    ///                          incompatible with the serde JSON-number wire shape)
+    /// * `json` → `serde_json::Value` (napi serde-json feature handles the mapping)
+    /// * `char(N)` → `Vec<u8>` (serde: array of u8; napi maps Vec<u8> → Buffer)
+    /// * `struct` / complex → `serde_json::Value` (inline structs lack a
+    ///    `#[napi(object)]` peer; marshal via the serde bridge as before)
+    /// * Nullable/optional → `Option<inner_napi_type>`
+    ///
+    /// Returns `None` for virtual relation fields (no stored column → excluded).
+    fn napi_field_type(field_type: &forgedb_parser::FieldType) -> Option<TokenStream> {
+        use forgedb_parser::{FieldType, RelationType};
+        match field_type {
+            // Virtual relation fields carry no stored value.
+            FieldType::Relation(RelationType::OneToMany(_))
+            | FieldType::Relation(RelationType::ManyToMany(_)) => None,
+
+            // Primitive numerics — native napi types.
+            FieldType::U32 => Some(quote! { u32 }),
+            // u64: serde emits a JSON number; napi `u64` maps to BigInt (different
+            // wire shape). Map to i64 to stay wire-compatible.
+            FieldType::U64 => Some(quote! { i64 }),
+            FieldType::I32 => Some(quote! { i32 }),
+            FieldType::I64 => Some(quote! { i64 }),
+            FieldType::F64 => Some(quote! { f64 }),
+            FieldType::Bool => Some(quote! { bool }),
+
+            // String-typed fields.
+            FieldType::String => Some(quote! { String }),
+
+            // uuid serializes as a hyphenated string in serde.
+            FieldType::Uuid => Some(quote! { String }),
+
+            // timestamp (`forgedb_types::Timestamp` newtype over i64) serializes
+            // as i64 in serde.
+            FieldType::Timestamp => Some(quote! { i64 }),
+
+            // decimal serializes as a string (serde-with-str feature).
+            FieldType::Decimal => Some(quote! { String }),
+
+            // enum serializes as its variant-name string in serde.
+            FieldType::Enum(_) => Some(quote! { String }),
+
+            // json is serde_json::Value — napi's serde-json feature handles it.
+            FieldType::Json => Some(quote! { serde_json::Value }),
+
+            // char(N) is [u8; N] in the generated struct; serde serializes as an
+            // array of u8 integers; napi maps Vec<u8> to a JS Buffer.
+            FieldType::Char(_) => Some(quote! { Vec<u8> }),
+
+            // FixedArray — map element type recursively.
+            FieldType::FixedArray(inner, _) => {
+                let inner_ty = Self::napi_field_type(inner)?;
+                Some(quote! { Vec<#inner_ty> })
+            }
+
+            // Inline struct types — marshal via serde_json::Value (the struct
+            // itself is not a `#[napi(object)]`; using Value preserves the serde
+            // contract without requiring a parallel napi struct per embedded type).
+            FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
+                Some(quote! { serde_json::Value })
+            }
+
+            // FK scalars: both store a UUID → String (matching serde's uuid output).
+            FieldType::Relation(RelationType::RequiredReference(_)) => Some(quote! { String }),
+            FieldType::Relation(RelationType::OptionalReference(_)) => {
+                Some(quote! { Option<String> })
+            }
+
+            // Nullable wraps the inner mapped type.
+            FieldType::Nullable(inner) => {
+                let inner_ty = Self::napi_field_type(inner)?;
+                Some(quote! { Option<#inner_ty> })
+            }
+
+            // Fallback — should not be reached for stored fields.
+            _ => Some(quote! { serde_json::Value }),
+        }
+    }
+
+    /// Generate the conversion expression from a `database::<Model>` field
+    /// (`source.#field_name`) to the corresponding napi object field value.
+    fn napi_field_conv(
+        field_type: &forgedb_parser::FieldType,
+        field_name: &proc_macro2::Ident,
+    ) -> TokenStream {
+        use forgedb_parser::{FieldType, RelationType};
+        match field_type {
+            // Virtual relations have no column — excluded by the caller.
+            FieldType::Relation(RelationType::OneToMany(_))
+            | FieldType::Relation(RelationType::ManyToMany(_)) => quote! { () },
+
+            // Native primitives — copy directly.
+            FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
+                quote! { __src.#field_name }
+            }
+
+            // u64 is mapped to i64 — cast (wrapping, but safe for realistic row
+            // counts; the serde path also truncates via JSON number).
+            FieldType::U64 => quote! { __src.#field_name as i64 },
+
+            // String — clone (String → String).
+            FieldType::String => quote! { __src.#field_name.clone() },
+
+            // uuid → hyphenated string (matches serde's `Serialize for Uuid`).
+            FieldType::Uuid => quote! { __src.#field_name.to_string() },
+
+            // timestamp → i64 (the `Timestamp` newtype wraps i64; `From<Timestamp> for i64`).
+            FieldType::Timestamp => quote! { i64::from(__src.#field_name) },
+
+            // decimal → string (matches serde-with-str).
+            FieldType::Decimal => quote! { __src.#field_name.to_string() },
+
+            // enum → variant-name string (matches serde's default string repr).
+            FieldType::Enum(_) => {
+                quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default().as_str().unwrap_or_default().to_string() }
+            }
+
+            // json → serde_json::Value (already that type in the generated struct).
+            FieldType::Json => quote! { __src.#field_name.clone() },
+
+            // char(N): [u8; N] → Vec<u8>.
+            FieldType::Char(_) => quote! { __src.#field_name.to_vec() },
+
+            // FixedArray: [T; N] → Vec<napi_type(T)>.
+            FieldType::FixedArray(inner, _) => {
+                let elem_conv = Self::napi_scalar_conv(inner, &quote! { __e });
+                quote! { __src.#field_name.iter().map(|__e| #elem_conv).collect() }
+            }
+
+            // Inline struct → serde_json::Value via serde.
+            FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
+                quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default() }
+            }
+
+            // Required FK (Uuid) → hyphenated string.
+            FieldType::Relation(RelationType::RequiredReference(_)) => {
+                quote! { __src.#field_name.to_string() }
+            }
+
+            // Optional FK (Option<Uuid>) → Option<String>.
+            FieldType::Relation(RelationType::OptionalReference(_)) => {
+                quote! { __src.#field_name.map(|__u| __u.to_string()) }
+            }
+
+            // Nullable(inner) → Option<inner_conv>.
+            FieldType::Nullable(inner) => {
+                let inner_conv = Self::napi_nullable_inner_conv(inner, field_name);
+                quote! { #inner_conv }
+            }
+
+            _ => quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default() },
+        }
+    }
+
+    /// Conversion for the inner type of a nullable field expression
+    /// (`__src.#field_name` is `Option<InnerType>`).
+    fn napi_nullable_inner_conv(
+        inner: &forgedb_parser::FieldType,
+        field_name: &proc_macro2::Ident,
+    ) -> TokenStream {
+        use forgedb_parser::FieldType;
+        match inner {
+            FieldType::String => quote! { __src.#field_name.clone() },
+            FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
+                quote! { __src.#field_name }
+            }
+            FieldType::U64 => quote! { __src.#field_name.map(|__v| __v as i64) },
+            FieldType::Uuid => quote! { __src.#field_name.map(|__u| __u.to_string()) },
+            FieldType::Timestamp => quote! { __src.#field_name.map(|__t| i64::from(__t)) },
+            FieldType::Decimal => quote! { __src.#field_name.map(|__d| __d.to_string()) },
+            FieldType::Enum(_) => {
+                quote! {
+                    __src.#field_name.as_ref().and_then(|__e|
+                        serde_json::to_value(__e).ok()
+                            .and_then(|__v| __v.as_str().map(|__s| __s.to_string()))
+                    )
+                }
+            }
+            FieldType::Json => quote! { __src.#field_name.clone() },
+            FieldType::Char(_) => quote! { __src.#field_name.map(|__b| __b.to_vec()) },
+            FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
+                quote! { __src.#field_name.as_ref().map(|__s| serde_json::to_value(__s).unwrap_or_default()) }
+            }
+            _ => quote! { __src.#field_name.as_ref().map(|__v| serde_json::to_value(__v).unwrap_or_default()) },
+        }
+    }
+
+    /// Conversion for an element in a FixedArray (value expression `elem_expr`).
+    fn napi_scalar_conv(inner: &forgedb_parser::FieldType, elem_expr: &TokenStream) -> TokenStream {
+        use forgedb_parser::FieldType;
+        match inner {
+            FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
+                quote! { *#elem_expr }
+            }
+            FieldType::U64 => quote! { *#elem_expr as i64 },
+            FieldType::Uuid => quote! { #elem_expr.to_string() },
+            _ => quote! { serde_json::to_value(#elem_expr).unwrap_or_default() },
+        }
+    }
+
+    /// Per-identity-model `#[napi(object)]` typed row structs (`Napi<Model>`).
+    ///
+    /// Each struct has one `pub` field per stored model field (virtual relation
+    /// fields are excluded — they carry no stored value). Field types match the
+    /// serde JSON wire shape (see `napi_field_type` for the mapping). A
+    /// `from_record` constructor converts `database::<Model>` → `Napi<Model>`.
+    fn generate_row_structs(schema: &Schema) -> Vec<TokenStream> {
+        Self::identity_models(schema)
+            .map(|model| {
+                let model_ident = format_ident!("{}", model.name);
+                let napi_ident = format_ident!("Napi{}", model.name);
+                let napi_name_str = model.name.as_str();
+                let doc = format!("Typed `{}` row returned by `ForgeDb` read methods.", model.name);
+
+                // Stored fields with their napi types.
+                let fields: Vec<_> = model
+                    .fields
+                    .iter()
+                    .filter(|f| !Self::is_virtual_relation(&f.field_type))
+                    .filter_map(|f| {
+                        let fname = format_ident!("{}", f.name);
+                        let ty = Self::napi_field_type(&f.field_type)?;
+                        Some(quote! { pub #fname: #ty })
+                    })
+                    .collect();
+
+                // Conversion expressions from a `database::<Model>` value (__src).
+                let conv_exprs: Vec<_> = model
+                    .fields
+                    .iter()
+                    .filter(|f| !Self::is_virtual_relation(&f.field_type))
+                    .filter_map(|f| {
+                        let fname = format_ident!("{}", f.name);
+                        let _ = Self::napi_field_type(&f.field_type)?; // skip excluded
+                        let conv = Self::napi_field_conv(&f.field_type, &fname);
+                        Some(quote! { #fname: #conv })
+                    })
+                    .collect();
+
+                quote! {
+                    #[doc = #doc]
+                    #[napi(object, js_name = #napi_name_str)]
+                    pub struct #napi_ident {
+                        #(#fields),*
+                    }
+
+                    impl #napi_ident {
+                        /// Convert a generated `database::<Model>` record into the
+                        /// typed napi row struct, matching the serde JSON wire shape.
+                        fn from_record(__src: &database::#model_ident) -> Self {
+                            Self {
+                                #(#conv_exprs),*
+                            }
+                        }
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// The per-model CRUD methods on `ForgeDb`, mirroring the generated `Database`
-    /// integrity wrappers + storage reads 1:1. Rows/ids marshal through the
-    /// generated struct's serde via `Env::to_js_value`/`from_js_value` (native JS
-    /// objects, one source of truth — no second per-field matrix).
+    /// integrity wrappers + storage reads 1:1.
+    ///
+    /// `get_<m>` and `all_<m>` return the typed `Napi<Model>` struct (or
+    /// `Option<Napi<Model>>` / `Vec<Napi<Model>>`). `create_<m>` and `update_<m>`
+    /// continue to accept `JsUnknown` via the serde bridge — one marshalling contract
+    /// for input, typed output.
     fn generate_db_methods(schema: &Schema) -> Vec<TokenStream> {
         Self::identity_models(schema)
             .map(|model| {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
+                let napi_ident = format_ident!("Napi{}", model.name);
                 let storage = format_ident!("{}", snake);
                 let id_ty = RustGenerator::id_type_tokens(model);
 
@@ -221,23 +511,23 @@ impl NapiGenerator {
 
                     #[doc = #get_doc]
                     #[napi]
-                    pub fn #get_m(&self, env: Env, id: JsUnknown) -> Result<JsUnknown> {
+                    pub fn #get_m(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_ident>> {
                         let id: #id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                         let opt = match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.get(id))) {
                             Ok(opt) => opt,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        env.to_js_value(&opt).map_err(to_napi_err)
+                        Ok(opt.as_ref().map(#napi_ident::from_record))
                     }
 
                     #[doc = #all_doc]
                     #[napi]
-                    pub fn #all_m(&self, env: Env) -> Result<JsUnknown> {
+                    pub fn #all_m(&self) -> Result<Vec<#napi_ident>> {
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#storage.all())) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        env.to_js_value(&rows).map_err(to_napi_err)
+                        Ok(rows.iter().map(#napi_ident::from_record).collect())
                     }
 
                     #[doc = #count_doc]
@@ -286,18 +576,13 @@ impl NapiGenerator {
     /// `RustGenerator::generate_traversal_impl` exactly (so a method is never
     /// emitted for a getter that was deduped away). Three families, all id-keyed
     /// (a fixed generated edge walk, never a runtime predicate):
-    ///   * **Forward FK** `<model>_<field>(id) -> Option<Target>` (flattened: null
-    ///     if the source is absent OR the FK is unset);
-    ///   * **Reverse 1:M** `<parent>_<field>[_by_<child_field>](id) -> [Child]`;
+    ///   * **Forward FK** `<model>_<field>(id) -> Option<Napi<Target>>`;
+    ///   * **Reverse 1:M** `<parent>_<field>[_by_<child_field>](id) -> Vec<Napi<Child>>`;
     ///   * **M2M** `link_<a>_<b>(l, r)` / `unlink_<a>_<b>(l, r) -> bool` + the query
-    ///     getters `<a>_<field1>(id) -> [B]` / `<b>_<field2>(id) -> [A]`.
+    ///     getters `<a>_<field1>(id) -> Vec<Napi<B>>` / `<b>_<field2>(id) -> Vec<Napi<A>>`.
     ///
-    /// Rows marshal through the generated struct's serde via `Env::to_js_value`
-    /// (native JS objects — no row-class constraint, unlike the PyO3 wrapper). The
-    /// one snapshot-scoped M2M `_at` traversal is deferred (no `Snapshot` handle on
-    /// the ergonomic wrapper yet). Identity: no generic query surface — each getter
-    /// is a fixed, generated edge walk by name; the napi serde bridge is
-    /// schema-agnostic.
+    /// Row-returning methods return typed `Napi<Model>` structs. Identity: no generic
+    /// query surface — each getter is a fixed, generated edge walk by name.
     fn generate_relation_methods(schema: &Schema) -> Vec<TokenStream> {
         use forgedb_parser::{FieldType, RelationType};
         use std::collections::{HashMap, HashSet};
@@ -330,12 +615,13 @@ impl NapiGenerator {
                     continue;
                 }
                 // Needs the source id-addressable (to `get` it before resolving the
-                // FK); the target marshals via serde regardless of its PK kind. The
-                // `seen` slot is consumed either way, matching the impl's ordering.
+                // FK); the target marshals via the typed napi struct. The `seen` slot
+                // is consumed either way, matching the impl's ordering.
                 if !model_has_id {
                     continue;
                 }
                 let method_ident = format_ident!("{}", method_name);
+                let napi_target = format_ident!("Napi{}", target.name);
                 let doc = format!(
                     "Resolve the `{}` foreign key of a `{}` (by id) to its record, or `null`.",
                     field.name, model.name
@@ -343,7 +629,7 @@ impl NapiGenerator {
                 methods.push(quote! {
                     #[doc = #doc]
                     #[napi]
-                    pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<JsUnknown> {
+                    pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Option<#napi_target>> {
                         let id: #source_id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                         let resolved = match catch_unwind(AssertUnwindSafe(|| {
                             self.inner.#storage.get(id).and_then(|__rec| self.inner.#method_ident(&__rec))
@@ -351,7 +637,7 @@ impl NapiGenerator {
                             Ok(opt) => opt,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        env.to_js_value(&resolved).map_err(to_napi_err)
+                        Ok(resolved.as_ref().map(#napi_target::from_record))
                     }
                 });
             }
@@ -388,7 +674,11 @@ impl NapiGenerator {
             if !seen.insert(method_name.clone()) {
                 continue;
             }
+            let Some(child) = schema.find_model(&p.child_model) else {
+                continue;
+            };
             let method_ident = format_ident!("{}", method_name);
+            let napi_child = format_ident!("Napi{}", child.name);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id.",
                 p.child_model, p.child_field, p.parent_model
@@ -396,13 +686,13 @@ impl NapiGenerator {
             methods.push(quote! {
                 #[doc = #doc]
                 #[napi]
-                pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<JsUnknown> {
+                pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_child>> {
                     let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
                     let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
                         Ok(rows) => rows,
                         Err(p) => return Err(panic_to_napi_err(p)),
                     };
-                    env.to_js_value(&rows).map_err(to_napi_err)
+                    Ok(rows.iter().map(#napi_child::from_record).collect())
                 }
             });
         }
@@ -450,40 +740,42 @@ impl NapiGenerator {
                 });
             }
 
-            // model1.field1 -> Vec<model2>  (forward M2M query)
+            // model1.field1 -> Vec<Napi<model2>>  (forward M2M query)
             let fwd_name = format!("{snake1}_{}", m.field1);
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
+                let napi_b = format_ident!("Napi{}", m.model2);
                 let doc = format!("All linked `{}` for the given `{}` id.", m.model2, m.model1);
                 methods.push(quote! {
                     #[doc = #doc]
                     #[napi]
-                    pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<JsUnknown> {
+                    pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_b>> {
                         let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        env.to_js_value(&rows).map_err(to_napi_err)
+                        Ok(rows.iter().map(#napi_b::from_record).collect())
                     }
                 });
             }
 
-            // model2.field2 -> Vec<model1>  (reverse M2M query)
+            // model2.field2 -> Vec<Napi<model1>>  (reverse M2M query)
             let rev_name = format!("{snake2}_{}", m.field2);
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
+                let napi_a = format_ident!("Napi{}", m.model1);
                 let doc = format!("All linked `{}` for the given `{}` id.", m.model1, m.model2);
                 methods.push(quote! {
                     #[doc = #doc]
                     #[napi]
-                    pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<JsUnknown> {
+                    pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_a>> {
                         let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
                         };
-                        env.to_js_value(&rows).map_err(to_napi_err)
+                        Ok(rows.iter().map(#napi_a::from_record).collect())
                     }
                 });
             }
