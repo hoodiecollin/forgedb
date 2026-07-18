@@ -204,13 +204,15 @@ pub struct Order {
 }
 ///Storage for Order model
 pub struct OrderStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     label_col: VariableColumn,
     status_col: FixedColumn,
     prev_status_col: FixedColumn,
-    status_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    status_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -244,7 +246,7 @@ impl OrderStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("order/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -260,7 +262,7 @@ impl OrderStorage {
                     2usize,
                 )
                 .expect("Failed to create fixed column"),
-            status_index: std::collections::HashMap::new(),
+            status_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("order/tombstones.bin"),
                 )
@@ -287,7 +289,7 @@ impl OrderStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -322,7 +324,10 @@ impl OrderStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.status_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.status_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
         db.write_manifest(root);
@@ -439,7 +444,7 @@ impl OrderStorage {
                 .expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -458,7 +463,10 @@ impl OrderStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.status_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.status_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Order", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -528,7 +536,7 @@ impl OrderStorage {
                 .expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -549,12 +557,13 @@ impl OrderStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.status_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.status_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.status_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -575,7 +584,10 @@ impl OrderStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.status_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.status_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Order", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -651,7 +663,7 @@ impl OrderStorage {
                 .expect("Failed to append to column");
         }
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -671,12 +683,13 @@ impl OrderStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.status_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.status_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.status_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -893,8 +906,8 @@ impl OrderStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.status_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.status_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -902,7 +915,7 @@ impl OrderStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -937,7 +950,10 @@ impl OrderStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.status_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.status_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
     }
@@ -1347,12 +1363,14 @@ impl OrderStorage {
 }
 ///Read-only, lock-free reader handle for Order storage (#56 Direction B)
 pub struct OrderStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     label_col: forgedb_storage::VariableColumnReader,
     status_col: forgedb_storage::FixedColumnReader,
     prev_status_col: forgedb_storage::FixedColumnReader,
-    status_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    status_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl OrderStorageReader {

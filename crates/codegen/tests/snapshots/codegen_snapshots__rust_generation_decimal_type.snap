@@ -163,12 +163,14 @@ pub struct Product {
 }
 ///Storage for Product model
 pub struct ProductStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     price_col: FixedColumn,
     discount_col: FixedColumn,
-    price_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    price_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -202,7 +204,7 @@ impl ProductStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("product/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -216,7 +218,7 @@ impl ProductStorage {
                     std::mem::size_of::<Option<rust_decimal::Decimal>>(),
                 )
                 .expect("Failed to create fixed column"),
-            price_index: std::collections::HashMap::new(),
+            price_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("product/tombstones.bin"),
                 )
@@ -243,7 +245,7 @@ impl ProductStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -278,7 +280,10 @@ impl ProductStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.price_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.price_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
         db.write_manifest(root);
@@ -392,7 +397,7 @@ impl ProductStorage {
             self.discount_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -411,7 +416,10 @@ impl ProductStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.price_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.price_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -484,7 +492,7 @@ impl ProductStorage {
             self.discount_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -505,12 +513,13 @@ impl ProductStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.price_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.price_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.price_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -531,7 +540,10 @@ impl ProductStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.price_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.price_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -606,7 +618,7 @@ impl ProductStorage {
             self.discount_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -626,12 +638,13 @@ impl ProductStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.price_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.price_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.price_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -841,8 +854,8 @@ impl ProductStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.price_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.price_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -850,7 +863,7 @@ impl ProductStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -885,7 +898,10 @@ impl ProductStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.price_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.price_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
     }
@@ -1283,11 +1299,13 @@ impl ProductStorage {
 }
 ///Read-only, lock-free reader handle for Product storage (#56 Direction B)
 pub struct ProductStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     price_col: forgedb_storage::FixedColumnReader,
     discount_col: forgedb_storage::FixedColumnReader,
-    price_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    price_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl ProductStorageReader {

@@ -1865,6 +1865,10 @@ impl RustGenerator {
 
     /// Emit an "add `id` under `key_token`" statement for one index (#157: the key
     /// is pre-built by the caller — hoisted or inline — not derived here).
+    ///
+    /// #158: the index map is `Arc`-shared with outstanding readers, so a mutation
+    /// goes through `Arc::make_mut` — copy-on-write (clones the map once iff a
+    /// reader still holds the prior snapshot, otherwise mutates in place).
     fn index_add_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -1874,13 +1878,14 @@ impl RustGenerator {
         quote! {
             {
                 let __k: String = { #key_token };
-                #receiver.#index_ident.entry(__k).or_default().insert(#id_expr);
+                std::sync::Arc::make_mut(&mut #receiver.#index_ident).entry(__k).or_default().insert(#id_expr);
             }
         }
     }
 
     /// Emit a "remove `id` from `key_token`" statement for one index, pruning the
     /// bucket when it empties (structured to avoid a double mutable borrow).
+    /// `Arc::make_mut` gives copy-on-write against outstanding readers (#158).
     fn index_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -1891,12 +1896,13 @@ impl RustGenerator {
             {
                 let __k: String = { #key_token };
                 let mut __empty = false;
-                if let Some(__set) = #receiver.#index_ident.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut #receiver.#index_ident);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(#id_expr));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    #receiver.#index_ident.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -1998,12 +2004,13 @@ impl RustGenerator {
         quote! {
             {
                 let __k: String = #key;
-                #receiver.#index_ident.entry(__k).or_default().insert(#id_expr);
+                std::sync::Arc::make_mut(&mut #receiver.#index_ident).entry(__k).or_default().insert(#id_expr);
             }
         }
     }
 
     /// Emit a "remove `id` from the composite key" statement, pruning empty buckets.
+    /// `Arc::make_mut` gives copy-on-write against outstanding readers (#158).
     fn composite_remove_block(
         receiver: &TokenStream,
         index_ident: &proc_macro2::Ident,
@@ -2015,12 +2022,13 @@ impl RustGenerator {
             {
                 let __k: String = #key;
                 let mut __empty = false;
-                if let Some(__set) = #receiver.#index_ident.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut #receiver.#index_ident);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(#id_expr));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    #receiver.#index_ident.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -2049,29 +2057,35 @@ impl RustGenerator {
 
         // Secondary index fields (#90): one `value-key -> {id}` map per `^index`
         // / `&unique` scalar field, maintained alongside `id_to_row`.
+        //
+        // #158: each map is `Arc`-wrapped so `reader()` shares it structurally
+        // (O(1) `Arc::clone`) instead of deep-cloning O(rows) per capture; the
+        // writer mutates via `Arc::make_mut` (copy-on-write only while a reader
+        // still holds the previous snapshot — see `index_add_block`).
         let index_fields: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
                 quote! {
-                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                    #ident: std::sync::Arc<std::collections::HashMap<String, std::collections::HashSet<#id_type>>>
                 }
             })
             .collect();
 
         // Composite `@index(a, b)` fields (#101): same `key -> {id}` shape, keyed
-        // by the collision-free length-prefixed composite key.
+        // by the collision-free length-prefixed composite key.  Same `Arc` share
+        // discipline as the single-field maps (#158).
         let composite_fields: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, _comps)| {
                 quote! {
-                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                    #ident: std::sync::Arc<std::collections::HashMap<String, std::collections::HashSet<#id_type>>>
                 }
             })
             .collect();
 
         quote! {
-            id_to_row: HashMap<#id_type, usize>,
+            id_to_row: std::sync::Arc<HashMap<#id_type, usize>>,
             row_count: usize,
             #(#column_fields,)*
             #(#index_fields,)*
@@ -2177,7 +2191,7 @@ impl RustGenerator {
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                quote! { #ident: std::collections::HashMap::new() }
+                quote! { #ident: std::sync::Arc::new(std::collections::HashMap::new()) }
             })
             .collect();
 
@@ -2185,7 +2199,7 @@ impl RustGenerator {
         let composite_inits: Vec<_> = Self::composite_indexes(model)
             .iter()
             .map(|(ident, _comps)| {
-                quote! { #ident: std::collections::HashMap::new() }
+                quote! { #ident: std::sync::Arc::new(std::collections::HashMap::new()) }
             })
             .collect();
 
@@ -2194,7 +2208,7 @@ impl RustGenerator {
         let wal_fsync = Self::wal_fsync_policy_tokens();
 
         quote! {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             #(#inits,)*
             #(#index_inits,)*
@@ -2245,16 +2259,21 @@ impl RustGenerator {
             }
         }
         let id_type = Self::id_type_tokens(model);
-        // Index maps (#103): the reader carries a point-in-time CLONE of every
+        // Index maps (#103): the reader carries a point-in-time snapshot of every
         // secondary + composite index, captured on the writer at `reader()` time
         // (same instant its column readers open), so its `_at` probes are O(1)
         // like the writer's.  Same field names/types as the writer storage.
+        //
+        // #158: shared via `Arc` (not a deep clone) — the reader's snapshot is the
+        // exact map the writer held at capture, made immutable by structural
+        // sharing; a later writer mutation copies-on-write, leaving this snapshot
+        // untouched.  Probe reads (`.get`) deref straight through the `Arc`.
         let index_fields: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
                 quote! {
-                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                    #ident: std::sync::Arc<std::collections::HashMap<String, std::collections::HashSet<#id_type>>>
                 }
             })
             .collect();
@@ -2262,12 +2281,12 @@ impl RustGenerator {
             .iter()
             .map(|(ident, _comps)| {
                 quote! {
-                    #ident: std::collections::HashMap<String, std::collections::HashSet<#id_type>>
+                    #ident: std::sync::Arc<std::collections::HashMap<String, std::collections::HashSet<#id_type>>>
                 }
             })
             .collect();
         quote! {
-            id_to_row: HashMap<#id_type, usize>,
+            id_to_row: std::sync::Arc<HashMap<#id_type, usize>>,
             #(#column_fields,)*
             #(#index_fields,)*
             #(#composite_fields,)*
@@ -2291,11 +2310,12 @@ impl RustGenerator {
                 });
             }
         }
-        // Clone every index map (#103) — captured on the single writer, off the
-        // mutation path (same discipline as `id_to_row.clone()` and
+        // Share every index map (#103/#158) — captured on the single writer, off
+        // the mutation path (same discipline as `id_to_row` and
         // `DatabaseSnapshot::snapshot()`), so the reader's view is coherent with
-        // its column readers.  Plain clone (O(rows) per index), amortized per
-        // reader thread; an `Arc`-swap is the escape hatch if it ever matters.
+        // its column readers.  `Arc::clone` is O(1) (a refcount bump, no data
+        // copy); the map became immutable to this reader the instant it was
+        // captured — a later writer mutation copies-on-write (`Arc::make_mut`).
         let index_clones: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
@@ -3363,10 +3383,10 @@ impl RustGenerator {
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                quote! { self.#ident.clear(); }
+                quote! { std::sync::Arc::make_mut(&mut self.#ident).clear(); }
             })
             .chain(Self::composite_indexes(model).iter().map(|(ident, _)| {
-                quote! { self.#ident.clear(); }
+                quote! { std::sync::Arc::make_mut(&mut self.#ident).clear(); }
             }))
             .collect();
         let rehydrate_self = Self::generate_rehydrate_body(model, &quote! { self });
@@ -3381,7 +3401,7 @@ impl RustGenerator {
             /// end up exactly as a fresh reopen would build them — no incremental
             /// remove-old/add-new bookkeeping to drift.
             pub fn __reindex_committed(&mut self) {
-                self.id_to_row.clear();
+                std::sync::Arc::make_mut(&mut self.id_to_row).clear();
                 #(#clear_indexes)*
                 #rehydrate_self
             }
@@ -3638,7 +3658,7 @@ impl RustGenerator {
             self.tombstones.append(false).expect("Failed to append tombstone");
 
             // Store ID mapping
-            self.id_to_row.insert(id, row_index);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): index the committed row.
@@ -3794,7 +3814,7 @@ impl RustGenerator {
 
             // Repoint the id at its newest physical row; the prior version's bytes
             // remain committed (backup-faithful) until compaction reclaims them.
-            self.id_to_row.insert(id, row_index);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop stale value keys, add new.
@@ -3901,7 +3921,7 @@ impl RustGenerator {
             self.tombstones.append(true).expect("Failed to append tombstone");
 
             // Repoint the id at the tombstoned newest row so `get` reads absent.
-            self.id_to_row.insert(id, row_index);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop the deleted id's value keys.
@@ -4880,7 +4900,7 @@ impl RustGenerator {
             Some(read_expr) => quote! {
                 for i in 0..n {
                     let id = #read_expr;
-                    #recv.id_to_row.insert(id, i);
+                    std::sync::Arc::make_mut(&mut #recv.id_to_row).insert(id, i);
                 }
             },
             // No id/auto field: nothing to index (such a model cannot `insert`

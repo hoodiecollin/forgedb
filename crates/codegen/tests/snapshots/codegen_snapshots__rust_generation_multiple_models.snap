@@ -157,7 +157,7 @@ pub struct User {
 }
 ///Storage for User model
 pub struct UserStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     tombstones: forgedb_storage::Tombstones,
@@ -193,7 +193,7 @@ impl UserStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -223,7 +223,7 @@ impl UserStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         db.write_manifest(root);
         db
@@ -314,7 +314,7 @@ impl UserStorage {
             .append_uuid(*record.id.as_bytes())
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -370,7 +370,7 @@ impl UserStorage {
             .append_uuid(*record.id.as_bytes())
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -433,7 +433,7 @@ impl UserStorage {
             .append_uuid(*record.id.as_bytes())
             .expect("Failed to append to column");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("User", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
@@ -600,7 +600,7 @@ impl UserStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -608,7 +608,7 @@ impl UserStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -879,7 +879,7 @@ impl UserStorage {
 }
 ///Read-only, lock-free reader handle for User storage (#56 Direction B)
 pub struct UserStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     tombstones: forgedb_storage::TombstonesReader,
 }
@@ -971,7 +971,7 @@ pub struct Post {
 }
 ///Storage for Post model
 pub struct PostStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     title_col: VariableColumn,
@@ -1008,7 +1008,7 @@ impl PostStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("post/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -1043,7 +1043,7 @@ impl PostStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         db.write_manifest(root);
         db
@@ -1139,7 +1139,7 @@ impl PostStorage {
             .expect("Failed to append to column");
         self.title_col.append_string(&record.title).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -1196,7 +1196,7 @@ impl PostStorage {
             .expect("Failed to append to column");
         self.title_col.append_string(&record.title).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -1260,7 +1260,7 @@ impl PostStorage {
             .expect("Failed to append to column");
         self.title_col.append_string(&record.title).expect("Failed to append string");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
@@ -1440,7 +1440,7 @@ impl PostStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -1448,7 +1448,7 @@ impl PostStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -1733,7 +1733,7 @@ impl PostStorage {
 }
 ///Read-only, lock-free reader handle for Post storage (#56 Direction B)
 pub struct PostStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     title_col: forgedb_storage::VariableColumnReader,
     tombstones: forgedb_storage::TombstonesReader,

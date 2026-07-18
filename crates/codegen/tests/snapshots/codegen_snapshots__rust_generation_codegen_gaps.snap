@@ -167,7 +167,7 @@ pub struct Place {
 }
 ///Storage for Place model
 pub struct PlaceStorage {
-    id_to_row: HashMap<u64, usize>,
+    id_to_row: std::sync::Arc<HashMap<u64, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     name_col: VariableColumn,
@@ -206,7 +206,7 @@ impl PlaceStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("place/fixed/u64_0.bin"), 8usize)
                 .expect("Failed to create fixed column"),
@@ -248,7 +248,7 @@ impl PlaceStorage {
         db.row_count = n;
         for i in 0..n {
             let id = db.id_col.read_u64(i).expect("Failed to read id column");
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         db.write_manifest(root);
         db
@@ -373,7 +373,7 @@ impl PlaceStorage {
             self.location_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -451,7 +451,7 @@ impl PlaceStorage {
             self.location_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -536,7 +536,7 @@ impl PlaceStorage {
             self.location_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Place", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
@@ -763,12 +763,12 @@ impl PlaceStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
             let id = self.id_col.read_u64(i).expect("Failed to read id column");
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -1100,7 +1100,7 @@ impl PlaceStorage {
 }
 ///Read-only, lock-free reader handle for Place storage (#56 Direction B)
 pub struct PlaceStorageReader {
-    id_to_row: HashMap<u64, usize>,
+    id_to_row: std::sync::Arc<HashMap<u64, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     name_col: forgedb_storage::VariableColumnReader,
     description_col: forgedb_storage::VariableColumnReader,

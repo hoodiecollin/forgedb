@@ -160,7 +160,7 @@ pub struct Product {
 }
 ///Storage for Product model
 pub struct ProductStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     name_col: VariableColumn,
@@ -197,7 +197,7 @@ impl ProductStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("product/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -232,7 +232,7 @@ impl ProductStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         db.write_manifest(root);
         db
@@ -328,7 +328,7 @@ impl ProductStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -389,7 +389,7 @@ impl ProductStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -453,7 +453,7 @@ impl ProductStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
@@ -633,7 +633,7 @@ impl ProductStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -641,7 +641,7 @@ impl ProductStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -928,7 +928,7 @@ impl ProductStorage {
 }
 ///Read-only, lock-free reader handle for Product storage (#56 Direction B)
 pub struct ProductStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     name_col: forgedb_storage::VariableColumnReader,
     tombstones: forgedb_storage::TombstonesReader,

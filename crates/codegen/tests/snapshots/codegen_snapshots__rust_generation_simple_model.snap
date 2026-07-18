@@ -159,12 +159,14 @@ pub struct User {
 }
 ///Storage for User model
 pub struct UserStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     row_count: usize,
     id_col: FixedColumn,
     email_col: VariableColumn,
     age_col: FixedColumn,
-    email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    email_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -198,7 +200,7 @@ impl UserStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -212,7 +214,7 @@ impl UserStorage {
                     std::mem::size_of::<Option<u32>>(),
                 )
                 .expect("Failed to create fixed column"),
-            email_index: std::collections::HashMap::new(),
+            email_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("user/tombstones.bin"),
                 )
@@ -239,7 +241,7 @@ impl UserStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -271,7 +273,10 @@ impl UserStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.email_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.email_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
         db.write_manifest(root);
@@ -405,7 +410,7 @@ impl UserStorage {
             self.age_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -424,7 +429,10 @@ impl UserStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.email_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.email_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -516,7 +524,7 @@ impl UserStorage {
             self.age_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -537,12 +545,13 @@ impl UserStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.email_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.email_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.email_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -563,7 +572,10 @@ impl UserStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.email_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.email_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -636,7 +648,7 @@ impl UserStorage {
             self.age_col.append_bytes(bytes).expect("Failed to append to column");
         }
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -656,12 +668,13 @@ impl UserStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.email_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.email_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.email_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -865,8 +878,8 @@ impl UserStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.email_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.email_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -874,7 +887,7 @@ impl UserStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -906,7 +919,10 @@ impl UserStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.email_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.email_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
     }
@@ -1364,11 +1380,13 @@ impl UserStorage {
 }
 ///Read-only, lock-free reader handle for User storage (#56 Direction B)
 pub struct UserStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
     id_col: forgedb_storage::FixedColumnReader,
     email_col: forgedb_storage::VariableColumnReader,
     age_col: forgedb_storage::FixedColumnReader,
-    email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    email_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl UserStorageReader {
