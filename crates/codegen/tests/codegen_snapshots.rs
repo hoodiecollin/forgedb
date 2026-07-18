@@ -3,9 +3,9 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, HopPlan, ModelOp, NapiGenerator, OpenApiGenerator, PyO3Generator,
-    RustGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
-    WasmGenerator,
+    ApiGenerator, FfiGenerator, GenConfig, HopPlan, ModelOp, NapiGenerator, OpenApiGenerator,
+    PyO3Generator, RustGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator,
+    VersionSchema, WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -2735,7 +2735,11 @@ Tag {
 "#;
     let mut parser = forgedb_parser::Parser::new(src).unwrap();
     let schema = parser.parse().unwrap();
-    let code = RustGenerator::generate(&schema).unwrap().code;
+    // Replication defaults OFF (#130, G6 sanctioned exception): generate WITH it
+    // enabled so the broker-attach path is emitted and asserted here.
+    let code = RustGenerator::generate_with_config(&schema, 1, GenConfig::legacy_with_replication())
+        .unwrap()
+        .code;
     // RustGenerator emits a raw token stream (spaces around `::`/`<`/`>`); compare
     // against a whitespace-stripped copy so needles stay readable.
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2787,6 +2791,115 @@ Tag {
     assert!(
         !flat.contains("matchmodel_name"),
         "the broker must never match on the model name to decode a field"
+    );
+}
+
+#[test]
+fn test_gen_config_knobs() {
+    // Configurable runtime behavior (epic #126): the generate-time knobs in
+    // GenConfig tailor the emitted consts / branches. Default reproduces today's
+    // output byte-for-byte EXCEPT the replication broker (default OFF, #130 — the
+    // G6 sanctioned exception).
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  author: *Author
+}
+
+Author {
+  id: +uuid
+  name: string
+  posts: [Post]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let flatten = |code: &str| -> String { code.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    // --- Default: replication OFF (#130), all other consts at their prior values.
+    let default_code = RustGenerator::generate(&schema).unwrap().code;
+    let d = flatten(&default_code);
+    assert!(
+        !d.contains("DurableBroker::open("),
+        "default output must NOT attach the durable broker (#130 default OFF)"
+    );
+    assert!(
+        d.contains("constWAL_CHECKPOINT_INTERVAL:u64=1000"),
+        "default WAL checkpoint interval is 1000 (#131)"
+    );
+    assert!(
+        d.contains("constCOMPACTION_DEAD_THRESHOLD:u64=1000"),
+        "default compaction threshold is 1000 (#133)"
+    );
+    assert!(
+        d.contains("constMAX_CASCADE_DEPTH:u32=64"),
+        "default cascade depth is 64 (#150)"
+    );
+    assert!(
+        d.contains("forgedb_wal::FsyncPolicy::Always"),
+        "default fsync policy is Always (#129)"
+    );
+    assert!(
+        d.contains("ChangeFeed::new(1024)"),
+        "default changefeed capacity is 1024 (#135)"
+    );
+    // Default auto-compaction trigger is emitted (#134 ON).
+    assert!(
+        d.contains("self.dead_since_compaction>=COMPACTION_DEAD_THRESHOLD"),
+        "default emits the auto-compaction trigger (#134 ON)"
+    );
+
+    // --- Fully custom config: every knob honored.
+    let cfg = GenConfig {
+        replication: true,
+        fsync: forgedb_codegen::FsyncMode::Never,
+        wal_checkpoint_interval: 500,
+        compaction: false,
+        compaction_threshold: 250,
+        changefeed_capacity: 64,
+        max_cascade_depth: 8,
+    };
+    let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
+    let c = flatten(&custom);
+    assert!(
+        c.contains("DurableBroker::open("),
+        "replication=true attaches the durable broker (#130 ON)"
+    );
+    assert!(
+        c.contains("constWAL_CHECKPOINT_INTERVAL:u64=500"),
+        "WAL checkpoint interval is configurable (#131)"
+    );
+    assert!(
+        c.contains("constCOMPACTION_DEAD_THRESHOLD:u64=250"),
+        "compaction threshold is configurable (#133)"
+    );
+    assert!(
+        c.contains("constMAX_CASCADE_DEPTH:u32=8"),
+        "cascade depth is configurable (#150)"
+    );
+    assert!(
+        c.contains("forgedb_wal::FsyncPolicy::Never"),
+        "fsync policy is configurable to Never (#129)"
+    );
+    assert!(
+        c.contains("ChangeFeed::new(64)"),
+        "changefeed capacity is configurable (#135)"
+    );
+    assert!(
+        c.contains("forgedb_changefeed::durable::FsyncPolicy::Never"),
+        "the durable broker fsync follows the fsync knob (#136)"
+    );
+    // Tier A #134: compaction=false OMITS the auto-compaction trigger.
+    assert!(
+        !c.contains("self.dead_since_compaction>=COMPACTION_DEAD_THRESHOLD"),
+        "compaction=false omits the auto-compaction trigger (#134 Tier A)"
+    );
+    // The dead-row counter is still incremented (kept live for the explicit path).
+    assert!(
+        c.contains("self.dead_since_compaction+=1"),
+        "the dead-row counter stays live even with auto-compaction off (#134)"
     );
 }
 

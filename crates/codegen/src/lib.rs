@@ -47,6 +47,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+pub mod config;
 pub mod rust;
 pub mod typescript;
 pub mod api;
@@ -60,6 +61,7 @@ pub mod napi;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
+pub use config::{FsyncMode, GenConfig};
 pub use ffi::FfiGenerator;
 pub use napi::NapiGenerator;
 pub use openapi::OpenApiGenerator;

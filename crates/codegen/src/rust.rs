@@ -2,10 +2,24 @@
 //!
 //! Generates optimized Rust code with columnar storage for ForgeDB schemas.
 
+use crate::config::GenConfig;
 use crate::{CodegenError, GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+
+thread_local! {
+    /// The generate-time runtime-behavior config (epic #126) active for the
+    /// current `generate*` call. `GenConfig` is `Copy`, so a `Cell` suffices.
+    ///
+    /// Threading `&GenConfig` through the ~10 static helpers that emit
+    /// config-dependent literals (WAL interval, fsync policy, broker attach,
+    /// compaction trigger, cascade depth) would be invasive; instead each
+    /// `generate*` entry point sets this at the top of the call and the emission
+    /// sites read it via `active_cfg()`. Safe under parallel test execution:
+    /// every entry point sets the value on *its own* thread before emitting.
+    static ACTIVE_CONFIG: std::cell::Cell<GenConfig> = const { std::cell::Cell::new(GenConfig::DEFAULT) };
+}
 
 /// Rust code generator
 pub struct RustGenerator;
@@ -48,10 +62,28 @@ impl RustGenerator {
     /// from the committed migration lineage** by the `generate` CLI command (red
     /// line #8: lineage-sourced, never hand-edited); it is an opaque integer the
     /// generated open guard compares and refuses on mismatch — nothing more.
+    ///
+    /// Uses the default generate-time runtime config (`GenConfig::DEFAULT`) — see
+    /// `generate_with_config` for the #126 configurable-behavior knobs.
     pub fn generate_with_format_version(
         schema: &Schema,
         format_version: u32,
     ) -> Result<GeneratedCode> {
+        Self::generate_with_config(schema, format_version, GenConfig::DEFAULT)
+    }
+
+    /// Generate the Rust database implementation with an explicit generate-time
+    /// runtime-behavior config (epic #126). The config tailors emitted
+    /// consts/branches (WAL checkpoint interval, fsync policy, compaction trigger,
+    /// changefeed capacity, cascade depth) and gates the replication-broker attach
+    /// (Tier A). `GenConfig::DEFAULT` reproduces the pre-#126 output byte-for-byte
+    /// except the broker (default OFF — G6 sanctioned exception).
+    pub fn generate_with_config(
+        schema: &Schema,
+        format_version: u32,
+        config: GenConfig,
+    ) -> Result<GeneratedCode> {
+        ACTIVE_CONFIG.with(|c| c.set(config));
         let code = Self::generate_code(schema, format_version)?;
 
         Ok(GeneratedCode {
@@ -61,6 +93,22 @@ impl RustGenerator {
                 schema.models.len()
             ),
         })
+    }
+
+    /// The generate-time runtime-behavior config (#126) active for the current
+    /// `generate*` call. Read at each config-dependent emission site.
+    fn active_cfg() -> GenConfig {
+        ACTIVE_CONFIG.with(|c| c.get())
+    }
+
+    /// The `forgedb_wal::FsyncPolicy::<variant>` token for the active fsync mode
+    /// (#129, Tier B). Default `Always` — byte-identical. `Never` is a
+    /// durability-weakening opt-in (guardrail G7); the substrate still matches the
+    /// policy per-write, so this is Tier B (a baked value), not the Tier-A
+    /// `sync_all`-removed form (a substrate follow-up noted on #129).
+    fn wal_fsync_policy_tokens() -> TokenStream {
+        let variant = format_ident!("{}", Self::active_cfg().fsync.wal_policy_variant());
+        quote! { forgedb_wal::FsyncPolicy::#variant }
     }
 
     /// Whether a field can appear in a `@projection` (#113): it must have a
@@ -215,26 +263,34 @@ impl RustGenerator {
         };
         tokens.extend(imports);
 
+        let cfg = Self::active_cfg();
+
         // WAL checkpoint interval (#89 step 2 — bound the WAL).  After this many
         // WAL-recorded mutations a storage fsyncs its columns and truncates its
         // WAL, so the WAL never grows without limit and reopen never replays a
-        // huge WAL.  Fixed for v1 (not yet configurable — the same posture as the
-        // fixed `FsyncPolicy::Always`).  Bounds the WAL to ~this many records
-        // between checkpoints (bytes are bounded by interval × max row size).
+        // huge WAL.  Configurable at generate time (#131, epic #126) via
+        // `[storage].wal_checkpoint_interval`; default 1000 (byte-identical).
+        // Bounds the WAL to ~this many records between checkpoints (bytes are
+        // bounded by interval × max row size).
+        let __wal_checkpoint_interval =
+            proc_macro2::Literal::u64_unsuffixed(cfg.wal_checkpoint_interval);
         tokens.extend(quote! {
-            const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
+            const WAL_CHECKPOINT_INTERVAL: u64 = #__wal_checkpoint_interval;
         });
 
         // Compaction trigger threshold (#92 Phase 4 — bound column storage).
         // Each update/delete leaves a dead (superseded/tombstoned) row version
         // behind (#66); once this many accumulate since the last compaction, the
         // storage compacts IN-PROCESS under the single-writer lock, reclaiming the
-        // dead bytes.  Fixed for v1 (not yet configurable — the same posture as
-        // `WAL_CHECKPOINT_INTERVAL` and `FsyncPolicy::Always`; a tuning knob rides
-        // the Phase 4 bounded-storage follow-up).  Storage is bounded to roughly
-        // this many dead versions between compactions.
+        // dead bytes.  Configurable at generate time (#133, epic #126) via
+        // `[storage].compaction_threshold`; default 1000 (byte-identical).
+        // Storage is bounded to roughly this many dead versions between
+        // compactions.  (The auto-trigger that reads this const is itself gated by
+        // `[storage].compaction` — #134; when off the const is unused but harmless.)
+        let __compaction_threshold =
+            proc_macro2::Literal::u64_unsuffixed(cfg.compaction_threshold);
         tokens.extend(quote! {
-            const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+            const COMPACTION_DEAD_THRESHOLD: u64 = #__compaction_threshold;
         });
 
         // On-disk format version this binary was generated for (#74 Phase 1 —
@@ -2076,6 +2132,10 @@ impl RustGenerator {
             })
             .collect();
 
+        // WAL fsync policy (#129, epic #126): default `Always` (byte-identical);
+        // configurable via `[storage].fsync`.
+        let wal_fsync = Self::wal_fsync_policy_tokens();
+
         quote! {
             id_to_row: HashMap::new(),
             row_count: 0,
@@ -2086,11 +2146,12 @@ impl RustGenerator {
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
             // One WAL per model, namespaced under the same data root (#89).
-            // `FsyncPolicy::Always` makes each commit record durable before the
-            // columns are appended — the crash-durability boundary.
+            // The fsync policy (`Always` by default) makes each commit record
+            // durable before the columns are appended — the crash-durability
+            // boundary.
             wal: forgedb_wal::WalManager::open(
                 root.join(#wal_path),
-                forgedb_wal::FsyncPolicy::Always,
+                #wal_fsync,
             ).expect("Failed to open WAL"),
             writes_since_checkpoint: 0,
             // Remember the data root so `compact()` can rewrite + reopen files (#92).
@@ -3383,6 +3444,20 @@ impl RustGenerator {
     /// `#maybe_checkpoint` so a compaction (which itself checkpoints) sees a
     /// consistent, bounded WAL.
     fn generate_maybe_compact() -> TokenStream {
+        // #134 (Tier A, epic #126): when `[storage].compaction = false`, OMIT the
+        // auto-compaction trigger entirely — the `>= COMPACTION_DEAD_THRESHOLD`
+        // check and `compact()` call are simply not emitted, so the compiler
+        // optimizes as if in-process auto-compaction did not exist. The dead-row
+        // counter is still incremented (kept live for observability / the explicit
+        // `Database::compact()` path, which reclaims on demand).
+        if !Self::active_cfg().compaction {
+            return quote! {
+                // Auto-compaction disabled at generate time (#134): track the dead
+                // version for observability, but never auto-reclaim — the operator
+                // drives reclaim via the explicit `Database::compact()`.
+                self.dead_since_compaction += 1;
+            };
+        }
         quote! {
             // Bound column storage (#92 Phase 4): this mutation left a dead
             // (superseded/tombstoned) row version behind; once enough accumulate,
@@ -5040,6 +5115,55 @@ impl RustGenerator {
             })
             .collect();
 
+        // Generate-time runtime-behavior config (epic #126), read once for this
+        // `generate_database` emission.
+        let cfg = Self::active_cfg();
+
+        // Changefeed broadcast capacity (#135) + durable-broker in-memory buffer
+        // (#136). Default 1024 (byte-identical).
+        let __changefeed_capacity = proc_macro2::Literal::usize_unsuffixed(cfg.changefeed_capacity);
+        // WAL fsync policy for the multi-model transaction journal (#132) — follows
+        // the same `[storage].fsync` knob as the per-model WALs. Default `Always`.
+        let __journal_fsync = Self::wal_fsync_policy_tokens();
+        let __broker_fsync = {
+            // The durable replication log's fsync policy (#136). Mirrors the WAL
+            // fsync variant name in the `changefeed::durable` module. Default
+            // `Always` (byte-identical).
+            let variant = format_ident!("{}", cfg.fsync.wal_policy_variant());
+            quote! { forgedb_changefeed::durable::FsyncPolicy::#variant }
+        };
+
+        // Replication-broker attach gate (#130, Tier A — flagship). When OFF
+        // (the default, G6 sanctioned exception), emit `let broker = None` in
+        // place of `DurableBroker::open(...)`: no durable log is opened and no
+        // second `F_FULLFSYNC` barrier is paid per write (the mutation path's
+        // `if let Some(broker)` guard is then statically dead). When ON, open the
+        // durable, offset-addressed log so a resumable follower (#82/#110) can
+        // replay. The `broker` struct field is `Option<...>` either way, so
+        // downstream code (attach, `/replicate`) is unchanged.
+        let __broker_open = if cfg.replication {
+            quote! {
+                let broker = match forgedb_changefeed::durable::DurableBroker::open(
+                    root.join("_replication.log"),
+                    #__broker_fsync,
+                    #__changefeed_capacity,
+                ) {
+                    Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
+                    Err(_) => None,
+                };
+            }
+        } else {
+            quote! {
+                // Replication disabled at generate time (#130): no durable broker
+                // is attached, so no second fsync barrier per write. Turn on via
+                // `[runtime].replication = true` for apps that consume `/replicate`
+                // or run a browser read-replica follower.
+                let broker: Option<
+                    std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
+                > = None;
+            }
+        };
+
         let tokens = quote! {
             /// Main database struct
             pub struct Database {
@@ -5106,7 +5230,7 @@ impl RustGenerator {
 
             impl Database {
                 pub fn new() -> Self {
-                    let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+                    let changefeed = forgedb_changefeed::ChangeFeed::new(#__changefeed_capacity);
                     #(#attach_stmts)*
                     Self {
                         #(#field_idents,)*
@@ -5166,20 +5290,15 @@ impl RustGenerator {
                     // Reads one opaque integer per existing manifest and fails fast
                     // on mismatch — never reshapes (DV-6).  Skipped for a fresh dir.
                     #(#version_guard_stmts)*
-                    let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
+                    let changefeed = forgedb_changefeed::ChangeFeed::new(#__changefeed_capacity);
                     // Durable replication broker (#82 Direction C): one offset-addressed
                     // log per tenant, under the data root, shared across all collections
                     // so a single global offset sequences every change.  If it cannot be
                     // opened the server still runs — replication is simply unavailable
                     // (the `/replicate` endpoint reports it), never blocking writes.
-                    let broker = match forgedb_changefeed::durable::DurableBroker::open(
-                        root.join("_replication.log"),
-                        forgedb_changefeed::durable::FsyncPolicy::Always,
-                        1024,
-                    ) {
-                        Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
-                        Err(_) => None,
-                    };
+                    // Gated by `[runtime].replication` (#130, Tier A): when off (the
+                    // default) `broker` is `None` and no second fsync barrier is paid.
+                    #__broker_open
                     // MVCC Tier 2 (#83): seed the commit sequencer from the broker
                     // watermark so the commit-LSN and the broker's global offset form
                     // one unified monotonic sequence.  The broker watermark is the
@@ -5206,7 +5325,7 @@ impl RustGenerator {
                     // written before transactions existed.)
                     let mut _txn_journal = forgedb_wal::WalManager::open(
                         root.join("_txn_journal.log"),
-                        forgedb_wal::FsyncPolicy::Always,
+                        #__journal_fsync,
                     ).expect("Failed to open transaction journal");
                     // The last valid record's decoded length vector (empty if none).
                     let __journal_committed: Vec<(String, u64)> = {
@@ -5575,13 +5694,18 @@ impl RustGenerator {
         if methods.is_empty() {
             return quote! {};
         }
+        // Cascade-depth bound (#150, epic #126): configurable at generate time via
+        // `[runtime].max_cascade_depth`; default 64 (byte-identical).
+        let __max_cascade_depth =
+            proc_macro2::Literal::u32_unsuffixed(Self::active_cfg().max_cascade_depth);
         quote! {
             /// Maximum on-delete cascade recursion depth (delete semantics).  A
             /// cascade delete recurses into referencing children (which may cascade
             /// in turn); this bounds a pathological schema FK cycle so it fails
             /// loudly with `ReferencedByChildren`-class refusal rather than
-            /// looping.  Fixed for v1 (same posture as the WAL/compaction consts).
-            const MAX_CASCADE_DEPTH: u32 = 64;
+            /// looping.  Configurable at generate time (#150) via
+            /// `[runtime].max_cascade_depth`.
+            const MAX_CASCADE_DEPTH: u32 = #__max_cascade_depth;
 
             impl Database {
                 #(#methods)*

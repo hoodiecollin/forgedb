@@ -1386,14 +1386,9 @@ impl Database {
             }
         }
         let changefeed = forgedb_changefeed::ChangeFeed::new(1024);
-        let broker = match forgedb_changefeed::durable::DurableBroker::open(
-            root.join("_replication.log"),
-            forgedb_changefeed::durable::FsyncPolicy::Always,
-            1024,
-        ) {
-            Ok(b) => Some(std::sync::Arc::new(std::sync::Mutex::new(b))),
-            Err(_) => None,
-        };
+        let broker: Option<
+            std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
+        > = None;
         let __seq_start = match &broker {
             Some(b) => b.lock().map(|b| b.watermark()).unwrap_or(0),
             None => 0,
@@ -1621,7 +1616,8 @@ impl Database {
 /// cascade delete recurses into referencing children (which may cascade
 /// in turn); this bounds a pathological schema FK cycle so it fails
 /// loudly with `ReferencedByChildren`-class refusal rather than
-/// looping.  Fixed for v1 (same posture as the WAL/compaction consts).
+/// looping.  Configurable at generate time (#150) via
+/// `[runtime].max_cascade_depth`.
 const MAX_CASCADE_DEPTH: u32 = 64;
 impl Database {
     ///Create a ComplexModel with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `insert`.
