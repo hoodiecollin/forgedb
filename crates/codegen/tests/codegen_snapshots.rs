@@ -3574,6 +3574,42 @@ Reading {
     assert!(flat.contains("m.add_class::<ForgeDb>()"), "ForgeDb is registered");
     assert!(flat.contains("m.add_class::<PyUser>()"), "the User row class is registered");
 
+    // Typed field getters (Phase 5b follow-up) — per-field `#[getter]` on each
+    // `#[pyclass]` row type with concrete return types where possible.
+    // uuid fields → `String` (hyphenated UUID); string fields → `String`;
+    // i64 fields → `i64`; the Reading.id (u64) → `u64`.
+    // Simple typed getters do NOT take a `py: Python<'py>` parameter.
+    assert!(
+        flat.contains("fnid(&self)->PyResult<String>"),
+        "uuid id getter returns String"
+    );
+    assert!(
+        flat.contains("fnemail(&self)->PyResult<String>"),
+        "string email getter returns String"
+    );
+    assert!(
+        flat.contains("fnvalue(&self)->PyResult<i64>"),
+        "i64 value getter returns i64"
+    );
+    // Reading id is u64 PK — typed getter returns u64.
+    assert!(
+        flat.contains("fnid(&self)->PyResult<u64>"),
+        "u64 id getter returns u64"
+    );
+    // title is a string field on Post.
+    assert!(
+        flat.contains("fntitle(&self)->PyResult<String>"),
+        "string title getter returns String"
+    );
+    // FK field: Post.author is *User (RequiredReference → Uuid → String).
+    assert!(
+        flat.contains("fnauthor(&self)->PyResult<String>"),
+        "required FK (Uuid) getter returns String"
+    );
+    // `__repr__` and `to_dict` remain on all row classes.
+    assert!(flat.contains("fn__repr__"), "__repr__ is generated on every row class");
+    assert!(flat.contains("fnto_dict"), "to_dict is generated on every row class");
+
     // Relation traversal (Phase 5b) — forward FK / reverse 1:M / M2M, mirroring the
     // generated `Database` getters by name, marshalling into the Py row classes.
     assert!(
@@ -3698,12 +3734,48 @@ Reading {
     assert!(flat.contains("self.inner.reading.row_count("), "count uses the generated row_count");
     assert!(flat.contains("self.inner.post.all()"), "all uses the generated storage read");
 
+    // Typed row structs (Phase 5b/6b follow-up) — one `#[napi(object)]` struct per
+    // identity model so napi-rs auto-emits a typed TypeScript interface in the
+    // `.d.ts`. Struct fields match the serde JSON wire shape (uuid/decimal/enum →
+    // String, u64 → i64, timestamp → i64, json → serde_json::Value, etc.).
+    // (flat has all whitespace stripped, so `pub struct NapiUser` → `pubstructNapiUser`)
+    for model in ["User", "Post", "Tag", "Reading"] {
+        assert!(
+            flat.contains(&format!("pubstructNapi{model}")),
+            "typed #[napi(object)] row struct Napi{model} is generated"
+        );
+        assert!(
+            flat.contains(&format!("#[napi(object,js_name=\"{model}\")]")),
+            "Napi{model} is annotated #[napi(object, js_name)]"
+        );
+        assert!(
+            flat.contains(&format!("Napi{model}::from_record")),
+            "Napi{model}::from_record converter is present"
+        );
+    }
+    // Typed fields in the row struct: User has `id: String` (uuid → String) and
+    // `email: String`; Reading has `value: i64` (i64 field).
+    // Note: u64 PK on Reading maps to i64 in the napi struct.
+    assert!(flat.contains("pubid:String"), "User id field is typed String (uuid)");
+    assert!(flat.contains("pubvalue:i64"), "Reading value field is typed i64");
+
+    // get/all now return the typed napi struct instead of JsUnknown.
+    assert!(
+        flat.contains("->Result<Option<NapiUser>>"),
+        "get_user returns typed Option<NapiUser>"
+    );
+    assert!(
+        flat.contains("->Result<Vec<NapiPost>>") || flat.contains("->Result<Vec<NapiUser>>"),
+        "all_<m> returns typed Vec<Napi<Model>>"
+    );
+
     // Rows/ids marshal through the generated struct's serde via NAPI-RS's
     // serde bridge (native JS objects, one source of truth — no second per-field
-    // matrix).
+    // matrix). Input (create/update) still uses the serde bridge; output uses
+    // the typed Napi<Model> struct.
     assert!(flat.contains("database::User"), "rows decode into the generated User struct");
     assert!(flat.contains("env.from_js_value"), "inbound rows/ids via Env::from_js_value");
-    assert!(flat.contains("env.to_js_value"), "outbound rows/ids via Env::to_js_value");
+    assert!(flat.contains("env.to_js_value"), "outbound ids (create) via Env::to_js_value");
 
     // Integrity failures throw a JS Error; engine calls are catch_unwind-guarded
     // (a panic must not unwind across the Node-API boundary).
@@ -3711,29 +3783,36 @@ Reading {
     assert!(flat.contains("catch_unwind"), "engine calls are catch_unwind-guarded");
 
     // Relation traversal (Phase 6b) — forward FK / reverse 1:M / M2M, mirroring the
-    // generated `Database` getters by name, marshalling via the napi serde bridge.
+    // generated `Database` getters by name. Row-returning methods return typed
+    // Napi<Model> structs (typed ergonomics follow-up).
     assert!(
-        flat.contains("pubfnpost_author(&self,env:Env,id:JsUnknown)->Result<JsUnknown>"),
-        "forward FK post_author exists"
+        flat.contains("pubfnpost_author(&self,env:Env,id:JsUnknown)->Result<Option<NapiUser>>"),
+        "forward FK post_author returns typed Option<NapiUser>"
     );
     assert!(
         flat.contains("self.inner.post.get(id).and_then(|__rec|self.inner.post_author(&__rec))"),
         "forward FK fetches the source then resolves the generated getter"
     );
     assert!(
-        flat.contains("pubfnuser_posts(&self,env:Env,id:JsUnknown)->Result<JsUnknown>"),
-        "reverse 1:M user_posts exists"
+        flat.contains("pubfnuser_posts(&self,env:Env,id:JsUnknown)->Result<Vec<NapiPost>>"),
+        "reverse 1:M user_posts returns typed Vec<NapiPost>"
     );
     assert!(flat.contains("pubfnlink_post_tag(&mutself"), "M2M link_post_tag exists");
     assert!(
         flat.contains("pubfnunlink_post_tag(&mutself") && flat.contains("->Result<bool>"),
         "M2M unlink_post_tag returns bool"
     );
-    assert!(flat.contains("pubfnpost_tags(&self,env:Env,id:JsUnknown)"), "M2M forward query post_tags exists");
-    assert!(flat.contains("pubfntag_posts(&self,env:Env,id:JsUnknown)"), "M2M reverse query tag_posts exists");
+    assert!(
+        flat.contains("pubfnpost_tags(&self,env:Env,id:JsUnknown)->Result<Vec<NapiTag>>"),
+        "M2M forward query post_tags returns typed Vec<NapiTag>"
+    );
+    assert!(
+        flat.contains("pubfntag_posts(&self,env:Env,id:JsUnknown)->Result<Vec<NapiPost>>"),
+        "M2M reverse query tag_posts returns typed Vec<NapiPost>"
+    );
 
     // Arrow columnar export (Phase 6b) — per-exportable-column methods returning a
-    // zero-copy external ArrayBuffer + format + length.
+    // zero-copy external ArrayBuffer + format + length (unchanged from prior phase).
     assert!(
         flat.contains("pubfnreading_value_arrow(&self,env:Env)->Result<JsUnknown>"),
         "the exportable i64 column gets a zero-copy Arrow method"
