@@ -414,7 +414,15 @@ impl NapiGenerator {
                     .filter_map(|f| {
                         let fname = format_ident!("{}", f.name);
                         let ty = Self::napi_field_type(&f.field_type)?;
-                        Some(quote! { pub #fname: #ty })
+                        // Pin the JS key to the exact `.forge` field name. Without this,
+                        // `#[napi(object)]` camelCases multi-word fields (`view_count` ->
+                        // `viewCount`), which would diverge from the serde snake_case wire
+                        // shape used by `create`/`update` input, REST, and the TS SDK.
+                        let js_key = f.name.as_str();
+                        Some(quote! {
+                            #[napi(js_name = #js_key)]
+                            pub #fname: #ty
+                        })
                     })
                     .collect();
 

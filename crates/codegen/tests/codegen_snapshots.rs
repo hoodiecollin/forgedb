@@ -3685,6 +3685,7 @@ User {
 Post {
   id: +uuid
   title: string
+  view_count: u64
   author: *User
   tags: [Tag]
 }
@@ -3758,6 +3759,15 @@ Reading {
     // Note: u64 PK on Reading maps to i64 in the napi struct.
     assert!(flat.contains("pubid:String"), "User id field is typed String (uuid)");
     assert!(flat.contains("pubvalue:i64"), "Reading value field is typed i64");
+    // Every row-struct field pins its JS key to the exact `.forge` field name via
+    // `#[napi(js_name = ...)]`. Without this, `#[napi(object)]` camelCases multi-word
+    // fields (`view_count` -> `viewCount`), diverging from the snake_case serde wire
+    // shape used by create/update input, REST, and the TS SDK. The multi-word
+    // `Post.view_count` is the regression guard.
+    assert!(
+        flat.contains("#[napi(js_name=\"view_count\")]"),
+        "row-struct fields pin their snake_case JS key (Post.view_count stays snake_case, not viewCount)"
+    );
 
     // get/all now return the typed napi struct instead of JsUnknown.
     assert!(
