@@ -84,11 +84,99 @@ struct PendingTurn {
     granted_at: Instant,
 }
 
+/// When the coordinator fsyncs its durable replication log at commit (#156,
+/// Option C). Configurable per deployment (`forgedb coordinate --fsync`);
+/// default [`CoordFsync::Always`], which preserves the pre-#156 durability of
+/// the replication log.
+///
+/// The coordinator's `_coordinator_replication.log` is a **resumable, secondary**
+/// artifact: a coordinated client already fsync'd its own columns + WAL before
+/// reporting `Committed`, and followers re-request from their watermark on a
+/// coordinator crash — so trading this log's fsync for throughput never loses
+/// committed client data, only rewinds replication. That is why `Never`/`Periodic`
+/// are safe to offer (guardrail G7 still applies: they are explicit opt-ins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoordFsync {
+    /// Fsync the replication log on every commit (max durability; the default).
+    #[default]
+    Always,
+    /// Never fsync in the commit path — rely on the OS to flush the log. A
+    /// coordinator crash rewinds the replication tail (no client data lost).
+    Never,
+    /// Fsync once per N commits (group commit): amortizes the barrier under load.
+    Periodic(u64),
+}
+
+// ── Broker state (its own lock, off the turn critical section — #156 Option A) ──
+
+/// The durable replication broker plus its fsync policy, behind a **separate**
+/// mutex from [`CoordState`] (#156 Option A). The broker append + fsync barrier
+/// runs here, OUTSIDE the turn/condvar critical section, so a committing client's
+/// disk barrier no longer blocks other writers from being granted a turn. Broker
+/// appends stay in commit order because a `Committed` handler holds this lock
+/// across the turn release (see `handle_connection`), and only one turn is ever
+/// outstanding.
+struct BrokerState {
+    broker: DurableBroker,
+    fsync: CoordFsync,
+    commits_since_flush: u64,
+}
+
+impl BrokerState {
+    /// Append one commit's opaque records (in commit order) and fsync per policy.
+    /// Runs under the broker mutex, never the coord/turn mutex.
+    fn record_commit(
+        &mut self,
+        model_tags: &[Vec<u8>],
+        row_indices: &[u64],
+        change_kinds: &[u8],
+        opaque_row_bytes: &[Vec<u8>],
+    ) {
+        let n = model_tags.len().min(row_indices.len()).min(opaque_row_bytes.len());
+        for i in 0..n {
+            let model_name = String::from_utf8_lossy(&model_tags[i]).into_owned();
+            let row_index = row_indices[i];
+            let kind_byte = *change_kinds.get(i).unwrap_or(&0);
+            let kind = ChangeKind::from_byte(kind_byte).unwrap_or(ChangeKind::Inserted);
+            let bytes = opaque_row_bytes[i].clone();
+            if let Err(e) = self.broker.record(&model_name, row_index, kind, bytes) {
+                log::warn!("coordinator: broker record error: {e}");
+            }
+        }
+        // The broker is opened with `FsyncPolicy::Never` (record() does not fsync),
+        // so the coordinator drives the barrier here per its configured mode —
+        // one barrier per commit (or per N commits), never one per record.
+        let should_flush = match self.fsync {
+            CoordFsync::Always => true,
+            CoordFsync::Never => false,
+            CoordFsync::Periodic(k) => {
+                self.commits_since_flush += 1;
+                if self.commits_since_flush >= k.max(1) {
+                    self.commits_since_flush = 0;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if should_flush && let Err(e) = self.broker.flush() {
+            log::warn!("coordinator: broker flush error: {e}");
+        }
+    }
+}
+
+/// Everything a connection handler shares: the turn state (coord mutex + condvar)
+/// and the broker (its own mutex). Split so the broker fsync barrier is off the
+/// turn critical section (#156 Option A).
+struct Shared {
+    coord: (Mutex<CoordState>, Condvar),
+    broker: Mutex<BrokerState>,
+}
+
 // ── Shared coordinator state (behind Mutex + Condvar) ────────────────────────
 
 struct CoordState {
     seq: CommitSequencer,
-    broker: DurableBroker,
     next_turn_id: u64,
     /// At most one outstanding granted turn.
     pending_turn: Option<PendingTurn>,
@@ -97,10 +185,9 @@ struct CoordState {
 }
 
 impl CoordState {
-    fn new(seq: CommitSequencer, broker: DurableBroker) -> Self {
+    fn new(seq: CommitSequencer) -> Self {
         CoordState {
             seq,
-            broker,
             next_turn_id: 1,
             pending_turn: None,
             shutdown: false,
@@ -159,47 +246,25 @@ impl CoordState {
 
     /// Record the committed payload to `_coordinator_replication.log` and
     /// release the turn.  Returns the message to send to the client.
-    fn commit(
-        &mut self,
-        turn_id: u64,
-        model_tags: Vec<Vec<u8>>,
-        row_indices: Vec<u64>,
-        change_kinds: Vec<u8>,
-        opaque_row_bytes: Vec<Vec<u8>>,
-    ) -> ServerMsg {
-        // Validate that this is the current outstanding turn.
+    /// Validate that `turn_id` is the current outstanding turn, release it (so a
+    /// waiting writer can be granted immediately), and return its reserved LSN.
+    /// The durable broker append + fsync barrier happens AFTER this, under the
+    /// separate broker lock (#156 Option A) — never inside the turn critical
+    /// section — so the barrier no longer blocks turn-granting.
+    fn take_commit(&mut self, turn_id: u64) -> std::result::Result<u64, ServerMsg> {
         let lsn = match &self.pending_turn {
             Some(p) if p.turn_id == turn_id => p.reserved_lsn,
             Some(p) => {
-                return ServerMsg::Error {
-                    message: format!(
-                        "turn {} is not current (current is {})",
-                        turn_id, p.turn_id
-                    ),
-                };
+                return Err(ServerMsg::Error {
+                    message: format!("turn {} is not current (current is {})", turn_id, p.turn_id),
+                });
             }
             None => {
-                return ServerMsg::Error {
+                return Err(ServerMsg::Error {
                     message: format!("turn {} was not granted (no pending turn)", turn_id),
-                };
+                });
             }
         };
-
-        // Append to the durable replication log — opaque bytes, never decoded.
-        let n = model_tags.len().min(row_indices.len()).min(opaque_row_bytes.len());
-        for i in 0..n {
-            let model_name = String::from_utf8_lossy(&model_tags[i]).into_owned();
-            let row_index = row_indices[i];
-            let kind_byte = *change_kinds.get(i).unwrap_or(&0);
-            let kind = ChangeKind::from_byte(kind_byte).unwrap_or(ChangeKind::Inserted);
-            let bytes = opaque_row_bytes[i].clone();
-            if let Err(e) = self.broker.record(&model_name, row_index, kind, bytes) {
-                log::warn!("coordinator: broker record error: {e}");
-            }
-        }
-        if let Err(e) = self.broker.flush() {
-            log::warn!("coordinator: broker flush error: {e}");
-        }
 
         // Release the turn.
         self.pending_turn = None;
@@ -211,8 +276,7 @@ impl CoordState {
         // The conflict map grows monotonically with committed keys — bounded by the
         // number of unique rows and unique-key claims ever written, which is
         // acceptable at v1 application-database scale.
-
-        ServerMsg::Ack { lsn }
+        Ok(lsn)
     }
 }
 
@@ -222,7 +286,7 @@ impl CoordState {
 pub struct Coordinator {
     root: PathBuf,
     socket_path: PathBuf,
-    state: Arc<(Mutex<CoordState>, Condvar)>,
+    state: Arc<Shared>,
     _lock_file: File,
 }
 
@@ -244,6 +308,19 @@ impl Coordinator {
     /// Returns `Err(DirAlreadyLocked)` if another coordinator process already
     /// holds the lock on this directory.
     pub fn open(root: &Path, socket_path: &Path) -> Result<Self> {
+        Self::open_with_fsync(root, socket_path, CoordFsync::default())
+    }
+
+    /// Like [`open`](Self::open) but with an explicit replication-log fsync policy
+    /// (#156 Option C). `CoordFsync::Always` (the `open` default) preserves the
+    /// pre-#156 durability; `Never`/`Periodic` trade replication-log durability
+    /// for commit throughput (no committed client data is ever at risk — see
+    /// [`CoordFsync`]).
+    pub fn open_with_fsync(
+        root: &Path,
+        socket_path: &Path,
+        fsync: CoordFsync,
+    ) -> Result<Self> {
         std::fs::create_dir_all(root)?;
 
         // Acquire the #89 single-writer lock (spec T3-5): the SAME
@@ -260,9 +337,14 @@ impl Coordinator {
             .try_lock_exclusive()
             .map_err(|_| ServerError::DirAlreadyLocked)?;
 
-        // Open the durable replication log.
+        // Open the durable replication log with `FsyncPolicy::Never` so `record()`
+        // does NOT fsync per event; the coordinator drives the barrier once per
+        // commit (or per N, or never) via `CoordFsync` (#156). This also fixes a
+        // latent inefficiency — the old `Always` broker fsync'd once per record
+        // AND once per explicit flush (N+1 barriers per commit); now it is at most
+        // one barrier per commit even in `Always` mode.
         let log_path = root.join("_coordinator_replication.log");
-        let broker = DurableBroker::open(&log_path, FsyncPolicy::Always, 1024)
+        let broker = DurableBroker::open(&log_path, FsyncPolicy::Never, 1024)
             .map_err(io::Error::other)?;
 
         // Seed the sequencer from the broker's current watermark so LSNs
@@ -271,16 +353,24 @@ impl Coordinator {
         let seq = CommitSequencer::new(watermark);
 
         log::info!(
-            "coordinator: opened root={} socket={} watermark={}",
+            "coordinator: opened root={} socket={} watermark={} fsync={:?}",
             root.display(),
             socket_path.display(),
             watermark,
+            fsync,
         );
 
         Ok(Coordinator {
             root: root.to_owned(),
             socket_path: socket_path.to_owned(),
-            state: Arc::new((Mutex::new(CoordState::new(seq, broker)), Condvar::new())),
+            state: Arc::new(Shared {
+                coord: (Mutex::new(CoordState::new(seq)), Condvar::new()),
+                broker: Mutex::new(BrokerState {
+                    broker,
+                    fsync,
+                    commits_since_flush: 0,
+                }),
+            }),
             _lock_file: lock_file,
         })
     }
@@ -309,7 +399,7 @@ impl Coordinator {
                     });
                 }
                 Err(e) => {
-                    let (lock, _) = &*self.state;
+                    let (lock, _) = &self.state.coord;
                     if lock.lock().unwrap().shutdown {
                         break;
                     }
@@ -322,7 +412,7 @@ impl Coordinator {
 
     /// Signal the coordinator to stop accepting new connections.
     pub fn shutdown(&self) {
-        let (lock, cvar) = &*self.state;
+        let (lock, cvar) = &self.state.coord;
         let mut s = lock.lock().unwrap();
         s.shutdown = true;
         cvar.notify_all();
@@ -346,7 +436,7 @@ fn is_eof(e: &io::Error) -> bool {
 /// use `Condvar::wait_timeout` so a stuck client cannot deadlock others.
 fn handle_connection(
     mut stream: UnixStream,
-    state: Arc<(Mutex<CoordState>, Condvar)>,
+    state: Arc<Shared>,
 ) -> io::Result<()> {
     // Set a read timeout so a hung client cannot block this thread forever.
     stream.set_read_timeout(Some(TURN_TIMEOUT))?;
@@ -378,13 +468,37 @@ fn handle_connection(
                 change_kinds,
                 opaque_row_bytes,
             } => {
-                let (lock, cvar) = &*state;
+                // #156 Option A: acquire the BROKER lock first (held across the
+                // turn release), then briefly the coord lock to validate + release
+                // the turn and notify waiters. Ordering: because the broker lock is
+                // held from before the turn release until after this commit's fsync,
+                // and only one turn is ever outstanding, broker appends stay in
+                // commit order — while the NEXT writer's turn + client I/O overlap
+                // this commit's replication barrier (which is now off the turn path).
+                let mut broker = state.broker.lock().unwrap();
+                let (lock, cvar) = &state.coord;
                 let reply = {
                     let mut s = lock.lock().unwrap();
-                    s.commit(turn_id, model_tags, row_indices, change_kinds, opaque_row_bytes)
+                    match s.take_commit(turn_id) {
+                        Ok(lsn) => {
+                            // Coord lock is dropped at the end of this block; wake
+                            // waiters so a new turn can be granted DURING the fsync.
+                            drop(s);
+                            cvar.notify_all();
+                            // Durable append + fsync (per policy) under the broker
+                            // lock only — not the turn lock.
+                            broker.record_commit(
+                                &model_tags,
+                                &row_indices,
+                                &change_kinds,
+                                &opaque_row_bytes,
+                            );
+                            ServerMsg::Ack { lsn }
+                        }
+                        Err(err) => err,
+                    }
                 };
-                // Notify waiting clients that the turn slot is now free.
-                cvar.notify_all();
+                drop(broker);
                 let frame = encode_msg(&reply)?;
                 stream.write_all(&frame)?;
             }
@@ -402,11 +516,11 @@ fn handle_connection(
 /// if the coordinator is busy, wait up to `TURN_TIMEOUT` for the current
 /// turn to clear before returning `Busy`.
 fn request_turn_with_wait(
-    state: &Arc<(Mutex<CoordState>, Condvar)>,
+    state: &Arc<Shared>,
     write_set_keys: Vec<Vec<u8>>,
     snapshot_lsn: u64,
 ) -> ServerMsg {
-    let (lock, cvar) = state.as_ref();
+    let (lock, cvar) = &state.coord;
     let deadline = Instant::now() + TURN_TIMEOUT;
 
     let mut s = lock.lock().unwrap();
@@ -496,7 +610,7 @@ mod tests {
     fn grant_and_commit_through_state() {
         let tmp = TempDir::new().unwrap();
         let coord = make_coordinator(&tmp);
-        let (lock, _) = &*coord.state;
+        let (lock, _) = &coord.state.coord;
         let mut s = lock.lock().unwrap();
 
         // Empty write-set at snapshot_lsn=0 → should grant.
@@ -511,15 +625,10 @@ mod tests {
         let busy = s.try_request_turn(vec![b"row:1".to_vec()], 0);
         assert!(matches!(busy, ServerMsg::Busy));
 
-        // Commit the first turn.
-        let ack = s.commit(
-            turn_id,
-            vec![b"user".to_vec()],
-            vec![0],
-            vec![0],
-            vec![vec![1, 2, 3]],
-        );
-        assert!(matches!(ack, ServerMsg::Ack { lsn } if lsn == reserved_lsn));
+        // Commit the first turn (release + LSN; the broker append is off the turn
+        // lock in the handler — #156 Option A — so `take_commit` only returns lsn).
+        let lsn = s.take_commit(turn_id).expect("commit");
+        assert_eq!(lsn, reserved_lsn);
 
         // Now another request succeeds (different key — no conflict).
         let reply2 = s.try_request_turn(vec![b"row:1".to_vec()], reserved_lsn);
@@ -530,7 +639,7 @@ mod tests {
     fn conflict_detection() {
         let tmp = TempDir::new().unwrap();
         let coord = make_coordinator(&tmp);
-        let (lock, _) = &*coord.state;
+        let (lock, _) = &coord.state.coord;
         let mut s = lock.lock().unwrap();
 
         // Commit key "row:0" at snapshot_lsn=0.
@@ -539,11 +648,7 @@ mod tests {
             ServerMsg::Grant { turn_id, .. } => turn_id,
             _ => panic!(),
         };
-        let ServerMsg::Ack { lsn: committed_lsn } =
-            s.commit(turn_id, vec![], vec![], vec![], vec![])
-        else {
-            panic!()
-        };
+        let committed_lsn = s.take_commit(turn_id).expect("commit");
 
         // Another transaction with snapshot_lsn=0 (predates the commit) on the same key
         // → conflict.
