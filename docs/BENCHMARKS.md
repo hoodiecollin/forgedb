@@ -94,9 +94,12 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
 
 - **In-process for everyone possible** — SQLite/DuckDB/redb linked in-process; PG over a
   localhost socket with prepared statements, clearly labeled as carrying transport cost.
-- **Matched fsync semantics per group** — ForgeDB's default `FsyncPolicy::Always` is
-  compared against SQLite `synchronous=FULL` + `journal_mode=WAL`; a separate relaxed
-  group compares the looser tiers. Never mix durability levels in one chart.
+- **Matched fsync semantics per group** — ForgeDB is fixed at `FsyncPolicy::Always`,
+  which on macOS is an `F_FULLFSYNC` barrier. The like-for-like SQLite config is
+  `journal_mode=WAL` + `synchronous=FULL` + **`fullfsync=1`** (also a barrier); SQLite's
+  default (no `fullfsync`) is a *weaker* guarantee (plain `fsync`) and belongs in a
+  separate row, not the matched comparison. The harness runs SQLite inserts at both.
+  Never mix durability levels in one chart. (See "fsync-parity findings" above.)
 - **Criterion** for micro-timings (point ops, probes, traversals); a separate driver for
   wall-clock end-to-end (bulk load, reopen, footprint).
 - **Report distributions (p50/p99), not just means**, always next to a footprint number.
@@ -104,19 +107,59 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
   until compaction; M2M is a scan; PG pays parse + network; hash indexes are exact-match
   only (no range/prefix).
 
-## Open methodology items (must resolve before publishing write numbers)
+## fsync-parity findings (RESOLVED)
 
-- **macOS fsync parity (`F_FULLFSYNC` vs `fsync`).** Rust's `File::sync_all()` on macOS
-  issues `F_FULLFSYNC` — a true barrier flush that costs several ms on Apple SSDs — while
-  SQLite's `synchronous = FULL` uses plain `fsync()` unless `PRAGMA fullfsync = 1`. Early
-  runs show ForgeDB single-insert latency ~100× SQLite's; a large part of that is likely
-  **ForgeDB buying a stronger durability guarantee**, not raw inefficiency. Before any
-  write comparison is reported, confirm what `forgedb-wal` actually calls and either set
-  SQLite `fullfsync = 1` to match or state the durability difference explicitly. Do not
-  publish the raw gap as-is.
-- **Per-insert fsync count.** ForgeDB appends per-column files; verify whether a single
-  insert fsyncs once (WAL only) or multiple times, since that changes the write story
-  independently of the `F_FULLFSYNC` question.
+The write comparison hinged on a durability-guarantee mismatch. Measured on this macOS
+host (Apple SSD), per durable op:
+
+| Primitive | per-op | What it is |
+| --- | --- | --- |
+| Rust `File::sync_all()` | ~3.5 ms | On macOS this is `fcntl(F_FULLFSYNC)` — a true barrier flush. |
+| `libc fcntl(F_FULLFSYNC)` | ~3.7 ms | The macOS barrier primitive directly (matches `sync_all`). |
+| `libc::fsync()` | ~27 µs | Plain fsync — flushes to the drive cache, **not** a barrier. |
+| SQLite `synchronous=FULL` (default) | ~113 µs | Uses plain `fsync()`. |
+| SQLite `FULL` + `fullfsync=1` | ~4.0 ms | Uses `F_FULLFSYNC` — same barrier as ForgeDB. |
+
+**Conclusions:**
+
+1. **`forgedb-wal` (`FsyncPolicy::Always`) calls `File::sync_all()`** (`writer.rs`), which
+   on macOS is `F_FULLFSYNC` — a real barrier. SQLite's out-of-box `synchronous=FULL`
+   uses plain `fsync()` (weaker on macOS). So the raw ~100× single-insert gap was
+   **almost entirely a durability-level mismatch, not engine inefficiency.** At matched
+   durability (SQLite `fullfsync=1`), SQLite is ~4.0 ms.
+2. **ForgeDB does TWO barriers per insert, not one.** The generated `insert` fsyncs the
+   WAL (`sync_all`, ~3.5 ms) *and* records to the durable replication broker
+   (`DurableBroker::record` → `sync_all` under `FsyncPolicy::Always`, `durable.rs`), which
+   `open_at` attaches unconditionally — a second ~3.5 ms barrier. That is why ForgeDB
+   single-insert is ~7.6 ms ≈ 2 × a single barrier, vs. SQLite-`fullfsync`'s ~4.0 ms for
+   one. The residual over the raw barrier (~0.5 ms) is serde + column appends + index
+   maintenance — reasonable.
+
+**How the harness reports it now:** `sqlite/insert_user` runs at **both** durability
+levels — `default` (plain fsync, SQLite's out-of-box guarantee) and `fullfsync` (matched
+barrier) — so every write comparison is explicit about which durability it's at. ForgeDB
+is always at the barrier level (its fsync policy is fixed `Always`, no relaxed tier).
+
+## Performance-triage candidates (seeded from the fsync work)
+
+Feed these into the broader perf sweep (not fixes — triage items):
+
+- **Double fsync barrier per write (highest signal).** `open_at` attaches a synchronous
+  `FsyncPolicy::Always` replication broker, so every insert/update/delete pays a second
+  `F_FULLFSYNC` on the critical path even for apps that never consume `/replicate`.
+  Options to weigh: make the broker fsync policy configurable / batched / async; only
+  attach it when replication is enabled; or coalesce the WAL + broker append behind one
+  barrier. Removing the second barrier alone would roughly halve durable-write latency
+  (~7.6 ms → ~4 ms, on par with SQLite-`fullfsync`).
+- **No relaxed durability tier.** ForgeDB's fsync policy is a fixed generated constant
+  (`Always`); there is no per-deployment knob to trade the barrier for `Periodic`/grouped
+  commit the way SQLite exposes `synchronous`/`fullfsync`. Worth a design look for the
+  write-throughput story.
+- **Group/batch commit.** Bulk load fsyncs per row (one — now two — barriers each). A
+  batched-commit path (one barrier per N rows) is the standard fix and would transform the
+  bulk-load numbers; currently absent.
+
+## Expected shape of results (stated up front, so results don't read as cherry-picked)
 
 ## Expected shape of results (stated up front, so results don't read as cherry-picked)
 
