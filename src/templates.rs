@@ -118,28 +118,6 @@ pub fn default_config(project_name: &str) -> String {
 name = "{}"
 version = "0.1.0"
 
-[database]
-path = "./data/db"
-wal_path = "./data/wal"
-page_size = 4096
-compaction_threshold = 0.20
-
-[api]
-port = 3000
-host = "127.0.0.1"
-cors_origins = ["http://localhost:5173"]
-
-[dev]
-hot_reload = true
-watch_paths = ["schema.forge", "src/"]
-browser = true
-
-[codegen]
-rust_output = "./generated"
-typescript_output = "./generated"
-format_rust = true
-format_typescript = false
-
 # Generator configuration — consumed by the forgedb CLI.
 # Precedence: explicit CLI flag > values below > built-in defaults.
 [generate]
@@ -147,6 +125,42 @@ schema = "schema.forge"
 output = "./generated"
 # Uncomment to restrict which targets are generated:
 # targets = ["rust", "typescript", "api", "stubs"]
+
+# Generate-time RUNTIME BEHAVIOR (epic #126). These schema-blind knobs are baked
+# into the generated database.rs when you run `forgedb generate` / `forgedb build`
+# — the Rust compiler optimizes around them (there is no runtime settings engine).
+# Every value below is the DEFAULT; the commented lines document what you can
+# change. Changing one requires regenerating.
+[runtime]
+# Attach the durable replication broker so `/replicate` and browser read-replica
+# followers work (#130). OFF by default: an unused broker fsyncs a SECOND time per
+# write (pure waste when nothing is subscribed). Turn on only if you consume it.
+replication = false
+# In-process change-feed / durable-broker buffer capacity (#135).
+# changefeed_capacity = 1024
+# Max @on_delete(cascade) recursion depth — a structural safety bound (#150).
+# max_cascade_depth = 64
+
+# Generate-time STORAGE / DURABILITY knobs (epic #126). Also baked at generate
+# time. Defaults are crash-safe and byte-identical to prior releases.
+[storage]
+# WAL fsync policy (#129): "always" (default — every acked write is crash-safe)
+# or "never" (OS flushes on its own schedule; FASTER but a real data-loss window
+# on power loss — an explicit, deliberate durability trade-off).
+# fsync = "always"
+# Mutations per collection between WAL checkpoints (#131) — bounds WAL growth.
+# wal_checkpoint_interval = 1000
+# In-process auto-compaction of dead row versions (#134). true = reclaim
+# automatically; false = omit the auto-trigger (reclaim only via an explicit
+# Database::compact() call).
+# compaction = true
+# Dead row versions per model before auto-compaction fires (#133).
+# compaction_threshold = 1000
+
+# Note: the generated server's host/port, log level/format, and graceful-shutdown
+# are DEPLOY-environment config, read from the environment at process start
+# (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT) — 12-factor, not
+# baked into the binary. See the generated main.rs and docs/DEPLOYMENT.md.
 
 # Multi-tenancy (#59): physical, dir-per-tenant isolation. Each tenant's data
 # lives under <root>/<tenant>/, and ONE `forgedb serve` process serves ONE
