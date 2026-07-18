@@ -258,6 +258,15 @@ across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
 
+- **Hardcoded runtime behavior → epic #126 (configurable runtime behavior) + perf triage #152.** Many bullets
+  below note a value is "fixed / not yet config / not tunable" (fsync policy, WAL checkpoint interval, compaction
+  threshold, changefeed capacity, coordinator timeouts, `MAX_LIMIT`, `MAX_CASCADE_DEPTH`, wasm commit debounce, …).
+  Those are now catalogued as child issues under **epic #126** (design note + binding-time tier model — A
+  generate-time code specialization / B baked const / C process-start override — in
+  `docs/proposals/configurable-runtime-behavior.md`). Performance factors that are *not* config (junction indexing,
+  projection wiring, buffered I/O, lock scope, the double fsync barrier's algorithmic peers) are the **#152** triage
+  sweep. When you make one of these configurable or fix a perf item, update BOTH the relevant bullet here and the
+  issue. Benchmark harness + fsync-parity findings: `docs/BENCHMARKS.md` + `benchmarks/`.
 - **Core is not yet production-complete — ForgeDB is built perimeter-first (v1 roadmap: `docs/V1_ROADMAP.md`).**
   The advanced, well-documented features below (live queries, multi-tenancy, snapshots, backup, single-writer/
   many-reader) are real but sit on a **generated core with critical gaps** that the "LANDED" bullets can obscure.
