@@ -148,6 +148,11 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#157 — redundant write-path serialization (2026-07-18).** Part A: serialize the record ONCE per
+  insert/update/delete (WAL borrows the buffer, the broker moves it) instead of twice. Part B: a field in
+  ≥2 index structures (single + composite) derives its tagged index key once per mutation and reuses it. No
+  format change. The *encoding* half (JSON→binary codec across all internal wasteful-JSON sites) is the
+  separate, larger **#165** (sweep catalogued there).
 - **#156 — coordinator fsync off the turn lock (2026-07-18).** The Tier-3 coordinator's replication-log
   append + fsync now runs under a separate broker mutex, OUTSIDE the turn/condvar critical section (Option A),
   so a committing client's barrier no longer blocks other writers from a turn; the next writer's turn +
