@@ -594,12 +594,13 @@ impl ComplexModelStorage {
     /// Native fsync; wasm arena no-op (durability at the transport's
     /// IndexedDB/OPFS write boundary).
     pub fn commit(&mut self) -> std::io::Result<()> {
-        self.id_col.flush()?;
-        self.count_col.flush()?;
-        self.price_col.flush()?;
-        self.active_col.flush()?;
-        self.created_at_col.flush()?;
-        self.tombstones.flush()?;
+        self.id_col.sync_to_drive()?;
+        self.count_col.sync_to_drive()?;
+        self.price_col.sync_to_drive()?;
+        self.active_col.sync_to_drive()?;
+        self.created_at_col.sync_to_drive()?;
+        self.tombstones.sync_to_drive()?;
+        self.tombstones.barrier()?;
         Ok(())
     }
     fn recover_from_wal(&mut self) {
@@ -683,12 +684,25 @@ impl ComplexModelStorage {
     /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
     /// required for correctness (recovery reads the column lengths).
     pub fn checkpoint(&mut self) {
-        self.id_col.flush().expect("Failed to fsync column on checkpoint");
-        self.count_col.flush().expect("Failed to fsync column on checkpoint");
-        self.price_col.flush().expect("Failed to fsync column on checkpoint");
-        self.active_col.flush().expect("Failed to fsync column on checkpoint");
-        self.created_at_col.flush().expect("Failed to fsync column on checkpoint");
-        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.id_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.count_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.price_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.active_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.created_at_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.tombstones
+            .sync_to_drive()
+            .expect("Failed to sync tombstones to drive on checkpoint");
+        self.tombstones.barrier().expect("Failed to issue checkpoint device barrier");
         self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
         self.writes_since_checkpoint = 0;
     }

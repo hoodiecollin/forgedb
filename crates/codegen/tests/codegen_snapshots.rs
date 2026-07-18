@@ -717,6 +717,27 @@ Tag {
         "junction is a Database field"
     );
 
+    // #154: the junction holds in-memory traversal indexes and the M2M getters
+    // PROBE them (O(degree)) instead of scanning every link row via `pairs()`.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("left_index:std::collections::HashMap<Uuid,Vec<Uuid>>")
+            && flat.contains("right_index:std::collections::HashMap<Uuid,Vec<Uuid>>"),
+        "junction holds left_index/right_index traversal maps (#154)"
+    );
+    assert!(
+        flat.contains("self.post_tag_link.rights_of(id)"),
+        "forward M2M getter probes rights_of (not pairs().filter())"
+    );
+    assert!(
+        flat.contains("self.post_tag_link.lefts_of(id)"),
+        "reverse M2M getter probes lefts_of (not pairs().filter())"
+    );
+    assert!(
+        !flat.contains(".pairs().into_iter().filter(|(left,_)|*left==id)"),
+        "the live forward getter no longer scans pairs() (#154)"
+    );
+
     // Eager-load struct bundling a record with its resolved forward refs.
     assert!(code.contains("pub struct PostWithRelations"), "eager-load struct");
     assert!(
@@ -1773,21 +1794,35 @@ Tag {
         "storage tracks mutations since the last checkpoint"
     );
 
-    // The checkpoint fsyncs columns BEFORE truncating the WAL (the correctness
-    // ordering) and resets the counter.
+    // The checkpoint makes columns durable BEFORE truncating the WAL (the
+    // correctness ordering) and resets the counter. #153: durability is now a
+    // coalesced push-to-drive on every column + tombstones, then ONE device
+    // barrier — instead of an F_FULLFSYNC per column.
     assert!(
         code.contains("pub fn checkpoint(&mut self)"),
         "generated per-model checkpoint method"
     );
     assert!(
-        code.contains("self.tombstones.flush()") && code.contains("self.wal.truncate()"),
-        "checkpoint fsyncs columns/tombstones then truncates the WAL"
+        code.contains("self.tombstones.sync_to_drive()")
+            && code.contains("self.tombstones.barrier()")
+            && code.contains("self.wal.truncate()"),
+        "checkpoint syncs columns to drive + one barrier, then truncates the WAL (#153)"
     );
-    let flush_pos = code.find(".flush().expect(\"Failed to fsync tombstones on checkpoint\")");
-    let trunc_pos = code.find(".truncate().expect(\"Failed to truncate WAL on checkpoint\")");
+    // Coalesced: every checkpoint/commit pushes N columns to the drive but issues
+    // only ONE device barrier, so sync-to-drive calls strictly outnumber barriers
+    // (#153 — the whole point: 1 barrier per checkpoint, not N).
     assert!(
-        matches!((flush_pos, trunc_pos), (Some(f), Some(t)) if f < t),
-        "columns are fsync'd before the WAL is truncated (durability ordering)"
+        code.matches(".sync_to_drive()").count() > code.matches(".barrier()").count(),
+        "each checkpoint syncs many columns to drive but issues a single barrier (#153)"
+    );
+    // Ordering (durability): sync-to-drive → device barrier → WAL truncate. Match
+    // on the distinct expect-message needles (prettyplease may wrap the chain).
+    let sync_pos = code.find("Failed to sync tombstones to drive on checkpoint");
+    let barrier_pos = code.find("Failed to issue checkpoint device barrier");
+    let trunc_pos = code.find("Failed to truncate WAL on checkpoint");
+    assert!(
+        matches!((sync_pos, barrier_pos, trunc_pos), (Some(s), Some(b), Some(t)) if s < b && b < t),
+        "sync-to-drive, then the barrier, then WAL truncate (durability ordering, #153)"
     );
 
     // Auto-invoked from the mutation path once the interval is reached.
@@ -1815,11 +1850,13 @@ Tag {
         "no hardcoded-0 checkpoint left in the manifest"
     );
 
-    // Junctions (no WAL — a #89 boundary) still fsync their id columns at checkpoint
-    // so a full Database::checkpoint() leaves link rows as durable as model rows.
+    // Junctions (no WAL — a #89 boundary) still make their id columns durable at
+    // checkpoint (coalesced push-to-drive + one barrier, #153) so a full
+    // Database::checkpoint() leaves link rows as durable as model rows.
     assert!(
-        code.contains("Failed to fsync junction left column on checkpoint"),
-        "junction checkpoint fsyncs its id columns (no WAL to truncate)"
+        code.contains("Failed to sync junction left column on checkpoint")
+            && code.contains("Failed to issue junction checkpoint device barrier"),
+        "junction checkpoint syncs its id columns + one barrier (no WAL to truncate)"
     );
 }
 

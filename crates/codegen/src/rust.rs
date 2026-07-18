@@ -3085,10 +3085,13 @@ impl RustGenerator {
             /// Native fsync; wasm arena no-op (durability at the transport's
             /// IndexedDB/OPFS write boundary).
             pub fn commit(&mut self) -> std::io::Result<()> {
+                // Coalesced durability (#153): push every column to the drive
+                // cache, then ONE device barrier (native); both no-ops on wasm.
                 #(
-                    self.#col_idents.flush()?;
+                    self.#col_idents.sync_to_drive()?;
                 )*
-                self.tombstones.flush()?;
+                self.tombstones.sync_to_drive()?;
+                self.tombstones.barrier()?;
                 Ok(())
             }
         }
@@ -3120,16 +3123,26 @@ impl RustGenerator {
             /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
             /// required for correctness (recovery reads the column lengths).
             pub fn checkpoint(&mut self) {
-                // 1. Make the committed columns durable up to `row_count`.
+                // 1. Push every column + the tombstones to the drive cache — the
+                //    cheap flush, NO device barrier (#153). On macOS a barrier
+                //    (F_FULLFSYNC) is ~3.5 ms; a plain fsync is ~27 µs.
                 #(
                     self.#col_idents
-                        .flush()
-                        .expect("Failed to fsync column on checkpoint");
+                        .sync_to_drive()
+                        .expect("Failed to sync column to drive on checkpoint");
                 )*
                 self.tombstones
-                    .flush()
-                    .expect("Failed to fsync tombstones on checkpoint");
-                // 2. Only now that the data is durable, discard the redundant WAL.
+                    .sync_to_drive()
+                    .expect("Failed to sync tombstones to drive on checkpoint");
+                // 2. ONE device barrier makes ALL of the above durable on media
+                //    (#153): F_FULLFSYNC flushes the whole drive cache, covering
+                //    every column pushed in step 1 — 1 barrier per checkpoint, not
+                //    N. (On the wasm arena backend both steps are no-ops; durability
+                //    is at the transport's IndexedDB/OPFS write boundary.)
+                self.tombstones
+                    .barrier()
+                    .expect("Failed to issue checkpoint device barrier");
+                // 3. Only now that the data is durable, discard the redundant WAL.
                 self.wal
                     .truncate()
                     .expect("Failed to truncate WAL on checkpoint");
@@ -7198,6 +7211,18 @@ impl RustGenerator {
                     /// Appended in lockstep with `left`/`right` (append-only).
                     tombstones: Tombstones,
                     row_count: usize,
+                    /// In-memory M2M traversal indexes (#154): the LIVE right-ids
+                    /// per left-id and vice-versa, so `post_tags`/`tag_posts` probe
+                    /// in O(matches) instead of scanning every link row into a
+                    /// latest-wins HashMap on every call.  Maintained in lockstep
+                    /// with `link`/`unlink` (link adds, unlink removes — so the
+                    /// stored set is always exactly the live set, latest-wins), and
+                    /// rebuilt from the committed rows on `new_at`.  Each per-key
+                    /// `Vec` preserves first-link order and never holds a duplicate
+                    /// (idempotent add).  Writer-only, like the FK `find_by_*`
+                    /// indexes (#100) — readers/snapshots still use the `_at` scans.
+                    left_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
+                    right_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
                     broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
                 }
@@ -7239,16 +7264,92 @@ impl RustGenerator {
                                 .append(false)
                                 .expect("Failed to back-fill junction tombstone");
                         }
+                        // Rebuild the in-memory traversal indexes (#154) from the
+                        // committed rows, applying latest-wins per pair so only LIVE
+                        // edges are indexed (an unlinked-then-not-relinked pair is
+                        // excluded).  Single pass over the prefix, mirroring
+                        // `pairs_prefix` but populating both directions.
+                        let mut left_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                            std::collections::HashMap::new();
+                        let mut right_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                            std::collections::HashMap::new();
+                        {
+                            let mut __state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                                std::collections::HashMap::new();
+                            let mut __order: Vec<(Uuid, Uuid)> = Vec::new();
+                            for i in 0..row_count {
+                                let l = Uuid::from_bytes(
+                                    left_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                let r = Uuid::from_bytes(
+                                    right_col.read_uuid(i).expect("Failed to read link"),
+                                );
+                                if !__state.contains_key(&(l, r)) {
+                                    __order.push((l, r));
+                                }
+                                __state.insert((l, r), tombstones.is_deleted(i).unwrap_or(false));
+                            }
+                            for (l, r) in __order {
+                                if !__state.get(&(l, r)).copied().unwrap_or(true) {
+                                    left_index.entry(l).or_default().push(r);
+                                    right_index.entry(r).or_default().push(l);
+                                }
+                            }
+                        }
                         let db = Self {
                             left_col,
                             right_col,
                             tombstones,
                             row_count,
+                            left_index,
+                            right_index,
                             changefeed: None,
                             broker: None,
                         };
                         db.write_manifest(root);
                         db
+                    }
+
+                    /// Add a live edge to both traversal indexes (#154), idempotent
+                    /// per direction (a re-link of an already-live pair is a no-op in
+                    /// the index — `pairs()`/`get` already dedup by pair).
+                    fn __index_add(&mut self, left: Uuid, right: Uuid) {
+                        let rs = self.left_index.entry(left).or_default();
+                        if !rs.contains(&right) {
+                            rs.push(right);
+                        }
+                        let ls = self.right_index.entry(right).or_default();
+                        if !ls.contains(&left) {
+                            ls.push(left);
+                        }
+                    }
+
+                    /// Remove an edge from both traversal indexes (#154); prunes an
+                    /// emptied bucket so the maps stay bounded by the live degree.
+                    fn __index_remove(&mut self, left: Uuid, right: Uuid) {
+                        if let Some(rs) = self.left_index.get_mut(&left) {
+                            rs.retain(|r| *r != right);
+                            if rs.is_empty() {
+                                self.left_index.remove(&left);
+                            }
+                        }
+                        if let Some(ls) = self.right_index.get_mut(&right) {
+                            ls.retain(|l| *l != left);
+                            if ls.is_empty() {
+                                self.right_index.remove(&right);
+                            }
+                        }
+                    }
+
+                    /// Live right-ids linked to `left` (#154): an O(degree) index
+                    /// probe, not an O(all-links) scan.  Order is first-link order.
+                    pub fn rights_of(&self, left: Uuid) -> Vec<Uuid> {
+                        self.left_index.get(&left).cloned().unwrap_or_default()
+                    }
+
+                    /// Live left-ids linked to `right` (#154): the reverse probe.
+                    pub fn lefts_of(&self, right: Uuid) -> Vec<Uuid> {
+                        self.right_index.get(&right).cloned().unwrap_or_default()
                     }
 
                     /// Attach a shared change feed (#62): `link` then emits a
@@ -7335,6 +7436,9 @@ impl RustGenerator {
                         self.tombstones.append(false)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
+                        // Maintain the traversal indexes (#154) after the durable
+                        // append, so they only ever key committed edges.
+                        self.__index_add(left, right);
                         // Change-feed emit (#62): a link is an M2M junction append.
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
@@ -7364,19 +7468,13 @@ impl RustGenerator {
                     /// Re-`link` after `unlink` restores the edge (a later live row
                     /// supersedes the retraction).
                     pub fn unlink(&mut self, left: Uuid, right: Uuid) -> bool {
-                        // Is the pair currently live?  Latest-wins scan.
-                        let mut __live = false;
-                        for i in 0..self.row_count {
-                            let l = Uuid::from_bytes(
-                                self.left_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            let r = Uuid::from_bytes(
-                                self.right_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            if l == left && r == right {
-                                __live = !self.tombstones.is_deleted(i).unwrap_or(false);
-                            }
-                        }
+                        // Is the pair currently live?  O(degree) index probe (#154)
+                        // instead of the old O(all-links) latest-wins scan.
+                        let __live = self
+                            .left_index
+                            .get(&left)
+                            .map(|rs| rs.contains(&right))
+                            .unwrap_or(false);
                         if !__live {
                             return false;
                         }
@@ -7388,6 +7486,8 @@ impl RustGenerator {
                         self.tombstones.append(true)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
+                        // Retract the edge from the traversal indexes (#154).
+                        self.__index_remove(left, right);
                         if let Some(feed) = &self.changefeed {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Deleted);
                         }
@@ -7410,12 +7510,9 @@ impl RustGenerator {
                     /// Retract every live pair whose `left` id equals `id` (M2M
                     /// cascade-unlink when the left model's row is deleted).
                     pub fn unlink_all_left(&mut self, id: Uuid) {
-                        let __targets: Vec<Uuid> = self
-                            .pairs()
-                            .into_iter()
-                            .filter(|(l, _)| *l == id)
-                            .map(|(_, r)| r)
-                            .collect();
+                        // O(degree) index probe (#154) instead of an O(all-links)
+                        // `pairs()` scan per cascade (a step toward #155).
+                        let __targets = self.rights_of(id);
                         for r in __targets {
                             self.unlink(id, r);
                         }
@@ -7424,12 +7521,9 @@ impl RustGenerator {
                     /// Retract every live pair whose `right` id equals `id` (M2M
                     /// cascade-unlink when the right model's row is deleted).
                     pub fn unlink_all_right(&mut self, id: Uuid) {
-                        let __targets: Vec<Uuid> = self
-                            .pairs()
-                            .into_iter()
-                            .filter(|(_, r)| *r == id)
-                            .map(|(l, _)| l)
-                            .collect();
+                        // O(degree) index probe (#154) instead of an O(all-links)
+                        // `pairs()` scan per cascade (a step toward #155).
+                        let __targets = self.lefts_of(id);
                         for l in __targets {
                             self.unlink(l, id);
                         }
@@ -7441,15 +7535,20 @@ impl RustGenerator {
                     /// only fsyncs the columns so a `Database::checkpoint()`
                     /// leaves link rows as durable as model rows.
                     pub fn checkpoint(&mut self) {
+                        // Coalesced durability (#153): push both id columns +
+                        // tombstones to the drive cache, then ONE device barrier.
                         self.left_col
-                            .flush()
-                            .expect("Failed to fsync junction left column on checkpoint");
+                            .sync_to_drive()
+                            .expect("Failed to sync junction left column on checkpoint");
                         self.right_col
-                            .flush()
-                            .expect("Failed to fsync junction right column on checkpoint");
+                            .sync_to_drive()
+                            .expect("Failed to sync junction right column on checkpoint");
                         self.tombstones
-                            .flush()
-                            .expect("Failed to fsync junction tombstones on checkpoint");
+                            .sync_to_drive()
+                            .expect("Failed to sync junction tombstones on checkpoint");
+                        self.tombstones
+                            .barrier()
+                            .expect("Failed to issue junction checkpoint device barrier");
                     }
 
                     /// Every LIVE (left, right) id pair (latest-wins per pair):
@@ -7770,11 +7869,12 @@ impl RustGenerator {
                 methods.push(quote! {
                     #[doc = #doc]
                     pub fn #fwd_ident(&self, id: Uuid) -> Vec<#model2_ident> {
+                        // O(degree) junction-index probe (#154), not an
+                        // O(all-links) `pairs()` scan.
                         self.#junction_field
-                            .pairs()
+                            .rights_of(id)
                             .into_iter()
-                            .filter(|(left, _)| *left == id)
-                            .filter_map(|(_, right)| self.#model2_storage.get(right))
+                            .filter_map(|right| self.#model2_storage.get(right))
                             .collect()
                     }
                 });
@@ -7825,11 +7925,12 @@ impl RustGenerator {
                 methods.push(quote! {
                     #[doc = #doc]
                     pub fn #rev_ident(&self, id: Uuid) -> Vec<#model1_ident> {
+                        // O(degree) junction-index probe (#154), not an
+                        // O(all-links) `pairs()` scan.
                         self.#junction_field
-                            .pairs()
+                            .lefts_of(id)
                             .into_iter()
-                            .filter(|(_, right)| *right == id)
-                            .filter_map(|(left, _)| self.#model1_storage.get(left))
+                            .filter_map(|left| self.#model1_storage.get(left))
                             .collect()
                     }
                 });

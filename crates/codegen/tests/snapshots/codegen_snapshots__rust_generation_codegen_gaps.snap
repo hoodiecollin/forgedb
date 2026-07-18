@@ -616,11 +616,12 @@ impl PlaceStorage {
     /// Native fsync; wasm arena no-op (durability at the transport's
     /// IndexedDB/OPFS write boundary).
     pub fn commit(&mut self) -> std::io::Result<()> {
-        self.id_col.flush()?;
-        self.name_col.flush()?;
-        self.description_col.flush()?;
-        self.location_col.flush()?;
-        self.tombstones.flush()?;
+        self.id_col.sync_to_drive()?;
+        self.name_col.sync_to_drive()?;
+        self.description_col.sync_to_drive()?;
+        self.location_col.sync_to_drive()?;
+        self.tombstones.sync_to_drive()?;
+        self.tombstones.barrier()?;
         Ok(())
     }
     fn recover_from_wal(&mut self) {
@@ -714,11 +715,22 @@ impl PlaceStorage {
     /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
     /// required for correctness (recovery reads the column lengths).
     pub fn checkpoint(&mut self) {
-        self.id_col.flush().expect("Failed to fsync column on checkpoint");
-        self.name_col.flush().expect("Failed to fsync column on checkpoint");
-        self.description_col.flush().expect("Failed to fsync column on checkpoint");
-        self.location_col.flush().expect("Failed to fsync column on checkpoint");
-        self.tombstones.flush().expect("Failed to fsync tombstones on checkpoint");
+        self.id_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.name_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.description_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.location_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.tombstones
+            .sync_to_drive()
+            .expect("Failed to sync tombstones to drive on checkpoint");
+        self.tombstones.barrier().expect("Failed to issue checkpoint device barrier");
         self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
         self.writes_since_checkpoint = 0;
     }
