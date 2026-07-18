@@ -863,7 +863,6 @@ See [LICENSE-MIT](../LICENSE-MIT) and [LICENSE-APACHE](../LICENSE-APACHE).
 - [Development Guide](./DEVELOPMENT.md)
 - [Publishing Process](./PUBLISHING.md)
 - [Public Crates Guide](./PUBLIC_CRATES.md)
-- [Internal Crates Guide](./INTERNAL_CRATES.md)
 
 ---
 

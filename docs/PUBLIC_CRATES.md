@@ -58,7 +58,7 @@ crates.io as authoritative.
 `forgedb-backup`, and `forgedb-watcher` are also on crates.io, but **only so that
 `cargo install forgedb` can build the CLI from the registry**. They are compiler internals,
 explicitly **not** a stable public API — see [SEMVER.md §4](./SEMVER.md) and
-[INTERNAL_CRATES.md](./INTERNAL_CRATES.md). `forgedb-lsp-server` is unpublished.
+[`CLAUDE.md`](../CLAUDE.md). `forgedb-lsp-server` is unpublished.
 
 ---
 
@@ -128,5 +128,4 @@ is tracked in `CLAUDE.md`.
 - [SEMVER.md](./SEMVER.md) — stability policy across the four surfaces
 - [INSTALL.md](./INSTALL.md) — install paths + substrate version matrix
 - [PUBLISHING.md](./PUBLISHING.md) — the release/publish runbook
-- [INTERNAL_CRATES.md](./INTERNAL_CRATES.md) — the compiler-internal crates
 - [`CLAUDE.md`](../CLAUDE.md) — authoritative workspace inventory

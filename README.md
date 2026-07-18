@@ -142,7 +142,6 @@ forgedb/
 ├── docs/                 # Comprehensive documentation
 │   ├── ARCHITECTURE.md   # System design
 │   ├── PUBLIC_CRATES.md  # Runtime library guide
-│   ├── INTERNAL_CRATES.md # Tooling guide
 │   ├── CONTRIBUTING.md   # Contribution guidelines
 │   ├── DEVELOPMENT.md    # Development setup
 │   └── PUBLISHING.md     # Release process
@@ -252,7 +251,6 @@ Comprehensive documentation is available in the [`docs/`](./docs/) directory.
 
 - **[Architecture](./docs/ARCHITECTURE.md)** - System design, component architecture, and design decisions
 - **[Public Crates](./docs/PUBLIC_CRATES.md)** - Runtime library guide and API documentation
-- **[Internal Crates](./docs/INTERNAL_CRATES.md)** - Tooling and code generation pipeline
 - **[Contributing](./docs/CONTRIBUTING.md)** - Contribution guidelines and code of conduct
 - **[Development](./docs/DEVELOPMENT.md)** - Development environment setup and workflow
 - **[Publishing](./docs/PUBLISHING.md)** - Release process and version management

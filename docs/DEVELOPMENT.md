@@ -896,7 +896,6 @@ After setting up your development environment:
 
 - [Architecture Documentation](./ARCHITECTURE.md)
 - [Public Crates Guide](./PUBLIC_CRATES.md)
-- [Internal Crates Guide](./INTERNAL_CRATES.md)
 - [Contributing Guide](./CONTRIBUTING.md)
 - [Publishing Guide](./PUBLISHING.md)
 

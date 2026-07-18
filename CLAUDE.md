@@ -214,7 +214,7 @@ from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public 
   0.1.0 (2026-07-07)**; the scaffold pins `forgedb-changefeed = "0.1"`. It never decodes a field;
   generated code routes by model name and materializes typed events.
 
-Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`, `INTERNAL_CRATES.md`,
+Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
 
 ### Generation pipeline

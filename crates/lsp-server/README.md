@@ -139,7 +139,6 @@ cargo test -p forgedb-lsp-server
 For more information about ForgeDB:
 
 - **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
-- **[Internal Crates Guide](../../docs/INTERNAL_CRATES.md)** - Tooling and LSP integration
 - **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
 
 ## License

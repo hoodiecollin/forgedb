@@ -76,8 +76,8 @@ The workspace splits cleanly into three tiers.
 
 `forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
 `forgedb-backup`, `forgedb-watcher`. Published to crates.io only so `cargo install forgedb`
-resolves; see [INTERNAL_CRATES.md](./INTERNAL_CRATES.md) and [SEMVER.md §4](./SEMVER.md).
-`forgedb-lsp-server` is unpublished.
+resolves; see [SEMVER.md §4](./SEMVER.md) and [`CLAUDE.md`](../CLAUDE.md) (the authoritative
+workspace inventory). `forgedb-lsp-server` is unpublished.
 
 ### Dependency direction
 
@@ -195,7 +195,6 @@ Multi-machine replication/consensus is a separate future product, not these tier
 
 - [`CLAUDE.md`](../CLAUDE.md) — authoritative workspace inventory + feature status
 - [PUBLIC_CRATES.md](./PUBLIC_CRATES.md) — substrate crate catalog
-- [INTERNAL_CRATES.md](./INTERNAL_CRATES.md) — compiler-internal crates
 - [SEMVER.md](./SEMVER.md) — stability policy
 - [MIGRATIONS.md](./MIGRATIONS.md) — schema evolution + the version interlock
 - [V1_ROADMAP.md](./V1_ROADMAP.md) — scope and honest current state
