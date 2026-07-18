@@ -1,0 +1,42 @@
+[package]
+name = "forgedb-benchmarks"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Comparative benchmarks of ForgeDB's generated code vs. established DBs. See docs/BENCHMARKS.md."
+
+[lib]
+path = "src/lib.rs"
+
+# Substrate the ForgeDB-generated `gen/database.rs` links against, path-patched to
+# the local crates (this is a detached project — see `[workspace]` below — so the
+# heavy bench deps never enter the root workspace build or test baseline).
+[dependencies]
+forgedb-types = { path = "../crates/types" }
+forgedb-storage = { path = "../crates/storage" }
+forgedb-changefeed = { path = "../crates/changefeed" }
+forgedb-wal = { path = "../crates/wal" }
+forgedb-txn = { path = "../crates/txn" }
+forgedb-compaction = { path = "../crates/compaction" }
+forgedb-coordinator = { path = "../crates/coordinator" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+utoipa = { version = "5", features = ["uuid"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[[bench]]
+name = "forgedb_bench"
+harness = false
+
+[[bench]]
+name = "sqlite_bench"
+harness = false
+
+# Detached from the root workspace on purpose: keeps SQLite (and later DuckDB / PG
+# client libs) out of `cargo build --workspace` and the test baseline.
+[workspace]

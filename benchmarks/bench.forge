@@ -1,0 +1,28 @@
+// ForgeDB benchmark schema. Deliberately minimal + relational so the equivalent
+// SQL DDL (schema.sql) is an obvious 1:1 mapping and the scenarios stay honest.
+// Covers: point lookup (uuid PK), secondary-index probe (^views), FK forward +
+// reverse traversal (Post.author -> User), and many-to-many (Post <-> Tag).
+
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  created_at: +timestamp
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string @length(1, 200)
+  views: ^u64
+  published: bool
+  author: *User
+  created_at: +timestamp
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: &string @length(1, 50)
+  posts: [Post]
+}
