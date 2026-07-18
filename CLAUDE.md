@@ -327,7 +327,14 @@ across many domains live in `examples/` — see `examples/README.md`.**
       **schema-agnostic `forgedb-query-params` substrate** (`QueryParams::from_map` + `Pagination::apply`, clamped
       to `MAX_LIMIT`). Response is `{data,total,limit,offset}`. query-params parses only the query string into
       generic `Sort`/`Pagination`; every field-aware step is generated — identity-clean (PM audit kept the crate
-      precisely to wire here). Guard `test_api_generation_list_endpoint`.
+      precisely to wire here). Guard `test_api_generation_list_endpoint`. **#160 perf (2026-07-18):** the LIVE list
+      path no longer full-materializes every column of every row — it filters/sorts an internal narrow
+      `<Model>ScanRow` (id + filterable/sortable columns only, decoded via the shared `generate_row_read_body`) and
+      full-materializes **only the paginated page** (A); when the filter names an eligible single-indexed field it
+      resolves candidates from that field's index (O(matches), fallback-on-parse-fail) instead of scanning (C). The
+      narrow filter/sort reuse the SAME per-field checks/arms as `_event_matches`/`_apply_sort`. `?as_of` list keeps
+      the full-record path. Guard `test_rust_generation_list_scan_narrow`. Still full-materializing: reverse-FK
+      getters + live-query re-runs (documented #160 follow-up).
     - **Secondary indexes + `find_by_*` / `get_by_*` probes.** Each indexed scalar field gets an in-memory
       `value-key → {id}` map (`<field>_index`), maintained like `id_to_row`: **after** the #89 WAL commit boundary
       on insert (add), update (remove-old + add-new — superseding-version aware, #66), delete (drop); **rebuilt on

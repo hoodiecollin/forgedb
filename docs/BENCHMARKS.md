@@ -148,6 +148,22 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#160 — narrow list scan + index pushdown (2026-07-18, Options A + C).** The REST list handler
+  full-materialized every column of every row via `all()`, then filtered/sorted/paginated and discarded all
+  but `limit` rows — decoding N full records to return a page. **(A)** The live list path now filters + sorts
+  an internal narrow `<Model>ScanRow` (id + only the filterable/sortable columns, decoded via the shared
+  `generate_row_read_body` — the same body `read_at` uses, no drift) and **full-materializes only the paginated
+  page** (`N` full decodes → `N` narrow decodes + `limit` full). The narrow filter/sort reuse the SAME per-field
+  checks/arms as `_event_matches`/`_apply_sort` (one predicate source). **(C)** When the filter names an eligible
+  single-indexed field (string/uuid/int/bool/decimal/timestamp/enum), candidates resolve from that field's
+  secondary index (**O(matches)**) instead of scanning every row; a parse failure falls back to the full scan, so
+  a match is never missed. The `<Model>ScanRow` is internal — never wired to REST `?projection=` / TS / OpenAPI.
+  `?as_of` list reads keep the existing full-record path (a rarer inspector read; #159 already made its resolution
+  sub-linear). Guard `test_rust_generation_list_scan_narrow`; E2E `scratchpad/perf160` (live `tower::oneshot`:
+  narrow filter/sort/paginate returns full-record pages, unique-index + composite-fallthrough + no-match, projection
+  + `as_of` intact); full `examples/` corpus (nullable/char/decimal/enum/composite/M2M/integer-PK) compile-checked.
+  **Honest limit:** only the **live list** path is wired; reverse-FK getters (return full records by API contract)
+  and live-query re-runs still full-materialize — a documented follow-up.
 - **#159 — snapshot reads via per-id version index (2026-07-18, Option A).** `get_at`/`all_at`/
   `find_by_*_at` (REST `?as_of`, #85) resolved "newest version as of a watermark" by scanning `0..watermark`
   of the id column — O(watermark) per point read, and the FK snapshot-probe called `get_at` per candidate →
