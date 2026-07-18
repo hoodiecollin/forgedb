@@ -3602,6 +3602,26 @@ Reading {
         "M2M reverse query tag_posts returns Vec<PyPost>"
     );
 
+    // Arrow columnar export (Phase 5b) — a schema-invariant ArrowColumn #[pyclass]
+    // implementing the Arrow PyCapsule protocol, + per-exportable-column methods.
+    assert!(flat.contains("structArrowColumn"), "the ArrowColumn class exists");
+    assert!(flat.contains("fn__arrow_c_array__"), "ArrowColumn implements the Arrow PyCapsule protocol");
+    assert!(flat.contains("\"arrow_array\""), "the array capsule is named arrow_array");
+    assert!(flat.contains("\"arrow_schema\""), "the schema capsule is named arrow_schema");
+    assert!(flat.contains("m.add_class::<ArrowColumn>()"), "ArrowColumn is registered");
+    // Exportable columns get an `_arrow` method (Reading.value = i64, Reading.id = u64).
+    assert!(
+        flat.contains("fnreading_value_arrow(&self)->PyResult<ArrowColumn>"),
+        "the exportable i64 column gets a zero-copy Arrow method"
+    );
+    assert!(flat.contains("fnreading_id_arrow(&self)->PyResult<ArrowColumn>"), "the u64 PK column is exportable");
+    assert!(
+        flat.contains("self.inner.reading.export_live_indices()") && flat.contains(".export_col_value("),
+        "the export computes the live set in generated code + gathers the one column"
+    );
+    // A non-exportable column (variable-length string) gets NO Arrow method.
+    assert!(!flat.contains("post_title_arrow"), "a string column is not Arrow-exportable");
+
     // IDENTITY: no generic query surface / runtime schema dispatch.
     for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
         assert!(
@@ -3711,6 +3731,25 @@ Reading {
     );
     assert!(flat.contains("pubfnpost_tags(&self,env:Env,id:JsUnknown)"), "M2M forward query post_tags exists");
     assert!(flat.contains("pubfntag_posts(&self,env:Env,id:JsUnknown)"), "M2M reverse query tag_posts exists");
+
+    // Arrow columnar export (Phase 6b) — per-exportable-column methods returning a
+    // zero-copy external ArrayBuffer + format + length.
+    assert!(
+        flat.contains("pubfnreading_value_arrow(&self,env:Env)->Result<JsUnknown>"),
+        "the exportable i64 column gets a zero-copy Arrow method"
+    );
+    assert!(flat.contains("pubfnreading_id_arrow(&self,env:Env)"), "the u64 PK column is exportable");
+    assert!(
+        flat.contains("create_arraybuffer_with_borrowed_data"),
+        "the export aliases the column bytes into an external ArrayBuffer (zero-copy)"
+    );
+    assert!(
+        flat.contains("self.inner.reading.export_live_indices()") && flat.contains(".export_col_value("),
+        "the export computes the live set in generated code + gathers the one column"
+    );
+    assert!(flat.contains("set_named_property(\"format\""), "the result carries the Arrow format string");
+    // A non-exportable column (variable-length string) gets NO Arrow method.
+    assert!(!flat.contains("post_title_arrow"), "a string column is not Arrow-exportable");
 
     // IDENTITY: no generic query surface / runtime schema dispatch.
     for forbidden in ["forgedb_query", "match model", "matchmodel", "predicate", "orderBy"] {
