@@ -182,6 +182,18 @@ enum Commands {
         /// Unix socket path.  Default: <root>/_coord.sock
         #[arg(short, long)]
         socket: Option<std::path::PathBuf>,
+
+        /// Replication-log fsync policy (#156): `always` (default, max durability),
+        /// `never` (rely on the OS; a crash rewinds replication only — no committed
+        /// client data lost), or `periodic` (fsync once per `--fsync-interval`
+        /// commits). Overridable via `FORGEDB_COORDINATOR_FSYNC`.
+        #[arg(long)]
+        fsync: Option<String>,
+
+        /// Commits per fsync when `--fsync periodic` (default 64). Overridable via
+        /// `FORGEDB_COORDINATOR_FSYNC_INTERVAL`.
+        #[arg(long)]
+        fsync_interval: Option<u64>,
     },
 }
 
@@ -570,8 +582,13 @@ fn run(cli: Cli) -> Result<()> {
             }),
         },
 
-        Commands::Coordinate { root, socket } => {
-            commands::coordinate::run(commands::coordinate::CoordinateOptions { root, socket })
+        Commands::Coordinate { root, socket, fsync, fsync_interval } => {
+            commands::coordinate::run(commands::coordinate::CoordinateOptions {
+                root,
+                socket,
+                fsync,
+                fsync_interval,
+            })
         }
 
         Commands::Compact(compact_cmd) => match compact_cmd {
