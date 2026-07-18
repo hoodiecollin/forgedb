@@ -160,6 +160,7 @@ pub struct User {
 ///Storage for User model
 pub struct UserStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     row_count: usize,
     id_col: FixedColumn,
     email_col: VariableColumn,
@@ -201,6 +202,7 @@ impl UserStorage {
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
             id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -242,6 +244,7 @@ impl UserStorage {
                 Uuid::from_bytes(bytes)
             };
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -411,6 +414,10 @@ impl UserStorage {
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
         std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -525,6 +532,10 @@ impl UserStorage {
         }
         self.tombstones.append(false).expect("Failed to append tombstone");
         std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -649,6 +660,10 @@ impl UserStorage {
         }
         self.tombstones.append(true).expect("Failed to append tombstone");
         std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -879,6 +894,7 @@ impl UserStorage {
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
         std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.id_versions).clear();
         std::sync::Arc::make_mut(&mut self.email_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
@@ -888,6 +904,10 @@ impl UserStorage {
                 Uuid::from_bytes(bytes)
             };
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -1114,53 +1134,37 @@ impl UserStorage {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<User> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<User> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -1367,6 +1371,7 @@ impl UserStorage {
     pub fn reader(&self) -> UserStorageReader {
         UserStorageReader {
             id_to_row: self.id_to_row.clone(),
+            id_versions: self.id_versions.clone(),
             id_col: self.id_col.reader().expect("Failed to open column reader"),
             email_col: self.email_col.reader().expect("Failed to open column reader"),
             age_col: self.age_col.reader().expect("Failed to open column reader"),
@@ -1381,6 +1386,7 @@ impl UserStorage {
 ///Read-only, lock-free reader handle for User storage (#56 Direction B)
 pub struct UserStorageReader {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     id_col: forgedb_storage::FixedColumnReader,
     email_col: forgedb_storage::VariableColumnReader,
     age_col: forgedb_storage::FixedColumnReader,
@@ -1425,53 +1431,37 @@ impl UserStorageReader {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<User> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<User> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records

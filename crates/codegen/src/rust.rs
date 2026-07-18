@@ -1013,46 +1013,45 @@ impl RustGenerator {
         id_read: Option<&TokenStream>,
     ) -> TokenStream {
         match id_read {
-            Some(id_read) => quote! {
+            Some(_id_read) => quote! {
                 /// Snapshot-scoped point read (#56 + #66): resolve the newest version
                 /// of `id` committed as of `snap`.  A snapshot captured before a later
                 /// update/delete still resolves the version live as-of capture; a
                 /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+                ///
+                /// #159: binary-search the id's ascending version list for the newest
+                /// physical row `< watermark` — O(log versions), not an O(watermark)
+                /// id-column scan (which made the FK snapshot-probe quadratic).
                 pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#model_name> {
                     let watermark = snap.watermark();
-                    let mut newest: Option<usize> = None;
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        if row_id == id {
-                            newest = Some(row_index);
-                        }
+                    let versions = self.id_versions.get(&id)?;
+                    // `versions` is sorted ascending (appended in row order); the
+                    // newest visible version is the last element `< watermark`.
+                    let pos = versions.partition_point(|&r| r < watermark);
+                    if pos == 0 {
+                        return None; // no version of this id committed as of `snap`
                     }
-                    self.read_at(newest?)
+                    self.read_at(versions[pos - 1])
                 }
 
                 /// Return every live record committed as of `snap` (#56 + #66).
-                /// Resolves the newest version per id within `0..watermark`, so an
-                /// updated row appears once (its newest version) and a deleted row is
-                /// excluded — no duplicate physical versions leak into the view.
+                /// Resolves the newest version per id, so an updated row appears once
+                /// (its newest version) and a deleted row is excluded — no duplicate
+                /// physical versions leak into the view.
+                ///
+                /// #159: resolve each id via its version list (O(distinct_ids × log v))
+                /// instead of two O(watermark) passes; a tombstoned newest is filtered
+                /// by `read_at`.
                 pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<#model_name> {
                     let watermark = snap.watermark();
-                    // Highest physical row per id within the watermark (ascending scan
-                    // ⇒ last write wins ⇒ newest version).
-                    let mut newest: HashMap<#id_type, usize> = HashMap::new();
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        newest.insert(row_id, row_index);
-                    }
-                    // Second pass in row order for a deterministic result; materialize a
-                    // row only when it is the newest for its id (a tombstoned newest is
-                    // filtered by `read_at`).
                     let mut records = Vec::new();
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        if newest.get(&row_id) == Some(&row_index) {
-                            if let Some(record) = self.read_at(row_index) {
-                                records.push(record);
-                            }
+                    for versions in self.id_versions.values() {
+                        let pos = versions.partition_point(|&r| r < watermark);
+                        if pos == 0 {
+                            continue; // id not yet present as of `snap`
+                        }
+                        if let Some(record) = self.read_at(versions[pos - 1]) {
+                            records.push(record);
                         }
                     }
                     records
@@ -2084,8 +2083,21 @@ impl RustGenerator {
             })
             .collect();
 
+        // #159: per-id ascending list of that id's physical row versions.  Snapshot
+        // reads (`get_at`/`all_at`/`find_by_*_at`) binary-search it for the newest
+        // version `< watermark` — O(log versions) instead of an O(watermark) id
+        // scan (which made the FK snapshot-probe O(candidates × watermark)).
+        // Appended in lockstep with `id_to_row` (monotonic row_count ⇒ each vec
+        // stays sorted for free); Arc-shared into readers (#158).  Id-bearing only.
+        let id_versions_field = if Self::identity_field(model).is_some() {
+            quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
+        } else {
+            quote! {}
+        };
+
         quote! {
             id_to_row: std::sync::Arc<HashMap<#id_type, usize>>,
+            #id_versions_field
             row_count: usize,
             #(#column_fields,)*
             #(#index_fields,)*
@@ -2207,8 +2219,16 @@ impl RustGenerator {
         // configurable via `[storage].fsync`.
         let wal_fsync = Self::wal_fsync_policy_tokens();
 
+        // #159: empty per-id version index, rebuilt by `#rehydrate_logic` on reopen.
+        let id_versions_init = if Self::identity_field(model).is_some() {
+            quote! { id_versions: std::sync::Arc::new(HashMap::new()), }
+        } else {
+            quote! {}
+        };
+
         quote! {
             id_to_row: std::sync::Arc::new(HashMap::new()),
+            #id_versions_init
             row_count: 0,
             #(#inits,)*
             #(#index_inits,)*
@@ -2285,8 +2305,16 @@ impl RustGenerator {
                 }
             })
             .collect();
+        // #159: the reader shares the per-id version index too (Arc, #158), so its
+        // snapshot `_at` probes binary-search like the writer's.  Id-bearing only.
+        let id_versions_field = if Self::identity_field(model).is_some() {
+            quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
+        } else {
+            quote! {}
+        };
         quote! {
             id_to_row: std::sync::Arc<HashMap<#id_type, usize>>,
+            #id_versions_field
             #(#column_fields,)*
             #(#index_fields,)*
             #(#composite_fields,)*
@@ -2329,8 +2357,16 @@ impl RustGenerator {
                 quote! { #ident: self.#ident.clone() }
             })
             .collect();
+        // #159: share the per-id version index (Arc, O(1) capture) so the reader's
+        // snapshot probes binary-search like the writer's.  Id-bearing only.
+        let id_versions_clone = if Self::identity_field(model).is_some() {
+            quote! { id_versions: self.id_versions.clone(), }
+        } else {
+            quote! {}
+        };
         quote! {
             id_to_row: self.id_to_row.clone(),
+            #id_versions_clone
             #(#inits,)*
             #(#index_clones,)*
             #(#composite_clones,)*
@@ -2794,6 +2830,29 @@ impl RustGenerator {
             }
         };
         Some(expr)
+    }
+
+    /// #159: the per-id version-index push paired with an `id_to_row` insert.
+    /// Records `row_expr` as the newest physical version of `id_expr`, so snapshot
+    /// reads binary-search `id_versions[id]` for the newest version `< watermark`
+    /// instead of scanning the id column.  Row indices are appended in monotonic
+    /// order (each mutation appends at the current `row_count`), so each vec stays
+    /// sorted ascending with a plain `push` — no sort.  Emitted only for id-bearing
+    /// models (a no-id model has no `id_versions` field and cannot be mutated).
+    fn id_versions_push_stmt(
+        model: &forgedb_parser::Model,
+        receiver: &TokenStream,
+        id_expr: &TokenStream,
+        row_expr: &TokenStream,
+    ) -> TokenStream {
+        if Self::identity_field(model).is_some() {
+            quote! {
+                std::sync::Arc::make_mut(&mut #receiver.id_versions)
+                    .entry(#id_expr).or_default().push(#row_expr);
+            }
+        } else {
+            quote! {}
+        }
     }
 
     /// Emit the WAL commit record for one mutation (#89 durable write path).
@@ -3390,6 +3449,12 @@ impl RustGenerator {
             }))
             .collect();
         let rehydrate_self = Self::generate_rehydrate_body(model, &quote! { self });
+        // #159: the version index is rebuilt by `#rehydrate_self` too; clear it first.
+        let clear_versions = if Self::identity_field(model).is_some() {
+            quote! { std::sync::Arc::make_mut(&mut self.id_versions).clear(); }
+        } else {
+            quote! {}
+        };
         quote! {
             /// Rebuild `id_to_row` + secondary indexes from the committed prefix
             /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -3402,6 +3467,7 @@ impl RustGenerator {
             /// remove-old/add-new bookkeeping to drift.
             pub fn __reindex_committed(&mut self) {
                 std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+                #clear_versions
                 #(#clear_indexes)*
                 #rehydrate_self
             }
@@ -3633,6 +3699,8 @@ impl RustGenerator {
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
+        // #159: record this row as the newest version of `id` for snapshot reads.
+        let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         quote! {
             // Integrity gate (#91): field constraints, then `&unique`.  Both run
@@ -3659,6 +3727,7 @@ impl RustGenerator {
 
             // Store ID mapping
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+            #versions_push
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): index the committed row.
@@ -3787,6 +3856,8 @@ impl RustGenerator {
                 }
             }
         };
+        // #159: append the superseding version's row index to `id_versions[id]`.
+        let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         Some(quote! {
             if !self.id_to_row.contains_key(&id) {
@@ -3815,6 +3886,7 @@ impl RustGenerator {
             // Repoint the id at its newest physical row; the prior version's bytes
             // remain committed (backup-faithful) until compaction reclaims them.
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+            #versions_push
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop stale value keys, add new.
@@ -3892,6 +3964,11 @@ impl RustGenerator {
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
+        // #159: the tombstoned version is the newest physical row for `id` — append
+        // it to `id_versions[id]` so a snapshot taken AFTER the delete resolves it
+        // (and reads absent via the tombstone), while an earlier snapshot still
+        // resolves the pre-delete version.
+        let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         Some(quote! {
             // Materialize the current live record; also gives the values to
@@ -3922,6 +3999,7 @@ impl RustGenerator {
 
             // Repoint the id at the tombstoned newest row so `get` reads absent.
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+            #versions_push
             self.row_count += 1;
 
             // Secondary-index maintenance (#90): drop the deleted id's value keys.
@@ -4481,36 +4559,32 @@ impl RustGenerator {
         // but return row indices (leaving the final read to the projected
         // decoder).  Guarded on identity presence exactly like the accessors.
         let resolvers = match id_read {
-            Some(id_read) => quote! {
+            Some(_id_read) => quote! {
                 /// Resolve the newest committed row of `id` as of `snap`
                 /// (#113 projection `_at` support; same logic as `get_at`).
+                /// #159: binary-search the id's version list, not an O(watermark) scan.
                 fn __proj_resolve_at(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<usize> {
                     let watermark = snap.watermark();
-                    let mut newest: Option<usize> = None;
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        if row_id == id {
-                            newest = Some(row_index);
-                        }
+                    let versions = self.id_versions.get(&id)?;
+                    let pos = versions.partition_point(|&r| r < watermark);
+                    if pos == 0 {
+                        return None;
                     }
-                    newest
+                    Some(versions[pos - 1])
                 }
 
                 /// Row indices of every live record as of `snap` — the newest
-                /// version per id in row order (#113; same logic as `all_at`).
+                /// version per id (#113; same logic as `all_at`).  #159: resolve via
+                /// each id's version list instead of two O(watermark) passes.
                 fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
                     let watermark = snap.watermark();
-                    let mut newest: HashMap<#id_type, usize> = HashMap::new();
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        newest.insert(row_id, row_index);
-                    }
                     let mut rows = Vec::new();
-                    for row_index in 0..watermark {
-                        let row_id = #id_read;
-                        if newest.get(&row_id) == Some(&row_index) {
-                            rows.push(row_index);
+                    for versions in self.id_versions.values() {
+                        let pos = versions.partition_point(|&r| r < watermark);
+                        if pos == 0 {
+                            continue;
                         }
+                        rows.push(versions[pos - 1]);
                     }
                     rows
                 }
@@ -4896,11 +4970,16 @@ impl RustGenerator {
         // resolution the mutation surface (#66) needs on reopen: the newest version
         // is the highest physical index for an id, so the reopened index resolves it.
         let i = format_ident!("i");
+        // #159: rebuild `id_versions` in the SAME ascending id-scan.  Every physical
+        // row is pushed in order, so each id's version vec ends up sorted ascending
+        // exactly as live maintenance built it (last element = newest version).
+        let versions_push = Self::id_versions_push_stmt(model, recv, &quote! { id }, &quote! { i });
         let id_scan = match Self::generate_id_read_expr(model, recv, &i) {
             Some(read_expr) => quote! {
                 for i in 0..n {
                     let id = #read_expr;
                     std::sync::Arc::make_mut(&mut #recv.id_to_row).insert(id, i);
+                    #versions_push
                 }
             },
             // No id/auto field: nothing to index (such a model cannot `insert`
