@@ -619,7 +619,10 @@ Place {
     assert!(code.contains("pub latitude: f64"), "struct fields must be emitted");
 
     // Gap 3: integer PK — identity type is u64 across map key + insert/get.
-    assert!(code.contains("id_to_row: HashMap<u64, usize>"), "id map must be keyed by u64");
+    assert!(
+        code.contains("id_to_row: std::sync::Arc<HashMap<u64, usize>>"),
+        "id map must be keyed by u64 (Arc-wrapped, #158)"
+    );
     // insert now returns Result<u64, _> (#91 validation); the PK type still threads through.
     assert!(code.contains("-> Result<u64, ValidationError>"), "insert must return the u64 PK");
     assert!(code.contains("id: u64"), "get must take the u64 PK");
@@ -1141,8 +1144,8 @@ Widget {
 
     // Identity index rebuilt by scanning the id column.
     assert!(
-        code.contains("db.id_to_row.insert(id, i);"),
-        "reopen must rebuild id_to_row"
+        code.contains("std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);"),
+        "reopen must rebuild id_to_row (via Arc::make_mut, #158)"
     );
     // uuid PK is read via read_uuid + from_bytes...
     assert!(
@@ -1988,11 +1991,11 @@ User {
     let schema = parser.parse().unwrap();
     let code = RustGenerator::generate(&schema).unwrap().code;
 
-    // A per-field index structure keyed by canonical string -> set of ids.
+    // A per-field index structure keyed by canonical string -> set of ids,
+    // Arc-wrapped for cheap reader capture (#158).
     assert!(
-        code.contains("email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>")
-            || code.contains("email_index : std :: collections :: HashMap"),
-        "unique field gets a value->ids index"
+        code.contains("email_index: std::sync::Arc<"),
+        "unique field gets a value->ids index (Arc-wrapped)"
     );
     assert!(
         code.contains("handle_index") ,
@@ -2024,19 +2027,19 @@ User {
     );
 
     // Maintenance: insert adds, delete removes, update removes-old + adds-new.
+    // (#158: the map is `Arc`-shared with readers, so mutations go through
+    // `Arc::make_mut` — copy-on-write.)
+    // (prettyplease may line-wrap the `.entry(..).or_default().insert(..)` chain,
+    // so we assert on the `make_mut` receiver — the load-bearing CoW part.)
     assert!(
-        code.contains("self.email_index.entry(__k).or_default().insert(id);"),
-        "insert/update maintain the index"
-    );
-    assert!(
-        code.contains("self.email_index.get_mut(&__k)"),
-        "update/delete remove stale index entries"
+        code.contains("std::sync::Arc::make_mut(&mut self.email_index)"),
+        "insert/update/delete maintain the index (via Arc::make_mut)"
     );
 
     // Reopen rebuild is folded into the id-scan rehydrate (keyed off db.get).
     assert!(
-        code.contains("db.email_index.entry(__k).or_default().insert(__id);"),
-        "indexes are rebuilt from committed rows on reopen"
+        code.contains("std::sync::Arc::make_mut(&mut db.email_index)"),
+        "indexes are rebuilt from committed rows on reopen (via Arc::make_mut)"
     );
 }
 
@@ -2132,6 +2135,71 @@ Post {
         1,
         "#103: live probe emitted on the writer only"
     );
+}
+
+#[test]
+fn test_rust_generation_reader_index_maps_are_arc_shared() {
+    // #158: `reader()` shares the index maps via `Arc` (O(1) capture) instead of
+    // deep-cloning O(rows) per call; the writer mutates them copy-on-write via
+    // `Arc::make_mut`.  Guards both the shared field type and the CoW mutation.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  status: ^string
+  region: string
+  @index(status, region)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Index + composite maps and `id_to_row` are `Arc`-wrapped on BOTH the writer
+    // storage and its reader handle (same field name/type), so `reader()`'s clone
+    // is a refcount bump, not a data copy.  (prettyplease may line-wrap the long
+    // generic, so we check the `field: std::sync::Arc<` prefix only.)
+    assert!(
+        code.contains("status_index: std::sync::Arc<"),
+        "#158: single-field index map is Arc-wrapped"
+    );
+    assert!(
+        code.contains("status_region_index: std::sync::Arc<"),
+        "#158: composite index map is Arc-wrapped"
+    );
+    assert!(
+        code.contains("id_to_row: std::sync::Arc<HashMap<"),
+        "#158: id_to_row is Arc-wrapped"
+    );
+    // The reader still captures via `.clone()` (now Arc::clone, O(1)).
+    assert!(
+        code.contains("status_index: self.status_index.clone()"),
+        "#158: reader captures the index Arc (cheap clone)"
+    );
+
+    // Writer mutations go through copy-on-write, never a direct `&mut` deref of the
+    // `Arc` (which would not compile).  Add/remove/rebuild all use `Arc::make_mut`.
+    assert!(
+        code.contains("std::sync::Arc::make_mut(&mut self.status_index)"),
+        "#158: index add/remove mutates via Arc::make_mut (copy-on-write)"
+    );
+    assert!(
+        code.contains("std::sync::Arc::make_mut(&mut self.id_to_row).insert("),
+        "#158: id_to_row mutates via Arc::make_mut"
+    );
+    // No index/id_to_row map is mutated by a bare `self.<map>.entry/insert/clear`
+    // that bypasses make_mut (would fail to compile against `Arc<HashMap>`).
+    for needle in [
+        "self.status_index.entry(",
+        "self.status_region_index.entry(",
+        "self.id_to_row.insert(",
+        "self.status_index.clear(",
+    ] {
+        assert!(
+            !code.contains(needle),
+            "#158: `{needle}` must route through Arc::make_mut, not a bare deref"
+        );
+    }
 }
 
 #[test]
