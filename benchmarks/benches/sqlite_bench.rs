@@ -12,17 +12,31 @@ const READ_POSTS: usize = 10_000;
 
 const SCHEMA: &str = include_str!("../schema.sql");
 
-/// Durability matched to ForgeDB (fsync on every commit).
-fn apply_pragmas(conn: &Connection) {
+/// WAL journal + `synchronous = FULL`. `fullfsync` decides the *strength* of the
+/// flush, which is the whole fsync-parity question (see docs/BENCHMARKS.md):
+///   - `false` → SQLite's default `fsync()`. On macOS that flushes to the drive
+///     cache only (~113 µs) — NOT a barrier, a weaker guarantee than ForgeDB.
+///   - `true`  → `fcntl(F_FULLFSYNC)` (~4 ms), the same true barrier ForgeDB's
+///     WAL `sync_all()` issues on macOS. This is the like-for-like durability.
+fn apply_pragmas(conn: &Connection, fullfsync: bool) {
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    if fullfsync {
+        conn.pragma_update(None, "fullfsync", "1").unwrap();
+    }
 }
 
-fn fresh_conn(path: &std::path::Path) -> Connection {
+fn fresh_conn_dur(path: &std::path::Path, fullfsync: bool) -> Connection {
     let conn = Connection::open(path).expect("open sqlite");
-    apply_pragmas(&conn);
+    apply_pragmas(&conn, fullfsync);
     conn.execute_batch(SCHEMA).expect("apply schema");
     conn
+}
+
+/// Default durability (plain fsync). Reads don't touch the fsync path, so the
+/// read/bulk fixtures use this.
+fn fresh_conn(path: &std::path::Path) -> Connection {
+    fresh_conn_dur(path, false)
 }
 
 /// Load `data` into `conn` in one transaction (setup — not timed).
@@ -58,33 +72,41 @@ fn load(conn: &mut Connection, data: &Dataset) {
 }
 
 // --- Scenario 2: single-row insert latency (autocommit → fsync per row) ------
+// Measured at BOTH durability levels so the fsync-parity comparison is explicit:
+// `default` is SQLite out-of-box (plain fsync), `fullfsync` matches ForgeDB's
+// per-commit F_FULLFSYNC barrier. See docs/BENCHMARKS.md.
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("sqlite/insert_user");
     group.throughput(Throughput::Elements(1));
-    let dir = tempfile::tempdir().unwrap();
-    let conn = fresh_conn(&dir.path().join("bench.db"));
-    let mut stmt_i = 0usize;
-    group.bench_function("insert_one", |b| {
-        b.iter_batched(
-            || {
-                let i = stmt_i;
-                stmt_i += 1;
-                i
-            },
-            |i| {
-                let id = uuid::Uuid::from_u128(
-                    0xF000_0000_0000_0000_0000_0000_0000_0000 + i as u128,
-                )
-                .into_bytes();
-                conn.execute(
-                    "INSERT INTO user (id, name, email, created_at) VALUES (?1, ?2, ?3, ?4)",
-                    params![&id[..], "bulk", format!("insert{i}@example.com"), 1_700_000_000i64],
-                )
-                .unwrap();
-            },
-            BatchSize::SmallInput,
-        );
-    });
+    for &fullfsync in &[false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        // `dir`/`conn` are locals that live until the end of this loop body,
+        // which is after `bench_function` returns (it measures synchronously).
+        let conn = fresh_conn_dur(&dir.path().join("bench.db"), fullfsync);
+        let mut stmt_i = 0usize;
+        let label = if fullfsync { "fullfsync" } else { "default" };
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let i = stmt_i;
+                    stmt_i += 1;
+                    i
+                },
+                |i| {
+                    let id = uuid::Uuid::from_u128(
+                        0xF000_0000_0000_0000_0000_0000_0000_0000 + i as u128,
+                    )
+                    .into_bytes();
+                    conn.execute(
+                        "INSERT INTO user (id, name, email, created_at) VALUES (?1, ?2, ?3, ?4)",
+                        params![&id[..], "bulk", format!("insert{i}@example.com"), 1_700_000_000i64],
+                    )
+                    .unwrap();
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
     group.finish();
 }
 
