@@ -1,8 +1,36 @@
 # Configurable Runtime Behavior — Epic Design Note
 
-Status: proposed (epic framing). Tracks the umbrella epic + child issues that make
-ForgeDB's hardcoded runtime behavior configurable **without compromising the generator
-identity**. This note is the durable framing; the concrete knobs live as child issues.
+Status: **batch 1 LANDED** (generate-time Tier A/B knobs, 2026-07-18); Tier-C
+(process-start env) batch remains. Tracks the umbrella epic (#126) + child issues
+that make ForgeDB's hardcoded runtime behavior configurable **without compromising
+the generator identity**. This note is the durable framing; the concrete knobs live
+as child issues.
+
+## Status — batch 1 landed (generate-time Tier A/B)
+
+The foundation and every generate-time knob baked into `database.rs` are done and
+e2e-proven:
+
+- **#127 foundation** — `GenConfig` (`crates/codegen/src/config.rs`, schema-blind,
+  `DEFAULT` byte-identical except the broker) threaded via
+  `RustGenerator::generate_with_config` using a thread-local set at the generate
+  entry point (no invasive signature churn). CLI: `[runtime]`/`[storage]` tables in
+  `src/config.rs` → `ForgeConfig::gen_config()`, threaded through `generate`/`build`.
+- **#130 broker-attach gate** (flagship, Tier A, default OFF) — the double-barrier fix.
+- **#129 fsync** (Tier B — see the nuance section; true Tier-A omit deferred),
+  **#131** WAL checkpoint interval, **#133** compaction threshold, **#134**
+  compaction-off (Tier A omit), **#135** changefeed capacity, **#150** cascade depth,
+  **#132** txn-journal fsync + **#136** broker fsync/capacity (both ride the unified
+  `[storage].fsync` / capacity knobs).
+- **#128** — the dead `[database]`/`[api]`/`[dev]`/`[codegen]` scaffold tables removed.
+
+Guard `test_gen_config_knobs` + `src/config.rs` mapping tests; e2e `scratchpad/config_e2e`
+(default replication-OFF vs custom all-knobs, both compile + run — no `_replication.log`
+when off, present when on). Snapshots re-accepted for the G6 broker-off exception.
+
+**Remaining = the Tier-C batch** (read once at process start, a *different* mechanism):
+#138–#142 (server body/WS/CORS/limit, host-port), #143–#146 (coordinator/txn), #147
+(auth), #148–#149 (wasm), #151 (observability), #137 (broker retention).
 
 ## Why
 
@@ -114,6 +142,12 @@ Tier B (a baked value, still a runtime branch in the substrate). Realizing true 
 `const`-generic `FsyncPolicy` or emitting the sync call **conditionally at the generated
 call site**. The child issue must choose; this note flags it so "Tier A fsync" isn't
 assumed free.
+
+**Decision (batch 1, #129): Tier B.** `[storage].fsync` binds the `FsyncPolicy` variant
+baked into every `WalManager::open` (per-model WALs + txn journal) and the durable broker —
+a working, default-byte-identical knob today. The substrate-side true-Tier-A form
+(`sync_all` removed from the binary via a const-generic policy) is a deferred substrate
+follow-up on #129, not required for the knob to function.
 
 ## Delivery mechanism (layered resolution)
 

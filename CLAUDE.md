@@ -258,12 +258,27 @@ across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
 
-- **Hardcoded runtime behavior → epic #126 (configurable runtime behavior) + perf triage #152.** Many bullets
-  below note a value is "fixed / not yet config / not tunable" (fsync policy, WAL checkpoint interval, compaction
-  threshold, changefeed capacity, coordinator timeouts, `MAX_LIMIT`, `MAX_CASCADE_DEPTH`, wasm commit debounce, …).
-  Those are now catalogued as child issues under **epic #126** (design note + binding-time tier model — A
-  generate-time code specialization / B baked const / C process-start override — in
-  `docs/proposals/configurable-runtime-behavior.md`). Performance factors that are *not* config (junction indexing,
+- **Configurable runtime behavior — epic #126: BATCH 1 LANDED (generate-time Tier A/B), 2026-07-18.** The
+  foundation + every knob baked into `database.rs` is done and e2e-proven. A `GenConfig`
+  (`crates/codegen/src/config.rs`, schema-blind, `DEFAULT` byte-identical **except** the broker) is threaded via
+  `RustGenerator::generate_with_config` using a thread-local set at the generate entry point (no signature churn
+  through the ~10 static emitters). CLI: schema-blind **`[runtime]`/`[storage]`** tables in `forgedb.toml`
+  (`src/config.rs` → `ForgeConfig::gen_config()`), threaded through `generate`/`build`; the dead
+  `[database]`/`[api]`/`[dev]`/`[codegen]` scaffold tables were removed (#128). Knobs: **`[runtime].replication`**
+  (#130 flagship, **Tier A, default OFF** — a G6 sanctioned exception: no `DurableBroker::open`, no SECOND
+  `F_FULLFSYNC` per write; `if let Some(broker)` becomes statically dead — halves the double-barrier latency toward
+  SQLite-`fullfsync` parity), **`[storage].fsync`** (#129/#132/#136, Tier B — `Always`|`Never` for all WALs + txn
+  journal + broker), **`[storage].wal_checkpoint_interval`** (#131), **`[storage].compaction_threshold`** (#133),
+  **`[storage].compaction`** (#134, Tier A — `false` OMITS the auto-compaction trigger), **`[runtime].changefeed_capacity`**
+  (#135/#136), **`[runtime].max_cascade_depth`** (#150). Guard `test_gen_config_knobs` + `src/config.rs` mapping
+  tests; e2e `scratchpad/config_e2e` (default replication-OFF vs custom all-knobs, both compile + run; no
+  `_replication.log` when off, present when on). Snapshots re-accepted for the broker-off default. **fsync is Tier B**
+  (baked `FsyncPolicy` value); true Tier-A `never`-omit (barrier gone from the binary) is a deferred substrate
+  follow-up on #129. **Remaining = the Tier-C (process-start env) batch:** #138–#142 (server body/WS/CORS/limit,
+  host-port), #143–#146 (coordinator/txn), #147 (auth), #148–#149 (wasm), #151 (observability), #137 (broker
+  retention) — a *different* mechanism (read once at `open_at`/process start), the next batch. Design note +
+  binding-time tier model (A generate-time specialization / B baked const / C process-start override):
+  `docs/proposals/configurable-runtime-behavior.md`. Performance factors that are *not* config (junction indexing,
   projection wiring, buffered I/O, lock scope, the double fsync barrier's algorithmic peers) are the **#152** triage
   sweep. When you make one of these configurable or fix a perf item, update BOTH the relevant bullet here and the
   issue. Benchmark harness + fsync-parity findings: `docs/BENCHMARKS.md` + `benchmarks/`.
