@@ -148,6 +148,19 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
+- **#159 — snapshot reads via per-id version index (2026-07-18, Option A).** `get_at`/`all_at`/
+  `find_by_*_at` (REST `?as_of`, #85) resolved "newest version as of a watermark" by scanning `0..watermark`
+  of the id column — O(watermark) per point read, and the FK snapshot-probe called `get_at` per candidate →
+  **O(candidates × watermark)** (quadratic). Each id-bearing model now carries a per-id ascending list of its
+  physical row versions (`id_versions: Arc<HashMap<Id, Vec<usize>>>`, appended in lockstep with `id_to_row`,
+  rebuilt on reopen, Arc-shared into readers per #158). `get_at` binary-searches it for the newest row
+  `< watermark` → **O(log versions)**; the FK-probe drops to O(candidates × log v); `all_at`/projection `_at`
+  resolve per-id → O(distinct_ids × log v) (a win under update/delete churn, where dead versions inflate the
+  watermark). No on-disk format change; the vec stays sorted for free (monotonic row_count). Guard
+  `test_rust_generation_version_index` + updated snapshot-reads guard; E2E `scratchpad/perf158` proves
+  snapshot-version resolution respects the watermark (an old snapshot resolves the pre-update version on the
+  live writer via binary search) + reader isolation + reopen rebuild. Honest limit: `id_versions` grows with
+  dead versions until compaction reclaims + reopen rebuilds (same bound as `id_to_row`).
 - **#158 — reader() index-map sharing (2026-07-18, Option A).** `Database::reader()` no longer deep-clones
   every secondary/composite index map + `id_to_row` per call (was O(total live rows across the DB)). The maps
   are `Arc<HashMap<..>>`, so `reader()` capture is an O(1) `Arc::clone` (refcount bump); the single writer

@@ -983,8 +983,11 @@ across many domains live in `examples/` — see `examples/README.md`.**
   (replaced the fake-clock slider). `tsc --noEmit` clean. **Honest limits:** the "as of" token is a **row-count
   watermark, not a wall-clock instant** (no wall-clock→watermark index — a separate, heavier feature); watermarks are
   valid only within a compaction epoch (an in-process `compact()` renumbers rows — the client must discard pinned
-  tokens on a detected reopen); REST `list ?as_of` still reads full rows server-side (only the point-`get` is cheap);
-  the Inspector data-path is **type-checked, not runtime-tested in the Tauri shell** (needs a running generated server
+  tokens on a detected reopen); REST `list ?as_of` still reads full rows server-side to filter/sort (only the wire
+  is not shrunk — but **#159** made the newest-version *resolution* sub-linear: `get_at`/`all_at`/`find_by_*_at`
+  binary-search a per-id ascending version index `id_versions` (O(log versions)) instead of an O(watermark) id
+  scan, killing the FK-probe's O(candidates × watermark) quadratic); the Inspector data-path is **type-checked,
+  not runtime-tested in the Tauri shell** (needs a running generated server
   + desktop build); the compare-vs-current diff is a labeled inspector-level marker, not yet a rendered diff.
 - **MVCC Tiers 1–3 — transactions + concurrent writers — LANDED 2026-07-14 (#75/#84; merged to `main` 2026-07-15;
   design `docs/proposals/multi-writer-mvcc.md`, all three tiers).** The Direction-C rock: an atomic transaction
