@@ -20,6 +20,8 @@ The good news: **almost every gap is a codegen-wiring problem, and codegen is Fo
 
 Multi-writer / Direction C · migrations data-transform engine · PITR / incremental backup · row-level authz (#72) · JWT issuance (#73) · cross-process broker.
 
+> **Post-v1 update (2026-07-17):** three items on this deferral list have since landed *after* the v1 scope was locked — **multi-writer / Direction C** (MVCC Tiers 1–3, #75/#84), the **migrations data-transform engine** (schema-migrations Phases 1–4, #74), and the **cross-process broker** (durable replication broker #82 + the Tier-3 coordinator). This list records the *v1 release scope* as decided on 2026-07-10; it is no longer the current capability map. Still genuinely deferred: PITR / incremental backup (#76–#78), row-level authz (#72), JWT issuance (#73).
+
 ## Current-state gap map
 
 Established by four code probes on 2026-07-10 (see the `core-gaps-vs-claudemd` project memory). ✅ solid · 🟡 partial · 🔴 missing/stub.

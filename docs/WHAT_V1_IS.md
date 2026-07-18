@@ -115,8 +115,8 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 ### Query capability
 - Indexes are **hash exact-match** — they answer `field = value` (and
   `a = ? AND b = ?` for composites), **not** prefix or range queries (a B-tree
-  feature, out of scope). Many-to-many junction lookups are still linear scans;
-  there is no M2M `unlink` (storage is append-only).
+  feature, out of scope). Many-to-many junction lookups are still linear scans
+  (and `unlink_<a>_<b>` / `unlink_all_*` is likewise a linear junction scan).
 
 ### Operations
 - `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text
