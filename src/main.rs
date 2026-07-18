@@ -461,6 +461,10 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 None
             };
+            // Generate-time runtime-behavior config (epic #126): resolve the
+            // schema-blind [runtime]/[storage] knobs into the codegen GenConfig
+            // baked into database.rs. An invalid knob value is a config error.
+            let gen_config = forge_config.gen_config()?;
             commands::generate::run(commands::generate::GenerateOptions {
                 target,
                 mode,
@@ -468,6 +472,7 @@ fn run(cli: Cli) -> Result<()> {
                 output: resolved_output,
                 schema: resolved_schema,
                 config_targets: forge_config.generate.targets.clone(),
+                gen_config,
                 force,
                 from,
                 to,

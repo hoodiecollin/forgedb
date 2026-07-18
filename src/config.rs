@@ -1,9 +1,9 @@
 /// Compile-time generator configuration loaded from `forgedb.toml`.
 ///
-/// Only the `[generate]` table is consumed here; other tables present in a
-/// project's `forgedb.toml` (e.g. `[project]`, `[database]`, `[api]`) are
-/// silently ignored, so this struct is forward-compatible with the full config
-/// file emitted by `forgedb init`.
+/// The generator consumes the `[generate]`, `[tenant]`, `[auth]`, `[runtime]`,
+/// and `[storage]` tables; any other table present in a project's `forgedb.toml`
+/// (e.g. `[project]`) is silently ignored, so this struct is forward-compatible
+/// with the full config file emitted by `forgedb init`.
 ///
 /// Precedence (highest → lowest):
 /// 1. Explicit CLI flag (`--output`, `--schema`, …)
@@ -105,6 +105,47 @@ impl AuthConfig {
     }
 }
 
+/// Generate-time **runtime-behavior** knobs (`[runtime]` table, epic #126).
+///
+/// Schema-blind (litmus: two apps with entirely different schemas could share
+/// these verbatim with identical effect) — they select among behaviors the
+/// generated/substrate code already contains and are baked into the emitted
+/// `database.rs` at generate time (Tier A/B). **Never** read from a `.forge`
+/// schema. Absent values reproduce today's output byte-for-byte, except
+/// `replication` (default OFF — the #130 sanctioned exception).
+#[derive(Debug, Deserialize, Default)]
+pub struct RuntimeConfig {
+    /// Attach the durable replication broker (#130, Tier A). Default `false`:
+    /// an unused broker's second `F_FULLFSYNC` per write is pure waste. Turn on
+    /// for apps consuming `/replicate` or running a browser read-replica.
+    #[serde(default)]
+    pub replication: bool,
+    /// In-process changefeed broadcast capacity + durable-broker buffer (#135).
+    /// Default 1024.
+    pub changefeed_capacity: Option<usize>,
+    /// Maximum `@on_delete(cascade)` recursion depth (#150). Default 64.
+    pub max_cascade_depth: Option<u32>,
+}
+
+/// Generate-time **storage/durability** knobs (`[storage]` table, epic #126).
+/// Schema-blind, baked at generate time (Tier A/B). Defaults are byte-identical
+/// to today's output.
+#[derive(Debug, Deserialize, Default)]
+pub struct StorageConfig {
+    /// WAL fsync policy (#129): `"always"` (default, crash-safe) or `"never"`
+    /// (durability-weakening opt-in — a real data-loss window on power loss).
+    pub fsync: Option<String>,
+    /// Mutations per collection between WAL checkpoints (#131). Default 1000.
+    pub wal_checkpoint_interval: Option<u64>,
+    /// Emit the in-process auto-compaction trigger (#134, Tier A). Default
+    /// `true`; when `false` the auto-trigger is omitted and reclaim is driven
+    /// only by the explicit `Database::compact()`.
+    pub compaction: Option<bool>,
+    /// Dead row versions per model before auto-compaction fires (#133). Default
+    /// 1000.
+    pub compaction_threshold: Option<u64>,
+}
+
 /// Top-level config struct.  Unknown top-level TOML tables are ignored.
 #[derive(Debug, Deserialize, Default)]
 pub struct ForgeConfig {
@@ -114,6 +155,48 @@ pub struct ForgeConfig {
     pub tenant: TenantConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+impl ForgeConfig {
+    /// Resolve the generate-time runtime-behavior knobs (#126) into the codegen
+    /// `GenConfig` baked into `database.rs`. Absent values fall back to
+    /// `GenConfig::DEFAULT` (today's output, byte-identical). Returns a config
+    /// error if a knob has an out-of-range value (e.g. an unknown `fsync` mode).
+    pub fn gen_config(&self) -> Result<forgedb_codegen::GenConfig> {
+        let d = forgedb_codegen::GenConfig::DEFAULT;
+        let fsync = match self.storage.fsync.as_deref() {
+            None => d.fsync,
+            Some("always") => forgedb_codegen::FsyncMode::Always,
+            Some("never") => forgedb_codegen::FsyncMode::Never,
+            Some(other) => {
+                return Err(CliError::Config(format!(
+                    "invalid [storage].fsync = \"{other}\" — expected \"always\" or \"never\""
+                )));
+            }
+        };
+        Ok(forgedb_codegen::GenConfig {
+            replication: self.runtime.replication,
+            fsync,
+            wal_checkpoint_interval: self
+                .storage
+                .wal_checkpoint_interval
+                .unwrap_or(d.wal_checkpoint_interval),
+            compaction: self.storage.compaction.unwrap_or(d.compaction),
+            compaction_threshold: self
+                .storage
+                .compaction_threshold
+                .unwrap_or(d.compaction_threshold),
+            changefeed_capacity: self
+                .runtime
+                .changefeed_capacity
+                .unwrap_or(d.changefeed_capacity),
+            max_cascade_depth: self.runtime.max_cascade_depth.unwrap_or(d.max_cascade_depth),
+        })
+    }
 }
 
 /// Load generator configuration.
@@ -148,5 +231,65 @@ pub fn load_config(path: Option<&str>) -> Result<ForgeConfig> {
                 Ok(ForgeConfig::default())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgedb_codegen::{FsyncMode, GenConfig};
+
+    #[test]
+    fn empty_config_maps_to_default_gen_config() {
+        // No [runtime]/[storage] tables → GenConfig::DEFAULT (byte-identical
+        // output, replication OFF).
+        let cfg: ForgeConfig = toml::from_str("[project]\nname = \"x\"\n").unwrap();
+        assert_eq!(cfg.gen_config().unwrap(), GenConfig::DEFAULT);
+        assert!(!cfg.runtime.replication);
+    }
+
+    #[test]
+    fn runtime_and_storage_knobs_map_through() {
+        let src = r#"
+[runtime]
+replication = true
+changefeed_capacity = 256
+max_cascade_depth = 16
+
+[storage]
+fsync = "never"
+wal_checkpoint_interval = 500
+compaction = false
+compaction_threshold = 250
+"#;
+        let cfg: ForgeConfig = toml::from_str(src).unwrap();
+        let gc = cfg.gen_config().unwrap();
+        assert_eq!(
+            gc,
+            GenConfig {
+                replication: true,
+                fsync: FsyncMode::Never,
+                wal_checkpoint_interval: 500,
+                compaction: false,
+                compaction_threshold: 250,
+                changefeed_capacity: 256,
+                max_cascade_depth: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_storage_keeps_other_defaults() {
+        // Only fsync set → every other knob stays at its default.
+        let cfg: ForgeConfig = toml::from_str("[storage]\nfsync = \"always\"\n").unwrap();
+        let gc = cfg.gen_config().unwrap();
+        assert_eq!(gc, GenConfig::DEFAULT);
+    }
+
+    #[test]
+    fn invalid_fsync_is_a_config_error() {
+        let cfg: ForgeConfig = toml::from_str("[storage]\nfsync = \"sometimes\"\n").unwrap();
+        let err = cfg.gen_config().unwrap_err();
+        assert!(matches!(err, CliError::Config(_)), "unknown fsync mode → config error");
     }
 }

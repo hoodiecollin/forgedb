@@ -22,6 +22,11 @@ pub fn run(options: BuildOptions) -> Result<()> {
         schema: options.schema.clone(),
     })?;
 
+    // Generate-time runtime-behavior config (epic #126): honor the schema-blind
+    // [runtime]/[storage] knobs from forgedb.toml (discovered in the CWD) so a
+    // `build` bakes the same tailored behavior as `generate`.
+    let gen_config = crate::config::load_config(None)?.gen_config()?;
+
     // Generate code — respect the --no-api flag by running only the targets we want.
     ui::info("Generating code...");
     if options.no_api {
@@ -41,6 +46,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
                 output: options.output.clone(),
                 schema: options.schema.clone(),
                 config_targets: None,
+                gen_config,
                 force: true,
                 from: None,
                 to: None,
@@ -56,6 +62,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
             output: options.output.clone(),
             schema: options.schema.clone(),
             config_targets: None,
+            gen_config,
             force: true,
             from: None,
             to: None,

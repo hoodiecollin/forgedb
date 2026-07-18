@@ -44,6 +44,9 @@ pub struct GenerateOptions {
     /// When present and `target` is `"all"`, only these targets are generated.
     /// Ignored for explicit single-target invocations.
     pub config_targets: Option<Vec<String>>,
+    /// Generate-time runtime-behavior config (epic #126) resolved from the
+    /// `[runtime]`/`[storage]` tables, baked into the emitted `database.rs`.
+    pub gen_config: forgedb_codegen::GenConfig,
     pub force: bool,
     /// Origin format version for the `transform` target (#74 Phase 3).
     pub from: Option<u32>,
@@ -139,11 +142,13 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 options.force,
                 allowed,
                 format_version,
+                options.gen_config,
             )?);
         }
         "rust" => {
-            let result = RustGenerator::generate_with_format_version(&schema, format_version)
-                .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+            let result =
+                RustGenerator::generate_with_config(&schema, format_version, options.gen_config)
+                    .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("database.rs");
             write_file(&path, &result.code, options.force)?;
             generated_files.push((path, result));
@@ -248,6 +253,7 @@ fn generate_all(
     force: bool,
     target_filter: Option<&[String]>,
     format_version: u32,
+    gen_config: forgedb_codegen::GenConfig,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let enabled = |name: &str| -> bool {
         target_filter.map_or(true, |ts| ts.iter().any(|t| t.as_str() == name))
@@ -255,9 +261,9 @@ fn generate_all(
 
     let mut files = Vec::new();
 
-    // Generate Rust database code
+    // Generate Rust database code (with the #126 generate-time runtime config).
     if enabled("rust") {
-        let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+        let rust_result = RustGenerator::generate_with_config(schema, format_version, gen_config)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let rust_path = output_path.join("database.rs");
         write_file(&rust_path, &rust_result.code, force)?;
