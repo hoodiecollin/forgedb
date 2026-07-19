@@ -9,13 +9,15 @@ deps (SQLite, later DuckDB / Postgres client libs) never enter the root workspac
 or test baseline. Run everything from the repo root — never `cd` in here.
 
 ```bash
-make bench            # every implemented suite (ForgeDB + SQLite)
+make bench            # the no-setup embedded suites (ForgeDB + SQLite + redb + DuckDB)
 make bench-forgedb    # ForgeDB generated code only
 make bench-sqlite     # SQLite only
 make bench-redb       # redb (pure-Rust embedded KV)
 make bench-duckdb     # DuckDB (embedded columnar; bundled C++ build, ~2.5 min first time)
 make bench-postgres   # PostgreSQL — ephemeral cluster via devbox (see below)
 make bench-pglite     # JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite
+make bench-footprint  # on-disk bytes per corpus (all engines) + ForgeDB churn bloat (scenario 18)
+make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, scenario 16)
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
 
 # Config matrix (epic #126): same scenarios across generated config variants.
@@ -61,14 +63,17 @@ Criterion writes HTML reports under `benchmarks/target/criterion/`.
 | `benches/duckdb_bench.rs` | DuckDB Criterion suite. |
 | `benches/pg_bench.rs` | PostgreSQL Criterion suite (needs a running cluster — `make bench-postgres`). |
 | `benches/matrix_bench.rs` | ForgeDB config-matrix Criterion suite (needs `make bench-regen-matrix`). |
+| `examples/footprint.rs` | On-disk footprint report (all engines) + ForgeDB churn bloat (scenario 18). A size report, not a Criterion timing — an example so it can use the bench dev-deps. |
+| `examples/concurrency.rs` | ForgeDB reader-throughput-under-a-live-writer report (#56-B, scenario 16). |
 | `scripts/pg_run.sh` | Ephemeral-PostgreSQL lifecycle (initdb → start → bench → stop) for `make bench-postgres`. |
 | `js/bench.ts` | JS/Bun suite: PGlite vs `bun:sqlite` (`mitata` timings). Not part of the Rust Criterion harness. |
 
 ## Status
 
-**First cut: ForgeDB + SQLite.** redb, DuckDB, PostgreSQL, and the PGlite (WASM,
-in-process) variant are designed in `docs/BENCHMARKS.md` and added incrementally against
-the same shared scenarios.
+**All five comparison targets implemented** (ForgeDB, SQLite, redb, DuckDB, PostgreSQL) plus
+the PGlite (WASM, in-process) JS variant, over the shared scenarios. Point/probe/traversal +
+**scan/aggregate** (scenario 7), **concurrency** (scenario 16), and **footprint** (scenario 18)
+are cut cross-engine; results + interpretation live in `docs/BENCHMARKS.md`.
 
 `gen/database.rs` is generated and drifts as codegen changes — its compiling here is
 itself a codegen guard (snapshot pass ≠ output compiles). Rerun `make bench-regen` after

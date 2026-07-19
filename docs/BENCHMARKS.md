@@ -35,8 +35,10 @@ throughput can't be read in isolation.
 
 **All five comparison targets are implemented** (SQLite, redb, DuckDB, PostgreSQL, PGlite),
 each over the same shared scenarios. First cross-engine result cuts are recorded per engine
-below; remaining shared-scenario gaps (a scan/aggregate scenario across all engines, the
-write/lifecycle/concurrency/footprint scenarios) are filled incrementally.
+below. The **scan/aggregate** (scenario 7), **concurrency** (scenario 16), and **footprint**
+(scenario 18) scenarios are now also implemented and cut cross-engine — see "Scan / aggregate",
+"Concurrency", and "Footprint" below. Remaining gaps (bulk-load sweeps at 1e6, crash-recovery
+timing) are filled incrementally.
 
 ### redb (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
 
@@ -149,6 +151,109 @@ Reading PGlite (in-process WASM PG) against server PostgreSQL (native, over a so
 separates the engine cost from the transport cost — that contrast is the point of
 including it.
 
+### Scan / aggregate (scenario 7, 2026-07-18, macOS Apple Silicon)
+
+Two shapes over the 10 000-post corpus, run in every embedded suite (`make bench-<engine> --
+scan`): **`scan_aggregate`** = `COUNT + SUM(views) WHERE published` (a full-table aggregate),
+and **`scan_sort_top10`** = top-10 posts by `views (>= 50 000)` (a filtered scan + sort + page).
+This is the scenario the analytical/columnar engine is built to win.
+
+| scenario | ForgeDB | SQLite | redb | DuckDB |
+| --- | --- | --- | --- | --- |
+| `scan_aggregate` | 32.4 ms | 352 µs | 632 µs | **100 µs** |
+| `scan_sort_top10` | 32.6 ms | **4.35 µs** | 809 µs | 491 µs |
+
+Honest read — this is the scenario where **ForgeDB loses by 1–2 orders of magnitude**, and the
+reasons are structural, not incidental:
+
+1. **DuckDB wins the pure aggregate (100 µs)** — vectorized columnar aggregation over pruned
+   columns, exactly as predicted for an analytical engine. (It is ~3× slower than SQLite on the
+   `top10` because that one is index-served for SQLite; see below.)
+2. **ForgeDB's generated scan (`__scan_all`) is ~90× slower than SQLite on the aggregate** for
+   two compounding reasons, both real: (a) **no column pruning** — the aggregate needs only
+   `views`+`published`, but the generated scan materializes the full narrow row *including a
+   `String` allocation for `title`* every row; (b) **row-wise, hashmap-order iteration** — it
+   walks `id_to_row.values()` (random row order) and reads every column positionally per row, so
+   it gets **neither** columnar sequential-read locality **nor** row-store contiguity. Even vs
+   redb's honest full scan (which decodes a contiguous packed blob per row) ForgeDB is ~50×
+   slower. A column-pruned, sequential scan path is a clear optimization opportunity.
+3. **`scan_sort_top10`: SQLite's 4.35 µs is index-served, ForgeDB's 32.6 ms is a full scan.**
+   SQLite has a B-tree `idx_post_views`, so `WHERE views >= T ORDER BY views DESC LIMIT 10` is an
+   ordered range scan + limit (O(10)). ForgeDB *also* declares `views: ^u64`, but its index is a
+   **hash** (exact-match only) — it cannot serve an ordered range/top-N, so it full-scans. This is
+   the B-tree-vs-hash tradeoff made concrete (redb, with no `views` index at all, full-scans at
+   809 µs — ~40× faster than ForgeDB's full scan, again the wide-narrow-row + random-order cost).
+
+The JS suite (2 000-post corpus, **no `views` index** in its DDL) adds the same two shapes for
+PGlite vs `bun:sqlite`:
+
+| scenario | PGlite | bun:sqlite | ratio |
+| --- | --- | --- | --- |
+| `scan_aggregate` | 241 µs | ~72 µs | 3.4× |
+| `scan_sort_top10` | 318 µs | ~103 µs | 3.1× |
+
+The PGlite-vs-SQLite scan gap (~3×) is FAR smaller than its point-op gap (~55–110× above) —
+because PGlite's WASM-engine overhead is largely **fixed per query**, so it amortizes over a
+scan's many rows but dominates a single point op. (JS row count + missing `views` index mean
+these are not 1:1 comparable to the Rust suite's absolute numbers.)
+
+### Concurrency (scenario 16, 2026-07-18, macOS Apple Silicon)
+
+`make bench-concurrency`. ForgeDB reader throughput under a live writer (#56-B: single writer +
+lock-free concurrent readers). A `DatabaseReader` + `DatabaseSnapshot` are captured, the writable
+`Database` is moved into a background writer thread that inserts continuously, and N reader threads
+hammer point reads on the captured handle. If reads were serialized against the writer, the
+`(+writer)` column would collapse toward the writer's rate.
+
+| readers | reads/s (idle) | reads/s (+writer) | writer writes/s |
+| --- | --- | --- | --- |
+| 1 | 274 644 | 271 262 | 273 |
+| 2 | 295 867 | 302 747 | 265 |
+| 4 | 338 970 | 334 061 | 264 |
+| 8 | 139 621 | 164 031 | 271 |
+
+Honest read: the `(+writer)` column stays within noise of the `idle` column at 1/2/4 readers —
+**reads are lock-free; a live writer does not throttle them**, confirming #56-B. Read throughput
+scales to ~4 threads then falls off at 8 (past this host's performance-core count — scheduling/
+oversubscription, not a lock). The writer runs at ~270 inserts/s, which independently corroborates
+the **single** `F_FULLFSYNC` barrier per insert (~3.7 ms ⇒ ~270/s; the pre-#130 double barrier
+would be ~135/s). Honest limit: this is one writer + N readers (the v1 contract); it is a snapshot
+read (rows appended after capture are invisible — that is the isolation guarantee, not a miss).
+
+### Footprint (scenario 18, 2026-07-18, macOS Apple Silicon)
+
+`make bench-footprint`. On-disk bytes for the shared 41 500-row corpus (1 000 users + 10 000 posts
++ 500 tags + 30 000 M2M links), each engine loaded via its simplest durable path and measured by
+summing its data files (SQLite checkpointed, DuckDB `CHECKPOINT`, ForgeDB `checkpoint()`):
+
+| engine | on-disk |
+| --- | --- |
+| **ForgeDB** | **1.88 MB** |
+| DuckDB | 4.01 MB |
+| SQLite | 4.80 MB |
+| redb | 8.54 MB |
+
+Honest read: **ForgeDB has the smallest footprint (1.88 MB — ~2.6× smaller than SQLite, ~4.5×
+smaller than redb)** — the flip side of the slower point reads. Columnar files pack a column's
+values contiguously with no per-row B-tree page overhead or per-row key repetition; redb is largest
+because a B-tree KV stores the full 16-byte key beside every value in every table AND repeats ids in
+the secondary/multimap index tables. This is the footprint dividend ForgeDB trades its point-read
+latency for.
+
+ForgeDB update-churn bloat (superseding-version append; #66) — 2 000 updates to one user, then
+`compact()`:
+
+| | bytes |
+| --- | --- |
+| before compact | 247.3 KB |
+| after compact | 84.3 KB |
+| reclaimed | 162.9 KB (66%) |
+
+Honest read: updates **grow** storage (each update appends a new row version; measured, not hidden),
+and in-process `compact()` reclaims the dead versions (66% here). (Implementing this scenario surfaced
+and fixed a real divide-by-zero in `forgedb-compaction` when `compact()` ran over a database with an
+untouched/empty model — see the compaction bullet in CLAUDE.md.)
+
 ## Scenarios
 
 Each scenario is *designed* to run across three row counts — **1e3 / 1e5 / 1e6** — so we
@@ -229,13 +334,17 @@ host (Apple SSD), per durable op:
    uses plain `fsync()` (weaker on macOS). So the raw ~100× single-insert gap was
    **almost entirely a durability-level mismatch, not engine inefficiency.** At matched
    durability (SQLite `fullfsync=1`), SQLite is ~4.0 ms.
-2. **ForgeDB does TWO barriers per insert, not one.** The generated `insert` fsyncs the
-   WAL (`sync_all`, ~3.5 ms) *and* records to the durable replication broker
-   (`DurableBroker::record` → `sync_all` under `FsyncPolicy::Always`, `durable.rs`), which
-   `open_at` attaches unconditionally — a second ~3.5 ms barrier. That is why ForgeDB
-   single-insert is ~7.6 ms ≈ 2 × a single barrier, vs. SQLite-`fullfsync`'s ~4.0 ms for
-   one. The residual over the raw barrier (~0.5 ms) is serde + column appends + index
-   maintenance — reasonable.
+2. **By default ForgeDB does ONE barrier per insert; a second only when replication is on.**
+   The generated `insert` fsyncs the WAL (`sync_all`, ~3.5 ms). *When `[runtime].replication
+   = true`* it ALSO records to the durable replication broker (`DurableBroker::record` →
+   `sync_all` under `FsyncPolicy::Always`, `durable.rs`) — a second ~3.5 ms barrier. Since
+   **#130 made `[runtime].replication` default OFF**, `open_at` no longer attaches the broker
+   unconditionally, so the default single-insert is **~3.95 ms ≈ one barrier** (on par with
+   SQLite-`fullfsync`'s ~4.0 ms); the residual over the raw barrier (~0.5 ms) is serde +
+   column appends + index maintenance — reasonable. With `replication_on` it is ~7.35 ms ≈
+   2 × a barrier (see the configuration matrix). (Historically — pre-#130 — the broker was
+   attached unconditionally, so *every* insert paid two barriers ~7.6 ms; that is no longer
+   the default.)
 
 **How the harness reports it now:** `sqlite/insert_user` runs at **both** durability
 levels — `default` (plain fsync, SQLite's out-of-box guarantee) and `fullfsync` (matched
@@ -386,13 +495,15 @@ seeded rows):
 
 Feed these into the broader perf sweep (not fixes — triage items):
 
-- **Double fsync barrier per write (highest signal).** `open_at` attaches a synchronous
-  `FsyncPolicy::Always` replication broker, so every insert/update/delete pays a second
-  `F_FULLFSYNC` on the critical path even for apps that never consume `/replicate`.
-  Options to weigh: make the broker fsync policy configurable / batched / async; only
-  attach it when replication is enabled; or coalesce the WAL + broker append behind one
-  barrier. Removing the second barrier alone would roughly halve durable-write latency
-  (~7.6 ms → ~4 ms, on par with SQLite-`fullfsync`).
+- **Double fsync barrier per write — RESOLVED by #130 (the `[runtime].replication` knob).**
+  Historically `open_at` attached a synchronous `FsyncPolicy::Always` replication broker
+  unconditionally, so every insert/update/delete paid a second `F_FULLFSYNC` on the critical
+  path even for apps that never consume `/replicate`. #130 made `[runtime].replication` default
+  **OFF** — the broker is now attached only when replication is enabled — which took the
+  default durable-write latency from ~7.6 ms to ~3.95 ms (one barrier, on par with
+  SQLite-`fullfsync`). The `replication_on` variant (~7.35 ms) is the opt-in two-barrier cost.
+  Still open as design items: a batched/async broker fsync, and coalescing the WAL + broker
+  append behind a single barrier when replication IS on.
 - **No relaxed durability tier.** ForgeDB's fsync policy is a fixed generated constant
   (`Always`); there is no per-deployment knob to trade the barrier for `Periodic`/grouped
   commit the way SQLite exposes `synchronous`/`fullfsync`. Worth a design look for the
@@ -442,9 +553,11 @@ seeded data**, so their Criterion groups line up for direct comparison.
 ## Running
 
 ```bash
-make bench            # run every implemented engine suite (currently ForgeDB + SQLite)
+make bench            # the no-setup embedded suites (ForgeDB + SQLite + redb + DuckDB)
 make bench-forgedb    # ForgeDB generated code only
 make bench-sqlite     # SQLite only
+make bench-footprint  # on-disk footprint (all engines) + ForgeDB churn bloat (scenario 18)
+make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, scenario 16)
 make bench-regen      # re-emit benchmarks/gen/database.rs from bench.forge
 ```
 
