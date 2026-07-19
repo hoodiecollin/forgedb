@@ -145,6 +145,37 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 The seeded candidates below were promoted to the tracked sweep **#152** (12 children).
 **Landed:**
 
+- **#162 — deferred compaction + in-place remap (2026-07-18, Options A + C).** Auto-compaction ran INLINE on
+  the update/delete that crossed the dead-row threshold: checkpoint + rewrite every column file (temp+rename)
+  + a full `*self = Self::new_at()` reopen (an O(rows × indexes) rehydrate rescan) — one write per ~1000
+  mutations ate a multi-ms tail-latency spike. **(A defer)** Crossing the SOFT threshold now only sets a
+  `compaction_due` flag (the triggering write does not stall); `Database::maintain()` runs the reclaim off the
+  hot write turn at an operator/coordinator idle point, and a HARD ceiling
+  (`COMPACTION_DEAD_THRESHOLD × COMPACTION_DEAD_CEILING_FACTOR`, ×4) still forces an inline compaction as a
+  growth-bounding safety net if `maintain()` is never called. **(C in-place remap)** When compaction does run,
+  it no longer rehydrate-rescans: it reopens ONLY the column handles (stale fds after the rename) via
+  `new_at_no_rehydrate`, then remaps `id_to_row`/`id_versions` in place — a surviving row's dense new index is
+  `keep_sorted.partition_point(|&r| r < old_row)` — and reinstalls the secondary index maps **verbatim** (they
+  are value→id keyed, so a physical-row renumber leaves them correct). **Zero column reads** on the reopen.
+  Guards `test_rust_generation_auto_compaction` (defer + ceiling + maintain) + `test_rust_generation_incremental_rehydrate`
+  (in-place remap); E2E `scratchpad/perf162` (explicit compact preserves values/deletes/all index kinds + reopen
+  consistency; soft-threshold defers, `maintain()` reclaims, ceiling forces inline). Corpus incl. integer-PK
+  compile-checked. **Honest limit:** single physical append point per column stands — the reclaim is still
+  serialized under the writer lock (just off the *write* turn); true background compaction needs the segmented-
+  column effort.
+- **#161 — incremental delta peer refresh (2026-07-18, Option B).** The Tier-3 coordinated peer refresh
+  (`__sync_columns_from_disk` + `__reindex_committed`) CLEARED every in-memory map and rescanned all rows ×
+  indexes on *every* refresh (before each prepare when a peer advanced). It now captures the pre-sync watermark
+  and folds ONLY the new rows `[from..row_count)` via `__reindex_delta` — **O(new rows), not O(all rows ×
+  indexes)** — replaying the SAME live update/delete maintenance per row (remove the pre-row version's keys via
+  `self.get(id)`, add the folded row's keys via `self.read_at`), so the maps end up identical to a full rebuild
+  with no second maintenance source to drift. Pure generated code, no on-disk artifact, no write amplification.
+  Guard in `test_rust_generation_coordinated_client`; E2E `scratchpad/perf162` (delta fold over `__stage_append`ed
+  "peer" rows == full `__reindex_committed`; supersede + tombstone + insert within the range; no-op tail).
+  **Chosen over A (persist-per-checkpoint, which adds `(N/1000)×rows` write-amp exceeding the one-time reopen
+  scan) and C (lazy index, which collides with the `&self` read API — `reader()`/`find_by_*` can't build
+  continuously-mutated maps without write-path locks).** Cold-start reopen keeps the existing #110 narrow
+  indexed-columns-only scan.
 - **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
   `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
   Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).

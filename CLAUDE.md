@@ -408,9 +408,16 @@ across many domains live in `examples/` — see `examples/README.md`.**
   - **Storage is now bounded under update/delete (v1 Phase 4 W1 — #92 LANDED, publish-pending).** Generated
     `Storage::compact()` + `Database::compact()` reclaim the dead (superseded/tombstoned) row versions the #66
     mutation surface leaves behind, **in-process under the single-writer lock** (never a background thread — that
-    would compact off the #89 `DirLock`), auto-invoked once `COMPACTION_DEAD_THRESHOLD` (=1000 dead versions, fixed)
-    is reached on update/delete. Ordering is load-bearing: `checkpoint()` first (fsync columns + truncate WAL, so no
-    index-relative WAL tail survives the renumber), then reclaim, then reopen to rebuild `id_to_row` + indexes.
+    would compact off the #89 `DirLock`). **#162 (2026-07-18) moved it OFF the hot write turn (Options A+C):**
+    crossing the soft `COMPACTION_DEAD_THRESHOLD` (=1000 dead versions, `[storage].compaction_threshold`) now only sets
+    a `compaction_due` flag — the triggering write no longer stalls on the rewrite+remap; `Database::maintain()` runs
+    the reclaim at an operator/coordinator idle point, and a hard ceiling (`× COMPACTION_DEAD_CEILING_FACTOR`, ×4)
+    forces an inline compaction as a growth-bounding safety net if `maintain()` is never called. Ordering is
+    load-bearing: `checkpoint()` first (fsync columns + truncate WAL, so no index-relative WAL tail survives the
+    renumber), then reclaim, then **(#162 in-place remap)** reopen ONLY the column handles (`new_at_no_rehydrate` —
+    stale fds after the rename) and remap `id_to_row`/`id_versions` in place (`keep_sorted.partition_point`),
+    reinstalling the value→id-keyed secondary index maps verbatim — the old `*self = Self::new_at()` O(rows × indexes)
+    rehydrate rescan is gone (zero column reads on the reopen). Guard `test_rust_generation_incremental_rehydrate`.
     **New substrate: `forgedb-compaction` gains `Compactor::compact_model_keeping(model, live_rows)`** — a
     schema-agnostic keep-set GC: generated code computes the LIVE physical-row set from `id_to_row` + tombstone
     liveness (the field-aware decision) and hands the opaque indices over; the substrate keeps exactly those rows.
@@ -1017,7 +1024,10 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `_lock: None`) and are mutually exclusive with a standalone self-locking writer (T3-5). A coordinated writer is also
     a lightweight follower — peer read-currency via a NEW additive `sync_from_disk` on all three storage-native column
     types (re-derive each column's `row_count` from disk so a peer's appends become visible), driven by
-    `__sync_columns_from_disk` + `__reindex_committed` on the coordinator log-tail signal. Guard
+    `__sync_columns_from_disk` + **`__reindex_delta(from)`** on the coordinator log-tail signal (**#161-B, 2026-07-18:**
+    the delta folds only the new rows `[from..row_count)` via the live update/delete maintenance — O(new), not the
+    old `__reindex_committed` full clear-and-rescan of every row × index; the txn-commit path still uses the full
+    rebuild). Guard
     `test_rust_generation_coordinated_client` (asserts lock-free open + coordinator has no `forgedb-storage` dep). The
     coordinator *is* the single writer, so data recovery reuses #89/#96 — no distributed 2-phase record.
   Verified: 486 workspace tests green; generated code compile-tested single- **and** multi-model; **genuine two-live-
