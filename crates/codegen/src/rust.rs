@@ -291,6 +291,14 @@ impl RustGenerator {
             proc_macro2::Literal::u64_unsuffixed(cfg.compaction_threshold);
         tokens.extend(quote! {
             const COMPACTION_DEAD_THRESHOLD: u64 = #__compaction_threshold;
+            // #162-A: the soft threshold above only RECORDS that a compaction is
+            // due (`compaction_due`) so the triggering write does not stall on the
+            // rewrite+remap — `Database::maintain()` runs it off the hot write turn.
+            // This hard ceiling is the growth-bounding safety net: if `maintain()`
+            // is never called, an inline compaction is forced once dead versions
+            // reach `COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR`, so
+            // storage stays bounded regardless of the deferral.
+            const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
         });
 
         // On-disk format version this binary was generated for (#74 Phase 1 —
@@ -793,6 +801,25 @@ impl RustGenerator {
                     // Refresh the physical-layout manifest on open (#57): cheap,
                     // off the insert hot path, gives schema-blind backup/inspector
                     // a current column map + row-count anchor.
+                    db.write_manifest(root);
+                    db
+                }
+
+                /// Reopen the column handles + recover `row_count`, WITHOUT the
+                /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+                /// after the compaction rewrite renames every file, the open fds are
+                /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+                /// so the handles must be reopened — but the in-memory maps are
+                /// remapped in place (a dense row renumber that needs no column
+                /// reads), so rebuilding them from a full rescan would be wasted work.
+                fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+                    let mut db = Self {
+                        #storage_inits
+                    };
+                    // Same crash-recovery anchor as `new_at` (sets `row_count` from
+                    // the tombstone length; the WAL was truncated by the pre-compact
+                    // checkpoint, so the replay is a no-op) — but no `#rehydrate_logic`.
+                    db.recover_from_wal();
                     db.write_manifest(root);
                     db
                 }
@@ -2145,6 +2172,14 @@ impl RustGenerator {
             // A compaction became due while `in_transaction`; deferred (#92) so it
             // never renumbers rows a live transaction's marks refer to.
             compact_deferred: bool,
+            // #162-A: a compaction became due on the normal (non-transaction) write
+            // path but was NOT run inline — the soft threshold now only RECORDS that
+            // reclaim is due and returns, so the triggering write does not eat the
+            // rewrite+remap stall.  `Database::maintain()` runs it off the hot write
+            // turn; a hard ceiling (`COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR`)
+            // still forces an inline compaction as a growth-bounding safety net if
+            // `maintain()` is never called.
+            compaction_due: bool,
             // Change-feed handle (#62 Direction A): `None` for standalone use;
             // `Database::new()` attaches a shared feed so `insert` can emit.
             changefeed: Option<forgedb_changefeed::ChangeFeed>,
@@ -2262,6 +2297,7 @@ impl RustGenerator {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         }
@@ -3339,19 +3375,70 @@ impl RustGenerator {
     ///    tombstoned, and marks a delete with a *new* tombstoned marker row, so a
     ///    tombstone-driven drop reclaims nothing from updates and would resurrect
     ///    deletes.
-    /// 3. Compaction renumbers surviving rows, invalidating every in-memory
-    ///    `id_to_row` / secondary-index entry, so reopen the storage to rebuild
-    ///    them from the compacted files via the SAME reopen-scan as `new_at`.
+    /// 3. Compaction renumbers surviving rows, invalidating every physical-row
+    ///    reference in `id_to_row` / `id_versions`.  Rather than a full rescan
+    ///    (`new_at`), reopen ONLY the column handles (stale after the rename) and
+    ///    REMAP the maps in place (#162-C): each surviving id's dense new row is
+    ///    `keep_sorted.partition_point(|&r| r < old_row)`; the secondary index maps
+    ///    are keyed value→id (never by physical row) and are already current, so
+    ///    they carry over verbatim — no column reads.
     ///
     /// Best-effort: a compaction error leaves the (still-correct) un-compacted
     /// files in place and retries after the next interval — it never corrupts
     /// live state.
     fn generate_compact_method(model: &forgedb_parser::Model) -> TokenStream {
         let model_snake = Self::to_snake_case(&model.name);
+
+        // #162-C: the secondary index maps (single + composite) are keyed
+        // value→id, so a physical-row renumber leaves them correct — save each
+        // Arc across the column-handle reopen and reinstall it verbatim.
+        let index_idents: Vec<proc_macro2::Ident> = Self::indexed_fields(model)
+            .iter()
+            .map(|f| Self::index_field_ident(f))
+            .chain(Self::composite_indexes(model).into_iter().map(|(ident, _)| ident))
+            .collect();
+        let save_indexes: Vec<_> = index_idents
+            .iter()
+            .map(|ident| {
+                let saved = format_ident!("__saved_{}", ident);
+                quote! { let #saved = std::sync::Arc::clone(&self.#ident); }
+            })
+            .collect();
+        let reinstall_indexes: Vec<_> = index_idents
+            .iter()
+            .map(|ident| {
+                let saved = format_ident!("__saved_{}", ident);
+                quote! { self.#ident = #saved; }
+            })
+            .collect();
+
+        // #162-C: `id_versions` (#159) references physical rows, so rebuild it to a
+        // single-element `[new_row]` per surviving id (compaction collapses every id
+        // to its one kept version).  Omitted for an id-less model (no such field).
+        let remap_versions = if Self::identity_field(model).is_some() {
+            quote! { __new_id_versions.insert(__id, vec![__new_row]); }
+        } else {
+            quote! {}
+        };
+        let assign_versions = if Self::identity_field(model).is_some() {
+            quote! { self.id_versions = std::sync::Arc::new(__new_id_versions); }
+        } else {
+            quote! {}
+        };
+        let decl_versions = if Self::identity_field(model).is_some() {
+            quote! {
+                let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> =
+                    std::collections::HashMap::with_capacity(__old_id_to_row.len());
+            }
+        } else {
+            quote! {}
+        };
+
         quote! {
             /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-            /// rewrite this model's files dropping dead rows, then reopen to
-            /// rebuild `id_to_row` + secondary indexes from the compacted files.
+            /// rewrite this model's files dropping dead rows, then reopen the column
+            /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+            /// secondary indexes (value→id keyed) carry over unchanged.
             pub fn compact(&mut self) {
                 // MVCC Tier 1 (#83, M1d): never compact mid-transaction — the
                 // renumbering below would invalidate a live transaction's rollback
@@ -3659,8 +3746,20 @@ impl RustGenerator {
                 // lengths).  Defer it to after commit/rollback.
                 if self.in_transaction {
                     self.compact_deferred = true;
-                } else {
+                } else if self.dead_since_compaction
+                    >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+                {
+                    // #162-A hard ceiling: `maintain()` was not called and dead
+                    // versions reached the growth bound — compact inline now (the
+                    // safety net) so storage stays bounded regardless of deferral.
+                    self.compaction_due = false;
                     self.compact();
+                } else {
+                    // #162-A soft threshold: do NOT stall this write on the
+                    // rewrite+remap — just record that reclaim is due.  An operator
+                    // / coordinator idle turn runs `Database::maintain()`, which
+                    // reclaims off the hot write path.
+                    self.compaction_due = true;
                 }
             }
         }
@@ -5875,6 +5974,23 @@ impl RustGenerator {
                         }
                     }
                     #(self.#model_field_idents.compact();)*
+                }
+
+                /// Run maintenance deferred off the hot write turn (#162-A): for
+                /// every model, reclaim dead row versions IFF a compaction became
+                /// due (the soft dead-row threshold set `compaction_due` instead of
+                /// stalling the triggering write).  Call this at an operator /
+                /// coordinator idle point so the rewrite+remap cost lands here, not
+                /// on a user write.  Cheap when nothing is due (a per-model flag
+                /// check).  Snapshot-safety is the same as `compact()` — a live
+                /// prepare snapshot defers the whole pass.  Single-writer only.
+                pub fn maintain(&mut self) {
+                    if let Ok(__seq) = self.seq.lock() {
+                        if __seq.oldest_live_snapshot().as_u64() > 0 {
+                            return;
+                        }
+                    }
+                    #(self.#model_field_idents.maintain();)*
                 }
 
                 /// Open a read-only handle over the whole database (#56 Direction
