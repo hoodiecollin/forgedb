@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_FORMAT_VERSION: u32 = 1;
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
@@ -156,15 +157,26 @@ pub struct User {
     pub created_at: Timestamp,
     pub posts: (),
 }
+///Internal narrow scan record for `User` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct UserScanRow {
+    pub id: Uuid,
+    pub name: String,
+    pub email: String,
+    pub created_at: Timestamp,
+}
 ///Storage for User model
 pub struct UserStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     row_count: usize,
     id_col: FixedColumn,
     name_col: VariableColumn,
     email_col: VariableColumn,
     created_at_col: FixedColumn,
-    email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    email_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -173,6 +185,7 @@ pub struct UserStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -198,7 +211,8 @@ impl UserStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -217,7 +231,7 @@ impl UserStorage {
                     8usize,
                 )
                 .expect("Failed to create fixed column"),
-            email_index: std::collections::HashMap::new(),
+            email_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("user/tombstones.bin"),
                 )
@@ -233,6 +247,7 @@ impl UserStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -244,7 +259,8 @@ impl UserStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -276,9 +292,65 @@ impl UserStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.email_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.email_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            name_col: VariableColumn::new(
+                    root.join("user/variable/string_data_1.bin"),
+                    root.join("user/variable/string_offsets_1.bin"),
+                )
+                .expect("Failed to create variable column"),
+            email_col: VariableColumn::new(
+                    root.join("user/variable/string_data_2.bin"),
+                    root.join("user/variable/string_offsets_2.bin"),
+                )
+                .expect("Failed to create variable column"),
+            created_at_col: FixedColumn::new(
+                    root.join("user/fixed/timestamp_3.bin"),
+                    8usize,
+                )
+                .expect("Failed to create fixed column"),
+            email_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            tombstones: forgedb_storage::Tombstones::new(
+                    root.join("user/tombstones.bin"),
+                )
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("user/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -408,7 +480,11 @@ impl UserStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -427,7 +503,10 @@ impl UserStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.email_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.email_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -514,7 +593,11 @@ impl UserStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -535,12 +618,13 @@ impl UserStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.email_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.email_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.email_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -561,7 +645,10 @@ impl UserStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.email_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.email_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("User", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -589,8 +676,13 @@ impl UserStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -629,7 +721,11 @@ impl UserStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -649,12 +745,13 @@ impl UserStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.email_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.email_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.email_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -683,8 +780,13 @@ impl UserStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -826,8 +928,9 @@ impl UserStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -843,15 +946,49 @@ impl UserStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("user", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __saved_email_index = std::sync::Arc::clone(&self.email_index);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            self.email_index = __saved_email_index;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -863,8 +1000,9 @@ impl UserStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.email_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.id_versions).clear();
+        std::sync::Arc::make_mut(&mut self.email_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -872,7 +1010,11 @@ impl UserStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -904,7 +1046,88 @@ impl UserStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.email_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.email_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
+            }
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if let Some(__old_rec) = self.get(id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__old_rec.email)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.email_index);
+                    if let Some(__set) = __map.get_mut(&__k) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__k);
+                    }
+                }
+            }
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {
+                if let Some(__new_rec) = self.read_at(__r) {
+                    {
+                        let __k: String = {
+                            match serde_json::to_value(&(__new_rec.email)) {
+                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                                Ok(serde_json::Value::String(__s)) => {
+                                    let mut __k = String::from('\u{1}');
+                                    __k.push_str(&__s);
+                                    __k
+                                }
+                                Ok(__other) => {
+                                    let mut __k = String::from('\u{2}');
+                                    __k.push_str(&__other.to_string());
+                                    __k
+                                }
+                                Err(_) => String::from('\u{3}'),
+                            }
+                        };
+                        std::sync::Arc::make_mut(&mut self.email_index)
+                            .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                }
             }
         }
     }
@@ -1101,53 +1324,37 @@ impl UserStorage {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<User> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<User> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -1359,6 +1566,85 @@ impl UserStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let name_value = self
+            .name_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let email_value = self
+            .email_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let created_at_value = Timestamp::from(
+            self
+                .created_at_col
+                .read_timestamp(row_index)
+                .expect("Failed to read from column"),
+        );
+        Some(UserScanRow {
+            id: id_value,
+            name: name_value,
+            email: email_value,
+            created_at: created_at_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<UserScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
+    }
+    /// #160 (C): resolve list candidates for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
+    /// param did not parse; the caller falls back to `__scan_all`.
+    pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.email_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Some(Vec::new()),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(&__row) = self.id_to_row.get(&__id) {
+                if let Some(__r) = self.__scan_row_at(__row) {
+                    __out.push(__r);
+                }
+            }
+        }
+        Some(__out)
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
@@ -1368,6 +1654,7 @@ impl UserStorage {
     pub fn reader(&self) -> UserStorageReader {
         UserStorageReader {
             id_to_row: self.id_to_row.clone(),
+            id_versions: self.id_versions.clone(),
             id_col: self.id_col.reader().expect("Failed to open column reader"),
             name_col: self.name_col.reader().expect("Failed to open column reader"),
             email_col: self.email_col.reader().expect("Failed to open column reader"),
@@ -1385,12 +1672,15 @@ impl UserStorage {
 }
 ///Read-only, lock-free reader handle for User storage (#56 Direction B)
 pub struct UserStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     id_col: forgedb_storage::FixedColumnReader,
     name_col: forgedb_storage::VariableColumnReader,
     email_col: forgedb_storage::VariableColumnReader,
     created_at_col: forgedb_storage::FixedColumnReader,
-    email_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    email_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl UserStorageReader {
@@ -1434,53 +1724,37 @@ impl UserStorageReader {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<User> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<User> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -1633,9 +1907,19 @@ pub struct Post {
     pub created_at: Timestamp,
     pub tags: (),
 }
+///Internal narrow scan record for `Post` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct PostScanRow {
+    pub id: Uuid,
+    pub title: String,
+    pub views: u64,
+    pub published: bool,
+    pub created_at: Timestamp,
+}
 ///Storage for Post model
 pub struct PostStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     row_count: usize,
     id_col: FixedColumn,
     title_col: VariableColumn,
@@ -1643,8 +1927,12 @@ pub struct PostStorage {
     published_col: FixedColumn,
     author_col: FixedColumn,
     created_at_col: FixedColumn,
-    views_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
-    author_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    views_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
+    author_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -1653,6 +1941,7 @@ pub struct PostStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -1678,7 +1967,8 @@ impl PostStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("post/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -1698,8 +1988,8 @@ impl PostStorage {
                     8usize,
                 )
                 .expect("Failed to create fixed column"),
-            views_index: std::collections::HashMap::new(),
-            author_index: std::collections::HashMap::new(),
+            views_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            author_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("post/tombstones.bin"),
                 )
@@ -1715,6 +2005,7 @@ impl PostStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -1726,7 +2017,8 @@ impl PostStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -1765,7 +2057,10 @@ impl PostStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.views_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.views_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
             {
                 let __k: String = {
@@ -1784,9 +2079,67 @@ impl PostStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.author_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.author_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("post/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            title_col: VariableColumn::new(
+                    root.join("post/variable/string_data_1.bin"),
+                    root.join("post/variable/string_offsets_1.bin"),
+                )
+                .expect("Failed to create variable column"),
+            views_col: FixedColumn::new(root.join("post/fixed/u64_2.bin"), 8usize)
+                .expect("Failed to create fixed column"),
+            published_col: FixedColumn::new(root.join("post/fixed/bool_3.bin"), 1usize)
+                .expect("Failed to create fixed column"),
+            author_col: FixedColumn::new(root.join("post/fixed/uuid_4.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            created_at_col: FixedColumn::new(
+                    root.join("post/fixed/timestamp_5.bin"),
+                    8usize,
+                )
+                .expect("Failed to create fixed column"),
+            views_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            author_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            tombstones: forgedb_storage::Tombstones::new(
+                    root.join("post/tombstones.bin"),
+                )
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("post/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -1906,7 +2259,11 @@ impl PostStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -1925,7 +2282,10 @@ impl PostStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.views_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.views_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         {
             let __k: String = {
@@ -1944,7 +2304,10 @@ impl PostStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.author_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.author_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -2012,7 +2375,11 @@ impl PostStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -2033,12 +2400,13 @@ impl PostStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.views_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.views_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.views_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
             {
@@ -2059,12 +2427,13 @@ impl PostStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.author_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.author_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.author_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -2085,7 +2454,10 @@ impl PostStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.views_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.views_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         {
             let __k: String = {
@@ -2104,7 +2476,10 @@ impl PostStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.author_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.author_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -2132,8 +2507,13 @@ impl PostStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -2178,7 +2558,11 @@ impl PostStorage {
             .append_timestamp(i64::from(record.created_at))
             .expect("Failed to append to column");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -2198,12 +2582,13 @@ impl PostStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.views_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.views_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.views_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         {
@@ -2224,12 +2609,13 @@ impl PostStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.author_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.author_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.author_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -2258,8 +2644,13 @@ impl PostStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -2427,8 +2818,9 @@ impl PostStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -2444,15 +2836,51 @@ impl PostStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("post", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __saved_views_index = std::sync::Arc::clone(&self.views_index);
+            let __saved_author_index = std::sync::Arc::clone(&self.author_index);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            self.views_index = __saved_views_index;
+            self.author_index = __saved_author_index;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -2464,9 +2892,10 @@ impl PostStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.views_index.clear();
-        self.author_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.id_versions).clear();
+        std::sync::Arc::make_mut(&mut self.views_index).clear();
+        std::sync::Arc::make_mut(&mut self.author_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -2474,7 +2903,11 @@ impl PostStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -2513,7 +2946,10 @@ impl PostStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.views_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.views_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
             {
                 let __k: String = {
@@ -2532,7 +2968,137 @@ impl PostStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.author_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.author_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
+            }
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if let Some(__old_rec) = self.get(id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__old_rec.views)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.views_index);
+                    if let Some(__set) = __map.get_mut(&__k) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__k);
+                    }
+                }
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__old_rec.author)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.author_index);
+                    if let Some(__set) = __map.get_mut(&__k) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__k);
+                    }
+                }
+            }
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {
+                if let Some(__new_rec) = self.read_at(__r) {
+                    {
+                        let __k: String = {
+                            match serde_json::to_value(&(__new_rec.views)) {
+                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                                Ok(serde_json::Value::String(__s)) => {
+                                    let mut __k = String::from('\u{1}');
+                                    __k.push_str(&__s);
+                                    __k
+                                }
+                                Ok(__other) => {
+                                    let mut __k = String::from('\u{2}');
+                                    __k.push_str(&__other.to_string());
+                                    __k
+                                }
+                                Err(_) => String::from('\u{3}'),
+                            }
+                        };
+                        std::sync::Arc::make_mut(&mut self.views_index)
+                            .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                    {
+                        let __k: String = {
+                            match serde_json::to_value(&(__new_rec.author)) {
+                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                                Ok(serde_json::Value::String(__s)) => {
+                                    let mut __k = String::from('\u{1}');
+                                    __k.push_str(&__s);
+                                    __k
+                                }
+                                Ok(__other) => {
+                                    let mut __k = String::from('\u{2}');
+                                    __k.push_str(&__other.to_string());
+                                    __k
+                                }
+                                Err(_) => String::from('\u{3}'),
+                            }
+                        };
+                        std::sync::Arc::make_mut(&mut self.author_index)
+                            .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                }
             }
         }
     }
@@ -2758,53 +3324,37 @@ impl PostStorage {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Post> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Post> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -3048,6 +3598,91 @@ impl PostStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<PostScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let title_value = self
+            .title_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let views_value = self
+            .views_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let published_value = self
+            .published_col
+            .read_bool(row_index)
+            .expect("Failed to read from column");
+        let created_at_value = Timestamp::from(
+            self
+                .created_at_col
+                .read_timestamp(row_index)
+                .expect("Failed to read from column"),
+        );
+        Some(PostScanRow {
+            id: id_value,
+            title: title_value,
+            views: views_value,
+            published: published_value,
+            created_at: created_at_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<PostScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
+    }
+    /// #160 (C): resolve list candidates for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
+    /// param did not parse; the caller falls back to `__scan_all`.
+    pub fn __scan_by_views(&self, value: &str) -> Option<Vec<PostScanRow>> {
+        let __typed = value.parse::<u64>().ok()?;
+        let __k: String = {
+            match serde_json::to_value(&(__typed)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.views_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Some(Vec::new()),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(&__row) = self.id_to_row.get(&__id) {
+                if let Some(__r) = self.__scan_row_at(__row) {
+                    __out.push(__r);
+                }
+            }
+        }
+        Some(__out)
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
@@ -3057,6 +3692,7 @@ impl PostStorage {
     pub fn reader(&self) -> PostStorageReader {
         PostStorageReader {
             id_to_row: self.id_to_row.clone(),
+            id_versions: self.id_versions.clone(),
             id_col: self.id_col.reader().expect("Failed to open column reader"),
             title_col: self.title_col.reader().expect("Failed to open column reader"),
             views_col: self.views_col.reader().expect("Failed to open column reader"),
@@ -3080,15 +3716,20 @@ impl PostStorage {
 }
 ///Read-only, lock-free reader handle for Post storage (#56 Direction B)
 pub struct PostStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     id_col: forgedb_storage::FixedColumnReader,
     title_col: forgedb_storage::VariableColumnReader,
     views_col: forgedb_storage::FixedColumnReader,
     published_col: forgedb_storage::FixedColumnReader,
     author_col: forgedb_storage::FixedColumnReader,
     created_at_col: forgedb_storage::FixedColumnReader,
-    views_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
-    author_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    views_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
+    author_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl PostStorageReader {
@@ -3145,53 +3786,37 @@ impl PostStorageReader {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Post> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Post> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -3326,13 +3951,22 @@ pub struct Tag {
     pub name: String,
     pub posts: (),
 }
+///Internal narrow scan record for `Tag` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct TagScanRow {
+    pub id: Uuid,
+    pub name: String,
+}
 ///Storage for Tag model
 pub struct TagStorage {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     row_count: usize,
     id_col: FixedColumn,
     name_col: VariableColumn,
-    name_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    name_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -3341,6 +3975,7 @@ pub struct TagStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -3366,7 +4001,8 @@ impl TagStorage {
     /// directory boundary — no query logic, no schema read at runtime.
     pub fn new_at(root: &std::path::Path) -> Self {
         let mut db = Self {
-            id_to_row: HashMap::new(),
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
             row_count: 0,
             id_col: FixedColumn::new(root.join("tag/fixed/uuid_0.bin"), 16usize)
                 .expect("Failed to create fixed column"),
@@ -3375,7 +4011,7 @@ impl TagStorage {
                     root.join("tag/variable/string_offsets_1.bin"),
                 )
                 .expect("Failed to create variable column"),
-            name_index: std::collections::HashMap::new(),
+            name_index: std::sync::Arc::new(std::collections::HashMap::new()),
             tombstones: forgedb_storage::Tombstones::new(root.join("tag/tombstones.bin"))
                 .expect("Failed to create tombstones"),
             wal: forgedb_wal::WalManager::open(
@@ -3389,6 +4025,7 @@ impl TagStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -3400,7 +4037,8 @@ impl TagStorage {
                 let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            db.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
         let __ids: Vec<Uuid> = db.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -3432,9 +4070,53 @@ impl TagStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                db.name_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut db.name_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
             }
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("tag/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            name_col: VariableColumn::new(
+                    root.join("tag/variable/string_data_1.bin"),
+                    root.join("tag/variable/string_offsets_1.bin"),
+                )
+                .expect("Failed to create variable column"),
+            name_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            tombstones: forgedb_storage::Tombstones::new(root.join("tag/tombstones.bin"))
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("tag/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -3552,7 +4234,11 @@ impl TagStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -3571,7 +4257,10 @@ impl TagStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.name_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.name_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Inserted);
@@ -3654,7 +4343,11 @@ impl TagStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(false).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         if let Some(__old_rec) = &__old {
             {
@@ -3675,12 +4368,13 @@ impl TagStorage {
                     }
                 };
                 let mut __empty = false;
-                if let Some(__set) = self.name_index.get_mut(&__k) {
+                let __map = std::sync::Arc::make_mut(&mut self.name_index);
+                if let Some(__set) = __map.get_mut(&__k) {
                     __set.remove(&(id));
                     __empty = __set.is_empty();
                 }
                 if __empty {
-                    self.name_index.remove(&__k);
+                    __map.remove(&__k);
                 }
             }
         }
@@ -3701,7 +4395,10 @@ impl TagStorage {
                     Err(_) => String::from('\u{3}'),
                 }
             };
-            self.name_index.entry(__k).or_default().insert(id);
+            std::sync::Arc::make_mut(&mut self.name_index)
+                .entry(__k)
+                .or_default()
+                .insert(id);
         }
         if let Some(feed) = &self.changefeed {
             feed.emit("Tag", row_index, forgedb_changefeed::ChangeKind::Updated);
@@ -3729,8 +4426,13 @@ impl TagStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -3765,7 +4467,11 @@ impl TagStorage {
             .expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         self.tombstones.append(true).expect("Failed to append tombstone");
-        self.id_to_row.insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
         self.row_count += 1;
         {
             let __k: String = {
@@ -3785,12 +4491,13 @@ impl TagStorage {
                 }
             };
             let mut __empty = false;
-            if let Some(__set) = self.name_index.get_mut(&__k) {
+            let __map = std::sync::Arc::make_mut(&mut self.name_index);
+            if let Some(__set) = __map.get_mut(&__k) {
                 __set.remove(&(id));
                 __empty = __set.is_empty();
             }
             if __empty {
-                self.name_index.remove(&__k);
+                __map.remove(&__k);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -3819,8 +4526,13 @@ impl TagStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -3934,8 +4646,9 @@ impl TagStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -3951,15 +4664,49 @@ impl TagStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("tag", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __saved_name_index = std::sync::Arc::clone(&self.name_index);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            self.name_index = __saved_name_index;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -3971,8 +4718,9 @@ impl TagStorage {
     /// end up exactly as a fresh reopen would build them — no incremental
     /// remove-old/add-new bookkeeping to drift.
     pub fn __reindex_committed(&mut self) {
-        self.id_to_row.clear();
-        self.name_index.clear();
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.id_versions).clear();
+        std::sync::Arc::make_mut(&mut self.name_index).clear();
         let n = self.tombstones.len();
         self.row_count = n;
         for i in 0..n {
@@ -3980,7 +4728,11 @@ impl TagStorage {
                 let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
                 Uuid::from_bytes(bytes)
             };
-            self.id_to_row.insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(i);
         }
         let __ids: Vec<Uuid> = self.id_to_row.keys().copied().collect();
         for __id in __ids {
@@ -4012,7 +4764,88 @@ impl TagStorage {
                         Err(_) => String::from('\u{3}'),
                     }
                 };
-                self.name_index.entry(__k).or_default().insert(__id);
+                std::sync::Arc::make_mut(&mut self.name_index)
+                    .entry(__k)
+                    .or_default()
+                    .insert(__id);
+            }
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if let Some(__old_rec) = self.get(id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__old_rec.name)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.name_index);
+                    if let Some(__set) = __map.get_mut(&__k) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__k);
+                    }
+                }
+            }
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {
+                if let Some(__new_rec) = self.read_at(__r) {
+                    {
+                        let __k: String = {
+                            match serde_json::to_value(&(__new_rec.name)) {
+                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                                Ok(serde_json::Value::String(__s)) => {
+                                    let mut __k = String::from('\u{1}');
+                                    __k.push_str(&__s);
+                                    __k
+                                }
+                                Ok(__other) => {
+                                    let mut __k = String::from('\u{2}');
+                                    __k.push_str(&__other.to_string());
+                                    __k
+                                }
+                                Err(_) => String::from('\u{3}'),
+                            }
+                        };
+                        std::sync::Arc::make_mut(&mut self.name_index)
+                            .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                }
             }
         }
     }
@@ -4183,53 +5016,37 @@ impl TagStorage {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Tag> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Tag> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -4427,6 +5244,73 @@ impl TagStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
+    /// Narrow-decode the scan columns at a physical row (#160).
+    fn __scan_row_at(&self, row_index: usize) -> Option<TagScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let name_value = self
+            .name_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        Some(TagScanRow {
+            id: id_value,
+            name: name_value,
+        })
+    }
+    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
+    /// source, decoding only the filterable/sortable columns.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all(&self) -> Vec<TagScanRow> {
+        let mut rows = Vec::new();
+        for &__row in self.id_to_row.values() {
+            if let Some(__r) = self.__scan_row_at(__row) {
+                rows.push(__r);
+            }
+        }
+        rows
+    }
+    /// #160 (C): resolve list candidates for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
+    /// param did not parse; the caller falls back to `__scan_all`.
+    pub fn __scan_by_name(&self, value: &str) -> Option<Vec<TagScanRow>> {
+        let __k: String = {
+            match serde_json::to_value(&(value)) {
+                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                Ok(serde_json::Value::String(__s)) => {
+                    let mut __k = String::from('\u{1}');
+                    __k.push_str(&__s);
+                    __k
+                }
+                Ok(__other) => {
+                    let mut __k = String::from('\u{2}');
+                    __k.push_str(&__other.to_string());
+                    __k
+                }
+                Err(_) => String::from('\u{3}'),
+            }
+        };
+        let __ids = match self.name_index.get(&__k) {
+            Some(__s) => __s,
+            None => return Some(Vec::new()),
+        };
+        let mut __out = Vec::new();
+        for &__id in __ids {
+            if let Some(&__row) = self.id_to_row.get(&__id) {
+                if let Some(__r) = self.__scan_row_at(__row) {
+                    __out.push(__r);
+                }
+            }
+        }
+        Some(__out)
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
@@ -4436,6 +5320,7 @@ impl TagStorage {
     pub fn reader(&self) -> TagStorageReader {
         TagStorageReader {
             id_to_row: self.id_to_row.clone(),
+            id_versions: self.id_versions.clone(),
             id_col: self.id_col.reader().expect("Failed to open column reader"),
             name_col: self.name_col.reader().expect("Failed to open column reader"),
             name_index: self.name_index.clone(),
@@ -4448,10 +5333,13 @@ impl TagStorage {
 }
 ///Read-only, lock-free reader handle for Tag storage (#56 Direction B)
 pub struct TagStorageReader {
-    id_to_row: HashMap<Uuid, usize>,
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
     id_col: forgedb_storage::FixedColumnReader,
     name_col: forgedb_storage::VariableColumnReader,
-    name_index: std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    name_index: std::sync::Arc<
+        std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::TombstonesReader,
 }
 impl TagStorageReader {
@@ -4483,53 +5371,37 @@ impl TagStorageReader {
     /// of `id` committed as of `snap`.  A snapshot captured before a later
     /// update/delete still resolves the version live as-of capture; a
     /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
     pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Tag> {
         let watermark = snap.watermark();
-        let mut newest: Option<usize> = None;
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if row_id == id {
-                newest = Some(row_index);
-            }
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
         }
-        self.read_at(newest?)
+        self.read_at(versions[pos - 1])
     }
     /// Return every live record committed as of `snap` (#56 + #66).
-    /// Resolves the newest version per id within `0..watermark`, so an
-    /// updated row appears once (its newest version) and a deleted row is
-    /// excluded — no duplicate physical versions leak into the view.
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
     pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Tag> {
         let watermark = snap.watermark();
-        let mut newest: HashMap<Uuid, usize> = HashMap::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            newest.insert(row_id, row_index);
-        }
         let mut records = Vec::new();
-        for row_index in 0..watermark {
-            let row_id = {
-                let bytes = self
-                    .id_col
-                    .read_uuid(row_index)
-                    .expect("Failed to read id column");
-                Uuid::from_bytes(bytes)
-            };
-            if newest.get(&row_id) == Some(&row_index) {
-                if let Some(record) = self.read_at(row_index) {
-                    records.push(record);
-                }
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
             }
         }
         records
@@ -5438,6 +6310,24 @@ impl Database {
         self.user.compact();
         self.post.compact();
         self.tag.compact();
+    }
+    /// Run maintenance deferred off the hot write turn (#162-A): for
+    /// every model, reclaim dead row versions IFF a compaction became
+    /// due (the soft dead-row threshold set `compaction_due` instead of
+    /// stalling the triggering write).  Call this at an operator /
+    /// coordinator idle point so the rewrite+remap cost lands here, not
+    /// on a user write.  Cheap when nothing is due (a per-model flag
+    /// check).  Snapshot-safety is the same as `compact()` — a live
+    /// prepare snapshot defers the whole pass.  Single-writer only.
+    pub fn maintain(&mut self) {
+        if let Ok(__seq) = self.seq.lock() {
+            if __seq.oldest_live_snapshot().as_u64() > 0 {
+                return;
+            }
+        }
+        self.user.maintain();
+        self.post.maintain();
+        self.tag.maintain();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
@@ -7564,12 +8454,15 @@ impl Database {
     /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
     /// dependency and never calls this.
     pub(crate) fn __peer_refresh(&mut self) {
+        let __from = self.user.row_count;
         self.user.__sync_columns_from_disk();
-        self.user.__reindex_committed();
+        self.user.__reindex_delta(__from);
+        let __from = self.post.row_count;
         self.post.__sync_columns_from_disk();
-        self.post.__reindex_committed();
+        self.post.__reindex_delta(__from);
+        let __from = self.tag.row_count;
         self.tag.__sync_columns_from_disk();
-        self.tag.__reindex_committed();
+        self.tag.__reindex_delta(__from);
     }
     /// Open a data dir as a **coordinated Tier-3 client** of a running
     /// `forgedb coordinate <root>` coordinator, returning a

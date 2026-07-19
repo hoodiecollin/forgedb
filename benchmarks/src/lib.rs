@@ -12,6 +12,33 @@
 #[path = "../gen/database.rs"]
 pub mod forgedb_generated;
 
+/// Config-matrix variants (epic #126): the SAME `bench.forge` generated under a
+/// range of `forgedb.toml` configs, each a separate module, so the matrix bench
+/// (`benches/matrix_bench.rs`) can measure how a generate-time knob shifts the
+/// write path. Regenerate all of these with `make bench-regen-matrix`. Each
+/// module is byte-different only where its knob bakes in (fsync policy, broker
+/// presence, thresholds, changefeed capacity) — the schema is identical.
+/// (Top-level modules, not nested under a `variants` module: `#[path]` for an
+/// inline nested module resolves through a `src/<mod>/` dir that does not exist.)
+#[allow(warnings)]
+#[path = "../gen/default/database.rs"]
+pub mod v_default;
+#[allow(warnings)]
+#[path = "../gen/fsync_never/database.rs"]
+pub mod v_fsync_never;
+#[allow(warnings)]
+#[path = "../gen/replication_on/database.rs"]
+pub mod v_replication_on;
+#[allow(warnings)]
+#[path = "../gen/compaction_off/database.rs"]
+pub mod v_compaction_off;
+#[allow(warnings)]
+#[path = "../gen/compaction_low/database.rs"]
+pub mod v_compaction_low;
+#[allow(warnings)]
+#[path = "../gen/changefeed_small/database.rs"]
+pub mod v_changefeed_small;
+
 /// Row counts every scaling scenario sweeps (small / medium / large).
 pub const SIZES: [usize; 3] = [1_000, 100_000, 1_000_000];
 

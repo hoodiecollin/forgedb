@@ -1,0 +1,9 @@
+# Matrix config-variant modules are regenerable from bench.forge + configs/*.toml.
+# Run `make bench-regen-matrix` before `make bench-matrix`. The default single
+# `gen/database.rs` (used by forgedb_bench) stays tracked, per the existing convention.
+/gen/default/
+/gen/fsync_never/
+/gen/replication_on/
+/gen/compaction_off/
+/gen/compaction_low/
+/gen/changefeed_small/

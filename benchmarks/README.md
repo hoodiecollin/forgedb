@@ -13,7 +13,16 @@ make bench            # every implemented suite (currently ForgeDB + SQLite)
 make bench-forgedb    # ForgeDB generated code only
 make bench-sqlite     # SQLite only
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
+
+# Config matrix (epic #126): same scenarios across generated config variants.
+make bench-regen-matrix   # regenerate gen/<variant>/ from configs/<variant>.toml (REQUIRED first)
+make bench-matrix         # run the write-path / churn / reopen scenarios across variants
 ```
+
+The matrix variant modules (`gen/<variant>/`) are **gitignored** (regenerable from
+`bench.forge` + `configs/*.toml`) — run `make bench-regen-matrix` before `make bench-matrix`.
+Config axes live in `benchmarks/configs/*.toml`; results + interpretation are in
+[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) under "Configuration matrix".
 
 Filter to one scenario and shorten the run while iterating:
 

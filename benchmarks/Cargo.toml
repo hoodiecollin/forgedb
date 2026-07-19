@@ -37,6 +37,10 @@ harness = false
 name = "sqlite_bench"
 harness = false
 
+[[bench]]
+name = "matrix_bench"
+harness = false
+
 # Detached from the root workspace on purpose: keeps SQLite (and later DuckDB / PG
 # client libs) out of `cargo build --workspace` and the test baseline.
 [workspace]

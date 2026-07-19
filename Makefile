@@ -6,9 +6,13 @@ BUN := /Users/collin/.bun/bin/bun
 INSPECTOR := apps/inspector
 BENCH := benchmarks/Cargo.toml
 
+## Config variants for the matrix bench (epic #126): each becomes a generated
+## module under benchmarks/gen/<name>/. Keep in sync with benchmarks/configs/.
+BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_low changefeed_small
+
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
-        bench bench-forgedb bench-sqlite bench-regen
+        bench bench-forgedb bench-sqlite bench-matrix bench-regen bench-regen-matrix
 
 ## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
 bench:
@@ -22,10 +26,25 @@ bench-forgedb:
 bench-sqlite:
 	cargo bench --manifest-path $(BENCH) --bench sqlite_bench
 
+## Config-matrix bench (epic #126): same scenarios across generated config variants.
+bench-matrix:
+	cargo bench --manifest-path $(BENCH) --bench matrix_bench
+
 ## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
 ## Run this after any codegen change so the bench links current generated output.
 bench-regen:
 	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen --force
+
+## Re-emit every matrix config variant (benchmarks/gen/<variant>/database.rs) from
+## bench.forge under its benchmarks/configs/<variant>.toml. Run after codegen changes.
+bench-regen-matrix:
+	@for v in $(BENCH_VARIANTS); do \
+		echo "regen $$v"; \
+		cargo run -q -- generate rust --force \
+			--config benchmarks/configs/$$v.toml \
+			--schema benchmarks/bench.forge \
+			--output benchmarks/gen/$$v || exit 1; \
+	done
 
 ## Install the inspector app's JS dependencies.
 inspector-install:

@@ -1,0 +1,3 @@
+[runtime]
+changefeed_capacity = 16
+max_cascade_depth = 8
