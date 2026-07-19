@@ -28,6 +28,8 @@ uuid = { version = "1", features = ["v4"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 redb = "2"
+duckdb = { version = "1", features = ["bundled"] }
+postgres = "0.19"
 tempfile = "3"
 
 [[bench]]
@@ -40,6 +42,14 @@ harness = false
 
 [[bench]]
 name = "redb_bench"
+harness = false
+
+[[bench]]
+name = "duckdb_bench"
+harness = false
+
+[[bench]]
+name = "pg_bench"
 harness = false
 
 [[bench]]

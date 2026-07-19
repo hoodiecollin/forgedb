@@ -12,7 +12,8 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
-        bench bench-forgedb bench-sqlite bench-redb bench-matrix bench-regen bench-regen-matrix
+        bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
+        bench-matrix bench-regen bench-regen-matrix
 
 ## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
 bench:
@@ -29,6 +30,16 @@ bench-sqlite:
 ## Benchmark redb only (pure-Rust embedded KV).
 bench-redb:
 	cargo bench --manifest-path $(BENCH) --bench redb_bench
+
+## Benchmark DuckDB only (embedded columnar; bundled build).
+bench-duckdb:
+	cargo bench --manifest-path $(BENCH) --bench duckdb_bench
+
+## Benchmark PostgreSQL only. Spins an EPHEMERAL cluster from the devbox-provided
+## `postgresql` package (no binary download), runs the suite over a unix socket,
+## and tears it down. Requires devbox (declarative host deps — see devbox.json).
+bench-postgres:
+	devbox run -- benchmarks/scripts/pg_run.sh
 
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 bench-matrix:

@@ -29,8 +29,8 @@ throughput can't be read in isolation.
 | --- | --- | --- | --- |
 | **SQLite** (`rusqlite`) | 1 | embedded, single-writer, row-store | The canonical embedded DB; closest to ForgeDB's write model. The primary comparison. | **Implemented** |
 | **redb** | 1 | embedded, pure-Rust KV | Closest on *deployment shape* — generated Rust links a substrate crate, no external process. | **Implemented** |
-| **DuckDB** | 1 | embedded, **columnar** | Closest on *storage model* (our columns vs. their vectorized columnar). Expected to win scans. | Planned |
-| **PostgreSQL** (`postgres`, localhost socket) | 2 | client/server, row-store | The industry reference. Carries parse + planning + socket overhead — anchors the RDBMS axis. | Planned |
+| **DuckDB** | 1 | embedded, **columnar** | Closest on *storage model* (our columns vs. their vectorized columnar). Expected to win scans. | **Implemented** |
+| **PostgreSQL** (`postgres`, localhost socket) | 2 | client/server, row-store | The industry reference. Carries parse + planning + socket overhead — anchors the RDBMS axis. | **Implemented** |
 | **PGlite** (`@electric-sql/pglite`) | 2 (variant) | **Postgres compiled to WASM, in-process** | A Postgres variant that runs in-process (no server, no socket). Isolates "what does the Postgres engine cost" from "what does the client/server boundary cost" when read against the server PG numbers. | Planned (JS/Bun suite) |
 
 **SQLite + redb implemented.** The remaining three (DuckDB, PostgreSQL, PGlite) are
@@ -58,6 +58,58 @@ read path (notably `reverse_fk`, where ForgeDB full-materializes each child — 
 residual). ForgeDB's differentiators (typed generated API, no query parser, columnar
 footprint, snapshot/replica) are not what these point/traversal micro-latencies capture;
 the value of the comparison is exactly surfacing where the generated path is slower.
+
+### DuckDB (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
+
+`make bench-duckdb` (the `duckdb` crate's `bundled` feature builds the C++ amalgamation —
+a ~2.5 min one-time compile). DuckDB is here for its **columnar** storage model; it is
+expected to be **weak at single-row OLTP** (point insert/lookup) and to **win vectorized
+scans/aggregates** — the mirror image of the embedded row engines.
+
+| scenario | DuckDB | redb | ForgeDB (default) | note |
+| --- | --- | --- | --- | --- |
+| `insert_user` | 208 µs | 4.04 ms (barrier) / 0.50 ms | 3.95 ms (barrier) | DuckDB WAL, not a per-row `F_FULLFSYNC` barrier — not like-for-like |
+| `bulk_load/10000` | 1.39 s | 4.9 s (eventual) | 50.7 s (barrier) | row-at-a-time INSERT is DuckDB's worst case (its bulk path is the Appender) |
+| `point_lookup` | 88.4 µs | 0.62 µs | 3.48 µs | **columnar point lookup is ~25× slower than ForgeDB, ~140× slower than redb** |
+| `index_probe` | 82.6 µs | 1.11 µs | 3.67 µs | same columnar point-op weakness |
+| `reverse_fk` | 106 µs | 3.94 µs | 36.9 µs | — |
+| `m2m` | 196 µs | 1.62 µs | 5.94 µs | — |
+
+Honest read: DuckDB loses every point/traversal micro-op here by 1–2 orders of magnitude —
+**as expected for a columnar analytical engine**; row-at-a-time access is not what it
+optimizes. The scenario where DuckDB should win — a filtered **scan + sort + aggregate**
+over the whole table (scenario 7) — is a cross-engine addition still TODO across all
+suites; adding it is where DuckDB's model pays off and is the honest place to show it.
+
+### PostgreSQL (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
+
+`make bench-postgres` — spins an **ephemeral cluster from the devbox-provided `postgresql`
+package** (declarative host dep, no binary download): `benchmarks/scripts/pg_run.sh` runs
+`initdb` → `pg_ctl start` on a unix socket in a tempdir → the suite → `pg_ctl stop`, all
+under `devbox run`. The suite connects over the unix socket (`FORGEDB_BENCH_PG_URL`).
+
+PostgreSQL is a full **client/server** RDBMS — every op carries **parse + plan + protocol
+round-trip** the embedded engines do not — so it anchors the "what a real RDBMS costs"
+axis, not a head-to-head.
+
+| scenario | PostgreSQL | ForgeDB (default) | redb | note |
+| --- | --- | --- | --- | --- |
+| `insert_user` (`sync_on`) | 56.1 µs | 3.95 ms (barrier) | 4.04 ms (barrier) | ⚠ PG `synchronous_commit=on` on macOS uses plain `fsync`, **not** `F_FULLFSYNC` — a weaker durability tier, NOT barrier-matched |
+| `insert_user` (`sync_off`) | 37.4 µs | — | 0.50 ms | relaxed (group commit) |
+| `point_lookup` | 26.0 µs | 3.48 µs | 0.62 µs | the ~7.5× over ForgeDB is the **client/server round-trip** (parse+plan+IPC over a socket) |
+| `index_probe` | 28.9 µs | 3.67 µs | 1.11 µs | — |
+| `reverse_fk` | 32.4 µs | 36.9 µs | 3.94 µs | PG's planned index scan ≈ ForgeDB's full-materialize here |
+| `m2m` | 59.5 µs | 5.94 µs | 1.62 µs | PG plans a hash/nested-loop join; the others probe an index directly |
+
+Honest read: PostgreSQL's read latencies (26–60 µs) are dominated by the protocol
+round-trip — it is 1–2 orders of magnitude slower than the in-process embedded engines on
+these point/traversal micro-ops, **which is the client/server cost the axis exists to
+show**, not an engine deficiency. Two durability caveats: (1) PG's `sync_on` here is
+plain-`fsync` durability (weaker than the `F_FULLFSYNC` barrier ForgeDB/redb/SQLite-`fullfsync`
+use), so its ~56 µs insert is NOT a like-for-like barrier comparison — a `wal_sync_method =
+fsync_writethrough` (macOS F_FULLFSYNC) tier is the barrier-matched follow-up; (2) PG still
+beats columnar DuckDB's 88 µs point lookup despite the socket, because DuckDB's columnar
+model is the wrong shape for point ops.
 
 ### A note on PGlite
 

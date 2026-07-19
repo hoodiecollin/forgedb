@@ -31,3 +31,6 @@ apps/inspector/*.tsbuildinfo
 # VS Code extension build artifacts (source is tracked; outputs are not)
 vscode-forgedb/out/
 vscode-forgedb/*.vsix
+
+# devbox nix runtime profile (machine-specific; devbox.json/.lock are committed)
+.devbox/
