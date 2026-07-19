@@ -16,7 +16,7 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use forgedb_benchmarks::{dataset, id_for, Dataset};
-use redb::{Database, Durability, MultimapTableDefinition, TableDefinition};
+use redb::{Database, Durability, MultimapTableDefinition, ReadableTable, TableDefinition};
 
 const READ_USERS: usize = 1_000;
 const READ_POSTS: usize = 10_000;
@@ -272,5 +272,60 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads);
+// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
+// A B-tree KV has no columnar projection: the full-table scan walks every leaf and
+// decodes each packed value blob, then filters/aggregates in Rust — exactly what a
+// hand-rolled redb app would do. This is the scenario a columnar engine should win.
+fn bench_scan(c: &mut Criterion) {
+    let data = dataset(READ_USERS, READ_POSTS);
+    let dir = tempfile::tempdir().unwrap();
+    let db = fresh_db(&dir.path().join("bench.redb"));
+    load(&db, &data);
+
+    // 7a: full scan + aggregate — decode every post, COUNT + SUM(views) WHERE published.
+    c.benchmark_group("redb/scan_aggregate")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("sum_views_where_published", |b| {
+            b.iter(|| {
+                let rtx = db.begin_read().unwrap();
+                let posts = rtx.open_table(POST).unwrap();
+                let mut count = 0u64;
+                let mut sum = 0u128;
+                for row in posts.iter().unwrap() {
+                    let (_k, v) = row.unwrap();
+                    let (views, _ca, published, _a, _t) = unpack_post(v.value());
+                    if published {
+                        count += 1;
+                        sum += views as u128;
+                    }
+                }
+                std::hint::black_box((count, sum))
+            });
+        });
+
+    // 7b: filtered scan + sort + page — decode every post, filter views >= T,
+    // sort desc, take top 10 (full records — no early prune without a views index).
+    type PostRowOut = (u64, i64, bool, [u8; 16], String);
+    c.benchmark_group("redb/scan_sort_top10")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("top10_by_views", |b| {
+            b.iter(|| {
+                let rtx = db.begin_read().unwrap();
+                let posts = rtx.open_table(POST).unwrap();
+                let mut rows: Vec<PostRowOut> = Vec::new();
+                for row in posts.iter().unwrap() {
+                    let (_k, v) = row.unwrap();
+                    let rec = unpack_post(v.value());
+                    if rec.0 >= 50_000 {
+                        rows.push(rec);
+                    }
+                }
+                rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                rows.truncate(10);
+                std::hint::black_box(rows)
+            });
+        });
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
 criterion_main!(benches);

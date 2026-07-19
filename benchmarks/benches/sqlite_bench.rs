@@ -246,5 +246,49 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads);
+// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
+fn bench_scan(c: &mut Criterion) {
+    let data = dataset(READ_USERS, READ_POSTS);
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = fresh_conn(&dir.path().join("bench.db"));
+    load(&mut conn, &data);
+
+    // 7a: full scan + aggregate.
+    c.benchmark_group("sqlite/scan_aggregate")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("sum_views_where_published", |b| {
+            let mut stmt = conn
+                .prepare("SELECT COUNT(*), COALESCE(SUM(views), 0) FROM post WHERE published = 1")
+                .unwrap();
+            b.iter(|| {
+                let row: (i64, i64) = stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+                std::hint::black_box(row)
+            });
+        });
+
+    // 7b: filtered scan + sort + page (top-10 by views, full records).
+    type PostRowOut = (Vec<u8>, String, i64, i64, Vec<u8>, i64);
+    c.benchmark_group("sqlite/scan_sort_top10")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("top10_by_views", |b| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, title, views, published, author, created_at FROM post \
+                     WHERE views >= ?1 ORDER BY views DESC LIMIT 10",
+                )
+                .unwrap();
+            b.iter(|| {
+                let rows: Vec<PostRowOut> = stmt
+                    .query_map(params![50_000i64], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    })
+                    .unwrap()
+                    .map(|r| r.unwrap())
+                    .collect();
+                std::hint::black_box(rows)
+            });
+        });
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
 criterion_main!(benches);

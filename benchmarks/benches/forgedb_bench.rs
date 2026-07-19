@@ -180,5 +180,52 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads);
+// --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
+// The columnar-scan path. ForgeDB's honest scan is the generated narrow
+// `__scan_all()` (decodes only the filterable/sortable columns, not the full
+// record — the #160 list path), then, for the top-N, materialize ONLY the page.
+// This is the scenario a columnar analytical engine (DuckDB) is built to win.
+fn bench_scan(c: &mut Criterion) {
+    let data = dataset(READ_USERS, READ_POSTS);
+    let (db, _dir) = populated(&data);
+
+    // 7a: full scan + aggregate — COUNT + SUM(views) WHERE published.
+    c.benchmark_group("forgedb/scan_aggregate")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("sum_views_where_published", |b| {
+            b.iter(|| {
+                let mut count = 0u64;
+                let mut sum = 0u128;
+                for row in db.post.__scan_all() {
+                    if row.published {
+                        count += 1;
+                        sum += row.views as u128;
+                    }
+                }
+                std::hint::black_box((count, sum))
+            });
+        });
+
+    // 7b: filtered scan + sort + page — top-10 posts by views (>= threshold),
+    // materializing only the 10-row page (mirrors the generated #160 list path:
+    // narrow scan/filter/sort, then full-materialize only the returned page).
+    c.benchmark_group("forgedb/scan_sort_top10")
+        .throughput(Throughput::Elements(READ_POSTS as u64))
+        .bench_function("top10_by_views", |b| {
+            b.iter(|| {
+                let mut rows: Vec<_> = db
+                    .post
+                    .__scan_all()
+                    .into_iter()
+                    .filter(|r| r.views >= 50_000)
+                    .collect();
+                rows.sort_unstable_by(|a, b| b.views.cmp(&a.views));
+                rows.truncate(10);
+                let page: Vec<_> = rows.iter().map(|r| db.post.get(r.id)).collect();
+                std::hint::black_box(page)
+            });
+        });
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
 criterion_main!(benches);

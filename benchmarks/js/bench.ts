@@ -131,12 +131,17 @@ const PG_POINT = "SELECT id,title,views,published,author,created_at FROM post WH
 const PG_EMAIL = 'SELECT id,name,email,created_at FROM "user" WHERE email = $1';
 const PG_AUTHOR = "SELECT id,title,views,published,author,created_at FROM post WHERE author = $1";
 const PG_TAGS = "SELECT tag.id, tag.name FROM tag JOIN post_tag_link l ON l.tag_id = tag.id WHERE l.post_id = $1";
+// Scenario 7: filtered scan + aggregate, and filtered scan + sort + top-N.
+const PG_AGG = "SELECT COUNT(*), COALESCE(SUM(views),0) FROM post WHERE published";
+const PG_TOPN = "SELECT id,title,views,published,author,created_at FROM post WHERE views >= $1 ORDER BY views DESC LIMIT 10";
 
 // Prepared bun:sqlite statements.
 const sqPoint = sq.query("SELECT id,title,views,published,author,created_at FROM post WHERE id = ?");
 const sqEmail = sq.query("SELECT id,name,email,created_at FROM user WHERE email = ?");
 const sqAuthor = sq.query("SELECT id,title,views,published,author,created_at FROM post WHERE author = ?");
 const sqTags = sq.query("SELECT tag.id, tag.name FROM tag JOIN post_tag_link l ON l.tag_id = tag.id WHERE l.post_id = ?");
+const sqAgg = sq.query("SELECT COUNT(*), COALESCE(SUM(views),0) FROM post WHERE published = 1");
+const sqTopN = sq.query("SELECT id,title,views,published,author,created_at FROM post WHERE views >= ? ORDER BY views DESC LIMIT 10");
 
 let i = 0;
 
@@ -169,6 +174,22 @@ summary(() => {
   group("js/m2m", () => {
     bench("pglite", async () => { const id = idFor(2, i++ % READ_POSTS); await pg.query(PG_TAGS, [id]); });
     bench("bun:sqlite", () => { const id = idFor(2, i++ % READ_POSTS); sqTags.all(id); });
+  });
+});
+
+// Scenario 7a: filtered scan + aggregate (COUNT + SUM(views) WHERE published).
+summary(() => {
+  group("js/scan_aggregate", () => {
+    bench("pglite", async () => { await pg.query(PG_AGG); });
+    bench("bun:sqlite", () => { sqAgg.get(); });
+  });
+});
+
+// Scenario 7b: filtered scan + sort + top-10 by views.
+summary(() => {
+  group("js/scan_sort_top10", () => {
+    bench("pglite", async () => { await pg.query(PG_TOPN, [50_000]); });
+    bench("bun:sqlite", () => { sqTopN.all(50_000); });
   });
 });
 
