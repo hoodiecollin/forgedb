@@ -3473,26 +3473,69 @@ impl RustGenerator {
                 let __config = forgedb_compaction::CompactionConfig::default();
                 let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
                 if __compactor.compact_model_keeping(#model_snake, &__keep).is_ok() {
-                    // 3. Rows renumbered: reopen to rebuild the in-memory maps from
-                    //    the compacted files (preserving the shared change feed and
-                    //    the durable replication broker across the reopen).
+                    // 4. In-place remap (#162-C) — NOT a full rehydrate rescan.
+                    //    The compactor rewrites survivors in ascending physical
+                    //    order and renumbers them densely, so a kept row's new index
+                    //    is the count of kept rows before it.  Sort the keep set once
+                    //    for the O(log n) `partition_point` lookup.
+                    let mut __keep_sorted = __keep;
+                    __keep_sorted.sort_unstable();
+                    // Preserve the maps across the column-handle reopen: index maps
+                    // are value→id keyed (renumber-invariant, already current), so
+                    // save + reinstall them verbatim; `id_to_row` is remapped below.
+                    let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+                    #(#save_indexes)*
                     let __root = self.root.clone();
                     let __feed = self.changefeed.take();
                     let __broker = self.broker.take();
-                    *self = Self::new_at(&__root);
+                    // Reopen ONLY the column handles (stale fds after the rename);
+                    // skip the O(rows × indexes) rehydrate scan — remap follows.
+                    *self = Self::new_at_no_rehydrate(&__root);
                     self.changefeed = __feed;
                     self.broker = __broker;
-                    // 4. Break the incremental-backup chain (#76): renumbering
-                    //    moved every row's bytes, so a byte-tail delta computed
-                    //    against a pre-compaction base is invalid.  Bump the epoch
-                    //    AFTER the reopen (which rewrote the manifest preserving the
-                    //    old epoch) so an incremental across this boundary is
-                    //    refused rather than silently corrupt.
+                    #(#reinstall_indexes)*
+                    // Remap `id_to_row` (and rebuild the single-version
+                    // `id_versions`) from the dense keep-set positions.  An id whose
+                    // newest row was tombstoned is absent from `__keep` and so is
+                    // dropped here — the delete is fully reclaimed.
+                    let mut __new_id_to_row: std::collections::HashMap<_, usize> =
+                        std::collections::HashMap::with_capacity(__old_id_to_row.len());
+                    #decl_versions
+                    for (&__id, &__old_row) in __old_id_to_row.iter() {
+                        if __keep_sorted.binary_search(&__old_row).is_ok() {
+                            let __new_row = __keep_sorted.partition_point(|&__r| __r < __old_row);
+                            __new_id_to_row.insert(__id, __new_row);
+                            #remap_versions
+                        }
+                    }
+                    self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+                    #assign_versions
+                    // 5. Break the incremental-backup chain (#76): renumbering moved
+                    //    every row's bytes, so a byte-tail delta computed against a
+                    //    pre-compaction base is invalid.  Bump the epoch AFTER the
+                    //    reopen (which rewrote the manifest preserving the old epoch)
+                    //    so an incremental across this boundary is refused rather
+                    //    than silently corrupt.
                     self.bump_compaction_epoch(&__root);
                 }
                 // Reset unconditionally: a failed compaction waits a full interval
-                // rather than re-attempting on every subsequent mutation.
+                // rather than re-attempting on every subsequent mutation.  #162-A:
+                // clear the deferred-due flag too (this reclaim satisfied it).
                 self.dead_since_compaction = 0;
+                self.compaction_due = false;
+            }
+
+            /// Run a compaction the write path deferred off the hot turn (#162-A).
+            /// The soft dead-row threshold only sets `compaction_due` so a user
+            /// write never stalls on the rewrite+remap; an operator / coordinator
+            /// idle turn calls `Database::maintain()`, which routes here — so the
+            /// reclaim happens off the write path.  A no-op when nothing is due (or
+            /// mid-transaction, where `compact()` would itself defer).
+            pub fn maintain(&mut self) {
+                if self.compaction_due && !self.in_transaction {
+                    self.compaction_due = false;
+                    self.compact();
+                }
             }
         }
     }
@@ -3552,6 +3595,9 @@ impl RustGenerator {
         } else {
             quote! {}
         };
+        // #161-B: the incremental delta variant of `__reindex_committed` for the
+        // coordinated peer-refresh hot path (folds only new rows, no full rebuild).
+        let reindex_delta = Self::generate_reindex_delta_method(model);
         quote! {
             /// Rebuild `id_to_row` + secondary indexes from the committed prefix
             /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -3568,6 +3614,8 @@ impl RustGenerator {
                 #(#clear_indexes)*
                 #rehydrate_self
             }
+
+            #reindex_delta
 
             /// Refresh EVERY column + the tombstone's in-memory `row_count` from
             /// the on-disk file lengths, then adopt the peer-visible row count
@@ -3688,6 +3736,132 @@ impl RustGenerator {
                 } else if self.checkpoint_deferred {
                     self.checkpoint_deferred = false;
                     self.checkpoint();
+                }
+            }
+        }
+    }
+
+    /// Emit `__reindex_delta(&mut self, from: usize)` (#161-B): the incremental
+    /// counterpart to `__reindex_committed` for the coordinated peer-refresh hot
+    /// path.  After `__sync_columns_from_disk` bumps `row_count` to include a
+    /// peer's newly-committed rows, this folds ONLY the rows in `[from..row_count)`
+    /// into the existing maps — instead of clearing every map and rescanning all
+    /// rows.  Cost is O(new rows), not O(all rows × indexes).
+    ///
+    /// Each new row is a superseding version (`insert`/`update`/`delete`) of some
+    /// id.  The per-row maintenance is EXACTLY the live update/delete path's
+    /// remove-old / add-new (it reuses the same `index_remove_block` /
+    /// `index_add_block` builders, keyed off `__old_rec` = the version resolved
+    /// *before* this row and `__new_rec` = the row itself), so there is one index-
+    /// maintenance source and no drift.  Rows are processed in ascending physical
+    /// order, so within the range a later version of an id correctly supersedes an
+    /// earlier one: `self.get(id)` at row R resolves the version last folded (or
+    /// the pre-`from` state), whose keys are removed before R's are added.
+    fn generate_reindex_delta_method(model: &forgedb_parser::Model) -> TokenStream {
+        // Guarded by the caller (`generate_txn_storage_methods` returns early for
+        // an id-less model), but keep the None-guard local so the helper is safe.
+        let row_var = format_ident!("__r");
+        let id_read = match Self::generate_id_read_expr(model, &quote! { self }, &row_var) {
+            Some(expr) => expr,
+            None => return quote! {},
+        };
+        let recv = quote! { self };
+        let id_tok = quote! { id };
+        let indexed = Self::indexed_fields(model);
+        let composites = Self::composite_indexes(model);
+        let has_index = !indexed.is_empty() || !composites.is_empty();
+
+        // Remove side — the SAME blocks the live update/delete path builds, keyed
+        // off `__old_rec` (the record resolved before this row, via `self.get(id)`).
+        let old = quote! { __old_rec };
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &old, "rem");
+        let single_removes: Vec<_> = indexed
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let key = Self::field_key_token(f, &old, &rem_map);
+                Self::index_remove_block(&recv, &ident, key, &id_tok)
+            })
+            .collect();
+        let composite_removes: Vec<_> = composites
+            .iter()
+            .map(|(ident, comps)| {
+                let parts: Vec<_> =
+                    comps.iter().map(|c| Self::field_key_token(c, &old, &rem_map)).collect();
+                Self::composite_remove_block(&recv, ident, &parts, &id_tok)
+            })
+            .collect();
+
+        // Add side — the SAME blocks the live update/insert path builds, keyed off
+        // `__new_rec` (the row being folded, via `self.read_at(__r)`).
+        let rec = quote! { __new_rec };
+        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
+        let single_adds: Vec<_> = indexed
+            .iter()
+            .map(|f| {
+                let ident = Self::index_field_ident(f);
+                let key = Self::field_key_token(f, &rec, &add_map);
+                Self::index_add_block(&recv, &ident, key, &id_tok)
+            })
+            .collect();
+        let composite_adds: Vec<_> = composites
+            .iter()
+            .map(|(ident, comps)| {
+                let parts: Vec<_> =
+                    comps.iter().map(|c| Self::field_key_token(c, &rec, &add_map)).collect();
+                Self::composite_add_block(&recv, ident, &parts, &id_tok)
+            })
+            .collect();
+
+        // Only decode/resolve the old + new records when there is an index to
+        // maintain — an index-free model just repoints `id_to_row` + `id_versions`.
+        let remove_old = if has_index {
+            quote! {
+                if let Some(__old_rec) = self.get(id) {
+                    #(#rem_hoist)*
+                    #(#single_removes)*
+                    #(#composite_removes)*
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let add_new = if has_index {
+            quote! {
+                if let Some(__new_rec) = self.read_at(__r) {
+                    #(#add_hoist)*
+                    #(#single_adds)*
+                    #(#composite_adds)*
+                }
+            }
+        } else {
+            quote! {}
+        };
+        let versions_push =
+            Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { __r });
+
+        quote! {
+            /// Fold only the rows in `[from..row_count)` into the in-memory maps
+            /// (#161-B).  Reuses the live update/delete index maintenance per row,
+            /// so the maps end up exactly as `__reindex_committed` would rebuild
+            /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+            /// `from >= row_count`.
+            pub fn __reindex_delta(&mut self, from: usize) {
+                let __n = self.row_count;
+                for __r in from..__n {
+                    let id = #id_read;
+                    // Drop the pre-row version's keys (the update/delete remove).
+                    #remove_old
+                    let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+                    // Repoint the id at this newest physical row (live or tombstone,
+                    // exactly as the live update/delete path does).
+                    std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+                    #versions_push
+                    // A live row adds its keys; a tombstoned row adds none (its keys
+                    // were removed above and stay absent — a delete).
+                    if !__deleted {
+                        #add_new
+                    }
                 }
             }
         }
@@ -8788,9 +8962,20 @@ impl RustGenerator {
             .iter()
             .map(|m| {
                 let field = format_ident!("{}", Self::to_snake_case(&m.name));
+                // #161-B: capture the pre-sync committed length, sync the columns to
+                // adopt the peer's advanced row count, then fold ONLY the new rows
+                // `[from..row_count)` into the maps — the incremental delta refresh,
+                // not a full clear-and-rescan of every row × index (`__reindex_delta`
+                // reuses the live update/delete maintenance, so the maps end up
+                // identical to `__reindex_committed`).  This process's maps are
+                // already correct for `[0..from)` (its own commits maintain them live
+                // and prior refreshes covered earlier peer rows); the coordinator
+                // serializes commits, so `[from..row_count)` are exactly the rows
+                // committed by peers since this process last synced.
                 quote! {
+                    let __from = self.#field.row_count;
                     self.#field.__sync_columns_from_disk();
-                    self.#field.__reindex_committed();
+                    self.#field.__reindex_delta(__from);
                 }
             })
             .collect();
