@@ -28,13 +28,36 @@ throughput can't be read in isolation.
 | Engine | Tier | Model | Why it's here | Status |
 | --- | --- | --- | --- |
 | **SQLite** (`rusqlite`) | 1 | embedded, single-writer, row-store | The canonical embedded DB; closest to ForgeDB's write model. The primary comparison. | **Implemented** |
-| **redb** | 1 | embedded, pure-Rust KV | Closest on *deployment shape* — generated Rust links a substrate crate, no external process. | Planned |
+| **redb** | 1 | embedded, pure-Rust KV | Closest on *deployment shape* — generated Rust links a substrate crate, no external process. | **Implemented** |
 | **DuckDB** | 1 | embedded, **columnar** | Closest on *storage model* (our columns vs. their vectorized columnar). Expected to win scans. | Planned |
 | **PostgreSQL** (`postgres`, localhost socket) | 2 | client/server, row-store | The industry reference. Carries parse + planning + socket overhead — anchors the RDBMS axis. | Planned |
 | **PGlite** (`@electric-sql/pglite`) | 2 (variant) | **Postgres compiled to WASM, in-process** | A Postgres variant that runs in-process (no server, no socket). Isolates "what does the Postgres engine cost" from "what does the client/server boundary cost" when read against the server PG numbers. | Planned (JS/Bun suite) |
 
-**First cut = SQLite only.** The other four are documented + designed here; their bench
-files are added incrementally against the same shared scenarios.
+**SQLite + redb implemented.** The remaining three (DuckDB, PostgreSQL, PGlite) are
+documented + designed here; their bench files are added incrementally against the same
+shared scenarios.
+
+### redb (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
+
+`make bench-redb`. redb models the relational shape explicitly (secondary index +
+reverse-FK/M2M as multimap tables); reads decode a packed value blob so they
+materialize the FULL record, matching the SQLite suite. Numbers next to the ForgeDB
+default-config baseline (same host/run epoch) — **relative** shape is the signal:
+
+| scenario | redb | ForgeDB (default) | note |
+| --- | --- | --- | --- |
+| `insert_user` (barrier) | 4.04 ms (`immediate`) | 3.95 ms | matched `F_FULLFSYNC`; ~parity |
+| `insert_user` (relaxed) | 0.50 ms (`eventual`) | — (no relaxed tier) | redb defers the per-commit fsync |
+| `point_lookup` | 0.62 µs | 3.48 µs | redb B-tree get beats the generated `id_to_row`+column read here |
+| `index_probe` | 1.11 µs | 3.67 µs | redb 2-table hop (email→id→row) still faster |
+| `reverse_fk` | 3.94 µs | 36.9 µs | ForgeDB materializes full records per child (`find_by`+`get`) — the gap is real |
+| `m2m` | 1.62 µs | 5.94 µs | redb multimap vs the generated junction index |
+
+Honest read: on this corpus redb's B-tree reads are faster than ForgeDB's generated
+read path (notably `reverse_fk`, where ForgeDB full-materializes each child — the #160
+residual). ForgeDB's differentiators (typed generated API, no query parser, columnar
+footprint, snapshot/replica) are not what these point/traversal micro-latencies capture;
+the value of the comparison is exactly surfacing where the generated path is slower.
 
 ### A note on PGlite
 

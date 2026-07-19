@@ -12,7 +12,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
-        bench bench-forgedb bench-sqlite bench-matrix bench-regen bench-regen-matrix
+        bench bench-forgedb bench-sqlite bench-redb bench-matrix bench-regen bench-regen-matrix
 
 ## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
 bench:
@@ -25,6 +25,10 @@ bench-forgedb:
 ## Benchmark SQLite only.
 bench-sqlite:
 	cargo bench --manifest-path $(BENCH) --bench sqlite_bench
+
+## Benchmark redb only (pure-Rust embedded KV).
+bench-redb:
+	cargo bench --manifest-path $(BENCH) --bench redb_bench
 
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 bench-matrix:

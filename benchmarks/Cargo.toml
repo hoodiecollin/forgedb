@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+redb = "2"
 tempfile = "3"
 
 [[bench]]
@@ -35,6 +36,10 @@ harness = false
 
 [[bench]]
 name = "sqlite_bench"
+harness = false
+
+[[bench]]
+name = "redb_bench"
 harness = false
 
 [[bench]]
