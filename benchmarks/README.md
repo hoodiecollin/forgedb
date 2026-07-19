@@ -15,6 +15,7 @@ make bench-sqlite     # SQLite only
 make bench-redb       # redb (pure-Rust embedded KV)
 make bench-duckdb     # DuckDB (embedded columnar; bundled C++ build, ~2.5 min first time)
 make bench-postgres   # PostgreSQL — ephemeral cluster via devbox (see below)
+make bench-pglite     # JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
 
 # Config matrix (epic #126): same scenarios across generated config variants.
@@ -56,6 +57,12 @@ Criterion writes HTML reports under `benchmarks/target/criterion/`.
 | `src/lib.rs` | Shared seeded data generation + the generated module. |
 | `benches/forgedb_bench.rs` | ForgeDB Criterion suite. |
 | `benches/sqlite_bench.rs` | SQLite Criterion suite. |
+| `benches/redb_bench.rs` | redb Criterion suite. |
+| `benches/duckdb_bench.rs` | DuckDB Criterion suite. |
+| `benches/pg_bench.rs` | PostgreSQL Criterion suite (needs a running cluster — `make bench-postgres`). |
+| `benches/matrix_bench.rs` | ForgeDB config-matrix Criterion suite (needs `make bench-regen-matrix`). |
+| `scripts/pg_run.sh` | Ephemeral-PostgreSQL lifecycle (initdb → start → bench → stop) for `make bench-postgres`. |
+| `js/bench.ts` | JS/Bun suite: PGlite vs `bun:sqlite` (`mitata` timings). Not part of the Rust Criterion harness. |
 
 ## Status
 

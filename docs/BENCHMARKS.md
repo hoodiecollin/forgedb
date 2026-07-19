@@ -31,7 +31,7 @@ throughput can't be read in isolation.
 | **redb** | 1 | embedded, pure-Rust KV | Closest on *deployment shape* — generated Rust links a substrate crate, no external process. | **Implemented** |
 | **DuckDB** | 1 | embedded, **columnar** | Closest on *storage model* (our columns vs. their vectorized columnar). Expected to win scans. | **Implemented** |
 | **PostgreSQL** (`postgres`, localhost socket) | 2 | client/server, row-store | The industry reference. Carries parse + planning + socket overhead — anchors the RDBMS axis. | **Implemented** |
-| **PGlite** (`@electric-sql/pglite`) | 2 (variant) | **Postgres compiled to WASM, in-process** | A Postgres variant that runs in-process (no server, no socket). Isolates "what does the Postgres engine cost" from "what does the client/server boundary cost" when read against the server PG numbers. | Planned (JS/Bun suite) |
+| **PGlite** (`@electric-sql/pglite`) | 2 (variant) | **Postgres compiled to WASM, in-process** | A Postgres variant that runs in-process (no server, no socket). Isolates "what does the Postgres engine cost" from "what does the client/server boundary cost" when read against the server PG numbers. | **Implemented** (JS/Bun suite) |
 
 **SQLite + redb implemented.** The remaining three (DuckDB, PostgreSQL, PGlite) are
 documented + designed here; their bench files are added incrementally against the same
@@ -110,6 +110,32 @@ use), so its ~56 µs insert is NOT a like-for-like barrier comparison — a `wal
 fsync_writethrough` (macOS F_FULLFSYNC) tier is the barrier-matched follow-up; (2) PG still
 beats columnar DuckDB's 88 µs point lookup despite the socket, because DuckDB's columnar
 model is the wrong shape for point ops.
+
+### PGlite + bun:sqlite — the JS/Bun suite (2026-07-18, macOS Apple Silicon)
+
+`make bench-pglite` (or `bun run benchmarks/js/bench.ts`). PGlite doesn't fit the native
+Rust Criterion harness — it is Postgres 16 compiled to WASM, driven from JS — so it lives
+in a separate Bun suite (`benchmarks/js/`, `mitata` timings) alongside `bun:sqlite` (native
+SQLite via Bun's binding) as the JS-side anchor. The corpus generator mirrors the Rust seed
+logic (splitmix64 + `id_for`); the read corpus is smaller (2 000 posts) because PGlite's
+per-query WASM-boundary cost makes a 1e4 row-at-a-time load slow (point/probe latency is
+O(1), so the smaller corpus is representative).
+
+| scenario | PGlite (PG-in-WASM, in-process) | bun:sqlite (native) | ratio |
+| --- | --- | --- | --- |
+| `point_lookup` | 113.5 µs | 1.33 µs | 85× |
+| `index_probe` | 95.1 µs | 0.90 µs | 105× |
+| `reverse_fk` | 110.9 µs | 1.78 µs | 62× |
+| `m2m` | 148.9 µs | 2.70 µs | 55× |
+
+**The headline finding (why PGlite is here): PGlite in-process (95–149 µs) is actually
+*slower* than native server PostgreSQL over a unix socket (26–60 µs above).** Removing the
+client/server transport does NOT win, because the WASM engine's execution overhead exceeds
+the socket cost it saves — i.e. for this Postgres, the *engine-in-WASM* cost dominates the
+*transport* cost. That is exactly the engine-vs-transport separation PGlite was included to
+expose. Meanwhile `bun:sqlite` (native SQLite through the JS boundary) lands at 0.9–2.7 µs —
+in the same range as the native embedded engines, confirming the JS boundary itself is cheap;
+it is WASM execution, not "being called from JS", that makes PGlite slow.
 
 ### A note on PGlite
 

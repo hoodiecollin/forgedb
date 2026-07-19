@@ -13,7 +13,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
-        bench-matrix bench-regen bench-regen-matrix
+        bench-pglite bench-matrix bench-regen bench-regen-matrix
 
 ## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
 bench:
@@ -40,6 +40,10 @@ bench-duckdb:
 ## and tears it down. Requires devbox (declarative host deps — see devbox.json).
 bench-postgres:
 	devbox run -- benchmarks/scripts/pg_run.sh
+
+## Benchmark the JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite.
+bench-pglite:
+	($(BUN) install --cwd benchmarks/js && $(BUN) run --cwd benchmarks/js bench.ts)
 
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 bench-matrix:
