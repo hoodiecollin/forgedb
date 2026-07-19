@@ -13,7 +13,8 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
-        bench-pglite bench-matrix bench-regen bench-regen-matrix
+        bench-pglite bench-matrix bench-regen bench-regen-matrix \
+        bench-footprint bench-concurrency
 
 ## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
 ## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), and the
@@ -49,6 +50,17 @@ bench-postgres:
 ## Benchmark the JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite.
 bench-pglite:
 	($(BUN) install --cwd benchmarks/js && $(BUN) run --cwd benchmarks/js bench.ts)
+
+## On-disk footprint report (scenario 18): bytes-per-corpus for ForgeDB / SQLite /
+## redb / DuckDB + ForgeDB update-churn bloat before/after compaction. A size
+## report (not a Criterion timing) — an example so it can use the bench dev-deps.
+bench-footprint:
+	cargo run --manifest-path $(BENCH) --example footprint --release
+
+## Concurrency report (scenario 16): ForgeDB reader throughput under a live writer
+## (#56-B lock-free reads) at 1/2/4/8 reader threads, with and without a writer.
+bench-concurrency:
+	cargo run --manifest-path $(BENCH) --example concurrency --release
 
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 bench-matrix:
