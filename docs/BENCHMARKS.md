@@ -239,6 +239,47 @@ The seeded candidates below were promoted to the tracked sweep **#152** (12 chil
   positional `read_exact_at`/mmap read-after-write and the lock-free Direction-B reader view —
   unbuffered page-cache writes are load-bearing.)
 
+## Configuration matrix (epic #126) — how generate-time knobs shift performance
+
+`make bench-regen-matrix && make bench-matrix` regenerates the SAME `bench.forge`
+under each `benchmarks/configs/<variant>.toml` (a distinct generated module) and runs
+the write-path / churn / reopen scenarios against every relevant variant, so Criterion
+lines the configs up side by side. Numbers below are macOS (Apple Silicon, APFS SSD),
+2026-07-18, `--measurement-time 3` — **relative** deltas are the signal, not absolute
+values (fsync-bound numbers are storage-hardware-specific).
+
+**Write-path latency** (per single durable op):
+
+| scenario | `default` | `fsync_never` | `replication_on` | `changefeed_small` |
+| --- | --- | --- | --- | --- |
+| `insert_one` | 3.95 ms | **36.1 µs** (~109×) | 7.35 ms (~1.9×) | 3.89 ms (≈) |
+| `update_one` | 3.80 ms | **47.9 µs** (~79×) | 7.55 ms (~2.0×) | — |
+| `delete_reinsert` (2 durable ops) | 7.83 ms | **80.5 µs** (~97×) | 14.79 ms (~1.9×) | — |
+
+- **`[storage].fsync = "never"` (#129) is the dominant lever: ~80–110× faster writes.** The
+  `F_FULLFSYNC` device barrier (~3.5 ms) *is* essentially the entire write latency; without it a
+  write is a page-cache append (tens of µs). It trades a real power-loss durability window for that.
+- **`[runtime].replication = true` (#130) ~doubles write latency** — the durable broker adds a SECOND
+  `F_FULLFSYNC` per write (default OFF exists precisely to avoid this; the flagship #126 knob).
+- **`[runtime].changefeed_capacity` has no write-latency effect** (it is a broadcast-buffer size, not
+  on the durable path) — confirms the knob is free to tune for subscriber fan-out.
+
+**Compaction churn** (250 updates to one id, then `maintain()`) and **cold-start reopen** (2 000
+seeded rows):
+
+| scenario | `default` | `compaction_off` | `compaction_low` |
+| --- | --- | --- | --- |
+| `churn_250_updates` | 1.003 s | 0.990 s | 1.081 s |
+| `reopen_2000_rows` | 28.4 ms | 25.2 ms | — |
+
+- Churn is fsync-dominated (250 × ~3.9 ms ≈ 0.98 s), so compaction is a small delta on top: threshold
+  1000 (`default`) never auto-fires over 250 updates (one `maintain()` reclaim at the end), `compaction_off`
+  never reclaims, and threshold 100 (`compaction_low`) reclaims — costing ~+8% (~90 ms for the extra
+  reclaim). The #162-C **in-place remap** is what keeps each reclaim that cheap (no O(rows × indexes)
+  rehydrate rescan); a low threshold trades a bit of throughput for bounded storage.
+- `reopen_2000_rows` ≈ 28 ms is the rehydrate cost (id-scan + secondary-index rebuild) that #161-B (peer
+  refresh) and #162-C (post-compaction) avoid re-paying on their hot paths.
+
 ## Performance-triage candidates (seeded from the fsync work)
 
 Feed these into the broader perf sweep (not fixes — triage items):
