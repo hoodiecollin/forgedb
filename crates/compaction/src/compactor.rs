@@ -454,8 +454,10 @@ impl Compactor {
             .map_err(|e| e.to_string())?;
 
         // tombstones.len() == row_count (guaranteed by manifest-based read_tombstone_bitmap)
-        // so element_size is always the correct per-column width.
-        let element_size = data.len() / tombstones.len();
+        // so element_size is always the correct per-column width. An EMPTY column
+        // (0 rows — e.g. compacting a database with an untouched model) has no width
+        // to derive and nothing to keep: guard the division and emit an empty file.
+        let element_size = if tombstones.is_empty() { 0 } else { data.len() / tombstones.len() };
 
         let mut new_data = Vec::new();
         for (i, &is_deleted) in tombstones.iter().enumerate() {

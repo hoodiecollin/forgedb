@@ -434,7 +434,13 @@ across many domains live in `examples/` — see `examples/README.md`.**
     mutate nothing and exit non-zero (code 6) with guidance pointing to the safe in-process `Database::compact()`
     (auto-invoked, keep-set-based). The substrate `compact_model` fn is doc-deprecated but retained (removing a
     published-crate public fn is breaking — no compaction publish gap reopened). Threshold not yet
-    tunable (deferred).
+    tunable (deferred). **Empty-model divide-by-zero FIXED (2026-07-18):** `stage_fixed_column_write`
+    computed `element_size = data.len() / tombstones.len()` and **panicked when compacting a database
+    with an untouched/empty model** (0 rows → `tombstones.len() == 0`) — surfaced by the footprint
+    benchmark's churn scenario (`compact()` over a users-only DB with empty Post/Tag). Guarded the
+    division (empty column ⇒ width 0, empty output). Correctness fix in the **published** substrate →
+    warrants a `forgedb-compaction 0.1.1` patch publish (additive/bugfix; scaffold pin `= "0.1"` still
+    resolves). Compaction crate tests green.
   - **Additive migrations preserve data (v1 Phase 4 W2 — #92 LANDED).** Adding a field (nullable, or appended at the
     end) + regenerating + reopening no longer wipes the DB. Generated recovery anchors on the **tombstone count**
     (authoritative committed rows) and **backfills any column shorter than it** (a newly-added field) with the
