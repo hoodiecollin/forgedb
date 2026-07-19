@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_FORMAT_VERSION: u32 = 1;
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
@@ -230,6 +231,7 @@ pub struct OrderStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -288,6 +290,7 @@ impl OrderStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -341,6 +344,56 @@ impl OrderStorage {
                     .insert(__id);
             }
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("order/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            label_col: VariableColumn::new(
+                    root.join("order/variable/string_data_1.bin"),
+                    root.join("order/variable/string_offsets_1.bin"),
+                )
+                .expect("Failed to create variable column"),
+            status_col: FixedColumn::new(root.join("order/fixed/enum_2.bin"), 1usize)
+                .expect("Failed to create fixed column"),
+            prev_status_col: FixedColumn::new(
+                    root.join("order/fixed/enum_3.bin"),
+                    2usize,
+                )
+                .expect("Failed to create fixed column"),
+            status_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            tombstones: forgedb_storage::Tombstones::new(
+                    root.join("order/tombstones.bin"),
+                )
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("order/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -634,8 +687,13 @@ impl OrderStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -741,8 +799,13 @@ impl OrderStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -892,8 +955,9 @@ impl OrderStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -909,15 +973,49 @@ impl OrderStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("order", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __saved_status_index = std::sync::Arc::clone(&self.status_index);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            self.status_index = __saved_status_index;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -982,6 +1080,84 @@ impl OrderStorage {
                     .entry(__k)
                     .or_default()
                     .insert(__id);
+            }
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            if let Some(__old_rec) = self.get(id) {
+                {
+                    let __k: String = {
+                        match serde_json::to_value(&(__old_rec.status)) {
+                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                            Ok(serde_json::Value::String(__s)) => {
+                                let mut __k = String::from('\u{1}');
+                                __k.push_str(&__s);
+                                __k
+                            }
+                            Ok(__other) => {
+                                let mut __k = String::from('\u{2}');
+                                __k.push_str(&__other.to_string());
+                                __k
+                            }
+                            Err(_) => String::from('\u{3}'),
+                        }
+                    };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.status_index);
+                    if let Some(__set) = __map.get_mut(&__k) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__k);
+                    }
+                }
+            }
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {
+                if let Some(__new_rec) = self.read_at(__r) {
+                    {
+                        let __k: String = {
+                            match serde_json::to_value(&(__new_rec.status)) {
+                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                                Ok(serde_json::Value::String(__s)) => {
+                                    let mut __k = String::from('\u{1}');
+                                    __k.push_str(&__s);
+                                    __k
+                                }
+                                Ok(__other) => {
+                                    let mut __k = String::from('\u{2}');
+                                    __k.push_str(&__other.to_string());
+                                    __k
+                                }
+                                Err(_) => String::from('\u{3}'),
+                            }
+                        };
+                        std::sync::Arc::make_mut(&mut self.status_index)
+                            .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                }
             }
         }
     }
@@ -1874,6 +2050,22 @@ impl Database {
             }
         }
         self.order.compact();
+    }
+    /// Run maintenance deferred off the hot write turn (#162-A): for
+    /// every model, reclaim dead row versions IFF a compaction became
+    /// due (the soft dead-row threshold set `compaction_due` instead of
+    /// stalling the triggering write).  Call this at an operator /
+    /// coordinator idle point so the rewrite+remap cost lands here, not
+    /// on a user write.  Cheap when nothing is due (a per-model flag
+    /// check).  Snapshot-safety is the same as `compact()` — a live
+    /// prepare snapshot defers the whole pass.  Single-writer only.
+    pub fn maintain(&mut self) {
+        if let Ok(__seq) = self.seq.lock() {
+            if __seq.oldest_live_snapshot().as_u64() > 0 {
+                return;
+            }
+        }
+        self.order.maintain();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
@@ -2982,8 +3174,9 @@ impl Database {
     /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
     /// dependency and never calls this.
     pub(crate) fn __peer_refresh(&mut self) {
+        let __from = self.order.row_count;
         self.order.__sync_columns_from_disk();
-        self.order.__reindex_committed();
+        self.order.__reindex_delta(__from);
     }
     /// Open a data dir as a **coordinated Tier-3 client** of a running
     /// `forgedb coordinate <root>` coordinator, returning a

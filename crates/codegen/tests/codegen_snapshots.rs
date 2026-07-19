@@ -2715,10 +2715,24 @@ Gadget {
         "generated code computes the live keep-set from id_to_row + liveness"
     );
 
-    // Compaction renumbers rows → reopen to rebuild id_to_row + indexes.
+    // #162-C: compaction renumbers rows → reopen ONLY the column handles (stale
+    // after the file rename) via `new_at_no_rehydrate`, then remap the maps in
+    // place — NOT the old O(rows × indexes) `*self = Self::new_at()` rehydrate
+    // rescan.  The index maps (value→id keyed) survive the renumber, so they are
+    // saved + reinstalled verbatim; only id_to_row / id_versions are remapped.
     assert!(
-        code.contains("*self = Self::new_at(&__root);"),
-        "compact() reopens to rebuild the in-memory maps from compacted files"
+        code.contains("*self = Self::new_at_no_rehydrate(&__root);"),
+        "compact() reopens column handles only (no full rehydrate rescan)"
+    );
+    let compact_reopen = code.find("pub fn compact(&mut self)").unwrap();
+    let compact_reopen_body = &code[compact_reopen..compact_reopen + 4500];
+    assert!(
+        !compact_reopen_body.contains("*self = Self::new_at(&__root);"),
+        "compact() must NOT full-reopen (#162-C replaced the rehydrate rescan)"
+    );
+    assert!(
+        compact_reopen_body.contains(".partition_point(|&__r| __r < __old_row)"),
+        "compact() remaps id_to_row via the dense keep-set position (in-place)"
     );
 
     // Auto-invoked from update AND delete (not insert — inserts create no dead
@@ -2729,11 +2743,121 @@ Gadget {
         "update/delete count toward and trigger the auto-compaction"
     );
 
+    // #162-A: crossing the SOFT threshold on the normal write path only RECORDS
+    // that a compaction is due (`compaction_due`) — it does NOT stall the write
+    // with an inline compact.  A HARD ceiling still forces an inline compaction as
+    // a growth-bounding safety net if `maintain()` is never called.
+    assert!(
+        code.contains("const COMPACTION_DEAD_CEILING_FACTOR: u64"),
+        "generated hard-ceiling factor constant (#162-A safety net)"
+    );
+    assert!(
+        code.contains("self.compaction_due = true;"),
+        "soft threshold defers by setting compaction_due, not compacting inline"
+    );
+    assert!(
+        code.contains("COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR"),
+        "hard ceiling forces an inline compaction as the growth bound"
+    );
+
+    // #162-A: `maintain()` runs the deferred reclaim off the hot write turn.
+    assert!(
+        code.contains("pub fn maintain(&mut self)"),
+        "generated per-model + Database maintain() runs deferred compaction"
+    );
+    assert!(
+        code.contains("self.widget.maintain();") && code.contains("self.gadget.maintain();"),
+        "Database::maintain() runs deferred maintenance for every model"
+    );
+
     // Database-wide force-compact across every MODEL (junctions excluded — an
     // append-only link table accumulates no dead versions).
     assert!(
         code.contains("self.widget.compact();") && code.contains("self.gadget.compact();"),
         "Database::compact() compacts every model collection"
+    );
+}
+
+#[test]
+fn test_rust_generation_incremental_rehydrate() {
+    // #161-B (incremental delta peer refresh) + #162-C (in-place compaction remap):
+    // reopen / peer-refresh / post-compaction map rebuilds must NOT rescan every
+    // row × index.  The delta path folds only the new rows via the SAME live
+    // update/delete maintenance; compaction remaps physical-row references in place
+    // and reinstalls the (renumber-invariant) index maps verbatim.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  status: ^string
+  region: string
+  @index(status, region)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // --- #161-B: __reindex_delta folds only [from..row_count) --------------
+    assert!(
+        code.contains("pub fn __reindex_delta(&mut self, from: usize)"),
+        "incremental delta refresh method emitted"
+    );
+    assert!(
+        code.contains("for __r in from..__n {"),
+        "delta iterates only the new rows [from..row_count)"
+    );
+    // Reuses the live maintenance: remove the pre-row version's keys (self.get),
+    // add the folded row's keys (self.read_at) — one maintenance source, no drift.
+    let delta_start = code.find("pub fn __reindex_delta").unwrap();
+    // The window must clear the (verbose) per-field key-derivation blocks between
+    // the remove side and the add side.
+    let delta_body = &code[delta_start..delta_start + 6000];
+    assert!(
+        delta_body.contains("if let Some(__old_rec) = self.get(id)"),
+        "delta removes the superseded version's index keys via self.get (like update)"
+    );
+    assert!(
+        delta_body.contains("if let Some(__new_rec) = self.read_at(__r)"),
+        "delta adds the folded row's index keys via self.read_at (like insert/update)"
+    );
+    // It must NOT clear-and-rescan (that is `__reindex_committed`, kept separate).
+    assert!(
+        !delta_body.contains(".clear();"),
+        "delta must not clear the maps (that is the full __reindex_committed path)"
+    );
+
+    // --- #162-C: compaction remaps in place, no full rehydrate rescan ------
+    let compact_start = code.find("pub fn compact(&mut self)").unwrap();
+    let compact_body = &code[compact_start..compact_start + 4500];
+    assert!(
+        compact_body.contains("Self::new_at_no_rehydrate(&__root)"),
+        "compact reopens column handles only (no O(rows × indexes) rehydrate)"
+    );
+    assert!(
+        compact_body.contains("partition_point(|&__r| __r < __old_row)"),
+        "compact remaps id_to_row to dense keep-set positions in place"
+    );
+    // Index maps are value→id keyed (renumber-invariant): saved + reinstalled
+    // verbatim across the reopen, never rebuilt from a column scan.
+    assert!(
+        compact_body.contains("let __saved_status_index = std::sync::Arc::clone(&self.status_index);")
+            && compact_body.contains("self.status_index = __saved_status_index;"),
+        "compact preserves the (renumber-invariant) index maps across the reopen"
+    );
+
+    // The narrow-scan `new_at_no_rehydrate` exists: it recovers row_count but does
+    // NOT run the rehydrate id-scan (`make_mut(&mut db.id_to_row).insert(id, i)`),
+    // which is the O(rows) rebuild the in-place remap replaces.
+    let nar_start = code.find("fn new_at_no_rehydrate").unwrap();
+    let nar_body = &code[nar_start..nar_start + 3200];
+    assert!(
+        nar_body.contains("db.recover_from_wal();"),
+        "new_at_no_rehydrate recovers row_count via recover_from_wal"
+    );
+    assert!(
+        !nar_body.contains(".id_to_row).insert(id, i)"),
+        "new_at_no_rehydrate skips the rehydrate id-scan (maps remapped in place)"
     );
 }
 
@@ -5608,7 +5732,7 @@ User {
 
     // (f) Peer refresh re-derives EVERY column's row_count from disk (not just the
     // tombstone — that was the bug: a peer's row is unreadable until all columns'
-    // bounds are refreshed), then rebuilds the maps.
+    // bounds are refreshed), then folds ONLY the new rows into the maps (#161-B).
     assert!(
         code.contains("__sync_columns_from_disk"),
         "peer refresh syncs ALL columns from disk (not tombstone-only) — #84"
@@ -5617,9 +5741,13 @@ User {
         code.contains("sync_from_disk"),
         "peer refresh reads shared column live length via sync_from_disk (T3-8)"
     );
+    // #161-B: the peer path captures the pre-sync watermark and folds only the
+    // new rows `[from..row_count)` via the incremental `__reindex_delta` — NOT a
+    // full clear-and-rescan (`__reindex_committed`) of every row × index.
     assert!(
-        code.contains("__reindex_committed"),
-        "peer refresh rebuilds id_to_row + indexes via __reindex_committed"
+        code.contains("let __from = self.user.row_count;")
+            && code.contains("self.user.__reindex_delta(__from);"),
+        "peer refresh folds only new rows via __reindex_delta (#161-B), not a full rebuild"
     );
 
     // (g) T3-8 structural: last_refreshed_lsn tracks the peer-refresh cursor.

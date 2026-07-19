@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
+const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_FORMAT_VERSION: u32 = 1;
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
@@ -174,6 +175,7 @@ pub struct UserStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -219,6 +221,7 @@ impl UserStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -233,6 +236,43 @@ impl UserStorage {
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
             std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("user/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            tombstones: forgedb_storage::Tombstones::new(
+                    root.join("user/tombstones.bin"),
+                )
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("user/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -414,8 +454,13 @@ impl UserStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -481,8 +526,13 @@ impl UserStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -583,8 +633,9 @@ impl UserStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -600,15 +651,47 @@ impl UserStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("user", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -634,6 +717,30 @@ impl UserStorage {
                 .entry(id)
                 .or_default()
                 .push(i);
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {}
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -1011,6 +1118,7 @@ pub struct PostStorage {
     in_transaction: bool,
     checkpoint_deferred: bool,
     compact_deferred: bool,
+    compaction_due: bool,
     changefeed: Option<forgedb_changefeed::ChangeFeed>,
     broker: Option<
         std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
@@ -1061,6 +1169,7 @@ impl PostStorage {
             in_transaction: false,
             checkpoint_deferred: false,
             compact_deferred: false,
+            compaction_due: false,
             changefeed: None,
             broker: None,
         };
@@ -1075,6 +1184,48 @@ impl PostStorage {
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
             std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("post/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            title_col: VariableColumn::new(
+                    root.join("post/variable/string_data_1.bin"),
+                    root.join("post/variable/string_offsets_1.bin"),
+                )
+                .expect("Failed to create variable column"),
+            tombstones: forgedb_storage::Tombstones::new(
+                    root.join("post/tombstones.bin"),
+                )
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("post/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
         db.write_manifest(root);
         db
     }
@@ -1262,8 +1413,13 @@ impl PostStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         Ok(true)
@@ -1330,8 +1486,13 @@ impl PostStorage {
         if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
             if self.in_transaction {
                 self.compact_deferred = true;
-            } else {
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
                 self.compact();
+            } else {
+                self.compaction_due = true;
             }
         }
         true
@@ -1445,8 +1606,9 @@ impl PostStorage {
         self.writes_since_checkpoint = 0;
     }
     /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
-    /// rewrite this model's files dropping dead rows, then reopen to
-    /// rebuild `id_to_row` + secondary indexes from the compacted files.
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
     pub fn compact(&mut self) {
         if self.in_transaction {
             self.compact_deferred = true;
@@ -1462,15 +1624,47 @@ impl PostStorage {
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("post", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
-            *self = Self::new_at(&__root);
+            *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
             self.bump_compaction_epoch(&__root);
         }
         self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
     }
     /// Rebuild `id_to_row` + secondary indexes from the committed prefix
     /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -1496,6 +1690,30 @@ impl PostStorage {
                 .entry(id)
                 .or_default()
                 .push(i);
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {}
         }
     }
     /// Refresh EVERY column + the tombstone's in-memory `row_count` from
@@ -2185,6 +2403,23 @@ impl Database {
         }
         self.user.compact();
         self.post.compact();
+    }
+    /// Run maintenance deferred off the hot write turn (#162-A): for
+    /// every model, reclaim dead row versions IFF a compaction became
+    /// due (the soft dead-row threshold set `compaction_due` instead of
+    /// stalling the triggering write).  Call this at an operator /
+    /// coordinator idle point so the rewrite+remap cost lands here, not
+    /// on a user write.  Cheap when nothing is due (a per-model flag
+    /// check).  Snapshot-safety is the same as `compact()` — a live
+    /// prepare snapshot defers the whole pass.  Single-writer only.
+    pub fn maintain(&mut self) {
+        if let Ok(__seq) = self.seq.lock() {
+            if __seq.oldest_live_snapshot().as_u64() > 0 {
+                return;
+            }
+        }
+        self.user.maintain();
+        self.post.maintain();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
@@ -3578,10 +3813,12 @@ impl Database {
     /// NEVER writes a column.  The coordinator has no `forgedb-storage*`
     /// dependency and never calls this.
     pub(crate) fn __peer_refresh(&mut self) {
+        let __from = self.user.row_count;
         self.user.__sync_columns_from_disk();
-        self.user.__reindex_committed();
+        self.user.__reindex_delta(__from);
+        let __from = self.post.row_count;
         self.post.__sync_columns_from_disk();
-        self.post.__reindex_committed();
+        self.post.__reindex_delta(__from);
     }
     /// Open a data dir as a **coordinated Tier-3 client** of a running
     /// `forgedb coordinate <root>` coordinator, returning a
