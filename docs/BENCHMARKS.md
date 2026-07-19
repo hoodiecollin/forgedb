@@ -33,9 +33,10 @@ throughput can't be read in isolation.
 | **PostgreSQL** (`postgres`, localhost socket) | 2 | client/server, row-store | The industry reference. Carries parse + planning + socket overhead — anchors the RDBMS axis. | **Implemented** |
 | **PGlite** (`@electric-sql/pglite`) | 2 (variant) | **Postgres compiled to WASM, in-process** | A Postgres variant that runs in-process (no server, no socket). Isolates "what does the Postgres engine cost" from "what does the client/server boundary cost" when read against the server PG numbers. | **Implemented** (JS/Bun suite) |
 
-**SQLite + redb implemented.** The remaining three (DuckDB, PostgreSQL, PGlite) are
-documented + designed here; their bench files are added incrementally against the same
-shared scenarios.
+**All five comparison targets are implemented** (SQLite, redb, DuckDB, PostgreSQL, PGlite),
+each over the same shared scenarios. First cross-engine result cuts are recorded per engine
+below; remaining shared-scenario gaps (a scan/aggregate scenario across all engines, the
+write/lifecycle/concurrency/footprint scenarios) are filled incrementally.
 
 ### redb (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
 
@@ -141,7 +142,7 @@ it is WASM execution, not "being called from JS", that makes PGlite slow.
 
 PGlite is Postgres 16 built to WebAssembly, run in a single in-process instance with no
 server. It is driven from JavaScript/TypeScript, so it does **not** fit the native Rust
-Criterion suite — it lives in a separate Bun-driven suite (`benchmarks/js/`, planned)
+Criterion suite — it lives in a separate Bun-driven suite (`benchmarks/js/`, **implemented**)
 alongside `bun:sqlite` (as a JS-side sanity anchor) and, later, the ForgeDB **WASM
 read-replica** (#110) so the in-process/browser story is measured on its own terms.
 Reading PGlite (in-process WASM PG) against server PostgreSQL (native, over a socket)

@@ -15,9 +15,14 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix
 
-## Run every implemented benchmark suite (ForgeDB + SQLite). See docs/BENCHMARKS.md.
+## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
+## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), and the
+## JS/PGlite suite are separate targets below — a bare `cargo bench` would also try to
+## compile matrix_bench, whose gitignored variant modules only exist after
+## `make bench-regen-matrix`. See docs/BENCHMARKS.md.
 bench:
-	cargo bench --manifest-path $(BENCH)
+	cargo bench --manifest-path $(BENCH) \
+		--bench forgedb_bench --bench sqlite_bench --bench redb_bench --bench duckdb_bench
 
 ## Benchmark the ForgeDB generated code only.
 bench-forgedb:
