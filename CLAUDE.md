@@ -283,7 +283,7 @@ across many domains live in `examples/` — see `examples/README.md`.**
   enum/decimal/bool — variable-width in-place is a heap/free-list, out of scope; variable columns stay append-with-GC).
   **Phase 1** (strict wins, no feature loss, ship regardless): **#168 column-pruned sequential `__scan` — LANDED
   2026-07-20** (see the dedicated bullet below; `scan_aggregate` 32.4 ms → 568 µs, `scan_sort_top10` 32.6 ms → 763 µs),
-  #169 ordered/range index kind (fixes range/top-N the hash index can't serve), #160 narrow
+  **#169 ordered/range index kind — LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs, index-served), #160 narrow
   reverse-FK/live-query materialization, #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
   `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
   AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
@@ -317,6 +317,28 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `gather_buffered`/`Buffered*Column`/`live_indices` API, bumping **`forgedb-storage-native`/`-web` 0.1.3 → 0.1.4**
     behind **`forgedb-storage` 0.2.2 → 0.2.3** (scaffold pin `= "0.2"` still resolves); publish with the #153 batch before
     an outside-repo `init → build` reclose.
+  - **#169 ordered/range index kind — LANDED 2026-07-20 (Phase 1b of #167).** Hash secondary indexes are exact-match
+    only (tagged-`String` keys sort lexically, not by value), so `views: ^u64` couldn't serve `WHERE views >= T ORDER
+    BY views DESC LIMIT 10` — it full-scanned. Each ordered-eligible **non-nullable** indexed field
+    (`u32/u64/i32/i64/timestamp/decimal` — the `Ord` key types; **f64** excluded (no clean total order), **nullable**
+    deferred) now gets a **parallel** `<field>_ordered: Arc<BTreeMap<TypedValue, BTreeSet<Id>>>` keyed by the typed
+    value (decimal normalized, scale-invariant) — **parallel, not replace**: the exact-match hash `<field>_index` is
+    untouched (load-bearing for `&unique`/FK/reverse-FK/scan-pushdown), and the extra per-write `BTreeMap` insert is
+    negligible vs the fsync barrier. Maintained at ALL 7 index sites (insert/update/delete/reindex-delta×2/rehydrate)
+    via `ordered_index_add_maint`/`_remove_maint` (peers of `index_add_block`/`index_remove_block`, `Arc::make_mut`
+    copy-on-write), rebuilt on reopen (rehydrate), preserved across compaction (value→id keyed, renumber-safe). New
+    generated method **`find_by_<field>_range(min, max, descending, limit)`** walks the `BTreeMap` range in value order
+    (or reversed), resolving each id's live record, stopping at `limit` — O(offset+limit) range/top-N. **Measured:**
+    `scan_sort_top10` 763 µs → **37 µs** (index-served, ~875× from the pre-#168 32.6 ms); the residual vs SQLite's
+    4.35 µs is 10× full-record `get()` (materialization + version resolution, ~3.5 µs each), not the index walk. **No
+    schema-language change** — the AST already carried `index_type: Hash|BTree` (auto by field type) but codegen
+    ignored it; eligibility is codegen's own `Ord`-key predicate (the choice is automatic-by-type). **No substrate
+    change, no publish gap** (the index is in-memory generated code, `std::collections::BTreeMap`). Guards
+    `test_rust_generation_ordered_index` (eligible types get the map+range method keyed by typed value; string/nullable/
+    f64 do NOT; hash index kept) + runtime E2E `benchmarks/tests/ordered_index.rs` (range/asc-desc/inclusive-bounds/
+    top-N/empty+inverted/update-moves-bucket/delete-excludes/reopen-rebuild) + all-6-key-types compile check.
+    **Deferred:** REST list auto-planning (handler auto-picks the index), reader/snapshot `_at` ordered probe, f64/
+    nullable ordered indexes, an explicit hash-vs-ordered directive override.
 - **Configurable runtime behavior — epic #126: BATCH 1 LANDED (generate-time Tier A/B), 2026-07-18.** The
   foundation + every knob baked into `database.rs` is done and e2e-proven. A `GenConfig`
   (`crates/codegen/src/config.rs`, schema-blind, `DEFAULT` byte-identical **except** the broker) is threaded via

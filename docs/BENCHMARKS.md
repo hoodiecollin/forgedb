@@ -158,10 +158,10 @@ scan`): **`scan_aggregate`** = `COUNT + SUM(views) WHERE published` (a full-tabl
 and **`scan_sort_top10`** = top-10 posts by `views (>= 50 000)` (a filtered scan + sort + page).
 This is the scenario the analytical/columnar engine is built to win.
 
-| scenario | ForgeDB (pre-#168) | ForgeDB (#168) | SQLite | redb | DuckDB |
+| scenario | ForgeDB (pre-#168) | ForgeDB (now) | SQLite | redb | DuckDB |
 | --- | --- | --- | --- | --- | --- |
-| `scan_aggregate` | 32.4 ms | **568 µs** | 352 µs | 632 µs | **100 µs** |
-| `scan_sort_top10` | 32.6 ms | **763 µs** | **4.35 µs** | 809 µs | 491 µs |
+| `scan_aggregate` | 32.4 ms | **568 µs** (#168) | 352 µs | 632 µs | **100 µs** |
+| `scan_sort_top10` | 32.6 ms | **37 µs** (#169) | **4.35 µs** | 809 µs | 491 µs |
 
 **#168 landed the column-pruned sequential scan (2026-07-20), a ~56×/~42× win** — the
 `scan_aggregate` dropped 32.4 ms → 568 µs and `scan_sort_top10` 32.6 ms → 763 µs (now *faster*
@@ -187,12 +187,16 @@ The original diagnosis and what changed:
    the scan still materializes the full narrow row (id + all filterable columns, incl. a `title`
    `String` alloc) rather than only the queried columns, and aggregates row-wise rather than
    vectorized — the remaining gap is that, not the mutation model.
-3. **`scan_sort_top10`: SQLite's 4.35 µs is still index-served; ForgeDB's 763 µs is a full scan.**
-   SQLite has a B-tree `idx_post_views`, so `WHERE views >= T ORDER BY views DESC LIMIT 10` is an
-   ordered range scan + limit (O(10)). ForgeDB *also* declares `views: ^u64`, but its index is a
-   **hash** (exact-match only) — it cannot serve an ordered range/top-N, so it full-scans (now a
-   *fast* full scan, ahead of redb's 809 µs, but still O(rows) not O(10)). Closing this is **#169**
-   (ordered/range index kind) — the B-tree-vs-hash tradeoff made a config/directive choice.
+3. **`scan_sort_top10`: #169 made it index-served (763 µs → 37 µs).** SQLite has a B-tree
+   `idx_post_views`, so `WHERE views >= T ORDER BY views DESC LIMIT 10` is an ordered range scan +
+   limit (O(10)). **#169** gives `views: ^u64` a **parallel `BTreeMap` ordered index** (keyed by the
+   typed value, alongside the untouched exact-match hash index), and a generated
+   `find_by_views_range(min, max, descending, limit)` that walks it — the same O(offset+limit)
+   ordered-range shape. The benchmark now calls it (fair apples-to-apples with SQLite's index-served
+   number). The residual ~37 µs vs SQLite's 4.35 µs is the 10 full-record `get()`s (each ≈ the 3.5 µs
+   point-lookup: full column materialize + version resolution), not the index walk — the same
+   materialization residual as `scan_aggregate`. Ordered index covers non-nullable
+   `u32/u64/i32/i64/timestamp/decimal`; **f64** (no clean total order) and **nullable** are deferred.
 
 The JS suite (2 000-post corpus, **no `views` index** in its DDL) adds the same two shapes for
 PGlite vs `bun:sqlite`:
@@ -368,8 +372,9 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 > independent axes (columnar = keep; append-only = the axis under test; durability policy +
 > generated-read-path quality = orthogonal confounds). **Phase 1** fixes the read-path confounds
 > as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
-> #169 ordered/range index, #160 narrow materialization, #170 group-commit); **Phase 2** adds a
-> fixed-width in-place `GenConfig` variant to the config
+> **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; #160 narrow
+> materialization, #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant
+> to the config
 > matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
 > below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.
 

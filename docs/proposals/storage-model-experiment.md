@@ -67,10 +67,23 @@ experiment. Each is generated-code or index work over existing substrate.
   `String` alloc for unused columns*. A scan that (a) reads only the columns the operation needs
   and (b) iterates in physical row order fixes `scan_aggregate` (32 ms → target ~SQLite/redb
   range). Biggest single lever.
-- **P1b — ordered/range index kind.** Hash indexes are exact-match only, so `views: ^u64` can't
-  serve `WHERE views >= T ORDER BY views DESC LIMIT 10` — it full-scans (`scan_sort_top10` 32 ms
-  vs SQLite's index-served 4.35 µs). Add an ordered index kind that serves range + top-N. This
-  is the hash-vs-B-tree tradeoff made a config/directive choice, not a hard limit.
+- **P1b — ordered/range index kind (#169). LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs,
+  index-served). Hash indexes are exact-match only, so `views: ^u64`
+  can't serve `WHERE views >= T ORDER BY views DESC LIMIT 10` — it full-scanned (`scan_sort_top10`
+  32 ms vs SQLite's index-served 4.35 µs). Added an ordered index kind that serves range + top-N.
+  **Design (decided 2026-07-20):** a **parallel** `BTreeMap<TypedKey, BTreeSet<Uuid>>` ordered index
+  built alongside the existing tagged-`String` hash index for each ordered-eligible **non-nullable**
+  indexed field (`u32/u64/i32/i64/timestamp/decimal` — the `Ord` key types; **f64** excluded, no
+  clean total order, and **nullable** deferred). Parallel, not replace: the exact-match hash path
+  (load-bearing for `&unique` / FK-existence / reverse-FK / scan-pushdown) is untouched, and the
+  extra per-write `BTreeMap` insert is negligible against the fsync barrier. Generated method
+  `find_by_<field>_range(min, max, descending, limit)` serves range + ordered top-N in O(matches).
+  The AST already carries `index_type: Hash|BTree` (auto by field type) but codegen ignored it;
+  eligibility here is codegen's own `Ord`-key predicate (the AST's f64=BTree / decimal=Hash
+  classification is left as-is, advisory). **Deferred:** REST list auto-planning (handler picks the
+  index), reader/snapshot `_at` ordered probes, f64/nullable ordered indexes, an explicit
+  hash-vs-ordered directive override. The choice is automatic-by-type for now (ordered types gain
+  range for free).
 - **P1c — narrow materialization on the residual read paths.** Reverse-FK getters and live-query
   re-runs still full-materialize (the #160 residual, tracked there). Fold into the narrow-decode
   path #160 already built for the list scan.
