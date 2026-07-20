@@ -1566,7 +1566,9 @@ impl UserStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -1599,15 +1601,76 @@ impl UserStorage {
             created_at: created_at_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<UserScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __UserScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+            email_col: forgedb_storage::BufferedVariableColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __UserScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            email_col: self
+                .email_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let email_value = __bufs
+                .email_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            rows.push(UserScanRow {
+                id: id_value,
+                name: name_value,
+                email: email_value,
+                created_at: created_at_value,
+            });
         }
         rows
     }
@@ -3598,7 +3661,9 @@ impl PostStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<PostScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -3636,15 +3701,86 @@ impl PostStorage {
             created_at: created_at_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<PostScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __PostScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            title_col: forgedb_storage::BufferedVariableColumn,
+            views_col: forgedb_storage::BufferedFixedColumn,
+            published_col: forgedb_storage::BufferedFixedColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __PostScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            title_col: self
+                .title_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            views_col: self
+                .views_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            published_col: self
+                .published_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let title_value = __bufs
+                .title_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let views_value = __bufs
+                .views_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let published_value = __bufs
+                .published_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            rows.push(PostScanRow {
+                id: id_value,
+                title: title_value,
+                views: views_value,
+                published: published_value,
+                created_at: created_at_value,
+            });
         }
         rows
     }
@@ -5244,7 +5380,9 @@ impl TagStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<TagScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -5265,15 +5403,54 @@ impl TagStorage {
             name: name_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<TagScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __TagScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __TagScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            rows.push(TagScanRow {
+                id: id_value,
+                name: name_value,
+            });
         }
         rows
     }
