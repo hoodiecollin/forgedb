@@ -180,6 +180,12 @@ pub struct ProductStorage {
     price_index: std::sync::Arc<
         std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
     >,
+    price_ordered: std::sync::Arc<
+        std::collections::BTreeMap<
+            rust_decimal::Decimal,
+            std::collections::BTreeSet<Uuid>,
+        >,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -230,6 +236,7 @@ impl ProductStorage {
                 )
                 .expect("Failed to create fixed column"),
             price_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            price_ordered: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("product/tombstones.bin"),
                 )
@@ -298,6 +305,12 @@ impl ProductStorage {
                     .or_default()
                     .insert(__id);
             }
+            {
+                std::sync::Arc::make_mut(&mut db.price_ordered)
+                    .entry((price_value).normalize())
+                    .or_default()
+                    .insert(__id);
+            }
         }
         db.write_manifest(root);
         db
@@ -327,6 +340,7 @@ impl ProductStorage {
                 )
                 .expect("Failed to create fixed column"),
             price_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            price_ordered: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("product/tombstones.bin"),
                 )
@@ -486,6 +500,12 @@ impl ProductStorage {
                 .or_default()
                 .insert(id);
         }
+        {
+            std::sync::Arc::make_mut(&mut self.price_ordered)
+                .entry((record.price).normalize())
+                .or_default()
+                .insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("Product", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
@@ -591,6 +611,18 @@ impl ProductStorage {
                     __map.remove(&__k);
                 }
             }
+            {
+                let __ok = { (__old_rec.price).normalize() };
+                let mut __empty = false;
+                let __map = std::sync::Arc::make_mut(&mut self.price_ordered);
+                if let Some(__set) = __map.get_mut(&__ok) {
+                    __set.remove(&(id));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    __map.remove(&__ok);
+                }
+            }
         }
         {
             let __k: String = {
@@ -611,6 +643,12 @@ impl ProductStorage {
             };
             std::sync::Arc::make_mut(&mut self.price_index)
                 .entry(__k)
+                .or_default()
+                .insert(id);
+        }
+        {
+            std::sync::Arc::make_mut(&mut self.price_ordered)
+                .entry((record.price).normalize())
                 .or_default()
                 .insert(id);
         }
@@ -723,6 +761,18 @@ impl ProductStorage {
             }
             if __empty {
                 __map.remove(&__k);
+            }
+        }
+        {
+            let __ok = { (record.price).normalize() };
+            let mut __empty = false;
+            let __map = std::sync::Arc::make_mut(&mut self.price_ordered);
+            if let Some(__set) = __map.get_mut(&__ok) {
+                __set.remove(&(id));
+                __empty = __set.is_empty();
+            }
+            if __empty {
+                __map.remove(&__ok);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -922,6 +972,7 @@ impl ProductStorage {
             __keep_sorted.sort_unstable();
             let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
             let __saved_price_index = std::sync::Arc::clone(&self.price_index);
+            let __saved_price_ordered = std::sync::Arc::clone(&self.price_ordered);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
@@ -929,6 +980,7 @@ impl ProductStorage {
             self.changefeed = __feed;
             self.broker = __broker;
             self.price_index = __saved_price_index;
+            self.price_ordered = __saved_price_ordered;
             let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
                 __old_id_to_row.len(),
             );
@@ -1026,6 +1078,12 @@ impl ProductStorage {
                     .or_default()
                     .insert(__id);
             }
+            {
+                std::sync::Arc::make_mut(&mut self.price_ordered)
+                    .entry((price_value).normalize())
+                    .or_default()
+                    .insert(__id);
+            }
         }
     }
     /// Fold only the rows in `[from..row_count)` into the in-memory maps
@@ -1071,6 +1129,18 @@ impl ProductStorage {
                         __map.remove(&__k);
                     }
                 }
+                {
+                    let __ok = { (__old_rec.price).normalize() };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.price_ordered);
+                    if let Some(__set) = __map.get_mut(&__ok) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__ok);
+                    }
+                }
             }
             let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
@@ -1101,6 +1171,12 @@ impl ProductStorage {
                         };
                         std::sync::Arc::make_mut(&mut self.price_index)
                             .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                    {
+                        std::sync::Arc::make_mut(&mut self.price_ordered)
+                            .entry((__new_rec.price).normalize())
                             .or_default()
                             .insert(id);
                     }
@@ -1423,6 +1499,53 @@ impl ProductStorage {
                 };
                 if __rk == __k {
                     __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
+    ///Ordered-index range + top-N over `Product`.`price` (#169): live records with the field in `[min, max]` (inclusive; `None` = unbounded), ordered by the field (descending if `descending`), capped at `limit` (`None` = all).  O(matches) via the BTreeMap, not a scan.
+    pub fn find_by_price_range(
+        &self,
+        min: Option<rust_decimal::Decimal>,
+        max: Option<rust_decimal::Decimal>,
+        descending: bool,
+        limit: Option<usize>,
+    ) -> Vec<Product> {
+        let __lo_v: Option<rust_decimal::Decimal> = min.map(|__v| (__v).normalize());
+        let __hi_v: Option<rust_decimal::Decimal> = max.map(|__v| (__v).normalize());
+        if let (Some(__l), Some(__h)) = (__lo_v.as_ref(), __hi_v.as_ref()) {
+            if __l > __h {
+                return Vec::new();
+            }
+        }
+        let __lo = match __lo_v {
+            Some(__v) => std::ops::Bound::Included(__v),
+            None => std::ops::Bound::Unbounded,
+        };
+        let __hi = match __hi_v {
+            Some(__v) => std::ops::Bound::Included(__v),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut __out: Vec<Product> = Vec::new();
+        let __iter: Box<
+            dyn Iterator<
+                Item = (&rust_decimal::Decimal, &std::collections::BTreeSet<Uuid>),
+            > + '_,
+        > = if descending {
+            Box::new(self.price_ordered.range((__lo, __hi)).rev())
+        } else {
+            Box::new(self.price_ordered.range((__lo, __hi)))
+        };
+        'outer: for (_k, __ids) in __iter {
+            for &__id in __ids {
+                if let Some(__r) = self.get(__id) {
+                    __out.push(__r);
+                    if let Some(__n) = limit {
+                        if __out.len() >= __n {
+                            break 'outer;
+                        }
+                    }
                 }
             }
         }

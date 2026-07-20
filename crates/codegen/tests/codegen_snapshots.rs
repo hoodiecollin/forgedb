@@ -407,6 +407,55 @@ User {
 }
 
 #[test]
+fn test_rust_generation_ordered_index() {
+    // #169: ordered-eligible indexed fields get a PARALLEL BTreeMap index keyed by
+    // the typed value + a `find_by_<field>_range` query, alongside the untouched
+    // hash index. Ineligible indexed fields (string, nullable, f64) do NOT.
+    let src = r#"
+Metric {
+  id: +uuid
+  name: ^string
+  views: ^u64
+  score: ^i64?
+  ratio: ^f64
+  price: ^decimal
+  at: ^timestamp
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let db_code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Eligible: u64 / i64(non-null) / decimal / timestamp get an ordered map +
+    // range method, keyed by the typed value.
+    assert!(db_code.contains("views_ordered"), "#169: u64 gets an ordered index");
+    assert!(db_code.contains("BTreeMap<u64, std :: collections :: BTreeSet")
+            || db_code.contains("BTreeMap<u64,"),
+        "#169: ordered index keyed by the typed value (u64), not a String");
+    assert!(db_code.contains("pub fn find_by_views_range"), "#169: u64 range/top-N method");
+    assert!(db_code.contains("pub fn find_by_price_range"), "#169: decimal range method");
+    assert!(db_code.contains("pub fn find_by_at_range"), "#169: timestamp range method");
+    assert!(db_code.contains("price_ordered"), "#169: decimal ordered index");
+    // Decimal bound is normalized (scale-invariant), like its hash key.
+    let price_range = &db_code[db_code.find("fn find_by_price_range").unwrap()..];
+    let price_range = &price_range[..price_range.find("__out\n").unwrap_or(price_range.len().min(1200))];
+    assert!(price_range.contains("normalize"),
+        "#169: decimal range bounds normalized to match the stored key");
+
+    // The parallel hash index is untouched (exact-match path preserved).
+    assert!(db_code.contains("views_index"), "#169: hash index kept alongside (parallel, not replace)");
+    assert!(db_code.contains("pub fn find_by_views"), "#169: exact-match probe still emitted");
+
+    // Ineligible: string / nullable-i64 / f64 get NO ordered index or range method.
+    assert!(!db_code.contains("name_ordered"), "#169: string is exact-match only");
+    assert!(!db_code.contains("find_by_name_range"), "#169: no range on a string index");
+    assert!(!db_code.contains("score_ordered"), "#169: nullable ordered field deferred");
+    assert!(!db_code.contains("find_by_score_range"), "#169: no range on a nullable field");
+    assert!(!db_code.contains("ratio_ordered"), "#169: f64 excluded (no clean total order)");
+    assert!(!db_code.contains("find_by_ratio_range"), "#169: no range on f64");
+}
+
+#[test]
 fn test_api_openapi_doc_structure() {
     let schema = simple_user_schema();
     let result = ApiGenerator::generate(&schema).unwrap();

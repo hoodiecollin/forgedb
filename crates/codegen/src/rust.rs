@@ -1944,6 +1944,144 @@ impl RustGenerator {
         }
     }
 
+    // --- #169: ordered (range/top-N) secondary index ------------------------
+    //
+    // The hash index above keys by a tagged `String` (exact-match only — string
+    // order ≠ value order, so it cannot serve a range or ordered top-N). For
+    // ordered-eligible fields we additionally build a PARALLEL `BTreeMap` keyed
+    // by the field's **typed value**, which sorts in value order and serves
+    // `WHERE x >= lo [AND x <= hi] ORDER BY x [DESC] LIMIT n` in O(matches). It
+    // is parallel (not a replacement): the exact-match hash path stays untouched
+    // (load-bearing for `&unique` / FK / reverse-FK / scan-pushdown), and the
+    // extra per-write `BTreeMap` insert is negligible against the fsync barrier.
+
+    /// The Rust key type an ordered index uses for `field` — the field's natural
+    /// `Ord` value type — or `None` if the field is not ordered-eligible.
+    /// Eligible: non-nullable `u32/u64/i32/i64/timestamp/decimal`. Excluded:
+    /// `f64` (no clean total order — NaN), nullable (deferred), strings/uuid/enum/
+    /// bool/json/FK (either unordered or exact-match by nature).
+    fn ordered_key_type(field: &forgedb_parser::Field) -> Option<TokenStream> {
+        use forgedb_parser::FieldType;
+        if field.is_nullable() {
+            return None;
+        }
+        match &field.field_type {
+            FieldType::U32 => Some(quote! { u32 }),
+            FieldType::U64 => Some(quote! { u64 }),
+            FieldType::I32 => Some(quote! { i32 }),
+            FieldType::I64 => Some(quote! { i64 }),
+            FieldType::Timestamp => Some(quote! { Timestamp }),
+            FieldType::Decimal => Some(quote! { rust_decimal::Decimal }),
+            _ => None,
+        }
+    }
+
+    /// The indexed fields that also get an ordered index (#169) — the subset of
+    /// `indexed_fields` whose type is ordered-eligible.
+    fn ordered_index_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        Self::indexed_fields(model)
+            .into_iter()
+            .filter(|f| Self::ordered_key_type(f).is_some())
+            .collect()
+    }
+
+    /// The ordered index map identifier for `field` (`<field>_ordered`).
+    fn ordered_index_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
+        format_ident!("{}_ordered", field.name)
+    }
+
+    /// The typed ordered-index key for a field value expression — the value
+    /// itself, `decimal` normalized (scale-invariant, matching the hash index's
+    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound.
+    fn ordered_key_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
+        match field_type {
+            forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
+            _ => value_expr,
+        }
+    }
+
+    /// Add `id` under `field`'s typed value to its ordered index (#169), the
+    /// `BTreeMap`/`BTreeSet` peer of `index_add_block`.  `Arc::make_mut` gives the
+    /// same copy-on-write-against-readers discipline (#158).
+    fn ordered_index_add_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        key_expr: TokenStream,
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        quote! {
+            {
+                std::sync::Arc::make_mut(&mut #receiver.#index_ident)
+                    .entry(#key_expr)
+                    .or_default()
+                    .insert(#id_expr);
+            }
+        }
+    }
+
+    /// Remove `id` from `field`'s ordered index bucket (#169), pruning an emptied
+    /// bucket — the `BTreeMap` peer of `index_remove_block`.
+    fn ordered_index_remove_block(
+        receiver: &TokenStream,
+        index_ident: &proc_macro2::Ident,
+        key_expr: TokenStream,
+        id_expr: &TokenStream,
+    ) -> TokenStream {
+        quote! {
+            {
+                let __ok = { #key_expr };
+                let mut __empty = false;
+                let __map = std::sync::Arc::make_mut(&mut #receiver.#index_ident);
+                if let Some(__set) = __map.get_mut(&__ok) {
+                    __set.remove(&(#id_expr));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    __map.remove(&__ok);
+                }
+            }
+        }
+    }
+
+    /// Ordered-index ADD blocks (#169), one per ordered-eligible field, keyed by
+    /// the field's typed value read from `record_expr` (e.g. `record` / `__rec`).
+    /// The `BTreeMap` peer of the single-field `index_add_block` maintenance loop.
+    fn ordered_index_add_maint(
+        model: &forgedb_parser::Model,
+        recv: &TokenStream,
+        record_expr: &TokenStream,
+        id_tok: &TokenStream,
+    ) -> Vec<TokenStream> {
+        Self::ordered_index_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::ordered_index_ident(f);
+                let fname = format_ident!("{}", f.name);
+                let key = Self::ordered_key_expr(&f.field_type, quote! { #record_expr.#fname });
+                Self::ordered_index_add_block(recv, &ident, key, id_tok)
+            })
+            .collect()
+    }
+
+    /// Ordered-index REMOVE blocks (#169), one per ordered-eligible field, keyed by
+    /// the field's typed value read from `record_expr` (the pre-mutation record).
+    fn ordered_index_remove_maint(
+        model: &forgedb_parser::Model,
+        recv: &TokenStream,
+        record_expr: &TokenStream,
+        id_tok: &TokenStream,
+    ) -> Vec<TokenStream> {
+        Self::ordered_index_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::ordered_index_ident(f);
+                let fname = format_ident!("{}", f.name);
+                let key = Self::ordered_key_expr(&f.field_type, quote! { #record_expr.#fname });
+                Self::ordered_index_remove_block(recv, &ident, key, id_tok)
+            })
+            .collect()
+    }
+
     /// The composite `@index(a, b, …)` indexes of a model (#101), resolved to their
     /// component `&Field`s.  A composite is emitted only when the model has an
     /// identity field, has ≥2 components, and **every** component resolves to an
@@ -2120,6 +2258,19 @@ impl RustGenerator {
             })
             .collect();
 
+        // #169: parallel ordered index — a `BTreeMap` keyed by the field's typed
+        // value (value order, not string order) so it serves range + top-N.
+        let ordered_fields: Vec<_> = Self::ordered_index_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::ordered_index_ident(f);
+                let kty = Self::ordered_key_type(f).expect("ordered_index_fields filtered");
+                quote! {
+                    #ident: std::sync::Arc<std::collections::BTreeMap<#kty, std::collections::BTreeSet<#id_type>>>
+                }
+            })
+            .collect();
+
         // #159: per-id ascending list of that id's physical row versions.  Snapshot
         // reads (`get_at`/`all_at`/`find_by_*_at`) binary-search it for the newest
         // version `< watermark` — O(log versions) instead of an O(watermark) id
@@ -2139,6 +2290,7 @@ impl RustGenerator {
             #(#column_fields,)*
             #(#index_fields,)*
             #(#composite_fields,)*
+            #(#ordered_fields,)*
             tombstones: forgedb_storage::Tombstones,
             // Write-ahead log (#89 durable write path): every mutation records an
             // opaque row blob here + fsync BEFORE touching columns, so a crash
@@ -2260,6 +2412,15 @@ impl RustGenerator {
             })
             .collect();
 
+        // Empty ordered indexes (#169), also rebuilt by `#rehydrate_logic`.
+        let ordered_inits: Vec<_> = Self::ordered_index_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::ordered_index_ident(f);
+                quote! { #ident: std::sync::Arc::new(std::collections::BTreeMap::new()) }
+            })
+            .collect();
+
         // WAL fsync policy (#129, epic #126): default `Always` (byte-identical);
         // configurable via `[storage].fsync`.
         let wal_fsync = Self::wal_fsync_policy_tokens();
@@ -2278,6 +2439,7 @@ impl RustGenerator {
             #(#inits,)*
             #(#index_inits,)*
             #(#composite_inits,)*
+            #(#ordered_inits,)*
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
@@ -3392,10 +3554,14 @@ impl RustGenerator {
         // #162-C: the secondary index maps (single + composite) are keyed
         // value→id, so a physical-row renumber leaves them correct — save each
         // Arc across the column-handle reopen and reinstall it verbatim.
+        // #169: the ordered indexes are value→id keyed too, so a physical-row
+        // renumber leaves them correct — save + reinstall each Arc verbatim
+        // alongside the hash + composite maps.
         let index_idents: Vec<proc_macro2::Ident> = Self::indexed_fields(model)
             .iter()
             .map(|f| Self::index_field_ident(f))
             .chain(Self::composite_indexes(model).into_iter().map(|(ident, _)| ident))
+            .chain(Self::ordered_index_fields(model).iter().map(|f| Self::ordered_index_ident(f)))
             .collect();
         let save_indexes: Vec<_> = index_idents
             .iter()
@@ -3791,6 +3957,8 @@ impl RustGenerator {
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
+        // #169 ordered-index remove side (keyed off `__old_rec`).
+        let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &old, &id_tok);
 
         // Add side — the SAME blocks the live update/insert path builds, keyed off
         // `__new_rec` (the row being folded, via `self.read_at(__r)`).
@@ -3804,6 +3972,8 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
+        // #169 ordered-index add side (keyed off `__new_rec`).
+        let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
         let composite_adds: Vec<_> = composites
             .iter()
             .map(|(ident, comps)| {
@@ -3820,6 +3990,7 @@ impl RustGenerator {
                 if let Some(__old_rec) = self.get(id) {
                     #(#rem_hoist)*
                     #(#single_removes)*
+                    #(#ordered_removes)*
                     #(#composite_removes)*
                 }
             }
@@ -3831,6 +4002,7 @@ impl RustGenerator {
                 if let Some(__new_rec) = self.read_at(__r) {
                     #(#add_hoist)*
                     #(#single_adds)*
+                    #(#ordered_adds)*
                     #(#composite_adds)*
                 }
             }
@@ -3971,6 +4143,8 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
+        // #169 ordered-index maintenance: same timing, keyed by the typed value.
+        let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
         // Composite-index maintenance (#101): same timing, keyed by the tuple.
         let composite_adds: Vec<_> = Self::composite_indexes(model)
             .iter()
@@ -4017,6 +4191,8 @@ impl RustGenerator {
             // #157 part B: derive shared-field keys once, then reuse below.
             #(#add_hoist)*
             #(#index_adds)*
+            // Ordered-index maintenance (#169).
+            #(#ordered_adds)*
             // Composite-index maintenance (#101).
             #(#composite_adds)*
 
@@ -4100,6 +4276,10 @@ impl RustGenerator {
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
+        // #169 ordered-index update: remove the old typed value (from `__old_rec`),
+        // add the new one (from `record`).
+        let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &old, &id_tok);
+        let ordered_adds: Vec<_> = Self::ordered_index_add_maint(model, &recv, &rec, &id_tok);
         // Composite-index update maintenance (#101): remove the old tuple key
         // (from `__old`), add the new one (from `record`).
         let composite_removes: Vec<_> = composites
@@ -4134,6 +4314,8 @@ impl RustGenerator {
                 if let Some(__old_rec) = &__old {
                     #(#rem_hoist)*
                     #(#single_removes)*
+                    // Ordered-index maintenance (#169): drop the stale typed value.
+                    #(#ordered_removes)*
                     // Composite-index maintenance (#101): drop stale tuple keys.
                     #(#composite_removes)*
                 }
@@ -4178,6 +4360,8 @@ impl RustGenerator {
             #index_remove_maint
             #(#add_hoist)*
             #(#single_adds)*
+            // Ordered-index maintenance (#169): add the new typed value.
+            #(#ordered_adds)*
             #(#composite_adds)*
 
             // #62: an Updated event carries the new live row index.
@@ -4236,6 +4420,8 @@ impl RustGenerator {
                 Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
+        // #169 ordered-index removal: drop the deleted id's typed value.
+        let ordered_removes: Vec<_> = Self::ordered_index_remove_maint(model, &recv, &rec, &id_tok);
         // Composite-index removal (#101): drop the deleted id's tuple key.
         let composite_removes: Vec<_> = Self::composite_indexes(model)
             .iter()
@@ -4289,6 +4475,8 @@ impl RustGenerator {
             // #157 part B: shared-field keys derived once, then reused.
             #(#rem_hoist)*
             #(#index_removes)*
+            // Ordered-index removal (#169).
+            #(#ordered_removes)*
             // Composite-index removal (#101).
             #(#composite_removes)*
 
@@ -4323,7 +4511,90 @@ impl RustGenerator {
     /// `_at` probe additionally post-filters on the resolved value, so a
     /// candidate whose value changed *after* the snapshot is excluded.
     fn generate_index_lookups(model: &forgedb_parser::Model) -> TokenStream {
-        Self::generate_index_probes(model, true)
+        let probes = Self::generate_index_probes(model, true);
+        let ranges = Self::generate_ordered_range_methods(model);
+        quote! { #probes #ranges }
+    }
+
+    /// #169: the ordered-index range + top-N query methods, one per
+    /// ordered-eligible field.  `find_by_<field>_range(min, max, descending,
+    /// limit)` walks the field's `BTreeMap` within `[min, max]` (inclusive; `None`
+    /// = unbounded) in value order (or reversed), resolving each id's live record,
+    /// stopping at `limit` — O(matches) top-N / range, not a full scan.  Writer
+    /// only (resolves via live `get`); the reader/`_at` ordered probe is deferred.
+    fn generate_ordered_range_methods(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = format_ident!("{}", model.name);
+        let methods: Vec<TokenStream> = Self::ordered_index_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::ordered_index_ident(f);
+                let kty = Self::ordered_key_type(f).expect("ordered_index_fields filtered");
+                let id_type = Self::id_type_tokens(model);
+                let range_fn = format_ident!("find_by_{}_range", f.name);
+                // Normalize each bound identically to the stored key (decimal
+                // scale-invariant) so `1.0` and `1.00` bound the same bucket.
+                let lo_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
+                let hi_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
+                let doc = format!(
+                    "Ordered-index range + top-N over `{}`.`{}` (#169): live records \
+                     with the field in `[min, max]` (inclusive; `None` = unbounded), \
+                     ordered by the field (descending if `descending`), capped at \
+                     `limit` (`None` = all).  O(matches) via the BTreeMap, not a scan.",
+                    model.name, f.name
+                );
+                quote! {
+                    #[doc = #doc]
+                    pub fn #range_fn(
+                        &self,
+                        min: Option<#kty>,
+                        max: Option<#kty>,
+                        descending: bool,
+                        limit: Option<usize>,
+                    ) -> Vec<#model_name> {
+                        let __lo_v: Option<#kty> = min.map(|__v| #lo_norm);
+                        let __hi_v: Option<#kty> = max.map(|__v| #hi_norm);
+                        // An inverted range would panic `BTreeMap::range`; treat it
+                        // as empty.
+                        if let (Some(__l), Some(__h)) = (__lo_v.as_ref(), __hi_v.as_ref()) {
+                            if __l > __h {
+                                return Vec::new();
+                            }
+                        }
+                        let __lo = match __lo_v {
+                            Some(__v) => std::ops::Bound::Included(__v),
+                            None => std::ops::Bound::Unbounded,
+                        };
+                        let __hi = match __hi_v {
+                            Some(__v) => std::ops::Bound::Included(__v),
+                            None => std::ops::Bound::Unbounded,
+                        };
+                        let mut __out: Vec<#model_name> = Vec::new();
+                        // Unify both scan directions behind one boxed iterator so the
+                        // resolve loop is written once.
+                        let __iter: Box<dyn Iterator<Item = (&#kty, &std::collections::BTreeSet<#id_type>)> + '_> =
+                            if descending {
+                                Box::new(self.#ident.range((__lo, __hi)).rev())
+                            } else {
+                                Box::new(self.#ident.range((__lo, __hi)))
+                            };
+                        'outer: for (_k, __ids) in __iter {
+                            for &__id in __ids {
+                                if let Some(__r) = self.get(__id) {
+                                    __out.push(__r);
+                                    if let Some(__n) = limit {
+                                        if __out.len() >= __n {
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        __out
+                    }
+                }
+            })
+            .collect();
+        quote! { #(#methods)* }
     }
 
     /// Emit the secondary-index probe methods for a model's storage, factored so
@@ -5613,6 +5884,14 @@ impl RustGenerator {
                         Self::index_add_block(recv, &ident, key, &id_tok)
                     })
                     .collect();
+                // #169 ordered index adds, keyed off the same decoded `<field>_value`
+                // locals (ordered fields ⊆ indexed fields, so already decoded).
+                adds.extend(Self::ordered_index_fields(model).iter().map(|f| {
+                    let ident = Self::ordered_index_ident(f);
+                    let val = format_ident!("{}_value", f.name);
+                    let key = Self::ordered_key_expr(&f.field_type, quote! { #val });
+                    Self::ordered_index_add_block(recv, &ident, key, &id_tok)
+                }));
                 // Composite index adds (#101), folded into the same scan.
                 adds.extend(composites.iter().map(|(ident, comps)| {
                     let parts: Vec<_> = comps
