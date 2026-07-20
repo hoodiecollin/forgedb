@@ -93,6 +93,13 @@ impl WalManager {
         self.writer.write(entry)
     }
 
+    /// Append an entry WITHOUT fsyncing (#170 group commit) — durability deferred
+    /// to a later [`flush`](Self::flush). Only for writes gated on a later durable
+    /// marker (MVCC-Tier-1 staged rows). See [`WalWriter::write_buffered`].
+    pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
+        self.writer.write_buffered(entry)
+    }
+
     /// Flush buffered bytes to disk (fsync).
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
@@ -210,6 +217,12 @@ impl WalManager {
     pub fn write(&mut self, entry: &WalEntry) -> io::Result<()> {
         self.buffer.extend_from_slice(&entry.to_bytes());
         Ok(())
+    }
+
+    /// #170 group-commit parity: identical to [`write`](Self::write) on wasm —
+    /// the in-memory log has no fsync to defer.
+    pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
+        self.write(entry)
     }
 
     /// No-op flush — there is no disk to sync to on wasm.

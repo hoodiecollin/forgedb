@@ -1515,7 +1515,7 @@ version = "0.1.0"
 
 [[package]]
 name = "forgedb-wal"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "crc32fast",
  "tempfile",

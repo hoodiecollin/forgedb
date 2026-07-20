@@ -60,6 +60,20 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Append an entry WITHOUT fsyncing, regardless of the fsync policy (#170
+    /// group commit).  Durability is deferred to an explicit [`flush`](Self::flush)
+    /// at the batch/transaction commit boundary — so a batch of N appends pays one
+    /// barrier instead of N.  Safe only for writes whose visibility is gated on a
+    /// later durable marker (e.g. MVCC-Tier-1 staged rows, which crash-recovery
+    /// drops unless the transaction journal committed): a crash before the flush
+    /// loses these appends, which is exactly correct for not-yet-committed data.
+    pub fn write_buffered(&mut self, entry: &WalEntry) -> io::Result<()> {
+        let bytes = entry.to_bytes();
+        self.file.write_all(&bytes)?;
+        self.bytes_since_fsync += bytes.len();
+        Ok(())
+    }
+
     /// Manually flush the WAL to disk
     pub fn flush(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
