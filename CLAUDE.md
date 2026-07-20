@@ -285,7 +285,9 @@ across many domains live in `examples/` — see `examples/README.md`.**
   2026-07-20** (see the dedicated bullet below; `scan_aggregate` 32.4 ms → 568 µs, `scan_sort_top10` 32.6 ms → 763 µs),
   **#169 ordered/range index kind — LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs, index-served), **#160 narrow
   reverse-FK/live-query materialization — LANDED 2026-07-20** (reverse-FK already index-served; live-query re-run
-  narrowed to materialize only matches), #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
+  narrowed to materialize only matches), **#170 group/batch commit — LANDED 2026-07-20** (`bulk_load` 50.7 s → 5.5 s /
+  14.8 s → 107 ms via one barrier per transaction). **Phase 1 of #167 is COMPLETE.** **Phase 2** (filed now Phase 1 has
+  landed; run past
   `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
   AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
   `benchmarks/configs/in_place.toml` matrix wiring + a feature-support column. Likely honest outcome: Phase 1 closes
@@ -340,6 +342,26 @@ across many domains live in `examples/` — see `examples/README.md`.**
     top-N/empty+inverted/update-moves-bucket/delete-excludes/reopen-rebuild) + all-6-key-types compile check.
     **Deferred:** REST list auto-planning (handler auto-picks the index), reader/snapshot `_at` ordered probe, f64/
     nullable ordered indexes, an explicit hash-vs-ordered directive override.
+  - **#170 group/batch commit — LANDED 2026-07-20 (Phase 1d of #167, COMPLETES Phase 1).** A per-row `insert` pays one
+    `F_FULLFSYNC` barrier (~3.5 ms) each → `bulk_load/10000` = 50.7 s. Group commit rides the existing MVCC Tier-1
+    **transaction**: staged rows (`__stage_append`) now use a NEW **buffered** WAL append (`WalManager::write_buffered`
+    — append, NO per-record fsync, regardless of `FsyncPolicy`) instead of the fsync-per-row `write`, and durability is
+    the SINGLE `wal.flush()` + column `barrier()` already done at `TxHandle::commit`. So a whole transaction pays **one
+    barrier** instead of one per row. **Durability-correct:** staged rows are invisible (past the watermark) and
+    journal-driven recovery drops any uncommitted tail — a crash before the commit flush loses only not-yet-committed
+    data; the commit flushes the staged WAL durable BEFORE writing the `_txn` journal commit marker. The committed
+    single-write `insert`/`update`/`delete` path is unchanged (keeps its per-op fsync). **Measured** (`bulk_load_grouped`):
+    1 000 rows 14.8 s → **107 ms (~138×)**, 10 000 rows 50.7 s → **5.5 s (~9×)** — the barrier is gone (per-row cost
+    ~10 ms → ~70 µs). **Residual:** a large *single* transaction's commit-time full reindex (`__reindex_committed`
+    rebuilds `id_to_row` + indexes, superlinear) dominates once the barrier is removed, so moderate batch sizes (e.g.
+    1 000/txn) beat one giant txn; a delta-reindex at commit (the #161-B fold-only-new path) is the follow-up. **FK
+    caveat:** a child's FK validates against COMMITTED rows, so a batch commits parents before children (two txns).
+    Substrate: **`forgedb-wal` 0.2.2 → 0.2.3** (additive `write_buffered` on both native + wasm `WalManager` + the inner
+    `WalWriter`) — additive, publish with the storage batch. Guards: extended `test_rust_generation_transaction`
+    (staging uses `write_buffered`, committed path keeps `write`) + WAL unit test
+    `test_writer_write_buffered_defers_fsync_but_persists_after_flush`; runtime durability E2E
+    `benchmarks/tests/group_commit.rs` (committed txn rows survive reopen despite buffered staging; rolled-back txn
+    leaves nothing).
 - **Configurable runtime behavior — epic #126: BATCH 1 LANDED (generate-time Tier A/B), 2026-07-18.** The
   foundation + every knob baked into `database.rs` is done and e2e-proven. A `GenConfig`
   (`crates/codegen/src/config.rs`, schema-blind, `DEFAULT` byte-identical **except** the broker) is threaded via
@@ -702,17 +724,18 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — OPEN (#153 + #168, 2026-07-18 / 2026-07-20):** two additive substrate batches the
-  generated `database.rs` now links, both unpublished: (a) **#153** — the perf single-barrier checkpoint made
+- **`init → build` publish gap — OPEN (#153 + #168 + #170, 2026-07-18 / 2026-07-20):** three additive substrate
+  batches the generated `database.rs` now links, all unpublished: (a) **#153** — the perf single-barrier checkpoint made
   `checkpoint()`/`commit()`/junction `checkpoint()` call the NEW `sync_to_drive()` + `barrier()` on the storage columns;
   (b) **#168** — the column-pruned scan made `__scan_all` call the NEW `FixedColumn::gather_buffered` /
-  `VariableColumn::gather_buffered` (→ `BufferedFixedColumn` / `BufferedVariableColumn`) + `Tombstones::live_indices`.
-  Together they require **`forgedb-storage-native 0.1.4`** + **`forgedb-storage-web 0.1.4`** (parity impls) behind the
-  **`forgedb-storage 0.2.3`** facade (all bumped in-tree; `storage-native 0.1.2` is the published ceiling). All additive
-  (no format break), but must republish `storage-native`/`storage-web`/`storage` before an outside-repo `init → build`
-  resolves from crates.io — same discipline as the wal/compaction bumps. The scaffold pin stays
-  `forgedb-storage = "0.2"` (semver-compatible with 0.2.3). No other crate changed. #154 (M2M index) is pure generated
-  code → **no** publish gap.
+  `VariableColumn::gather_buffered` (→ `BufferedFixedColumn` / `BufferedVariableColumn`) + `Tombstones::live_indices`;
+  (c) **#170** — group commit made `__stage_append` call the NEW `WalManager::write_buffered`. Together they require
+  **`forgedb-storage-native 0.1.4`** + **`forgedb-storage-web 0.1.4`** (parity impls) behind the **`forgedb-storage
+  0.2.3`** facade + **`forgedb-wal 0.2.2 → 0.2.3`** (all bumped in-tree; `storage-native 0.1.2` / `wal 0.2.2` are the
+  published ceilings). All additive (no format break), but must republish `storage-native`/`storage-web`/`storage`/`wal`
+  before an outside-repo `init → build` resolves from crates.io — same discipline as the prior wal/compaction bumps. The
+  scaffold pins stay `forgedb-storage = "0.2"` / `forgedb-wal = "0.2"` (semver-compatible). No other crate changed. #154
+  (M2M index) + #169 (ordered index) are pure generated code → **no** publish gap.
 - **`init → build` publish gap — CLOSED again 2026-07-10 (#90):** Phase 2 made generated `api.rs` require
   **`forgedb-query-params 0.1.0`** (list-endpoint filter/sort/paginate parsing); it is **now published**, and the
   reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust+api → cargo build` resolving

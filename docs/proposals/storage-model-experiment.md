@@ -91,14 +91,21 @@ experiment. Each is generated-code or index work over existing substrate.
   #100 (O(matches) `find_by_<fk>`), returning full records by contract. Not benchmark-visible (both
   are WS/traversal paths, orthogonal to the storage-model comparison) but the explicit #160 residual
   is now closed.
-- **P1d — group/batch commit.** Bulk load fsyncs per row (one barrier each). One barrier per N
-  rows is the standard fix and would transform the bulk-load numbers. Orthogonal to layout;
-  additive to the WAL path. (`[storage].fsync=never` already exists as the durability-trading
-  knob; group-commit keeps durability while amortizing the barrier.)
+- **P1d — group/batch commit (#170). LANDED 2026-07-20** (`bulk_load` 50.7 s → 5.5 s /10k, 14.8 s →
+  107 ms /1k). Bulk load fsynced per row (one barrier each). Group commit rides the existing MVCC
+  Tier-1 **transaction**: staged rows use a new **buffered** WAL append (`WalManager::write_buffered`,
+  no per-record fsync) and pay the SINGLE barrier already done at `TxHandle::commit`. Durability-correct
+  (staged rows invisible; journal-driven recovery drops any uncommitted tail; commit flushes the staged
+  WAL before the journal marker). Keeps durability (unlike `[storage].fsync=never`, which trades it).
+  Residual: a large single txn's commit-time full reindex dominates once the barrier is gone → moderate
+  batch sizes win; a delta-reindex at commit (#161-B path) is the follow-up.
 
 **Phase 1 done when** the append-only benchmark path no longer loses scans/top-N by orders of
 magnitude for reasons unrelated to the mutation model — i.e. the remaining gap vs redb/SQLite is
-attributable to append-only itself, not read-path quality.
+attributable to append-only itself, not read-path quality. **STATUS: COMPLETE (2026-07-20)** —
+all four items (#168/#169/#160/#170) landed; scan 32 ms → 568 µs, top-N 32.6 ms → 37 µs, live-query
+narrowed, bulk-load barrier amortized. The residual gaps (row-wise vs vectorized aggregate,
+commit-time reindex) are named follow-ups, not read-path confounds. Ready for Phase 2.
 
 ## Phase 2 — the experiment (fixed-width in-place variant)
 

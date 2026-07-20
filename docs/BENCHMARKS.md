@@ -72,7 +72,7 @@ scans/aggregates** — the mirror image of the embedded row engines.
 | scenario | DuckDB | redb | ForgeDB (default) | note |
 | --- | --- | --- | --- | --- |
 | `insert_user` | 208 µs | 4.04 ms (barrier) / 0.50 ms | 3.95 ms (barrier) | DuckDB WAL, not a per-row `F_FULLFSYNC` barrier — not like-for-like |
-| `bulk_load/10000` | 1.39 s | 4.9 s (eventual) | 50.7 s (barrier) | row-at-a-time INSERT is DuckDB's worst case (its bulk path is the Appender) |
+| `bulk_load/10000` | 1.39 s | 4.9 s (eventual) | 50.7 s per-insert / **5.5 s grouped (#170)** | per-row `F_FULLFSYNC`; #170 group commit amortizes it to one barrier per transaction (see below) |
 | `point_lookup` | 88.4 µs | 0.62 µs | 3.48 µs | **columnar point lookup is ~25× slower than ForgeDB, ~140× slower than redb** |
 | `index_probe` | 82.6 µs | 1.11 µs | 3.67 µs | same columnar point-op weakness |
 | `reverse_fk` | 106 µs | 3.94 µs | 36.9 µs | — |
@@ -359,6 +359,18 @@ host (Apple SSD), per durable op:
    2 × a barrier (see the configuration matrix). (Historically — pre-#130 — the broker was
    attached unconditionally, so *every* insert paid two barriers ~7.6 ms; that is no longer
    the default.)
+3. **Group commit (#170) amortizes the barrier across a transaction.** A per-row insert pays one
+   `F_FULLFSYNC` per row (the 50.7 s `bulk_load/10000`). Wrapping the load in a `db.transaction`
+   makes staged rows use the **buffered** (no-fsync) WAL append and pay a **single** barrier at
+   commit — durability preserved (the transaction commits atomically or rolls back; a crash before
+   the commit flush drops the staged rows via journal-driven recovery). Measured `bulk_load_grouped`:
+   **1 000 rows 14.8 s → 107 ms (~138×)**, **10 000 rows 50.7 s → 5.5 s (~9×)**. The barrier is gone
+   (per-row cost ~10 ms → ~70 µs); the residual for a *large* single transaction is the commit-time
+   full **reindex** (`__reindex_committed` rebuilds the model's `id_to_row` + indexes — superlinear
+   in one giant txn), so moderate batch sizes (e.g. 1 000/txn) beat one all-in-one transaction. A
+   delta-reindex at commit (the #161-B fold-only-new-rows path) is the follow-up. Note: a post's FK
+   is validated against **committed** rows, so a batch must commit its parents before its children
+   (two transactions, still two barriers vs N).
 
 **How the harness reports it now:** `sqlite/insert_user` runs at **both** durability
 levels — `default` (plain fsync, SQLite's out-of-box guarantee) and `fullfsync` (matched
@@ -374,7 +386,8 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 > as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
 > **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; **#160 narrow
 > materialization — LANDED 2026-07-20** (live-query re-run narrowed; reverse-FK already index-served);
-> #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant
+> **#170 group-commit — LANDED 2026-07-20, bulk_load 50.7 s → 5.5 s / 14.8 s → 107 ms**).
+> **Phase 1 of #167 is COMPLETE.** **Phase 2** adds a fixed-width in-place `GenConfig` variant
 > to the config
 > matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
 > below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.
