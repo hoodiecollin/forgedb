@@ -1109,13 +1109,14 @@ impl ApiGenerator {
     /// Generate the live-query WebSocket handler for a model (#62 Direction B).
     ///
     /// A stateful, removal-aware result-set subscription.  On connect it runs a
-    /// **generated closed-set query** — `db.<model>.all()` filtered by the same
-    /// generated per-model `<model>_event_matches` closed-set filter the REST
-    /// `list` endpoint and #62-A use (NO second predicate parser: the filterable
-    /// keys are the finite declared-scalar set, exact-match by name) — sends an
-    /// `Init` delta, and records membership as `id -> opaque hash`.  On every
-    /// change to this model it re-runs that same generated query, diffs by id over
-    /// the opaque hashes, and pushes typed `Added` / `Updated` / `Removed` deltas.
+    /// **generated closed-set query** — the narrow `db.<model>.__scan_all()`
+    /// filtered by the generated per-model `__<model>_scan_matches` closed-set
+    /// filter (the SAME per-field checks as `<model>_event_matches` / the REST
+    /// `list` endpoint, only the operand is the narrow scan row — NO second
+    /// predicate parser), then full-materializes ONLY the matching rows (#160) —
+    /// sends an `Init` delta, and records membership as `id -> typed record`.  On
+    /// every change to this model it re-runs that same query, diffs by id, and
+    /// pushes typed `Added` / `Updated` / `Removed` deltas.
     ///
     /// Identity: the substrate feed is consulted **coarsely — only `event.model`**
     /// (never `row_index`/`kind`), so no logical-row identity is resolved through
@@ -1124,10 +1125,12 @@ impl ApiGenerator {
     /// hashes.  This is "generated code re-executing generated code on a coarse
     /// signal," not a runtime predicate interpreter.
     ///
-    /// Honest limits: O(rows) full re-run per matched event per connection (no
-    /// coalescing/debounce yet — #83); single-process.  `Updated` detection now
-    /// uses a typed per-field comparison (`<model>_record_changed`, #84), so the
-    /// old `serde_json` stringify float/bool fragility is gone.
+    /// Honest limits: re-runs on every matched event per connection (no
+    /// coalescing/debounce yet — #83); single-process.  #160 narrows the re-run —
+    /// it scans only the filterable columns and full-materializes only the rows
+    /// that match the filter (not every column of every row) — but a broad filter
+    /// still materializes its whole matching set.  `Updated` detection uses a typed
+    /// per-field comparison (`<model>_record_changed`, #84).
     fn generate_live_query(model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
@@ -1135,23 +1138,25 @@ impl ApiGenerator {
         let storage_field = format_ident!("{}", snake);
         let subscribe_fn = format_ident!("subscribe_live_{}", snake);
         let handle_fn = format_ident!("handle_{}_live_query", snake);
-        // Reuse the EXACT generated closed-set filter emitted by
-        // `generate_subscription` — do not define a second filtering path.
-        let filter_fn = format_ident!("{}_event_matches", snake);
         // Typed per-field change detector (#84), also defined by
         // `generate_subscription` — reused here so there is one change-detection
         // body per model, never a second (stringify) path.
         let changed_fn = format_ident!("{}_record_changed", snake);
+        // #160: the narrow closed-set filter over `<Model>ScanRow` (id +
+        // filterable columns), co-emitted with the list path. The live-query
+        // re-evaluation filters the CHEAP narrow scan and full-materializes only
+        // the matching rows, instead of full-decoding every column of every row.
+        let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(model);
         let model_name_str = &model.name;
 
         let subscribe_doc = format!(
             "Live-query WebSocket subscription for `{}` (#62 Direction B). Runs the \
-             generated closed-set query `all()` + `{}_event_matches` (narrow with \
-             `?field=value`), streams an initial `{}LiveDelta::Init`, then pushes \
-             removal-aware `Added` / `Updated` / `Removed` deltas as the matching \
-             set changes.",
+             generated closed-set query (narrow `__scan_all` + `__{}_scan_matches`, \
+             materializing only matches — #160), streams an initial \
+             `{}LiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / \
+             `Removed` deltas as the matching set changes.",
             model.name, snake, model.name
         );
 
@@ -1178,14 +1183,16 @@ impl ApiGenerator {
                 // set.  Change-detection compares these field-by-field (#84).
                 let mut members: HashMap<#id_type, super::#model_name> = HashMap::new();
 
-                // Initial matching set via the GENERATED closed-set query.
+                // Initial matching set via the GENERATED closed-set query (#160:
+                // filter the narrow scan, full-materialize only the matches).
                 {
                     let rows: Vec<super::#model_name> = {
                         let g = db.read().await;
                         g.#storage_field
-                            .all()
+                            .__scan_all()
                             .into_iter()
-                            .filter(|r| #filter_fn(r, &params))
+                            .filter(|r| #scan_matches_fn(r, &params))
+                            .filter_map(|r| g.#storage_field.get(r.#id_field))
                             .collect()
                     };
                     for r in &rows {
@@ -1208,13 +1215,15 @@ impl ApiGenerator {
                                 continue;
                             }
 
-                            // Re-run the SAME generated closed-set query.
+                            // Re-run the SAME generated closed-set query (#160:
+                            // narrow scan + filter, full-materialize only matches).
                             let current: Vec<super::#model_name> = {
                                 let g = db.read().await;
                                 g.#storage_field
-                                    .all()
+                                    .__scan_all()
                                     .into_iter()
-                                    .filter(|r| #filter_fn(r, &params))
+                                    .filter(|r| #scan_matches_fn(r, &params))
+                                    .filter_map(|r| g.#storage_field.get(r.#id_field))
                                     .collect()
                             };
 

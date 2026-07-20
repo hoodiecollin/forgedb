@@ -2998,9 +2998,10 @@ Widget {
 
 #[test]
 fn test_api_generation_list_endpoint() {
-    // Real list endpoint (#90): fetch live rows via all(), filter with the
-    // generated closed-set matcher, sort with the generated per-model comparator,
-    // paginate with the schema-agnostic query-params substrate.
+    // Real list endpoint (#90/#160): filter the narrow scan with the generated
+    // closed-set matcher, sort with the generated per-model comparator, then
+    // full-materialize only the page; paginate with the schema-agnostic
+    // query-params substrate.
     let src = r#"
 User {
   id: +uuid
@@ -3015,9 +3016,17 @@ User {
 
     // No stub: the handler fetches real rows and filters/sorts/paginates.
     assert!(!code.contains(r#"json!({ "data": [] })"#), "list stub is gone");
+    // #160: the live list filters the narrow scan through the SAME closed-set
+    // matcher as the change-feed / live-query paths (no second predicate parser).
     assert!(
-        code.contains(".all()") && code.contains("user_event_matches(r, &params)"),
-        "list fetches real rows and reuses the closed-set filter (no second parser)"
+        code.contains("__scan_all()") && code.contains("__user_scan_matches(r, &params)"),
+        "list filters the narrow scan via the generated closed-set matcher (no second parser)"
+    );
+    // The `?as_of` snapshot path keeps the full-record read + the same closed-set
+    // filter (`user_event_matches`).
+    assert!(
+        code.contains("user_event_matches(r, &params)"),
+        "as_of snapshot path reuses the full-record closed-set filter"
     );
     assert!(
         code.contains("forgedb_query_params::QueryParams::from_map")

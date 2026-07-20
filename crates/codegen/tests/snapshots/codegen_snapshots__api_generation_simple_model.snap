@@ -440,7 +440,7 @@ async fn handle_user_subscription(
         }
     }
 }
-///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query `all()` + `user_event_matches` (narrow with `?field=value`), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
+///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query (narrow `__scan_all` + `__user_scan_matches`, materializing only matches — #160), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_user(
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
@@ -458,7 +458,12 @@ async fn handle_user_live_query(
     {
         let rows: Vec<super::User> = {
             let g = db.read().await;
-            g.user.all().into_iter().filter(|r| user_event_matches(r, &params)).collect()
+            g.user
+                .__scan_all()
+                .into_iter()
+                .filter(|r| __user_scan_matches(r, &params))
+                .filter_map(|r| g.user.get(r.id))
+                .collect()
         };
         for r in &rows {
             members.insert(r.id, r.clone());
@@ -479,9 +484,10 @@ async fn handle_user_live_query(
                 let current: Vec<super::User> = {
                     let g = db.read().await;
                     g.user
-                        .all()
+                        .__scan_all()
                         .into_iter()
-                        .filter(|r| user_event_matches(r, &params))
+                        .filter(|r| __user_scan_matches(r, &params))
+                        .filter_map(|r| g.user.get(r.id))
                         .collect()
                 };
                 let mut next: HashMap<Uuid, super::User> = HashMap::new();
