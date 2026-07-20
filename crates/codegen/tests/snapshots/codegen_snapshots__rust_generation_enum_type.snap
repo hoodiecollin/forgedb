@@ -1254,7 +1254,7 @@ impl OrderStorage {
                 __wal_payload.push(1u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Order", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Order", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         } else {
@@ -1264,7 +1264,7 @@ impl OrderStorage {
                 __wal_payload.push(0u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Order", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Order", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         }

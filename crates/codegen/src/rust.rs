@@ -3074,11 +3074,35 @@ impl RustGenerator {
     /// applied; a crash mid-append is recovered from the WAL on reopen.  Assumes
     /// a `record` binding (the row's values) is in scope.
     fn generate_wal_record_write(model: &forgedb_parser::Model, deleted: bool) -> TokenStream {
+        Self::generate_wal_record_write_impl(model, deleted, false)
+    }
+
+    /// Like `generate_wal_record_write` but appends via the WAL's **buffered**
+    /// (no per-record fsync) path (#170 group commit).  Used ONLY by the MVCC
+    /// Tier-1 `__stage_append`: staged rows are invisible (past the watermark) and
+    /// journal-driven recovery drops any uncommitted tail, so deferring their
+    /// durability to the ONE `wal.flush()` at `TxHandle::commit` is correct — a
+    /// transaction of N rows pays one barrier instead of N.  The committed
+    /// insert/update/delete path keeps the per-op fsync (`write`).
+    fn generate_wal_record_write_buffered(model: &forgedb_parser::Model, deleted: bool) -> TokenStream {
+        Self::generate_wal_record_write_impl(model, deleted, true)
+    }
+
+    fn generate_wal_record_write_impl(
+        model: &forgedb_parser::Model,
+        deleted: bool,
+        buffered: bool,
+    ) -> TokenStream {
         let model_name_str = model.name.clone();
         let deleted_tok = if deleted {
             quote! { 1u8 }
         } else {
             quote! { 0u8 }
+        };
+        let write_call = if buffered {
+            quote! { write_buffered }
+        } else {
+            quote! { write }
         };
         quote! {
             {
@@ -3092,7 +3116,7 @@ impl RustGenerator {
                 // own payload; the broker later MOVES `__record_json` (no clone).
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw(#model_name_str, __wal_payload))
+                    .#write_call(&forgedb_wal::WalEntry::raw(#model_name_str, __wal_payload))
                     .expect("Failed to write WAL record");
             }
         }
@@ -3729,8 +3753,11 @@ impl RustGenerator {
         }
         let model_name = format_ident!("{}", model.name);
         let append_statements = Self::generate_append_statements(model);
-        let wal_write_live = Self::generate_wal_record_write(model, false);
-        let wal_write_deleted = Self::generate_wal_record_write(model, true);
+        // #170: staged rows use the buffered (no-fsync) WAL append — durability is
+        // the single `wal.flush()` at `TxHandle::commit`, so a whole transaction
+        // pays one barrier instead of one per staged row.
+        let wal_write_live = Self::generate_wal_record_write_buffered(model, false);
+        let wal_write_deleted = Self::generate_wal_record_write_buffered(model, true);
         let shared_record_json = Self::generate_shared_record_json();
         let col_idents: Vec<_> = model
             .fields

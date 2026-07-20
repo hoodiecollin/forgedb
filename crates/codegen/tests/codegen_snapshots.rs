@@ -5366,6 +5366,26 @@ Post {
         !code.contains("match record.") && !code.contains("match field_name"),
         "transaction machinery must never match on a decoded field"
     );
+
+    // #170 group commit: staged rows use the BUFFERED (no-fsync) WAL append, so a
+    // transaction pays ONE barrier (the commit's `wal.flush()`) instead of one per
+    // staged row. The committed insert/update/delete path keeps the per-op `write`.
+    let stage_body = &code[code.find("fn __stage_append").unwrap()..];
+    let stage_body = &stage_body[..stage_body.find("row_index\n").unwrap_or(stage_body.len().min(1500))];
+    assert!(
+        stage_body.contains(".write_buffered("),
+        "#170: __stage_append uses the buffered (no-fsync) WAL append"
+    );
+    assert!(
+        !stage_body.contains(".write(&forgedb_wal::WalEntry"),
+        "#170: __stage_append does NOT per-record fsync (no plain wal.write)"
+    );
+    // The committed single-write path keeps the durable per-op fsync.
+    let insert_body = &code[code.find("pub fn insert(").unwrap_or(0)..];
+    assert!(
+        insert_body.contains(".write(&forgedb_wal::WalEntry"),
+        "#170: committed insert still fsyncs per op (durable single write unchanged)"
+    );
 }
 
 #[test]
