@@ -98,7 +98,13 @@ fn bench_insert(c: &mut Criterion) {
     group.finish();
 }
 
-// --- Scenario 1: bulk load ---------------------------------------------------
+// --- Scenario 1: bulk load (per-row durable — ANTI-PATTERN baseline) ---------
+// This loads via per-row `insert()`, so EVERY row pays its own `F_FULLFSYNC`
+// barrier (~3.5 ms). It is NOT the fair cross-engine bulk comparison — SQLite's
+// and DuckDB's `bulk_load` wrap the whole load in ONE transaction (one durability
+// event), so compare those against `bulk_load_grouped` below (ForgeDB's #170
+// transaction path), not against this. Kept only to measure the fsync-bound
+// per-row write ceiling deliberately; do not read it as "ForgeDB bulk load".
 fn bench_bulk_load(c: &mut Criterion) {
     let mut group = c.benchmark_group("forgedb/bulk_load_posts");
     group.sample_size(10);
@@ -224,22 +230,25 @@ fn bench_reads(c: &mut Criterion) {
 }
 
 // --- Scenario 7: filtered scan + aggregate + top-N ---------------------------
-// The columnar-scan path. ForgeDB's honest scan is the generated narrow
-// `__scan_all()` (decodes only the filterable/sortable columns, not the full
-// record — the #160 list path), then, for the top-N, materialize ONLY the page.
-// This is the scenario a columnar analytical engine (DuckDB) is built to win.
+// The columnar-scan path. For the aggregate, ForgeDB reads ONLY the queried
+// columns via a declared `@projection(agg: views, published)` — the buffered
+// narrow scan `all_agg()` bulk-loads just those two fixed-width columns and never
+// touches the `title` `String` (#167/#168 column-pruning). This is the fair
+// apples-to-apples with a columnar engine that also reads only queried columns.
+// For the top-N, #169's ordered index serves the range directly.
 fn bench_scan(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
     let (db, _dir) = populated(&data);
 
-    // 7a: full scan + aggregate — COUNT + SUM(views) WHERE published.
+    // 7a: filtered aggregate — COUNT + SUM(views) WHERE published, over the
+    // projected (views, published) buffered scan — no `title` decode/alloc.
     c.benchmark_group("forgedb/scan_aggregate")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("sum_views_where_published", |b| {
             b.iter(|| {
                 let mut count = 0u64;
                 let mut sum = 0u128;
-                for row in db.post.__scan_all() {
+                for row in db.post.all_agg() {
                     if row.published {
                         count += 1;
                         sum += row.views as u128;
