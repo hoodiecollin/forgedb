@@ -353,6 +353,15 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 
 ## Performance-triage sweep — status
 
+> **Primary focus (2026-07-19): the storage-model experiment — epic #167**, design
+> `docs/proposals/storage-model-experiment.md`. It reframes the weak numbers below as four
+> independent axes (columnar = keep; append-only = the axis under test; durability policy +
+> generated-read-path quality = orthogonal confounds). **Phase 1** fixes the read-path confounds
+> as strict wins (#168 column-pruned scan, #169 ordered/range index, #160 narrow materialization,
+> #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant to the config
+> matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
+> below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.
+
 The seeded candidates below were promoted to the tracked sweep **#152** (12 children).
 **Landed:**
 
@@ -508,9 +517,10 @@ Feed these into the broader perf sweep (not fixes — triage items):
   (`Always`); there is no per-deployment knob to trade the barrier for `Periodic`/grouped
   commit the way SQLite exposes `synchronous`/`fullfsync`. Worth a design look for the
   write-throughput story.
-- **Group/batch commit.** Bulk load fsyncs per row (one — now two — barriers each). A
-  batched-commit path (one barrier per N rows) is the standard fix and would transform the
-  bulk-load numbers; currently absent.
+- **Group/batch commit (#170, Phase 1 of epic #167).** Bulk load fsyncs per row (one — now two —
+  barriers each). A batched-commit path (one barrier per N rows) is the standard fix and would
+  transform the bulk-load numbers; currently absent. Unlike `[storage].fsync=never` it keeps the
+  barrier guarantee while amortizing it.
 
 ## Expected shape of results (stated up front, so results don't read as cherry-picked)
 
