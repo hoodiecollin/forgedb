@@ -266,6 +266,29 @@ across many domains live in `examples/` — see `examples/README.md`.**
 
 ## Known issues / backlog
 
+- **▶ CURRENT PRIMARY FOCUS (set 2026-07-19) — Storage-model experiment: append-only vs in-place, MEASURED.**
+  Epic **#167**; design of record `docs/proposals/storage-model-experiment.md`; project memory `storage-model-focus`.
+  The benchmarks (`docs/BENCHMARKS.md`) make storage look like the cause of every weak number, but "storage"
+  conflates four independent axes: **columnar** (KEEP — smallest footprint; scan slowness is NOT inherent, DuckDB is
+  columnar and wins scans), **append-only mutation** (the axis under test — buys snapshots / lock-free readers /
+  MVCC / replica with no xmin/xmax; costs churn growth + version indirection), **durability policy** (fixed
+  `FsyncPolicy::Always` — the `F_FULLFSYNC` barrier is ~3.5 ms of the 3.95 ms write, orthogonal), and
+  **generated-read-path quality** (full materialization, hashmap-order scan, hash-only index — not a storage-model
+  question at all). The append-only mutation model lives in **codegen** (`crates/codegen/src/rust.rs`: `id_versions`,
+  superseding-version append, watermark resolution), NOT substrate — so in-place is a `GenConfig` codegen variant fed
+  through the existing benchmark config matrix (`benchmarks/configs/*.toml` + `make bench-matrix`), not a second
+  storage crate. **Two decisions LOCKED with the user (do not relitigate): (1) Phase 1 confound fixes FIRST, then
+  Phase 2 in-place experiment** — so both variants share read-path quality and Phase 2 measures the real
+  mutation-model cost, not a materialization confound; **(2) in-place scope = FIXED-WIDTH ONLY** (id/int/timestamp/
+  enum/decimal/bool — variable-width in-place is a heap/free-list, out of scope; variable columns stay append-with-GC).
+  **Phase 1** (strict wins, no feature loss, ship regardless): #168 column-pruned sequential `__scan` (fixes 32 ms
+  `scan_aggregate`), #169 ordered/range index kind (fixes range/top-N the hash index can't serve), #160 narrow
+  reverse-FK/live-query materialization, #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
+  `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
+  AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
+  `benchmarks/configs/in_place.toml` matrix wiring + a feature-support column. Likely honest outcome: Phase 1 closes
+  most of the gap and the measured append-only tax is small enough to keep it — Phase 2 is the evidence, not a
+  foregone redesign.
 - **Configurable runtime behavior — epic #126: BATCH 1 LANDED (generate-time Tier A/B), 2026-07-18.** The
   foundation + every knob baked into `database.rs` is done and e2e-proven. A `GenConfig`
   (`crates/codegen/src/config.rs`, schema-blind, `DEFAULT` byte-identical **except** the broker) is threaded via
