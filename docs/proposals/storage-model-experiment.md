@@ -84,9 +84,13 @@ experiment. Each is generated-code or index work over existing substrate.
   index), reader/snapshot `_at` ordered probes, f64/nullable ordered indexes, an explicit
   hash-vs-ordered directive override. The choice is automatic-by-type for now (ordered types gain
   range for free).
-- **P1c — narrow materialization on the residual read paths.** Reverse-FK getters and live-query
-  re-runs still full-materialize (the #160 residual, tracked there). Fold into the narrow-decode
-  path #160 already built for the list scan.
+- **P1c — narrow materialization on the residual read paths (#160). LANDED 2026-07-20.** The
+  **live-query re-run** now filters the narrow `__scan_all()` via the same `__<model>_scan_matches`
+  closed-set matcher and full-materializes only the matching rows (was `all()`-materialize every
+  column of every row per event). **Reverse-FK** getters were already optimal — index-served since
+  #100 (O(matches) `find_by_<fk>`), returning full records by contract. Not benchmark-visible (both
+  are WS/traversal paths, orthogonal to the storage-model comparison) but the explicit #160 residual
+  is now closed.
 - **P1d — group/batch commit.** Bulk load fsyncs per row (one barrier each). One barrier per N
   rows is the standard fix and would transform the bulk-load numbers. Orthogonal to layout;
   additive to the WAL path. (`[storage].fsync=never` already exists as the durability-trading

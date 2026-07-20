@@ -372,8 +372,9 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 > independent axes (columnar = keep; append-only = the axis under test; durability policy +
 > generated-read-path quality = orthogonal confounds). **Phase 1** fixes the read-path confounds
 > as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
-> **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; #160 narrow
-> materialization, #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant
+> **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; **#160 narrow
+> materialization — LANDED 2026-07-20** (live-query re-run narrowed; reverse-FK already index-served);
+> #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant
 > to the config
 > matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
 > below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.

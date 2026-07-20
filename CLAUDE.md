@@ -283,8 +283,9 @@ across many domains live in `examples/` — see `examples/README.md`.**
   enum/decimal/bool — variable-width in-place is a heap/free-list, out of scope; variable columns stay append-with-GC).
   **Phase 1** (strict wins, no feature loss, ship regardless): **#168 column-pruned sequential `__scan` — LANDED
   2026-07-20** (see the dedicated bullet below; `scan_aggregate` 32.4 ms → 568 µs, `scan_sort_top10` 32.6 ms → 763 µs),
-  **#169 ordered/range index kind — LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs, index-served), #160 narrow
-  reverse-FK/live-query materialization, #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
+  **#169 ordered/range index kind — LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs, index-served), **#160 narrow
+  reverse-FK/live-query materialization — LANDED 2026-07-20** (reverse-FK already index-served; live-query re-run
+  narrowed to materialize only matches), #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
   `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
   AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
   `benchmarks/configs/in_place.toml` matrix wiring + a feature-support column. Likely honest outcome: Phase 1 closes
@@ -406,8 +407,15 @@ across many domains live in `examples/` — see `examples/README.md`.**
       full-materializes **only the paginated page** (A); when the filter names an eligible single-indexed field it
       resolves candidates from that field's index (O(matches), fallback-on-parse-fail) instead of scanning (C). The
       narrow filter/sort reuse the SAME per-field checks/arms as `_event_matches`/`_apply_sort`. `?as_of` list keeps
-      the full-record path. Guard `test_rust_generation_list_scan_narrow`. Still full-materializing: reverse-FK
-      getters + live-query re-runs (documented #160 follow-up).
+      the full-record path. Guard `test_rust_generation_list_scan_narrow`. **#160 follow-ups LANDED 2026-07-20:**
+      (1) the **live-query re-run** (`/live-query/<model>` WS, #62-B) no longer `all()`-materializes every column of
+      every row on each event — it filters the narrow `__scan_all()` via the SAME `__<model>_scan_matches` closed-set
+      matcher and full-`get()`s **only the matching rows** (a real win for a selective subscription; a broad filter
+      still materializes its whole matching set — a different problem, #83 coalescing). Change-detection + membership
+      are unchanged (typed `_record_changed`, #84). (2) **reverse-FK getters** (`user_posts`) are already optimal —
+      index-served since #100 (O(matches) `find_by_<fk>` probe) returning full records by contract (no narrowing
+      possible without a projected `_card` variant, which #113 already provides on demand). Guards
+      `test_api_generation_live_query` + `test_api_generation_list_endpoint`; api+db compile-checked.
     - **Secondary indexes + `find_by_*` / `get_by_*` probes.** Each indexed scalar field gets an in-memory
       `value-key → {id}` map (`<field>_index`), maintained like `id_to_row`: **after** the #89 WAL commit boundary
       on insert (add), update (remove-old + add-new — superseding-version aware, #66), delete (drop); **rebuilt on
