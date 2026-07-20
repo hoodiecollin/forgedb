@@ -285,8 +285,9 @@ across many domains live in `examples/` — see `examples/README.md`.**
   2026-07-20** (see the dedicated bullet below; `scan_aggregate` 32.4 ms → 568 µs, `scan_sort_top10` 32.6 ms → 763 µs),
   **#169 ordered/range index kind — LANDED 2026-07-20** (`scan_sort_top10` 763 µs → 37 µs, index-served), **#160 narrow
   reverse-FK/live-query materialization — LANDED 2026-07-20** (reverse-FK already index-served; live-query re-run
-  narrowed to materialize only matches), **#170 group/batch commit — LANDED 2026-07-20** (`bulk_load` 50.7 s → 5.5 s /
-  14.8 s → 107 ms via one barrier per transaction). **Phase 1 of #167 is COMPLETE.** **Phase 2** (filed now Phase 1 has
+  narrowed to materialize only matches), **#170 group/batch commit — LANDED 2026-07-20** (`bulk_load_grouped`
+  50.7 s → **0.37 s** / 14.8 s → **0.11 s** via one barrier per transaction; re-measured 2026-07-20 clean — beats
+  SQLite 0.85 s and DuckDB 1.33 s at 10k). **Phase 1 of #167 is COMPLETE.** **Phase 2** (filed now Phase 1 has
   landed; run past
   `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
   AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
@@ -313,10 +314,19 @@ across many domains live in `examples/` — see `examples/README.md`.**
     `test_buffered_variable_column_matches_per_row_reads`, `test_tombstones_live_indices_filters_deleted`); runtime E2E
     `benchmarks/tests/scan_correctness.rs` (buffered scan == per-id reads under insert+update+delete+reopen churn with a
     multibyte string column) + exotic-type corpus compile (`banking-ledger` decimal, `food-delivery` enum+decimal+json,
-    `iot-sensors` u64-PK, `code-hosting`). **Residual (the read-path gap left to DuckDB/SQLite, NOT the mutation model):**
-    the scan still materializes the full narrow row (all filterable columns incl. a `title` `String` alloc) rather than
-    only the queried columns, and aggregates row-wise not vectorized; ordered range/top-N is still a (now fast) full scan
-    until #169's ordered index. **Publish gap:** extends the OPEN #153 storage gap — generated code now links the additive
+    `iot-sensors` u64-PK, `code-hosting`). **Column-pruning follow-up — LANDED 2026-07-20 (PM-gated PASS-WITH-CONSTRAINTS):**
+    the #168 residual "the scan still materializes the full narrow row (all filterable columns incl. a `title` `String`
+    alloc)" is now closed for declared projections — the buffered-scan emitter (`generate_buffered_scan_method`) is
+    column-subset-parameterized and each `@projection`'s live `all_<proj>()` runs it over ONLY the projected columns
+    (converging #113 projections with the #168 buffered path), so an aggregate over a `@projection(agg: views, published)`
+    gathers just those two fixed-width columns and never touches/allocs `title`. **Measured** `scan_aggregate` (the bench
+    now scans the projected `all_agg()`): **885 µs → 186 µs (~4.8×)** — now 2nd of the embedded four, ahead of SQLite
+    (352 µs) and redb (680 µs), behind only DuckDB's vectorized 92 µs. Guards: extended
+    `test_rust_generation_list_scan_narrow` + `test_rust_generation_column_projection` (both green); one shared decode
+    path preserved (`field_read_stmt`, PM constraint 2); no substrate/schema-language change. **Residual (still left to
+    DuckDB):** the fold is row-wise not vectorized (the 186 µs vs 92 µs), and a true vectorized aggregate would need a
+    declared aggregate directive — gated on a follow-up PM review per the gate; ordered range/top-N is served by #169's
+    index. **Publish gap:** extends the OPEN #153 storage gap — generated code now links the additive
     `gather_buffered`/`Buffered*Column`/`live_indices` API, bumping **`forgedb-storage-native`/`-web` 0.1.3 → 0.1.4**
     behind **`forgedb-storage` 0.2.2 → 0.2.3** (scaffold pin `= "0.2"` still resolves); publish with the #153 batch before
     an outside-repo `init → build` reclose.
@@ -350,9 +360,12 @@ across many domains live in `examples/` — see `examples/README.md`.**
     barrier** instead of one per row. **Durability-correct:** staged rows are invisible (past the watermark) and
     journal-driven recovery drops any uncommitted tail — a crash before the commit flush loses only not-yet-committed
     data; the commit flushes the staged WAL durable BEFORE writing the `_txn` journal commit marker. The committed
-    single-write `insert`/`update`/`delete` path is unchanged (keeps its per-op fsync). **Measured** (`bulk_load_grouped`):
-    1 000 rows 14.8 s → **107 ms (~138×)**, 10 000 rows 50.7 s → **5.5 s (~9×)** — the barrier is gone (per-row cost
-    ~10 ms → ~70 µs). **Residual:** a large *single* transaction's commit-time full reindex (`__reindex_committed`
+    single-write `insert`/`update`/`delete` path is unchanged (keeps its per-op fsync). **Measured** (`bulk_load_grouped`,
+    re-measured 2026-07-20 clean/idle machine): 1 000 rows 14.8 s → **108 ms (~137×)**, 10 000 rows 50.7 s → **373 ms
+    (~136×)** — the barrier is gone (per-row cost ~10 ms → ~37 µs), and grouped now **beats SQLite (851 ms) and DuckDB
+    (1.33 s) at 10k** (a full fair-durability run is in `docs/BENCHMARKS.md`). (The earlier "5.5 s" figure for grouped-10k
+    did not reproduce — the bench splits 2 000 users + 10 000 posts into two txns, so no single txn is large enough for
+    the reindex to dominate.) **Residual:** a large *single* transaction's commit-time full reindex (`__reindex_committed`
     rebuilds `id_to_row` + indexes, superlinear) dominates once the barrier is removed, so moderate batch sizes (e.g.
     1 000/txn) beat one giant txn; a delta-reindex at commit (the #161-B fold-only-new path) is the follow-up. **FK
     caveat:** a child's FK validates against COMMITTED rows, so a batch commits parents before children (two txns).

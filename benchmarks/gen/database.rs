@@ -1601,14 +1601,7 @@ impl UserStorage {
             created_at: created_at_value,
         })
     }
-    /// Narrow scan of every live row (#160/#168): the list endpoint's
-    /// filter/sort source, decoding only the filterable/sortable columns.
-    /// The page is full-materialized separately, so only `limit` rows pay a
-    /// full decode.
-    ///
-    /// #168: iterates live rows in physical order and bulk-loads each column
-    /// once (`gather_buffered`) instead of per-row positional reads — one
-    /// bulk read per column rather than a `read_*` syscall per row × column.
+    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
     pub fn __scan_all(&self) -> Vec<UserScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();
@@ -1969,6 +1962,13 @@ pub struct Post {
     #[schema(value_type = i64)]
     pub created_at: Timestamp,
     pub tags: (),
+}
+///Projection `agg` of `Post` (#113): materializes only PK + declared columns, leaving unselected columns unread.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PostAgg {
+    pub id: Uuid,
+    pub views: u64,
+    pub published: bool,
 }
 ///Internal narrow scan record for `Post` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
 #[derive(Debug, Clone)]
@@ -3779,6 +3779,142 @@ impl PostStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
+    /// Resolve the newest committed row of `id` as of `snap`
+    /// (#113 projection `_at` support; same logic as `get_at`).
+    /// #159: binary-search the id's version list, not an O(watermark) scan.
+    fn __proj_resolve_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        id: Uuid,
+    ) -> Option<usize> {
+        let watermark = snap.watermark();
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
+        }
+        Some(versions[pos - 1])
+    }
+    /// Row indices of every live record as of `snap` — the newest
+    /// version per id (#113; same logic as `all_at`).  #159: resolve via
+    /// each id's version list instead of two O(watermark) passes.
+    fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
+        let watermark = snap.watermark();
+        let mut rows = Vec::new();
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            rows.push(versions[pos - 1]);
+        }
+        rows
+    }
+    /// Read the projection at a physical row index (subset decode —
+    /// only the projected columns are touched).
+    pub fn read_agg_at(&self, row_index: usize) -> Option<PostAgg> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let views_value = self
+            .views_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let published_value = self
+            .published_col
+            .read_bool(row_index)
+            .expect("Failed to read from column");
+        Some(PostAgg {
+            id: id_value,
+            views: views_value,
+            published: published_value,
+        })
+    }
+    /// Fetch the projection for `id` from the live newest version.
+    pub fn get_agg(&self, id: Uuid) -> Option<PostAgg> {
+        let row_index = *self.id_to_row.get(&id)?;
+        self.read_agg_at(row_index)
+    }
+    ///Every live record as projection `agg` (#113 + #168): buffered narrow scan bulk-loading only the projected columns, skipping unselected ones entirely.
+    pub fn all_agg(&self) -> Vec<PostAgg> {
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __PostAggScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            views_col: forgedb_storage::BufferedFixedColumn,
+            published_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __PostAggScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            views_col: self
+                .views_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            published_col: self
+                .published_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let views_value = __bufs
+                .views_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let published_value = __bufs
+                .published_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            rows.push(PostAgg {
+                id: id_value,
+                views: views_value,
+                published: published_value,
+            });
+        }
+        rows
+    }
+    /// Snapshot-scoped projection point read (#56 + #113).
+    pub fn get_agg_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        id: Uuid,
+    ) -> Option<PostAgg> {
+        let row_index = self.__proj_resolve_at(snap, id)?;
+        self.read_agg_at(row_index)
+    }
+    /// Snapshot-scoped projection scan (#56 + #113).
+    pub fn all_agg_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<PostAgg> {
+        let mut records = Vec::new();
+        for row_index in self.__proj_live_rows_at(snap) {
+            if let Some(record) = self.read_agg_at(row_index) {
+                records.push(record);
+            }
+        }
+        records
+    }
     /// Narrow-decode the scan columns at a physical row (#160).  Used by the
     /// index-pushdown path (`__scan_by_*`), which resolves a handful of
     /// candidate rows and reads them individually.
@@ -3819,14 +3955,7 @@ impl PostStorage {
             created_at: created_at_value,
         })
     }
-    /// Narrow scan of every live row (#160/#168): the list endpoint's
-    /// filter/sort source, decoding only the filterable/sortable columns.
-    /// The page is full-materialized separately, so only `limit` rows pay a
-    /// full decode.
-    ///
-    /// #168: iterates live rows in physical order and bulk-loads each column
-    /// once (`gather_buffered`) instead of per-row positional reads — one
-    /// bulk read per column rather than a `read_*` syscall per row × column.
+    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
     pub fn __scan_all(&self) -> Vec<PostScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();
@@ -5521,14 +5650,7 @@ impl TagStorage {
             name: name_value,
         })
     }
-    /// Narrow scan of every live row (#160/#168): the list endpoint's
-    /// filter/sort source, decoding only the filterable/sortable columns.
-    /// The page is full-materialized separately, so only `limit` rows pay a
-    /// full decode.
-    ///
-    /// #168: iterates live rows in physical order and bulk-loads each column
-    /// once (`gather_buffered`) instead of per-row positional reads — one
-    /// bulk read per column rather than a `read_*` syscall per row × column.
+    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
     pub fn __scan_all(&self) -> Vec<TagScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();

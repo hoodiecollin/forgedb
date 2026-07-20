@@ -19,6 +19,12 @@ Post {
   author: *User
   created_at: +timestamp
   tags: [Tag]
+
+  // #167/#168: the aggregate scan reads only `views` + `published`.  A declared
+  // projection lets the buffered narrow scan bulk-load ONLY those fixed-width
+  // columns — never the `title` `String` — the column-pruning win (and the fair
+  // apples-to-apples with a columnar engine that reads only queried columns).
+  @projection(agg: views, published)
 }
 
 Tag {
