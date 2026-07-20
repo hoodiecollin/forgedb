@@ -4877,20 +4877,96 @@ impl RustGenerator {
             .map(|f| Self::generate_scan_by_index(f, &scan_ident))
             .collect();
 
+        // #168: the buffered column scan.  Each scan column is bulk-loaded once
+        // into an in-memory `Buffered{Fixed,Variable}Column` (a zero-copy mmap of
+        // the dense-prefix common case, else one gathered copy) and decoded from
+        // memory — replacing the per-row `read_*` syscall storm the hashmap-order
+        // `__scan_row_at` loop paid.  A local holder struct named `__bufs` carries
+        // each buffered column under its `<field>_col` name, so the SAME
+        // `field_read_stmt` decode bodies `read_at`/`__scan_row_at` use recompile
+        // against it verbatim (receiver `__bufs`, slot index) — no second decoder.
+        let buf_holder = format_ident!("__{}ScanBufs", model.name);
+        let mut buf_field_decls = Vec::new();
+        let mut buf_inits = Vec::new();
+        let mut buf_read_stmts = Vec::new();
+        let mut buf_field_values = Vec::new();
+        let recv = quote! { __bufs };
+        let slot = quote! { __slot };
+        for field in &scan_fields {
+            let fname = format_ident!("{}", field.name);
+            let col_ident = format_ident!("{}_col", field.name);
+            let buffered_ty = if Self::is_string_type(&field.field_type)
+                || Self::is_json_type(&field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedVariableColumn })
+            } else if Self::is_enum_type(&field.field_type)
+                || Self::is_fixed_size_type(&field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedFixedColumn })
+            } else {
+                None // relation/component: no storage column (see field_read_stmt None arm)
+            };
+            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot)) {
+                (Some(ty), Some((value_ident, stmt))) => {
+                    buf_field_decls.push(quote! { #col_ident: #ty });
+                    buf_inits.push(quote! {
+                        #col_ident: self.#col_ident.gather_buffered(&__rows)
+                            .expect("Failed to bulk-load scan column")
+                    });
+                    buf_read_stmts.push(stmt);
+                    buf_field_values.push(quote! { #fname: #value_ident });
+                }
+                _ => {
+                    // No storage column (virtual relation) — default, like
+                    // generate_row_read_body's None arm.
+                    let default_val = Self::default_for_unstored_field(&field.field_type);
+                    buf_field_values.push(quote! { #fname: #default_val });
+                }
+            }
+        }
+
         let methods = quote! {
-            /// Narrow-decode the scan columns at a physical row (#160).
+            /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+            /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+            /// candidate rows and reads them individually.
             fn __scan_row_at(&self, row_index: usize) -> Option<#scan_ident> {
                 #read_body
             }
-            /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-            /// source, decoding only the filterable/sortable columns.  The page is
-            /// full-materialized separately, so only `limit` rows pay a full decode.
+            /// Narrow scan of every live row (#160/#168): the list endpoint's
+            /// filter/sort source, decoding only the filterable/sortable columns.
+            /// The page is full-materialized separately, so only `limit` rows pay a
+            /// full decode.
+            ///
+            /// #168: iterates live rows in physical order and bulk-loads each column
+            /// once (`gather_buffered`) instead of per-row positional reads — one
+            /// bulk read per column rather than a `read_*` syscall per row × column.
             pub fn __scan_all(&self) -> Vec<#scan_ident> {
-                let mut rows = Vec::new();
-                for &__row in self.id_to_row.values() {
-                    if let Some(__r) = self.__scan_row_at(__row) {
-                        rows.push(__r);
-                    }
+                // Live rows in ascending physical order — so a churn-free table's
+                // selection is exactly the dense prefix `[0, n)` (zero-copy mmap
+                // bulk load) and column reads march forward.  `id_to_row` repoints
+                // a deleted id at its tombstoned row (delete appends a tombstone,
+                // #66), so filter those out with one bulk tombstone read — the
+                // liveness check `__scan_row_at` did per row.
+                let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+                __rows.sort_unstable();
+                let __rows = self.tombstones.live_indices(&__rows)
+                    .expect("Failed to read tombstone liveness");
+                let __n = __rows.len();
+
+                #[allow(non_camel_case_types)]
+                struct #buf_holder {
+                    #(#buf_field_decls,)*
+                }
+                let __bufs = #buf_holder {
+                    #(#buf_inits,)*
+                };
+
+                let mut rows = Vec::with_capacity(__n);
+                for __slot in 0..__n {
+                    #(#buf_read_stmts)*
+                    rows.push(#scan_ident {
+                        #(#buf_field_values),*
+                    });
                 }
                 rows
             }

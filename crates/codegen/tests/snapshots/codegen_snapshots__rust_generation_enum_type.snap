@@ -1525,7 +1525,9 @@ impl OrderStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<OrderScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -1566,15 +1568,84 @@ impl OrderStorage {
             prev_status: prev_status_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<OrderScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __OrderScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            label_col: forgedb_storage::BufferedVariableColumn,
+            status_col: forgedb_storage::BufferedFixedColumn,
+            prev_status_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __OrderScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            label_col: self
+                .label_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            status_col: self
+                .status_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            prev_status_col: self
+                .prev_status_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let label_value = __bufs
+                .label_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let status_value = {
+                let bytes = __bufs
+                    .status_col
+                    .read_bytes(__slot)
+                    .expect("Failed to read from column");
+                OrderStatus::__from_u8(bytes[0])
+            };
+            let prev_status_value = {
+                let bytes = __bufs
+                    .prev_status_col
+                    .read_bytes(__slot)
+                    .expect("Failed to read from column");
+                if bytes.first() == Some(&1u8) {
+                    Some(OrderStatus::__from_u8(bytes[1]))
+                } else {
+                    None
+                }
+            };
+            rows.push(OrderScanRow {
+                id: id_value,
+                label: label_value,
+                status: status_value,
+                prev_status: prev_status_value,
+            });
         }
         rows
     }

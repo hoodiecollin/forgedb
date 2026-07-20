@@ -1234,7 +1234,9 @@ impl ComplexModelStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<ComplexModelScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -1272,15 +1274,86 @@ impl ComplexModelStorage {
             created_at: created_at_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<ComplexModelScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __ComplexModelScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            count_col: forgedb_storage::BufferedFixedColumn,
+            price_col: forgedb_storage::BufferedFixedColumn,
+            active_col: forgedb_storage::BufferedFixedColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __ComplexModelScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            count_col: self
+                .count_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            price_col: self
+                .price_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            active_col: self
+                .active_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let count_value = __bufs
+                .count_col
+                .read_i64(__slot)
+                .expect("Failed to read from column");
+            let price_value = __bufs
+                .price_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let active_value = __bufs
+                .active_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            rows.push(ComplexModelScanRow {
+                id: id_value,
+                count: count_value,
+                price: price_value,
+                active: active_value,
+                created_at: created_at_value,
+            });
         }
         rows
     }

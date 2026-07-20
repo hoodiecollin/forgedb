@@ -1208,7 +1208,9 @@ impl PlaceStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
     fn __scan_row_at(&self, row_index: usize) -> Option<PlaceScanRow> {
         if self.tombstones.is_deleted(row_index).unwrap_or(true) {
             return None;
@@ -1238,15 +1240,68 @@ impl PlaceStorage {
             description: description_value,
         })
     }
-    /// Narrow scan of every live row (#160): the list endpoint's filter/sort
-    /// source, decoding only the filterable/sortable columns.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
+    /// Narrow scan of every live row (#160/#168): the list endpoint's
+    /// filter/sort source, decoding only the filterable/sortable columns.
+    /// The page is full-materialized separately, so only `limit` rows pay a
+    /// full decode.
+    ///
+    /// #168: iterates live rows in physical order and bulk-loads each column
+    /// once (`gather_buffered`) instead of per-row positional reads — one
+    /// bulk read per column rather than a `read_*` syscall per row × column.
     pub fn __scan_all(&self) -> Vec<PlaceScanRow> {
-        let mut rows = Vec::new();
-        for &__row in self.id_to_row.values() {
-            if let Some(__r) = self.__scan_row_at(__row) {
-                rows.push(__r);
-            }
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __PlaceScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+            description_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __PlaceScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            description_col: self
+                .description_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = __bufs
+                .id_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let name_value = __bufs
+                .name_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let description_value = {
+                let raw = __bufs
+                    .description_col
+                    .read_string(__slot)
+                    .expect("Failed to read string");
+                if raw.as_bytes().first() == Some(&1u8) {
+                    Some(raw[1..].to_string())
+                } else {
+                    None
+                }
+            };
+            rows.push(PlaceScanRow {
+                id: id_value,
+                name: name_value,
+                description: description_value,
+            });
         }
         rows
     }

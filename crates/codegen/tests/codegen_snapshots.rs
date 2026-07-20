@@ -379,6 +379,31 @@ User {
     // pushdown field — it falls through to the narrow scan.
     assert!(!db_code.contains("fn __scan_by_region("),
         "#160 C: a composite-only field is not a single-field pushdown");
+
+    // #168: `__scan_all` bulk-loads each scan column once and decodes from memory
+    // (physical row order + `gather_buffered`) instead of a per-row read syscall
+    // storm.  A churn-free selection is the dense prefix, so `export` aliases the
+    // column via mmap; deleted rows are excluded by one bulk tombstone read.
+    let scan_all = &db_code[db_code.find("pub fn __scan_all").unwrap()..];
+    let scan_all = &scan_all[..scan_all.find("fn __scan_by_").unwrap_or(scan_all.len())];
+    assert!(scan_all.contains("struct __UserScanBufs"),
+        "#168: local buffered-column holder emitted");
+    assert!(scan_all.contains(".gather_buffered(&__rows)"),
+        "#168: each scan column is bulk-loaded once");
+    assert!(scan_all.contains("forgedb_storage::BufferedFixedColumn"),
+        "#168: fixed scan columns use the buffered fixed reader");
+    assert!(scan_all.contains("forgedb_storage::BufferedVariableColumn"),
+        "#168: string scan columns use the buffered variable reader");
+    assert!(scan_all.contains("tombstones") && scan_all.contains(".live_indices(&__rows)"),
+        "#168: deleted rows excluded by one bulk tombstone read");
+    assert!(scan_all.contains("__rows.sort_unstable()"),
+        "#168: live rows iterated in physical (ascending) order");
+    // The buffered loop decodes by SLOT via the reused field_read_stmt bodies —
+    // never a per-row positional read against `self.<col>` inside the scan loop.
+    assert!(scan_all.contains("for __slot in 0..__n"),
+        "#168: buffered decode iterates slots");
+    assert!(!scan_all.contains("self.__scan_row_at"),
+        "#168: __scan_all no longer calls the per-row decoder in its loop");
 }
 
 #[test]
