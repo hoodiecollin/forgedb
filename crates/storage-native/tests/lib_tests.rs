@@ -1266,6 +1266,138 @@ fn test_fixed_column_export_aliases_dense_prefix_else_gathers() {
 }
 
 // ---------------------------------------------------------------------------
+// #168: bulk-buffered column scan primitives — gather_buffered +
+// BufferedFixedColumn / BufferedVariableColumn + Tombstones::live_indices.
+// The generated column scan bulk-loads each column once and decodes from
+// memory; these prove the buffered decode is byte-identical to the per-row
+// read_* path for both the dense-prefix (mmap) and reordered (gather) cases.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_buffered_fixed_column_matches_per_row_reads() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_fixed");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("bf.bin"), 8).unwrap();
+    for v in [10u64, 11, 12, 13, 14] {
+        col.append_u64(v).unwrap();
+    }
+
+    // Dense prefix [0, n): zero-copy mmap path. Slot i decodes to row i.
+    let buf = col.gather_buffered(&[0, 1, 2, 3, 4]).unwrap();
+    assert_eq!(buf.len(), 5);
+    for slot in 0..5usize {
+        assert_eq!(buf.read_u64(slot).unwrap(), col.read_u64(slot).unwrap());
+    }
+
+    // Reordered / non-prefix selection: gathered owned copy, slots follow the
+    // selection order.
+    let buf = col.gather_buffered(&[3, 0, 4]).unwrap();
+    assert_eq!(buf.len(), 3);
+    assert_eq!(buf.read_u64(0).unwrap(), 13);
+    assert_eq!(buf.read_u64(1).unwrap(), 10);
+    assert_eq!(buf.read_u64(2).unwrap(), 14);
+    // Slot past the selection → error, like a per-row out-of-bounds read.
+    assert!(buf.read_u64(3).is_err());
+
+    // Out-of-bounds index → error (mirrors export/gather).
+    assert!(col.gather_buffered(&[0, 5]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_buffered_fixed_column_all_read_kinds() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_kinds");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // uuid/bytes column (16-byte): read_uuid + read_bytes decode identically.
+    let mut ucol = FixedColumn::new(temp_dir.join("u.bin"), 16).unwrap();
+    ucol.append_uuid([1u8; 16]).unwrap();
+    ucol.append_uuid([2u8; 16]).unwrap();
+    let ubuf = ucol.gather_buffered(&[0, 1]).unwrap();
+    assert_eq!(ubuf.read_uuid(0).unwrap(), [1u8; 16]);
+    assert_eq!(ubuf.read_bytes(1).unwrap(), vec![2u8; 16]);
+
+    // bool column (1-byte).
+    let mut bcol = FixedColumn::new(temp_dir.join("b.bin"), 1).unwrap();
+    bcol.append_bool(true).unwrap();
+    bcol.append_bool(false).unwrap();
+    let bbuf = bcol.gather_buffered(&[0, 1]).unwrap();
+    assert!(bbuf.read_bool(0).unwrap());
+    assert!(!bbuf.read_bool(1).unwrap());
+
+    // i32 column (4-byte).
+    let mut icol = FixedColumn::new(temp_dir.join("i.bin"), 4).unwrap();
+    icol.append_i32(-7).unwrap();
+    let ibuf = icol.gather_buffered(&[0]).unwrap();
+    assert_eq!(ibuf.read_i32(0).unwrap(), -7);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_buffered_variable_column_matches_per_row_reads() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_var");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = VariableColumn::new(
+        temp_dir.join("v_data.bin"),
+        temp_dir.join("v_offsets.bin"),
+    )
+    .unwrap();
+    for s in ["", "a", "hello world", "unicode ✓ é"] {
+        col.append_string(s).unwrap();
+    }
+
+    // Dense selection: slot i == row i.
+    let buf = col.gather_buffered(&[0, 1, 2, 3]).unwrap();
+    assert_eq!(buf.len(), 4);
+    for slot in 0..4usize {
+        assert_eq!(buf.read_string(slot).unwrap(), col.read_string(slot).unwrap());
+    }
+
+    // Reordered selection preserves order.
+    let buf = col.gather_buffered(&[3, 0, 2]).unwrap();
+    assert_eq!(buf.read_string(0).unwrap(), "unicode ✓ é");
+    assert_eq!(buf.read_string(1).unwrap(), "");
+    assert_eq!(buf.read_string(2).unwrap(), "hello world");
+    assert!(buf.read_string(3).is_err());
+
+    // Out-of-bounds index → error.
+    assert!(col.gather_buffered(&[0, 4]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_tombstones_live_indices_filters_deleted() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_live_indices");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut t = Tombstones::new(temp_dir.join("t.bin")).unwrap();
+    // rows: 0 live, 1 deleted, 2 live, 3 deleted, 4 live
+    for deleted in [false, true, false, true, false] {
+        t.append(deleted).unwrap();
+    }
+
+    // Preserves order, drops deleted, agrees with is_deleted row-by-row.
+    assert_eq!(t.live_indices(&[0, 1, 2, 3, 4]).unwrap(), vec![0, 2, 4]);
+    assert_eq!(t.live_indices(&[4, 3, 2, 1, 0]).unwrap(), vec![4, 2, 0]);
+    // A row index past the committed count is treated as not-live (dropped),
+    // matching is_deleted(..).unwrap_or(true).
+    assert_eq!(t.live_indices(&[0, 9, 2]).unwrap(), vec![0, 2]);
+    // Empty input → empty output.
+    assert!(t.live_indices(&[]).unwrap().is_empty());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // #153: coalesced-barrier durability primitives (sync_to_drive + barrier).
 //
 // A checkpoint pushes every column to the drive cache (sync_to_drive, cheap,

@@ -52,6 +52,88 @@ impl ColumnExport {
     }
 }
 
+/// In-memory bulk-loaded selection of a [`FixedColumn`]'s rows (#168), the
+/// browser twin of the native
+/// [`BufferedFixedColumn`](../../forgedb_storage_native). Same slot-addressed
+/// `read_*` surface, so the shared generated column-scan code links unchanged.
+pub struct BufferedFixedColumn {
+    buf: ColumnExport,
+    value_size: usize,
+}
+
+impl BufferedFixedColumn {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buf.len() / self.value_size
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn slot_bytes(&self, slot: usize) -> io::Result<&[u8]> {
+        let start = slot * self.value_size;
+        let end = start + self.value_size;
+        self.buf.as_slice().get(start..end).ok_or_else(oob)
+    }
+
+    pub fn read_u32(&self, slot: usize) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.slot_bytes(slot)?[..4].try_into().unwrap()))
+    }
+    pub fn read_u64(&self, slot: usize) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.slot_bytes(slot)?[..8].try_into().unwrap()))
+    }
+    pub fn read_i32(&self, slot: usize) -> io::Result<i32> {
+        Ok(i32::from_le_bytes(self.slot_bytes(slot)?[..4].try_into().unwrap()))
+    }
+    pub fn read_i64(&self, slot: usize) -> io::Result<i64> {
+        Ok(i64::from_le_bytes(self.slot_bytes(slot)?[..8].try_into().unwrap()))
+    }
+    pub fn read_f64(&self, slot: usize) -> io::Result<f64> {
+        Ok(f64::from_le_bytes(self.slot_bytes(slot)?[..8].try_into().unwrap()))
+    }
+    pub fn read_bool(&self, slot: usize) -> io::Result<bool> {
+        Ok(self.slot_bytes(slot)?[0] != 0)
+    }
+    pub fn read_uuid(&self, slot: usize) -> io::Result<[u8; 16]> {
+        Ok(self.slot_bytes(slot)?[..16].try_into().unwrap())
+    }
+    pub fn read_timestamp(&self, slot: usize) -> io::Result<i64> {
+        Ok(i64::from_le_bytes(self.slot_bytes(slot)?[..8].try_into().unwrap()))
+    }
+    pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
+        Ok(self.slot_bytes(slot)?.to_vec())
+    }
+}
+
+/// In-memory bulk-loaded selection of a [`VariableColumn`]'s rows (#168), the
+/// browser twin of the native
+/// [`BufferedVariableColumn`](../../forgedb_storage_native).
+pub struct BufferedVariableColumn {
+    data: Vec<u8>,
+    slots: Vec<(u64, u64)>,
+}
+
+impl BufferedVariableColumn {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+        let &(offset, length) = self.slots.get(slot).ok_or_else(oob)?;
+        let start = offset as usize;
+        let end = start + length as usize;
+        let bytes = self.data.get(start..end).ok_or_else(oob)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
 /// Fixed-size column storage backed by an in-memory arena.
 pub struct FixedColumn {
     path: PathBuf,
@@ -203,6 +285,16 @@ impl FixedColumn {
         })
     }
 
+    /// Bulk-load the rows at `indices` into a [`BufferedFixedColumn`] (#168
+    /// column scan). Arena twin of the native
+    /// [`FixedColumn::gather_buffered`](../../forgedb_storage_native).
+    pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedFixedColumn> {
+        Ok(BufferedFixedColumn {
+            buf: self.export(indices)?,
+            value_size: self.value_size,
+        })
+    }
+
     /// No-op on this target — durability is at the [`crate::store::dump`] commit
     /// boundary, not per append.
     pub fn flush(&mut self) -> io::Result<()> {
@@ -312,6 +404,30 @@ impl VariableColumn {
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    /// Bulk-load the rows at `indices` into a [`BufferedVariableColumn`] (#168
+    /// column scan). Arena twin of the native
+    /// [`VariableColumn::gather_buffered`](../../forgedb_storage_native): reads
+    /// the whole offsets + data arenas once, then records each slot's
+    /// `(offset, length)` in selection order.
+    pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
+        let data: Vec<u8> =
+            store::with_bytes(&self.data_path, |b| Ok::<Vec<u8>, io::Error>(b.to_vec()))?;
+        let slots = store::with_bytes(&self.offsets_path, |b| {
+            let mut slots = Vec::with_capacity(indices.len());
+            for &index in indices {
+                let pos = index * 16;
+                if pos + 16 > b.len() {
+                    return Err(oob());
+                }
+                let offset = u64::from_le_bytes(b[pos..pos + 8].try_into().unwrap());
+                let length = u64::from_le_bytes(b[pos + 8..pos + 16].try_into().unwrap());
+                slots.push((offset, length));
+            }
+            Ok(slots)
+        })?;
+        Ok(BufferedVariableColumn { data, slots })
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
@@ -413,6 +529,19 @@ impl Tombstones {
                 return Err(oob());
             }
             Ok(b[index] != 0)
+        })
+    }
+
+    /// Return the subset of `rows` that are **not** tombstoned, preserving order
+    /// (#168 scan filter). Arena twin of the native
+    /// [`Tombstones::live_indices`](../../forgedb_storage_native).
+    pub fn live_indices(&self, rows: &[usize]) -> io::Result<Vec<usize>> {
+        store::with_bytes(&self.path, |b| {
+            Ok(rows
+                .iter()
+                .copied()
+                .filter(|&r| b.get(r) == Some(&0))
+                .collect())
         })
     }
 

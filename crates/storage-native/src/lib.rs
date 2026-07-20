@@ -453,6 +453,90 @@ impl ColumnExport {
     }
 }
 
+/// An in-memory bulk-loaded selection of a [`FixedColumn`]'s rows (#168).
+///
+/// Produced by [`FixedColumn::gather_buffered`], it holds one column's selected
+/// rows as a single contiguous buffer (a zero-copy `mmap` alias of the dense
+/// prefix, or a gathered copy) and exposes the **same** positional
+/// `read_*` accessors as [`FixedColumn`], addressed by **slot** (`0..n` over the
+/// selection order) rather than physical row index.  Decoding one column of a
+/// scan from this buffer costs no syscalls; it lets the generated column scan
+/// decode with the identical per-field logic it uses for per-row reads.
+///
+/// Errors mirror [`FixedColumn`]: an out-of-range slot returns `InvalidInput`.
+pub struct BufferedFixedColumn {
+    buf: ColumnExport,
+    value_size: usize,
+}
+
+impl BufferedFixedColumn {
+    /// Number of buffered slots (`indices.len()` from the gather).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buf.len() / self.value_size
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The `value_size`-wide bytes at `slot`, or `InvalidInput` if out of range.
+    fn slot_bytes(&self, slot: usize) -> io::Result<&[u8]> {
+        let start = slot * self.value_size;
+        let end = start + self.value_size;
+        self.buf.as_slice().get(start..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
+        })
+    }
+
+    pub fn read_u32(&self, slot: usize) -> io::Result<u32> {
+        let b = self.slot_bytes(slot)?;
+        Ok(u32::from_le_bytes(b[..4].try_into().unwrap()))
+    }
+
+    pub fn read_u64(&self, slot: usize) -> io::Result<u64> {
+        let b = self.slot_bytes(slot)?;
+        Ok(u64::from_le_bytes(b[..8].try_into().unwrap()))
+    }
+
+    pub fn read_i32(&self, slot: usize) -> io::Result<i32> {
+        let b = self.slot_bytes(slot)?;
+        Ok(i32::from_le_bytes(b[..4].try_into().unwrap()))
+    }
+
+    pub fn read_i64(&self, slot: usize) -> io::Result<i64> {
+        let b = self.slot_bytes(slot)?;
+        Ok(i64::from_le_bytes(b[..8].try_into().unwrap()))
+    }
+
+    pub fn read_f64(&self, slot: usize) -> io::Result<f64> {
+        let b = self.slot_bytes(slot)?;
+        Ok(f64::from_le_bytes(b[..8].try_into().unwrap()))
+    }
+
+    pub fn read_bool(&self, slot: usize) -> io::Result<bool> {
+        let b = self.slot_bytes(slot)?;
+        Ok(b[0] != 0)
+    }
+
+    pub fn read_uuid(&self, slot: usize) -> io::Result<[u8; 16]> {
+        let b = self.slot_bytes(slot)?;
+        Ok(b[..16].try_into().unwrap())
+    }
+
+    pub fn read_timestamp(&self, slot: usize) -> io::Result<i64> {
+        let b = self.slot_bytes(slot)?;
+        Ok(i64::from_le_bytes(b[..8].try_into().unwrap()))
+    }
+
+    /// The whole `value_size`-wide value at `slot` (for char(N) / struct /
+    /// fixed-array / nullable / optional-FK columns decoded via `read_unaligned`).
+    pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
+        Ok(self.slot_bytes(slot)?.to_vec())
+    }
+}
+
 pub struct FixedColumn {
     file: File,
     row_count: usize,
@@ -757,6 +841,31 @@ impl FixedColumn {
         Ok(ColumnExport::Owned(self.gather(indices)?))
     }
 
+    /// Bulk-load the physical rows at `indices` into an in-memory
+    /// [`BufferedFixedColumn`] whose positional `read_*(slot)` accessors read
+    /// from memory instead of the file (#168 column scan).
+    ///
+    /// This is the class-1 read primitive behind the generated column-pruned
+    /// sequential scan: a scan over `n` rows pays **one** bulk read per column
+    /// (a zero-copy `mmap` alias when `indices` is the dense prefix `[0, n)` — the
+    /// common append-only case — or a single gathered copy otherwise) rather than
+    /// `n` per-row `read_exact_at` syscalls.  `indices` are opaque physical row
+    /// positions the caller (generated code) computed from the live set; the
+    /// returned buffer's `read_*` methods take a **slot** `0..indices.len()`
+    /// indexing into that selection, in the given order.  Reads no field name,
+    /// type, or schema.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`export`](Self::export)'s errors (out-of-bounds index or a
+    /// failed `mmap`).
+    pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedFixedColumn> {
+        Ok(BufferedFixedColumn {
+            buf: self.export(indices)?,
+            value_size: self.value_size,
+        })
+    }
+
     /// Flush all pending writes to disk (fsync).
     ///
     /// This is the explicit durability checkpoint: after `flush()` returns `Ok(())`,
@@ -840,6 +949,44 @@ impl FixedColumn {
             file: self.file.try_clone()?,
             value_size: self.value_size,
         })
+    }
+}
+
+/// An in-memory bulk-loaded selection of a [`VariableColumn`]'s rows (#168).
+///
+/// Produced by [`VariableColumn::gather_buffered`]; holds the column's data
+/// bytes plus each selected slot's `(absolute offset, length)` so `read_string`
+/// slices from memory without a syscall.  The variable-column peer of
+/// [`BufferedFixedColumn`]: same `read_string` name as [`VariableColumn`],
+/// addressed by **slot** (`0..n` over the selection order).
+pub struct BufferedVariableColumn {
+    data: Vec<u8>,
+    // (absolute offset into `data`, byte length) per slot, in selection order.
+    slots: Vec<(u64, u64)>,
+}
+
+impl BufferedVariableColumn {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+        let &(offset, length) = self.slots.get(slot).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
+        })?;
+        let start = offset as usize;
+        let end = start + length as usize;
+        let bytes = self.data.get(start..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "Variable slot out of data bounds")
+        })?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -934,6 +1081,47 @@ impl VariableColumn {
         self.data_file.read_exact_at(&mut data, offset)?;
 
         String::from_utf8(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Bulk-load the rows at `indices` into an in-memory
+    /// [`BufferedVariableColumn`] whose `read_string(slot)` reads from memory
+    /// (#168 column scan).
+    ///
+    /// Reads the whole committed offsets index and data region **once each**
+    /// (two reads total), then records each selected slot's `(offset, length)`
+    /// in selection order — so a scan over `n` variable rows pays two bulk reads
+    /// instead of `3n` per-row `read_exact_at` syscalls (offset + length + data).
+    /// `indices` are opaque physical row positions; reads no schema.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if any index is `>= self.len()`; other errors come from the
+    /// underlying reads.
+    pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
+        // One bulk read of the whole committed offsets index (16 bytes/row).
+        let mut offsets = vec![0u8; self.row_count * 16];
+        if !offsets.is_empty() {
+            self.offsets_file.read_exact_at(&mut offsets, 0)?;
+        }
+        // One bulk read of the whole committed data region.
+        let mut data = vec![0u8; self.current_data_offset as usize];
+        if !data.is_empty() {
+            self.data_file.read_exact_at(&mut data, 0)?;
+        }
+        let mut slots = Vec::with_capacity(indices.len());
+        for &index in indices {
+            if index >= self.row_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Index out of bounds",
+                ));
+            }
+            let base = index * 16;
+            let offset = u64::from_le_bytes(offsets[base..base + 8].try_into().unwrap());
+            let length = u64::from_le_bytes(offsets[base + 8..base + 16].try_into().unwrap());
+            slots.push((offset, length));
+        }
+        Ok(BufferedVariableColumn { data, slots })
     }
 
     /// Flush all pending writes to disk (fsync both data and offsets files).
@@ -1084,6 +1272,24 @@ impl Tombstones {
         let mut buf = [0u8; 1];
         self.file.read_exact_at(&mut buf, index as u64)?;
         Ok(buf[0] != 0)
+    }
+
+    /// Return the subset of `rows` that are **not** tombstoned, preserving order
+    /// (#168 scan filter).  Reads the whole tombstone column **once** rather than
+    /// a per-row [`is_deleted`](Self::is_deleted) syscall — the bulk liveness
+    /// filter a column scan applies to its live-row selection.  A row index past
+    /// the committed count is treated as not-live (dropped), matching
+    /// `is_deleted(..).unwrap_or(true)`.
+    pub fn live_indices(&self, rows: &[usize]) -> io::Result<Vec<usize>> {
+        let mut bytes = vec![0u8; self.count];
+        if !bytes.is_empty() {
+            self.file.read_exact_at(&mut bytes, 0)?;
+        }
+        Ok(rows
+            .iter()
+            .copied()
+            .filter(|&r| bytes.get(r) == Some(&0))
+            .collect())
     }
 
     /// Flush all pending writes to disk (fsync).

@@ -27,8 +27,8 @@ pub mod store;
 pub mod persist;
 
 pub use columns::{
-    ColumnExport, FixedColumn, FixedColumnReader, Tombstones, TombstonesReader, VariableColumn,
-    VariableColumnReader,
+    BufferedFixedColumn, BufferedVariableColumn, ColumnExport, FixedColumn, FixedColumnReader,
+    Tombstones, TombstonesReader, VariableColumn, VariableColumnReader,
 };
 pub use dir_lock::DirLock;
 pub use manifest::{ColumnKind, ColumnMetadata, ColumnType, Manifest, RowAnchor};
