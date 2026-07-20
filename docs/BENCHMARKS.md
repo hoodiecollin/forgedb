@@ -158,31 +158,41 @@ scan`): **`scan_aggregate`** = `COUNT + SUM(views) WHERE published` (a full-tabl
 and **`scan_sort_top10`** = top-10 posts by `views (>= 50 000)` (a filtered scan + sort + page).
 This is the scenario the analytical/columnar engine is built to win.
 
-| scenario | ForgeDB | SQLite | redb | DuckDB |
-| --- | --- | --- | --- | --- |
-| `scan_aggregate` | 32.4 ms | 352 µs | 632 µs | **100 µs** |
-| `scan_sort_top10` | 32.6 ms | **4.35 µs** | 809 µs | 491 µs |
+| scenario | ForgeDB (pre-#168) | ForgeDB (#168) | SQLite | redb | DuckDB |
+| --- | --- | --- | --- | --- | --- |
+| `scan_aggregate` | 32.4 ms | **568 µs** | 352 µs | 632 µs | **100 µs** |
+| `scan_sort_top10` | 32.6 ms | **763 µs** | **4.35 µs** | 809 µs | 491 µs |
 
-Honest read — this is the scenario where **ForgeDB loses by 1–2 orders of magnitude**, and the
-reasons are structural, not incidental:
+**#168 landed the column-pruned sequential scan (2026-07-20), a ~56×/~42× win** — the
+`scan_aggregate` dropped 32.4 ms → 568 µs and `scan_sort_top10` 32.6 ms → 763 µs (now *faster*
+than redb's honest full scan, and within ~1.6× of SQLite on the aggregate). The mechanism (below)
+was measured, not asserted; the pre-#168 column keeps the honest starting point.
+
+The original diagnosis and what changed:
 
 1. **DuckDB wins the pure aggregate (100 µs)** — vectorized columnar aggregation over pruned
    columns, exactly as predicted for an analytical engine. (It is ~3× slower than SQLite on the
-   `top10` because that one is index-served for SQLite; see below.)
-2. **ForgeDB's generated scan (`__scan_all`) is ~90× slower than SQLite on the aggregate** for
-   two compounding reasons, both real: (a) **no column pruning** — the aggregate needs only
-   `views`+`published`, but the generated scan materializes the full narrow row *including a
-   `String` allocation for `title`* every row; (b) **row-wise, hashmap-order iteration** — it
-   walks `id_to_row.values()` (random row order) and reads every column positionally per row, so
-   it gets **neither** columnar sequential-read locality **nor** row-store contiguity. Even vs
-   redb's honest full scan (which decodes a contiguous packed blob per row) ForgeDB is ~50×
-   slower. A column-pruned, sequential scan path is a clear optimization opportunity.
-3. **`scan_sort_top10`: SQLite's 4.35 µs is index-served, ForgeDB's 32.6 ms is a full scan.**
+   `top10` because that one is index-served for SQLite; see below.) ForgeDB is now ~5.7× off
+   DuckDB on the aggregate (was ~320×).
+2. **The 32 ms was ~80 000 per-row `read_*` syscalls in hashmap order, not a columnar-layout
+   penalty.** `__scan_all` walked `id_to_row.values()` (random order) and read every column
+   positionally per row (`pread` each) — neither columnar sequential locality nor row-store
+   contiguity, and the files were cache-hot so ordering alone barely helped (a physical-order sort
+   measured only −3%). **#168** iterates the live rows in physical order and **bulk-loads each
+   scan column once** (`FixedColumn::gather_buffered` / `VariableColumn::gather_buffered` — a
+   zero-copy `mmap` alias of the dense prefix in the churn-free common case, else one gathered
+   copy), decoding from memory via the *same* per-field decoder `read_at` uses (no second decode
+   path). One bulk `Tombstones::live_indices` read replaces the per-row liveness check. Result:
+   two bulk reads per column instead of a syscall per row × column. **Residual vs DuckDB/SQLite:**
+   the scan still materializes the full narrow row (id + all filterable columns, incl. a `title`
+   `String` alloc) rather than only the queried columns, and aggregates row-wise rather than
+   vectorized — the remaining gap is that, not the mutation model.
+3. **`scan_sort_top10`: SQLite's 4.35 µs is still index-served; ForgeDB's 763 µs is a full scan.**
    SQLite has a B-tree `idx_post_views`, so `WHERE views >= T ORDER BY views DESC LIMIT 10` is an
    ordered range scan + limit (O(10)). ForgeDB *also* declares `views: ^u64`, but its index is a
-   **hash** (exact-match only) — it cannot serve an ordered range/top-N, so it full-scans. This is
-   the B-tree-vs-hash tradeoff made concrete (redb, with no `views` index at all, full-scans at
-   809 µs — ~40× faster than ForgeDB's full scan, again the wide-narrow-row + random-order cost).
+   **hash** (exact-match only) — it cannot serve an ordered range/top-N, so it full-scans (now a
+   *fast* full scan, ahead of redb's 809 µs, but still O(rows) not O(10)). Closing this is **#169**
+   (ordered/range index kind) — the B-tree-vs-hash tradeoff made a config/directive choice.
 
 The JS suite (2 000-post corpus, **no `views` index** in its DDL) adds the same two shapes for
 PGlite vs `bun:sqlite`:
@@ -357,8 +367,9 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 > `docs/proposals/storage-model-experiment.md`. It reframes the weak numbers below as four
 > independent axes (columnar = keep; append-only = the axis under test; durability policy +
 > generated-read-path quality = orthogonal confounds). **Phase 1** fixes the read-path confounds
-> as strict wins (#168 column-pruned scan, #169 ordered/range index, #160 narrow materialization,
-> #170 group-commit); **Phase 2** adds a fixed-width in-place `GenConfig` variant to the config
+> as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
+> #169 ordered/range index, #160 narrow materialization, #170 group-commit); **Phase 2** adds a
+> fixed-width in-place `GenConfig` variant to the config
 > matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
 > below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.
 

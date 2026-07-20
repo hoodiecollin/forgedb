@@ -281,14 +281,42 @@ across many domains live in `examples/` — see `examples/README.md`.**
   Phase 2 in-place experiment** — so both variants share read-path quality and Phase 2 measures the real
   mutation-model cost, not a materialization confound; **(2) in-place scope = FIXED-WIDTH ONLY** (id/int/timestamp/
   enum/decimal/bool — variable-width in-place is a heap/free-list, out of scope; variable columns stay append-with-GC).
-  **Phase 1** (strict wins, no feature loss, ship regardless): #168 column-pruned sequential `__scan` (fixes 32 ms
-  `scan_aggregate`), #169 ordered/range index kind (fixes range/top-N the hash index can't serve), #160 narrow
+  **Phase 1** (strict wins, no feature loss, ship regardless): **#168 column-pruned sequential `__scan` — LANDED
+  2026-07-20** (see the dedicated bullet below; `scan_aggregate` 32.4 ms → 568 µs, `scan_sort_top10` 32.6 ms → 763 µs),
+  #169 ordered/range index kind (fixes range/top-N the hash index can't serve), #160 narrow
   reverse-FK/live-query materialization, #170 group/batch commit. **Phase 2** (filed once Phase 1 lands; run past
   `forgedb-product-manager` first): `write_at` positional-overwrite substrate primitive + `GenConfig storage_model:
   AppendOnly|InPlace` variant (snapshot/`_at`/reader/replica compiled off for in-place — feature-loss is a RESULT) +
   `benchmarks/configs/in_place.toml` matrix wiring + a feature-support column. Likely honest outcome: Phase 1 closes
   most of the gap and the measured append-only tax is small enough to keep it — Phase 2 is the evidence, not a
   foregone redesign.
+  - **#168 column-pruned sequential `__scan` — LANDED 2026-07-20 (Phase 1a of #167, the biggest single lever).**
+    The generated narrow scan (`__scan_all`, the REST list filter/sort source + benchmark scan path) no longer walks
+    `id_to_row.values()` in hashmap order doing a per-row `read_*` **syscall per row × column** (~80k `pread`s for the
+    10k-post corpus — the 32 ms). It now (1) iterates the live rows in **physical (ascending) order** and (2)
+    **bulk-loads each scan column ONCE** via new substrate `FixedColumn::gather_buffered` / `VariableColumn::gather_buffered`
+    → `BufferedFixedColumn` / `BufferedVariableColumn` (a **zero-copy `mmap` alias** of the dense prefix in the churn-free
+    common case — reusing the existing `export()` path — else one gathered copy), decoding each slot from memory via the
+    **SAME `field_read_stmt` per-field decoder `read_at` uses** (a local `__<Model>ScanBufs` holder names each buffered
+    column `<field>_col`, so the decode bodies recompile verbatim — no second decode path, no drift). One bulk
+    `Tombstones::live_indices` read replaces the per-row liveness check (delete repoints `id_to_row` at the tombstoned
+    row, so the filter is load-bearing). **Measured:** `scan_aggregate` 32.4 ms → **568 µs** (~56×, now within ~1.6× of
+    SQLite), `scan_sort_top10` 32.6 ms → **763 µs** (~42×, now *ahead* of redb's 809 µs full scan); a physical-order sort
+    *alone* measured only −3%, confirming syscalls (not layout/ordering) were the cost. **No feature loss** (a strict
+    read-path win independent of the mutation model — no `forgedb-product-manager` gate). Substrate is **schema-agnostic**
+    (opaque row indices + slot math, reads no field/type). Guards: extended `test_rust_generation_list_scan_narrow`
+    (asserts the buffered holder + `gather_buffered` + `BufferedFixed/VariableColumn` + `live_indices` + physical sort +
+    no per-row `__scan_row_at` in the loop) + 4 storage-native unit tests (`test_buffered_fixed_column_*`,
+    `test_buffered_variable_column_matches_per_row_reads`, `test_tombstones_live_indices_filters_deleted`); runtime E2E
+    `benchmarks/tests/scan_correctness.rs` (buffered scan == per-id reads under insert+update+delete+reopen churn with a
+    multibyte string column) + exotic-type corpus compile (`banking-ledger` decimal, `food-delivery` enum+decimal+json,
+    `iot-sensors` u64-PK, `code-hosting`). **Residual (the read-path gap left to DuckDB/SQLite, NOT the mutation model):**
+    the scan still materializes the full narrow row (all filterable columns incl. a `title` `String` alloc) rather than
+    only the queried columns, and aggregates row-wise not vectorized; ordered range/top-N is still a (now fast) full scan
+    until #169's ordered index. **Publish gap:** extends the OPEN #153 storage gap — generated code now links the additive
+    `gather_buffered`/`Buffered*Column`/`live_indices` API, bumping **`forgedb-storage-native`/`-web` 0.1.3 → 0.1.4**
+    behind **`forgedb-storage` 0.2.2 → 0.2.3** (scaffold pin `= "0.2"` still resolves); publish with the #153 batch before
+    an outside-repo `init → build` reclose.
 - **Configurable runtime behavior — epic #126: BATCH 1 LANDED (generate-time Tier A/B), 2026-07-18.** The
   foundation + every knob baked into `database.rs` is done and e2e-proven. A `GenConfig`
   (`crates/codegen/src/config.rs`, schema-blind, `DEFAULT` byte-identical **except** the broker) is threaded via
@@ -644,14 +672,17 @@ across many domains live in `examples/` — see `examples/README.md`.**
   parsed-but-unenforced marker and `validate --implementations` is a no-op. Tracked as a
   backlog task; do **not** invent a stopgap impl-location convention (companion `.rs` stubs /
   `api://` refs) — it would be torn out when expressions land.
-- **`init → build` publish gap — OPEN again (#153, 2026-07-18):** the perf single-barrier checkpoint made
-  generated `database.rs` (`checkpoint()`/`commit()`/junction `checkpoint()`) call the NEW additive
-  `sync_to_drive()` + `barrier()` on the storage columns, so it now requires **`forgedb-storage-native 0.1.3`** +
-  **`forgedb-storage-web 0.1.3`** (no-op parity impls) behind the **`forgedb-storage 0.2.2`** facade (all bumped
-  in-tree; `storage-native 0.1.2` is the published ceiling). Additive (no format break), but must republish
-  `storage-native`/`storage-web`/`storage` before an outside-repo `init → build` resolves from crates.io — same
-  discipline as the wal/compaction bumps. The scaffold pin stays `forgedb-storage = "0.2"` (semver-compatible with
-  0.2.2). No other crate changed. #154 (M2M index) is pure generated code → **no** publish gap.
+- **`init → build` publish gap — OPEN (#153 + #168, 2026-07-18 / 2026-07-20):** two additive substrate batches the
+  generated `database.rs` now links, both unpublished: (a) **#153** — the perf single-barrier checkpoint made
+  `checkpoint()`/`commit()`/junction `checkpoint()` call the NEW `sync_to_drive()` + `barrier()` on the storage columns;
+  (b) **#168** — the column-pruned scan made `__scan_all` call the NEW `FixedColumn::gather_buffered` /
+  `VariableColumn::gather_buffered` (→ `BufferedFixedColumn` / `BufferedVariableColumn`) + `Tombstones::live_indices`.
+  Together they require **`forgedb-storage-native 0.1.4`** + **`forgedb-storage-web 0.1.4`** (parity impls) behind the
+  **`forgedb-storage 0.2.3`** facade (all bumped in-tree; `storage-native 0.1.2` is the published ceiling). All additive
+  (no format break), but must republish `storage-native`/`storage-web`/`storage` before an outside-repo `init → build`
+  resolves from crates.io — same discipline as the wal/compaction bumps. The scaffold pin stays
+  `forgedb-storage = "0.2"` (semver-compatible with 0.2.3). No other crate changed. #154 (M2M index) is pure generated
+  code → **no** publish gap.
 - **`init → build` publish gap — CLOSED again 2026-07-10 (#90):** Phase 2 made generated `api.rs` require
   **`forgedb-query-params 0.1.0`** (list-endpoint filter/sort/paginate parsing); it is **now published**, and the
   reclose is PROVEN by an outside-repo `forgedb init --template blog → generate rust+api → cargo build` resolving
