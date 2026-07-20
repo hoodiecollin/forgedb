@@ -126,6 +126,49 @@ fn bench_bulk_load(c: &mut Criterion) {
     group.finish();
 }
 
+// --- Scenario 1b: bulk load with GROUP COMMIT (#170) -------------------------
+// The same bulk load, but inside ONE transaction: staged rows use the buffered
+// (no-fsync) WAL append and pay a SINGLE `F_FULLFSYNC` barrier at commit instead
+// of one per row. This is the group-commit fix — durability preserved (the whole
+// transaction commits atomically or rolls back), barrier amortized across N rows.
+fn bench_bulk_load_grouped(c: &mut Criterion) {
+    let mut group = c.benchmark_group("forgedb/bulk_load_grouped");
+    group.sample_size(10);
+    for &n in &[1_000usize, 10_000] {
+        let data = dataset(n.min(2_000).max(1), n);
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(n), &data, |b, data| {
+            b.iter_batched(
+                || tempfile::tempdir().unwrap(),
+                |dir| {
+                    let mut db = Database::open_at(dir.path().to_path_buf());
+                    // Two transactions (not one): a post's `author` FK is validated
+                    // against COMMITTED rows, so the users must commit before the
+                    // posts that reference them. Two barriers for N rows — still the
+                    // group-commit win vs one barrier per row.
+                    db.transaction(|tx| {
+                        for u in &data.users {
+                            tx.create_user(user_of(u))?;
+                        }
+                        Ok(())
+                    })
+                    .expect("group-commit users");
+                    db.transaction(|tx| {
+                        for p in &data.posts {
+                            tx.create_post(post_of(p))?;
+                        }
+                        Ok(())
+                    })
+                    .expect("group-commit posts");
+                    dir // keep dir alive until after timing
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
 // --- Read / traversal scenarios (5, 6, 8, 10, 11) ----------------------------
 fn bench_reads(c: &mut Criterion) {
     let data = dataset(READ_USERS, READ_POSTS);
@@ -224,5 +267,12 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
+criterion_group!(
+    benches,
+    bench_insert,
+    bench_bulk_load,
+    bench_bulk_load_grouped,
+    bench_reads,
+    bench_scan
+);
 criterion_main!(benches);

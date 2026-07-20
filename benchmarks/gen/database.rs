@@ -1224,7 +1224,7 @@ impl UserStorage {
                 __wal_payload.push(1u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         } else {
@@ -1234,7 +1234,7 @@ impl UserStorage {
                 __wal_payload.push(0u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("User", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("User", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         }
@@ -3341,7 +3341,7 @@ impl PostStorage {
                 __wal_payload.push(1u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         } else {
@@ -3351,7 +3351,7 @@ impl PostStorage {
                 __wal_payload.push(0u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Post", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         }
@@ -5186,7 +5186,7 @@ impl TagStorage {
                 __wal_payload.push(1u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         } else {
@@ -5196,7 +5196,7 @@ impl TagStorage {
                 __wal_payload.push(0u8);
                 __wal_payload.extend_from_slice(&__record_json);
                 self.wal
-                    .write(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Tag", __wal_payload))
                     .expect("Failed to write WAL record");
             }
         }
