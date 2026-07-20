@@ -839,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "forgedb-storage-native",
  "forgedb-storage-web",
@@ -847,7 +847,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-native"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "forgedb-wal",
  "fs2",
@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-web"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "forgedb-wal",
  "js-sys",

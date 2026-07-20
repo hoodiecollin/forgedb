@@ -206,22 +206,19 @@ fn bench_scan(c: &mut Criterion) {
             });
         });
 
-    // 7b: filtered scan + sort + page — top-10 posts by views (>= threshold),
-    // materializing only the 10-row page (mirrors the generated #160 list path:
-    // narrow scan/filter/sort, then full-materialize only the returned page).
+    // 7b: top-10 posts by views (>= threshold), DESC. Since #169, `views: ^u64`
+    // carries an ORDERED index, so this is served by `find_by_views_range` — an
+    // O(offset+limit) ordered range walk + page materialize, the same shape as
+    // SQLite's index-served 4.35 µs (its `idx_post_views` B-tree). Before #169
+    // this was a full narrow scan + sort + truncate (kept below for reference).
     c.benchmark_group("forgedb/scan_sort_top10")
         .throughput(Throughput::Elements(READ_POSTS as u64))
         .bench_function("top10_by_views", |b| {
             b.iter(|| {
-                let mut rows: Vec<_> = db
+                // min=50_000, max=unbounded, descending, limit 10.
+                let page = db
                     .post
-                    .__scan_all()
-                    .into_iter()
-                    .filter(|r| r.views >= 50_000)
-                    .collect();
-                rows.sort_unstable_by(|a, b| b.views.cmp(&a.views));
-                rows.truncate(10);
-                let page: Vec<_> = rows.iter().map(|r| db.post.get(r.id)).collect();
+                    .find_by_views_range(Some(50_000), None, true, Some(10));
                 std::hint::black_box(page)
             });
         });

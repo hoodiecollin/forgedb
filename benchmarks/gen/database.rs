@@ -1996,6 +1996,9 @@ pub struct PostStorage {
     author_index: std::sync::Arc<
         std::collections::HashMap<String, std::collections::HashSet<Uuid>>,
     >,
+    views_ordered: std::sync::Arc<
+        std::collections::BTreeMap<u64, std::collections::BTreeSet<Uuid>>,
+    >,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -2053,6 +2056,7 @@ impl PostStorage {
                 .expect("Failed to create fixed column"),
             views_index: std::sync::Arc::new(std::collections::HashMap::new()),
             author_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            views_ordered: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("post/tombstones.bin"),
                 )
@@ -2147,6 +2151,12 @@ impl PostStorage {
                     .or_default()
                     .insert(__id);
             }
+            {
+                std::sync::Arc::make_mut(&mut db.views_ordered)
+                    .entry(views_value)
+                    .or_default()
+                    .insert(__id);
+            }
         }
         db.write_manifest(root);
         db
@@ -2183,6 +2193,7 @@ impl PostStorage {
                 .expect("Failed to create fixed column"),
             views_index: std::sync::Arc::new(std::collections::HashMap::new()),
             author_index: std::sync::Arc::new(std::collections::HashMap::new()),
+            views_ordered: std::sync::Arc::new(std::collections::BTreeMap::new()),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("post/tombstones.bin"),
                 )
@@ -2372,6 +2383,12 @@ impl PostStorage {
                 .or_default()
                 .insert(id);
         }
+        {
+            std::sync::Arc::make_mut(&mut self.views_ordered)
+                .entry(record.views)
+                .or_default()
+                .insert(id);
+        }
         if let Some(feed) = &self.changefeed {
             feed.emit("Post", row_index, forgedb_changefeed::ChangeKind::Inserted);
         }
@@ -2499,6 +2516,18 @@ impl PostStorage {
                     __map.remove(&__k);
                 }
             }
+            {
+                let __ok = { __old_rec.views };
+                let mut __empty = false;
+                let __map = std::sync::Arc::make_mut(&mut self.views_ordered);
+                if let Some(__set) = __map.get_mut(&__ok) {
+                    __set.remove(&(id));
+                    __empty = __set.is_empty();
+                }
+                if __empty {
+                    __map.remove(&__ok);
+                }
+            }
         }
         {
             let __k: String = {
@@ -2541,6 +2570,12 @@ impl PostStorage {
             };
             std::sync::Arc::make_mut(&mut self.author_index)
                 .entry(__k)
+                .or_default()
+                .insert(id);
+        }
+        {
+            std::sync::Arc::make_mut(&mut self.views_ordered)
+                .entry(record.views)
                 .or_default()
                 .insert(id);
         }
@@ -2679,6 +2714,18 @@ impl PostStorage {
             }
             if __empty {
                 __map.remove(&__k);
+            }
+        }
+        {
+            let __ok = { record.views };
+            let mut __empty = false;
+            let __map = std::sync::Arc::make_mut(&mut self.views_ordered);
+            if let Some(__set) = __map.get_mut(&__ok) {
+                __set.remove(&(id));
+                __empty = __set.is_empty();
+            }
+            if __empty {
+                __map.remove(&__ok);
             }
         }
         if let Some(feed) = &self.changefeed {
@@ -2904,6 +2951,7 @@ impl PostStorage {
             let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
             let __saved_views_index = std::sync::Arc::clone(&self.views_index);
             let __saved_author_index = std::sync::Arc::clone(&self.author_index);
+            let __saved_views_ordered = std::sync::Arc::clone(&self.views_ordered);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
@@ -2912,6 +2960,7 @@ impl PostStorage {
             self.broker = __broker;
             self.views_index = __saved_views_index;
             self.author_index = __saved_author_index;
+            self.views_ordered = __saved_views_ordered;
             let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
                 __old_id_to_row.len(),
             );
@@ -3036,6 +3085,12 @@ impl PostStorage {
                     .or_default()
                     .insert(__id);
             }
+            {
+                std::sync::Arc::make_mut(&mut self.views_ordered)
+                    .entry(views_value)
+                    .or_default()
+                    .insert(__id);
+            }
         }
     }
     /// Fold only the rows in `[from..row_count)` into the in-memory maps
@@ -3108,6 +3163,18 @@ impl PostStorage {
                         __map.remove(&__k);
                     }
                 }
+                {
+                    let __ok = { __old_rec.views };
+                    let mut __empty = false;
+                    let __map = std::sync::Arc::make_mut(&mut self.views_ordered);
+                    if let Some(__set) = __map.get_mut(&__ok) {
+                        __set.remove(&(id));
+                        __empty = __set.is_empty();
+                    }
+                    if __empty {
+                        __map.remove(&__ok);
+                    }
+                }
             }
             let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
             std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
@@ -3158,6 +3225,12 @@ impl PostStorage {
                         };
                         std::sync::Arc::make_mut(&mut self.author_index)
                             .entry(__k)
+                            .or_default()
+                            .insert(id);
+                    }
+                    {
+                        std::sync::Arc::make_mut(&mut self.views_ordered)
+                            .entry(__new_rec.views)
                             .or_default()
                             .insert(id);
                     }
@@ -3581,6 +3654,51 @@ impl PostStorage {
                 };
                 if __rk == __k {
                     __out.push(__rec);
+                }
+            }
+        }
+        __out
+    }
+    ///Ordered-index range + top-N over `Post`.`views` (#169): live records with the field in `[min, max]` (inclusive; `None` = unbounded), ordered by the field (descending if `descending`), capped at `limit` (`None` = all).  O(matches) via the BTreeMap, not a scan.
+    pub fn find_by_views_range(
+        &self,
+        min: Option<u64>,
+        max: Option<u64>,
+        descending: bool,
+        limit: Option<usize>,
+    ) -> Vec<Post> {
+        let __lo_v: Option<u64> = min.map(|__v| __v);
+        let __hi_v: Option<u64> = max.map(|__v| __v);
+        if let (Some(__l), Some(__h)) = (__lo_v.as_ref(), __hi_v.as_ref()) {
+            if __l > __h {
+                return Vec::new();
+            }
+        }
+        let __lo = match __lo_v {
+            Some(__v) => std::ops::Bound::Included(__v),
+            None => std::ops::Bound::Unbounded,
+        };
+        let __hi = match __hi_v {
+            Some(__v) => std::ops::Bound::Included(__v),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut __out: Vec<Post> = Vec::new();
+        let __iter: Box<
+            dyn Iterator<Item = (&u64, &std::collections::BTreeSet<Uuid>)> + '_,
+        > = if descending {
+            Box::new(self.views_ordered.range((__lo, __hi)).rev())
+        } else {
+            Box::new(self.views_ordered.range((__lo, __hi)))
+        };
+        'outer: for (_k, __ids) in __iter {
+            for &__id in __ids {
+                if let Some(__r) = self.get(__id) {
+                    __out.push(__r);
+                    if let Some(__n) = limit {
+                        if __out.len() >= __n {
+                            break 'outer;
+                        }
+                    }
                 }
             }
         }
