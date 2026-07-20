@@ -72,17 +72,21 @@ scans/aggregates** — the mirror image of the embedded row engines.
 | scenario | DuckDB | redb | ForgeDB (default) | note |
 | --- | --- | --- | --- | --- |
 | `insert_user` | 208 µs | 4.04 ms (barrier) / 0.50 ms | 3.95 ms (barrier) | DuckDB WAL, not a per-row `F_FULLFSYNC` barrier — not like-for-like |
-| `bulk_load/10000` | 1.39 s | 4.9 s (eventual) | 50.7 s per-insert / **5.5 s grouped (#170)** | per-row `F_FULLFSYNC`; #170 group commit amortizes it to one barrier per transaction (see below) |
-| `point_lookup` | 88.4 µs | 0.62 µs | 3.48 µs | **columnar point lookup is ~25× slower than ForgeDB, ~140× slower than redb** |
-| `index_probe` | 82.6 µs | 1.11 µs | 3.67 µs | same columnar point-op weakness |
-| `reverse_fk` | 106 µs | 3.94 µs | 36.9 µs | — |
+| `bulk_load/10000` (batched/grouped) | 1.33 s | 4.27 s (eventual) | **373 ms grouped (#170)** | fair like-for-like = DuckDB one-txn batch vs ForgeDB `bulk_load_grouped`; ForgeDB wins (do NOT compare against per-row `bulk_load_posts`, an anti-pattern) |
+| `point_lookup` | 87 µs | 0.97 µs | 3.71 µs | **columnar point lookup ~23× slower than ForgeDB, ~90× slower than redb** |
+| `index_probe` | 83 µs | 1.28 µs | 3.89 µs | same columnar point-op weakness |
+| `reverse_fk` | 106 µs | 4.72 µs | 39.6 µs | — |
 | `m2m` | 196 µs | 1.62 µs | 5.94 µs | — |
+| `scan_aggregate` (sum/filter) | **92 µs** | 680 µs | 186 µs (projected, #168) | DuckDB's vectorized win; ForgeDB 2nd after column-pruning (`@projection(agg: …)`), ahead of SQLite (352 µs) + redb |
+| `scan_sort_top10` | 469 µs | 801 µs | **45.9 µs** (index, #169) | ForgeDB's ordered index beats DuckDB's full scan here |
 
 Honest read: DuckDB loses every point/traversal micro-op here by 1–2 orders of magnitude —
 **as expected for a columnar analytical engine**; row-at-a-time access is not what it
-optimizes. The scenario where DuckDB should win — a filtered **scan + sort + aggregate**
-over the whole table (scenario 7) — is a cross-engine addition still TODO across all
-suites; adding it is where DuckDB's model pays off and is the honest place to show it.
+optimizes. The scenario DuckDB is built to win — a filtered **scan + aggregate** (scenario 7) —
+it does win (92 µs), but after #168 column-pruning (ForgeDB reads only the queried columns via
+a declared `@projection`) the gap is ~2×, not 10×, and ForgeDB now leads SQLite/redb on it; the
+residual is DuckDB's vectorized fold vs ForgeDB's row-wise fold. On the sorted top-N, ForgeDB's
+#169 ordered index (45.9 µs) beats DuckDB's full columnar scan.
 
 ### PostgreSQL (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
 
@@ -363,9 +367,12 @@ host (Apple SSD), per durable op:
    `F_FULLFSYNC` per row (the 50.7 s `bulk_load/10000`). Wrapping the load in a `db.transaction`
    makes staged rows use the **buffered** (no-fsync) WAL append and pay a **single** barrier at
    commit — durability preserved (the transaction commits atomically or rolls back; a crash before
-   the commit flush drops the staged rows via journal-driven recovery). Measured `bulk_load_grouped`:
-   **1 000 rows 14.8 s → 107 ms (~138×)**, **10 000 rows 50.7 s → 5.5 s (~9×)**. The barrier is gone
-   (per-row cost ~10 ms → ~70 µs); the residual for a *large* single transaction is the commit-time
+   the commit flush drops the staged rows via journal-driven recovery). Measured `bulk_load_grouped`
+   (re-measured 2026-07-20, clean/idle): **1 000 rows 14.8 s → 108 ms (~137×)**, **10 000 rows 50.7 s → 373 ms
+   (~136×)** — grouped now **beats SQLite (851 ms) and DuckDB (1.33 s) at 10k**. (An earlier "5.5 s" grouped-10k
+   figure did not reproduce; the bench splits 2 000 users + 10 000 posts into two txns, so no single txn is large
+   enough for the reindex to dominate.) The barrier is gone
+   (per-row cost ~10 ms → ~37 µs); the residual for a *large* single transaction is the commit-time
    full **reindex** (`__reindex_committed` rebuilds the model's `id_to_row` + indexes — superlinear
    in one giant txn), so moderate batch sizes (e.g. 1 000/txn) beat one all-in-one transaction. A
    delta-reindex at commit (the #161-B fold-only-new-rows path) is the follow-up. Note: a post's FK
@@ -374,8 +381,15 @@ host (Apple SSD), per durable op:
 
 **How the harness reports it now:** `sqlite/insert_user` runs at **both** durability
 levels — `default` (plain fsync, SQLite's out-of-box guarantee) and `fullfsync` (matched
-barrier) — so every write comparison is explicit about which durability it's at. ForgeDB
-is always at the barrier level (its fsync policy is fixed `Always`, no relaxed tier).
+barrier) — so every write comparison is explicit about which durability it's at. **ForgeDB
+also runs at both tiers:** the `matrix_bench` runs the write path at `default`
+(`FsyncPolicy::Always` = F_FULLFSYNC) **and** `fsync_never` (the relaxed tier), so ForgeDB
+has a matched row against every competitor's relaxed tier. **Fair-durability results (2026-07-20):**
+at the **barrier** tier ForgeDB `insert` (3.89 ms) ties SQLite-`fullfsync` (3.90 ms) and
+redb-`immediate` (3.94 ms); at the **relaxed** tier ForgeDB-`fsync_never` (**37 µs**) is the
+**fastest** of all — ahead of SQLite-`default` (64 µs), DuckDB (208 µs), and redb-`eventual`
+(331 µs). Never compare across tiers (the ForgeDB-`Always`-vs-DuckDB gap is barrier-vs-no-barrier,
+not an engine deficit).
 
 ## Performance-triage sweep — status
 
@@ -386,7 +400,8 @@ is always at the barrier level (its fsync policy is fixed `Always`, no relaxed t
 > as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
 > **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; **#160 narrow
 > materialization — LANDED 2026-07-20** (live-query re-run narrowed; reverse-FK already index-served);
-> **#170 group-commit — LANDED 2026-07-20, bulk_load 50.7 s → 5.5 s / 14.8 s → 107 ms**).
+> **#170 group-commit — LANDED 2026-07-20, `bulk_load_grouped` 50.7 s → 373 ms / 14.8 s → 108 ms**,
+> beating SQLite + DuckDB at 10k).
 > **Phase 1 of #167 is COMPLETE.** **Phase 2** adds a fixed-width in-place `GenConfig` variant
 > to the config
 > matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
