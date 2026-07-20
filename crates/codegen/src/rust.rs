@@ -5175,22 +5175,63 @@ impl RustGenerator {
             .map(|f| Self::generate_scan_by_index(f, &scan_ident))
             .collect();
 
-        // #168: the buffered column scan.  Each scan column is bulk-loaded once
-        // into an in-memory `Buffered{Fixed,Variable}Column` (a zero-copy mmap of
-        // the dense-prefix common case, else one gathered copy) and decoded from
-        // memory — replacing the per-row `read_*` syscall storm the hashmap-order
-        // `__scan_row_at` loop paid.  A local holder struct named `__bufs` carries
-        // each buffered column under its `<field>_col` name, so the SAME
-        // `field_read_stmt` decode bodies `read_at`/`__scan_row_at` use recompile
-        // against it verbatim (receiver `__bufs`, slot index) — no second decoder.
+        // #168: the buffered column scan — emitted by the shared
+        // `generate_buffered_scan_method` helper (over the full filterable
+        // `scan_fields` set here; over a projected subset for `@projection`), so
+        // there is one buffered-scan emitter and one decode path.
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
+        let scan_all_doc = "Narrow scan of every live row (#160/#168): the list \
+             endpoint's filter/sort source, decoding only the filterable/sortable \
+             columns.  The page is full-materialized separately, so only `limit` \
+             rows pay a full decode.  #168: iterates live rows in physical order \
+             and bulk-loads each column once (`gather_buffered`) instead of per-row \
+             positional reads.";
+        let scan_all_method = Self::generate_buffered_scan_method(
+            &scan_ident,
+            &format_ident!("__scan_all"),
+            &buf_holder,
+            &scan_fields,
+            scan_all_doc,
+        );
+
+        let methods = quote! {
+            /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+            /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+            /// candidate rows and reads them individually.
+            fn __scan_row_at(&self, row_index: usize) -> Option<#scan_ident> {
+                #read_body
+            }
+            #scan_all_method
+            #(#pushdown)*
+        };
+        (struct_tokens, methods)
+    }
+
+    /// Emit a buffered narrow-scan method (#168): bulk-load each column of
+    /// `fields` once via `gather_buffered` (a zero-copy `mmap` alias of the dense
+    /// prefix in the churn-free common case, else one gathered copy), then decode
+    /// every live row from memory through the SAME `field_read_stmt` path
+    /// (receiver `__bufs`, slot index) that `read_at` uses — no second decoder
+    /// (PM constraint 2).  Because only the columns of `fields` are gathered and
+    /// decoded, a projected subset skips the unselected columns entirely — no
+    /// `gather_buffered`, no per-row heap alloc for them (e.g. a `views,published`
+    /// aggregate scan never touches the `title` `String` column).  Reused by
+    /// `__scan_all` (the full filterable set) and each `@projection`'s live
+    /// `all_<proj>` (#113 + #168 converged).
+    fn generate_buffered_scan_method(
+        struct_ident: &proc_macro2::Ident,
+        method: &proc_macro2::Ident,
+        holder: &proc_macro2::Ident,
+        fields: &[&forgedb_parser::Field],
+        doc: &str,
+    ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
         let mut buf_read_stmts = Vec::new();
         let mut buf_field_values = Vec::new();
         let recv = quote! { __bufs };
         let slot = quote! { __slot };
-        for field in &scan_fields {
+        for field in fields {
             let fname = format_ident!("{}", field.name);
             let col_ident = format_ident!("{}_col", field.name);
             let buffered_ty = if Self::is_string_type(&field.field_type)
@@ -5223,28 +5264,14 @@ impl RustGenerator {
             }
         }
 
-        let methods = quote! {
-            /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-            /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-            /// candidate rows and reads them individually.
-            fn __scan_row_at(&self, row_index: usize) -> Option<#scan_ident> {
-                #read_body
-            }
-            /// Narrow scan of every live row (#160/#168): the list endpoint's
-            /// filter/sort source, decoding only the filterable/sortable columns.
-            /// The page is full-materialized separately, so only `limit` rows pay a
-            /// full decode.
-            ///
-            /// #168: iterates live rows in physical order and bulk-loads each column
-            /// once (`gather_buffered`) instead of per-row positional reads — one
-            /// bulk read per column rather than a `read_*` syscall per row × column.
-            pub fn __scan_all(&self) -> Vec<#scan_ident> {
+        quote! {
+            #[doc = #doc]
+            pub fn #method(&self) -> Vec<#struct_ident> {
                 // Live rows in ascending physical order — so a churn-free table's
                 // selection is exactly the dense prefix `[0, n)` (zero-copy mmap
                 // bulk load) and column reads march forward.  `id_to_row` repoints
                 // a deleted id at its tombstoned row (delete appends a tombstone,
-                // #66), so filter those out with one bulk tombstone read — the
-                // liveness check `__scan_row_at` did per row.
+                // #66), so filter those out with one bulk tombstone read.
                 let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
                 __rows.sort_unstable();
                 let __rows = self.tombstones.live_indices(&__rows)
@@ -5252,25 +5279,23 @@ impl RustGenerator {
                 let __n = __rows.len();
 
                 #[allow(non_camel_case_types)]
-                struct #buf_holder {
+                struct #holder {
                     #(#buf_field_decls,)*
                 }
-                let __bufs = #buf_holder {
+                let __bufs = #holder {
                     #(#buf_inits,)*
                 };
 
                 let mut rows = Vec::with_capacity(__n);
                 for __slot in 0..__n {
                     #(#buf_read_stmts)*
-                    rows.push(#scan_ident {
+                    rows.push(#struct_ident {
                         #(#buf_field_values),*
                     });
                 }
                 rows
             }
-            #(#pushdown)*
-        };
-        (struct_tokens, methods)
+        }
     }
 
     /// #160 (C): the single-field indexed columns a list `?field=value` filter can
@@ -5486,6 +5511,22 @@ impl RustGenerator {
                 proj.name, model.name
             );
 
+            // The live `all_<proj>` is a buffered narrow scan (#113 + #168
+            // converged): it bulk-loads only the projected columns, so an
+            // aggregate/scan over a projection never touches — nor allocates for —
+            // the unselected columns (the column-pruning win).  The snapshot
+            // `_at` variant keeps the per-row resolver (it clamps to a watermark).
+            let proj_holder =
+                format_ident!("__{}{}ScanBufs", model.name, Self::projection_pascal(&proj.name));
+            let all_doc = format!(
+                "Every live record as projection `{}` (#113 + #168): buffered \
+                 narrow scan bulk-loading only the projected columns, skipping \
+                 unselected ones entirely.",
+                proj.name
+            );
+            let all_method =
+                Self::generate_buffered_scan_method(&proj_ident, &all_name, &proj_holder, &fields, &all_doc);
+
             structs.push(quote! {
                 #[doc = #doc]
                 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -5507,16 +5548,7 @@ impl RustGenerator {
                     self.#read_at_name(row_index)
                 }
 
-                /// Every live record as this projection (order follows the id map).
-                pub fn #all_name(&self) -> Vec<#proj_ident> {
-                    let mut records = Vec::new();
-                    for id in self.id_to_row.keys() {
-                        if let Some(record) = self.#get_name(*id) {
-                            records.push(record);
-                        }
-                    }
-                    records
-                }
+                #all_method
 
                 /// Snapshot-scoped projection point read (#56 + #113).
                 pub fn #get_at_name(&self, snap: &forgedb_storage::Snapshot, id: #id_type) -> Option<#proj_ident> {
