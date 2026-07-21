@@ -5,7 +5,7 @@
 //! # Overview
 //!
 //! This crate provides parsing capabilities for ForgeDB's schema language, converting
-//! schema files (.fdb) into an Abstract Syntax Tree (AST) that can be used for code
+//! schema files (.forge) into an Abstract Syntax Tree (AST) that can be used for code
 //! generation, validation, and other tooling.
 //!
 //! # Architecture
@@ -20,8 +20,8 @@
 //! - **Models** - Database table definitions with fields and constraints
 //! - **Structs** - Composite data types
 //! - **Fields** - Typed fields with constraints
-//! - **Constraints** - Validation rules (@unique, @email, @min, etc.)
-//! - **Relations** - Model relationships (hasMany, belongsTo)
+//! - **Constraints** - Directive validation rules (@email, @min, @pattern, etc.)
+//! - **Relations** - Model relationships (`[Model]`, `*Model`, `?Model`)
 //! - **Components** - Reusable field groups with protocols
 //!
 //! # Examples
@@ -105,8 +105,8 @@
 //! - [`Struct`] - Composite data type
 //! - [`Field`] - Field definition with type and constraints
 //! - [`FieldType`] - Field data type (i32, string, uuid, etc.)
-//! - [`Constraint`] - Validation constraint (@unique, @email, etc.)
-//! - [`RelationType`] - Relationship type (hasMany, belongsTo)
+//! - [`Constraint`] - Directive constraint (@email, @min, @pattern, etc.)
+//! - [`RelationType`] - Relationship type (OneToMany, RequiredReference, OptionalReference, ManyToMany)
 //!
 //! ## Component System
 //!
@@ -117,31 +117,38 @@
 //!
 //! ## Field Types
 //!
-//! - **Integers**: `i32`, `i64`
+//! - **Integers**: `u32`, `u64`, `i32`, `i64`
 //! - **Floating Point**: `f64`
+//! - **Decimal**: `decimal` (exact fixed-point)
 //! - **Boolean**: `bool`
-//! - **String**: `string`
+//! - **String**: `string`, `char(N)` (fixed-size)
+//! - **JSON**: `json`
 //! - **UUID**: `uuid`
 //! - **Timestamp**: `timestamp`
+//! - **Enum**: a bare reference to a top-level `enum Name { ... }`
 //!
-//! ## Field Modifiers
+//! ## Field Modifiers (prefix, before the type)
 //!
-//! - `+field` - Primary key
-//! - `field?` - Optional (nullable)
+//! - `+field` - Auto-generate (`u32`/`u64`/`uuid`/`timestamp` only)
+//! - `&field` - Unique
+//! - `^field` - Index
+//! - `?field` / `field?` - Optional (nullable)
 //!
-//! ## Constraints
+//! ## Constraints (directives)
 //!
-//! - `@unique` - Unique constraint
 //! - `@email` - Email validation
-//! - `@min(value)` - Minimum value
-//! - `@max(value)` - Maximum value
-//! - `@length(min, max)` - String length constraint
+//! - `@min(value)` / `@max(value)` - Numeric bounds
+//! - `@length(n)` / `@length(min, max)` - String length
+//! - `@pattern("…")` / `@regex("…")` - Regex validation (enforced)
+//! - `@index(a, b)` - Composite index (model level)
+//! - `@on_delete(restrict|cascade|set_null)` - FK on-delete policy (enforced)
 //!
 //! ## Relations
 //!
-//! - `hasMany(Model)` - One-to-many relationship
-//! - `belongsTo(Model)` - Many-to-one relationship
-//! - `hasOne(Model)` - One-to-one relationship
+//! - `[Model]` - One-to-many
+//! - `*Model` - Required reference (belongs-to)
+//! - `?Model` - Optional reference
+//! - `[Model]` on both sides - Many-to-many
 //!
 //! # Error Handling
 //!

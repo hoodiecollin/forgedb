@@ -27,6 +27,16 @@
 //! 3. **Constraint Validation** - Check constraint parameters and applicability
 //! 4. **HTTP Validation** - Validate HTTP endpoints and status codes (if applicable)
 //!
+//! > **Current state (see epic #173):** steps 2–3 above describe the *intended*
+//! > home for schema validation, but they are **not** yet the live path. The CLI
+//! > `validate` command (`src/commands/validate.rs`) currently performs its schema
+//! > checks inline and does not route through the `validate_*` helpers here, and
+//! > the parser runs its own relation/struct-reference checks. These helpers carry
+//! > positions (`Position`) but are consumed today only by `forgedb-migrations` and
+//! > the parser's `Position` re-export. Consolidating these three implementations
+//! > into one positioned, reusable API — shared by the CLI and the LSP — is tracked
+//! > in epic #173 (WS2b).
+//!
 //! # Examples
 //!
 //! ## Schema Validation
