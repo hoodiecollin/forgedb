@@ -2,7 +2,7 @@
 # Rust workflows use cargo directly (see CLAUDE.md). JS/desktop workflows for the
 # inspector app are wrapped here so they never require cd-ing into apps/inspector.
 
-BUN := /Users/collin/.bun/bin/bun
+BUN := $(shell command -v bun 2>/dev/null || echo "$(HOME)/.bun/bin/bun")
 INSPECTOR := apps/inspector
 WEBSITE := apps/website
 BENCH := benchmarks/Cargo.toml
