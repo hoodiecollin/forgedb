@@ -30,7 +30,7 @@ These are checked by the generated code and reject a bad write.
 | Directive | Args | Applies to | Effect |
 |-----------|------|-----------|--------|
 | `@min` | `(number)` | numeric | Value must be ≥ the minimum, else **422** |
-| `@max` | `(number)` | numeric + string | Value / length must be ≤ the maximum, else **422** |
+| `@max` | `(number)` | numeric | Value must be ≤ the maximum, else **422**. *Not* a string-length check — use `@length` for strings |
 | `@length` | `(count)` or `(min, max)` | `string` | String length must be in range, else **422** |
 | `@email` | none | `string` | Must be a valid email, else **422** |
 | `@url` | none | `string` | Must be a valid URL, else **422** |

@@ -16,7 +16,12 @@ This builds the CLI from the published crates and drops `forgedb` in
 
 ## 2. Prebuilt binaries (no toolchain needed)
 
-Each tagged release attaches prebuilt binaries to its
+> **Not available yet.** No release has been tagged, so there are no prebuilt
+> binaries to download. Until the first tag is pushed, use `cargo install`
+> (above) or `--git` (below). The release workflow that will attach these assets
+> is authored but not yet exercised.
+
+Once a release is tagged, it attaches prebuilt binaries to its
 [GitHub Release](https://github.com/hoodiecollin/forgedb/releases). Download the
 archive for your platform, extract, and put `forgedb` on your `PATH`:
 

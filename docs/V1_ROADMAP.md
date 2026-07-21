@@ -27,10 +27,11 @@ already there, squarely inside the generator-identity model.
 
 The five phases that close the core have all shipped:
 
-- **Phase 1 — Durable write path.** The generated write path journals to the WAL, fsyncs, and
-  recovers on reopen (torn-tail truncate + idempotent replay); a `DirLock` refuses a second writer.
-  A bounded WAL (checkpoint → truncate) keeps reopen from replaying whole history. A `kill -9`
-  writer-stress test loses zero acked rows.
+- **Phase 1 — Durable write path.** The generated write path journals the row blob to the WAL and
+  fsyncs it *before* touching any column, and recovers on reopen (torn-tail truncate + idempotent
+  replay); a `DirLock` refuses a second writer. A bounded WAL (checkpoint → truncate) keeps reopen
+  from replaying whole history. By construction an acknowledged row survives a mid-write crash;
+  the WAL flush/reopen/torn-tail behavior is unit-tested in `crates/wal/tests`.
 - **Phase 2 — Readable database.** A real list endpoint with filter/sort/pagination (over the
   schema-agnostic `query-params` substrate and a generated closed-set matcher/comparator), plus
   generated secondary indexes with `find_by_*`/`get_by_*` probes over scalar, nullable, foreign-key,

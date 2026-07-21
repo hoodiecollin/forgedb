@@ -100,20 +100,23 @@ Directives are validation and configuration rules applied with the `@` symbol:
 User {
   email: string @email
   age: u32 @min(0) @max(150)
-  password: string @min(8) @private
+  password: string @length(8, 128)
   website: string @url
   name: string @length(1, 100)
 }
 ```
 
-Common directives:
-- `@email` - Email format validation
-- `@url` - URL format validation
-- `@min(n)` - Minimum value (numbers) or length (strings)
-- `@max(n)` - Maximum value (numbers) or length (strings)
-- `@length(min, max)` - String length range
-- `@private` - Exclude from API responses
-- `@unique` - Alternative to `&` symbol
+Common **enforced** directives (a violation rejects the write with HTTP 422):
+- `@email` - Email format validation (`string`)
+- `@url` - URL format validation (`string`)
+- `@min(n)` - Minimum value — **numeric fields only**
+- `@max(n)` - Maximum value — **numeric fields only** (not a string-length check; use `@length`)
+- `@length(min, max)` - String length range (`string`)
+- `@pattern("…")` / `@regex("…")` - Regex match (`string`)
+
+Uniqueness is the `&` modifier, not a directive. (`@min`/`@max` on a string,
+or any unrecognized directive such as `@private`/`@unique`, parses but is a
+no-op — it enforces nothing.)
 
 #### Computed Fields
 

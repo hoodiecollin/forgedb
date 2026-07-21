@@ -113,10 +113,14 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 - No WebSocket/subscription client in the generated SDK yet (REST only).
 
 ### Query capability
-- Indexes are **hash exact-match** — they answer `field = value` (and
-  `a = ? AND b = ?` for composites), **not** prefix or range queries (a B-tree
-  feature, out of scope). Many-to-many junction lookups are still linear scans
-  (and `unlink_<a>_<b>` / `unlink_all_*` is likewise a linear junction scan).
+- Scalar / foreign-key / composite (`@index(a, b)`) indexes are **hash
+  exact-match** — they answer `field = value` and `a = ? AND b = ?`, not prefix
+  matches. Ordered-eligible fields (`u32`/`u64`/`i32`/`i64`/`timestamp`/`decimal`)
+  *additionally* get a parallel ordered (BTreeMap) index, so they answer range and
+  top-N queries via `find_by_<field>_range(min, max, descending, limit)`. Still
+  deferred: prefix search, `f64`/nullable ordered indexes, and the snapshot (`_at`)
+  ordered form. Many-to-many junction lookups are still linear scans (and
+  `unlink_<a>_<b>` / `unlink_all_*` is likewise a linear junction scan).
 
 ### Operations
 - `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text

@@ -73,9 +73,9 @@ field: +uuid?               // auto-gen + nullable
 
 ### Example
 ```
-username: +&^string @min(3) @max(50)    // auto-gen, unique, indexed string with constraints
-age: ?i32 @min(0)                       // optional int with min constraint
-status: string? @default("pending")     // nullable string with default
+username: &^string @length(3, 50)       // unique, indexed string with a length constraint
+age: ?i32 @min(0) @max(120)             // optional int with numeric range constraints
+status: string? @default("pending")     // nullable string with a default (semantic-only marker)
 ```
 
 ---
@@ -192,18 +192,18 @@ Order {
 
 | Directive              | Arguments       | Field Types         | Meaning                                  | Example                      |
 |------------------------|-----------------|---------------------|------------------------------------------|------------------------------|
-| `@min`                 | `(number)`      | Numeric (u32, i32, f64, etc.) | Minimum value constraint | `age: u32 @min(13)` |
-| `@max`                 | `(number)`      | Numeric + string    | Maximum value or max length              | `age: u32 @max(150)` |
-| `@email`               | (none)          | `string`            | Email format validation (semantic)       | `email: string @email` |
-| `@pattern`             | `(regex_string)` | `string`            | Regex pattern matching (semantic)        | `phone: string @pattern("^[0-9]+$")` |
-| `@length`              | `(min, max)` or `(count)` | `string` | String length constraint (semantic) | `name: string @length(1, 100)` |
-| `@default`             | `(value)`       | Any                 | Default value on insert (semantic)       | `status: string @default("pending")` |
-| `@url`                 | (none)          | `string`            | URL format validation (semantic)         | `website: string @url` |
-| `@regex`               | `(pattern)`     | `string`            | Regex validation (semantic)              | `handle: string @regex("[a-z]+")` |
-| `@index`               | (none)          | Any                 | Create field-level index (semantic)      | `slug: string @index` |
-| `@computed`            | (none)          | Any                 | Field is computed (read-only) | `full_name: string @computed` |
-| `@fulltext`            | (none)          | `string`            | Full-text search index       | `content: string @fulltext` |
-| `@materialized`        | (none)          | Any                 | Field is materialized        | `count: u32 @materialized` |
+| `@min`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Minimum value — **ENFORCED** (violation → 422)     | `age: u32 @min(13)` |
+| `@max`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Maximum value — **ENFORCED** (violation → 422). *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)` |
+| `@length`              | `(min, max)` or `(count)` | `string`  | String length — **ENFORCED** (violation → 422)     | `name: string @length(1, 100)` |
+| `@email`               | (none)          | `string`            | Email format — **ENFORCED** (violation → 422)      | `email: string @email` |
+| `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
+| `@pattern`             | `(regex_string)` | `string`           | Regex match — **ENFORCED** via `LazyLock<Regex>` (non-match → 422) | `phone: string @pattern("^[0-9]+$")` |
+| `@regex`               | `(pattern)`     | `string`            | Regex match — **ENFORCED** (non-match → 422)       | `handle: string @regex("[a-z]+")` |
+| `@default`             | `(value)`       | Any                 | Default value on insert — **semantic-only marker** (not applied at write) | `status: string @default("pending")` |
+| `@index`               | (none)          | Any                 | Field-level index marker — **semantic-only**; use the `^` modifier to actually index | `slug: string @index` |
+| `@computed`            | (none)          | Any                 | Field is computed (read-only) — **semantic-only marker** | `full_name: string @computed` |
+| `@fulltext`            | (none)          | `string`            | Full-text search — **semantic-only marker** (no index generated) | `content: string @fulltext` |
+| `@materialized`        | (none)          | Any                 | Field is materialized — **semantic-only marker**   | `count: u32 @materialized` |
 | `@relations`           | `(*)` or `(field_list)` | Component refs | Component relation inclusion | `card: tsx://path @relations(*)` |
 | `@on_delete`           | `(restrict\|cascade\|set_null)` | FK field (`*Target`/`?Target`) | On-delete referential policy (ENFORCED, delete semantics) | `author: *User @on_delete(cascade)` |
 
@@ -536,7 +536,7 @@ User {
 ```
 Post {
   id: +uuid
-  title: &string @max(200)
+  title: &string @length(1, 200)
   slug: ^&string @length(1, 100)
   content: string
   view_count: u32 @default(0)
@@ -549,7 +549,7 @@ Post {
 
 Comment {
   id: +uuid
-  text: &string @max(1000)
+  text: &string @length(1, 1000)
   author: *User
   post: *Post
   created_at: +timestamp
@@ -625,13 +625,13 @@ The rules in this reference are grounded in the parser and validator source:
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
 3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, char(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
-5. **Constraints** (`@min`, `@max`, `@email`, `@length`, `@default`, `@regex`, `@url`) are parsed but semantic validation is deferred
+5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only), `@length` (string length), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable
 8. **Components:** `field: tsx://path @relations(*)`
 9. **Comments:** Only `//` line comments work; `/* */` blocks will **fail to parse**
-10. **DO NOT use:** `~`, `text`, block comments, `@on_delete`, duplicate names, non-PascalCase models, non-snake_case fields
+10. **DO NOT use:** `~` (auto-update), `text` (use `string`), block comments `/* */`, duplicate names, non-PascalCase models, non-snake_case fields
 
 **Verify with:**
 ```bash

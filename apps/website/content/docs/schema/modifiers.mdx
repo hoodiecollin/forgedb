@@ -59,10 +59,11 @@ index behavior.
 
 ## Combining prefix modifiers
 
-Any combination of `+`, `&`, `^` is allowed, in any order, all before the type:
+Any combination of `+`, `&`, `^` is allowed, in any order, all before the type —
+subject to the rule above that `+` is valid only on `u32`/`u64`/`uuid`/`timestamp`:
 
 ```forge
-username: +&^string       // (rare, but parses) auto-gen + unique + indexed
+id: +&^uuid               // auto-gen + unique + indexed (auto-gen needs an eligible type)
 email: ^&string @email    // indexed + unique
 ```
 

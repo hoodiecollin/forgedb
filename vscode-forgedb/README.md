@@ -87,7 +87,7 @@ Real-time ForgeDB status indicator showing:
 User {
   id: +uuid
   email: ^&string @email
-  username: ^&string @min(3) @max(50)
+  username: ^&string @length(3, 50)
   password_hash: &string
   full_name: string?
   avatar_url: string? @url
@@ -111,7 +111,7 @@ User {
 // Blog post with full-text search
 Post {
   id: +uuid
-  title: &string @max(200) @fulltext
+  title: &string @length(1, 200) @fulltext
   slug: ^&string
   content: &string @fulltext
   published: bool @default(false)
@@ -164,17 +164,17 @@ struct Address {
 **Validation:**
 - `@email` - Email format validation
 - `@url` - URL format validation
-- `@min(n)` - Minimum value/length
-- `@max(n)` - Maximum value/length
-- `@regex(pattern)` - Regex validation
-- `@length(n)` - Exact length
+- `@min(n)` - Minimum value (numeric fields only)
+- `@max(n)` - Maximum value (numeric fields only; use `@length` for strings)
+- `@pattern("…")` / `@regex("…")` - Regex validation (string)
+- `@length(n)` or `@length(min, max)` - String length
 
-**Database:**
-- `@unique` - Unique constraint
-- `@index(field1, field2, ...)` - Composite index
-- `@fulltext` - Full-text search index
-- `@default(value)` - Default value
-- `@on_delete(cascade|set_null|restrict)` - Foreign key behavior
+**Database / relations:**
+- `&` modifier - Unique constraint (uniqueness is a modifier, not a `@unique` directive)
+- `@index(field1, field2, ...)` - Composite index (model level)
+- `@fulltext` - Full-text search marker (**semantic-only**; no index generated)
+- `@default(value)` - Default value marker (**semantic-only**; not applied at write)
+- `@on_delete(cascade|set_null|restrict)` - Foreign-key on-delete policy (enforced)
 
 **Computed:**
 - `@computed` - Computed field (not stored)

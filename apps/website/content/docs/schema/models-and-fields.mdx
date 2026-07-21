@@ -71,9 +71,10 @@ field: +uuid?     // auto-generate + nullable
 ```
 
 <Callout type="tip" title="Read the sigils left to right">
-`username: +&^string @min(3)` reads as: auto-generate, unique, indexed `string`, with a
-minimum-length constraint. Prefix sigils modify the type; postfix `?` and `@`-directives
-follow it.
+`username: &^string @length(3, 50)` reads as: unique, indexed `string`, with a length
+constraint. Prefix sigils modify the type; postfix `?` and `@`-directives follow it. (`+`
+would need an auto-gen-eligible type — `u32`/`u64`/`uuid`/`timestamp` — so it can't go on a
+`string`.)
 </Callout>
 
 ## Worked field examples
