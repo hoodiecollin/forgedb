@@ -1,0 +1,227 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "ForgeDB Schema",
+  "scopeName": "source.forge",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#struct-definition" },
+    { "include": "#model-definition" },
+    { "include": "#field-definition" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.forge",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.forge",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "struct-definition": {
+      "patterns": [
+        {
+          "match": "\\b(struct)\\s+([A-Z][a-zA-Z0-9]*)\\s*(\\{)",
+          "captures": {
+            "1": { "name": "keyword.control.struct.forge" },
+            "2": { "name": "entity.name.type.struct.forge" },
+            "3": { "name": "punctuation.definition.block.begin.forge" }
+          }
+        }
+      ]
+    },
+    "model-definition": {
+      "patterns": [
+        {
+          "match": "\\b([A-Z][a-zA-Z0-9]*)\\s*(\\{)",
+          "captures": {
+            "1": { "name": "entity.name.type.model.forge" },
+            "2": { "name": "punctuation.definition.block.begin.forge" }
+          }
+        }
+      ]
+    },
+    "field-definition": {
+      "patterns": [
+        { "include": "#field-name" },
+        { "include": "#field-symbols" },
+        { "include": "#field-types" },
+        { "include": "#directives" },
+        { "include": "#relations" },
+        { "include": "#component-references" }
+      ]
+    },
+    "field-name": {
+      "patterns": [
+        {
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*:",
+          "captures": {
+            "1": { "name": "variable.other.field.forge" }
+          }
+        }
+      ]
+    },
+    "field-symbols": {
+      "patterns": [
+        {
+          "name": "keyword.operator.primary-key.forge",
+          "match": "\\+"
+        },
+        {
+          "name": "keyword.operator.unique.forge",
+          "match": "\\^"
+        },
+        {
+          "name": "keyword.operator.reference.forge",
+          "match": "\\*"
+        },
+        {
+          "name": "keyword.operator.required.forge",
+          "match": "&"
+        },
+        {
+          "name": "keyword.operator.optional.forge",
+          "match": "\\?"
+        }
+      ]
+    },
+    "field-types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.forge",
+          "match": "\\b(string|bool|u8|u16|u32|u64|i8|i16|i32|i64|f32|f64|uuid|timestamp)\\b"
+        },
+        {
+          "name": "support.type.char.forge",
+          "match": "\\bchar\\s*\\(\\s*\\d+\\s*\\)"
+        },
+        {
+          "name": "support.type.array.forge",
+          "match": "\\[([A-Z][a-zA-Z0-9]*)\\]",
+          "captures": {
+            "1": { "name": "entity.name.type.reference.forge" }
+          }
+        },
+        {
+          "name": "support.type.fixed-array.forge",
+          "match": "\\[([a-zA-Z0-9]+);\\s*(\\d+)\\]",
+          "captures": {
+            "1": { "name": "support.type.primitive.forge" },
+            "2": { "name": "constant.numeric.forge" }
+          }
+        }
+      ]
+    },
+    "directives": {
+      "patterns": [
+        {
+          "name": "entity.name.tag.directive.forge",
+          "match": "@[a-zA-Z_][a-zA-Z0-9_]*"
+        },
+        {
+          "name": "entity.name.tag.directive.validation.forge",
+          "match": "@(email|url|min|max|regex|length|unique|index|computed|fulltext|default|on_delete)"
+        },
+        {
+          "match": "@([a-zA-Z_][a-zA-Z0-9_]*)\\s*\\(([^)]*)\\)",
+          "captures": {
+            "1": { "name": "entity.name.tag.directive.forge" },
+            "2": { "name": "string.unquoted.directive-arg.forge" }
+          }
+        }
+      ]
+    },
+    "relations": {
+      "patterns": [
+        {
+          "match": "\\*([A-Z][a-zA-Z0-9]*)",
+          "captures": {
+            "1": { "name": "entity.name.type.reference.relation.forge" }
+          }
+        },
+        {
+          "match": "\\[([A-Z][a-zA-Z0-9]*)\\]",
+          "captures": {
+            "1": { "name": "entity.name.type.reference.array.forge" }
+          }
+        }
+      ]
+    },
+    "component-references": {
+      "patterns": [
+        {
+          "name": "string.other.component.forge",
+          "match": "(tsx|jsx|api)://[a-zA-Z0-9_/.-]+"
+        },
+        {
+          "match": "@relations\\s*\\(([^)]*)\\)",
+          "captures": {
+            "1": { "name": "variable.parameter.relations.forge" }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.forge",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.forge",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.forge",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.forge",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.forge",
+          "match": "\\b\\d+(\\.\\d+)?\\b"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.definition.block.begin.forge",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.definition.block.end.forge",
+          "match": "\\}"
+        },
+        {
+          "name": "punctuation.separator.forge",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.separator.array.forge",
+          "match": "\\[|\\]"
+        },
+        {
+          "name": "punctuation.separator.comma.forge",
+          "match": ","
+        }
+      ]
+    }
+  }
+}
