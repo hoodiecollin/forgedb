@@ -1,0 +1,80 @@
+---
+title: "Backup & restore"
+description: "Lock-free full-snapshot backup and restore over a ForgeDB data directory, with an overview of offset-based point-in-time recovery and honest notes on what is deferred."
+---
+
+Because ForgeDB storage is append-only under a row-count anchor, a backup is a **lock-free
+byte snapshot** — no MVCC, no per-row versions, and no need to pause writes. The `forgedb`
+CLI is schema-blind: it snapshots and restores opaque bytes over the `forgedb-backup`
+substrate, reading each model/junction directory's `manifest.json` and column files, never
+your `.forge` schema.
+
+## Full snapshots
+
+```bash
+# Full lock-free snapshot of a data directory.
+forgedb backup create --data-dir ./data --output ./backups/base.forgebk
+
+# Restore into a fresh directory (refuses a non-empty target without --overwrite).
+forgedb backup restore ./backups/base.forgebk --output ./restored
+
+# Inspect an archive header without materializing it.
+forgedb backup list ./backups/base.forgebk --json
+```
+
+### Why it's lock-free and torn-row-free
+
+Each model/junction directory's manifest names a **row anchor** (the appended-last file:
+`tombstones.bin` at 1 byte/row for models, the right-side column for junctions). The
+committed row count `N` is that anchor's length, and every column's committed byte length is a
+pure function of `N` plus the fixed layout. So the snapshot reads exactly the committed prefix
+of each column, and any concurrent append **past** the watermark is simply excluded — you can
+never capture a torn row. Restore is atomic (temp dir + rename).
+
+<Callout type="note" title="Restore reopens a durable directory">
+A restored directory is opened by your generated app exactly like any other data directory —
+recovery, the single-writer lock, and checkpointing all apply. See
+[Durability & crash safety](/docs/features/durability/).
+</Callout>
+
+## Point-in-time recovery (offset-based)
+
+Point-in-time recovery is "restore a base, then replay a globally-ordered change log up to a
+chosen point." The replay needs the generated per-model decode/apply logic, so — like
+`checkpoint` and `compact` — the **replay step runs inside your generated app**, not the CLI.
+
+Every archive header records a `base_offset`: the durable replication broker
+(`_replication.log`) end offset at snapshot time. PITR restores the base, places the retained
+broker log alongside it, then replays frames `(base_offset .. target]` through the generated
+`apply_frame` (the same path the [browser read-replica](/docs/features/browser-replica/)
+uses):
+
+```rust
+let mut db = Database::open_at("./recovered".into());
+let applied = db.recover_to(o_base, target)?;   // applies frames (o_base .. target]
+```
+
+Replay detaches the broker so replayed mutations don't re-record, applies only frames in range
+by their opaque broker offset (never a decoded field), then `commit()`s. Recovery is
+idempotent by id — the superseding-version append means `get`/`all` still resolve one record
+per id even if a boundary frame were re-applied.
+
+<Callout type="warning" title="Retain the replication log for PITR">
+The backup archive does **not** include `_replication.log` (it is a root-level file, not a
+model directory). Retain it separately, back to the oldest base you intend to recover to — a
+base at `O_base` plus a log covering `(O_base .. target]` is the complete recovery input.
+</Callout>
+
+## Limits
+
+- **Time-based recovery** ("recover to timestamp T") is not supported. Recovery is
+  **offset-based** only — it needs a timestamp on the persisted change frames, a substrate
+  change.
+- **Auto-prune** of the replication log is not wired to a retention window; pruning is manual,
+  and pruning below a base's offset makes that base unrecoverable.
+- PITR requires the broker-backed `open_at` path — a directory opened via the standalone
+  `Database::new()` path has no `_replication.log` and nothing to replay.
+- **Cloud backup targets, compression, and encryption** are not built. Backups are local byte
+  archives.
+- Junction (many-to-many) link crash recovery inherits the durable-write boundary: a torn
+  broker commit can duplicate a junction pair (append-only; traversal is latest-wins).

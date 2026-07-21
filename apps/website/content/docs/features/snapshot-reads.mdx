@@ -1,0 +1,70 @@
+---
+title: "Point-in-time reads"
+description: "Lock-free watermark snapshots and time-travel reads — generated get_at/all_at, REST ?as_of and /snapshot — with the honest note that the token is a row-count watermark, not a wall-clock instant."
+---
+
+ForgeDB gives you consistent point-in-time reads with **zero version machinery**. A snapshot
+is nothing more than a **row-count watermark**: because storage is append-only, reading "as of
+watermark W" means resolving the newest version of each id whose row index is below W. No
+`xmin`/`xmax`, no version chains — just a cutoff into an append-only log.
+
+## Watermark snapshots in generated Rust
+
+`Database::snapshot()` captures a `DatabaseSnapshot` — one watermark per model and junction,
+taken atomically on the single writer, so it is a clean commit boundary. Reads then resolve
+against that watermark:
+
+```rust
+let snap = db.snapshot();
+
+// Live reads see the newest versions.
+db.insert_post(Post { /* … */ })?;
+
+// Snapshot reads still see the state at capture time.
+let post = db.get_post_at(&snap, id);       // Option<Post> as of the snapshot
+let all_posts = db.all_post_at(&snap);      // Vec<Post> as of the snapshot
+```
+
+Snapshot isolation across mutation falls out for free: `get_at` / `all_at` resolve the newest
+version *within* the watermark per id, so a snapshot captured before an update or delete still
+resolves the old value. Index probes have `_at` variants too — see
+[Indexes](/docs/features/indexes/).
+
+## Point-in-time reads over REST
+
+The same watermark is exposed over the generated REST API so clients can time-travel:
+
+```bash
+# List a model as of a watermark:
+curl "http://localhost:8080/api/post?as_of=1200"
+
+# Get one record as of a watermark:
+curl "http://localhost:8080/api/post/<id>?as_of=1200"
+
+# Discover the current per-model watermarks:
+curl "http://localhost:8080/snapshot"
+# → { "watermarks": { "Post": 1450, "User": 320 } }
+```
+
+The `?as_of` branch swaps only the row source — it routes through the **same** generated
+filter/sort/paginate body as a live list, so there is no parallel handler. A non-numeric
+`as_of` is a 400. `/snapshot` is the read-side peer of `/metrics` in the unauthenticated ops
+routes (models only; junctions are deferred).
+
+<Callout type="warning" title="The token is a row-count watermark, not a wall-clock instant">
+`as_of` is an opaque `usize` row-count watermark, never a timestamp. There is no
+wall-clock-to-watermark index, so "as of 3pm yesterday" is not answerable — that is a
+separate, heavier feature. For offset-based recovery over the replication log, see
+[Backup & restore](/docs/features/backup-restore/).
+</Callout>
+
+## Limits
+
+- **Row-count watermark, not wall-clock.** No time-based ("as of timestamp T") reads.
+- **Epoch-scoped.** Watermarks are valid only within a compaction epoch — an in-process
+  `compact()` renumbers rows, so a client must discard pinned tokens when it detects a reopen.
+- **REST `list ?as_of` still reads full rows server-side** to filter and sort; only the wire
+  is not shrunk. The newest-version *resolution* is sub-linear (a per-id binary search over an
+  ascending version index), so it does not scan the whole watermark.
+- Single-process/single-writer capture: the snapshot is atomic *because* capture routes through
+  the one writer.

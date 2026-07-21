@@ -4,6 +4,7 @@
 
 BUN := /Users/collin/.bun/bin/bun
 INSPECTOR := apps/inspector
+WEBSITE := apps/website
 BENCH := benchmarks/Cargo.toml
 
 ## Config variants for the matrix bench (epic #126): each becomes a generated
@@ -12,6 +13,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
+        website-install website website-build website-typecheck \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
         bench-footprint bench-concurrency
@@ -107,3 +109,19 @@ inspector-app:
 ## Build the inspector desktop app for release (bundles the static export).
 inspector-app-build:
 	cd $(INSPECTOR) && $(BUN) run tauri build
+
+## Install the marketing + docs website's JS dependencies.
+website-install:
+	cd $(WEBSITE) && $(BUN) install
+
+## Run the website in dev mode (http://localhost:3100).
+website:
+	cd $(WEBSITE) && $(BUN) run dev
+
+## Build the website to a static export (apps/website/out; host-agnostic).
+website-build:
+	cd $(WEBSITE) && $(BUN) run build
+
+## Typecheck the website.
+website-typecheck:
+	cd $(WEBSITE) && $(BUN) run typecheck

@@ -1,0 +1,78 @@
+---
+title: "Multi-tenancy & auth"
+description: "Physical dir-per-tenant isolation with a process-per-tenant model, a verify-only JWT tenant guard, and the forgedb tenant CLI — plus the honest single-tenant-per-process limit."
+---
+
+ForgeDB's multi-tenancy is **physical, directory-per-tenant isolation** run as
+**process-per-tenant**: one `forgedb serve` process serves one tenant's data directory, and
+N processes sit behind a dumb host/subdomain proxy. Generated code stays tenant-oblivious —
+it just opens the data root it's given. A verify-only JWT guard cross-checks that the caller's
+token names the tenant this process serves.
+
+## The model: process-per-tenant
+
+Each tenant is an independent data directory. A process is pointed at one tenant's root and
+serves only that tenant; the multiplexer is a plain reverse proxy in front, not code inside
+ForgeDB. This keeps the generated code identical whether or not you use tenancy — there is no
+in-process tenant registry demultiplexing rows by tenant.
+
+The scaffolded `main.rs` is an env-driven server. Resolve the tenant, data root, and JWT
+config once, and it feeds both the data-directory open and the auth cross-check:
+
+```bash
+FORGEDB_TENANT=acme \
+FORGEDB_DATA=/srv/tenants/acme \
+FORGEDB_JWT_ISSUER=https://auth.example.com \
+FORGEDB_JWT_AUDIENCE=forgedb \
+  forgedb serve
+```
+
+The data root is threaded through every column, tombstone, and manifest path via the generated
+`Database::open_at(root)` (`new()` is byte-identical to `open_at(".")`).
+
+## The tenant guard — verify-only JWT
+
+The `forgedb-auth` substrate crate is a schema-agnostic axum extractor/middleware. When
+configured, it wraps every REST and WebSocket **data** route:
+
+- Verifies an asymmetric JWT (JWKS or static PEM), algorithm-pinned, checking
+  `exp`/`nbf`/`iss`/`aud` with skew.
+- Extracts the configured tenant claim and **cross-checks it against this process's tenant** —
+  a mismatch is a 403.
+- Injects an opaque `Principal` for downstream handlers.
+
+It knows nothing of models, rows, or fields — the cross-check is opaque string equality.
+
+<Callout type="note" title="Ops routes stay unauthenticated">
+The tenant guard wraps only the data routes. The ops routes (`/health`, `/ready`, `/metrics`,
+`/snapshot`) are merged in **after** the guard, so k8s/load-balancer probes need no JWT.
+</Callout>
+
+Verify-only means ForgeDB **does not issue** tokens, and it does not do RLS-style
+per-principal row authorization — it verifies a token and cross-checks the tenant. See
+[tenant & auth configuration](/docs/config/tenant-auth/) for the `[tenant]` / `[auth]` config
+tables (these live in `forgedb.toml`, never in your `.forge` schema).
+
+## The `forgedb tenant` CLI
+
+Manage the per-tenant data directories under a root:
+
+```bash
+forgedb tenant create acme
+forgedb tenant list
+forgedb tenant drop acme
+```
+
+## Limits
+
+- **Single tenant per process.** A cross-tenant read is a fan-out across processes; there is
+  no in-process registry (that model is a deferred strict superset on the same
+  `open_at` seam).
+- **WebSocket clients must send the token** in the `Authorization` header (there is no query-param
+  token path).
+- **JWKS-over-HTTP fetch is not yet wired into the scaffold** — the crate parses JWKS offline,
+  and static PEM is the wired path today.
+- Verify-only: **no token issuance** and **no per-principal (RLS-style) authorization**.
+
+Migrations sweep all tenants under a root in one command — see
+[Migrations](/docs/features/migrations/).

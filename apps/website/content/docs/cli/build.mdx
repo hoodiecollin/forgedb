@@ -1,0 +1,50 @@
+---
+title: "forgedb build"
+description: "Validate, regenerate, and compile production-ready ForgeDB artifacts for native or WASM targets."
+---
+
+Produce production artifacts end to end: validate the schema, regenerate the code (baking
+in the `[runtime]`/`[storage]` config from `forgedb.toml`), then compile. `build` always
+regenerates with force so a repeated build never fails on existing files.
+
+## Synopsis
+
+```bash
+forgedb build [--release] [--target <native|wasm|both>] [--output <DIR>] [--schema <PATH>] [--no-api]
+```
+
+## Flags
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--release` | bool (**true**) | Build with optimizations. On by default. |
+| `-t`, `--target <T>` | string (`native`) | Compile target: `native`, `wasm`, or `both`. |
+| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory for generated code. |
+| `--schema <PATH>` | string (auto-discover) | Schema file path. |
+| `--no-api` | bool (false) | Skip API generation — generate only `rust`, the `node --sdk` TypeScript SDK, and `stubs`. |
+
+<Callout type="note" title="build = validate + generate + compile">
+`build` first runs a syntax-only validation, then generates (`all`, or the reduced set
+with `--no-api`), then compiles the chosen target. The generate step honors the same
+config knobs as [`generate`](/docs/cli/generate/).
+</Callout>
+
+## Examples
+
+Build the native release artifacts:
+
+```bash
+forgedb build
+```
+
+Build both native and WASM:
+
+```bash
+forgedb build --target both
+```
+
+Build without the REST API server:
+
+```bash
+forgedb build --no-api
+```

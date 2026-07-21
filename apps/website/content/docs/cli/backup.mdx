@@ -1,0 +1,85 @@
+---
+title: "forgedb backup"
+description: "Create, restore, and inspect lock-free snapshot archives of a ForgeDB data directory."
+---
+
+Snapshot backup and restore for a database directory. `create` takes a lock-free full
+snapshot (or an incremental byte-tail delta); `restore` materializes an archive (or a base +
+incremental chain) atomically; `list` inspects an archive without restoring it.
+
+## Subcommands
+
+| Command | Purpose |
+|---|---|
+| `create` | Create a full snapshot, or an incremental delta with `--incremental`. |
+| `restore` | Restore a full archive, or a base followed by its incrementals. |
+| `list` | Show an archive's contents without restoring. |
+
+### create
+
+```bash
+forgedb backup create [--data-dir <DIR>] [--output <FILE>] [--incremental --base <ARCHIVE>]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-d`, `--data-dir <DIR>` | string (`data`) | Data directory to snapshot. |
+| `-o`, `--output <FILE>` | string (`backup.forgebk`) | Output archive path. |
+| `--incremental` | bool (false) | Produce an incremental delta instead of a full snapshot. Refused if compaction bumped the epoch since the base. |
+| `--base <ARCHIVE>` | string | The base archive to delta from. **Required** with `--incremental`; may itself be an earlier incremental in the chain. |
+
+### restore
+
+```bash
+forgedb backup restore <archive>... [--output <DIR>] [--overwrite]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<archive>...` | strings (required, 1+) | One full archive, or a base followed by its incrementals in order. |
+| `-o`, `--output <DIR>` | string (`data`) | Destination data directory. |
+| `--overwrite` | bool (false) | Replace an existing non-empty destination. |
+
+### list
+
+```bash
+forgedb backup list <archive> [--json]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<archive>` | string (required) | Archive path to inspect. |
+| `--json` | bool (false) | Emit JSON. |
+
+<Callout type="note" title="Incrementals are a chain">
+Restore applies archives in order: pass the base first, then each incremental in `sequence`
+order. Restore is atomic (temp dir + rename) and refuses a non-empty destination without
+`--overwrite`.
+</Callout>
+
+## Examples
+
+Full snapshot of the default data directory:
+
+```bash
+forgedb backup create --data-dir ./data --output ./snap.forgebk
+```
+
+An incremental delta on top of a base:
+
+```bash
+forgedb backup create --data-dir ./data --incremental \
+  --base ./snap.forgebk --output ./snap-2.forgebk
+```
+
+Restore a base + incremental chain into a fresh directory:
+
+```bash
+forgedb backup restore ./snap.forgebk ./snap-2.forgebk --output ./restored
+```
+
+Inspect an archive:
+
+```bash
+forgedb backup list ./snap.forgebk --json
+```

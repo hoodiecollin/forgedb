@@ -1,0 +1,50 @@
+---
+title: "CLI reference"
+description: "The forgedb command-line tool — global flags and every subcommand for generating, building, and operating a ForgeDB database."
+---
+
+The `forgedb` CLI is the entire toolchain: it scaffolds a project, transpiles your
+`.forge` schema into tailored Rust/TypeScript/REST artifacts, builds them, and operates
+the resulting database (migrations, compaction, backups, tenancy, and the multi-process
+commit coordinator).
+
+```bash
+forgedb <command> [flags]
+forgedb --help
+```
+
+## Global flags
+
+These flags are accepted on every command.
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-v`, `--verbose` | bool (false) | Enable verbose output. |
+| `-q`, `--quiet` | bool (false) | Suppress output. |
+| `-c`, `--config <PATH>` | string (auto-discover `forgedb.toml`) | Path to the config file. Commands that need config-derived defaults (schema path, output dir, `[runtime]`/`[storage]`/`[tenant]`/`[auth]` tables) read it from here. |
+
+<Callout type="note" title="Config precedence">
+For resolvable defaults the order is: CLI flag &gt; `forgedb.toml` &gt; built-in default.
+See [configuration](/docs/config/overview/) for the full set of tables and keys.
+</Callout>
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| [`init`](/docs/cli/init/) | Scaffold a new ForgeDB project. |
+| [`generate`](/docs/cli/generate/) | Transpile the schema into code (Rust, REST API, OpenAPI, stubs, language runtimes). |
+| [`validate`](/docs/cli/validate/) | Parse and validate the schema (and optionally components). |
+| [`build`](/docs/cli/build/) | Validate, generate, and compile production artifacts. |
+| [`dev`](/docs/cli/dev/) | Watch the schema and auto-regenerate on change. |
+| [`migrate`](/docs/cli/migrate/) | Record, build, and run schema migrations over data-at-rest. |
+| [`compact`](/docs/cli/compact/) | Database statistics and analysis. Offline `run`/`vacuum` are deprecated. |
+| [`backup`](/docs/cli/backup/) | Create, restore, and inspect snapshot archives. |
+| [`tenant`](/docs/cli/tenant/) | Manage dir-per-tenant data directories. |
+| [`coordinate`](/docs/cli/coordinate/) | Run the Tier-3 MVCC multi-process commit coordinator. |
+
+## Exit codes
+
+Commands exit `0` on success and non-zero on failure. Deprecated paths
+(`compact run`, `compact vacuum`) exit non-zero even though they are otherwise valid
+subcommands — see [compact](/docs/cli/compact/).

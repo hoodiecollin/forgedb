@@ -1,0 +1,51 @@
+---
+title: "Comments & whitespace"
+description: "How comments and whitespace work in .forge — line comments only, significant newlines, and no block comments."
+---
+
+## Comments
+
+`.forge` supports **line comments** only, introduced by `//`. Everything from `//` to the
+end of the line is ignored. A comment may stand on its own line or trail a field.
+
+```forge
+// A standalone comment describing the model.
+User {
+  id: +uuid
+  email: &string  // inline comment after a field
+}
+```
+
+<Callout type="warning" title="Block comments are not supported">
+`/* ... */` block comments do **not** parse — the lexer has no handling for them and will
+fail. Some older example files use them; those files will not parse in the CLI. Use `//`
+lines instead.
+</Callout>
+
+## Whitespace
+
+- **Newlines are significant.** They delimit logical tokens — fields are separated by
+  newlines, not semicolons.
+- **Horizontal whitespace** (spaces and tabs) is insignificant and skipped, so you may
+  indent and align freely.
+- **Carriage returns** (`\r`) are skipped, so CRLF files parse fine.
+- Model, struct, and enum definitions may span multiple lines; blank lines between
+  declarations are fine.
+
+## Terminators
+
+- There are **no semicolons**. The only structural delimiters are the `{` and `}` block
+  braces.
+- A field's `@` directives must appear after its type, before the next newline or the next
+  directive on the same field.
+
+```forge
+// Valid: newline-delimited fields, no semicolons, aligned for readability.
+Post {
+  id:          +uuid
+  title:       string  @length(1, 200)
+  published:   bool    @default(false)
+  author:      *User
+  created_at:  +timestamp
+}
+```

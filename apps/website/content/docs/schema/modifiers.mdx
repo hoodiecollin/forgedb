@@ -1,0 +1,93 @@
+---
+title: "Modifiers"
+description: "The .forge field modifiers — + auto-generate, & unique, ^ indexed, and ? nullable — with placement and type rules."
+---
+
+Modifiers are sigils that adorn a field's type. Three are **prefix** modifiers (`+`, `&`,
+`^`) that go before the type name; one is the **nullable** modifier (`?`) that goes after.
+
+| Symbol | Name | Position | Meaning | Valid on |
+|--------|------|----------|---------|----------|
+| `+` | auto-generate | prefix | Fill the value on insert | `u32`, `u64`, `uuid`, `timestamp` only |
+| `&` | unique | prefix | Value must be unique (enforced) | any type |
+| `^` | indexed | prefix | Build an index for fast lookups | any type |
+| `?` | nullable | postfix (or prefix) | Value may be absent | any type |
+
+## `+` — auto-generate
+
+`+` tells ForgeDB to generate the value on insert, so callers never supply it. It is
+**only valid on** `u32`, `u64`, `uuid`, and `timestamp`:
+
+```forge
+id: +uuid            // random UUID on insert
+seq: +u64            // auto-incrementing counter
+created_at: +timestamp
+```
+
+<Callout type="warning" title="`+` is type-restricted">
+`+` on any other type — e.g. `name: +string` — is a fatal parse error. Only the four
+generatable types above are allowed.
+</Callout>
+
+## `&` — unique
+
+`&` marks a column whose values must be unique across all rows. Uniqueness is **enforced**:
+on `insert`/`update` the generated code probes the field's index and rejects a duplicate
+(HTTP 409). Applicable to any type.
+
+```forge
+email: &string @email
+slug: &string
+```
+
+Under the hood `&` also builds an index (so a unique field is also fast to look up).
+
+## `^` — indexed
+
+`^` builds a secondary index on the field for fast `find_by_*` lookups and for
+index-served REST filters. Applicable to any indexable type (not `json`).
+
+```forge
+slug: ^string
+views: ^u64
+status: ^OrderStatus
+```
+
+You can combine `&` and `^` freely; `&` already indexes, so `^&` mainly documents intent.
+See [indexes & projections](/docs/schema/indexes-and-projections/) for hash-vs-ordered
+index behavior.
+
+## Combining prefix modifiers
+
+Any combination of `+`, `&`, `^` is allowed, in any order, all before the type:
+
+```forge
+username: +&^string       // (rare, but parses) auto-gen + unique + indexed
+email: ^&string @email    // indexed + unique
+```
+
+## `?` — nullable
+
+`?` makes a field optional (may be absent / `NULL`). It is a **postfix** modifier — placed
+after the type — and this is the idiomatic form. A prefix form also parses:
+
+```forge
+bio: string?         // nullable string (idiomatic)
+age: i32?            // nullable int
+avatar: ?string      // prefix form — also parses
+published_at: timestamp?
+```
+
+`?` composes with the prefix modifiers:
+
+```forge
+external_id: +uuid?  // auto-generate and nullable
+```
+
+On a relation, prefix `?` is how you declare an **optional foreign key**
+(`editor: ?User`). See [relations](/docs/schema/relations/).
+
+<Callout type="note" title="Nullable storage keeps absent distinct from zero">
+A nullable fixed-width field carries a 1-byte presence tag, so `None` and a stored `0`
+(or `Value::Null`, or an empty string) round-trip as different values.
+</Callout>

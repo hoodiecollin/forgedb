@@ -1,0 +1,75 @@
+---
+title: "Substrate crates"
+description: "The schema-agnostic runtime crates generated ForgeDB code links against — their roles, and the class-1 substrate vs class-2 transport distinction."
+---
+
+Generated ForgeDB code is **not** dependency-free. It links a small set of
+**schema-agnostic substrate crates** published to crates.io. They know nothing about any
+particular schema — the schema-specific surface (types, tables, queries, filters,
+relations, routes) is generated per app at compile time; these crates are the layer that
+generated code links against.
+
+<Callout type="note" title="Not an ORM">
+None of these is a generic, schema-reading query builder or ORM. The generated code is
+schema-aware; the substrate crates are not. That line is the generator-identity invariant.
+</Callout>
+
+## Two classes
+
+1. **Schema-agnostic substrate** — real programmatic APIs that interpret no schema. The
+   generated code links them directly. Everything in the table below.
+2. **Access / transport glue** — layers over the *already-generated* surface (e.g. the
+   wasm read-replica transport, language bindings). These are generated per-schema or thin
+   transport shims, not standalone published substrate.
+
+A generic, schema-reading engine is neither — it is explicitly never shipped.
+
+## The published substrate
+
+Each crate is versioned on an **independent** line; the pins are intentionally not
+normalized. Treat the crate manifests and crates.io as the authoritative version source.
+
+| Crate | Role |
+|---|---|
+| `forgedb-types` | Core type system (uuid, timestamp, primitives). Carries a `cfg(wasm32)` uuid/getrandom feature for the browser build. |
+| `forgedb-storage` | Columnar storage **facade** — a thin `cfg` re-export selecting a backend by target. Generated code uses only this crate. |
+| `forgedb-storage-native` | Native positional-file columnar backend (host targets), selected by the facade off wasm. |
+| `forgedb-storage-web` | In-memory-arena columnar backend for the browser read-replica (wasm32); async only at the IndexedDB/OPFS hydrate/commit boundary. Byte-identical positional semantics to native. |
+| `forgedb-wal` | Write-ahead log. Generated code links the **opaque `Raw`** record path (bytes + CRC framing + fsync policy + torn-tail recovery). File impl on host, in-memory on wasm32. |
+| `forgedb-changefeed` | Field-blind change-feed broadcast **plus** the durable replication broker (`durable` module: CRC-framed append-only log at a monotonic global offset; resumable subscription). |
+| `forgedb-auth` | Verify-only JWT + tenant cross-check axum extractor/middleware. Injects an opaque `Principal`; knows no model or row. |
+| `forgedb-query-params` | REST query-string parser (URL → generic `Filter`/`Sort`/`Pagination`, limit clamped). All field-aware filtering/sorting is generated per-model; this parses only the string. |
+| `forgedb-compaction` | In-process dead-row reclaim keyed by model *directory name*. Keeps exactly the caller-supplied opaque row indices (the generated code computes the live set). |
+| `forgedb-txn` | MVCC Tier-2 commit sequencer: monotonic LSN + first-committer-wins conflict detection over an in-memory map (rebuilt empty on open; never persisted). |
+| `forgedb-coordinator` | MVCC Tier-3 multi-process write control plane. A `forgedb coordinate <root>` process holds the directory lock and serializes the commit turn. **No `forgedb-storage*` dep** — it never writes columns. |
+
+## Dependency shape
+
+The storage facade never links both backends at once — `cfg(not(target_arch = "wasm32"))`
+pulls `storage-native`, `cfg(target_arch = "wasm32")` pulls `storage-web` — so their
+(identical) public types never collide. Generated `database.rs` uses the facade verbatim
+and stays byte-identical across native and wasm targets.
+
+The **on-disk column layout is part of the substrate ABI**: a change a prior binary cannot
+read is a breaking (major) bump. See [versioning & stability](/docs/reference/semver/).
+
+## Not substrate
+
+`forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
+`forgedb-backup`, and `forgedb-watcher` are also on crates.io, but **only so `cargo install
+forgedb` can build the CLI from the registry**. They are compiler internals — explicitly
+*not* a stable public API. Do not build a product on top of them. `forgedb-lsp-server` is
+unpublished. See [versioning & stability §4](/docs/reference/semver/).
+
+## Publish discipline
+
+Whenever generated code starts requiring a new substrate crate or a new additive substrate
+API, that crate/version must publish *before* the scaffold pins it — otherwise an
+outside-repo `init → generate → cargo build` cannot resolve from crates.io. `forgedb init`
+always pins versions the current CLI is known-compatible with, using caret ranges (e.g.
+`forgedb-storage = "0.2"`).
+
+## Related
+
+- [Versioning & stability](/docs/reference/semver/) — the ABI + on-disk-format policy over these crates.
+- [Deployment](/docs/reference/deployment/) — how the generated binary is built and run.

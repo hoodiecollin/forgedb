@@ -1,0 +1,52 @@
+---
+title: "[generate] & [project]"
+description: "The [generate] and [project] tables — schema path, output directory, targets, and project metadata."
+---
+
+The `[generate]` table controls what `forgedb generate` reads and emits; `[project]`
+carries plain metadata. Both are consumed at generate time.
+
+## `[generate]`
+
+```toml
+[generate]
+schema = "schema.forge"
+output = "./generated"
+targets = ["rust", "typescript", "api", "stubs"]
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `schema` | string | `"schema.forge"` | Path to the `.forge` schema file to transpile. |
+| `output` | string | `"./generated"` | Output directory for generated files. |
+| `targets` | string[] | *(all targets)* | Which targets to emit. When absent, all are enabled. |
+
+Valid `targets` values are `rust`, `typescript`, `api`, and `stubs`. When the key is
+absent, every target is generated.
+
+<Callout type="note" title="CLI flags override these">
+`--schema` and `--output` on the `forgedb generate` command take precedence over the
+`[generate]` values, which in turn take precedence over the built-in defaults. See
+[configuration precedence](/docs/config/overview/).
+</Callout>
+
+## `[project]`
+
+```toml
+[project]
+name = "my-app"
+version = "0.1.0"
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `name` | string | *(unset)* | Project name (metadata). |
+| `version` | string | *(unset)* | Project version (metadata). |
+
+`[project]` is metadata only — it does not affect generated code. It is emitted by
+`forgedb init` and ignored by the generator (unknown/ignored tables are forward-compatible).
+
+## Related
+
+- [`[runtime]`](/docs/config/runtime/) and [`[storage]`](/docs/config/storage/) — the generate-time behavior knobs.
+- [Configuration overview](/docs/config/overview/) — discovery, precedence, and the tier model.

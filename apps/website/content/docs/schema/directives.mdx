@@ -1,0 +1,133 @@
+---
+title: "Directives"
+description: "Every @ directive in .forge — which are enforced at write time, which are semantic-only markers, and their argument syntax."
+---
+
+Directives are `@`-prefixed annotations on a field or a model. Some are **enforced** at
+write time (a violation is rejected with an HTTP status); the rest are **semantic-only**
+markers today — parsed and carried through, but not yet enforced by the generated code.
+
+## Argument syntax
+
+Directive arguments accept **numbers**, **bare identifiers**, and **quoted string
+literals**:
+
+```forge
+age: u32 @min(13) @max(150)
+status: string @default(pending)
+status: string @default("pending")     // equivalent — both stored as a string
+phone: string @pattern("^[0-9]+$")
+```
+
+Quoted strings support the escapes `\"`, `\\`, `\n`, `\t`, `\r`. An unterminated or
+multiline string is a lex error. `@default(pending)` and `@default("pending")` are
+equivalent.
+
+## Enforced directives
+
+These are checked by the generated code and reject a bad write.
+
+| Directive | Args | Applies to | Effect |
+|-----------|------|-----------|--------|
+| `@min` | `(number)` | numeric | Value must be ≥ the minimum, else **422** |
+| `@max` | `(number)` | numeric + string | Value / length must be ≤ the maximum, else **422** |
+| `@length` | `(count)` or `(min, max)` | `string` | String length must be in range, else **422** |
+| `@email` | none | `string` | Must be a valid email, else **422** |
+| `@url` | none | `string` | Must be a valid URL, else **422** |
+| `@pattern` / `@regex` | `(regex)` | `string` | Value must match the regex, else **422** |
+| `@on_delete` | `(restrict\|cascade\|set_null)` | FK field | On-delete referential policy |
+
+### Field constraints — `@min` `@max` `@length` `@email` `@url`
+
+The generated `validate_<model>` enforces these at the top of `insert`/`update`; a
+violation is a field-constraint error (HTTP **422**). A nullable field is validated only
+when `Some`.
+
+```forge
+User {
+  age: u32 @min(13) @max(150)
+  name: string @length(1, 100)
+  email: string @email
+  website: string @url
+}
+```
+
+### `@pattern` / `@regex`
+
+The generated `validate_<model>` compiles a per-field regex and rejects a non-matching
+string with a field-constraint error (HTTP **422**), at the top of `insert`/`update`. A
+nullable field is only validated when `Some`.
+
+```forge
+User {
+  handle: string @pattern("^[a-z0-9_]{3,20}$")
+}
+```
+
+### `@on_delete`
+
+Declares what happens to a child when its referenced parent is deleted. Enforced in the
+generated `Database::delete_<parent>` wrapper (which the REST `DELETE` route goes through):
+
+- **`restrict`** (also the **default** when `@on_delete` is absent) — refuse to delete a
+  parent that still has a live child referencing it → **409**.
+- **`cascade`** — recursively delete every referencing child (each child's own
+  `@on_delete` rules fire; a cycle is bounded by a max depth).
+- **`set_null`** — null each referencing child's FK. **Only valid on an optional FK
+  (`?Target`)** — `set_null` on a required `*Target` is a hard codegen error.
+
+```forge
+Post {
+  author: *User @on_delete(cascade)      // deleting a user deletes their posts
+  category: ?Category @on_delete(set_null)
+}
+```
+
+## Semantic-only markers
+
+These parse and are carried through, but the generated code does **not** enforce them.
+Use them to document intent; do not rely on them for integrity.
+
+| Directive | Args | Applies to | Intended meaning |
+|-----------|------|-----------|------------------|
+| `@default` | `(value)` | any | Default on insert (marker only — a caller still supplies the value) |
+| `@computed` | none | any | Read-only computed field |
+| `@fulltext` | none | `string` | Full-text index intent |
+| `@materialized` | none | any | Materialized field |
+| `@relations` | `(*)` or `(fields)` | component ref | Component relation inclusion |
+
+<Callout type="note" title="Markers are documentation, not behavior">
+`@default`, `@computed`, `@fulltext`, and `@materialized` are parsed and preserved but have
+no runtime effect yet — for example `@default(0)` does not populate a value; the caller
+must still supply one. The enforced set is the table above (`@min`/`@max`/`@length`/
+`@email`/`@url`, `@pattern`/`@regex`, and `@on_delete`).
+</Callout>
+
+## Model-level directives
+
+These appear on their own line inside a model block, not attached to a field.
+
+| Directive | Args | Meaning |
+|-----------|------|---------|
+| `@index` | `(field1, field2, ...)` | Composite index over ≥ 2 fields |
+| `@projection` | `(name: col, col, ...)` | A named partial-read projection |
+| `@soft_delete` | none | Enable soft delete for the model |
+
+```forge
+Order {
+  id: +uuid
+  user_id: uuid
+  created_at: timestamp
+  @index(user_id, created_at)
+  @projection(card: id, created_at)
+  @soft_delete
+}
+```
+
+See [indexes & projections](/docs/schema/indexes-and-projections/) for `@index` and
+`@projection` in depth.
+
+<Callout type="warning" title="`@relations` is component-only">
+`@relations(*)` / `@relations(a, b)` is valid **only** on a component-reference field
+(`tsx://`, `jsx://`, `api://`). Using it on a scalar field is a parse error.
+</Callout>

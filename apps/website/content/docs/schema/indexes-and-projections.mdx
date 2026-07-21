@@ -1,0 +1,121 @@
+---
+title: "Indexes & projections"
+description: "Single-field ^ indexes, composite @index, @projection partial reads, and the &unique constraint in .forge."
+---
+
+ForgeDB builds in-memory secondary indexes from your schema so lookups and filters do not
+scan every row. This page covers the four index/projection surfaces.
+
+## Single-field index — `^`
+
+The `^` [modifier](/docs/schema/modifiers/) builds a secondary index on a field. Each
+indexed scalar gets a `find_by_<field>` / `get_by_<field>` probe that resolves candidates
+in O(1) instead of scanning, and index-served REST filters.
+
+```forge
+Post {
+  id: +uuid
+  slug: ^string     // find_by_slug(...)
+  views: ^u64
+}
+```
+
+<Callout type="warning" title="Hash indexes are exact-match only">
+A default index is a **hash** index — it answers `field = value` exactly. It does **not**
+answer prefix or range queries (`views > 100`, `slug LIKE ...`).
+</Callout>
+
+### Ordered indexes by type
+
+Ordered/range queries are served automatically for **non-nullable** indexed fields of an
+`Ord`-key type — `u32`, `u64`, `i32`, `i64`, `timestamp`, and `decimal`. For these, a
+parallel ordered index backs a `find_by_<field>_range(min, max, descending, limit)` method
+that walks values in order (range and top-N in O(offset + limit)).
+
+```forge
+Post {
+  views: ^u64        // range/top-N served: find_by_views_range(...)
+  created_at: ^timestamp
+}
+```
+
+`f64` (no clean total order), nullable fields, and `string` get the exact-match hash index
+only. The choice is automatic by field type — there is no directive to force it.
+
+## Unique — `&unique`
+
+The `&` modifier is the uniqueness constraint. On `insert`/`update` the generated code
+probes the field's index and rejects a value already held by a different row (HTTP **409**).
+A unique field is also indexed, so it is fast to look up.
+
+```forge
+User {
+  email: &string @email    // unique, and find_by_email(...)
+}
+```
+
+## Composite index — `@index(a, b)`
+
+A model-level `@index(field1, field2, ...)` builds one index keyed on the tuple of fields.
+It answers exact-match on the full tuple (`a = ? AND b = ?`) via `find_by_<a>_and_<b>`.
+
+```forge
+Order {
+  id: +uuid
+  user_id: uuid
+  status: string
+  created_at: timestamp
+  @index(user_id, created_at)
+  @index(status, created_at)
+}
+```
+
+**Rules:**
+
+- Must list **at least two** fields (a single-field index uses `^`).
+- Every listed field must exist in the model.
+- The key is a hash of the concatenated per-field keys — exact-match on the whole tuple,
+  not prefix or range.
+
+## Projections — `@projection(name: cols)`
+
+A model-level `@projection(name: col, col, ...)` generates a tailored partial-read struct
+`<Model><Name>` plus narrow reads (`get_<name>`, `all_<name>`, and the snapshot variants)
+that materialize **only** the primary key and the named columns — never the full record.
+
+```forge
+Post {
+  id: +uuid
+  title: string
+  slug: ^string
+  views: ^u64
+  content: string
+  published_at: timestamp?
+  @projection(card: title, slug, published_at)
+  @projection(agg: views, published_at)
+}
+```
+
+<Compare>
+```forge
+@projection(card: title, slug)
+```
+
+```rust
+// Generated (illustrative):
+struct PostCard { id: Uuid, title: String, slug: String }
+
+db.post.get_card(id);   // -> Option<PostCard>
+db.post.all_card();     // narrow scan, skips other columns
+```
+</Compare>
+
+Projections are also exposed over REST as a **closed set** — `GET /api/post?projection=card`
+selects a declared projection by name. There is no ad-hoc `?fields=` column list; only
+declared projection names are valid (an unknown name is a 400).
+
+<Callout type="tip" title="Projections shrink reads, not just the wire">
+A projected point-`get` (and the wasm replica path) skips reading the unselected columns
+entirely. A projected REST `list` still reads full rows server-side to filter/sort — it
+shrinks only the response body.
+</Callout>

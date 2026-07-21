@@ -1,0 +1,83 @@
+---
+title: "[storage]"
+description: "The [storage] table — WAL fsync policy, checkpoint interval, and compaction, with their durability tradeoffs."
+---
+
+The `[storage]` table carries generate-time storage and durability knobs (epic #126).
+They are schema-blind and baked into `database.rs` at generate time — change one and run
+`forgedb generate`. Defaults are byte-identical to the prior output.
+
+```toml
+[storage]
+fsync = "always"             # Tier B — WAL fsync policy
+wal_checkpoint_interval = 1000 # Tier B — mutations between WAL checkpoints
+compaction = true            # Tier A — emit the auto-compaction trigger
+compaction_threshold = 1000  # Tier B — dead versions before auto-compaction
+```
+
+## Keys
+
+| Key | Type | Default | Tier | Meaning |
+|---|---|---|---|---|
+| `fsync` | string `"always"` \| `"never"` | `"always"` | B | WAL fsync policy for the durable write path. |
+| `wal_checkpoint_interval` | u64 | `1000` | B | Mutations per collection between WAL checkpoints. |
+| `compaction` | bool | `true` | A | Emit the in-process auto-compaction trigger. |
+| `compaction_threshold` | u64 | `1000` | B | Dead row versions per model before an auto-compaction fires. |
+
+An unknown `fsync` value (anything but `"always"` or `"never"`) is a config error.
+
+## `fsync` (Tier B, default `always`)
+
+Controls whether the WAL is fsynced on every commit.
+
+- **`"always"`** (default) — fsync every commit. On macOS `File::sync_all()` is an
+  `F_FULLFSYNC` device barrier (~3.5 ms), so acked writes survive power loss with zero
+  loss. This is the v1 crash-safe default.
+- **`"never"`** — never fsync; the OS flushes on its own schedule. This is a
+  **durability-weakening** opt-in with a real data-loss window on power loss. It is the
+  single biggest write-throughput lever (~80–110× faster single writes in benchmarks,
+  because the barrier *is* essentially the entire write latency). Choose it only when you
+  can tolerate losing recently-acked writes on a crash.
+
+<Callout type="warning" title="fsync is Tier B, not yet Tier A">
+`"never"` bakes the `FsyncPolicy` value as a const, but the substrate still matches that
+value per-write at runtime — the `sync_all` call is still compiled into the substrate
+binary as a dead, value-known branch rather than being removed. True Tier-A elimination
+(barrier gone from the binary) is a documented follow-up. The durability *behavior* is
+correct today; only the "the syscall is physically absent" optimization is pending.
+</Callout>
+
+See [durability](/docs/features/durability/) for the full crash-safety model and
+[benchmarks](/docs/reference/benchmarks/) for the fair barrier-vs-relaxed comparison.
+
+## `wal_checkpoint_interval` (Tier B, default 1000)
+
+Bakes `const WAL_CHECKPOINT_INTERVAL`. After this many mutations to a collection, the
+generated code checkpoints: it fsyncs every column and tombstone file **then** truncates
+the WAL (that order is load-bearing — columns durable before the WAL is discarded). This
+bounds WAL growth and reopen-replay cost. A lower value keeps the WAL smaller at the cost
+of more frequent checkpoints.
+
+## `compaction` (Tier A, default on)
+
+When `true`, the generated code emits the auto-compaction trigger — the
+`dead_since_compaction >= COMPACTION_DEAD_THRESHOLD` check. When `false`, that check is
+omitted entirely and storage is reclaimed only when you call `Database::compact()`
+explicitly.
+
+Because updates and deletes append superseding/tombstoned row versions (append-only
+storage), dead versions accumulate; compaction reclaims them. Turning the auto-trigger off
+does not disable compaction — it moves the decision to your code.
+
+## `compaction_threshold` (Tier B, default 1000)
+
+Bakes `const COMPACTION_DEAD_THRESHOLD`. When a model accumulates this many dead row
+versions, an in-process compaction is due. Crossing the soft threshold sets a flag rather
+than stalling the triggering write; the reclaim runs off the hot write turn (with a hard
+ceiling as a growth-bounding safety net). A lower threshold keeps storage tighter at a
+small throughput cost.
+
+## Related
+
+- [`[runtime]`](/docs/config/runtime/) — replication and changefeed knobs.
+- [durability](/docs/features/durability/) — the WAL, checkpoint, and single-writer contract.

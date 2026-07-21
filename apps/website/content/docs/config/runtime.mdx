@@ -1,0 +1,62 @@
+---
+title: "[runtime]"
+description: "The [runtime] table — replication, changefeed capacity, and cascade depth, baked into database.rs at generate time."
+---
+
+The `[runtime]` table carries generate-time behavior knobs (epic #126). They are
+schema-blind and baked into the emitted `database.rs` — change one and run `forgedb
+generate` for it to take effect. Defaults reproduce the prior output byte-for-byte, with
+the one sanctioned exception that `replication` defaults to **off**.
+
+```toml
+[runtime]
+replication = false        # Tier A — attach the durable replication broker
+changefeed_capacity = 1024 # Tier B — broadcast/broker buffer size
+max_cascade_depth = 64     # Tier B — @on_delete(cascade) recursion bound
+```
+
+## Keys
+
+| Key | Type | Default | Tier | Meaning |
+|---|---|---|---|---|
+| `replication` | bool | `false` | A | Attach the durable replication broker in `open_at`. Required for `/replicate` and the browser read-replica. |
+| `changefeed_capacity` | usize | `1024` | B | In-process changefeed broadcast channel capacity and the durable broker's in-memory buffer. |
+| `max_cascade_depth` | u32 | `64` | B | Maximum recursive `@on_delete(cascade)` depth — a structural safety bound against a pathological FK cycle. |
+
+## `replication` (Tier A, default off)
+
+When `true`, `open_at` attaches a `DurableBroker` that records every committed change to a
+CRC-framed append-only log (`<root>/_replication.log`). This is what powers the generated
+`/replicate` WebSocket endpoint and the browser read-replica follower.
+
+When `false` (the default), no broker is emitted at all. The write path's `if let
+Some(broker)` guard becomes statically dead code the compiler removes.
+
+<Callout type="warning" title="Replication costs a second barrier per write">
+With `replication = true`, each `insert`/`update`/`delete` fsyncs the broker log *in
+addition to* the WAL — a **second** `F_FULLFSYNC` barrier. This roughly doubles single-write
+latency (measured ~3.95 ms → ~7.35 ms per insert). The default is off precisely so apps
+that never consume `/replicate` don't pay it. See [durability](/docs/features/durability/)
+and [benchmarks](/docs/reference/benchmarks/).
+</Callout>
+
+Turn it on when you consume the [replication stream](/docs/reference/rest-api/) or run a
+browser read-replica.
+
+## `changefeed_capacity` (Tier B, default 1024)
+
+The capacity of the in-process changefeed broadcast channel (used by the `/subscribe` and
+`/live-query` WebSocket endpoints) and the durable broker's buffer. It is a fan-out
+buffer, **not** on the durable write path, so tuning it has no measured write-latency
+effect — it is free to raise for a high subscriber count.
+
+## `max_cascade_depth` (Tier B, default 64)
+
+Bakes `const MAX_CASCADE_DEPTH`. When you delete a parent whose relation FK declares
+`@on_delete(cascade)`, the generated delete recurses into referencing children. This bound
+stops runaway recursion on a pathological FK cycle. Most schemas never approach 64.
+
+## Related
+
+- [`[storage]`](/docs/config/storage/) — the durability/compaction knobs.
+- [Generated REST API](/docs/reference/rest-api/) — the `/replicate`, `/subscribe`, and `/live-query` routes `replication` and `changefeed_capacity` feed.

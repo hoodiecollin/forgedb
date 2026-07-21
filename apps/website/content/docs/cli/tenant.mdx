@@ -1,0 +1,78 @@
+---
+title: "forgedb tenant"
+description: "Manage physical, dir-per-tenant data directories for ForgeDB multi-tenancy."
+---
+
+Manage physical, dir-per-tenant data directories. Multi-tenancy is filesystem-enforced:
+each tenant's data lives under `<root>/<tenant>/`, and one server process serves exactly one
+tenant (process-per-tenant). This command only ever creates, lists, or removes directories —
+it never reads a `.forge` schema.
+
+## Subcommands
+
+| Command | Purpose |
+|---|---|
+| `create <name>` | Create a tenant's (empty) data directory and print the serve incantation. |
+| `list` | List tenant directories under the root. |
+| `drop <name>` | Remove a tenant's data directory (destructive). |
+
+<Callout type="note" title="Root precedence">
+The tenant root resolves as `--root` flag &gt; `[tenant].root` in `forgedb.toml` &gt; `./data`.
+A tenant name must be a single path segment — no separators, and not `.` or `..`.
+</Callout>
+
+### create
+
+```bash
+forgedb tenant create <name> [--root <DIR>]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<name>` | string (required) | Tenant name; becomes the directory under the root. |
+| `-r`, `--root <DIR>` | string (config / `./data`) | Tenant root directory. |
+
+### list
+
+```bash
+forgedb tenant list [--root <DIR>] [--json]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-r`, `--root <DIR>` | string (config / `./data`) | Tenant root directory. |
+| `--json` | bool (false) | Emit JSON. |
+
+### drop
+
+```bash
+forgedb tenant drop <name> [--root <DIR>] [--force]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<name>` | string (required) | Tenant name to remove. |
+| `-r`, `--root <DIR>` | string (config / `./data`) | Tenant root directory. |
+| `--force` | bool (false) | Skip the confirmation guard. |
+
+## Examples
+
+Create a tenant and read back the serve command it prints:
+
+```bash
+forgedb tenant create acme --root ./tenants
+# ✓ Created tenant 'acme' at ./tenants/acme
+#   Serve it with:  FORGEDB_TENANT=acme FORGEDB_DATA=./tenants <your-generated-binary>
+```
+
+List tenants as JSON:
+
+```bash
+forgedb tenant list --root ./tenants --json
+```
+
+Drop a tenant without the prompt:
+
+```bash
+forgedb tenant drop acme --root ./tenants --force
+```

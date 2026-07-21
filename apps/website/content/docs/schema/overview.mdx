@@ -1,0 +1,99 @@
+---
+title: "Schema language"
+description: "The .forge schema language — top-level declarations, a worked example, and a map of the reference."
+---
+
+A `.forge` file is the single source of truth for a ForgeDB application. You write
+declarative models, structs, and enums; ForgeDB transpiles them at compile time into
+tailored Rust database code, a TypeScript SDK, a REST API, and React component stubs.
+The schema is a *compile-time input to generation* — never a runtime input to a generic
+engine.
+
+## Top-level declarations
+
+A `.forge` file is a sequence of top-level declarations. There are three kinds:
+
+- **`model`** — an entity that becomes a stored table (declared by name, no keyword):
+  `User { ... }`. Models have persisted columns, relations, and optionally
+  model-level directives.
+- **`struct`** — a reusable, embedded, fixed-size value type: `struct Address { ... }`.
+  Struct fields must all be fixed-size (no `string`, no relations). A struct is inlined
+  into whatever model embeds it, not stored as its own table.
+- **`enum`** — a closed set of named variants: `enum OrderStatus { Pending, Paid }`.
+  Stored as a 1-byte discriminant and referenced from a field by its bare name.
+
+Declarations may appear in any order — an `enum` or `struct` can be declared before or
+after the models that use it.
+
+## A worked schema
+
+Here is a small but complete blog schema exercising every top-level declaration kind:
+
+```forge
+// A closed set of states — an enum, not a free string.
+enum PostStatus { Draft, Published, Archived }
+
+// A fixed-size embedded value type.
+struct GeoPoint {
+  latitude: f64
+  longitude: f64
+}
+
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  home: GeoPoint?
+  created_at: +timestamp
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string @length(1, 200)
+  slug: ^&string @length(1, 200)
+  status: ^PostStatus
+  views: ^u64
+  published_at: timestamp?
+  author: *User
+  tags: [Tag]
+  created_at: +timestamp
+  @index(status, created_at)
+}
+
+Tag {
+  id: +uuid
+  name: ^&string @length(1, 50)
+  posts: [Post]
+}
+```
+
+<Callout type="note" title="Naming is parser-enforced">
+Model, struct, and enum names must be **PascalCase**; field names must be **snake_case**.
+These are fatal parse errors, not warnings — `userId` and `user { }` both fail to parse.
+</Callout>
+
+## What each part does
+
+- `id: +uuid` — an auto-generated UUID primary key. The `+` [modifier](/docs/schema/modifiers/)
+  fills the value on insert.
+- `&string` — a **unique** column; `^string` / `^u64` — an **indexed** column for fast
+  lookups. See [indexes & projections](/docs/schema/indexes-and-projections/).
+- `status: ^PostStatus` — an [enum](/docs/schema/enums/) field, indexed.
+- `author: *User` / `tags: [Tag]` / `posts: [Post]` — [relations](/docs/schema/relations/):
+  a required foreign key, a many-to-many, and a one-to-many.
+- `@length(...)`, `@email`, `@index(...)` — [directives](/docs/schema/directives/).
+
+## Map of this section
+
+| Page | Covers |
+|------|--------|
+| [Models & fields](/docs/schema/models-and-fields/) | Model syntax, field form, modifier positions, declaration rules |
+| [Scalar types](/docs/schema/scalar-types/) | Every scalar type with Rust/TS mappings and storage behavior |
+| [Modifiers](/docs/schema/modifiers/) | `+` `&` `^` `?` in depth, with placement and type rules |
+| [Relations](/docs/schema/relations/) | One-to-many, required/optional FK, many-to-many, arrays, inline structs |
+| [Enums](/docs/schema/enums/) | Declaring and using enums; storage and filter/sort/index behavior |
+| [Directives](/docs/schema/directives/) | Every `@` directive — enforced vs. semantic-only |
+| [Indexes & projections](/docs/schema/indexes-and-projections/) | `^`, composite `@index`, `@projection`, `&unique` |
+| [Comments & whitespace](/docs/schema/comments/) | `//` comments (block comments are not supported) |
+| [Cheatsheet](/docs/schema/cheatsheet/) | One-page scannable reference |
