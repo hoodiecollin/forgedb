@@ -20,6 +20,9 @@ generated_*/
 # artifacts. The inspector app is a real tracked JS app — carve it back in.
 !apps/inspector/package.json
 !apps/inspector/**/package.json
+# The website is a real tracked JS app too — carve its package.json back in.
+!apps/website/package.json
+!apps/website/**/package.json
 # Inspector build artifacts (Next static export + Tauri target + codegen)
 apps/inspector/.next/
 apps/inspector/out/
@@ -27,6 +30,12 @@ apps/inspector/src-tauri/target/
 apps/inspector/src-tauri/gen/
 apps/inspector/next-env.d.ts
 apps/inspector/*.tsbuildinfo
+# Website build artifacts (Next static export + generated search index)
+apps/website/.next/
+apps/website/out/
+apps/website/next-env.d.ts
+apps/website/*.tsbuildinfo
+apps/website/public/search-index.json
 
 # VS Code extension build artifacts (source is tracked; outputs are not)
 vscode-forgedb/out/
