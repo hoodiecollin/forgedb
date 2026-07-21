@@ -91,7 +91,7 @@ forgedb generate api          # → generated/api.rs (+ package.json, tsconfig.j
 forgedb generate node --sdk   # → generated/types.ts  (the REST SDK; `bun --sdk` is equivalent)
 ```
 
-Or `forgedb generate all` for everything at once (adds OpenAPI + React stubs).
+Or `forgedb generate all` for everything at once (adds the OpenAPI spec).
 Output goes to `./generated/` by default (`--output` to change it). The Rust
 generator emits one tailored `database.rs` per schema — typed structs, columnar
 storage, indexes, relation traversal, validation, and a crash-safe write path —

@@ -18,7 +18,7 @@ export const metadata: Metadata = {
     template: "%s — ForgeDB",
   },
   description:
-    "ForgeDB compiles one declarative .forge schema into a tailored Rust database, a TypeScript SDK, a REST API, and React stubs. A generator, not a runtime ORM.",
+    "ForgeDB compiles one declarative .forge schema into a tailored Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec. A generator, not a runtime ORM.",
   keywords: [
     "ForgeDB",
     "database generator",
@@ -31,7 +31,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: "ForgeDB — the application-database generator",
     description:
-      "One .forge schema → a tailored Rust database, TypeScript SDK, REST API, and React stubs.",
+      "One .forge schema → a tailored Rust database, TypeScript SDK, REST API, and an OpenAPI spec.",
     url: "https://forgedb.dev",
     siteName: "ForgeDB",
     type: "website",

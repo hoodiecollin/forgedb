@@ -12,7 +12,7 @@ the stability policy is [SEMVER.md](./SEMVER.md).
 
 ForgeDB is an **application-database generator** — a compile-time code-generation tool, **not**
 a runtime ORM or query engine. A declarative `.forge` schema is transpiled into tailored Rust
-database code plus a TypeScript SDK, a REST API, and React component stubs. End users need only
+database code plus a TypeScript SDK, a REST API, and an OpenAPI spec. End users need only
 their schema, the `forgedb` CLI, and config.
 
 **The invariant.** The app's schema is a *compile-time input to generation*, never a *runtime
@@ -44,7 +44,7 @@ forgedb-codegen       one generator per artifact:
    ├─ RustGenerator        → database.rs   (storage, CRUD, indexes, relations, txns)
    ├─ TypeScriptGenerator  → types.ts      (typed SDK client)
    ├─ ApiGenerator         → api.rs        (axum REST + WS routes)
-   ├─ StubGenerator        → React/route stubs
+   ├─ StubGenerator        → placeholder stubs README  (no UI/component codegen today)
    ├─ OpenApiGenerator     → openapi.json  (offline OpenAPI 3.1 document)
    ├─ WasmGenerator        → replica/*     (browser read-replica; opt-in)
    └─ TransformGenerator   → migrations/transform/*  (offline data migration bin)

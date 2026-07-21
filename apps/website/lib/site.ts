@@ -3,7 +3,7 @@ export const site = {
   name: "ForgeDB",
   tagline: "The application-database generator",
   description:
-    "One declarative .forge schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and React stubs. A generator, not a runtime ORM.",
+    "One declarative .forge schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec. A generator, not a runtime ORM.",
   url: "https://forgedb.dev",
   github: "https://github.com/hoodiecollin/forgedb",
   crate: "https://crates.io/crates/forgedb",
