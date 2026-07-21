@@ -1,13 +1,13 @@
 # ForgeDB VSCode Extension
 
-Complete IDE support for ForgeDB schema files (`.forge`) with syntax highlighting, Language Server Protocol (LSP), and integrated commands.
+IDE support for ForgeDB schema files (`.forge`): syntax highlighting, Language Server Protocol (LSP), and integrated commands.
 
 ## Features
 
 ### 🎨 Syntax Highlighting
-- **Keywords**: `struct`, model names
-- **Types**: `string`, `u32`, `i64`, `f64`, `bool`, `uuid`, `timestamp`, etc.
-- **Symbols**: `+` (primary key), `&` (required), `^` (unique), `*` (relation), `?` (optional)
+- **Keywords**: `struct`, `enum`, model names
+- **Types**: `string`, `u32`, `i64`, `f64`, `bool`, `uuid`, `timestamp`, `decimal`, `json`, enums, etc.
+- **Symbols**: `+` (auto-generate), `&` (unique), `^` (index), `*` (required relation), `?` (optional/nullable)
 - **Directives**: `@email`, `@url`, `@min`, `@max`, `@computed`, `@index`, `@fulltext`, etc.
 - **Relations**: `[Model]` (array), `*Model` (single)
 - **Comments**: `//` (line) and `/* */` (block)
@@ -137,27 +137,30 @@ struct Address {
 ## Supported Syntax
 
 ### Field Modifiers
-- `+` - Primary key (auto-generated or auto-increment)
-- `&` - Required (non-nullable)
-- `^` - Unique constraint
-- `*` - Relation reference
-- `?` - Optional (nullable)
+- `+` - Auto-generate (`u32`/`u64`/`uuid`/`timestamp` only)
+- `&` - Unique
+- `^` - Index (ordered → range queries for sortable types)
+- `*` - Required relation reference
+- `?` - Optional (nullable), or optional relation reference
 
 ### Data Types
 
 **Numeric:**
-- `u8`, `u16`, `u32`, `u64` - Unsigned integers
-- `i8`, `i16`, `i32`, `i64` - Signed integers
-- `f32`, `f64` - Floating point
+- `u32`, `u64` - Unsigned integers
+- `i32`, `i64` - Signed integers
+- `f64` - Floating point
+- `decimal` - Exact fixed-point (`rust_decimal::Decimal`)
 
 **Text:**
 - `string` - Variable-length string
-- `char(n)` - Fixed-length string
+- `char(n)` - Fixed-length character array
 
 **Other:**
 - `bool` - Boolean
 - `uuid` - UUID v4
 - `timestamp` - Unix timestamp (i64)
+- `json` - Arbitrary JSON (`serde_json::Value`)
+- `EnumName` - Reference to a top-level `enum Name { ... }`
 
 ### Directives
 
