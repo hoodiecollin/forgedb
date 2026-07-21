@@ -20,6 +20,18 @@
   --color-danger-foreground: oklch(0.985 0 0);
   --color-info: oklch(0.72 0.18 305);
   --color-info-foreground: oklch(0.985 0 0);
+
+  /*
+   * Brand accents (docs/brand palette). Violet is the house accent and already
+   * lives in `--primary`; molten/ember are the "active forge" accent — reserved
+   * for what's being generated right now, used sparingly, never as a general fill.
+   *   molten #f59e0b  →  oklch(0.75 0.16 62)
+   *   ember  #fbbf24  →  oklch(0.83 0.16 82)
+   */
+  --color-molten: oklch(0.75 0.16 62);
+  --color-molten-foreground: oklch(0.145 0 0);
+  --color-ember: oklch(0.83 0.16 82);
+  --color-ember-foreground: oklch(0.145 0 0);
 }
 
 /*
@@ -28,9 +40,9 @@
  * agent; a class not compiled here silently no-ops). Covers solids, foregrounds,
  * and the common tint opacities used for status chips.
  */
-@source inline("{bg,text,border}-{ok,warn,danger,info}");
-@source inline("{bg,text}-{ok,warn,danger,info}-foreground");
-@source inline("{bg,text,border}-{ok,warn,danger,info}/{10,15,20,30,40}");
+@source inline("{bg,text,border}-{ok,warn,danger,info,molten,ember}");
+@source inline("{bg,text}-{ok,warn,danger,info,molten,ember}-foreground");
+@source inline("{bg,text,border}-{ok,warn,danger,info,molten,ember}/{10,15,20,30,40}");
 
 @theme inline {
     --font-heading: var(--font-sans);

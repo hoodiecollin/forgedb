@@ -2,14 +2,16 @@ import type { ReactNode } from "react";
 import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Space_Grotesk, JetBrains_Mono } from "next/font/google";
 import { cn } from "@/lib/utils";
 import { SiteHeader } from "@/components/site-header";
 import { SiteFooter } from "@/components/site-footer";
 import { CommandMenu } from "@/components/docs/search";
 
-const geist = Geist({ subsets: ["latin"], variable: "--font-sans" });
-const geistMono = Geist_Mono({ subsets: ["latin"], variable: "--font-mono" });
+// Brand typography (docs/brand): Space Grotesk for display/wordmark/body,
+// JetBrains Mono for code, CLI, and labels.
+const spaceGrotesk = Space_Grotesk({ subsets: ["latin"], variable: "--font-sans" });
+const jetbrainsMono = JetBrains_Mono({ subsets: ["latin"], variable: "--font-mono" });
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://forgedb.dev"),
@@ -43,7 +45,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
     <html
       lang="en"
       suppressHydrationWarning
-      className={cn("font-sans", geist.variable, geistMono.variable)}
+      className={cn("font-sans", spaceGrotesk.variable, jetbrainsMono.variable)}
     >
       <body className="min-h-dvh bg-background text-foreground antialiased">
         <Providers>

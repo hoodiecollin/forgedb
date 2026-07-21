@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
 import { site, headerNav } from "@/lib/site";
-import { ForgeMark, GitHubIcon } from "@/components/icons";
+import { ForgeMark, ForgeWordmark, GitHubIcon } from "@/components/icons";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { SearchTrigger } from "@/components/docs/search";
 import { MobileNav } from "@/components/mobile-nav";
@@ -15,9 +15,9 @@ export function SiteHeader() {
   return (
     <header className="sticky top-0 z-50 w-full border-b border-border/60 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
       <div className="mx-auto flex h-14 max-w-screen-2xl items-center gap-4 px-4 sm:px-6">
-        <Link href="/" className="flex items-center gap-2 font-semibold tracking-tight">
-          <ForgeMark className="size-6 text-primary" />
-          <span className="text-[15px]">{site.name}</span>
+        <Link href="/" className="flex items-center gap-2">
+          <ForgeMark className="size-6" />
+          <ForgeWordmark className="text-[15px]" />
         </Link>
 
         <nav className="hidden items-center gap-1 md:flex">

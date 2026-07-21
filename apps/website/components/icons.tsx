@@ -1,25 +1,42 @@
 import type { SVGProps } from "react";
+import { cn } from "@/lib/utils";
 
-/** ForgeDB wordmark glyph — a stylized anvil/spark. Placeholder until a real logo. */
+/**
+ * ForgeDB logomark (docs/brand `forgemark-primary.svg`) — a schema "F" node
+ * fanning into streams; the top stream runs molten (what's being forged now),
+ * the rest violet. Colors are fixed brand hex, not `currentColor`.
+ */
 export function ForgeMark(props: SVGProps<SVGSVGElement>) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden {...props}>
-      <path
-        d="M4 14c0-1 .6-1.7 1.6-2l7.2-2.1c.8-.24 1.2-.9 1.2-1.7V6.5"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-      />
-      <path
-        d="M3 14h11.5c2 0 3.2 1.1 3.8 2.6l.7 1.9"
-        stroke="currentColor"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <circle cx="17.5" cy="6" r="2.2" stroke="currentColor" strokeWidth="1.8" />
-      <path d="M12 18.5 12 21" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    <svg viewBox="0 0 120 120" fill="none" aria-hidden {...props}>
+      <mask id="forgemark-f">
+        <rect x="8" y="38" width="44" height="44" rx="11" fill="#fff" />
+        <rect x="20" y="47" width="7.5" height="26" rx="1.5" fill="#000" />
+        <rect x="20" y="47" width="21" height="7.5" rx="1.5" fill="#000" />
+        <rect x="20" y="58" width="15" height="7.5" rx="1.5" fill="#000" />
+      </mask>
+      <path d="M50 60 C68 60 74 33 94 32" stroke="#f59e0b" strokeWidth="4.5" strokeLinecap="round" />
+      <path d="M50 60 C68 60 78 50 94 50" stroke="#a684ff" strokeWidth="4.5" strokeLinecap="round" />
+      <path d="M50 60 C68 60 78 70 94 70" stroke="#a684ff" strokeWidth="4.5" strokeLinecap="round" />
+      <path d="M50 60 C68 60 74 87 94 88" stroke="#a684ff" strokeWidth="4.5" strokeLinecap="round" />
+      <circle cx="98" cy="32" r="5.5" fill="#f59e0b" />
+      <circle cx="98" cy="50" r="5.5" fill="#a684ff" />
+      <circle cx="98" cy="70" r="5.5" fill="#a684ff" />
+      <circle cx="98" cy="88" r="5.5" fill="#a684ff" />
+      <rect x="8" y="38" width="44" height="44" rx="11" fill="#a684ff" mask="url(#forgemark-f)" />
     </svg>
+  );
+}
+
+/**
+ * ForgeDB wordmark — two-tone "Forge" (foreground) + "DB" (violet primary),
+ * set in the brand display face (Space Grotesk, via `--font-sans`).
+ */
+export function ForgeWordmark({ className, ...props }: React.ComponentProps<"span">) {
+  return (
+    <span className={cn("font-semibold tracking-tight", className)} {...props}>
+      Forge<span className="text-primary">DB</span>
+    </span>
   );
 }
 

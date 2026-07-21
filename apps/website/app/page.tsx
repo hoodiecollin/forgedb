@@ -18,7 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { CodeBlock } from "@/components/code-block";
 import { CopyCommand } from "@/components/marketing/copy-command";
-import { GitHubIcon } from "@/components/icons";
+import { GitHubIcon, ForgeMark } from "@/components/icons";
 
 const SCHEMA = `// schema.forge — the single source of truth
 User {
@@ -166,6 +166,7 @@ export default function Home() {
           className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(60%_50%_at_50%_-10%,color-mix(in_oklch,var(--primary)_22%,transparent),transparent)]"
         />
         <div className="mx-auto max-w-screen-xl px-4 py-20 text-center sm:px-6 sm:py-28">
+          <ForgeMark className="mx-auto mb-6 size-16" />
           <Badge variant="secondary" className="mb-5 gap-1.5 rounded-full px-3 py-1">
             <Zap className="size-3.5 text-primary" />
             Schema-first · compile-time · pre-1.0

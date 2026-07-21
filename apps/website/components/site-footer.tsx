@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { site } from "@/lib/site";
-import { ForgeMark, GitHubIcon } from "@/components/icons";
+import { ForgeMark, ForgeWordmark, GitHubIcon } from "@/components/icons";
 
 const cols: { title: string; links: { title: string; href: string }[] }[] = [
   {
@@ -37,9 +37,9 @@ export function SiteFooter() {
     <footer className="border-t border-border/60 bg-muted/20">
       <div className="mx-auto grid max-w-screen-2xl gap-10 px-4 py-12 sm:px-6 md:grid-cols-[1.5fr_repeat(3,1fr)]">
         <div className="space-y-3">
-          <Link href="/" className="flex items-center gap-2 font-semibold">
-            <ForgeMark className="size-6 text-primary" />
-            {site.name}
+          <Link href="/" className="flex items-center gap-2">
+            <ForgeMark className="size-6" />
+            <ForgeWordmark />
           </Link>
           <p className="max-w-xs text-sm text-muted-foreground">{site.description}</p>
           <div className="flex items-center gap-3 pt-1">
