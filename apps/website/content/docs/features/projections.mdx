@@ -11,8 +11,8 @@ row.
 ## Declaring a projection
 
 ```forge
-model Post {
-  +id: uuid
+Post {
+  id: +uuid
   title: string
   slug: string
   body: string
@@ -32,12 +32,12 @@ The projection reads materialize only the projected columns, and have live and s
 (`_at`) forms:
 
 ```rust
-let card = db.get_post_card(id);          // Option<PostCard> — reads only PK + title + slug
-let cards = db.all_post_card();           // Vec<PostCard>
+let card = db.post.get_card(id);          // Option<PostCard> — reads only PK + title + slug
+let cards = db.post.all_card();           // Vec<PostCard>
 
 // Snapshot-scoped:
-let snap = db.snapshot();
-let past = db.read_post_card_at(&snap, id);
+let snap = db.post.snapshot();
+let past = db.post.get_card_at(&snap, id);
 ```
 
 <Callout type="note" title="One decode path, no drift">

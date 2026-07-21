@@ -16,11 +16,11 @@ storage; no runtime engine reads your schema.
 Mark a field with the `^` index modifier (or `&` for a unique index) in your schema:
 
 ```forge
-model User {
-  +id: uuid
-  &email: string      // unique index
-  ^status: string     // secondary index
-  ^created_at: timestamp
+User {
+  id: +uuid
+  email: &string      // unique index
+  status: ^string     // secondary index
+  created_at: ^timestamp
 }
 ```
 
@@ -30,12 +30,12 @@ Each indexed scalar field gets `find_by_<field>` (returns all matches) and `get_
 (returns the first), plus `_at` variants for snapshot reads:
 
 ```rust
-let admins = db.find_by_status("admin");        // O(1) index lookup, not a scan
-let user = db.get_by_email("a@b.com");          // Option<User>
+let admins = db.user.find_by_status("admin");   // O(1) index lookup, not a scan
+let user = db.user.get_by_email("a@b.com");      // Option<User>
 
 // Point-in-time variants resolve the snapshot's version:
-let snap = db.snapshot();
-let past = db.find_by_status_at(&snap, "admin");
+let snap = db.user.snapshot();
+let past = db.user.find_by_status_at(&snap, "admin");
 ```
 
 The index is maintained around the durable write boundary: added on insert, remove-old +
@@ -60,9 +60,9 @@ When a child has multiple FKs back to one parent, the getter disambiguates by ch
 Declare a model-level `@index(a, b)` to index a combination of fields:
 
 ```forge
-model Event {
-  +id: uuid
-  ^tenant: uuid
+Event {
+  id: +uuid
+  tenant: ^uuid
   status: string
 
   @index(tenant, status)
@@ -83,7 +83,7 @@ Nullable scalar fields are indexable. Probe parameters are `Option<T>` (`Option<
 strings), so `find_by_<field>(None)` probes the unset bucket:
 
 ```rust
-let unassigned = db.find_by_assignee(None);
+let unassigned = db.ticket.find_by_assignee(None);
 ```
 
 The index key is null-distinct and type-tagged, so `None` and the literal string `"null"`
@@ -97,9 +97,9 @@ by the typed value. Eligible types are the `Ord` keys: `u32`, `u64`, `i32`, `i64
 `timestamp`, and `decimal`.
 
 ```forge
-model Post {
-  +id: uuid
-  ^views: u64          // ordered-eligible → gets a range index
+Post {
+  id: +uuid
+  views: ^u64          // ordered-eligible → gets a range index
 }
 ```
 
@@ -107,7 +107,7 @@ This generates `find_by_<field>_range`:
 
 ```rust
 // WHERE views >= 100 ORDER BY views DESC LIMIT 10
-let top = db.find_by_views_range(100, u64::MAX, /* descending */ true, /* limit */ 10);
+let top = db.post.find_by_views_range(Some(100), None, /* descending */ true, /* limit */ Some(10));
 ```
 
 The range walk is O(offset + limit) in value order. The ordered index is **parallel** to the

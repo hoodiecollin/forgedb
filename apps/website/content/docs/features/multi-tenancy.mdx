@@ -4,7 +4,7 @@ description: "Physical dir-per-tenant isolation with a process-per-tenant model,
 ---
 
 ForgeDB's multi-tenancy is **physical, directory-per-tenant isolation** run as
-**process-per-tenant**: one `forgedb serve` process serves one tenant's data directory, and
+**process-per-tenant**: one compiled server process serves one tenant's data directory, and
 N processes sit behind a dumb host/subdomain proxy. Generated code stays tenant-oblivious —
 it just opens the data root it's given. A verify-only JWT guard cross-checks that the caller's
 token names the tenant this process serves.
@@ -20,11 +20,12 @@ The scaffolded `main.rs` is an env-driven server. Resolve the tenant, data root,
 config once, and it feeds both the data-directory open and the auth cross-check:
 
 ```bash
+# run the compiled server binary (e.g. ./target/release/<app>), not a forgedb subcommand
 FORGEDB_TENANT=acme \
 FORGEDB_DATA=/srv/tenants/acme \
 FORGEDB_JWT_ISSUER=https://auth.example.com \
 FORGEDB_JWT_AUDIENCE=forgedb \
-  forgedb serve
+  ./target/release/myapp
 ```
 
 The data root is threaded through every column, tombstone, and manifest path via the generated

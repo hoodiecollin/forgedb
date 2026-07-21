@@ -9,22 +9,27 @@ you can publish it — a `package.json` and `tsconfig.json` alongside it.
 
 ## CRUD methods
 
-For each model the SDK exposes the full CRUD set, faithful to the real REST responses:
+The SDK exports a single `ForgeDBClient` class with **flat, model-suffixed** methods
+(`get<Model>` / `list<Model>` / `create<Model>` / `update<Model>` / `delete<Model>`) — there
+is no per-model sub-object. For a model `Post`, faithful to the real REST responses:
 
 | Method | REST call | Returns |
 |---|---|---|
-| `get(id)` | `GET /api/<model>/{id}` | the record, or `null` on `404` |
-| `list(options)` | `GET /api/<model>` | `ListResult<T>` |
-| `create(input)` | `POST /api/<model>` | the new `id` (throws `ForgeDBError` on `409`/`422`) |
-| `update(id, record)` | `PUT /api/<model>/{id}` | `true`, or `false` on `404` |
-| `delete(id)` | `DELETE /api/<model>/{id}` | `true`, or `false` on `404` |
+| `getPost(id)` | `GET /api/post/{id}` | the record, or `null` on `404` |
+| `listPost(options)` | `GET /api/post` | `ListResult<Post>` |
+| `createPost(input)` | `POST /api/post` | the new `id` (throws `ForgeDBError` on `409`/`422`) |
+| `updatePost(id, record)` | `PUT /api/post/{id}` | `true`, or `false` on `404` |
+| `deletePost(id)` | `DELETE /api/post/{id}` | `true`, or `false` on `404` |
 
 ```typescript
-const { data, total } = await posts.list({ limit: 20, sort: "views" });
-const id = await posts.create({ title: "Hello", views: 0 });
-const post = await posts.get(id);       // Post | null
-await posts.update(id, { ...post!, views: 1 });
-await posts.delete(id);                 // boolean
+import { ForgeDBClient } from "./generated/types";
+const db = new ForgeDBClient("http://localhost:3000");
+
+const { data, total } = await db.listPost({ limit: 20, sort: "views", order: "desc" });
+const id = await db.createPost({ title: "Hello", views: 0 });
+const post = await db.getPost(id);       // Post | null
+await db.updatePost(id, { ...post!, views: 1 });
+await db.deletePost(id);                 // boolean
 ```
 
 ## `ListResult<T>`
@@ -40,8 +45,9 @@ interface ListResult<T> {
 }
 ```
 
-`list(options)` accepts pagination, sort, and per-field filters, mapped onto the REST
-query parameters (see [Generated REST API](/docs/reference/rest-api/)).
+`list<Model>(options)` accepts pagination (`limit`/`offset`), `sort` + `order`
+(`'asc'|'desc'`), and a per-field `filter` map, mapped onto the REST query parameters (see
+[Generated REST API](/docs/reference/rest-api/)).
 
 ## Create input types
 
@@ -51,7 +57,7 @@ Each model gets a create-input type that omits the id:
 type PostCreate = Omit<Post, "id">;
 ```
 
-`create` takes `<Model>Create` and returns the server-assigned id (the REST create
+`create<Model>` takes `<Model>Create` and returns the server-assigned id (the REST create
 responds `{ id }`, not the full record).
 
 ## Typed errors

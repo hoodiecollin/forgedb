@@ -42,12 +42,12 @@ Post {
 }`;
 
 const SDK = `// generated TypeScript SDK — fully typed from your schema
-import { ForgeDB } from "./generated/types";
+import { ForgeDBClient } from "./generated/types";
 
-const db = new ForgeDB("http://localhost:8080");
+const db = new ForgeDBClient("http://localhost:3000");
 
-// create() is typed to PostCreate; returns the new id
-const id = await db.post.create({
+// createPost() is typed to PostCreate; returns the new id
+const id = await db.createPost({
   title: "Hello, ForgeDB",
   slug: "hello-forgedb",
   views: 0,
@@ -55,10 +55,11 @@ const id = await db.post.create({
   author: userId,
 });
 
-// list() → ListResult<Post> { data, total, limit, offset }
-const { data, total } = await db.post.list({
-  filters: { published: true },
-  sort: "-views",
+// listPost() → ListResult<Post> { data, total, limit, offset }
+const { data, total } = await db.listPost({
+  filter: { published: true },
+  sort: "views",
+  order: "desc",
   limit: 10,
 });`;
 
@@ -125,7 +126,7 @@ const features: {
 ];
 
 const stats: { value: string; label: string }[] = [
-  { value: "1 schema", label: "→ Rust DB + TS SDK + REST API + stubs" },
+  { value: "1 schema", label: "→ Rust DB + TS SDK + REST API + OpenAPI" },
   { value: "1.88 MB", label: "on-disk footprint — smallest of the embedded four" },
   { value: "0.37 s", label: "group-commit bulk load of 10k rows" },
   { value: "0 deps", label: "on any runtime ORM — only schema-agnostic substrate" },
@@ -142,7 +143,7 @@ const steps: { n: string; title: string; body: string; code: string; lang: strin
   {
     n: "02",
     title: "Generate",
-    body: "Transpile the schema into tailored Rust, a TypeScript SDK, a REST API, and stubs.",
+    body: "Transpile the schema into tailored Rust, a TypeScript SDK, a REST API, and an OpenAPI spec.",
     code: "forgedb generate all --output ./generated",
     lang: "bash",
   },
@@ -176,7 +177,7 @@ export default function Home() {
           <p className="mx-auto mt-6 max-w-2xl text-balance text-lg text-muted-foreground sm:text-xl">
             Write one <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.9em]">.forge</code>{" "}
             schema. ForgeDB compiles it into a tailored Rust database, a TypeScript SDK, a REST
-            API, and React stubs — specialized to your schema at compile time. Not a runtime ORM.
+            API, and an OpenAPI spec — specialized to your schema at compile time. Not a runtime ORM.
           </p>
           <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
             <Button asChild size="lg">
