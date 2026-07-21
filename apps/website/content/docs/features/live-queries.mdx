@@ -1,0 +1,59 @@
+---
+title: "Live queries & change feed"
+description: "In-process real-time subscriptions over generated WebSocket endpoints — a field-blind change feed and stateful, removal-aware live queries — with honest notes on single-process scope and the O(rows) re-run cost."
+---
+
+ForgeDB generates two real-time WebSocket surfaces: a lightweight **change feed** that pushes
+typed events as rows change, and stateful **live queries** that maintain a filtered result set
+with add/update/remove deltas. Both are in-process and best-effort; both reuse the *same*
+generated closed-set filter as the REST list endpoint — there is no second predicate parser.
+
+## Change feed — `/subscribe/<model>`
+
+Every mutation emits a **field-blind** signal `(model, row_index, kind)` onto an in-process
+broadcast (the schema-agnostic `forgedb-changefeed` substrate carries the model *name*, never
+a field). The generated WebSocket endpoint routes by model name, materializes the row via the
+read path, applies a generated per-model filter, and streams typed JSON events.
+
+```bash
+# Subscribe to filtered inserts/updates/deletes for a model:
+wscat -c "ws://localhost:8080/subscribe/post?status=published"
+```
+
+Events carry `ChangeKind::{Inserted, Updated, Deleted, Linked}`. A `Deleted` event includes
+the pre-delete row so the record is still materializable. The filter compares **typed
+per-field**: `?views=3` matches a stored `3.0`, and bool / uuid / decimal / timestamp / enum
+compare by value (the old `serde_json` stringify fragility is gone).
+
+## Live queries — `/live-query/<model>`
+
+A live query is stateful and removal-aware. It binds the query-string params to the same
+generated closed-set filter, sends the current matching set as an `Init` delta, then on each
+coarse change signal re-runs the filtered query and diffs by id, pushing typed deltas:
+
+```bash
+wscat -c "ws://localhost:8080/live-query/post?status=published"
+```
+
+Deltas are `Init` / `Added` / `Updated` / `Removed`. `Removed` is expressible because a delete
+appends a tombstoned version (the mutation surface makes removals observable). `Updated` is
+detected by a generated typed per-field comparison, not a string hash.
+
+<Callout type="note" title="One filter, everywhere">
+The change feed, live queries, and the REST list endpoint all bind to the same generated
+per-model closed-set matcher (`<model>_event_matches`). There is no second, drift-prone
+predicate parser — the field-aware logic is generated once.
+</Callout>
+
+## Limits
+
+- **Single-process.** Both surfaces are in-process, best-effort broadcasts — there is no
+  cross-process broker on this path. For a durable, resumable, cross-process stream (which
+  feeds the browser read-replica), see the replication broker in
+  [Browser read-replica](/docs/features/browser-replica/).
+- **Live queries re-run O(rows) per matched event per connection**, with no
+  coalescing/debounce. A selective filter re-runs a narrow scan and materializes only the
+  matching rows, but a broad filter materializes its whole matching set. This is the scaling
+  cliff to keep in mind for high-throughput or broad subscriptions.
+- The filter is **exact-match** (`=`), not range or prefix — for value ranges use an
+  [ordered index](/docs/features/indexes/).

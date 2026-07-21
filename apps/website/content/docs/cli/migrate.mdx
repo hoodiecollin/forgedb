@@ -1,0 +1,108 @@
+---
+title: "forgedb migrate"
+description: "Record, build, and run schema migrations that rewrite data-at-rest across format versions."
+---
+
+Schema evolution follows the generate-then-compile model: you edit `schema.forge`,
+regenerate, and rebuild. Additive changes (a new model, a new nullable field) are preserved
+automatically on reopen. Everything else rewrites data-at-rest, and `forgedb migrate` drives
+that end to end via a generated offline transformer. See the
+[migrations feature guide](/docs/features/migrations/) for the full workflow.
+
+## Subcommands
+
+| Command | Purpose |
+|---|---|
+| `create <description>` | Record a migration; with `--auto`, diff the schema and classify/scaffold the change. |
+| `status` | Show migration status. |
+| `build --from F --to T` | Generate + compile the offline transformer bin for a version range. |
+| `run --src S --dest D` | Run a built transformer over a source → destination data directory. |
+| `up` | One-CLI migration: build the transformer + run it over a data dir (or every tenant). |
+
+### create
+
+```bash
+forgedb migrate create <description> [--auto] [--schema <PATH>]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<description>` | string (required) | Human description of the migration. |
+| `-a`, `--auto` | bool (false) | Auto-detect schema changes by diffing against the recorded snapshot; record, classify (`Auto`/`Authored`), and scaffold any authored body. |
+| `-s`, `--schema <PATH>` | path | Schema file to diff against the snapshot (for `--auto`). |
+
+### status
+
+```bash
+forgedb migrate status
+```
+
+Show applied and pending migrations. Takes no flags.
+
+### build
+
+```bash
+forgedb migrate build --from <F> --to <T> [--output <DIR>]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--from <F>` | u32 (required) | Origin (current on-disk) format version. |
+| `--to <T>` | u32 (required) | Destination format version. |
+| `-o`, `--output <DIR>` | path (`migrations/transform`) | Where to emit + build the transformer crate. |
+
+### run
+
+```bash
+forgedb migrate run --src <DATA> --dest <MIGRATED> [--bin-dir <DIR>]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--src <DATA>` | path (required) | Source data directory at the origin format version. |
+| `--dest <MIGRATED>` | path (required) | Destination directory to materialize (must be absent/empty). |
+| `--bin-dir <DIR>` | path (`migrations/transform`) | The built transformer crate directory. |
+
+### up
+
+```bash
+forgedb migrate up [--from F] [--to T] [--src S --dest D] [--tenant-root R] [--output O] [--dest-suffix SUF]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--from <F>` | u32 (detected from source manifests) | Origin format version. |
+| `--to <T>` | u32 (lineage's current version) | Destination format version. |
+| `--src <S>` | path | Source data directory (single-dir mode). |
+| `--dest <D>` | path | Destination directory to materialize (single-dir mode). |
+| `-o`, `--output <O>` | path (`migrations/transform`) | Transformer crate directory. |
+| `--tenant-root <R>` | path | Migrate every data dir directly under this root (per-tenant sweep). |
+| `--dest-suffix <SUF>` | string (`-migrated-v<to>`) | Per-tenant destination suffix. |
+
+<Callout type="note" title="up writes a fresh destination">
+`migrate up` builds the transformer, `cargo build`s it, and runs it — writing a **fresh**
+destination and leaving the source untouched, so the original is your rollback. The app must
+be stopped (offline / exclusive-writer). `build`, `run`, and `generate transform` are the
+lower-level primitives `up` composes.
+</Callout>
+
+## Examples
+
+Record an additive change and regenerate:
+
+```bash
+forgedb migrate create "add note field" --auto --schema schema.forge
+forgedb generate
+```
+
+Migrate one data directory in a single step:
+
+```bash
+forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
+```
+
+Sweep every tenant under a root:
+
+```bash
+forgedb migrate up --tenant-root ./tenants --to 2
+```

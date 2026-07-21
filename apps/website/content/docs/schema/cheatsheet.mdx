@@ -1,0 +1,124 @@
+---
+title: "Cheatsheet"
+description: "A one-page scannable reference to every .forge type, modifier, relation, and directive, plus a kitchen-sink schema."
+---
+
+A compact lookup for the whole `.forge` language. Follow the links for the full detail.
+
+## Scalar types
+
+| Type | Rust | TS | Indexable? |
+|------|------|----|------------|
+| `u32` `u64` `i32` `i64` | same | `number` | ✅ |
+| `f64` | `f64` | `number` | filter/sort (no ordered index) |
+| `bool` | `bool` | `boolean` | ✅ |
+| `string` | `String` | `string` | ✅ (exact-match) |
+| `char(N)` | `[u8; N]` | `string` | ✅ (fixed-size; struct-safe) |
+| `uuid` | `Uuid` | `string` | ✅ |
+| `timestamp` | `i64` | `number` | ✅ |
+| `decimal` | `Decimal` | `string` | ✅ (normalized key) |
+| `json` | `serde_json::Value` | `unknown` | ❌ |
+
+No `text` type. See [scalar types](/docs/schema/scalar-types/).
+
+## Modifiers
+
+| Sigil | Position | Meaning | Notes |
+|-------|----------|---------|-------|
+| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only |
+| `&` | prefix | unique (enforced) | any type; also indexes |
+| `^` | prefix | indexed | any indexable type |
+| `?` | postfix (or prefix) | nullable | any type |
+
+Combine freely: `id: +uuid`, `email: ^&string`, `bio: string?`, `external: +uuid?`. See
+[modifiers](/docs/schema/modifiers/).
+
+## Relations
+
+| Syntax | Kind |
+|--------|------|
+| `[Model]` | one-to-many (virtual) |
+| `*Model` | required FK |
+| `?Model` | optional FK |
+| `[..]` / `[..]` on both sides | many-to-many (junction) |
+| `[type; N]` | fixed-size array (fixed-size element) |
+| `StructName` / `StructName?` | inline struct (fixed-size fields only) |
+
+Traversal is UUID-keyed-target only. See [relations](/docs/schema/relations/).
+
+## Enums
+
+```forge
+enum Status { Active, Suspended, Closed }
+Account { id: +uuid  status: ^Status }
+```
+
+PascalCase name + variants; 1-byte discriminant; serialized as the variant name;
+filterable / sortable (declaration order) / indexable. See [enums](/docs/schema/enums/).
+
+## Directives
+
+**Enforced:** `@min` `@max` `@length` `@email` `@url` `@pattern`/`@regex` (→ 422),
+`@on_delete(restrict|cascade|set_null)` (→ 409 / cascade / null).
+
+**Semantic-only markers:** `@default` `@computed` `@fulltext` `@materialized`
+`@relations(*|fields)` (component-only).
+
+**Model-level:** `@index(a, b, ...)` (composite, ≥ 2 fields), `@projection(name: cols)`,
+`@soft_delete`.
+
+Args accept numbers, bare idents, and quoted strings. See
+[directives](/docs/schema/directives/) and [indexes & projections](/docs/schema/indexes-and-projections/).
+
+## Comments
+
+`//` line comments only. **No** block comments (`/* */`). Newlines are significant; no
+semicolons. See [comments & whitespace](/docs/schema/comments/).
+
+## Not supported
+
+`~` auto-update · `text` type · block comments `/* */`.
+
+## Kitchen-sink schema
+
+```forge
+// Every construct in one file.
+enum OrderStatus { Placed, Paid, Shipped, Delivered, Cancelled }
+
+struct GeoPoint {
+  latitude: f64
+  longitude: f64
+}
+
+User {
+  id: +uuid
+  email: ^&string @email
+  name: string @length(1, 100)
+  bio: string?
+  home: GeoPoint?
+  balance: decimal
+  metadata: json?
+  created_at: +timestamp
+  orders: [Order]
+  tags: [Tag]
+}
+
+Order {
+  id: +uuid
+  status: ^OrderStatus
+  total: decimal @min(0)
+  placed_at: +timestamp
+  customer: *User @on_delete(cascade)
+  courier: ?User @on_delete(set_null)
+  scores: [u32; 5]
+  @index(customer, placed_at)
+  @projection(summary: status, total, placed_at)
+  @soft_delete
+}
+
+Tag {
+  id: +uuid
+  label: ^&string @length(1, 50)
+  users: [User]
+}
+```

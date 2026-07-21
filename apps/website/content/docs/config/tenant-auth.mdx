@@ -1,0 +1,95 @@
+---
+title: "[tenant] & [auth]"
+description: "The [tenant] and [auth] tables — the per-tenant data root and the verify-only JWT tenant guard that bridges to FORGEDB_* env at runtime."
+---
+
+The `[tenant]` and `[auth]` tables configure ForgeDB's process-per-tenant multi-tenancy
+and its verify-only JWT tenant guard. Both are deployment config — never read from a
+`.forge` schema.
+
+## `[tenant]`
+
+Physical, dir-per-tenant isolation: each tenant's data lives under `<root>/<tenant>/`, and
+one generated server process serves exactly one tenant.
+
+```toml
+[tenant]
+root = "./data"
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `root` | string | `"./data"` | Root directory under which each tenant's data dir lives. |
+
+`root` is what the `forgedb tenant {create,list,drop}` CLI manages and what generated
+processes open under. At runtime the server resolves its data dir from `FORGEDB_DATA` and
+`FORGEDB_TENANT` (a Tier-C env override — see [deployment](/docs/reference/deployment/)).
+
+## `[auth]`
+
+The generated server can guard every REST + WebSocket data route with a **verify-only**
+JWT tenant check. ForgeDB *verifies* tokens your identity provider issues — it never issues
+them, and it does no row-level authorization.
+
+```toml
+[auth]
+enabled = true
+issuer = "https://idp.example.com/"
+audience = "forgedb"
+tenant_claim = "tenant"
+jwks_url = "https://idp.example.com/.well-known/jwks.json"
+# public_key_path = "/etc/forgedb/idp.pem"   # alternative to jwks_url
+algorithms = ["RS256"]
+leeway_secs = 60
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | Turn the JWT tenant guard on for the generated server. |
+| `issuer` | string | *(unset)* | Expected `iss` (issuer) claim. |
+| `audience` | string | *(unset)* | Expected `aud` (audience) claim. |
+| `tenant_claim` | string | `"tenant"` | Name of the claim carrying the tenant identity. |
+| `jwks_url` | string | *(unset)* | JWKS endpoint URL (`.well-known/jwks.json`) to fetch verification keys. |
+| `public_key_path` | string | *(unset)* | Path to a static PEM public key (alternative to `jwks_url`). |
+| `algorithms` | string[] | `["RS256"]` | Allowed signature algorithms. Asymmetric only. |
+| `leeway_secs` | u64 | `60` | Clock-skew leeway in seconds (`exp`/`nbf` checks). |
+
+## The verify-only model
+
+The guard verifies an asymmetric JWT (via JWKS or a static PEM), pins the algorithm,
+checks `exp`/`nbf`/`iss`/`aud` with the configured skew, extracts the `tenant_claim`, and
+cross-checks it against the process's own tenant. A wrong tenant returns **403**; a
+missing or invalid token returns **401**. On success an opaque `Principal` is injected. The
+guard knows nothing about your models, rows, or fields.
+
+<Callout type="note" title="What it does not do">
+The auth layer is verify-only: no token issuance, and no per-principal / row-level
+authorization. It answers "is this a valid token for *this* tenant?" — nothing finer.
+</Callout>
+
+## FORGEDB_* env bridge
+
+Multi-tenancy is process-per-tenant and 12-factor: the running server reads its auth
+config from the environment, not from `forgedb.toml`. The `[auth]` table is the
+*declarative source* that `forgedb tenant create` translates into the exact `FORGEDB_*`
+exports an operator copies into their process manager. Enabling the guard sets the
+following (empty when `enabled = false`):
+
+| Config key | Env export |
+|---|---|
+| `public_key_path` | `FORGEDB_JWT_PUBKEY` |
+| `jwks_url` | `FORGEDB_JWKS_URL` |
+| `issuer` | `FORGEDB_JWT_ISSUER` |
+| `audience` | `FORGEDB_JWT_AUDIENCE` |
+| `tenant_claim` | `FORGEDB_TENANT_CLAIM` |
+| `algorithms` (first) | `FORGEDB_JWT_ALG` |
+| `leeway_secs` | `FORGEDB_JWT_LEEWAY` |
+
+The guard turns on at runtime when `FORGEDB_JWT_PUBKEY` (or `FORGEDB_JWKS_URL`) is set, and
+`FORGEDB_TENANT` is then required so the token's tenant claim has something to be
+cross-checked against. Full env reference: [deployment](/docs/reference/deployment/).
+
+## Related
+
+- [Deployment](/docs/reference/deployment/) — the full `FORGEDB_*` runtime env and process-per-tenant scale-out.
+- [Generated REST API](/docs/reference/rest-api/) — which routes sit behind the guard (data routes) versus outside it (ops routes).

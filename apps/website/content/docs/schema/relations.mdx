@@ -1,0 +1,147 @@
+---
+title: "Relations"
+description: "Modeling relationships in .forge — one-to-many, required/optional foreign keys, many-to-many, fixed arrays, and inline structs."
+---
+
+Relations connect models. ForgeDB generates the persisted foreign-key columns, the
+junction tables, and typed traversal methods (forward, reverse, and eager-load) from the
+relation syntax below.
+
+## Relation syntax at a glance
+
+| Syntax | Kind | Meaning |
+|--------|------|---------|
+| `[Model]` | one-to-many | This parent has many children |
+| `*Model` | required FK | Must reference exactly one record |
+| `?Model` | optional FK | May reference one record, or none |
+| `[..]` / `[..]` | many-to-many | Two models each list the other |
+
+<Callout type="warning" title="Traversal is UUID-keyed only">
+Foreign keys are always stored as `uuid`, so relation traversal is generated only between
+**UUID-keyed** models. A model with an integer primary key can still be defined, but FK
+targets pointing at it are skipped.
+</Callout>
+
+## Required foreign key — `*Model`
+
+`*Model` is a required, non-null reference. It generates a scalar FK column
+(`author: *User` → an `author_id: uuid` column) and a forward getter.
+
+```forge
+Post {
+  id: +uuid
+  title: string
+  author: *User        // every post must have an author
+}
+```
+
+Existence is enforced: creating a `Post` with an author id that does not resolve is
+rejected (HTTP 409 dangling reference).
+
+## Optional foreign key — `?Model`
+
+`?Model` is a nullable reference — the FK column is `Option<uuid>`.
+
+```forge
+Post {
+  id: +uuid
+  category: ?Category  // a post may have no category
+}
+```
+
+## One-to-many — `[Model]`
+
+`[Model]` declares the *many* side from the parent. It is **virtual** — nothing is stored
+on the parent row; the relationship lives on the child's foreign key. It generates a
+reverse getter (e.g. `user_posts`) that is index-served.
+
+```forge
+User {
+  id: +uuid
+  posts: [Post]        // reverse of Post.author
+}
+
+Post {
+  id: +uuid
+  author: *User
+}
+```
+
+## Many-to-many
+
+When **both** models list the other with `[..]` and neither side is a foreign key, the
+parser auto-detects a many-to-many relationship and generates a junction table.
+
+<Compare>
+```forge
+Post {
+  id: +uuid
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  posts: [Post]
+}
+```
+
+```rust
+// Generated junction + traversal (illustrative):
+struct PostTagLink { left: Uuid, right: Uuid }
+
+db.link_post_tag(post_id, tag_id);
+db.post_tags(post_id);   // -> Vec<Tag>
+db.tag_posts(tag_id);    // -> Vec<Post>
+```
+</Compare>
+
+`link` / `unlink` maintain the junction; `post_tags` / `tag_posts` traverse it.
+
+## Fixed-size arrays — `[type; N]`
+
+A fixed-length array of a **fixed-size** element type (a scalar or a struct). The count is
+a numeric literal.
+
+```forge
+Product {
+  scores: [u32; 10]         // exactly 10 ints
+  thumbnails: [char(255); 5] // 5 fixed-size byte arrays
+}
+```
+
+Because the element must be fixed-size, `[string; N]` is invalid — use `char(N)` for
+fixed-width text inside an array.
+
+## Inline structs
+
+A [struct](/docs/schema/overview/) is a reusable embedded value type. It is inlined into
+the model that references it — not stored as its own table.
+
+```forge
+struct Address {
+  street: char(100)
+  city: char(50)
+  zip: char(10)
+}
+
+User {
+  id: +uuid
+  address: Address?     // optional embedded struct
+}
+```
+
+<Callout type="warning" title="Structs are fixed-size only">
+A struct may contain **only fixed-size** fields. `string`, relations, and nested
+variable-length types are rejected inside a struct — use `char(N)` for text. Reference a
+struct required (`address: Address`) or optional (`address: Address?`).
+</Callout>
+
+## Generated traversal
+
+From these declarations ForgeDB generates typed helpers on `Database`:
+
+- **Forward FK** — `post_author(&post) -> Option<User>` (optional FKs thread through
+  `and_then`).
+- **Reverse one-to-many** — `user_posts(id) -> Vec<Post>`, an O(matches) index probe.
+- **Many-to-many** — `link_post_tag`, `post_tags`, `tag_posts`.
+- **Eager load** — `post_with_relations(id) -> PostWithRelations { post, author, ... }`.

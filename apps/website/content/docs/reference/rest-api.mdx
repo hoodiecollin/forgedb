@@ -1,0 +1,97 @@
+---
+title: "Generated REST API"
+description: "The shape of the REST + WebSocket API ForgeDB generates from your schema — CRUD routes, query parameters, operational routes, and realtime streams."
+---
+
+`forgedb generate api` emits an axum router tailored to your schema. Every model gets a
+full CRUD route set; the whole database gets operational and realtime routes. Nothing is
+interpreted at runtime — each handler is generated for exactly one schema.
+
+## CRUD routes per model
+
+For a model `Post`, the route base is the kebab-cased model name, under `/api`:
+
+| Method + Route | Purpose | Success | Errors |
+|---|---|---|---|
+| `GET /api/post` | List with filter/sort/paginate. | `200 {data, total, limit, offset}` | — |
+| `POST /api/post` | Create a record. | `201 {id}` | `409` unique/FK, `422` field constraint |
+| `GET /api/post/{id}` | Fetch one by id. | `200 <record>` | `404` |
+| `PUT /api/post/{id}` | Replace the whole record. | `200` / `204` | `404`, `409`, `422` |
+| `DELETE /api/post/{id}` | Delete by id. | `204` | `404`, `409` (referenced by children) |
+
+The `{id}` path segment is a string in the URL; integer-PK models parse it back to their
+key type.
+
+### List response shape
+
+```json
+{ "data": [ /* records */ ], "total": 137, "limit": 20, "offset": 0 }
+```
+
+`total` is the count of matches before pagination.
+
+## Query parameters (list + read)
+
+The list handler filters, sorts, and paginates. Filtering and sorting are **generated
+per-model** over a closed set of fields; the query string itself is parsed by the
+schema-agnostic `forgedb-query-params` substrate.
+
+| Param | Applies to | Meaning |
+|---|---|---|
+| `?<field>=<value>` | list | Exact-match filter on a filterable field (typed compare — `?n=3` matches a stored `3.0`). |
+| `?sort=<field>` / sort direction | list | Sort by a sortable field. |
+| `?limit=` / `?offset=` | list | Pagination (limit is clamped to a maximum). |
+| `?projection=<name>` | get + list | Return only a declared `@projection`'s columns. Unknown name → `400`; absent → full record. |
+| `?as_of=<watermark>` | get + list | Point-in-time read at a row-count watermark (snapshot). Non-numeric → `400`. |
+
+<Callout type="note" title="Filters are a closed generated set">
+Only fields the generator marks filterable/sortable are accepted — there is no ad-hoc
+`?fields=` or runtime column list. `json` columns are not filterable/sortable (no total
+order). `?projection=` accepts only declared projection names.
+</Callout>
+
+The `?as_of=` token is a **row-count watermark**, not a wall-clock instant, and is valid
+only within a compaction epoch — discard pinned tokens after a detected reopen. See
+[snapshots](/docs/features/snapshot-reads/).
+
+## Operational routes (no auth)
+
+These sit **outside** the JWT tenant guard so load balancers and probes reach them without
+a token:
+
+| Route | Response | Use |
+|---|---|---|
+| `GET /health` | `{"status":"ok"}` | Liveness — never touches the DB. |
+| `GET /ready` | `{"status":"ready"}` | Readiness — acquires a read lock. |
+| `GET /metrics` | `{"model_count", "rows_per_model", "total_rows"}` | Minimal per-model row counts (JSON, not Prometheus text). |
+| `GET /snapshot` | `{"watermarks": {"<Model>": <n>}}` | Current per-model watermarks (for `?as_of=` reads). |
+
+Point your liveness probe at `/health` and readiness at `/ready`. See
+[deployment](/docs/reference/deployment/).
+
+## WebSocket routes
+
+Realtime streams. `/subscribe` and `/live-query` sit **behind** the tenant guard;
+`/replicate` also sits behind it.
+
+| Route | Kind | Payload |
+|---|---|---|
+| `GET /subscribe/<model-kebab>` | Change feed (insert/update/delete/link events). | Typed JSON events, filtered by a generated per-model matcher. |
+| `GET /live-query/<model>?<field>=<value>` | Stateful result-set subscription. | Typed `<Model>LiveDelta` (`Init`/`Added`/`Updated`/`Removed`). |
+| `GET /replicate?after=<offset>` | Durable, resumable replication stream. | Opaque binary `PersistedEvent` frames from a monotonic global offset. |
+
+<Callout type="warning" title="/replicate requires the broker">
+The `/replicate` endpoint (and the browser read-replica that consumes it) only functions
+when the durable broker is attached. Set `[runtime].replication = true` — see
+[`[runtime]`](/docs/config/runtime/). `/subscribe` and `/live-query` are in-process and
+always available; their broadcast buffer is `[runtime].changefeed_capacity`.
+</Callout>
+
+WebSocket clients send the JWT in the `Authorization` header. Behind a reverse proxy,
+forward the `Upgrade`/`Connection` headers so these routes work — see
+[deployment](/docs/reference/deployment/).
+
+## Related
+
+- [TypeScript SDK](/docs/reference/typescript-sdk/) — the generated typed client over this API.
+- [`[tenant]` & `[auth]`](/docs/config/tenant-auth/) — which routes the guard covers.

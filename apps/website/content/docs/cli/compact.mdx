@@ -1,0 +1,70 @@
+---
+title: "forgedb compact"
+description: "Inspect database statistics and get maintenance recommendations. Offline compaction is deprecated."
+---
+
+Database maintenance and inspection. The read-only `stats` and `analyze` subcommands work
+over a data directory; the mutating `run` and `vacuum` subcommands are **deprecated and exit
+non-zero**.
+
+<Callout type="warning" title="Offline compaction is removed">
+`compact run` and `compact vacuum` mutate nothing and exit non-zero (code 6). Their
+tombstone-based algorithm is unsafe against the generated mutation surface — it reclaims
+nothing from updates and can **resurrect deleted rows**. Generated databases compact
+automatically in-process under the single-writer lock, or you can call `Database::compact()`
+from your running app. That path is keep-set-based and never resurrects deletes.
+</Callout>
+
+## Subcommands
+
+| Command | Status | Purpose |
+|---|---|---|
+| `stats` | active | Show per-model or database-wide statistics. |
+| `analyze` | active | Analyze the database and print recommendations. |
+| `run` | **deprecated** | No-op; exits non-zero with guidance. |
+| `vacuum` | **deprecated** | Alias for `run`; no-op, exits non-zero. |
+
+### stats
+
+```bash
+forgedb compact stats [--data-dir <DIR>] [--model <NAME>] [--json]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-d`, `--data-dir <DIR>` | string (`data`) | Data directory to inspect. |
+| `-m`, `--model <NAME>` | string | Show statistics for a single model only. |
+| `--json` | bool (false) | Emit JSON. |
+
+### analyze
+
+```bash
+forgedb compact analyze [--data-dir <DIR>] [--json]
+```
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-d`, `--data-dir <DIR>` | string (`data`) | Data directory to analyze. |
+| `--json` | bool (false) | Emit JSON. |
+
+## Examples
+
+Show database-wide statistics as JSON:
+
+```bash
+forgedb compact stats --data-dir ./data --json
+```
+
+Analyze a single data directory:
+
+```bash
+forgedb compact analyze --data-dir ./data
+```
+
+The deprecated path exits non-zero:
+
+```bash
+forgedb compact run
+# error: Offline `forgedb compact` / `vacuum` is REMOVED (issue #105) ...
+# (exit code 6)
+```

@@ -1,0 +1,44 @@
+---
+title: "What is ForgeDB"
+description: "An application-database generator — one schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and React stubs."
+---
+
+ForgeDB is an **application-database generator**. You write one declarative `.forge`
+schema and ForgeDB transpiles it into tailored Rust database code, a TypeScript SDK, a
+REST API, and React component stubs — all specialized to your schema at compile time.
+
+```forge
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  created_at: +timestamp
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string @length(1, 200)
+  views: ^u64
+  published: bool
+  author: *User
+  created_at: +timestamp
+}
+```
+
+<Callout type="note" title="A generator, not a runtime ORM">
+The app's schema is a *compile-time input to generation*, never a *runtime input to a
+generic engine*. Every schema-specific surface — types, tables, queries, filters,
+relations, API routes — is generated and tailored per app.
+</Callout>
+
+## The generation pipeline
+
+A single schema drives every artifact:
+
+- **`database.rs`** — a tailored Rust database over columnar storage
+- **`types.ts`** — TypeScript types + a typed client SDK
+- **`api.rs`** — a REST API with an OpenAPI document
+- **stubs** — React/route component contracts
+
+Read on for [installation](/docs/installation/) and the [quickstart](/docs/quickstart/).

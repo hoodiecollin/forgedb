@@ -1,0 +1,54 @@
+---
+title: "forgedb coordinate"
+description: "Run the Tier-3 MVCC commit coordinator that serializes writes across multiple processes."
+---
+
+Start the Tier-3 MVCC commit coordinator for a data directory. The coordinator holds the
+exclusive directory lock on behalf of all connected clients, serializes the commit turn, and
+sequences the commit LSN — enabling multiple *processes* to write to one data directory. See
+[transactions & MVCC](/docs/features/transactions-mvcc/) for how the tiers fit together.
+
+## Synopsis
+
+```bash
+forgedb coordinate <root> [--socket <PATH>] [--fsync <MODE>] [--fsync-interval <N>]
+```
+
+Coordinated clients connect via `Database::connect_coordinator(socket_path)` and open the
+data directory **lock-free** (they defer the write lock to the coordinator).
+
+## Flags
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `<root>` | path (required) | Data root directory to coordinate. |
+| `-s`, `--socket <PATH>` | path (`<root>/_coord.sock`) | Unix socket path clients connect on. |
+| `--fsync <MODE>` | string (`always`) | Replication-log fsync policy: `always`, `never`, or `periodic`. Overridable via `FORGEDB_COORDINATOR_FSYNC`. |
+| `--fsync-interval <N>` | u64 (`64`) | Commits per fsync when `--fsync periodic`. Overridable via `FORGEDB_COORDINATOR_FSYNC_INTERVAL`. |
+
+<Callout type="note" title="fsync affects only the replication log">
+The replication log is resumable and secondary — clients fsync their own columns and WAL
+before a commit is acknowledged. So `never`/`periodic` never risk committed client data; on
+a coordinator crash they only rewind replication. `always` is the max-durability default.
+</Callout>
+
+## Examples
+
+Start the coordinator on the default socket:
+
+```bash
+forgedb coordinate ./data
+```
+
+Use a custom socket and periodic replication fsync:
+
+```bash
+forgedb coordinate ./data --socket ./data/_coord.sock \
+  --fsync periodic --fsync-interval 128
+```
+
+Configure fsync via the environment instead of flags:
+
+```bash
+FORGEDB_COORDINATOR_FSYNC=never forgedb coordinate ./data
+```

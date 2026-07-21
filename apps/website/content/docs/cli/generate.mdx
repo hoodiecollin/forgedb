@@ -1,0 +1,86 @@
+---
+title: "forgedb generate"
+description: "Transpile a .forge schema into tailored Rust, a REST API, OpenAPI, stubs, or a language runtime binding."
+---
+
+Transpile your schema into code. A target is either a **standalone artifact** (`all`,
+`rust`, `api`, `openapi`, `stubs`, `ffi`, `transform`) or a **runtime** (`python`, `node`,
+`bun`, `browser`) paired with a mode flag (`--sdk`, `--runtime`, or `--replica`).
+
+## Synopsis
+
+```bash
+forgedb generate [target] [--sdk|--runtime|--replica] [flags]
+```
+
+The target defaults to `all`.
+
+## Targets
+
+| Target | Kind | Produces |
+|---|---|---|
+| `all` | standalone | Every enabled artifact (`rust`, `api`, `openapi`, `stubs`, and `ffi` if listed in `[generate].targets`). |
+| `rust` | standalone | `database.rs` — the tailored Rust database. |
+| `api` | standalone | `api.rs` — the REST API + OpenAPI document. |
+| `openapi` | standalone | `openapi.json` — the OpenAPI 3.1 document (offline). |
+| `stubs` | standalone | React/route component stubs. |
+| `ffi` | standalone | C-ABI FFI bindings. |
+| `transform` | standalone | The offline migration transformer crate (requires `--from`/`--to`; see [migrations](/docs/features/migrations/)). |
+| `python --runtime` | runtime | PyO3 in-process native binding. |
+| `node --sdk` / `bun --sdk` | runtime | TypeScript REST client SDK. |
+| `node --runtime` / `bun --runtime` | runtime | NAPI-RS in-process native binding. |
+| `browser --replica` | runtime | WASM in-process read-replica follower. |
+
+<Callout type="warning" title="Standalone targets take no mode">
+Passing `--sdk`/`--runtime`/`--replica` to a standalone target is an error. A runtime
+target **requires** a mode. Not-yet-implemented combinations (`python --sdk`,
+`node|bun --replica`) error explicitly. The old flat verbs `generate typescript` /
+`generate wasm` were renamed — use `node --sdk` / `browser --replica`.
+</Callout>
+
+## Flags
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `[target]` | string (`all`) | The artifact or runtime to generate. |
+| `--sdk` | bool | Mode (runtime targets): network REST client. |
+| `--runtime` | bool | Mode (runtime targets): in-process native FFI binding. |
+| `--replica` | bool | Mode (runtime targets): in-process read-replica follower. |
+| `--check` | bool (false) | Verify nothing needs regeneration (CI mode); do not write. |
+| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. |
+| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. |
+| `-f`, `--force` | bool (false) | Regenerate even if up-to-date; overwrite existing output. |
+| `--from <N>` | u32 | Origin format version — `transform` target only. |
+| `--to <N>` | u32 | Destination format version — `transform` target only. |
+
+<Callout type="note" title="Generate-time config is baked in">
+The schema-blind `[runtime]`/`[storage]` knobs from `forgedb.toml` are resolved into the
+codegen config baked into `database.rs`, so `generate` produces the tailored behavior you
+configured. See [configuration](/docs/config/overview/).
+</Callout>
+
+## Examples
+
+Generate everything into `./generated`:
+
+```bash
+forgedb generate all --output ./generated
+```
+
+Generate only the Rust database from a specific schema:
+
+```bash
+forgedb generate rust --schema ./schema.forge
+```
+
+Generate the TypeScript REST SDK for Node:
+
+```bash
+forgedb generate node --sdk
+```
+
+Fail CI if generated code is stale:
+
+```bash
+forgedb generate all --check
+```

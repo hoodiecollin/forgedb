@@ -1,0 +1,94 @@
+---
+title: "Scalar types"
+description: "Every .forge scalar type with its Rust and TypeScript mapping, storage layout, and index/filter/sort behavior."
+---
+
+These are the primitive types a field can hold. For composite types (relations, arrays,
+inline structs) see [relations](/docs/schema/relations/); for closed value sets see
+[enums](/docs/schema/enums/).
+
+## The complete list
+
+| Type | Rust | TypeScript | Storage | Indexable / filterable / sortable |
+|------|------|-----------|---------|-----------------------------------|
+| `u32` | `u32` | `number` | fixed 4-byte column | ✅ |
+| `u64` | `u64` | `number` | fixed 8-byte column | ✅ |
+| `i32` | `i32` | `number` | fixed 4-byte column | ✅ |
+| `i64` | `i64` | `number` | fixed 8-byte column | ✅ |
+| `f64` | `f64` | `number` | fixed 8-byte column | ✅ (filter/sort; ordered index deferred) |
+| `bool` | `bool` | `boolean` | fixed 1-byte column | ✅ |
+| `string` | `String` | `string` | variable-length column | ✅ |
+| `json` | `serde_json::Value` | `unknown` | variable-length column (serialized JSON) | ❌ |
+| `decimal` | `rust_decimal::Decimal` | `string` | fixed 16-byte column | ✅ |
+| `uuid` | `uuid::Uuid` | `string` | fixed 16-byte column | ✅ |
+| `timestamp` | `i64` | `number` | fixed 8-byte column | ✅ |
+| `char(N)` | `[u8; N]` | `string` | fixed N-byte column | ✅ |
+
+<Callout type="warning" title="There is no `text` type">
+Older docs mention a `text` type. It does **not** exist — use `string` for all
+variable-length UTF-8 text. Likewise the `~` auto-update modifier does not exist.
+</Callout>
+
+## Integers, floats, and booleans
+
+`u32`/`u64`/`i32`/`i64` are unsigned/signed integers; `f64` is a 64-bit float; `bool` is
+`true`/`false`. All ride fixed-width columns and are fully indexable, filterable, and
+sortable.
+
+`f64` is filterable and sortable, but does **not** yet get an ordered/range index (there
+is no clean total order for floats — `NaN` breaks `Ord`). Equality filters and sorting
+still work.
+
+## `string`
+
+Variable-length UTF-8 text, stored on the variable-length column. Fully indexable,
+filterable, and sortable. A hash index on a string is **exact-match only** (see
+[indexes](/docs/schema/indexes-and-projections/)).
+
+## `char(N)`
+
+A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Because it is
+fixed-width, it can live inside a [struct](/docs/schema/relations/#inline-structs) — where
+`string` cannot. Requires the parenthesized size: `code: char(8)`.
+
+## `uuid`
+
+A universally unique identifier, stored on a fixed 16-byte column. Foreign-key columns are
+always `uuid`, which is why relation traversal is only generated between UUID-keyed models.
+
+## `timestamp`
+
+A Unix timestamp stored as an `i64`. Auto-generatable with `+` (fills the current time on
+insert).
+
+## `json`
+
+Arbitrary JSON, typed `serde_json::Value` in Rust and `unknown` in TypeScript. Its
+serialized bytes ride the same variable-length column as `string`.
+
+<Callout type="warning" title="`json` is not indexable, filterable, or sortable">
+JSON has no total order the generated closed-set matcher can key on, so `^`/`&`, REST
+`?field=` filter/sort, and `find_by_*` are all rejected on a `json` field. `json?` uses a
+1-byte presence tag, so `None` and `Some(Value::Null)` round-trip distinctly.
+</Callout>
+
+## `decimal`
+
+Exact fixed-point (`rust_decimal::Decimal`) for money and quantities where `f64` would
+drift. It rides the fixed **16-byte column** (like `uuid`) and serializes to and from JSON
+as a **string** (precision-preserving — TS types it `string`).
+
+Because `Decimal` is `Ord` + `Hash`, `decimal` **is** filterable, sortable, and indexable.
+The index key is normalized (`.normalize()`), so scale-only differences like `1.0` and
+`1.00` share one bucket.
+
+<Callout type="note" title="`decimal(p, s)` precision is deferred">
+Only bare `decimal` is parsed today. Precision/scale metadata (`decimal(10, 2)`) is not yet
+supported.
+</Callout>
+
+## Nullability
+
+Any scalar can be made nullable with a postfix `?` (`age: i32?`, `bio: string?`). Nullable
+fixed-width types carry a 1-byte presence tag so an absent value and a zero value stay
+distinct. See [modifiers](/docs/schema/modifiers/) for the full nullability rules.

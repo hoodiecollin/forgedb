@@ -1,0 +1,82 @@
+---
+title: "Configuration"
+description: "What forgedb.toml is, how it is discovered, the precedence rules, and the binding-time tier model that governs every knob."
+---
+
+ForgeDB reads a single project config file, `forgedb.toml`, at **generate time**. It
+holds schema-blind knobs — deployment and behavior settings that are not part of your
+`.forge` schema. The schema describes your data shape; `forgedb.toml` describes how the
+generated code and the running process behave.
+
+<Callout type="note" title="Config is schema-blind">
+Nothing in `forgedb.toml` is per-model or field-aware. If a setting depended on a
+specific model or field, it would be a `.forge` directive, not a config key. Two apps
+with entirely different schemas could share the same `forgedb.toml` verbatim.
+</Callout>
+
+## Discovery
+
+`forgedb.toml` is auto-discovered in the current working directory. If no file is
+present, ForgeDB uses built-in defaults silently. You can point at an explicit path:
+
+```bash
+forgedb generate all                 # discovers ./forgedb.toml (or defaults)
+forgedb generate all -c prod.toml    # explicit path (also --config)
+```
+
+An explicit `-c/--config` path that is missing or contains invalid TOML is a hard error;
+a missing `./forgedb.toml` is not (defaults apply).
+
+## Precedence
+
+For any given setting, the highest-priority source wins:
+
+1. An explicit CLI flag (`--output`, `--schema`, …)
+2. The value in the loaded `forgedb.toml`
+3. The built-in default
+
+## Binding-time tiers
+
+Every runtime/storage knob binds at one of three times. Knowing the tier tells you *when*
+a change takes effect and how "baked in" it is.
+
+| Tier | Name | Mechanism | When it binds |
+|---|---|---|---|
+| **A** | Generate-time specialization | Code is emitted or omitted (e.g. the replication broker, the auto-compaction trigger). The compiler optimizes around code that is not there. | `forgedb generate` |
+| **B** | Baked const | Same code, a tailored number baked as a `const` (e.g. checkpoint interval, cascade depth, the fsync *policy value*). | `forgedb generate` |
+| **C** | Process-start env | Read once at process start from a `FORGEDB_*` environment variable (host, port, data dir, JWT settings). | Server launch |
+
+Tiers A and B are baked into `database.rs` when you run `forgedb generate` — change them
+and regenerate. Tier C is read fresh at each process start, so you can change it per
+deployment without regenerating. The `[runtime]` and `[storage]` tables are Tiers A/B;
+the `[auth]` table bridges to Tier-C `FORGEDB_*` env at runtime (see [tenant &
+auth](/docs/config/tenant-auth/)).
+
+<Callout type="warning" title="fsync is Tier B today">
+`[storage].fsync = "never"` bakes the `FsyncPolicy` *value* as a const, but the substrate
+still matches it per-write at runtime — so the barrier syscall is still present in the
+binary (a dead, value-known branch), not removed. True Tier-A elimination of the barrier
+is a documented follow-up. See [`[storage]`](/docs/config/storage/).
+</Callout>
+
+## The tables
+
+| Table | Purpose | Page |
+|---|---|---|
+| `[project]` | Project name and version metadata. | [\[generate\] & \[project\]](/docs/config/generate/) |
+| `[generate]` | Schema path, output dir, which targets to emit. | [\[generate\] & \[project\]](/docs/config/generate/) |
+| `[runtime]` | Replication, changefeed capacity, cascade depth (Tier A/B). | [\[runtime\]](/docs/config/runtime/) |
+| `[storage]` | fsync policy, WAL checkpoint, compaction (Tier A/B). | [\[storage\]](/docs/config/storage/) |
+| `[tenant]` | The per-tenant data root. | [\[tenant\] & \[auth\]](/docs/config/tenant-auth/) |
+| `[auth]` | Verify-only JWT tenant guard settings (bridges to `FORGEDB_*`). | [\[tenant\] & \[auth\]](/docs/config/tenant-auth/) |
+
+Unknown top-level tables are ignored, so `forgedb.toml` is forward-compatible with future
+keys.
+
+## Defaults are byte-identical
+
+The generated `database.rs` with an empty `[runtime]`/`[storage]` config is
+**byte-identical** to the fully-defaulted output — with one deliberate exception:
+`[runtime].replication` defaults to **off**. An unused durable replication broker would
+pay a second `F_FULLFSYNC` barrier per write for nothing, so it is omitted unless you opt
+in. See [`[runtime]`](/docs/config/runtime/).

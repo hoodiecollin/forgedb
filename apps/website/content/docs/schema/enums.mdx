@@ -1,0 +1,87 @@
+---
+title: "Enums"
+description: "Declaring and using enums in .forge — a closed set of named variants stored as a 1-byte discriminant, serialized by name."
+---
+
+An `enum` declares a closed set of named values. Use one instead of a free `string` when a
+field has a fixed set of valid states — an order status, a role, a priority.
+
+## Declaring an enum
+
+An `enum` is a top-level declaration (a sibling of models and structs):
+
+```forge
+enum OrderStatus {
+  Pending,
+  Paid,
+  Shipped,
+  Delivered,
+  Cancelled,
+}
+```
+
+**Rules:**
+
+- The enum name is **PascalCase**; every variant is **PascalCase**, unique, and the set is
+  non-empty. A trailing comma is optional.
+- Enums may be declared **before or after** the models that reference them.
+- An enum may have at most **256 variants** (the discriminant is one byte).
+
+## Using an enum
+
+Reference an enum from a field by its **bare PascalCase name** — no sigil (sigils like
+`*`, `?`, `[]` are relations). Prefix modifiers and postfix `?` work as usual:
+
+```forge
+Order {
+  id: +uuid
+  status: ^OrderStatus       // indexed enum field
+  prev_status: OrderStatus?  // nullable enum -> Option
+}
+```
+
+A bare identifier used as a type must resolve to a declared enum (or an inline struct),
+otherwise it is an "unknown type" error.
+
+## Storage & serialization
+
+<Compare>
+```forge
+enum Role { Admin, Editor, Viewer }
+
+User {
+  id: +uuid
+  role: ^Role
+}
+```
+
+```typescript
+// Generated TypeScript:
+export type Role = "Admin" | "Editor" | "Viewer";
+```
+</Compare>
+
+- **Storage** — a fixed **1-byte `u8` discriminant** (variants map to `0..N` in
+  declaration order). A nullable enum is a 2-byte `[present, disc]` column, so `None` and
+  `Some(<variant 0>)` stay distinct.
+- **Rust** — a fieldless enum deriving `Ord`, `Hash`, `Serialize`, `Deserialize`, and
+  more. It serializes as the **variant-name string**, so REST, TypeScript, and JSON all
+  agree on `"Admin"`.
+- **TypeScript** — a closed string union. **OpenAPI** — `{ "type": "string", "enum": [...] }`.
+
+## Filter, sort, index
+
+Because the generated enum is `Ord` + `Hash`, an enum field **is** filterable, sortable,
+and indexable (`^`, `&`, composite `@index`, and `find_by_*`):
+
+- **Sort** orders by **declaration order** (the discriminant value) — in `Role` above,
+  `Admin < Editor < Viewer`.
+- **Index** keys on the variant **name** string.
+- No runtime validation is needed on the Rust path (a closed enum cannot hold an invalid
+  variant). On the REST boundary, an unknown variant string fails deserialization → 4xx
+  automatically.
+
+<Callout type="tip" title="Prefer an enum over a status string">
+An enum documents the valid states, packs into one byte, and sorts in a meaningful order —
+strictly better than a `status: string` when the set is closed and known at schema time.
+</Callout>

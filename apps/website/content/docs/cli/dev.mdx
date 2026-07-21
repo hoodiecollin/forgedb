@@ -1,0 +1,36 @@
+---
+title: "forgedb dev"
+description: "Watch a .forge schema and auto-regenerate the generated code on every change."
+---
+
+Watch the schema file and regenerate the code whenever it changes. Blocks until you press
+`Ctrl+C`.
+
+## Synopsis
+
+```bash
+forgedb dev [--schema <PATH>] [--output <DIR>] [--debounce <MS>] [--clear]
+```
+
+## Flags
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `-s`, `--schema <PATH>` | string (`schema.forge`) | Schema file to watch. Must exist. |
+| `-o`, `--output <DIR>` | string (`generated`) | Output directory for regenerated code. |
+| `-d`, `--debounce <MS>` | u64 (`200`) | Debounce delay in milliseconds between a change and regeneration. |
+| `--clear` | bool (**true**) | Clear the terminal on each regeneration. |
+
+## Examples
+
+Watch the default `schema.forge` and regenerate into `generated/`:
+
+```bash
+forgedb dev
+```
+
+Watch a custom path with a longer debounce and no screen clearing:
+
+```bash
+forgedb dev --schema ./db/schema.forge --output ./out --debounce 500 --clear false
+```

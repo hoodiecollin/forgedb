@@ -1,0 +1,150 @@
+---
+title: "Deployment"
+description: "Running a generated ForgeDB app in production — the Docker/compose path, the FORGEDB_* environment, graceful shutdown, and health checks."
+---
+
+A ForgeDB-generated app is a single self-contained axum binary. `forgedb init` emits a
+blessed container path (multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`)
+and a 12-factor `main.rs` configured entirely from the environment. There is no config
+file at runtime — the binary reads its settings from `FORGEDB_*` env vars.
+
+## The environment
+
+The generated `src/main.rs` reads all config from the environment, opens its data
+directory, and serves the REST + WebSocket API plus the operational routes.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `FORGEDB_HOST` | `127.0.0.1` | Bind host — set `0.0.0.0` in a container. |
+| `FORGEDB_PORT` | `3000` | Bind port. |
+| `FORGEDB_DATA` | `data` | Data directory (the per-tenant root). |
+| `FORGEDB_TENANT` | *(unset)* | Tenant this process serves → opens `<FORGEDB_DATA>/<tenant>`. |
+| `RUST_LOG` | `info` | Log level filter (`tracing-subscriber` env-filter). |
+| `FORGEDB_LOG_FORMAT` | *(text)* | Set `json` for machine-parseable log lines. |
+
+### JWT tenant guard
+
+Verify-only — ForgeDB verifies tokens your IdP issues, it never issues them. The guard is
+enabled when `FORGEDB_JWT_PUBKEY` (or `FORGEDB_JWKS_URL`) is set:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `FORGEDB_JWT_PUBKEY` | *(unset)* | Path to the IdP's PEM public (verification) key. |
+| `FORGEDB_JWKS_URL` | *(unset)* | JWKS endpoint to fetch verification keys. |
+| `FORGEDB_JWT_ALG` | `RS256` | Signature algorithm (asymmetric only). |
+| `FORGEDB_JWT_ISSUER` | *(unset)* | Expected `iss`. |
+| `FORGEDB_JWT_AUDIENCE` | *(unset)* | Expected `aud`. |
+| `FORGEDB_TENANT_CLAIM` | `tenant` | Claim carrying the tenant id. |
+| `FORGEDB_JWT_LEEWAY` | `60` | Clock-skew leeway (seconds). |
+
+When the guard is on, `FORGEDB_TENANT` is required — the token's tenant claim is
+cross-checked against it (wrong tenant → 403). These env vars are the runtime bridge for
+the [`[auth]` config table](/docs/config/tenant-auth/); `forgedb tenant create` prints the
+exact exports.
+
+## Operational routes (no auth)
+
+Three ops routes sit **outside** the JWT guard so load balancers and Kubernetes probes
+reach them without a token:
+
+| Route | Response | Use |
+|---|---|---|
+| `GET /health` | `{"status":"ok"}` | Liveness — never touches the DB. |
+| `GET /ready` | `{"status":"ready"}` | Readiness — acquires a read lock. |
+| `GET /metrics` | per-model row counts | Minimal JSON scrape (not Prometheus text in v1). |
+
+Point your liveness probe at `/health` and your readiness probe at `/ready`. Full route
+list: [Generated REST API](/docs/reference/rest-api/).
+
+## Containers
+
+`forgedb init` writes a ready-to-build image. Generate before building — the build context
+expects the generated code present:
+
+```bash
+forgedb generate all --output ./generated
+docker build -t myblog .
+docker run -p 3000:3000 -v myblog-data:/data myblog
+```
+
+The generated `Dockerfile` is multi-stage: a `rust:1-slim` builder running `cargo build
+--release --locked`, and a `debian:bookworm-slim` runtime with only `ca-certificates` +
+`curl`, a non-root `forgedb` user, `/data` as a `VOLUME`, `FORGEDB_HOST=0.0.0.0` baked as
+a default, and a `HEALTHCHECK` that curls `/health`.
+
+### Compose
+
+```bash
+docker compose up --build
+```
+
+The generated `docker-compose.yml` maps `3000:3000`, mounts a named `forgedb-data` volume
+at `/data`, and includes the same `/health` healthcheck. Tenancy, JSON logs, and JWT knobs
+are present as commented environment entries — uncomment what you need.
+
+## Graceful shutdown
+
+The server installs a `tracing` subscriber and drains in-flight requests on
+`SIGINT`/`SIGTERM` (`axum::serve(..).with_graceful_shutdown`), so a container stop or
+`Ctrl-C` never severs a connection mid-write.
+
+## The single-writer contract
+
+<Callout type="warning" title="One writer per data directory">
+The process takes an advisory directory lock on open; a second writer against the same
+directory refuses to start (it does not corrupt). Do **not** point two server processes at
+the same `FORGEDB_DATA/<tenant>` dir. Concurrent *readers* are fine.
+</Callout>
+
+Scale a single tenant **vertically** (one process) and scale **across** tenants
+horizontally (one process each — process-per-tenant). Manage tenant directories with
+`forgedb tenant {create,list,drop}`.
+
+```bash
+forgedb tenant create acme --root ./data          # make ./data/acme
+FORGEDB_TENANT=acme FORGEDB_DATA=./data ./myblog  # serve tenant acme
+```
+
+## Reverse proxy / TLS
+
+Terminate TLS and route hosts/subdomains with nginx or Caddy in front of the bound port.
+Forward the `Upgrade`/`Connection` headers so the change-feed / live-query / replication
+WebSocket routes work, and forward `Authorization` for the JWT guard:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Authorization $http_authorization;
+}
+```
+
+## Logs
+
+Structured logging is the standard stack — `tracing` + `tracing-subscriber` (honors
+`RUST_LOG`) + a `tower-http` request span per request. Text by default;
+`FORGEDB_LOG_FORMAT=json` emits one JSON object per line for a log aggregator.
+
+## On-host (systemd)
+
+`forgedb init` also emits `deploy/<name>.service`, `deploy/<name>.env`, and a
+`deploy/README.md` for running under systemd (non-root `DynamicUser`, managed
+`StateDirectory`, `SIGTERM` drain). Other init systems (OpenRC, runit, s6, launchd,
+supervisord, Windows services) follow the same shape and are documented, not emitted.
+
+## Prebuilt CLI binaries
+
+<Callout type="note" title="Release workflow authored, not yet run">
+Tagging a release (`git tag v* && git push --tags`) triggers `.github/workflows/release.yml`,
+which cross-builds the `forgedb` **CLI** for Linux (x86_64/aarch64), macOS (Intel/ARM), and
+Windows and attaches them to a GitHub Release. That workflow is authored and YAML-validated
+but has not yet been run by a real tag push. It ships the CLI; your generated *app* is built
+from its own `Dockerfile`.
+</Callout>
+
+## Related
+
+- [`[tenant]` & `[auth]`](/docs/config/tenant-auth/) — the declarative source for the JWT env.
+- [Substrate crates](/docs/reference/substrate-crates/) — what the generated binary links.

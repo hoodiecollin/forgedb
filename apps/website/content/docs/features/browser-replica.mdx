@@ -1,0 +1,71 @@
+---
+title: "Browser read-replica"
+description: "The WASM read-replica — the same generated database.rs running in the browser, following the durable replication broker over /replicate, persisting to IndexedDB or OPFS. Read-only and local-first, not \"faster\"."
+---
+
+The browser read-replica is the **same generated `database.rs`** compiled to `wasm32`,
+running in a Web Worker as a **read-only replica**. It follows the server's durable
+replication broker over the `/replicate` stream, persists locally to IndexedDB or OPFS, and
+answers arbitrary generated queries against a local store — so your UI queries a local WASM
+instance instead of the network.
+
+<Callout type="warning" title="It's a local-first store, not a faster store">
+The replica is **not** a "faster store." It is a local-first, identity-preserving store that
+runs the *same* generated code as the server — same filter/sort/index/traversal/snapshot
+semantics, byte-for-byte. Justify it on local querying, offline reads, and cross-entity
+consistency — **not** on beating the JS engine at raw compute. For most apps, a well-cached
+TypeScript SDK plus a subscribe-WS is the lighter, faster-to-first-paint default.
+</Callout>
+
+## How it works
+
+- **Same generated engine.** The replica compiles the generated `database.rs` to `wasm32`
+  with zero codegen branches — a target-specific storage facade absorbs the difference. A
+  pure-TS store would be a second implementation of all the query logic that must stay
+  bit-identical to the Rust engine forever; the replica avoids that permanent drift surface.
+- **Fed by the durable broker.** The server records each committed change to a durable,
+  CRC-framed replication log at a monotonic global offset. The replica connects to
+  `/replicate?after=<offset>`, receives opaque `PersistedEvent` frames, and replays each
+  through the generated `apply_frame` — dispatch by the opaque model tag, ordering by the
+  broker offset, never a decoded field.
+- **Persistence — IndexedDB or OPFS.** The `storage-web` backend persists per-column files
+  with byte-identical positional layout to the native engine, so partial fault-in and the
+  backup/manifest format just work. OPFS writes discrete per-column files.
+- **Engine-in-Worker + partial hydrate.** The engine runs in a dedicated Web Worker so the
+  storage arena can fault columns in **synchronously** from OPFS sync-access handles (a
+  Worker-only API). Untouched columns never load; an index rebuild on reopen reads only the
+  indexed columns. First paint is architecturally protected — wasm fetch/compile/instantiate
+  and hydration happen off the main thread.
+
+## Resume semantics
+
+Because frames are ordered and idempotent by absolute offset, a return visit resumes cleanly:
+hydrate from the persisted watermark, connect `after=W`, catch up the bounded gap (durable
+replay stitched to the live tail), and stay live — with **0 frames re-applied**. On a dropped
+connection, resume from the offset with no refetch.
+
+<Callout type="note" title="Cold vs. warm is the whole story">
+Cold (first visit) pays the wasm download + compile + hydrate + catch-up — a genuine tax
+versus a plain network fetch. Warm (return visit) reuses the HTTP cache and persisted OPFS,
+resumes from the stored watermark, and skips re-downloading the dataset. Warm is where the
+replica clearly wins.
+</Callout>
+
+## Limits
+
+- **Read-only.** The replica is a read-only follower today. Writes still round-trip to the
+  server, so there is no write-latency or offline-write advantage yet — the advantage is
+  entirely on the read/query side.
+- **Not a compute win on small data.** V8 is fast at object manipulation, and crossing the
+  JS↔wasm↔Worker boundary has real per-call cost. The wins are identity (single
+  implementation), scale (columnar, GC-free, low memory at tens of thousands of rows and up),
+  and the opaque-byte replication/persistence format — not raw FLOPS.
+- **Cold-start tax is real and unmeasured per schema.** The `.wasm` binary is a separate
+  sibling asset (hundreds of KB to low-MB depending on schema and features); its size, compile
+  time, and time-to-first-local-query are not yet benchmarked.
+- **No wall-clock time-travel** locally either — snapshot tokens are row-count watermarks (see
+  [Point-in-time reads](/docs/features/snapshot-reads/)).
+
+The replica replaces both an SDK read-cache and its subscribe-WS with one local queryable
+store fed by one durable stream — see [Live queries & change feed](/docs/features/live-queries/)
+for the in-process realtime surfaces on the SDK path.

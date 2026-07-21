@@ -1,0 +1,102 @@
+---
+title: "Models & fields"
+description: "Model and field syntax in .forge — the field form, modifier positions, and the parser-enforced declaration rules."
+---
+
+A **model** is an entity that becomes a stored table. You declare it by name (no keyword)
+followed by a block of fields.
+
+## Model syntax
+
+```forge
+ModelName {
+  field: type
+  field: type
+}
+```
+
+**Rules the parser enforces (fatal on violation):**
+
+- The model name must be **PascalCase** — `User`, `OrderItem`. `user` or `order_item`
+  fail to parse.
+- A model must contain **at least one field**. An empty `User { }` is rejected.
+- Model names must be **unique** within the schema.
+
+```forge
+User {
+  id: +uuid
+  email: &string @email
+  created_at: +timestamp
+}
+```
+
+## Field syntax
+
+Each field has the form:
+
+```forge
+name: [MODIFIER]type [@directive ...]
+```
+
+- **`name`** — required, **snake_case** (`created_at`, not `createdAt`). Non-snake_case
+  names are a fatal parse error.
+- **`type`** — required, immediately after the colon. One of the
+  [scalar types](/docs/schema/scalar-types/), an [enum](/docs/schema/enums/), a struct,
+  or a [relation](/docs/schema/relations/).
+- **modifiers** — optional `+`, `&`, `^` prefixes (before the type).
+- **directives** — optional `@...` [directives](/docs/schema/directives/) after the type.
+
+Field names must be **unique within a model** — a duplicate `id` is rejected.
+
+## Modifier positions
+
+The prefix modifiers `+` (auto-generate), `&` (unique), and `^` (indexed) appear
+**between the colon and the type name**. Any combination is allowed and order among them
+does not matter:
+
+```forge
+field: +type      // auto-generate
+field: &type      // unique
+field: ^type      // indexed
+field: +&^type    // all three (any combination)
+```
+
+The nullable modifier `?` is different: it appears **after the type** (postfix), though a
+prefix form also works. See [modifiers](/docs/schema/modifiers/) for the full rules.
+
+```forge
+field: string?    // nullable string (postfix — the idiomatic form)
+field: ?string    // prefix nullable also parses
+field: +uuid?     // auto-generate + nullable
+```
+
+<Callout type="tip" title="Read the sigils left to right">
+`username: +&^string @min(3)` reads as: auto-generate, unique, indexed `string`, with a
+minimum-length constraint. Prefix sigils modify the type; postfix `?` and `@`-directives
+follow it.
+</Callout>
+
+## Worked field examples
+
+```forge
+Post {
+  id: +uuid                                 // auto-generated UUID PK
+  title: string @length(1, 200)             // required string, length constraint
+  slug: ^&string @length(1, 200)            // indexed + unique string
+  view_count: u32 @default(0)               // default marker (semantic)
+  published: bool @default(false)
+  published_at: timestamp?                  // nullable timestamp
+  author: *User                             // required foreign key
+  created_at: +timestamp                    // auto-generated timestamp
+}
+```
+
+## Terminators & layout
+
+- **No semicolons.** Fields and models are delimited by newlines and the `{` / `}` block
+  braces — newlines are significant.
+- A field's `@` directives must follow its type on the same logical line (before the next
+  newline or the next constraint).
+- Definitions may span multiple lines freely; horizontal whitespace is insignificant.
+
+See [comments & whitespace](/docs/schema/comments/) for the details.

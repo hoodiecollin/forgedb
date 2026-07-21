@@ -1,0 +1,120 @@
+---
+title: "Migrations"
+description: "Schema evolution the generator way — a version interlock, automatic additive backfill, Auto/Authored hop classification, and an offline transformer bin driven by forgedb migrate create → migrate up, with a per-tenant sweep."
+---
+
+ForgeDB is a code generator, so schema evolution follows the generate-then-compile model: you
+edit `schema.forge`, regenerate, and recompile. What happens to the **data on disk** depends
+on the change:
+
+- **Additive** changes (a new model, a new nullable field) are preserved automatically — the
+  regenerated app backfills them on reopen. No data step.
+- **Everything else** (a type change, a column/model drop, a nullable→NOT-NULL narrowing, a
+  `&unique` add, a required field with no default) rewrites data-at-rest. ForgeDB generates a
+  per-version **offline transformer bin** that does the rewrite, driven by `forgedb migrate`.
+
+<Callout type="note" title="The transformer is generated code, not a runtime engine">
+The schema is never a runtime input to a generic engine. The transformer is generated code —
+one straight-line typed replay per origin→destination version range — not an interpreter that
+reads your schema at runtime.
+</Callout>
+
+## The version interlock
+
+Every generated app bakes in an `EXPECTED_FORMAT_VERSION` derived from your migration lineage.
+On open it reads one opaque `format_version` integer from each data-dir manifest and
+**refuses a mismatch** rather than mis-decode stale bytes. A regenerated app will not silently
+read a not-yet-migrated directory, and the transformer will not apply the wrong range. The
+version is the only cross-schema handshake — it never reads column names or types to
+"self-heal." A fresh database baselines at `format_version = 1`; each recorded migration bumps
+it by one.
+
+## Additive changes — automatic
+
+```bash
+# 1. Edit schema.forge — add the new nullable field AT THE END of the model.
+# 2. Record the change (baselines the lineage on first run):
+forgedb migrate create "add note field" --auto --schema schema.forge
+# 3. Regenerate and rebuild:
+forgedb generate
+# 4. Restart. Existing rows are backfilled with defaults on first open.
+```
+
+On reopen, generated recovery anchors on the tombstone row count (the authoritative committed
+count) and backfills any column shorter than the anchor — the new field — with its default.
+Existing rows are never touched. **Constraints:** append new fields at the **end** of the
+model (columns are position-addressed), and prefer nullable when the type zero is not
+meaningful (new non-null fields backfill to the type zero, not `@default`).
+
+## Data-rewriting changes — hop classification
+
+For anything reopen backfill cannot do, `forgedb migrate create --auto` still **records** the
+change as a versioned hop and classifies it:
+
+- **`Auto`** — the differ can prove the new-row body (drop a field/model, rename, add a
+  `&unique`). No authoring needed.
+- **`Authored`** — the differ cannot know the value (a type re-encode, a nullable→NOT-NULL
+  fill, a required-add-without-default). `migrate create` writes a scaffold at
+  `migrations/<id>/transform.rs` for you to fill in and freeze.
+
+## Lifecycle — `migrate create` → `migrate up`
+
+```bash
+# 1. Edit schema.forge, then record + classify the change:
+forgedb migrate create "qty to string" --auto --schema schema.forge
+#    → records migrations/<id>_*.json (from_version -> to_version)
+#    → snapshots migrations/schemas/v<n>.forge
+#    → for Authored residue, scaffolds migrations/<id>/transform.rs
+
+# 2. If an authored body was scaffolded, fill in every TODO. authored_transform(model, row)
+#    receives each row as JSON AFTER the automatic ops, and returns it reshaped.
+
+# 3. Regenerate your app (its EXPECTED_FORMAT_VERSION advances):
+forgedb generate
+
+# 4. With the app STOPPED, migrate the data in one step:
+forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
+
+# 5. Point the regenerated app at ./data-migrated.
+```
+
+`migrate up` generates the transformer crate for the range, `cargo build`s it, and runs it. It
+writes a **fresh destination** and leaves the source untouched, so the original *is* your
+rollback. `--from` defaults to the version detected from the source manifests and `--to` to the
+lineage's current version.
+
+### How the transformer works
+
+For a `--from B --to G` range, ForgeDB emits a self-contained crate: one typed module per
+version (`vN.rs`, each carrying its own version open-guard), any frozen authored bodies
+embedded verbatim, and a `main.rs` that is a **fixed straight-line chain** of named
+`transform_vN_to_vM` hop functions — no runtime step interpreter. Each hop reads every row
+through the `vN` typed structs, applies the baked structural ops then the authored transform,
+and writes through `vM`'s `insert` (which preserves record ids, so foreign keys stay valid).
+Multi-hop ranges replay through temp dirs and publish with a single atomic rename. The crate
+depends only on your app's substrate — never on `forgedb-parser` or `forgedb-migrations`, and
+it never parses a `.forge` at runtime.
+
+## Per-tenant sweep
+
+Under [multi-tenancy](/docs/features/multi-tenancy/), each tenant is an independent data dir
+under one root. `migrate up` sweeps them in one command:
+
+```bash
+forgedb migrate up --tenant-root ./tenants --to 2
+# migrates ./tenants/<t> → ./tenants/<t>-migrated-v2 for every tenant data dir
+```
+
+It builds the transformer once and runs it per tenant independently: a tenant that fails (or
+is at an unexpected version — the open-guard refuses it) is reported and skipped with its source
+unchanged, and the command exits non-zero if any tenant failed.
+
+## Limits
+
+- **Offline / exclusive-writer.** `migrate up` is offline; online (live-writer) migration is
+  not supported.
+- Additive backfill uses the **type zero**, not `@default` (deferred).
+- `compaction_epoch` verification before apply is deferred — the format-version guard is the
+  interlock today.
+- Cheap in-place byte-op hops (drop/rename without an O(rows) typed rewrite) are deferred; the
+  transformer does a uniform typed replay.

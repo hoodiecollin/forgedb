@@ -1,0 +1,50 @@
+---
+title: "forgedb validate"
+description: "Parse and validate a .forge schema, its naming conventions, and optionally its UI component references."
+---
+
+Parse the schema, report its statistics (models, fields, relations), and check semantic
+rules such as PascalCase model names. Use it as a fast pre-flight before `generate` or in
+CI.
+
+## Synopsis
+
+```bash
+forgedb validate [--strict] [--schema-only] [--implementations] [--components] [--schema <PATH>]
+```
+
+## Flags
+
+| Flag | Type / default | Meaning |
+|---|---|---|
+| `--strict` | bool (false) | Fail on unimplemented computed/view fields (treat warnings as errors). |
+| `--schema-only` | bool (false) | Validate syntax only; skip the semantic checks. |
+| `--implementations` | bool (false) | Check `@computed` field implementations. **Accepted but not yet enforced** — a documented no-op until schema expressions land. |
+| `--components` | bool (false) | Check UI component references (`tsx://`, `jsx://`, `api://`). |
+| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. |
+
+<Callout type="warning" title="--implementations is a no-op">
+The `--implementations` flag is parsed and accepted but does nothing yet. The real check —
+verifying every `@computed` field resolves — lands with the `@computed(<expr>)` schema-
+expression feature. Do not rely on it to catch anything today.
+</Callout>
+
+## Examples
+
+Validate the schema in the current directory:
+
+```bash
+forgedb validate
+```
+
+Syntax-only check of a specific file:
+
+```bash
+forgedb validate --schema-only --schema ./schema.forge
+```
+
+Strict validation including component references:
+
+```bash
+forgedb validate --strict --components
+```
