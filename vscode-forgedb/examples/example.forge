@@ -5,11 +5,11 @@
 User {
   id: +uuid
   email: ^&string @email
-  username: ^&string @min(3) @max(50)
+  username: ^&string @length(3, 50)
   password_hash: &string
   full_name: string?
   avatar_url: string? @url
-  bio: string? @max(500)
+  bio: string? @length(1, 500)
   is_active: bool @default(true)
   role: &string @default("user")
 
@@ -39,14 +39,14 @@ User {
   last_login: timestamp?
 }
 
-/* Blog Post Model
-   Supports full-text search and rich content */
+// Blog Post Model
+// Supports full-text search and rich content
 Post {
   id: +uuid
-  title: &string @max(200) @fulltext
+  title: &string @length(1, 200) @fulltext
   slug: ^&string @index
   content: &string @fulltext
-  excerpt: string? @max(300)
+  excerpt: string? @length(1, 300)
   published: bool @default(false)
   view_count: u64 @default(0)
   like_count: u32 @default(0)
@@ -55,7 +55,7 @@ Post {
   author: *User @on_delete(cascade)
   comments: [Comment]
   tags: [Tag]
-  category: *Category?
+  category: ?Category
 
   // Metadata
   published_at: timestamp?
@@ -66,13 +66,13 @@ Post {
 // Comment with nested threading
 Comment {
   id: +uuid
-  content: &string @max(1000)
+  content: &string @length(1, 1000)
   is_edited: bool @default(false)
 
   // Relations
   author: *User @on_delete(cascade)
   post: *Post @on_delete(cascade)
-  parent: *Comment? @on_delete(cascade)
+  parent: ?Comment @on_delete(cascade)
   replies: [Comment]
 
   created_at: timestamp
@@ -82,9 +82,9 @@ Comment {
 // Tag for categorization
 Tag {
   id: +uuid
-  name: ^&string @max(50) @index
+  name: ^&string @length(1, 50) @index
   slug: ^&string
-  description: string? @max(200)
+  description: string? @length(1, 200)
   post_count: u32 @default(0) @computed
 
   // Relations
@@ -96,9 +96,9 @@ Tag {
 // Category hierarchy
 Category {
   id: +uuid
-  name: &string @max(100)
+  name: &string @length(1, 100)
   slug: ^&string
-  parent: *Category?
+  parent: ?Category
   children: [Category]
   posts: [Post]
 
@@ -134,7 +134,7 @@ Profile {
 // Product model with fixed arrays
 Product {
   id: +uuid
-  name: &string @max(200)
+  name: &string @length(1, 200)
   sku: ^&string @length(10)
   price: f64 @min(0)
   stock: i32 @default(0)
