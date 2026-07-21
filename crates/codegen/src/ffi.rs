@@ -1,7 +1,7 @@
 //! Native FFI generator — the Layer-0 C-ABI (language-bindings #51/#52/#117).
 //!
-//! Emits, per schema, the fat generated C-ABI described in
-//! `docs/proposals/language-bindings.md` ("ABI symbol naming (pinned)"). Two
+//! Emits, per schema, the fat generated C-ABI for the language bindings
+//! (#51/#52/#117); ABI symbol naming is pinned. Two
 //! halves land in the SAME generated `ffi/src/lib.rs`:
 //!
 //! * the schema-**invariant** *lifecycle + error* spine (Phase 2) every binding

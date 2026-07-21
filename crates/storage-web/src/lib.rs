@@ -4,7 +4,7 @@
 //! semantics** to `forgedb-storage-native`. Selected by the `forgedb-storage`
 //! facade on `wasm32`; the generated `database.rs` links it unchanged.
 //!
-//! The load-bearing observation (`docs/proposals/wasm-runtime.md`): positional
+//! The load-bearing observation: positional
 //! I/O over an in-memory byte buffer is naturally synchronous, so the per-row
 //! column API (`append_uuid`, `read_string(index)`, …) stays sync and unchanged.
 //! Async is quarantined to the [`hydrate`]/[`dump`] boundary — loading column

@@ -20,7 +20,7 @@
 //! directly. A `StorageBackend` trait would risk *async-coloring* that per-row
 //! API (`get()` becoming `async` everywhere) — the native path would pay for the
 //! browser path and pressure would build toward runtime schema interpretation
-//! (see `docs/proposals/wasm-runtime.md` red lines). The cfg facade keeps the
+//! (against the generator-identity red lines). The cfg facade keeps the
 //! generated surface **byte-identical across targets** with zero codegen
 //! branches: exactly one backend is linked per build, so their identically-named
 //! public types never collide.

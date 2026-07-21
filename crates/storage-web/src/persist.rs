@@ -3,7 +3,7 @@
 //! The arena [`crate::store`] is volatile. This module moves its opaque
 //! path→bytes blobs to and from a durable browser store at the open/commit
 //! boundary, so a follower resumes after a tab reload. Two backends, chosen
-//! per-project (the design note keeps both — `docs/proposals/wasm-runtime.md`):
+//! per-project (both are kept):
 //!
 //! - [`Backend::IndexedDb`] — one object store of **keyed blobs**, key = the
 //!   column path, value = the column bytes. **Eager**: [`hydrate`] loads every

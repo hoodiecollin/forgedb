@@ -184,8 +184,8 @@ impl WalManager {
 
 /// In-memory `WalManager` for the `wasm32` browser read-replica target (#110).
 ///
-/// The design note (`docs/proposals/wasm-runtime.md`) drops the **file** WAL on
-/// wasm: the browser follower is durable at IndexedDB/OPFS *commit* granularity,
+/// The wasm build drops the **file** WAL: the browser follower is durable at
+/// IndexedDB/OPFS *commit* granularity,
 /// and its upstream (the server) is the authoritative durable log, so a
 /// crash-recovery WAL is unnecessary there. But the generated `database.rs` is
 /// emitted **once** and compiled for both targets — it unconditionally

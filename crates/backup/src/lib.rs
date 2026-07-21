@@ -5,7 +5,7 @@
 //! understands the on-disk *layout* (per-model `manifest.json`, fixed/variable
 //! columns, tombstones, junction dirs) and **never** the `.forge` *schema*. It
 //! moves opaque file bytes; it does not know any model's fields, relations, or
-//! directives. See `docs/proposals/backup-restore.md`.
+//! directives.
 //!
 //! ## Why it is lock-free
 //!

@@ -1,8 +1,8 @@
 //! Generate-time runtime-behavior configuration (epic #126).
 //!
 //! `GenConfig` carries the schema-blind, generate-time knobs that tailor the
-//! emitted Rust database (`RustGenerator`) — the *binding-time* model from
-//! `docs/proposals/configurable-runtime-behavior.md`:
+//! emitted Rust database (`RustGenerator`) — the *binding-time* model
+//! (config epic #126):
 //!
 //! - **Tier A** — code *specialization* (emit/omit): `replication` gates whether
 //!   `open_at` attaches the durable broker at all; `compaction` gates whether the

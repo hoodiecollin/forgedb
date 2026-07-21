@@ -1,8 +1,8 @@
 //! The in-memory backing store — the arena behind every column on this target.
 //!
 //! Each column file the native engine would put on disk is here a keyed byte
-//! arena: the **path string is the key** (the "signature-preservation trick"
-//! from `docs/proposals/wasm-runtime.md`). The generated code still calls
+//! arena: the **path string is the key** (the "signature-preservation trick").
+//! The generated code still calls
 //! `FixedColumn::new(PathBuf::from(col_path), size)`; on this target the path is
 //! just the arena key instead of a filesystem path.
 //!
