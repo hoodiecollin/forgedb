@@ -627,19 +627,19 @@ Order {
 
 ## 13. File References (Citation Index)
 
-- **AST ground truth:** `/Users/collin/Projects/forgedb/crates/parser/src/ast.rs`
+- **AST ground truth:** `crates/parser/src/ast.rs`
   - FieldType enum: lines 43-64
   - Field struct: lines 103-114
   - Model struct: lines 124-129
   - Struct struct: lines 117-121
   - Constraint struct: lines 12-29
 
-- **Lexer (tokens):** `/Users/collin/Projects/forgedb/crates/parser/src/lexer.rs`
+- **Lexer (tokens):** `crates/parser/src/lexer.rs`
   - Token enum: lines 13-54
   - Comment handling: lines 110-118
   - Type tokenization: lines 240-254
 
-- **Parser logic:** `/Users/collin/Projects/forgedb/crates/parser/src/parser/core.rs`
+- **Parser logic:** `crates/parser/src/parser/core.rs`
   - Field parsing: lines 445-612
   - Model parsing: lines 675-790
   - Struct parsing: lines 614-673
@@ -649,18 +649,18 @@ Order {
   - Component reference parsing: lines 63-98, 299-330
   - Modifier validation: lines 471-492, 498-523
 
-- **Validation:** `/Users/collin/Projects/forgedb/crates/validation/src/lib.rs`
+- **Validation:** `crates/validation/src/lib.rs`
   - Field name validation: lines 296-309
   - Model name validation: lines 311-324
 
 - **Example schemas:**
-  - `/Users/collin/Projects/forgedb/schema.forge`
-  - `/Users/collin/Projects/forgedb/vscode-forgedb/examples/example.forge`
-  - `/Users/collin/Projects/forgedb/examples/component-integration/schema.forge`
+  - `schema.forge`
+  - `vscode-forgedb/examples/example.forge`
+  - `examples/component-integration/schema.forge`
 
-- **Templates:** `/Users/collin/Projects/forgedb/src/templates.rs` (lines 2-112)
+- **Templates:** `src/templates.rs` (lines 2-112)
 
-- **Quick reference:** `/Users/collin/Projects/forgedb/CLAUDE.md` (lines 98-104)
+- **Quick reference:** `CLAUDE.md` (lines 98-104)
 
 ---
 
