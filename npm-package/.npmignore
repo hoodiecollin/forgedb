@@ -1,0 +1,59 @@
+# Source code (Rust)
+*.rs
+Cargo.toml
+Cargo.lock
+target/
+.cargo/
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+
+# Tests
+test/
+tests/
+*.test.js
+*.test.ts
+__tests__/
+coverage/
+
+# Development
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Documentation (keep README.md)
+docs/
+*.md
+!README.md
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Dependencies
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+*.bak
+*.tmp

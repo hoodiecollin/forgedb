@@ -1,0 +1,14 @@
+[package]
+name = "forgedb-watcher"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "File watcher and schema regenerator for ForgeDB"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "watcher", "forgedb", "filesystem"]
+categories = ["database", "filesystem"]
+
+[dependencies]
+notify = "6.1"
+crossbeam-channel = "0.5"
+forgedb-parser = { path = "../parser" }

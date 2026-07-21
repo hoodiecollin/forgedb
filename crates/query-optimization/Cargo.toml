@@ -1,0 +1,22 @@
+[package]
+name = "forgedb-query-optimization"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SIMD-accelerated query optimization and columnar scanning for ForgeDB"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "query", "optimization", "simd", "forgedb"]
+categories = ["database"]
+
+[dependencies]
+forgedb-storage = { path = "../storage" }
+forgedb-types = { path = "../types" }
+ordered-float = "4.2"
+uuid = { version = "1.6", features = ["v4"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scan_bench"
+harness = false

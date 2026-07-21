@@ -1,0 +1,16 @@
+/target
+/generated
+.orchestrator/
+.worktrees/
+.turbo/
+.DS_Store
+package.json
+turbo.json
+node_modules/
+bun.lockb
+/*.forge
+!examples/**/schema.forge
+Cargo.lock
+generated/
+generated_*/
+.envrc

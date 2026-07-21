@@ -1,0 +1,6 @@
+{
+  "cSpell.words": ["codegen", "forgedb"],
+  "files.associations": {
+    "*.snap": "insta-snapshots"
+  }
+}

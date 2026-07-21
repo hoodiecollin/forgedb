@@ -1,0 +1,13 @@
+[package]
+name = "forgedb-query-params"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Query parameter parsing and validation for ForgeDB REST API endpoints"
+repository = "https://github.com/hoodiecollin/forgedb"
+keywords = ["database", "query", "rest", "api", "forgedb"]
+categories = ["database", "parsing"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_urlencoded = "0.7"

@@ -1,0 +1,196 @@
+{
+  "Model Definition": {
+    "prefix": "model",
+    "body": [
+      "${1:ModelName} {",
+      "\tid: +uuid",
+      "\t${2:field_name}: ${3:string}",
+      "\tcreated_at: timestamp",
+      "\tupdated_at: timestamp",
+      "}"
+    ],
+    "description": "Create a new model"
+  },
+  "Model with Relations": {
+    "prefix": "modelrel",
+    "body": [
+      "${1:ModelName} {",
+      "\tid: +uuid",
+      "\t${2:field_name}: ${3:string}",
+      "\t",
+      "\t// Relations",
+      "\t${4:related}: [${5:RelatedModel}]",
+      "\t",
+      "\tcreated_at: timestamp",
+      "\tupdated_at: timestamp",
+      "}"
+    ],
+    "description": "Create a model with relations"
+  },
+  "Struct Definition": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:StructName} {",
+      "\t${2:field_name}: ${3:string}",
+      "}"
+    ],
+    "description": "Create a struct"
+  },
+  "String Field": {
+    "prefix": "fstring",
+    "body": "${1:field_name}: &string",
+    "description": "Required string field"
+  },
+  "Optional String Field": {
+    "prefix": "fstringopt",
+    "body": "${1:field_name}: string?",
+    "description": "Optional string field"
+  },
+  "Unique String Field": {
+    "prefix": "fstringuniq",
+    "body": "${1:field_name}: ^&string",
+    "description": "Unique required string field"
+  },
+  "Email Field": {
+    "prefix": "femail",
+    "body": "${1:email}: ^&string @email",
+    "description": "Email field with validation"
+  },
+  "UUID Primary Key": {
+    "prefix": "fid",
+    "body": "id: +uuid",
+    "description": "UUID primary key"
+  },
+  "Auto-increment ID": {
+    "prefix": "fidauto",
+    "body": "id: +u64",
+    "description": "Auto-increment u64 primary key"
+  },
+  "Timestamp Field": {
+    "prefix": "ftimestamp",
+    "body": "${1:created_at}: timestamp",
+    "description": "Timestamp field"
+  },
+  "Boolean Field": {
+    "prefix": "fbool",
+    "body": "${1:is_active}: bool",
+    "description": "Boolean field"
+  },
+  "Number Field": {
+    "prefix": "fnum",
+    "body": "${1:count}: ${2|u32,u64,i32,i64,f32,f64|}",
+    "description": "Numeric field"
+  },
+  "Array Relation": {
+    "prefix": "farray",
+    "body": "${1:items}: [${2:RelatedModel}]",
+    "description": "Array relation (one-to-many)"
+  },
+  "Single Relation": {
+    "prefix": "frel",
+    "body": "${1:owner}: *${2:RelatedModel}",
+    "description": "Single relation (many-to-one)"
+  },
+  "Char Field": {
+    "prefix": "fchar",
+    "body": "${1:code}: char(${2:10})",
+    "description": "Fixed-length char field"
+  },
+  "Computed Field": {
+    "prefix": "fcomputed",
+    "body": "${1:full_name}: string @computed",
+    "description": "Computed field"
+  },
+  "Field with Min/Max": {
+    "prefix": "fminmax",
+    "body": "${1:age}: ${2:u32} @min(${3:0}) @max(${4:150})",
+    "description": "Field with min/max validation"
+  },
+  "Unique Index": {
+    "prefix": "dunique",
+    "body": "@unique",
+    "description": "Unique constraint directive"
+  },
+  "Index Directive": {
+    "prefix": "dindex",
+    "body": "@index(${1:field1}, ${2:field2})",
+    "description": "Composite index directive"
+  },
+  "Default Value": {
+    "prefix": "ddefault",
+    "body": "@default(${1:value})",
+    "description": "Default value directive"
+  },
+  "On Delete Directive": {
+    "prefix": "dondel",
+    "body": "@on_delete(${1|cascade,set_null,restrict|})",
+    "description": "On delete behavior"
+  },
+  "Full Text Search": {
+    "prefix": "dfulltext",
+    "body": "@fulltext",
+    "description": "Full-text search index"
+  },
+  "Component Reference": {
+    "prefix": "fcomponent",
+    "body": "${1:card}: tsx://pages/${2:model}/${1}",
+    "description": "TSX component reference"
+  },
+  "Component with Relations": {
+    "prefix": "fcomponentrel",
+    "body": "${1:card}: tsx://pages/${2:model}/${1} @relations(${3:*})",
+    "description": "TSX component with relations"
+  },
+  "API Route Handler": {
+    "prefix": "fapi",
+    "body": "${1:verify}: api://routes/${2:model}/${1}",
+    "description": "API route handler reference"
+  },
+  "User Model Template": {
+    "prefix": "tuser",
+    "body": [
+      "User {",
+      "\tid: +uuid",
+      "\temail: ^&string @email",
+      "\tusername: ^&string @min(3) @max(50)",
+      "\tpassword_hash: &string",
+      "\tfull_name: string?",
+      "\tavatar_url: string? @url",
+      "\tis_active: bool @default(true)",
+      "\tcreated_at: timestamp",
+      "\tupdated_at: timestamp",
+      "}"
+    ],
+    "description": "User model template"
+  },
+  "Blog Post Template": {
+    "prefix": "tpost",
+    "body": [
+      "Post {",
+      "\tid: +uuid",
+      "\ttitle: &string @max(200)",
+      "\tslug: ^&string",
+      "\tcontent: &string",
+      "\tpublished: bool @default(false)",
+      "\tauthor: *User",
+      "\tcomments: [Comment]",
+      "\tcreated_at: timestamp",
+      "\tupdated_at: timestamp",
+      "}"
+    ],
+    "description": "Blog post model template"
+  },
+  "Comment Template": {
+    "prefix": "tcomment",
+    "body": [
+      "Comment {",
+      "\tid: +uuid",
+      "\tcontent: &string @max(1000)",
+      "\tauthor: *User",
+      "\tpost: *Post",
+      "\tcreated_at: timestamp",
+      "}"
+    ],
+    "description": "Comment model template"
+  }
+}

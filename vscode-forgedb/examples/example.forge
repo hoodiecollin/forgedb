@@ -1,0 +1,169 @@
+// ForgeDB Example Schema
+// This file demonstrates all syntax elements
+
+// User model with authentication
+User {
+  id: +uuid
+  email: ^&string @email
+  username: ^&string @min(3) @max(50)
+  password_hash: &string
+  full_name: string?
+  avatar_url: string? @url
+  bio: string? @max(500)
+  is_active: bool @default(true)
+  role: &string @default("user")
+
+  // Numeric fields
+  age: u32? @min(13) @max(150)
+  follower_count: u32 @default(0)
+  following_count: u32 @default(0)
+
+  // Relations
+  posts: [Post]
+  comments: [Comment]
+  followers: [User]
+  following: [User]
+
+  // Component references (Sprint 17)
+  card: tsx://pages/user/card @relations(posts)
+  profile: tsx://pages/user/profile @relations(*)
+  avatar: tsx://components/user/avatar
+
+  // API route handlers (Sprint 17)
+  verify_email: api://routes/user/verify
+  change_password: api://routes/user/password
+
+  // Timestamps
+  created_at: timestamp
+  updated_at: timestamp
+  last_login: timestamp?
+}
+
+/* Blog Post Model
+   Supports full-text search and rich content */
+Post {
+  id: +uuid
+  title: &string @max(200) @fulltext
+  slug: ^&string @index
+  content: &string @fulltext
+  excerpt: string? @max(300)
+  published: bool @default(false)
+  view_count: u64 @default(0)
+  like_count: u32 @default(0)
+
+  // Relations
+  author: *User @on_delete(cascade)
+  comments: [Comment]
+  tags: [Tag]
+  category: *Category?
+
+  // Metadata
+  published_at: timestamp?
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+// Comment with nested threading
+Comment {
+  id: +uuid
+  content: &string @max(1000)
+  is_edited: bool @default(false)
+
+  // Relations
+  author: *User @on_delete(cascade)
+  post: *Post @on_delete(cascade)
+  parent: *Comment? @on_delete(cascade)
+  replies: [Comment]
+
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+// Tag for categorization
+Tag {
+  id: +uuid
+  name: ^&string @max(50) @index
+  slug: ^&string
+  description: string? @max(200)
+  post_count: u32 @default(0) @computed
+
+  // Relations
+  posts: [Post]
+
+  created_at: timestamp
+}
+
+// Category hierarchy
+Category {
+  id: +uuid
+  name: &string @max(100)
+  slug: ^&string
+  parent: *Category?
+  children: [Category]
+  posts: [Post]
+
+  created_at: timestamp
+}
+
+// Inline struct for addresses
+struct Address {
+  street: char(100)
+  city: char(50)
+  state: char(2)
+  zip: char(10)
+  country: char(2)
+}
+
+// Profile with embedded struct
+Profile {
+  id: +uuid
+  user: *User
+  address: Address?
+  phone: string? @regex("^\\+?[1-9]\\d{1,14}$")
+  website: string? @url
+
+  // Social links
+  twitter: string?
+  github: string?
+  linkedin: string?
+
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+// Product model with fixed arrays
+Product {
+  id: +uuid
+  name: &string @max(200)
+  sku: ^&string @length(10)
+  price: f64 @min(0)
+  stock: i32 @default(0)
+
+  // Fixed-size array for product images (max 5)
+  image_urls: [char(255); 5]
+
+  // Dimensions
+  weight_kg: f64?
+  length_cm: f64?
+  width_cm: f64?
+  height_cm: f64?
+
+  created_at: timestamp
+  updated_at: timestamp
+}
+
+// Order with composite index
+Order {
+  id: +uuid
+  order_number: ^&string
+  user: *User
+  total: f64 @min(0)
+  status: &string @default("pending")
+
+  // Composite index on user_id and created_at for efficient queries
+  @index(user, created_at)
+  @index(status, created_at)
+
+  created_at: timestamp
+  updated_at: timestamp
+}

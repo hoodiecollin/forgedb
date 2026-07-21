@@ -1,0 +1,4 @@
+User {
+  id: +u64
+  email: &string
+}
