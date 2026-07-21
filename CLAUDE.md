@@ -7,7 +7,7 @@ change the build, layout, or commands, update this file in the same change.
 
 ForgeDB is an **application database generator** — a compile-time code generation tool,
 **not** a runtime ORM or query engine. A declarative `.forge` schema is transpiled into
-tailored Rust database code plus a TypeScript SDK, a REST API, and React component stubs.
+tailored Rust database code plus a TypeScript SDK, a REST API, and an OpenAPI spec.
 End users need only: their schema, the `forgedb` CLI, and config.
 
 **The invariant:** the app's schema is a *compile-time input to generation*, never a
@@ -232,7 +232,7 @@ schema.forge → parser (lexer→AST) → validation → codegen
   ├─ RustGenerator       → database.rs
   ├─ TypeScriptGenerator → types.ts
   ├─ ApiGenerator        → api.rs
-  ├─ StubGenerator       → React/route stubs
+  ├─ StubGenerator       → placeholder stubs README (no UI/component codegen today)
   ├─ OpenApiGenerator    → openapi.json (offline OpenAPI 3.1)
   ├─ WasmGenerator       → replica/* (browser read-replica; opt-in)
   └─ TransformGenerator  → migrations/transform/* (offline data-migration bin)
@@ -319,8 +319,10 @@ what's next, exact versions — lives in ground truth, not here:
    in prose (chronic drift source — run the runner).
 
 5. **Design docs are not committed to the repo.** Proposals / design notes live as **`rfc`-labeled
-   GitHub issues**, not files. (The historical `docs/proposals/` set was removed; git history holds
-   it. Shipped-feature *architecture* reference belongs in `docs/ARCHITECTURE.md`.)
+   GitHub issues**, not files — run the **`rfc-workflow`** skill to file one (it has the gate, the
+   dedup check, the body template, and the epic cross-link). (The historical `docs/proposals/` set
+   was removed; git history holds it. Shipped-feature *architecture* reference belongs in
+   `docs/ARCHITECTURE.md`.)
 
 ### Current primary focus — storage-model experiment (epic #167)
 
