@@ -3,7 +3,7 @@ title: "[runtime]"
 description: "The [runtime] table — replication, changefeed capacity, and cascade depth, baked into database.rs at generate time."
 ---
 
-The `[runtime]` table carries generate-time behavior knobs (epic #126). They are
+The `[runtime]` table carries generate-time behavior knobs. They are
 schema-blind and baked into the emitted `database.rs` — change one and run `forgedb
 generate` for it to take effect. Defaults reproduce the prior output byte-for-byte, with
 the one sanctioned exception that `replication` defaults to **off**.

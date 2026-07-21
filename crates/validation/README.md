@@ -835,15 +835,7 @@ The crate has no external dependencies, making it:
 ## Related Crates
 
 - **[forgedb-parser](../parser)**: Uses validation for schema parsing errors
-- **[forgedb-http-server](../http-server)**: Uses HTTP validation for request validation
-- **[forgedb-crud-api](../crud-api)**: Uses validation for CRUD operation validation
 - **[forgedb-types](../types)**: Defines types that are validated
-
-## Links to Documentation
-
-- [SPRINT2_PERSISTENCE.md](../../archive/sprint-summaries/SPRINT2_PERSISTENCE.md) - Initial validation implementation
-- [SPRINT9_SUMMARY.md](../../archive/sprint-summaries/SPRINT9_SUMMARY.md) - HTTP validation extension
-- [CRATE_ORGANIZATION_PLAN.md](../../CRATE_ORGANIZATION_PLAN.md) - Overall crate organization
 
 ## License
 

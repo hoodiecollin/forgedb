@@ -7,10 +7,9 @@ this as the lookup reference. For 18 worked schemas across many domains, see
 [`examples/`](../examples/README.md).
 
 > **Verified against the parser.** Every rule below is grounded in
-> `crates/parser/src/{ast.rs, lexer.rs, parser/core.rs}` and the validator, with
-> source line references. Where older docs disagree with this file, this file is
-> correct — see [§10 Known Invalid Patterns](#10-known-invalid-patterns-parser-rejects)
-> and [§12 Quick Drift Summary](#12-quick-drift-summary-vs-claudemd-quick-ref).
+> `crates/parser/src/{ast.rs, lexer.rs, parser/core.rs}` and the validator. Where
+> older docs disagree with this file, this file is correct — see
+> [§10 Known Invalid Patterns](#10-known-invalid-patterns-parser-rejects).
 
 ---
 
@@ -98,10 +97,10 @@ status: string? @default("pending")     // nullable string with default
 | `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
 | `timestamp` | `timestamp`     | `i64`               | Unix timestamp (milliseconds)    |
-| `char(N)` | `char(8)`         | `[u8; 8]`           | Fixed-size byte array (Sprint 8) |
+| `char(N)` | `char(8)`         | `[u8; 8]`           | Fixed-size byte array |
 
 **Key points:**
-- No `text` type in parser (CLAUDE.md mentions it but parser has only `string`)
+- No `text` type — use `string`
 - `char(N)` is parsed as `FieldType::Char(usize)` and requires `(...)` syntax (`crates/parser/src/parser/core.rs:354-369`)
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 - `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
@@ -151,8 +150,8 @@ Order {
 - `&` (unique) can be applied to any field (no type restriction in parser)
 
 **NOT implemented:**
-- `~` (auto-update) is mentioned in CLAUDE.md quick-ref but does NOT exist in parser code
-- No implementation found in AST (`crates/parser/src/ast.rs:Field`) which only has `auto_generate: bool`
+- `~` (auto-update) does not exist — the AST `Field` carries only `auto_generate: bool` (the `+`
+  modifier). There is no auto-update-on-write modifier.
 
 ---
 
@@ -202,25 +201,25 @@ Order {
 | `@url`                 | (none)          | `string`            | URL format validation (semantic)         | `website: string @url` |
 | `@regex`               | `(pattern)`     | `string`            | Regex validation (semantic)              | `handle: string @regex("[a-z]+")` |
 | `@index`               | (none)          | Any                 | Create field-level index (semantic)      | `slug: string @index` |
-| `@computed`            | (none)          | Any                 | Field is computed (read-only; Sprint 19) | `full_name: string @computed` |
-| `@fulltext`            | (none)          | `string`            | Full-text search index (Sprint 18)       | `content: string @fulltext` |
-| `@materialized`        | (none)          | Any                 | Field is materialized (Sprint 19)        | `count: u32 @materialized` |
-| `@relations`           | `(*)` or `(field_list)` | Component refs | Component relation inclusion (Sprint 17) | `card: tsx://path @relations(*)` |
+| `@computed`            | (none)          | Any                 | Field is computed (read-only) | `full_name: string @computed` |
+| `@fulltext`            | (none)          | `string`            | Full-text search index       | `content: string @fulltext` |
+| `@materialized`        | (none)          | Any                 | Field is materialized        | `count: u32 @materialized` |
+| `@relations`           | `(*)` or `(field_list)` | Component refs | Component relation inclusion | `card: tsx://path @relations(*)` |
 | `@on_delete`           | `(restrict\|cascade\|set_null)` | FK field (`*Target`/`?Target`) | On-delete referential policy (ENFORCED, delete semantics) | `author: *User @on_delete(cascade)` |
 
 **Model-level directives:**
 
 | Directive              | Arguments       | Meaning                                          | Example                      |
 |------------------------|-----------------|--------------------------------------------------|------------------------------|
-| `@soft_delete`         | (none)          | Enable soft delete (Sprint 19)                   | `@soft_delete` in model block |
+| `@soft_delete`         | (none)          | Enable soft delete                   | `@soft_delete` in model block |
 | `@index`               | `(field1, field2, ...)` | Composite index on multiple fields | `@index(user_id, created_at)` |
 
-> **UPDATE (issue #46, 2026-07-06):** directive arguments now accept **quoted string
-> literals** in addition to numbers and bare identifiers. `@pattern("^[0-9]+$")`,
-> `@regex("...")`, and `@default("text")` parse — the lexer tokenizes `"..."` (escapes
-> `\" \\ \n \t \r`; unterminated/multiline strings are a lex error). Values are still stored
-> as `ConstraintParam::String`, so `@default(pending)` and `@default("pending")` are
-> equivalent; these directives remain **semantic-only markers** (parsed, not enforced).
+> **Quoted string literals.** Directive arguments accept **quoted string literals** in addition
+> to numbers and bare identifiers. `@pattern("^[0-9]+$")`, `@regex("...")`, and `@default("text")`
+> parse — the lexer tokenizes `"..."` (escapes `\" \\ \n \t \r`; unterminated/multiline strings are
+> a lex error). Values are stored as `ConstraintParam::String`, so `@default(pending)` and
+> `@default("pending")` are equivalent. `@pattern`/`@regex` are **enforced** (non-match → 422);
+> `@default` remains a **semantic-only marker** (parsed, not enforced).
 > Superseded the earlier limitation note that said `"` was an unexpected character.
 
 **Parser source:** `crates/parser/src/parser/core.rs:113-184` (constraint parsing, incl. the `Token::Str` arm), `crates/parser/src/parser/core.rs:381-447` (directive parsing); string-literal lexing in `crates/parser/src/lexer.rs` (`read_string`)
@@ -348,7 +347,7 @@ User {
 
 ---
 
-## 8. Component References (Sprint 17)
+## 8. Component References
 
 ### Syntax
 
@@ -579,7 +578,7 @@ Venue {
 }
 ```
 
-### With Components (Sprint 17)
+### With Components
 ```
 User {
   id: +uuid
@@ -606,61 +605,15 @@ Order {
 
 ---
 
-## 12. Quick Drift Summary (vs. CLAUDE.md Quick-Ref)
+## 12. Where the parser lives
 
-### What CLAUDE.md Claims vs. Parser Reality
+The rules in this reference are grounded in the parser and validator source:
 
-| CLAUDE.md Claim | Parser Reality | Status |
-|---|---|---|
-| `~` auto-update modifier | Not in AST or parser | **DRIFT** — `~` not implemented |
-| `text` type | Not in lexer (only `string`) | **DRIFT** — no `text` type |
-| `@unique` directive | `&` symbol is used, not `@unique` directive | **PARTIALLY CORRECT** — `&` is the modifier; `@unique` would be constraint |
-| `@pattern` constraint | Parsed as generic constraint, not validated | **CORRECT** — parsed but semantic validation deferred |
-| `@relations(...)` | Only valid on component fields | **CORRECT** |
-| `[Model]` one-to-many | Correct | **CORRECT** |
-| `*Model` required FK | Correct | **CORRECT** |
-| `?Model` optional FK | Correct | **CORRECT** |
-| Block comment `/* */` | **NOT supported** by lexer | **DRIFT** — example.forge uses it but won't parse |
-| All listed directives | Several not in parser (e.g., `@on_delete`) | **PARTIAL DRIFT** — example uses `@on_delete` but parser doesn't parse it |
-
----
-
-## 13. File References (Citation Index)
-
-- **AST ground truth:** `crates/parser/src/ast.rs`
-  - FieldType enum: lines 43-64
-  - Field struct: lines 103-114
-  - Model struct: lines 124-129
-  - Struct struct: lines 117-121
-  - Constraint struct: lines 12-29
-
+- **AST:** `crates/parser/src/ast.rs`
 - **Lexer (tokens):** `crates/parser/src/lexer.rs`
-  - Token enum: lines 13-54
-  - Comment handling: lines 110-118
-  - Type tokenization: lines 240-254
-
 - **Parser logic:** `crates/parser/src/parser/core.rs`
-  - Field parsing: lines 445-612
-  - Model parsing: lines 675-790
-  - Struct parsing: lines 614-673
-  - Type parsing: lines 183-341
-  - Constraint parsing: lines 113-181
-  - Composite index parsing: lines 377-443
-  - Component reference parsing: lines 63-98, 299-330
-  - Modifier validation: lines 471-492, 498-523
-
 - **Validation:** `crates/validation/src/lib.rs`
-  - Field name validation: lines 296-309
-  - Model name validation: lines 311-324
-
-- **Example schemas:**
-  - `schema.forge`
-  - `vscode-forgedb/examples/example.forge`
-  - `examples/component-integration/schema.forge`
-
-- **Templates:** `src/templates.rs` (lines 2-112)
-
-- **Quick reference:** `CLAUDE.md` (lines 98-104)
+- **Example schemas:** [`examples/`](../examples/README.md) and `vscode-forgedb/examples/example.forge`
 
 ---
 
@@ -676,7 +629,7 @@ Order {
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable
-8. **Components:** `field: tsx://path @relations(*)` (Sprint 17)
+8. **Components:** `field: tsx://path @relations(*)`
 9. **Comments:** Only `//` line comments work; `/* */` blocks will **fail to parse**
 10. **DO NOT use:** `~`, `text`, block comments, `@on_delete`, duplicate names, non-PascalCase models, non-snake_case fields
 

@@ -3,7 +3,7 @@ title: "[storage]"
 description: "The [storage] table — WAL fsync policy, checkpoint interval, and compaction, with their durability tradeoffs."
 ---
 
-The `[storage]` table carries generate-time storage and durability knobs (epic #126).
+The `[storage]` table carries generate-time storage and durability knobs.
 They are schema-blind and baked into `database.rs` at generate time — change one and run
 `forgedb generate`. Defaults are byte-identical to the prior output.
 

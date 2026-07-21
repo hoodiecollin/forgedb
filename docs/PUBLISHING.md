@@ -128,12 +128,12 @@ cargo build                          # must resolve every forgedb-* dep from cra
 ```
 
 and confirm the generated `Cargo.lock` resolved the freshly-published versions from
-`registry+https://.../crates.io-index`. `CLAUDE.md` tracks the current open/closed state of this
-gap; keep it updated when you publish.
+`registry+https://.../crates.io-index`. Track the open/closed state of this gap in the
+project's GitHub issues, and keep the scaffold pins updated when you publish.
 
 For the **wasm** replica, the equivalent reclose is `wasm-pack build --target web` against
-`forgedb-storage-web` + the wasm-flavored `types`/`wal`; note its own honest limits in
-`CLAUDE.md` if the wasm toolchain can't run in a given environment.
+`forgedb-storage-web` + the wasm-flavored `types`/`wal`; note its own honest limits if
+the wasm toolchain can't run in a given environment.
 
 ---
 
@@ -144,7 +144,7 @@ pin:
 
 - the scaffold `Cargo.toml` template in `src/commands/init.rs` (the caret pins),
 - the substrate version matrix in [INSTALL.md](./INSTALL.md),
-- the relevant status note in [`CLAUDE.md`](../CLAUDE.md).
+- the substrate crate table in [PUBLIC_CRATES.md](./PUBLIC_CRATES.md).
 
 Include `Cargo.lock` changes in the same commit when they're a side effect.
 
@@ -180,5 +180,5 @@ Follow with a fixed patch release and update the pins as above.
 - [SEMVER.md](./SEMVER.md) — the compatibility policy this runbook enforces
 - [PUBLIC_CRATES.md](./PUBLIC_CRATES.md) — substrate crate catalog + dependency graph
 - [INSTALL.md](./INSTALL.md) — install paths + substrate version matrix
-- [`CLAUDE.md`](../CLAUDE.md) — authoritative inventory + live publish-gap status
+- [`CLAUDE.md`](../CLAUDE.md) — authoritative workspace inventory
 - [Cargo Book — Publishing](https://doc.rust-lang.org/cargo/reference/publishing.html)

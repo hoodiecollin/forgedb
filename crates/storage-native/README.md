@@ -497,16 +497,12 @@ fn test_fixed_column_u64() {
 
 - **[forgedb-wal](../wal)**: Write-Ahead Log for ACID properties and crash recovery
 - **[forgedb-compaction](../compaction)**: Background compaction for reclaiming tombstone space
-- **[forgedb-query-optimization](../query-optimization)**: SIMD-optimized query execution over columnar data
-- **[forgedb-crud-api](../crud-api)**: High-level CRUD operations built on storage primitives
 
 ## Links to Documentation
 
 - **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - Overall system design and data flow
 - **[Public Crates Guide](../../docs/PUBLIC_CRATES.md)** - Complete guide to runtime libraries
 - **[Development Guide](../../docs/DEVELOPMENT.md)** - Setting up development environment
-- [SPRINT2_PERSISTENCE.md](../../archive/sprint-summaries/SPRINT2_PERSISTENCE.md) - Original storage implementation
-- [SPRINT7_SUMMARY.md](../../archive/sprint-summaries/SPRINT7_SUMMARY.md) - WAL integration
 
 ## License
 

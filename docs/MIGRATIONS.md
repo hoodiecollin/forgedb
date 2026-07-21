@@ -14,8 +14,7 @@ model: you edit `schema.forge`, regenerate, and recompile your app. What happens
 The invariant (the generator-identity red line): the schema is never a runtime input to a
 generic engine. The transformer is **generated code** — one straight-line typed replay per
 origin→destination version range — not a runtime interpreter reading your schema. See
-[V1_ROADMAP.md](./V1_ROADMAP.md) and the design note
-[`proposals/schema-migrations-impl-plan.md`](./proposals/schema-migrations-impl-plan.md).
+[V1_ROADMAP.md](./V1_ROADMAP.md).
 
 ---
 
@@ -112,7 +111,7 @@ The crate depends only on your app's substrate (storage/types/etc.) — never on
 
 ## Per-tenant sweep
 
-Under multi-tenancy (#59), each tenant is an independent data dir under one root. `migrate up`
+Under multi-tenancy, each tenant is an independent data dir under one root. `migrate up`
 sweeps them in one command:
 
 ```bash

@@ -108,6 +108,6 @@ recover to.** Concretely:
 - A DB opened via the standalone `Database::new()` path has no `_replication.log`
   and therefore nothing to replay — `recover_to` errors. PITR requires the
   `open_at` (broker-backed) path.
-- Junction (M2M) link crash recovery inherits the existing #89 boundary; a torn
+- Junction (M2M) link crash recovery inherits the existing durable-write boundary; a torn
   broker commit can duplicate a junction pair (append-only; traversal is
   latest-wins / not deduped).

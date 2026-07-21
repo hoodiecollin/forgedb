@@ -119,7 +119,6 @@ For more information about ForgeDB:
 
 - **[ForgeDB Architecture](../../docs/ARCHITECTURE.md)** - System design and component architecture
 - **[Development Guide](../../docs/DEVELOPMENT.md)** - Development setup and workflow
-- [SPRINT5_WATCHER.md](../../SPRINT5_WATCHER.md) - Original implementation
 
 ## License
 

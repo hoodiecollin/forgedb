@@ -118,7 +118,7 @@ CLI is known-compatible with.
 **Publish discipline:** whenever generated code starts requiring a new substrate crate or a new
 additive substrate API, that crate/version must publish *before* the scaffold pins it, or an
 outside-repo `init → generate → cargo build` cannot resolve from crates.io. This "publish gap"
-is tracked in `CLAUDE.md`.
+discipline is described in [PUBLISHING.md](./PUBLISHING.md).
 
 ---
 

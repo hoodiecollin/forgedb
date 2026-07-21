@@ -246,9 +246,9 @@ The extension configures optimal settings for `.forge` files:
 
 The extension integrates three main components:
 
-1. **TextMate Grammar** (Sprint 21): Syntax highlighting engine
-2. **Language Server** (Sprint 22): Rust-based LSP server for diagnostics and completion
-3. **Extension Client** (Sprint 23): TypeScript client with commands and UI integration
+1. **TextMate Grammar**: Syntax highlighting engine
+2. **Language Server**: Rust-based LSP server for diagnostics and completion
+3. **Extension Client**: TypeScript client with commands and UI integration
 
 ```
 ┌─────────────────────────────────────┐
@@ -315,9 +315,9 @@ npm run package
 
 ## Roadmap
 
-- ✅ **Sprint 21**: Syntax highlighting
-- ✅ **Sprint 22**: Language Server Protocol (LSP)
-- ✅ **Sprint 23**: Full VSCode Extension (current)
+- ✅ Syntax highlighting
+- ✅ Language Server Protocol (LSP)
+- ✅ Full VSCode Extension
 - 🔜 **Future**: Marketplace publishing, additional commands
 
 ## Contributing

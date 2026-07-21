@@ -29,7 +29,7 @@ All notable changes to the "ForgeDB Schema Language" extension will be documente
 - Editor defaults (2-space tabs, smart suggestions)
 
 ### Features Planned
-- LSP integration (Sprint 22)
-- Commands for code generation (Sprint 23)
-- Real-time diagnostics (Sprint 23)
-- Schema validation (Sprint 23)
+- LSP integration
+- Commands for code generation
+- Real-time diagnostics
+- Schema validation

@@ -1,11 +1,11 @@
 # Browser State Store — WASM Replica vs. TS SDK Cache
 
-An informational analysis of what the browser **wasm read-replica** (#110) buys
+An informational analysis of what the browser **wasm read-replica** buys
 you versus a well-cached **TypeScript SDK**, and where WebSockets fit. This is
 *not* a design doc — it makes no decisions and blesses no plan. It exists to help
 steer product shape and to name the gaps this comparison exposes in the current
 system. When a claim here matters, verify it against the code; the replica's
-honest limits live in `CLAUDE.md` (the #110 bullet) and `WHAT_V1_IS.md`.
+honest limits live in `WHAT_V1_IS.md`.
 
 The core framing, stated once: **the wasm replica is not a "faster store" — it is
 a local-first, identity-preserving store.** It runs the *same generated
@@ -35,7 +35,7 @@ The load cost splits into three things that arrive on different timelines.
   instantiated. On low-end mobile the compile CPU is non-trivial.
 
 - **First paint is architecturally protected.** Because the engine runs in a **Web
-  Worker** (the #110-#2 decision), wasm fetch/compile/instantiate happens off the
+  Worker** (by design), wasm fetch/compile/instantiate happens off the
   main thread. First paint / FCP is *not* blocked by it — the initial render uses
   SSR data, a loading state, or a network fetch, and the local store becomes
   queryable a beat later. What *is* gated by cold start is
@@ -122,7 +122,7 @@ There are **two different WS surfaces**, and conflating them hides the trade.
   SDK path*. In-process, best-effort, **not** durable/resumable. Upgrades a polling
   cache to push-fresh: subscribe, patch/invalidate the cache on each event. Cost: a
   live-query re-runs `all()+filter` **O(rows) per matched event per connection**
-  (the #83 scaling gap), and you tend to hold one subscription per view. On drop →
+  (the live-query scaling gap), and you tend to hold one subscription per view. On drop →
   refetch.
 
 - **`/replicate?after=<offset>`** — the durable broker stream that *feeds the
@@ -158,15 +158,15 @@ tax and losing HTTP-layer caching.
 These fall out of the analysis above and are worth tracking as product-shape
 signals, not just replica internals:
 
-- **Live-query scaling cliff (#83).** O(rows) re-run per matched event per
+- **Live-query scaling cliff.** O(rows) re-run per matched event per
   connection, no coalescing/debounce. This caps how far the *SDK realtime* path
   scales before the replica (which moves that cost client-side) becomes the only
-  answer — so #83 partly decides *when you're forced onto* the replica.
+  answer — so it partly decides *when you're forced onto* the replica.
 - **Replica is read-only (Phase 2 gap).** Writes still round-trip in both paths, so
   the replica gives no write-latency or offline-write advantage yet. A local-first
   pitch is incomplete until local/optimistic writes land.
 - **No wall-clock time-travel.** Snapshot tokens are row-count watermarks, not
-  instants (see #85 honest limits) — "as of a timestamp" is not answerable locally
+  instants — "as of a timestamp" is not answerable locally
   or over REST without a separate index.
 - **Cold-start tax is unmeasured.** The wasm binary size, compile time, and
   time-to-first-local-query are not benchmarked per representative schema. Any
@@ -179,6 +179,5 @@ signals, not just replica internals:
 
 ---
 
-*Related:* `docs/proposals/wasm-runtime.md` and `wasm-replica-plan.md` (the replica
-design), `docs/proposals/language-bindings.md` (#51/#52/#117 positioning),
-`WHAT_V1_IS.md` (honest v1 limits), and the #110/#82/#83/#85 bullets in `CLAUDE.md`.
+*Related:* the browser read-replica and language bindings work, and
+`WHAT_V1_IS.md` (honest v1 limits).

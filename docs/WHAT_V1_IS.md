@@ -100,8 +100,8 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 
 ### Auth
 - **Verify-only.** ForgeDB verifies asymmetric JWTs your identity provider issues
-  and cross-checks a tenant claim; it **does not issue tokens** (deferred, #73)
-  and does **not** do row-level / per-principal authorization (deferred, #72).
+  and cross-checks a tenant claim; it **does not issue tokens** (deferred)
+  and does **not** do row-level / per-principal authorization (deferred).
   The guard is tenant-level: right tenant → allowed, wrong tenant → 403.
 
 ### API / SDK
@@ -136,8 +136,7 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 
 ## Reading the maturity claims
 
-The `CLAUDE.md` "Known issues / backlog" section and
-[V1_ROADMAP.md](./V1_ROADMAP.md) carry the authoritative, code-grounded status of
-every feature, including "LANDED" markers with their guard tests and honest
-limits. Where a marketing-style description in the top-level README seems to
-promise more than this document, **this document and the roadmap are correct**.
+The [V1_ROADMAP.md](./V1_ROADMAP.md) and the project's GitHub issues carry the
+authoritative, code-grounded status of every feature and its honest limits.
+Where a marketing-style description in the top-level README seems to promise more
+than this document, **this document and the roadmap are correct**.

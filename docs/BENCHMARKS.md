@@ -57,7 +57,7 @@ default-config baseline (same host/run epoch) — **relative** shape is the sign
 | `m2m` | 1.62 µs | 5.94 µs | redb multimap vs the generated junction index |
 
 Honest read: on this corpus redb's B-tree reads are faster than ForgeDB's generated
-read path (notably `reverse_fk`, where ForgeDB full-materializes each child — the #160
+read path (notably `reverse_fk`, where ForgeDB full-materializes each child — a documented
 residual). ForgeDB's differentiators (typed generated API, no query parser, columnar
 footprint, snapshot/replica) are not what these point/traversal micro-latencies capture;
 the value of the comparison is exactly surfacing where the generated path is slower.
@@ -72,21 +72,21 @@ scans/aggregates** — the mirror image of the embedded row engines.
 | scenario | DuckDB | redb | ForgeDB (default) | note |
 | --- | --- | --- | --- | --- |
 | `insert_user` | 208 µs | 4.04 ms (barrier) / 0.50 ms | 3.95 ms (barrier) | DuckDB WAL, not a per-row `F_FULLFSYNC` barrier — not like-for-like |
-| `bulk_load/10000` (batched/grouped) | 1.33 s | 4.27 s (eventual) | **373 ms grouped (#170)** | fair like-for-like = DuckDB one-txn batch vs ForgeDB `bulk_load_grouped`; ForgeDB wins (do NOT compare against per-row `bulk_load_posts`, an anti-pattern) |
+| `bulk_load/10000` (batched/grouped) | 1.33 s | 4.27 s (eventual) | **373 ms grouped** | fair like-for-like = DuckDB one-txn batch vs ForgeDB `bulk_load_grouped`; ForgeDB wins (do NOT compare against per-row `bulk_load_posts`, an anti-pattern) |
 | `point_lookup` | 87 µs | 0.97 µs | 3.71 µs | **columnar point lookup ~23× slower than ForgeDB, ~90× slower than redb** |
 | `index_probe` | 83 µs | 1.28 µs | 3.89 µs | same columnar point-op weakness |
 | `reverse_fk` | 106 µs | 4.72 µs | 39.6 µs | — |
 | `m2m` | 196 µs | 1.62 µs | 5.94 µs | — |
-| `scan_aggregate` (sum/filter) | **92 µs** | 680 µs | 186 µs (projected, #168) | DuckDB's vectorized win; ForgeDB 2nd after column-pruning (`@projection(agg: …)`), ahead of SQLite (352 µs) + redb |
-| `scan_sort_top10` | 469 µs | 801 µs | **45.9 µs** (index, #169) | ForgeDB's ordered index beats DuckDB's full scan here |
+| `scan_aggregate` (sum/filter) | **92 µs** | 680 µs | 186 µs (projected) | DuckDB's vectorized win; ForgeDB 2nd after column-pruning (`@projection(agg: …)`), ahead of SQLite (352 µs) + redb |
+| `scan_sort_top10` | 469 µs | 801 µs | **45.9 µs** (index) | ForgeDB's ordered index beats DuckDB's full scan here |
 
 Honest read: DuckDB loses every point/traversal micro-op here by 1–2 orders of magnitude —
 **as expected for a columnar analytical engine**; row-at-a-time access is not what it
 optimizes. The scenario DuckDB is built to win — a filtered **scan + aggregate** (scenario 7) —
-it does win (92 µs), but after #168 column-pruning (ForgeDB reads only the queried columns via
+it does win (92 µs), but after column-pruning (ForgeDB reads only the queried columns via
 a declared `@projection`) the gap is ~2×, not 10×, and ForgeDB now leads SQLite/redb on it; the
 residual is DuckDB's vectorized fold vs ForgeDB's row-wise fold. On the sorted top-N, ForgeDB's
-#169 ordered index (45.9 µs) beats DuckDB's full columnar scan.
+the ordered index (45.9 µs) beats DuckDB's full columnar scan.
 
 ### PostgreSQL (first cross-engine cut, 2026-07-18, macOS Apple Silicon)
 
@@ -150,7 +150,7 @@ PGlite is Postgres 16 built to WebAssembly, run in a single in-process instance 
 server. It is driven from JavaScript/TypeScript, so it does **not** fit the native Rust
 Criterion suite — it lives in a separate Bun-driven suite (`benchmarks/js/`, **implemented**)
 alongside `bun:sqlite` (as a JS-side sanity anchor) and, later, the ForgeDB **WASM
-read-replica** (#110) so the in-process/browser story is measured on its own terms.
+read-replica** so the in-process/browser story is measured on its own terms.
 Reading PGlite (in-process WASM PG) against server PostgreSQL (native, over a socket)
 separates the engine cost from the transport cost — that contrast is the point of
 including it.
@@ -162,15 +162,15 @@ scan`): **`scan_aggregate`** = `COUNT + SUM(views) WHERE published` (a full-tabl
 and **`scan_sort_top10`** = top-10 posts by `views (>= 50 000)` (a filtered scan + sort + page).
 This is the scenario the analytical/columnar engine is built to win.
 
-| scenario | ForgeDB (pre-#168) | ForgeDB (now) | SQLite | redb | DuckDB |
+| scenario | ForgeDB (before scan fix) | ForgeDB (now) | SQLite | redb | DuckDB |
 | --- | --- | --- | --- | --- | --- |
-| `scan_aggregate` | 32.4 ms | **568 µs** (#168) | 352 µs | 632 µs | **100 µs** |
-| `scan_sort_top10` | 32.6 ms | **37 µs** (#169) | **4.35 µs** | 809 µs | 491 µs |
+| `scan_aggregate` | 32.4 ms | **568 µs** | 352 µs | 632 µs | **100 µs** |
+| `scan_sort_top10` | 32.6 ms | **37 µs** | **4.35 µs** | 809 µs | 491 µs |
 
-**#168 landed the column-pruned sequential scan (2026-07-20), a ~56×/~42× win** — the
+**The column-pruned sequential scan landed a ~56×/~42× win** — the
 `scan_aggregate` dropped 32.4 ms → 568 µs and `scan_sort_top10` 32.6 ms → 763 µs (now *faster*
 than redb's honest full scan, and within ~1.6× of SQLite on the aggregate). The mechanism (below)
-was measured, not asserted; the pre-#168 column keeps the honest starting point.
+was measured, not asserted; the pre-fix column keeps the honest starting point.
 
 The original diagnosis and what changed:
 
@@ -182,7 +182,7 @@ The original diagnosis and what changed:
    penalty.** `__scan_all` walked `id_to_row.values()` (random order) and read every column
    positionally per row (`pread` each) — neither columnar sequential locality nor row-store
    contiguity, and the files were cache-hot so ordering alone barely helped (a physical-order sort
-   measured only −3%). **#168** iterates the live rows in physical order and **bulk-loads each
+   measured only −3%). **The column-pruned scan** iterates the live rows in physical order and **bulk-loads each
    scan column once** (`FixedColumn::gather_buffered` / `VariableColumn::gather_buffered` — a
    zero-copy `mmap` alias of the dense prefix in the churn-free common case, else one gathered
    copy), decoding from memory via the *same* per-field decoder `read_at` uses (no second decode
@@ -191,9 +191,9 @@ The original diagnosis and what changed:
    the scan still materializes the full narrow row (id + all filterable columns, incl. a `title`
    `String` alloc) rather than only the queried columns, and aggregates row-wise rather than
    vectorized — the remaining gap is that, not the mutation model.
-3. **`scan_sort_top10`: #169 made it index-served (763 µs → 37 µs).** SQLite has a B-tree
+3. **`scan_sort_top10`: the ordered index made it index-served (763 µs → 37 µs).** SQLite has a B-tree
    `idx_post_views`, so `WHERE views >= T ORDER BY views DESC LIMIT 10` is an ordered range scan +
-   limit (O(10)). **#169** gives `views: ^u64` a **parallel `BTreeMap` ordered index** (keyed by the
+   limit (O(10)). **The ordered index** gives `views: ^u64` a **parallel `BTreeMap` ordered index** (keyed by the
    typed value, alongside the untouched exact-match hash index), and a generated
    `find_by_views_range(min, max, descending, limit)` that walks it — the same O(offset+limit)
    ordered-range shape. The benchmark now calls it (fair apples-to-apples with SQLite's index-served
@@ -217,7 +217,7 @@ these are not 1:1 comparable to the Rust suite's absolute numbers.)
 
 ### Concurrency (scenario 16, 2026-07-18, macOS Apple Silicon)
 
-`make bench-concurrency`. ForgeDB reader throughput under a live writer (#56-B: single writer +
+`make bench-concurrency`. ForgeDB reader throughput under a live writer (single writer + concurrent readers: single writer +
 lock-free concurrent readers). A `DatabaseReader` + `DatabaseSnapshot` are captured, the writable
 `Database` is moved into a background writer thread that inserts continuously, and N reader threads
 hammer point reads on the captured handle. If reads were serialized against the writer, the
@@ -231,10 +231,10 @@ hammer point reads on the captured handle. If reads were serialized against the 
 | 8 | 139 621 | 164 031 | 271 |
 
 Honest read: the `(+writer)` column stays within noise of the `idle` column at 1/2/4 readers —
-**reads are lock-free; a live writer does not throttle them**, confirming #56-B. Read throughput
+**reads are lock-free; a live writer does not throttle them**, confirming the single-writer/concurrent-reader model. Read throughput
 scales to ~4 threads then falls off at 8 (past this host's performance-core count — scheduling/
 oversubscription, not a lock). The writer runs at ~270 inserts/s, which independently corroborates
-the **single** `F_FULLFSYNC` barrier per insert (~3.7 ms ⇒ ~270/s; the pre-#130 double barrier
+the **single** `F_FULLFSYNC` barrier per insert (~3.7 ms ⇒ ~270/s; the earlier double barrier
 would be ~135/s). Honest limit: this is one writer + N readers (the v1 contract); it is a snapshot
 read (rows appended after capture are invisible — that is the isolation guarantee, not a miss).
 
@@ -258,7 +258,7 @@ because a B-tree KV stores the full 16-byte key beside every value in every tabl
 the secondary/multimap index tables. This is the footprint dividend ForgeDB trades its point-read
 latency for.
 
-ForgeDB update-churn bloat (superseding-version append; #66) — 2 000 updates to one user, then
+ForgeDB update-churn bloat (superseding-version append) — 2 000 updates to one user, then
 `compact()`:
 
 | | bytes |
@@ -294,7 +294,7 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
 5. **Point lookup by PK** — `get(id)` (O(1) `id_to_row`) vs. indexed `WHERE id = ?`.
 6. **Secondary-index lookup** — `find_by_views` / `get_by_email` (O(1) probe) vs. indexed column.
 7. **Filtered scan + sort + paginate** — the generated list path (closed-set matcher + comparator). Expected DuckDB win.
-8. **FK-index lookup** — `find_by_author` (O(1) since #100).
+8. **FK-index lookup** — `find_by_author` (O(1)).
 
 ### Relations (ForgeDB's differentiator — generated traversal, no runtime join planner)
 9. **Forward FK traversal** — `post_author`.
@@ -308,7 +308,7 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
 15. **Compaction** — bytes reclaimed + pause cost of in-process `compact()` after update/delete churn.
 
 ### Concurrency
-16. **Concurrent readers under a live writer** (#56-B) — reader throughput while one writer appends.
+16. **Concurrent readers under a live writer** — reader throughput while one writer appends.
 17. **Transaction throughput** (MVCC Tiers 1–2) — commits/s under optimistic concurrent writers.
 
 ### Footprint
@@ -356,14 +356,14 @@ host (Apple SSD), per durable op:
    The generated `insert` fsyncs the WAL (`sync_all`, ~3.5 ms). *When `[runtime].replication
    = true`* it ALSO records to the durable replication broker (`DurableBroker::record` →
    `sync_all` under `FsyncPolicy::Always`, `durable.rs`) — a second ~3.5 ms barrier. Since
-   **#130 made `[runtime].replication` default OFF**, `open_at` no longer attaches the broker
+   **replication now defaults OFF**, `open_at` no longer attaches the broker
    unconditionally, so the default single-insert is **~3.95 ms ≈ one barrier** (on par with
    SQLite-`fullfsync`'s ~4.0 ms); the residual over the raw barrier (~0.5 ms) is serde +
    column appends + index maintenance — reasonable. With `replication_on` it is ~7.35 ms ≈
-   2 × a barrier (see the configuration matrix). (Historically — pre-#130 — the broker was
+   2 × a barrier (see the configuration matrix). (Historically the broker was
    attached unconditionally, so *every* insert paid two barriers ~7.6 ms; that is no longer
    the default.)
-3. **Group commit (#170) amortizes the barrier across a transaction.** A per-row insert pays one
+3. **Group commit amortizes the barrier across a transaction.** A per-row insert pays one
    `F_FULLFSYNC` per row (the 50.7 s `bulk_load/10000`). Wrapping the load in a `db.transaction`
    makes staged rows use the **buffered** (no-fsync) WAL append and pay a **single** barrier at
    commit — durability preserved (the transaction commits atomically or rolls back; a crash before
@@ -375,7 +375,7 @@ host (Apple SSD), per durable op:
    (per-row cost ~10 ms → ~37 µs); the residual for a *large* single transaction is the commit-time
    full **reindex** (`__reindex_committed` rebuilds the model's `id_to_row` + indexes — superlinear
    in one giant txn), so moderate batch sizes (e.g. 1 000/txn) beat one all-in-one transaction. A
-   delta-reindex at commit (the #161-B fold-only-new-rows path) is the follow-up. Note: a post's FK
+   delta-reindex at commit (the fold-only-new-rows path) is the follow-up. Note: a post's FK
    is validated against **committed** rows, so a batch must commit its parents before its children
    (two transactions, still two barriers vs N).
 
@@ -391,120 +391,41 @@ redb-`immediate` (3.94 ms); at the **relaxed** tier ForgeDB-`fsync_never` (**37 
 (331 µs). Never compare across tiers (the ForgeDB-`Always`-vs-DuckDB gap is barrier-vs-no-barrier,
 not an engine deficit).
 
-## Performance-triage sweep — status
+## Recent performance work
 
-> **Primary focus (2026-07-19): the storage-model experiment — epic #167**, design
-> `docs/proposals/storage-model-experiment.md`. It reframes the weak numbers below as four
-> independent axes (columnar = keep; append-only = the axis under test; durability policy +
-> generated-read-path quality = orthogonal confounds). **Phase 1** fixes the read-path confounds
-> as strict wins (**#168 column-pruned scan — LANDED 2026-07-20, 32 ms → 568 µs / 763 µs**;
-> **#169 ordered/range index — LANDED 2026-07-20, top-N 763 µs → 37 µs**; **#160 narrow
-> materialization — LANDED 2026-07-20** (live-query re-run narrowed; reverse-FK already index-served);
-> **#170 group-commit — LANDED 2026-07-20, `bulk_load_grouped` 50.7 s → 373 ms / 14.8 s → 108 ms**,
-> beating SQLite + DuckDB at 10k).
-> **Phase 1 of #167 is COMPLETE.** **Phase 2** adds a fixed-width in-place `GenConfig` variant
-> to the config
-> matrix and measures append-only-vs-in-place side-by-side. Several candidates listed further
-> below (group/batch commit, relaxed durability) are now Phase-1 items of that epic.
+The weak numbers above are best understood as **four independent axes**, not one "storage is
+slow" verdict: **columnar layout** (kept — smallest footprint), **append-only mutation** (the axis
+under active study — it buys snapshots / lock-free readers / MVCC / replica with no `xmin`/`xmax`,
+at the cost of churn growth + version indirection), **durability policy** (the `F_FULLFSYNC`
+barrier, orthogonal to layout), and **generated-read-path quality** (fixable in codegen and index
+choice). The append-only-vs-in-place comparison is being **measured** rather than asserted (the
+storage-model experiment; its config-matrix variant is in progress).
 
-The seeded candidates below were promoted to the tracked sweep **#152** (12 children).
-**Landed:**
+A sweep of read-path and write-path confounds has landed as strict wins:
 
-- **#162 — deferred compaction + in-place remap (2026-07-18, Options A + C).** Auto-compaction ran INLINE on
-  the update/delete that crossed the dead-row threshold: checkpoint + rewrite every column file (temp+rename)
-  + a full `*self = Self::new_at()` reopen (an O(rows × indexes) rehydrate rescan) — one write per ~1000
-  mutations ate a multi-ms tail-latency spike. **(A defer)** Crossing the SOFT threshold now only sets a
-  `compaction_due` flag (the triggering write does not stall); `Database::maintain()` runs the reclaim off the
-  hot write turn at an operator/coordinator idle point, and a HARD ceiling
-  (`COMPACTION_DEAD_THRESHOLD × COMPACTION_DEAD_CEILING_FACTOR`, ×4) still forces an inline compaction as a
-  growth-bounding safety net if `maintain()` is never called. **(C in-place remap)** When compaction does run,
-  it no longer rehydrate-rescans: it reopens ONLY the column handles (stale fds after the rename) via
-  `new_at_no_rehydrate`, then remaps `id_to_row`/`id_versions` in place — a surviving row's dense new index is
-  `keep_sorted.partition_point(|&r| r < old_row)` — and reinstalls the secondary index maps **verbatim** (they
-  are value→id keyed, so a physical-row renumber leaves them correct). **Zero column reads** on the reopen.
-  Guards `test_rust_generation_auto_compaction` (defer + ceiling + maintain) + `test_rust_generation_incremental_rehydrate`
-  (in-place remap); E2E `scratchpad/perf162` (explicit compact preserves values/deletes/all index kinds + reopen
-  consistency; soft-threshold defers, `maintain()` reclaims, ceiling forces inline). Corpus incl. integer-PK
-  compile-checked. **Honest limit:** single physical append point per column stands — the reclaim is still
-  serialized under the writer lock (just off the *write* turn); true background compaction needs the segmented-
-  column effort.
-- **#161 — incremental delta peer refresh (2026-07-18, Option B).** The Tier-3 coordinated peer refresh
-  (`__sync_columns_from_disk` + `__reindex_committed`) CLEARED every in-memory map and rescanned all rows ×
-  indexes on *every* refresh (before each prepare when a peer advanced). It now captures the pre-sync watermark
-  and folds ONLY the new rows `[from..row_count)` via `__reindex_delta` — **O(new rows), not O(all rows ×
-  indexes)** — replaying the SAME live update/delete maintenance per row (remove the pre-row version's keys via
-  `self.get(id)`, add the folded row's keys via `self.read_at`), so the maps end up identical to a full rebuild
-  with no second maintenance source to drift. Pure generated code, no on-disk artifact, no write amplification.
-  Guard in `test_rust_generation_coordinated_client`; E2E `scratchpad/perf162` (delta fold over `__stage_append`ed
-  "peer" rows == full `__reindex_committed`; supersede + tombstone + insert within the range; no-op tail).
-  **Chosen over A (persist-per-checkpoint, which adds `(N/1000)×rows` write-amp exceeding the one-time reopen
-  scan) and C (lazy index, which collides with the `&self` read API — `reader()`/`find_by_*` can't build
-  continuously-mutated maps without write-path locks).** Cold-start reopen keeps the existing #110 narrow
-  indexed-columns-only scan.
-- **#154 — M2M traversal index (2026-07-18).** `post_tags`/`tag_posts` now probe in-memory
-  `left_index`/`right_index` maps (O(degree)) instead of scanning every link row via `pairs()`.
-  Measured **`m2m/post_tags`: ~38 ms → 5.94 µs** (~6400×; now within ~2× of SQLite's ~2.7 µs).
-- **#160 — narrow list scan + index pushdown (2026-07-18, Options A + C).** The REST list handler
-  full-materialized every column of every row via `all()`, then filtered/sorted/paginated and discarded all
-  but `limit` rows — decoding N full records to return a page. **(A)** The live list path now filters + sorts
-  an internal narrow `<Model>ScanRow` (id + only the filterable/sortable columns, decoded via the shared
-  `generate_row_read_body` — the same body `read_at` uses, no drift) and **full-materializes only the paginated
-  page** (`N` full decodes → `N` narrow decodes + `limit` full). The narrow filter/sort reuse the SAME per-field
-  checks/arms as `_event_matches`/`_apply_sort` (one predicate source). **(C)** When the filter names an eligible
-  single-indexed field (string/uuid/int/bool/decimal/timestamp/enum), candidates resolve from that field's
-  secondary index (**O(matches)**) instead of scanning every row; a parse failure falls back to the full scan, so
-  a match is never missed. The `<Model>ScanRow` is internal — never wired to REST `?projection=` / TS / OpenAPI.
-  `?as_of` list reads keep the existing full-record path (a rarer inspector read; #159 already made its resolution
-  sub-linear). Guard `test_rust_generation_list_scan_narrow`; E2E `scratchpad/perf160` (live `tower::oneshot`:
-  narrow filter/sort/paginate returns full-record pages, unique-index + composite-fallthrough + no-match, projection
-  + `as_of` intact); full `examples/` corpus (nullable/char/decimal/enum/composite/M2M/integer-PK) compile-checked.
-  **Honest limit:** only the **live list** path is wired; reverse-FK getters (return full records by API contract)
-  and live-query re-runs still full-materialize — a documented follow-up.
-- **#159 — snapshot reads via per-id version index (2026-07-18, Option A).** `get_at`/`all_at`/
-  `find_by_*_at` (REST `?as_of`, #85) resolved "newest version as of a watermark" by scanning `0..watermark`
-  of the id column — O(watermark) per point read, and the FK snapshot-probe called `get_at` per candidate →
-  **O(candidates × watermark)** (quadratic). Each id-bearing model now carries a per-id ascending list of its
-  physical row versions (`id_versions: Arc<HashMap<Id, Vec<usize>>>`, appended in lockstep with `id_to_row`,
-  rebuilt on reopen, Arc-shared into readers per #158). `get_at` binary-searches it for the newest row
-  `< watermark` → **O(log versions)**; the FK-probe drops to O(candidates × log v); `all_at`/projection `_at`
-  resolve per-id → O(distinct_ids × log v) (a win under update/delete churn, where dead versions inflate the
-  watermark). No on-disk format change; the vec stays sorted for free (monotonic row_count). Guard
-  `test_rust_generation_version_index` + updated snapshot-reads guard; E2E `scratchpad/perf158` proves
-  snapshot-version resolution respects the watermark (an old snapshot resolves the pre-update version on the
-  live writer via binary search) + reader isolation + reopen rebuild. Honest limit: `id_versions` grows with
-  dead versions until compaction reclaims + reopen rebuilds (same bound as `id_to_row`).
-- **#158 — reader() index-map sharing (2026-07-18, Option A).** `Database::reader()` no longer deep-clones
-  every secondary/composite index map + `id_to_row` per call (was O(total live rows across the DB)). The maps
-  are `Arc<HashMap<..>>`, so `reader()` capture is an O(1) `Arc::clone` (refcount bump); the single writer
-  mutates via `Arc::make_mut` — copy-on-write, cloning a map once only while a reader still holds the prior
-  snapshot, then in place. Probe reads are unchanged (`Arc` derefs to `HashMap`). Honest limit: a
-  **persistently-held reader under continuous writes** degrades to a whole-map CoW clone per write — the
-  cliff a persistent HAMT (Option B) would avoid, filed as the **#166** explore/experiment (needs an A-vs-B
-  bench across both reader profiles before adoption).
-- **#157 — redundant write-path serialization (2026-07-18).** Part A: serialize the record ONCE per
-  insert/update/delete (WAL borrows the buffer, the broker moves it) instead of twice. Part B: a field in
-  ≥2 index structures (single + composite) derives its tagged index key once per mutation and reuses it. No
-  format change. The *encoding* half (JSON→binary codec across all internal wasteful-JSON sites) is the
-  separate, larger **#165** (sweep catalogued there).
-- **#156 — coordinator fsync off the turn lock (2026-07-18).** The Tier-3 coordinator's replication-log
-  append + fsync now runs under a separate broker mutex, OUTSIDE the turn/condvar critical section (Option A),
-  so a committing client's barrier no longer blocks other writers from a turn; the next writer's turn +
-  client I/O overlap the barrier. The barrier is also configurable — `forgedb coordinate --fsync
-  always|never|periodic` (Option C, default `always`) — and the broker is opened `Never` so the coordinator
-  drives ≤1 barrier per commit (was N+1: per-record + explicit flush). `never`/`periodic` never risk committed
-  client data (the log is resumable; clients fsync their own columns+WAL first).
-- **#155 — M2M cascade-unlink (2026-07-18).** Fell out of #154: `unlink_all_*` + `unlink` now use the
-  junction index (O(degree)) instead of O(link_rows²) scans.
-- **#153 — single-barrier checkpoint (2026-07-18).** `checkpoint()`/`commit()` push every column
-  to the drive cache with a plain `fsync` (macOS `libc::fsync`, ~27 µs) then issue ONE device
-  barrier (`F_FULLFSYNC`), instead of an `F_FULLFSYNC` per column — one barrier per collection
-  checkpoint, not N. Substrate `forgedb-storage-native` gains `sync_to_drive()`/`barrier()`
-  (no-ops on `storage-web`); publish gap open until storage-native/web/facade republish. (The
-  userspace-`BufWriter` half of the original direction was rejected: buffered appends break
-  positional `read_exact_at`/mmap read-after-write and the lock-free Direction-B reader view —
-  unbuffered page-cache writes are load-bearing.)
+- **Column-pruned sequential scan** — the narrow list/scan path bulk-loads each needed column once
+  in physical order instead of a syscall per row × column. `scan_aggregate` **32.4 ms → 568 µs**
+  (→ 186 µs over a declared projection); `scan_sort_top10` **32.6 ms → 763 µs**.
+- **Ordered/range index kind** — a parallel `BTreeMap` index serves `WHERE x >= T ORDER BY x LIMIT
+  n`. `scan_sort_top10` **763 µs → 37 µs** (index-served).
+- **Group/batch commit** — bulk load rides one durability barrier per transaction instead of one
+  per row. `bulk_load` at 10k rows **50.7 s → ~0.37 s**, beating SQLite and DuckDB at that size
+  while keeping the barrier guarantee.
+- **M2M traversal index** — `post_tags`/`tag_posts` probe in-memory adjacency maps (O(degree))
+  instead of scanning every link. `m2m/post_tags` **~38 ms → 5.94 µs**.
+- **Narrow list materialization + index pushdown** — the list handler filters/sorts a narrow row
+  and full-materializes only the returned page, resolving from a secondary index when the filter
+  names an indexed field.
+- **Sub-linear snapshot resolution** — point-in-time (`?as_of`) reads binary-search a per-id
+  version index instead of scanning the id column, removing a quadratic FK-probe.
+- **Single-barrier checkpoint** — a checkpoint issues one device barrier per collection instead of
+  one per column.
+- **Deferred compaction + in-place remap** — compaction runs off the hot write turn and remaps the
+  in-memory indexes in place instead of a full rehydrate rescan.
 
-## Configuration matrix (epic #126) — how generate-time knobs shift performance
+Specific perf work is tracked in the GitHub issues (label `perf`).
+
+## Configuration matrix — how generate-time knobs shift performance
 
 `make bench-regen-matrix && make bench-matrix` regenerates the SAME `bench.forge`
 under each `benchmarks/configs/<variant>.toml` (a distinct generated module) and runs
@@ -521,11 +442,11 @@ values (fsync-bound numbers are storage-hardware-specific).
 | `update_one` | 3.80 ms | **47.9 µs** (~79×) | 7.55 ms (~2.0×) | — |
 | `delete_reinsert` (2 durable ops) | 7.83 ms | **80.5 µs** (~97×) | 14.79 ms (~1.9×) | — |
 
-- **`[storage].fsync = "never"` (#129) is the dominant lever: ~80–110× faster writes.** The
+- **`[storage].fsync = "never"` is the dominant lever: ~80–110× faster writes.** The
   `F_FULLFSYNC` device barrier (~3.5 ms) *is* essentially the entire write latency; without it a
   write is a page-cache append (tens of µs). It trades a real power-loss durability window for that.
-- **`[runtime].replication = true` (#130) ~doubles write latency** — the durable broker adds a SECOND
-  `F_FULLFSYNC` per write (default OFF exists precisely to avoid this; the flagship #126 knob).
+- **`[runtime].replication = true` ~doubles write latency** — the durable broker adds a SECOND
+  `F_FULLFSYNC` per write (default OFF exists precisely to avoid this).
 - **`[runtime].changefeed_capacity` has no write-latency effect** (it is a broadcast-buffer size, not
   on the durable path) — confirms the knob is free to tune for subscriber fan-out.
 
@@ -540,19 +461,19 @@ seeded rows):
 - Churn is fsync-dominated (250 × ~3.9 ms ≈ 0.98 s), so compaction is a small delta on top: threshold
   1000 (`default`) never auto-fires over 250 updates (one `maintain()` reclaim at the end), `compaction_off`
   never reclaims, and threshold 100 (`compaction_low`) reclaims — costing ~+8% (~90 ms for the extra
-  reclaim). The #162-C **in-place remap** is what keeps each reclaim that cheap (no O(rows × indexes)
+  reclaim). The **in-place remap** is what keeps each reclaim that cheap (no O(rows × indexes)
   rehydrate rescan); a low threshold trades a bit of throughput for bounded storage.
-- `reopen_2000_rows` ≈ 28 ms is the rehydrate cost (id-scan + secondary-index rebuild) that #161-B (peer
-  refresh) and #162-C (post-compaction) avoid re-paying on their hot paths.
+- `reopen_2000_rows` ≈ 28 ms is the rehydrate cost (id-scan + secondary-index rebuild) that the peer
+  refresh and post-compaction paths avoid re-paying on their hot paths.
 
 ## Performance-triage candidates (seeded from the fsync work)
 
 Feed these into the broader perf sweep (not fixes — triage items):
 
-- **Double fsync barrier per write — RESOLVED by #130 (the `[runtime].replication` knob).**
+- **Double fsync barrier per write — RESOLVED by the `[runtime].replication` knob.**
   Historically `open_at` attached a synchronous `FsyncPolicy::Always` replication broker
   unconditionally, so every insert/update/delete paid a second `F_FULLFSYNC` on the critical
-  path even for apps that never consume `/replicate`. #130 made `[runtime].replication` default
+  path even for apps that never consume `/replicate`. `[runtime].replication` now defaults
   **OFF** — the broker is now attached only when replication is enabled — which took the
   default durable-write latency from ~7.6 ms to ~3.95 ms (one barrier, on par with
   SQLite-`fullfsync`). The `replication_on` variant (~7.35 ms) is the opt-in two-barrier cost.
@@ -562,12 +483,10 @@ Feed these into the broader perf sweep (not fixes — triage items):
   (`Always`); there is no per-deployment knob to trade the barrier for `Periodic`/grouped
   commit the way SQLite exposes `synchronous`/`fullfsync`. Worth a design look for the
   write-throughput story.
-- **Group/batch commit (#170, Phase 1 of epic #167).** Bulk load fsyncs per row (one — now two —
+- **Group/batch commit (a storage-model Phase 1 item).** Bulk load fsyncs per row (one — now two —
   barriers each). A batched-commit path (one barrier per N rows) is the standard fix and would
   transform the bulk-load numbers; currently absent. Unlike `[storage].fsync=never` it keeps the
   barrier guarantee while amortizing it.
-
-## Expected shape of results (stated up front, so results don't read as cherry-picked)
 
 ## Expected shape of results (stated up front, so results don't read as cherry-picked)
 
@@ -599,7 +518,7 @@ benchmarks/
 
 **`gen/database.rs` is generated, not hand-edited.** It drifts as codegen changes;
 `make bench-regen` re-emits it from `bench.forge` through the current CLI. (Same
-discipline as the `scratchpad/*_compile` harnesses — snapshot pass ≠ output compiles, so
+discipline as the throwaway compile harnesses — snapshot pass ≠ output compiles, so
 the bench compiling the generated code is itself a codegen guard.)
 
 The ForgeDB and SQLite suites implement the **same numbered scenarios over the same
@@ -612,7 +531,7 @@ make bench            # the no-setup embedded suites (ForgeDB + SQLite + redb + 
 make bench-forgedb    # ForgeDB generated code only
 make bench-sqlite     # SQLite only
 make bench-footprint  # on-disk footprint (all engines) + ForgeDB churn bloat (scenario 18)
-make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, scenario 16)
+make bench-concurrency# ForgeDB reader throughput under a live writer (scenario 16)
 make bench-regen      # re-emit benchmarks/gen/database.rs from bench.forge
 ```
 

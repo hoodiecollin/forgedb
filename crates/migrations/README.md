@@ -1,312 +1,67 @@
 # forgedb-migrations
 
-Schema migration system for ForgeDB with automated diffing, generation, and tracking.
+The **dev-time** half of ForgeDB's schema-migration system: it detects how a
+`.forge` schema evolves, records each change as a versioned migration, classifies
+every hop, and maintains the serial version lineage.
 
-> **Note (#74, complete):** the in-crate `MigrationExecutor` (the old direct-column byte-op
-> path) has been **removed**. This crate is the **dev-time** half only — it records and
-> classifies the version lineage (`SchemaDiffer` → `MigrationGenerator` → `MigrationLineage`).
-> Applying a migration to data-at-rest is the job of the offline, per-version-range
-> **transformer bin** that `forgedb-codegen`'s `TransformGenerator` emits, driven end-to-end
-> by **`forgedb migrate up`** (`create --auto` → author any `transform.rs` → `up`).
-> **The canonical operator guide is [`docs/MIGRATIONS.md`](../../docs/MIGRATIONS.md).** Any
-> `MigrationExecutor::execute_up`/`execute_down` snippets remaining below are stale — ignore
-> them in favor of that guide.
+It does **not** rewrite data at rest. Applying a migration to a data directory is
+done by an offline, per-version-range **transformer binary** that
+[`forgedb-codegen`](../codegen)'s `TransformGenerator` emits and that the
+`forgedb migrate up` CLI builds and runs. Keeping the rewrite in generated code
+preserves ForgeDB's core invariant — the schema is a compile-time input to
+generation, never a runtime input to a generic engine.
+
+**The end-to-end operator workflow lives in
+[`docs/MIGRATIONS.md`](../../docs/MIGRATIONS.md).** This README documents the
+crate's library API only.
 
 ## Overview
 
-`forgedb-migrations` is the schema migration and evolution system for ForgeDB. It provides a complete migration workflow from detecting schema changes to generating migration files, executing them safely, and tracking their state. The system supports both breaking and non-breaking changes with built-in validation and rollback capabilities.
+`forgedb-migrations` covers the record-and-classify side of schema evolution:
 
-## Features
-
-- **Schema diffing algorithm** - Automatically detect changes between schema versions
-- **Migration generation** - Create timestamped, versioned (`from -> to`) migration records
-- **Hop classification** - Tag each change `Auto` (differ-provable) or `Authored` (needs a body)
-- **Lineage** - Order the serial version chain + expand a `--from`/`--to` range for the transformer
-- **Migration tracking** - Persistent state tracking of applied migrations
-- **Breaking change detection** - Automatic identification of potentially dangerous operations
-- **Checksum verification** - Ensure migration file integrity
-- **Detailed reporting** - Human-readable descriptions of all changes
-
-> Data-at-rest is rewritten by the generated transformer bin, not this crate — see the note
-> above and [`docs/MIGRATIONS.md`](../../docs/MIGRATIONS.md).
+- **Schema diffing** — compare two schema states and produce a list of changes.
+- **Migration generation** — write timestamped, versioned (`from → to`) migration
+  records to a `migrations/` directory.
+- **Hop classification** — tag each change `Auto` (the differ can prove the new-row
+  body from the diff alone) or `Authored` (it needs a hand-written transform).
+- **Lineage** — order the serial version chain and expand a `--from`/`--to` range
+  into the ordered hop sequence the transformer replays.
+- **Tracking** — persist which migrations have been applied, with checksum
+  verification.
 
 ## Installation
-
-Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 forgedb-migrations = "0.1"
 ```
 
+## Dev-time flow
+
+```text
+Schema v1 → Schema v2
+    │
+    ▼
+SchemaDiffer::diff  ──►  Vec<SchemaChange>
+    │
+    ▼
+MigrationGenerator::generate_versioned  ──►  Migration { changes, from_version, to_version }
+    │
+    ▼
+hop_body_class()  ──►  Auto | Authored   (Authored hops are scaffolded for you to author + freeze)
+    │
+    ▼
+forgedb-codegen TransformGenerator  ──►  offline transformer bin
+    │
+    ▼
+forgedb migrate up  ──►  data rewritten v1 → v2 into a fresh dir
+```
+
 ## Usage Examples
 
-### Diffing Schemas
+### Diffing schemas
 
-Compare two schemas to detect changes:
-
-```rust
-use forgedb_migrations::{
-    SchemaDiffer, SimpleSchema, SimpleModel, SimpleField
-};
-
-// Define old schema
-let old_schema = SimpleSchema {
-    models: vec![
-        SimpleModel {
-            name: "User".to_string(),
-            fields: vec![
-                SimpleField {
-                    name: "id".to_string(),
-                    field_type: "uuid".to_string(),
-                    nullable: false,
-                    unique: true,
-                    indexed: false,
-                    index_type: "Hash".to_string(),
-                    constraints: vec![],
-                }
-            ],
-            composite_indexes: vec![],
-        }
-    ],
-};
-
-// Define new schema with added field
-let new_schema = SimpleSchema {
-    models: vec![
-        SimpleModel {
-            name: "User".to_string(),
-            fields: vec![
-                SimpleField {
-                    name: "id".to_string(),
-                    field_type: "uuid".to_string(),
-                    nullable: false,
-                    unique: true,
-                    indexed: false,
-                    index_type: "Hash".to_string(),
-                    constraints: vec![],
-                },
-                SimpleField {
-                    name: "email".to_string(),
-                    field_type: "string".to_string(),
-                    nullable: false,
-                    unique: true,
-                    indexed: true,
-                    index_type: "Hash".to_string(),
-                    constraints: vec![],
-                }
-            ],
-            composite_indexes: vec![],
-        }
-    ],
-};
-
-// Diff the schemas
-let changes = SchemaDiffer::diff(&old_schema, &new_schema);
-
-// Inspect changes
-for change in &changes {
-    println!("{}", change.description());
-    if change.is_breaking() {
-        println!("  ⚠️  This is a breaking change!");
-    }
-}
-```
-
-### Generating Migrations
-
-Create a migration file from detected changes:
-
-```rust
-use forgedb_migrations::{MigrationGenerator, SchemaChange};
-use std::path::PathBuf;
-
-// Define changes to apply
-let changes = vec![
-    SchemaChange::AddModel {
-        model_name: "User".to_string(),
-    },
-    SchemaChange::AddField {
-        model_name: "User".to_string(),
-        field_name: "email".to_string(),
-        field_type: "string".to_string(),
-        nullable: false,
-        default_value: None,
-    },
-];
-
-// Generate migration file
-let migration = MigrationGenerator::generate(
-    PathBuf::from("./migrations"),
-    "Create User model".to_string(),
-    changes
-)?;
-
-println!("Generated migration: {}", migration.filename());
-println!("Migration ID: {}", migration.id);
-println!("Checksum: {}", migration.checksum);
-
-// Generate a report
-let report = MigrationGenerator::generate_report(&migration);
-println!("{}", report);
-```
-
-### Executing Migrations
-
-Apply migrations to your database:
-
-```rust
-use forgedb_migrations::{MigrationExecutor, MigrationGenerator};
-use std::path::PathBuf;
-
-let migrations_dir = PathBuf::from("./migrations");
-let data_dir = PathBuf::from("./data");
-
-// Load all migrations
-let migrations = MigrationGenerator::load_all_migrations(&migrations_dir)?;
-
-for migration in &migrations {
-    // Execute the migration (forward)
-    MigrationExecutor::execute_up(&migration, &data_dir)?;
-    println!("✓ Applied migration: {}", migration.description);
-}
-```
-
-### Rolling Back Migrations
-
-Undo the last applied migration:
-
-```rust
-use forgedb_migrations::{MigrationExecutor, MigrationTracker};
-use std::path::PathBuf;
-
-let migrations_dir = PathBuf::from("./migrations");
-let data_dir = PathBuf::from("./data");
-
-// Load tracker to find last migration
-let mut tracker = MigrationTracker::new(&migrations_dir)?;
-
-if let Some(last) = tracker.last_migration() {
-    // Load the migration
-    let migrations = MigrationGenerator::load_all_migrations(&migrations_dir)?;
-    let migration = migrations
-        .iter()
-        .find(|m| m.id == last.migration_id)
-        .expect("Migration not found");
-    
-    // Execute rollback (reverse)
-    MigrationExecutor::execute_down(&migration, &data_dir)?;
-    
-    // Update tracker
-    tracker.mark_rolled_back()?;
-    
-    println!("✓ Rolled back migration: {}", migration.description);
-}
-```
-
-### Tracking Migration History
-
-Track which migrations have been applied:
-
-```rust
-use forgedb_migrations::{MigrationTracker, MigrationGenerator};
-use std::path::PathBuf;
-
-let migrations_dir = PathBuf::from("./migrations");
-
-// Create tracker
-let mut tracker = MigrationTracker::new(&migrations_dir)?;
-
-// Load all available migrations
-let all_migrations = MigrationGenerator::load_all_migrations(&migrations_dir)?;
-
-for migration in &all_migrations {
-    if !tracker.is_applied(&migration.id) {
-        // Execute migration...
-        // MigrationExecutor::execute_up(&migration, &data_dir)?;
-        
-        // Mark as applied
-        tracker.mark_applied(
-            migration.id.clone(),
-            migration.checksum.clone()
-        )?;
-        
-        println!("✓ Applied and tracked: {}", migration.description);
-    } else {
-        println!("⊘ Already applied: {}", migration.description);
-    }
-}
-
-// Get status summary
-println!("{}", tracker.status_summary(all_migrations.len()));
-
-// List pending migrations
-let pending_ids: Vec<String> = all_migrations
-    .iter()
-    .map(|m| m.id.clone())
-    .collect();
-let pending = tracker.pending_migrations(&pending_ids);
-println!("Pending migrations: {}", pending.len());
-```
-
-## Diffing Algorithm
-
-The schema diffing algorithm compares two schema states and produces a list of changes. It works by:
-
-### Detection Process
-
-1. **Build lookup maps** - Index models and fields by name for efficient comparison
-2. **Detect model changes** - Compare model presence in old vs new schema
-3. **Detect field changes** - For each common model, compare field definitions
-4. **Detect index changes** - Compare index definitions and constraints
-5. **Order changes** - Ensure dependent changes are applied in correct order
-
-### Supported Changes
-
-The differ can detect the following schema changes:
-
-#### Model-Level Changes
-- **AddModel** - A new model was added to the schema
-- **RemoveModel** - A model was removed (⚠️ BREAKING)
-- **RenameModel** - A model was renamed (preserves data)
-
-#### Field-Level Changes
-- **AddField** - A new field was added to a model
-- **RemoveField** - A field was removed (⚠️ BREAKING)
-- **RenameField** - A field was renamed (preserves data)
-- **ChangeFieldType** - Field's data type changed (⚠️ BREAKING)
-- **ChangeFieldNullability** - Field's nullability changed (⚠️ BREAKING if making non-nullable)
-
-#### Index-Level Changes
-- **AddIndex** - An index was added to a field
-- **RemoveIndex** - An index was removed from a field
-- **AddCompositeIndex** - A composite index was added
-- **RemoveCompositeIndex** - A composite index was removed
-
-#### Constraint-Level Changes
-- **AddUniqueConstraint** - A unique constraint was added (⚠️ may fail if duplicates exist)
-- **RemoveUniqueConstraint** - A unique constraint was removed
-- **AddConstraint** - A validation constraint was added
-- **RemoveConstraint** - A validation constraint was removed
-
-### Breaking vs Non-Breaking Changes
-
-The system automatically categorizes changes as breaking or non-breaking:
-
-#### Breaking Changes (require careful review)
-- Removing models or fields (data loss)
-- Changing field types (data conversion required)
-- Making fields non-nullable (may fail if nulls exist)
-- Adding unique constraints (may fail if duplicates exist)
-
-#### Non-Breaking Changes (safe to apply)
-- Adding models or fields
-- Adding indexes
-- Removing constraints
-- Making fields nullable
-- Renaming (with proper mapping)
-
-### Change Detection Example
+Compare two schema states and inspect the detected changes:
 
 ```rust
 use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField};
@@ -315,10 +70,10 @@ let old_schema = SimpleSchema {
     models: vec![SimpleModel {
         name: "User".to_string(),
         fields: vec![SimpleField {
-            name: "age".to_string(),
-            field_type: "u32".to_string(),
-            nullable: true,
-            unique: false,
+            name: "id".to_string(),
+            field_type: "uuid".to_string(),
+            nullable: false,
+            unique: true,
             indexed: false,
             index_type: "Hash".to_string(),
             constraints: vec![],
@@ -330,553 +85,221 @@ let old_schema = SimpleSchema {
 let new_schema = SimpleSchema {
     models: vec![SimpleModel {
         name: "User".to_string(),
-        fields: vec![SimpleField {
-            name: "age".to_string(),
-            field_type: "u32".to_string(),
-            nullable: false,  // Changed to non-nullable
-            unique: false,
-            indexed: true,    // Added index
-            index_type: "Hash".to_string(),
-            constraints: vec![],
-        }],
+        fields: vec![
+            SimpleField {
+                name: "id".to_string(),
+                field_type: "uuid".to_string(),
+                nullable: false,
+                unique: true,
+                indexed: false,
+                index_type: "Hash".to_string(),
+                constraints: vec![],
+            },
+            SimpleField {
+                name: "email".to_string(),
+                field_type: "string".to_string(),
+                nullable: true,
+                unique: false,
+                indexed: false,
+                index_type: "Hash".to_string(),
+                constraints: vec![],
+            },
+        ],
         composite_indexes: vec![],
     }],
 };
 
+// `SchemaDiffer` is a unit struct; `diff` is a static method.
 let changes = SchemaDiffer::diff(&old_schema, &new_schema);
-
-// Will detect:
-// 1. ChangeFieldNullability (BREAKING - making non-nullable)
-// 2. AddIndex (safe)
+for change in &changes {
+    println!("{}", change.description());
+    if change.is_breaking() {
+        println!("  ⚠️  breaking change");
+    }
+}
 ```
 
-## API Reference
+### Recording a versioned migration + classifying its hops
 
-### Core Types
+Derive the next version span from the existing lineage, record the migration, then
+classify each hop:
 
-#### `SchemaDiffer`
+```rust,no_run
+use forgedb_migrations::{
+    MigrationGenerator, MigrationLineage, SchemaChange, HopBodyClass,
+};
 
-Compares two schema states and generates a list of changes.
+// 1. The lineage tells you what version the DB is at and the span a new hop carries.
+let lineage = MigrationLineage::load("./migrations")?;
+let (from, to) = lineage.next_version_span();
 
-**Methods:**
-- `diff(old_schema: &SimpleSchema, new_schema: &SimpleSchema) -> Vec<SchemaChange>` - Compare schemas and return list of changes
+// 2. Record the detected changes as a versioned migration record on disk.
+let changes = vec![SchemaChange::AddField {
+    model_name: "User".to_string(),
+    field_name: "email".to_string(),
+    field_type: "string".to_string(),
+    nullable: true,
+    default_value: None,
+}];
+let migration = MigrationGenerator::generate_versioned(
+    "./migrations",
+    "add user email".to_string(),
+    changes,
+    from,
+    to,
+)?;
+println!("wrote {} (v{} → v{})", migration.filename(), from, to);
 
-#### `SimpleSchema`
+// 3. Classify. `Authored` residue must be hand-written and frozen before the
+//    transformer can rewrite data at rest; `Auto` hops need nothing.
+for change in &migration.changes {
+    match change.hop_body_class() {
+        HopBodyClass::Auto => println!("auto:     {}", change.description()),
+        HopBodyClass::Authored => println!("authored: {}", change.description()),
+    }
+}
+# Ok::<(), String>(())
+```
 
-Simplified schema representation for diffing.
+### Tracking applied migrations
 
-**Fields:**
-- `models: Vec<SimpleModel>` - List of models in the schema
+```rust,no_run
+use forgedb_migrations::{MigrationGenerator, MigrationTracker};
 
-#### `SimpleModel`
+let mut tracker = MigrationTracker::new("./migrations")?;
+let all = MigrationGenerator::load_all_migrations("./migrations")?;
 
-Model definition for schema comparison.
+for migration in &all {
+    if tracker.is_applied(&migration.id) {
+        continue;
+    }
+    // ... apply the migration to data via the generated transformer bin ...
+    tracker.mark_applied(migration.id.clone(), migration.checksum.clone())?;
+}
 
-**Fields:**
-- `name: String` - Model name
-- `fields: Vec<SimpleField>` - List of fields
-- `composite_indexes: Vec<Vec<String>>` - Composite indexes (field name lists)
+println!("{}", tracker.status_summary(all.len()));
+let pending_ids: Vec<String> = all.iter().map(|m| m.id.clone()).collect();
+println!("pending: {}", tracker.pending_migrations(&pending_ids).len());
+# Ok::<(), String>(())
+```
 
-#### `SimpleField`
+## Public API
 
-Field definition for schema comparison.
+### Diffing
 
-**Fields:**
-- `name: String` - Field name
-- `field_type: String` - Field data type (e.g., "string", "u64", "uuid")
-- `nullable: bool` - Whether field can be null
-- `unique: bool` - Whether field has unique constraint
-- `indexed: bool` - Whether field is indexed
-- `index_type: String` - Type of index (e.g., "Hash", "BTree")
-- `constraints: Vec<SimpleConstraint>` - Field constraints
+- **`SchemaDiffer`** — `diff(old: &SimpleSchema, new: &SimpleSchema) -> Vec<SchemaChange>`.
+- **`SimpleSchema`** / **`SimpleModel`** / **`SimpleField`** / **`SimpleConstraint`** —
+  the simplified schema representation the differ compares. The CLI builds these
+  from parsed `.forge` schemas; you can also construct them directly.
 
-#### `SimpleConstraint`
+### Change model
 
-Constraint definition for field validation.
+- **`SchemaChange`** — an enum of a single detected change. Variants:
+  `AddModel`, `RemoveModel`, `RenameModel`, `AddField`, `RemoveField`,
+  `RenameField`, `ChangeFieldType`, `ChangeFieldNullability`, `AddIndex`,
+  `RemoveIndex`, `AddUniqueConstraint`, `RemoveUniqueConstraint`,
+  `AddCompositeIndex`, `RemoveCompositeIndex`, `AddConstraint`, `RemoveConstraint`.
+  Methods: `is_breaking()`, `hop_body_class()`, `target_model()`, `description()`.
+- **`HopBodyClass`** — `Auto` (the differ can prove the new-row body from the diff)
+  or `Authored` (the body needs semantic understanding the diff cannot supply, e.g.
+  re-encoding a changed type, filling a narrowed `NOT NULL`, or a newly-required
+  field with no default). Distinct from `is_breaking()`: a change can be breaking
+  yet still `Auto`.
 
-**Fields:**
-- `name: String` - Constraint name (e.g., "email", "minLength")
-- `params: Vec<String>` - Constraint parameters
+### Migration records
 
-### Migration Types
+- **`Migration`** — a recorded set of changes plus metadata: `id` (timestamp),
+  `description`, `created_at`, `changes`, `checksum`, and the serial version
+  interlock `from_version` / `to_version`. Constructed via `new` /
+  `new_versioned`. Methods include `filename()`, `verify_checksum()`,
+  `has_breaking_changes()`, `breaking_changes()`, `safe_changes()`, and
+  `authored_changes()`.
+- **`MigrationGenerator`** — writes and loads migration records: `generate`,
+  `generate_versioned`, `load_migration`, `load_all_migrations`,
+  `generate_report`.
 
-#### `MigrationGenerator`
+### Lineage
 
-Generates and loads migration files.
+- **`MigrationLineage`** — the ordered serial version chain loaded from a
+  `migrations/` directory: `load`, `migrations`, `current_format_version`,
+  `next_version_span`, and `expand_range(from, to)` (the ordered hop subsequence
+  the transformer replays; refuses a non-contiguous range).
+- **`BASELINE_FORMAT_VERSION`** — the fresh-database baseline (`1`).
+- Path + scaffold helpers: `current_format_version`, `versioned_schema_dir` /
+  `versioned_schema_path`, `save_versioned_schema` / `load_versioned_schema`,
+  `migration_body_dir`, `authored_body_path`, and `scaffold_authored_body`
+  (writes a documented `transform.rs` stub for any `Authored` residue, never
+  clobbering an already-frozen body).
 
-**Methods:**
-- `generate<P: AsRef<Path>>(migrations_dir: P, description: String, changes: Vec<SchemaChange>) -> Result<Migration, String>` - Generate a new migration file
-- `load_migration<P: AsRef<Path>>(path: P) -> Result<Migration, String>` - Load a migration from file
-- `load_all_migrations<P: AsRef<Path>>(migrations_dir: P) -> Result<Vec<Migration>, String>` - Load all migrations from directory
-- `generate_report(migration: &Migration) -> String` - Generate human-readable migration report
+### Tracking
 
-#### `Migration`
+- **`MigrationTracker`** — persistent applied-migration state: `is_applied`,
+  `mark_applied`, `mark_rolled_back`, `applied_migrations`, `last_migration`,
+  `pending_migrations`, `verify_checksum`, `status_summary`.
+- **`MigrationRecord`** / **`MigrationState`** — the persisted records and their
+  container.
 
-Represents a migration with changes and metadata.
+## On-disk layout
 
-**Fields:**
-- `id: String` - Unique identifier (timestamp-based: YYYYMMDDHHMMSS)
-- `description: String` - Human-readable description
-- `created_at: DateTime<Utc>` - Creation timestamp
-- `changes: Vec<SchemaChange>` - List of schema changes
-- `checksum: String` - File integrity checksum
-
-**Methods:**
-- `new(description: String, changes: Vec<SchemaChange>) -> Self` - Create new migration
-- `filename() -> String` - Get filename (e.g., "20240101120000_create_user_model.json")
-- `verify_checksum() -> bool` - Verify migration file integrity
-- `has_breaking_changes() -> bool` - Check if migration contains breaking changes
-- `breaking_changes() -> Vec<&SchemaChange>` - Get list of breaking changes
-- `safe_changes() -> Vec<&SchemaChange>` - Get list of safe changes
-
-#### `SchemaChange`
-
-Enum representing a single schema change.
-
-**Variants:** See [Supported Changes](#supported-changes) section above.
-
-**Methods:**
-- `is_breaking() -> bool` - Returns true if change requires manual intervention
-- `description() -> String` - Human-readable description of the change
-
-### Execution Types
-
-#### `MigrationExecutor`
-
-Executes migrations against a database.
-
-**Methods:**
-- `execute_up<P: AsRef<Path>>(migration: &Migration, data_dir: P) -> Result<(), String>` - Apply migration (forward)
-- `execute_down<P: AsRef<Path>>(migration: &Migration, data_dir: P) -> Result<(), String>` - Rollback migration (reverse)
-
-### Tracking Types
-
-#### `MigrationTracker`
-
-Tracks applied migrations and their state.
-
-**Methods:**
-- `new<P: AsRef<Path>>(migrations_dir: P) -> Result<Self, String>` - Create tracker with state file
-- `is_applied(migration_id: &str) -> bool` - Check if migration is applied
-- `mark_applied(migration_id: String, checksum: String) -> Result<(), String>` - Mark migration as applied
-- `mark_rolled_back() -> Result<Option<MigrationRecord>, String>` - Mark last migration as rolled back
-- `applied_migrations() -> &[MigrationRecord]` - Get list of applied migrations
-- `last_migration() -> Option<&MigrationRecord>` - Get last applied migration
-- `pending_migrations(all_migrations: &[String]) -> Vec<String>` - Get list of pending migrations
-- `verify_checksum(migration_id: &str, expected_checksum: &str) -> Result<(), String>` - Verify migration checksum
-- `status_summary(total_migrations: usize) -> String` - Get status summary string
-
-#### `MigrationState`
-
-Persistent state of applied migrations.
-
-**Fields:**
-- `applied_migrations: Vec<MigrationRecord>` - Chronological list of applied migrations
-
-**Methods:**
-- `is_applied(migration_id: &str) -> bool` - Check if migration is applied
-- `add_migration(migration_id: String, checksum: String)` - Record a migration as applied
-- `remove_last_migration() -> Option<MigrationRecord>` - Remove last migration (for rollback)
-- `last_migration() -> Option<&MigrationRecord>` - Get last applied migration
-
-#### `MigrationRecord`
-
-Record of an applied migration.
-
-**Fields:**
-- `migration_id: String` - Migration identifier
-- `applied_at: DateTime<Utc>` - When migration was applied
-- `checksum: String` - Checksum at time of application
-
-## Migration Format
-
-### File Structure
-
-Migrations are stored as JSON files in a migrations directory:
+A `migrations/` directory holds one JSON record per migration, plus per-version
+schema snapshots and any authored transform bodies:
 
 ```
 migrations/
-├── .migration_state.json         # Tracking state file
-├── 20240101120000_create_user.json
-├── 20240101130000_add_email_field.json
-└── 20240102090000_add_user_index.json
+├── .migration_state.json          # applied-migration tracking state
+├── 20240101120000_add_user_email.json
+├── 20240101120000/
+│   └── transform.rs               # frozen authored body (only for Authored hops)
+└── schemas/
+    ├── v1.forge                   # full schema snapshot per version
+    └── v2.forge
 ```
 
-### Migration File Format
-
-Each migration file is a JSON document:
+Each migration record carries its detected changes and its serial version span:
 
 ```json
 {
   "id": "20240101120000",
-  "description": "Create User model",
-  "created_at": "2024-01-01T12:00:00Z",
+  "description": "add user email",
   "changes": [
-    {
-      "AddModel": {
-        "model_name": "User"
-      }
-    },
     {
       "AddField": {
         "model_name": "User",
         "field_name": "email",
         "field_type": "string",
-        "nullable": false,
+        "nullable": true,
         "default_value": null
-      }
-    },
-    {
-      "AddIndex": {
-        "model_name": "User",
-        "field_name": "email",
-        "index_type": "Hash"
       }
     }
   ],
-  "checksum": "a1b2c3d4e5f6"
+  "from_version": 1,
+  "to_version": 2
 }
 ```
 
-### Versioning Scheme
-
-Migration IDs use timestamp-based versioning (YYYYMMDDHHMMSS):
-
-- **Format**: 14-digit timestamp (year, month, day, hour, minute, second)
-- **Example**: `20240101120000` = January 1, 2024, 12:00:00
-- **Sorting**: Natural chronological order
-- **Uniqueness**: Second-level granularity (avoid generating multiple in same second)
-
-### Filename Convention
-
-Migration filenames combine ID with sanitized description:
-
-```
-{id}_{sanitized_description}.json
-```
-
-Examples:
-- `20240101120000_create_user_model.json`
-- `20240101130000_add_email_field.json`
-- `20240102090000_remove_old_field.json`
-
-The description is sanitized by:
-- Converting to lowercase
-- Replacing spaces with underscores
-- Removing non-alphanumeric characters (except underscores)
-
-### State Tracking File
-
-The `.migration_state.json` file tracks applied migrations:
-
-```json
-{
-  "applied_migrations": [
-    {
-      "migration_id": "20240101120000",
-      "applied_at": "2024-01-01T12:05:30Z",
-      "checksum": "a1b2c3d4e5f6"
-    },
-    {
-      "migration_id": "20240101130000",
-      "applied_at": "2024-01-01T13:10:15Z",
-      "checksum": "b2c3d4e5f6a7"
-    }
-  ]
-}
-```
-
-### Metadata Tracking
-
-Each migration file includes:
-
-- **ID**: Unique timestamp-based identifier
-- **Description**: Human-readable purpose of migration
-- **Created At**: ISO 8601 timestamp of generation
-- **Changes**: Array of schema change operations
-- **Checksum**: Hash of migration contents for integrity verification
-
-The checksum ensures:
-- Migration files haven't been modified after creation
-- Applied migrations match their original definitions
-- Migration history integrity is maintained
-
-## Safety
-
-The migration system includes several safety features:
-
-### Validation Before Execution
-
-Before executing a migration:
-
-1. **Checksum verification** - Ensure file hasn't been modified
-   ```rust
-   if !migration.verify_checksum() {
-       return Err("Migration file corrupted!".to_string());
-   }
-   ```
-
-2. **Breaking change warnings** - Alert on potentially dangerous operations
-   ```rust
-   if migration.has_breaking_changes() {
-       println!("⚠️  WARNING: This migration contains breaking changes:");
-       for change in migration.breaking_changes() {
-           println!("  - {}", change.description());
-       }
-   }
-   ```
-
-3. **Duplicate detection** - Prevent applying same migration twice
-   ```rust
-   if tracker.is_applied(&migration.id) {
-       return Err("Migration already applied!".to_string());
-   }
-   ```
-
-### Rollback Support
-
-The system supports rolling back migrations:
-
-**Supported Rollbacks:**
-- Add/Remove models (can be reversed)
-- Add/Remove fields (field removal rollback loses data)
-- Add/Remove indexes (fully reversible)
-- Add/Remove constraints (fully reversible)
-
-**Limited Rollbacks:**
-- Type changes (requires data conversion logic)
-- Nullability changes (may fail if data incompatible)
-
-**Rollback Example:**
-```rust
-// Execute migration
-MigrationExecutor::execute_up(&migration, &data_dir)?;
-tracker.mark_applied(migration.id.clone(), migration.checksum.clone())?;
-
-// Later, rollback if needed
-MigrationExecutor::execute_down(&migration, &data_dir)?;
-tracker.mark_rolled_back()?;
-```
-
-### Data Preservation
-
-The executor implements strategies to preserve data:
-
-1. **Additive changes** - New fields get default/null values
-2. **Column removal** - Data files aren't immediately deleted
-3. **Type changes** - Require explicit migration logic
-4. **Unique constraints** - Validated before application
-
-### Best Practices
-
-For safe migrations:
-
-1. **Review breaking changes** - Manually inspect before applying
-   ```rust
-   let report = MigrationGenerator::generate_report(&migration);
-   println!("{}", report);
-   // Review output, ensure it's safe to proceed
-   ```
-
-2. **Test on staging** - Apply to non-production environment first
-3. **Backup data** - Before applying breaking changes
-4. **Use transactions** - Apply migrations within database transactions (when available)
-5. **Monitor application** - Track migration progress and errors
-
-### Error Handling
-
-All operations return `Result` types:
-
-```rust
-match MigrationExecutor::execute_up(&migration, &data_dir) {
-    Ok(_) => println!("✓ Migration applied successfully"),
-    Err(e) => {
-        eprintln!("✗ Migration failed: {}", e);
-        // Consider rollback or manual intervention
-    }
-}
-```
-
-### Checksum Integrity
-
-Checksums prevent tampering:
-
-```rust
-// Verify checksum before applying
-if !migration.verify_checksum() {
-    return Err("Migration file has been modified!".to_string());
-}
-
-// Verify checksum of applied migration
-tracker.verify_checksum(&migration.id, &migration.checksum)?;
-```
-
-## Testing
-
-### Running Migration Tests
-
-```bash
-# Run all tests
-cargo test --package forgedb-migrations
-
-# Run specific test
-cargo test --package forgedb-migrations test_full_migration_workflow
-
-# Run with output
-cargo test --package forgedb-migrations -- --nocapture
-
-# Run doc tests
-cargo test --package forgedb-migrations --doc
-```
-
-### Test Coverage
-
-The test suite includes:
-
-- ✅ Full migration workflow (generate, track, execute)
-- ✅ Breaking change detection
-- ✅ Migration rollback
-- ✅ Schema diffing (models, fields, indexes)
-- ✅ Checksum verification
-- ✅ State tracking and persistence
-- ✅ Migration loading and ordering
-
-### Example Tests
-
-#### Testing Schema Diffing
-
-```rust
-use forgedb_migrations::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField};
-
-#[test]
-fn test_detect_added_field() {
-    let old_schema = SimpleSchema {
-        models: vec![SimpleModel {
-            name: "User".to_string(),
-            fields: vec![],
-            composite_indexes: vec![],
-        }],
-    };
-    
-    let new_schema = SimpleSchema {
-        models: vec![SimpleModel {
-            name: "User".to_string(),
-            fields: vec![SimpleField {
-                name: "email".to_string(),
-                field_type: "string".to_string(),
-                nullable: false,
-                unique: false,
-                indexed: false,
-                index_type: "Hash".to_string(),
-                constraints: vec![],
-            }],
-            composite_indexes: vec![],
-        }],
-    };
-    
-    let changes = SchemaDiffer::diff(&old_schema, &new_schema);
-    assert_eq!(changes.len(), 1);
-    assert!(matches!(changes[0], SchemaChange::AddField { .. }));
-}
-```
-
-#### Testing Migration Workflow
-
-```rust
-use forgedb_migrations::*;
-use tempfile::TempDir;
-
-#[test]
-fn test_full_migration_workflow() {
-    let temp_dir = TempDir::new().unwrap();
-    let migrations_dir = temp_dir.path().join("migrations");
-    let data_dir = temp_dir.path().join("data");
-    
-    // Define changes
-    let changes = vec![
-        SchemaChange::AddModel {
-            model_name: "User".to_string(),
-        },
-        SchemaChange::AddField {
-            model_name: "User".to_string(),
-            field_name: "email".to_string(),
-            field_type: "string".to_string(),
-            nullable: false,
-            default_value: None,
-        },
-    ];
-    
-    // Generate migration
-    let migration = MigrationGenerator::generate(
-        &migrations_dir,
-        "Create User model".to_string(),
-        changes
-    ).unwrap();
-    
-    // Create tracker
-    let mut tracker = MigrationTracker::new(&migrations_dir).unwrap();
-    assert!(!tracker.is_applied(&migration.id));
-    
-    // Execute migration
-    MigrationExecutor::execute_up(&migration, &data_dir).unwrap();
-    
-    // Mark as applied
-    tracker.mark_applied(
-        migration.id.clone(),
-        migration.checksum.clone()
-    ).unwrap();
-    
-    assert!(tracker.is_applied(&migration.id));
-}
-```
-
-#### Testing Breaking Changes
-
-```rust
-#[test]
-fn test_breaking_change_detection() {
-    let changes = vec![
-        SchemaChange::AddField {
-            model_name: "User".to_string(),
-            field_name: "name".to_string(),
-            field_type: "string".to_string(),
-            nullable: false,
-            default_value: None,
-        },
-        SchemaChange::RemoveField {
-            model_name: "User".to_string(),
-            field_name: "old_field".to_string(),
-        },
-    ];
-    
-    let migration = Migration::new("Update User model".to_string(), changes);
-    
-    assert!(migration.has_breaking_changes());
-    assert_eq!(migration.breaking_changes().len(), 1);
-    assert_eq!(migration.safe_changes().len(), 1);
-}
-```
-
-## Related Crates
-
-- **[forgedb-types](../types)**: Core type definitions used in schema changes
-- **[forgedb-storage](../storage)**: Storage layer modified by migration executor
-- **[forgedb-crud-api](../crud-api)**: High-level API that uses migrations
-- **[forgedb-validation](../validation)**: Validation constraints referenced in migrations
-
-## Dependencies
-
-- `serde` - Serialization/deserialization of migration files
-- `serde_json` - JSON format for migration files
-- `chrono` - Timestamp handling for migration IDs and tracking
-- `uuid` - UUID support in schema types
-
-Dev dependencies:
-- `tempfile` - Temporary directories for testing
-
-## Contributing
-
-This crate is part of the ForgeDB project. For contribution guidelines, see the main repository.
+Migration IDs use timestamp-based versioning (`YYYYMMDDHHMMSS`), so they sort in
+chronological order. The `checksum` field covers every other field (including the
+version span) and lets `verify_checksum` detect a tampered record.
+
+## Safety model
+
+- **Version interlock** — a regenerated app bakes the lineage's current
+  `format_version` into `EXPECTED_FORMAT_VERSION` and refuses to open a data
+  directory at a different version rather than mis-decoding it. It fails fast; it
+  never self-heals.
+- **Rollback by retention** — the generated transformer writes a fresh destination
+  directory and leaves the source untouched, so the original data is the rollback.
+- **Atomic publish** — a multi-hop range materializes through temporary
+  directories and a single final rename (all-or-nothing).
+- **Checksums** — recorded and applied migrations are checksum-verified to catch
+  tampering.
+
+## Related crates
+
+- [`forgedb-parser`](../parser) — parses `.forge` schema files.
+- [`forgedb-codegen`](../codegen) — emits the offline transformer bin that rewrites
+  data at rest.
+- [`forgedb-validation`](../validation) — validates schemas and schema changes.
 
 ## License
 
@@ -886,3 +309,5 @@ Licensed under either of:
 - MIT License ([LICENSE-MIT](../../LICENSE-MIT))
 
 at your option.
+</content>
+</invoke>

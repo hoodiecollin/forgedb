@@ -106,8 +106,8 @@ A `1.0` release is a **compatibility commitment**, not a feature milestone:
 3. The CLI's commands/flags/config + `--json` outputs stay compatible across `1.x`.
 4. Breaking any of the above requires a `2.0` and a documented migration path.
 
-Until then, read the `CLAUDE.md` "what v1 is / isn't" section and the roadmap
-(`docs/V1_ROADMAP.md`) for the honest current state.
+Until then, read [WHAT_V1_IS.md](./WHAT_V1_IS.md) and the roadmap
+([V1_ROADMAP.md](./V1_ROADMAP.md)) for the honest current state.
 
 ## Deprecation
 

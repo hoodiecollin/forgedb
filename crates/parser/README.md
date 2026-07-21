@@ -251,7 +251,7 @@ Model {
 
 ### Component References
 
-Reference UI components and API routes (Sprint 17):
+Reference UI components and API routes:
 
 ```forge
 User {
