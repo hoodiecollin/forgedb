@@ -1,12 +1,20 @@
 <div align="center">
-  <img src="assets/tmp-logo.png" alt="ForgeDB Logo" width="200">
+
+# ForgeDB — Type-Safe, Schema-First Full-Stack Database Generator
+
 </div>
 
-# ForgeDB - Type-Safe, Schema-First Full-Stack Database Framework
+## Overview
 
-## Executive Summary
+ForgeDB is an **application-database generator**: a declarative `.forge` schema is transpiled at
+compile time into tailored Rust database code, a TypeScript SDK, a REST API, and UI component
+stubs. It is a code-generation tool, **not** a runtime ORM or query engine — the schema is a
+compile-time input to generation, never a runtime input to a generic engine. The generated code
+uses columnar storage and is specialized per schema, so there is no runtime overhead from generic
+data structures.
 
-ForgeDB is a revolutionary database system that uses a declarative schema language to generate a complete full-stack application: database, type-safe APIs, UI components, and developer tooling. The system transpiles schema definitions into highly optimized Rust code with columnar storage, providing exceptional performance through compile-time optimization while maintaining perfect type safety across the entire stack.
+Everything in this repository is open source under `MIT OR Apache-2.0`; see
+[`docs/OPEN_CORE.md`](./docs/OPEN_CORE.md) for the open-core boundary.
 
 ## Core Innovation
 
@@ -46,11 +54,10 @@ ForgeDB is a revolutionary database system that uses a declarative schema langua
 - OpenAPI specification
 - Type-safe client generation
 
-### Flexible Computed Fields
-- Client-side computation (default, zero overhead)
-- Server-side plugins (WASM/Lua/Python) when needed
-- Language-agnostic contract
-- Lazy evaluation
+### Computed Fields (contract-level)
+- Declared in the schema as a language-agnostic contract
+- Client-side computation by default (zero storage overhead)
+- Expression-backed generated getters are planned (see the roadmap)
 
 ### UI Integration
 - Components referenced in schema
@@ -70,7 +77,7 @@ ForgeDB is a revolutionary database system that uses a declarative schema langua
 ### Perfect For
 - Web applications with stable schemas
 - Type-safe full-stack development
-- Local-first applications (future WASM support)
+- Local-first applications (browser read-replica via WASM)
 - Embedded systems with schema known at compile-time
 - Microservices with strong contracts
 - Rapid prototyping with production-quality output
@@ -118,35 +125,21 @@ Transpiler (parser + code generator)
 - Less flexible than runtime-generic databases
 - Larger binary size (specialized code per schema)
 
-## Development Phases
-
-### Phase 1: Core Database
-Foundation: storage engine, type system, basic queries, transpiler.
-
-### Phase 2: Full-Stack Integration
-Developer experience: CLI, API generation, hot reload, TypeScript SDK.
-
-### Phase 3: AI-Powered Development (experimental)
-Future: AI agents implement components from schema annotations.
-
 ## Project Structure
 
 ```
 forgedb/
-├── crates/               # 15 focused crates (public + internal)
-│   ├── storage/          # Columnar storage engine
+├── src/                  # The `forgedb` CLI (main.rs + one module per subcommand)
+├── crates/               # Focused crates: schema-agnostic substrate + compiler internals
+│   ├── storage-native/   # Columnar storage engine (native)
+│   ├── storage-web/      # Browser arena backend (WASM read-replica)
 │   ├── wal/              # Write-Ahead Log
-│   ├── http-server/      # HTTP server infrastructure
-│   ├── parser/           # Schema parser
-│   └── ...               # See docs/ARCHITECTURE.md
-├── docs/                 # Comprehensive documentation
-│   ├── ARCHITECTURE.md   # System design
-│   ├── PUBLIC_CRATES.md  # Runtime library guide
-│   ├── CONTRIBUTING.md   # Contribution guidelines
-│   ├── DEVELOPMENT.md    # Development setup
-│   └── PUBLISHING.md     # Release process
-├── cli/                  # Developer tooling (src/main.rs)
-├── examples/             # Example applications
+│   ├── parser/           # Schema parser (lexer → AST)
+│   ├── codegen/          # Code generators
+│   └── ...               # See docs/ARCHITECTURE.md and docs/PUBLIC_CRATES.md
+├── docs/                 # Documentation (see the index below)
+├── examples/             # Worked example schemas across many domains
+├── apps/                 # Inspector (Tauri) + marketing/docs website
 └── tests/                # Integration tests
 ```
 
@@ -170,20 +163,20 @@ cargo run -- generate all --output ./generated
 ls ./generated
 ```
 
-See [examples/component-integration/](./examples/component-integration/) for a schema that
-exercises models, relations, indexes, and UI component integration.
+See [`examples/`](./examples/) for worked schemas across many domains, and
+[docs/GETTING_STARTED.md](./docs/GETTING_STARTED.md) for the full loop with verified output.
 
-### Future: CLI Usage
+### Install the CLI and scaffold a project
 
 ```bash
-# Install CLI (coming soon)
+# Install from crates.io
 cargo install forgedb
 
-# Create new project
+# Create a new project
 forgedb init my-app
 cd my-app
 
-# Define schema
+# Define a schema
 cat > schema.forge << EOF
 User {
   id: +uuid
@@ -192,11 +185,12 @@ User {
 }
 EOF
 
-# Generate and run
+# Generate, build, and run the dev server
 forgedb dev
-# Server running at http://localhost:3000
-# API docs at http://localhost:3000/docs
 ```
+
+See [docs/INSTALL.md](./docs/INSTALL.md) for every install path (prebuilt binaries, `--git`,
+from-clone) and the substrate version matrix.
 
 ## Philosophy
 
@@ -274,21 +268,20 @@ Key areas where we need help:
 
 ## Status
 
-ForgeDB is in **early development (0.1.x)** and not yet production-ready. The workspace
-builds on Rust 2024 (pinned via `rust-toolchain.toml`) with 466 passing tests.
+ForgeDB is in **early development (0.1.x)** and not yet production-ready. The workspace builds on
+Rust 2024 (pinned via `rust-toolchain.toml`).
 
 Implemented and working:
 - Schema parser (lexer → AST) and validation
-- Columnar storage engine, WAL, compaction
-- Code generation: Rust database, TypeScript SDK, REST API, React/route stubs
-- Migrations, full-text search, query optimization
-- HTTP server (axum), FFI for Bun, LSP server + VSCode extension
+- Columnar storage engine, WAL, in-process compaction
+- Crash-safe durable writes, MVCC transactions + multi-process write coordination
+- Code generation: Rust database, TypeScript SDK, REST API (+ OpenAPI 3.1), React/route stubs
+- Secondary indexes, relation traversal, snapshot reads, live queries, backup/restore
+- Multi-tenancy (verify-only JWT), schema migrations, browser read-replica (WASM)
+- LSP server + VS Code extension, language bindings (Python / Node / Bun)
 
-Known gaps (see [CLAUDE.md](./CLAUDE.md) → Known issues):
-- OpenAPI generation is temporarily disabled (lost in a refactor; slated for restore)
-- A few non-hermetic integration tests and one stale example need cleanup
-
-Historical per-sprint notes live in [archive/sprint-summaries/](./archive/sprint-summaries/).
+For the honest scope — what v1 guarantees and what it defers — see
+[docs/WHAT_V1_IS.md](./docs/WHAT_V1_IS.md) and [docs/V1_ROADMAP.md](./docs/V1_ROADMAP.md).
 
 ---
 
@@ -350,7 +343,7 @@ Post {
 - `find_by_author_and_created_at(id, date)` - Composite index
 - `post_tags.add_relation(post_id, tag_id)` - Many-to-many
 
-See [examples/component-integration/](./examples/component-integration/) for a working schema.
+See [`examples/`](./examples/) for worked schemas across many domains.
 
 ---
 
