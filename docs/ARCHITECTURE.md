@@ -171,6 +171,16 @@ format break:
 The ceiling is one physical append point per column — *concurrent prepare, serialized commit*.
 Multi-machine replication/consensus is a separate future product, not these tiers.
 
+**Control plane vs data plane (multi-process writers).** Tier 3 splits cleanly: the
+`forgedb-coordinator` process is a pure **control plane** — it holds the `DirLock`, serializes
+the commit turn, and sequences the LSN, but it has **no `forgedb-storage` dependency** and never
+decodes a row byte. The schema-aware column write stays in generated **data-plane** code, run
+lock-free by each coordinated client under a granted turn (clients open with `_lock: None`,
+mutually exclusive with a standalone self-locking writer). This is what keeps the identity honest
+at Tier 3: the coordinated writer is still the *same generated code*, and the coordinator — like
+every substrate crate — knows nothing about any schema. It is the symmetric inverse of the durable
+replication broker (control over the write turn, vs. an ordered feed of committed changes).
+
 ---
 
 ## Design decisions (and their trade-offs)

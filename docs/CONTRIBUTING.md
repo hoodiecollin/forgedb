@@ -41,7 +41,9 @@ We are committed to providing a welcoming and inspiring community for all. Pleas
 
 Project maintainers have the right to remove, edit, or reject comments, commits, code, issues, and other contributions that do not align with this Code of Conduct.
 
-Report unacceptable behavior to: [conduct@forgedb.dev] (placeholder)
+Report unacceptable behavior by opening a confidential report through
+[GitHub's private reporting](https://github.com/hoodiecollin/forgedb/security/advisories) or by
+contacting the maintainers via a GitHub issue.
 
 ---
 
@@ -117,6 +119,13 @@ Before creating bug reports, please check existing issues to avoid duplicates.
 ### Additional Context
 [Links, references, etc.]
 ```
+
+**Design notes & proposals live as issues, not committed files.** Non-trivial designs are
+captured as GitHub issues labeled **`rfc`** (request for comment) — we do **not** commit
+proposal/design documents to the repository. Durable *architecture* reference for shipped
+features belongs in [`ARCHITECTURE.md`](./ARCHITECTURE.md); an RFC issue holds the forward-looking
+design while it's under discussion. This keeps the tree free of point-in-time design notes that
+drift out of sync with the code.
 
 ### Your First Code Contribution
 
@@ -824,15 +833,12 @@ Update `CHANGELOG.md` for all user-facing changes:
 
 - **GitHub Issues**: Bug reports, feature requests
 - **GitHub Discussions**: Questions, ideas, showcase
-- **Discord**: Real-time chat (coming soon)
-- **Twitter**: [@forgedb](https://twitter.com/forgedb) (placeholder)
 
 ### Getting Help
 
 **Before asking:**
 1. Check documentation
 2. Search existing issues
-3. Read FAQ (coming soon)
 
 **When asking:**
 - Provide context and details
