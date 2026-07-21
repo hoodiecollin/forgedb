@@ -1,6 +1,9 @@
 <div align="center">
 
-# ForgeDB
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/forgedb-horizontal-dark.svg">
+  <img alt="ForgeDB" src="docs/brand/forgedb-horizontal-light.svg" width="360">
+</picture>
 
 **An application-database generator.** Write one schema; get a tailored database.
 
