@@ -405,7 +405,7 @@ field: string  // inline comment
 
 **NOT supported:**
 - Block comments (`/* ... */`) — **NOT parsed by lexer** (`crates/parser/src/lexer.rs` has no `/*` handling)
-  - Example files use them (e.g., `vscode-forgedb/examples/example.forge:42-43`), but they will **fail to parse** in the actual CLI
+  - Example files use them (e.g., `apps/vscode-forgedb/examples/example.forge:42-43`), but they will **fail to parse** in the actual CLI
   - This is a **drift issue** — example.forge uses `/* */` but parser doesn't support it
 
 ### Whitespace Rules
@@ -613,7 +613,7 @@ The rules in this reference are grounded in the parser and validator source:
 - **Lexer (tokens):** `crates/parser/src/lexer.rs`
 - **Parser logic:** `crates/parser/src/parser/core.rs`
 - **Validation:** `crates/validation/src/lib.rs`
-- **Example schemas:** [`examples/`](../examples/README.md) and `vscode-forgedb/examples/example.forge`
+- **Example schemas:** [`examples/`](../examples/README.md) and `apps/vscode-forgedb/examples/example.forge`
 
 ---
 

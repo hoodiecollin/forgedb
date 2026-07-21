@@ -4,7 +4,7 @@ import forgeGrammar from "@/lib/forge.tmLanguage.json";
 
 /**
  * Register the `.forge` schema language from the VS Code extension's own
- * TextMate grammar (`vscode-forgedb/syntaxes/forge.tmLanguage.json`), so
+ * TextMate grammar (`apps/vscode-forgedb/syntaxes/forge.tmLanguage.json`), so
  * ```forge fenced blocks highlight authentically instead of falling back to
  * plaintext. Shiki uses the registration's `name` as the language id.
  */

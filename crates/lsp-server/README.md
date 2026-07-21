@@ -68,7 +68,7 @@ The server communicates via stdin/stdout using the LSP protocol.
 
 ## Integration with VSCode
 
-See `vscode-forgedb/` extension for client integration.
+See `apps/vscode-forgedb/` extension for client integration.
 
 ## LSP Capabilities
 

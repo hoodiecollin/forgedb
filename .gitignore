@@ -23,6 +23,9 @@ generated_*/
 # The website is a real tracked JS app too — carve its package.json back in.
 !apps/website/package.json
 !apps/website/**/package.json
+# The VS Code extension is a real tracked app — carve its manifest back in.
+!apps/vscode-forgedb/package.json
+!apps/vscode-forgedb/**/package.json
 # Inspector build artifacts (Next static export + Tauri target + codegen)
 apps/inspector/.next/
 apps/inspector/out/
@@ -38,8 +41,8 @@ apps/website/*.tsbuildinfo
 apps/website/public/search-index.json
 
 # VS Code extension build artifacts (source is tracked; outputs are not)
-vscode-forgedb/out/
-vscode-forgedb/*.vsix
+apps/vscode-forgedb/out/
+apps/vscode-forgedb/*.vsix
 
 # devbox nix runtime profile (machine-specific; devbox.json/.lock are committed)
 .devbox/

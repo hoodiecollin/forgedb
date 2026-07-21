@@ -10,7 +10,7 @@ Mirrors `apps/inspector`: Next.js 16 (app router), React 19, TypeScript (strict)
 Tailwind v4 (CSS-first), shadcn/ui (`radix-nova`), jotai + next-themes, bun. Docs are
 MDX compiled at build time with `next-mdx-remote/rsc`; code is highlighted by Shiki,
 including authentic `.forge` highlighting from the VS Code extension's own TextMate
-grammar (`vscode-forgedb/syntaxes/forge.tmLanguage.json`). Search is a client-side ⌘K
+grammar (`apps/vscode-forgedb/syntaxes/forge.tmLanguage.json`). Search is a client-side ⌘K
 palette over a prebuilt static index.
 
 ## Develop (from the repo root — no `cd` needed)

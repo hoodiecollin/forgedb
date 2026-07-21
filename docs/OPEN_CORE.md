@@ -40,7 +40,7 @@ This means the project will **never**:
 | **Docs / examples / benchmarks** | `docs/`, `examples/`, `benchmarks/` | The adoption surface — kept honest on purpose. |
 | **Inspector** | `apps/inspector` | A **generic dev/ops tool** (Next.js + Tauri) that talks to any running ForgeDB server over its REST/WS contract. It is *not* a generated per-schema artifact, and it is *not* the shipped app's data plane — it is developer tooling, like `psql`. Free and open. |
 | **Website** | `apps/website` | Marketing + docs front door. |
-| **VS Code extension** | `vscode-forgedb` | Free. |
+| **VS Code extension** | `apps/vscode-forgedb` | Free. |
 
 ## What a commercial offering would add (built separately, not by closing the above)
 
