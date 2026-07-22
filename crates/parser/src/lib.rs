@@ -172,6 +172,7 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+pub mod validate;
 
 // Re-export main types for convenience
 pub use ast::{
@@ -180,3 +181,5 @@ pub use ast::{
 };
 pub use lexer::{Lexer, Token};
 pub use parser::Parser;
+// The single positioned schema-validation authority (consumed by the CLI + LSP).
+pub use validate::{collect_naming_errors, collect_structure_errors, validate_schema};

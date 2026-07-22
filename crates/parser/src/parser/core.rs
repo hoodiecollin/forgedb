@@ -3,7 +3,7 @@ use crate::ast::{
     Field, FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
-use forgedb_validation::{validate_field_name, validate_model_name, Position};
+use forgedb_validation::Position;
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -528,12 +528,10 @@ impl Parser {
         };
         self.advance();
 
-        // Validate field name
-        if self.use_validation {
-            if let Err(e) = validate_field_name(&name, field_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Naming, duplicate, and reference checks are deferred to
+        // `crate::validate` (the single positioned authority), run after the
+        // whole schema is assembled. Only structural/syntactic errors are fatal
+        // during parsing.
 
         // Expect colon
         self.expect(Token::Colon)?;
@@ -703,12 +701,7 @@ impl Parser {
         };
         self.advance();
 
-        // Validate struct name
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, struct_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/duplicate/reference validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -716,21 +709,10 @@ impl Parser {
 
         // Parse fields
         let mut fields = Vec::new();
-        let mut field_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
             let field = self.parse_field()?;
-
-            // Check for duplicate field name
-            if field_names.contains(&field.name) {
-                return Err(format!(
-                    "Duplicate field name '{}' in struct '{}'",
-                    field.name, name
-                ));
-            }
-            field_names.insert(field.name.clone());
-
             fields.push(field);
             self.skip_newlines();
         }
@@ -771,11 +753,7 @@ impl Parser {
         };
         self.advance();
 
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, enum_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/variant/duplicate validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -784,7 +762,6 @@ impl Parser {
 
         // Parse variant list.
         let mut variants = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
             let variant = match self.current_token() {
                 Token::Ident(s) => s.clone(),
@@ -798,22 +775,7 @@ impl Parser {
             };
             self.advance();
 
-            // Variant naming: PascalCase (reuse the model-name rule: leading
-            // uppercase, alphanumerics), and unique within the enum.
-            if self.use_validation {
-                if let Err(e) = validate_model_name(&variant, None) {
-                    return Err(format!(
-                        "Enum '{}' variant '{}' must be PascalCase: {}",
-                        name, variant, e
-                    ));
-                }
-            }
-            if !seen.insert(variant.clone()) {
-                return Err(format!(
-                    "Duplicate variant '{}' in enum '{}'",
-                    variant, name
-                ));
-            }
+            // Variant PascalCase + uniqueness are checked by `crate::validate`.
             variants.push(variant);
 
             // Separator: comma or newline; trailing comma optional.
@@ -857,12 +819,7 @@ impl Parser {
         };
         self.advance();
 
-        // Validate model name
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, model_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/duplicate/reference validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -870,7 +827,6 @@ impl Parser {
 
         // Parse fields and directives
         let mut fields = Vec::new();
-        let mut field_names = std::collections::HashSet::new();
         let mut composite_indexes = Vec::new();
         let mut projections = Vec::new();
         let mut soft_delete = false;
@@ -922,16 +878,6 @@ impl Parser {
                 }
             } else {
                 let field = self.parse_field()?;
-
-                // Check for duplicate field name
-                if field_names.contains(&field.name) {
-                    return Err(format!(
-                        "Duplicate field name '{}' in model '{}'",
-                        field.name, name
-                    ));
-                }
-                field_names.insert(field.name.clone());
-
                 fields.push(field);
                 self.skip_newlines();
             }
@@ -944,38 +890,9 @@ impl Parser {
             return Err(format!("Model '{}' has no fields", name));
         }
 
-        // Validate composite indexes reference existing fields
-        for comp_idx in &composite_indexes {
-            for field_name in &comp_idx.fields {
-                if !field_names.contains(field_name) {
-                    return Err(format!(
-                        "Composite index in model '{}' references undefined field '{}'",
-                        name, field_name
-                    ));
-                }
-            }
-        }
-
-        // Structural checks on projections (#113): referenced fields must exist,
-        // and projection names must be unique.  Type-based checks (reject
-        // relation/virtual fields) live in the validation crate.
-        let mut projection_names = std::collections::HashSet::new();
-        for proj in &projections {
-            if !projection_names.insert(proj.name.clone()) {
-                return Err(format!(
-                    "Duplicate @projection name '{}' in model '{}'",
-                    proj.name, name
-                ));
-            }
-            for field_name in &proj.fields {
-                if !field_names.contains(field_name) {
-                    return Err(format!(
-                        "@projection '{}' in model '{}' references undefined field '{}'",
-                        proj.name, name, field_name
-                    ));
-                }
-            }
-        }
+        // Duplicate field names, composite-index field references, and
+        // projection name/field checks are deferred to `crate::validate` (the
+        // single positioned authority), run once the whole schema is assembled.
 
         Ok(Model {
             name,
@@ -987,47 +904,59 @@ impl Parser {
         })
     }
 
+    /// Parse the input into a [`Schema`], running the full positioned semantic
+    /// validation ([`crate::validate::validate_schema`]) and failing fast on the
+    /// first diagnostic to preserve the historical `Result<Schema, String>`
+    /// contract. Naming diagnostics are gated by the parser's `use_validation`
+    /// flag (see [`Self::new_with_validation`]); structural/reference diagnostics
+    /// always run.
     pub fn parse(&mut self) -> Result<Schema, String> {
+        let schema = self.parse_unvalidated()?;
+
+        let mut errors = Vec::new();
+        if self.use_validation {
+            crate::validate::collect_naming_errors(&schema, &mut errors);
+        }
+        crate::validate::collect_structure_errors(&schema, &mut errors);
+
+        if let Some(first) = errors.first() {
+            return Err(first.to_string());
+        }
+
+        Ok(schema)
+    }
+
+    /// Parse the input into a [`Schema`] performing only *structural* parsing:
+    /// tokens are assembled into the AST and enum field-type references are
+    /// resolved, but no schema-level semantic validation is run. Syntactic
+    /// errors (unexpected tokens, malformed directives, empty models/structs,
+    /// composite-index arity) are still fatal.
+    ///
+    /// The returned schema may therefore contain semantic defects (duplicate
+    /// names, dangling relations, bad casing). Callers that want those reported —
+    /// the CLI `forgedb validate` command and the LSP — run
+    /// [`crate::validate::validate_schema`] on the result to collect **all**
+    /// positioned diagnostics instead of only the first. (Error recovery for
+    /// mid-keystroke buffers is #173 WS2c.)
+    pub fn parse_unvalidated(&mut self) -> Result<Schema, String> {
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut models = Vec::new();
-        let mut struct_names = std::collections::HashSet::new();
+        // Names of declared enums, used only to resolve bare-identifier field
+        // types below (duplicate detection is deferred to `crate::validate`).
         let mut enum_names = std::collections::HashSet::new();
-        let mut model_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::Eof) {
             // Dispatch on the leading keyword: struct / enum / (bare) model.
             if matches!(self.current_token(), Token::KwStruct) {
-                let struct_def = self.parse_struct()?;
-
-                // Check for duplicate struct name
-                if struct_names.contains(&struct_def.name) {
-                    return Err(format!("Duplicate struct name '{}'", struct_def.name));
-                }
-                struct_names.insert(struct_def.name.clone());
-
-                structs.push(struct_def);
+                structs.push(self.parse_struct()?);
             } else if matches!(self.current_token(), Token::KwEnum) {
                 let enum_def = self.parse_enum()?;
-
-                // Check for duplicate enum name
-                if enum_names.contains(&enum_def.name) {
-                    return Err(format!("Duplicate enum name '{}'", enum_def.name));
-                }
                 enum_names.insert(enum_def.name.clone());
-
                 enums.push(enum_def);
             } else {
-                let model = self.parse_model()?;
-
-                // Check for duplicate model name
-                if model_names.contains(&model.name) {
-                    return Err(format!("Duplicate model name '{}'", model.name));
-                }
-                model_names.insert(model.name.clone());
-
-                models.push(model);
+                models.push(self.parse_model()?);
             }
 
             self.skip_newlines();
@@ -1049,17 +978,11 @@ impl Parser {
             }
         }
 
-        let schema = Schema {
+        Ok(Schema {
             structs,
             enums,
             models,
-        };
-
-        // Validate relations and struct references
-        schema.validate_relations()?;
-        schema.validate_struct_references()?;
-
-        Ok(schema)
+        })
     }
 
     /// Rewrite `StructType(name)`/`OptionalStructType(name)` → `Enum(name)`/
