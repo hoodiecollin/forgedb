@@ -42,8 +42,11 @@ Recovery runs on open (`Database::open_at`), per model, via a generated
 - It then **idempotently replays the WAL tail** by absolute row index, restoring any
   acknowledged write whose column bytes didn't make it.
 
-This has been proven end to end: torn-tail repair, recovery of a lost committed row, and a
-`kill -9` mid-write that loses **zero** acknowledged rows.
+This has been proven end to end: torn-tail repair, recovery of a lost committed row, and an
+unclean crash mid-run that loses **zero** acknowledged rows. Run the proof yourself with
+`make crash-test` — it generates real database code, inserts rows, `abort()`s the process
+without a clean shutdown or flush, then reopens in a fresh process and asserts every committed
+row survives (plus a torn-WAL-tail discard).
 
 ## Single-writer directory lock
 

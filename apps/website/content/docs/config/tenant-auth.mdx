@@ -49,15 +49,16 @@ leeway_secs = 60
 | `issuer` | string | *(unset)* | Expected `iss` (issuer) claim. |
 | `audience` | string | *(unset)* | Expected `aud` (audience) claim. |
 | `tenant_claim` | string | `"tenant"` | Name of the claim carrying the tenant identity. |
-| `jwks_url` | string | *(unset)* | JWKS endpoint URL (`.well-known/jwks.json`) to fetch verification keys. |
+| `jwks_url` | string | *(unset)* | JWKS endpoint URL. Accepted and exported, but the generated server does not fetch it over HTTP yet — use `public_key_path`/`FORGEDB_JWT_PUBKEY` today (see caveat below, [#195](https://github.com/hoodiecollin/forgedb/issues/195)). |
 | `public_key_path` | string | *(unset)* | Path to a static PEM public key (alternative to `jwks_url`). |
 | `algorithms` | string[] | `["RS256"]` | Allowed signature algorithms. Asymmetric only. |
 | `leeway_secs` | u64 | `60` | Clock-skew leeway in seconds (`exp`/`nbf` checks). |
 
 ## The verify-only model
 
-The guard verifies an asymmetric JWT (via JWKS or a static PEM), pins the algorithm,
-checks `exp`/`nbf`/`iss`/`aud` with the configured skew, extracts the `tenant_claim`, and
+The generated server's guard verifies an asymmetric JWT against a **static PEM public key**,
+pins the algorithm, checks `exp`/`nbf`/`iss`/`aud` with the configured skew, extracts the
+`tenant_claim`, and
 cross-checks it against the process's own tenant. A wrong tenant returns **403**; a
 missing or invalid token returns **401**. On success an opaque `Principal` is injected. The
 guard knows nothing about your models, rows, or fields.
@@ -85,9 +86,20 @@ following (empty when `enabled = false`):
 | `algorithms` (first) | `FORGEDB_JWT_ALG` |
 | `leeway_secs` | `FORGEDB_JWT_LEEWAY` |
 
-The guard turns on at runtime when `FORGEDB_JWT_PUBKEY` (or `FORGEDB_JWKS_URL`) is set, and
-`FORGEDB_TENANT` is then required so the token's tenant claim has something to be
-cross-checked against. Full env reference: [deployment](/docs/reference/deployment/).
+The guard turns on at runtime when `FORGEDB_JWT_PUBKEY` is set, and `FORGEDB_TENANT` is then
+required so the token's tenant claim has something to be cross-checked against. Full env
+reference: [deployment](/docs/reference/deployment/).
+
+<Callout type="warning" title="JWKS-by-URL is not wired into the generated server yet">
+The scaffolded server (`forgedb init`) reads **only** `FORGEDB_JWT_PUBKEY` — a path to a
+static PEM public key — to turn the guard on. `jwks_url` / `FORGEDB_JWKS_URL` are accepted in
+config and exported, but the generated `main.rs` does **not** fetch a JWKS endpoint over
+HTTP, so setting only `FORGEDB_JWKS_URL` leaves the guard **off**. The `forgedb-auth`
+substrate can verify against a JWKS *document* you supply, but HTTP fetch + periodic key
+refresh is a planned feature, not a shipped one — so use `FORGEDB_JWT_PUBKEY`
+(`public_key_path`) today. Tracked in
+[#195](https://github.com/hoodiecollin/forgedb/issues/195).
+</Callout>
 
 ## Related
 

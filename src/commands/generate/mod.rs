@@ -109,26 +109,36 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // and the wasm replica share one lineage).
     let format_version = forgedb_migrations::current_format_version("migrations");
 
-    // Determine output directory
+    // Determine the committed output directory.
     let output_dir = options.output.as_deref().unwrap_or("./generated");
-    let output_path = PathBuf::from(output_dir);
+    let committed_path = PathBuf::from(output_dir);
 
-    // Create output directory
-    fs::create_dir_all(&output_path)?;
+    // Check mode (CI staleness gate): instead of writing into the committed dir,
+    // generate every artifact into a throwaway scratch dir, then compare it
+    // byte-for-byte against what's committed — touching nothing on disk. In normal
+    // mode `output_path` IS the committed dir and generation writes in place.
+    let output_path = if options.check {
+        std::env::temp_dir().join(format!("forgedb-check-{}", std::process::id()))
+    } else {
+        committed_path.clone()
+    };
+    // A stale scratch dir must never block a write, so check mode always forces.
+    let force = options.force || options.check;
 
-    // Check mode - verify nothing needs regeneration
+    // Create the output directory (a fresh scratch dir in check mode).
     if options.check {
-        ui::info("Running in check mode...");
-        // TODO: Implement check logic
-        ui::warning("Check mode not yet implemented");
-        return Ok(());
+        let _ = fs::remove_dir_all(&output_path);
     }
+    fs::create_dir_all(&output_path)?;
 
     // Resolve the (runtime/language, mode) axes (#122) into a single canonical
     // internal target. Standalone artifacts (rust/api/…) pass through unchanged;
     // a runtime target (python/node/bun/browser) requires a mode and maps to the
     // matching generator.
     let target = resolve_target(&options.target, options.mode)?;
+    ui::detail(&format!("output dir: {}", committed_path.display()));
+    ui::detail(&format!("format version: {}", format_version));
+    ui::detail(&format!("resolved target: {}", target));
     let mut generated_files = Vec::new();
 
     match target.as_str() {
@@ -139,7 +149,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.extend(generate_all(
                 &schema,
                 &output_path,
-                options.force,
+                force,
                 allowed,
                 format_version,
                 options.gen_config,
@@ -150,14 +160,14 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 RustGenerator::generate_with_config(&schema, format_version, options.gen_config)
                     .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("database.rs");
-            write_file(&path, &result.code, options.force)?;
+            write_file(&path, &result.code, force)?;
             generated_files.push((path, result));
         }
         "typescript" => {
             let result = TypeScriptGenerator::generate(&schema)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("types.ts");
-            write_file(&path, &result.code, options.force)?;
+            write_file(&path, &result.code, force)?;
             generated_files.push((path, result));
             write_ts_package_scaffold(&output_path)?;
         }
@@ -165,14 +175,14 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let result = ApiGenerator::generate(&schema)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("api.rs");
-            write_file(&path, &result.code, options.force)?;
+            write_file(&path, &result.code, force)?;
             generated_files.push((path, result));
         }
         "openapi" => {
             let result = OpenApiGenerator::generate(&schema)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("openapi.json");
-            write_file(&path, &result.code, options.force)?;
+            write_file(&path, &result.code, force)?;
             generated_files.push((path, result));
         }
         "stubs" => {
@@ -181,14 +191,14 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             let stubs_dir = output_path.join("stubs");
             fs::create_dir_all(&stubs_dir)?;
             let path = stubs_dir.join("README.md");
-            write_file(&path, &result.code, options.force)?;
+            write_file(&path, &result.code, force)?;
             generated_files.push((path, result));
         }
         "wasm" => {
             generated_files.extend(generate_wasm_replica(
                 &schema,
                 &output_path,
-                options.force,
+                force,
                 format_version,
             )?);
         }
@@ -196,7 +206,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.extend(generate_ffi_engine(
                 &schema,
                 &output_path,
-                options.force,
+                force,
                 format_version,
             )?);
         }
@@ -207,7 +217,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.extend(generate_pyo3_binding(
                 &schema,
                 &output_path,
-                options.force,
+                force,
                 format_version,
             )?);
         }
@@ -215,7 +225,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.extend(generate_napi_binding(
                 &schema,
                 &output_path,
-                options.force,
+                force,
                 format_version,
             )?);
         }
@@ -226,6 +236,53 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 target
             )));
         }
+    }
+
+    // Check mode: compare each freshly generated artifact against what's
+    // committed, then remove the scratch dir. Only generated artifacts are
+    // compared — write-once user scaffolds (Cargo.toml, package.json, the static
+    // worker bootstrap) are not in `generated_files`, so an edited scaffold never
+    // trips the check.
+    if options.check {
+        let mut missing = Vec::new();
+        let mut stale = Vec::new();
+        for (scratch_file, code) in &generated_files {
+            let rel = scratch_file
+                .strip_prefix(&output_path)
+                .unwrap_or(scratch_file);
+            let committed = committed_path.join(rel);
+            match fs::read_to_string(&committed) {
+                Ok(existing) if existing == code.code => {}
+                Ok(_) => stale.push(committed),
+                Err(_) => missing.push(committed),
+            }
+        }
+        let _ = fs::remove_dir_all(&output_path);
+
+        if missing.is_empty() && stale.is_empty() {
+            ui::success(&format!(
+                "Generated code is up to date ({} artifact(s) checked).",
+                generated_files.len()
+            ));
+            return Ok(());
+        }
+
+        println!();
+        for path in &missing {
+            ui::error(&format!("  missing: {}", path.display()));
+        }
+        for path in &stale {
+            ui::error(&format!("  stale:   {}", path.display()));
+        }
+        println!();
+        ui::error(&format!(
+            "Generated code is out of date ({} missing, {} stale) — run `forgedb generate` to update.",
+            missing.len(),
+            stale.len()
+        ));
+        return Err(CliError::CodeGeneration(
+            "generated code is out of date".to_string(),
+        ));
     }
 
     // Report results

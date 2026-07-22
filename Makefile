@@ -145,3 +145,12 @@ extension-typecheck:
 extension-package:
 	cd $(EXTENSION) && $(BUN) install && $(BUN) run package
 	@echo "Packaged: $(EXTENSION)/forgedb-*.vsix"
+
+.PHONY: crash-test
+
+## End-to-end crash-recovery proof (#16): generate + compile real database code,
+## insert rows, abort the process uncleanly, and assert committed rows survive the
+## reopen (plus torn-WAL-tail resilience). #[ignore]d out of the fast default
+## suite because it compiles a generated crate — run it explicitly here.
+crash-test:
+	cargo test --test crash_recovery_test -- --ignored --nocapture

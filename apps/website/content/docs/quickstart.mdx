@@ -46,6 +46,7 @@ myblog/
   Dockerfile            # multi-stage build → slim runtime
   .dockerignore
   docker-compose.yml
+  deploy/               # systemd unit + env file
   .gitignore
   README.md
 ```
@@ -145,13 +146,11 @@ curl localhost:3000/metrics   # {"model_count":3,"rows_per_model":{"Post":0,"Tag
 Each model gets a REST resource under `/api/<model>`:
 
 ```bash
-# Create — returns the new id (201)
+# Create — the server fills +uuid/+timestamp fields; returns the new id (201)
 curl -X POST localhost:3000/api/user -H 'content-type: application/json' -d '{
-  "id":"11111111-1111-1111-1111-111111111111",
-  "username":"ada","email":"ada@example.com","password_hash":"x",
-  "created_at":0,"posts":null
+  "username":"ada","email":"ada@example.com","password_hash":"x","posts":null
 }'
-# → {"id":"11111111-1111-1111-1111-111111111111"}
+# → {"id":"<server-generated uuid>"}
 
 # List — paginated envelope
 curl localhost:3000/api/user
@@ -171,12 +170,17 @@ curl -X POST localhost:3000/api/user -H 'content-type: application/json' -d '{
 `@email`/`@min`/`@max`/`@length`/`@url` violations return **422**; a `&unique` collision
 or a dangling foreign key returns **409**.
 
-<Callout type="warning" title="v1 create contract">
-The REST `create` body is deserialized into the whole record, so you supply every field —
-including auto (`+`) fields like `id` and `created_at`, and any virtual relation fields
-(as `null`). The direct Rust `db.create_<model>` path *does* auto-generate `+` fields; the
-REST layer does not yet. This is a documented v1 limit
-([what v1 is](/docs/what-v1-is/)).
+<Callout type="note" title="Create contract">
+Both the Rust `db.create_<model>` path and the REST `POST /api/<model>` that routes through
+it **auto-generate `+uuid` and `+timestamp` fields**: omit `id`/`created_at` from the JSON
+body (or send a nil/zero value) and the server fills them. You still send the concrete
+scalar fields plus virtual relation fields as `null` (e.g. `"posts":null`). The generated TS
+SDK's `<Model>Create` type omits `id` (server-assigned).
+
+Two honest caveats: integer `+u32`/`+u64` keys are **not** yet auto-incremented, so a create
+must supply them; and beyond `id`, the SDK's typed `Create` body still lists the other `+`
+fields for now ([#187](https://github.com/hoodiecollin/forgedb/issues/187),
+[#188](https://github.com/hoodiecollin/forgedb/issues/188)).
 </Callout>
 
 Full route set per model: `GET /api/<model>` (list, with `?limit&offset&sort&<field>=`),

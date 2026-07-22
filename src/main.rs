@@ -441,9 +441,9 @@ enum BackupCommands {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    // Set up logging/verbosity based on flags
-    let _verbose = cli.verbose;
-    let _quiet = cli.quiet;
+    // Wire the global -v/-q flags into the UI output level: --quiet suppresses
+    // everything but errors, --verbose unlocks detail lines.
+    ui::set_verbosity(cli.verbose, cli.quiet);
 
     // Load generator config (--config path or auto-discover forgedb.toml).
     // Commands that need config-derived defaults pull from this.

@@ -16,7 +16,7 @@ For a model `Post`, the route base is the kebab-cased model name, under `/api`:
 | `GET /api/post` | List with filter/sort/paginate. | `200 {data, total, limit, offset}` | — |
 | `POST /api/post` | Create a record. | `201 {id}` | `409` unique/FK, `422` field constraint |
 | `GET /api/post/{id}` | Fetch one by id. | `200 <record>` | `404` |
-| `PUT /api/post/{id}` | Replace the whole record. | `200` / `204` | `404`, `409`, `422` |
+| `PUT /api/post/{id}` | Replace the whole record. | `200` | `404`, `409`, `422` |
 | `DELETE /api/post/{id}` | Delete by id. | `204` | `404`, `409` (referenced by children) |
 
 The `{id}` path segment is a string in the URL; integer-PK models parse it back to their

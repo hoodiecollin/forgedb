@@ -29,7 +29,7 @@ Used as an optional embedded value type on `Device.calibration`.
 
 ## Grammar features showcased
 
-- **`+u64` primary key** on `SensorReading` — u64 auto-increment for high-volume append-only tables (avoids UUID entropy overhead at scale)
+- **`+u64` primary key** on `SensorReading` — a compact integer PK for high-volume append-only tables (avoids UUID entropy overhead at scale). Note: `+u64` currently *marks* the key but is **not** auto-incremented yet — the caller supplies the id ([#187](https://github.com/hoodiecollin/forgedb/issues/187)); `+uuid`/`+timestamp` are auto-generated today.
 - **Fixed array `[f64; 3]`** on `SensorReading.reading` — three-axis (x, y, z) sensor sample in a single typed field
 - **`struct Calibration`** — fixed-size embedded value type (f64 fields only, no strings); used as `calibration: Calibration?` (nullable struct) on `Device`
 - **Composite `@index(device, recorded_at)`** using a FK relation field name — validated by the parser against declared field names

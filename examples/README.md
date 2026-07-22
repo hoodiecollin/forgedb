@@ -46,7 +46,7 @@ is skipped by design — see the root CLAUDE.md).
 | `project-management` | Synthetic | 8 | Org→Team→Project→Issue hierarchy, sub-issue self-ref, label M2M, dual composite indexes |
 | `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log |
 | `ecommerce-store` | Synthetic | 9 | Product variants, `CartItem`/`OrderItem` joins, money as `i64` minor units, SKU/order-number natural keys |
-| `iot-sensors` | Synthetic | 3 + struct | `+u64` high-volume PK, fixed array `[f64; 3]`, `struct Calibration`, append-heavy telemetry |
+| `iot-sensors` | Synthetic | 3 + struct | `+u64` high-volume PK (not auto-incremented yet, [#187](https://github.com/hoodiecollin/forgedb/issues/187)), fixed array `[f64; 3]`, `struct Calibration`, append-heavy telemetry |
 
 ## Provenance & licensing
 
@@ -55,15 +55,14 @@ copy no SQL/DDL, triggers, or code. Each app README names the source, URL, and l
 (MIT, BSD, UPL, AGPL — AGPL/GPL sources are used as design inspiration only). Synthetic
 examples are original, modeled after standard patterns for their domain.
 
-## ⚠️ Known gaps (see root `CLAUDE.md` → Known issues)
+## Behavioral caveat
 
-These schemas all **parse and generate**. Two current generator limitations are worth
-knowing when using them:
+These schemas all **parse, generate, and compile** — including nullable variable-length
+strings (`string?`), inline `struct` definitions, integer PKs (`id: +u64`), and
+string-literal directive arguments (`@pattern("regex")`, `@default("text")`), which earlier
+revisions did not support. One behavioral caveat remains:
 
-- **Generated-code compilation gaps.** The emitted `database.rs` does **not** yet compile
-  for three features these schemas use: nullable variable-length strings (`string?`),
-  inline `struct` definitions, and `u64` auto-generate primary keys (`id: +u64`). Tracked
-  for a dedicated codegen pass. (Generation succeeds; only compiling the output fails.)
-- **No string-literal constraint arguments.** The lexer accepts only numbers and bare
-  identifiers as `@`-directive arguments, so `@pattern("regex")` and `@default("text")`
-  do not parse. These schemas use `@default(identifier)` and omit `@pattern`.
+- **Integer `+u32`/`+u64` keys are not auto-incremented yet.** The `+` modifier synthesizes
+  `+uuid` (a random UUID) and `+timestamp` (the current time) on create, but an integer auto
+  key is currently a marker only — a create must supply the id. `iot-sensors` uses `id: +u64`.
+  Tracked in [#187](https://github.com/hoodiecollin/forgedb/issues/187).
