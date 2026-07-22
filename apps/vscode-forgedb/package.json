@@ -1,0 +1,135 @@
+{
+  "name": "forgedb",
+  "displayName": "ForgeDB Schema Language",
+  "description": "IDE support for ForgeDB schema files (.forge): syntax highlighting, a compiler-backed language server (diagnostics, completion, hover, goto-definition, rename), and integrated commands.",
+  "version": "0.1.0",
+  "publisher": "forgedb",
+  "license": "MIT OR Apache-2.0",
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#08070D",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "keywords": [
+    "forgedb",
+    "forge",
+    "schema",
+    "database",
+    "code generation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoodiecollin/forgedb.git",
+    "directory": "apps/vscode-forgedb"
+  },
+  "homepage": "https://github.com/hoodiecollin/forgedb",
+  "bugs": {
+    "url": "https://github.com/hoodiecollin/forgedb/issues"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:forge"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "forge",
+        "aliases": [
+          "ForgeDB",
+          "forge"
+        ],
+        "extensions": [
+          ".forge"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/file-icon.svg",
+          "dark": "./icons/file-icon.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "forge",
+        "scopeName": "source.forge",
+        "path": "./syntaxes/forge.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "forge",
+        "path": "./snippets/forge.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "forgedb.generateCode",
+        "title": "Generate Code",
+        "category": "ForgeDB"
+      },
+      {
+        "command": "forgedb.validateSchema",
+        "title": "Validate Schema",
+        "category": "ForgeDB"
+      },
+      {
+        "command": "forgedb.startDevMode",
+        "title": "Start Dev Mode",
+        "category": "ForgeDB"
+      },
+      {
+        "command": "forgedb.createModel",
+        "title": "Create Model",
+        "category": "ForgeDB"
+      },
+      {
+        "command": "forgedb.restartServer",
+        "title": "Restart Language Server",
+        "category": "ForgeDB"
+      },
+      {
+        "command": "forgedb.showOutput",
+        "title": "Show Output",
+        "category": "ForgeDB"
+      }
+    ],
+    "configuration": {
+      "title": "ForgeDB",
+      "properties": {
+        "forgedb.lspServerPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `forgedb-lsp` language-server binary. When empty, the server is resolved from the installed `forgedb` CLI (per the ForgeDB extension distribution model — [epic #173](https://github.com/hoodiecollin/forgedb/issues/173) WS4). Set this only to override with a specific build."
+        },
+        "forgedb.autoGenerateOnSave": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically run `forgedb generate` when a `.forge` schema file changes."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@vscode/vsce": "^2.20.0",
+    "typescript": "^5.0.0"
+  }
+}
