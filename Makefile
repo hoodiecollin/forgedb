@@ -5,6 +5,7 @@
 BUN := $(shell command -v bun 2>/dev/null || echo "$(HOME)/.bun/bin/bun")
 INSPECTOR := apps/inspector
 WEBSITE := apps/website
+EXTENSION := apps/vscode-forgedb
 BENCH := benchmarks/Cargo.toml
 
 ## Config variants for the matrix bench (epic #126): each becomes a generated
@@ -14,6 +15,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         website-install website website-build website-typecheck \
+        extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
         bench-footprint bench-concurrency
@@ -125,3 +127,21 @@ website-build:
 ## Typecheck the website.
 website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
+
+## Install the VS Code extension's JS dependencies.
+extension-install:
+	cd $(EXTENSION) && $(BUN) install
+
+## Compile the VS Code extension (tsc -> out/extension.js).
+extension-build:
+	cd $(EXTENSION) && $(BUN) install && $(BUN) run compile
+
+## Typecheck the VS Code extension without emitting.
+extension-typecheck:
+	cd $(EXTENSION) && $(BUN) install && $(BUN) x tsc --noEmit -p ./
+
+## Package the VS Code extension into an installable .vsix at the repo root
+## (compiles first via vsce's prepublish hook; bundles production deps).
+extension-package:
+	cd $(EXTENSION) && $(BUN) install && $(BUN) run package
+	@echo "Packaged: $(EXTENSION)/forgedb-*.vsix"

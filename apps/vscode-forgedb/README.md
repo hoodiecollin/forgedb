@@ -97,7 +97,7 @@ User {
   id: +uuid
   email: ^&string @email
   username: ^&string @length(3, 50)
-  password_hash: &string
+  password_hash: string
   full_name: string?
   avatar_url: string? @url
   is_active: bool @default(true)
@@ -120,9 +120,9 @@ User {
 // Blog post with full-text search
 Post {
   id: +uuid
-  title: &string @length(1, 200) @fulltext
+  title: string @length(1, 200) @fulltext
   slug: ^&string
-  content: &string @fulltext
+  content: string @fulltext
   published: bool @default(false)
 
   // Relations
@@ -199,10 +199,15 @@ struct Address {
 
 ### Installation
 
-1. Install the extension from VSCode marketplace
-2. Ensure ForgeDB is installed in your project
-3. Build the LSP server: `cargo build -p forgedb-lsp-server`
-4. Open or create a `.forge` file - the extension activates automatically
+1. Install the extension from the VS Code marketplace.
+2. Install the **`forgedb` CLI** so it is on your `PATH` — the extension launches
+   the language server through it (`forgedb lsp`), so no separate server download
+   is needed. See the [install guide](https://github.com/hoodiecollin/forgedb#installation).
+3. Open or create a `.forge` file — the extension activates automatically.
+
+If `forgedb` is installed somewhere not on `PATH`, set `forgedb.path` in settings.
+For LSP development, point `forgedb.lspServerPath` at a local
+`target/debug/forgedb-lsp` build.
 
 ### First Steps
 
@@ -214,8 +219,8 @@ struct Address {
 
 ## Requirements
 
-- VSCode 1.80.0 or higher
-- ForgeDB project with LSP server built (`cargo build -p forgedb-lsp-server`)
+- VS Code 1.80.0 or higher
+- The `forgedb` CLI installed and on `PATH` (it carries the language server)
 
 ## Extension Settings
 
@@ -223,36 +228,33 @@ Configure via Settings (`Cmd+,` / `Ctrl+,`) or `settings.json`:
 
 ```json
 {
-  // Path to schema file
-  "forgedb.schemaPath": "schema.forge",
+  // Path to the `forgedb` CLI (empty = resolve from PATH).
+  "forgedb.path": "",
 
-  // Output directory for generated code
-  "forgedb.outputDirectory": "generated",
-
-  // Auto-generate on save
-  "forgedb.autoGenerateOnSave": false,
-
-  // Custom LSP server path (auto-detected if empty)
+  // Explicit `forgedb-lsp` server binary; overrides forgedb.path.
+  // Empty = resolve from the installed CLI. Use for LSP development.
   "forgedb.lspServerPath": "",
 
-  // LSP trace level (off, messages, verbose)
-  "forgedb.trace.server": "off"
+  // Run `forgedb generate` automatically when a .forge file changes.
+  "forgedb.autoGenerateOnSave": false
 }
 ```
 
-### Default Editor Settings
+## Building & packaging (from source)
 
-The extension configures optimal settings for `.forge` files:
-- Tab size: 2 spaces
-- Insert spaces: Enabled
-- Quick suggestions: Enabled for code (disabled in comments/strings)
+All commands run from the repository root — no `cd` required:
+
+```bash
+make extension-build      # compile src/extension.ts -> out/extension.js
+make extension-typecheck  # type-check without emitting
+make extension-package    # produce an installable apps/vscode-forgedb/forgedb-*.vsix
+```
 
 ## Keyboard Shortcuts
 
 - `Cmd+/` (Mac) or `Ctrl+/` (Windows/Linux): Toggle line comment
 - `Cmd+K Cmd+C`: Add line comment
 - `Cmd+K Cmd+U`: Remove line comment
-- `Shift+Alt+A`: Toggle block comment
 
 ## Architecture
 
@@ -288,23 +290,24 @@ The extension integrates three main components:
 
 ### LSP Server Not Starting
 
-If you see warnings about LSP server not found:
+If you see a warning that the ForgeDB CLI was not found:
 
-1. Build the server: `cargo build -p forgedb-lsp-server`
-2. Check the binary exists: `target/debug/forgedb-lsp` or `target/release/forgedb-lsp`
-3. Set custom path in settings: `"forgedb.lspServerPath": "/path/to/forgedb-lsp"`
+1. Confirm the CLI is installed and on `PATH`: `forgedb --version`
+2. If it lives elsewhere, set `"forgedb.path": "/path/to/forgedb"`
+3. For LSP development from source, build the server
+   (`cargo build -p forgedb-lsp-server`) and point
+   `"forgedb.lspServerPath": "/path/to/target/debug/forgedb-lsp"`
 
 ### No Diagnostics Appearing
 
-1. Ensure file is saved (`.forge` extension)
-2. Check Output panel: **ForgeDB: Show Output** command
-3. Enable trace logging: `"forgedb.trace.server": "verbose"`
+1. Ensure the file is saved (`.forge` extension)
+2. Check the Output panel: **ForgeDB: Show Output** command
+3. Restart the server: **ForgeDB: Restart Language Server**
 
 ### Commands Not Working
 
-1. Ensure you're in a ForgeDB project
-2. Check that `cargo` is in your PATH
-3. Verify workspace has ForgeDB CLI installed
+1. Ensure the `forgedb` CLI is installed and on `PATH` (or set `forgedb.path`)
+2. Open the integrated terminal to see the command's output
 
 ## Development
 
