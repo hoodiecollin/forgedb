@@ -1,7 +1,23 @@
 use crate::{error::CliError, ui, Result};
-use forgedb_parser::{validate_schema, ComponentProtocol, FieldType, Parser};
+use forgedb_parser::{ComponentProtocol, FieldType, ParsedSchema, Parser};
 use std::fs;
 use std::path::Path;
+
+/// The one seam behind CLI↔LSP diagnostic parity (epic #173 WS3).
+///
+/// Both surfaces derive their diagnostics from the *same* resilient parse:
+/// `Parser::parse_recover` returns a best-effort AST plus every syntax **and**
+/// semantic diagnostic at once (positioned, source-ordered). The CLI renders the
+/// resulting `ParsedSchema::diagnostics` here; the LSP (`crates/lsp-server`) calls
+/// `parse_recover` inside `update_document` and maps the identical set. The
+/// `tests/lsp_cli_parity.rs` fixture pins the two together over `examples/*`, so
+/// neither can drift onto a private notion of "valid".
+///
+/// Lexer errors remain fatal (no token stream to recover from) and surface as the
+/// `Err(String)` here — the LSP shows the same message as a single diagnostic.
+pub fn parse_and_validate(content: &str) -> std::result::Result<ParsedSchema, String> {
+    Ok(Parser::new(content)?.parse_recover())
+}
 
 pub struct ValidateOptions {
     pub strict: bool,
@@ -30,37 +46,32 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     let schema_content = fs::read_to_string(&schema_path)
         .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path, e)))?;
 
-    // Parse schema structurally (syntax/structural errors are fatal here), then
-    // run the single positioned schema-validation authority
-    // (`forgedb_parser::validate_schema`) — the same API the LSP consumes — to
-    // surface ALL semantic diagnostics with positions rather than just the first.
-    let mut parser = Parser::new(&schema_content)
+    // Resilient parse via the shared CLI↔LSP seam: one call yields a best-effort
+    // AST plus every syntax and semantic diagnostic (positioned, source-ordered) —
+    // the exact set the LSP surfaces (WS3 parity). Only a lexer error is fatal here.
+    let parsed = parse_and_validate(&schema_content)
         .map_err(|e| CliError::SchemaValidation(format!("Lexer error: {}", e)))?;
+    let schema = &parsed.schema;
 
-    let schema = parser
-        .parse_unvalidated()
-        .map_err(|e| CliError::SchemaValidation(format!("Parser error: {}", e)))?;
-
-    ui::success("Schema syntax valid");
-
-    // Schema-level semantic errors (naming, duplicates, dangling relations/type
-    // references, projection/index field references) are ALWAYS fatal — they are
-    // not advisory, so they fail regardless of `--strict`.
-    let diagnostics = validate_schema(&schema);
-    if !diagnostics.is_empty() {
+    // Syntax + schema-level semantic errors (naming, duplicates, dangling
+    // relations/type references, projection/index field references) are ALWAYS
+    // fatal — they are not advisory, so they fail regardless of `--strict`.
+    if !parsed.diagnostics.is_empty() {
         println!();
-        for d in &diagnostics {
+        for d in &parsed.diagnostics {
             ui::error(&d.to_string());
         }
         println!();
         ui::error(&format!(
             "Validation failed with {} error(s)",
-            diagnostics.len()
+            parsed.diagnostics.len()
         ));
         return Err(CliError::SchemaValidation(
             "Schema validation failed".to_string(),
         ));
     }
+
+    ui::success("Schema valid");
 
     // Count statistics
     let model_count = schema.models.len();

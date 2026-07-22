@@ -1317,6 +1317,7 @@ dependencies = [
  "forgedb-codegen",
  "forgedb-compaction",
  "forgedb-coordinator",
+ "forgedb-lsp-server",
  "forgedb-migrations",
  "forgedb-parser",
  "forgedb-query-params",
