@@ -295,7 +295,7 @@ If you see a warning that the ForgeDB CLI was not found:
 1. Confirm the CLI is installed and on `PATH`: `forgedb --version`
 2. If it lives elsewhere, set `"forgedb.path": "/path/to/forgedb"`
 3. For LSP development from source, build the server
-   (`cargo build -p forgedb-lsp-server`) and point
+   (`cargo build --features lsp --bin forgedb-lsp`) and point
    `"forgedb.lspServerPath": "/path/to/target/debug/forgedb-lsp"`
 
 ### No Diagnostics Appearing
