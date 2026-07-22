@@ -193,10 +193,13 @@ in `crates/`:
   ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
   so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
-**Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`
-are now **published to crates.io** 0.1.0 as of Phase 5 WS4, but **only** so `cargo install forgedb` can build the CLI
+**Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`,
+and now `lsp-server` are **published to crates.io** 0.1.0, but **only** so `cargo install forgedb` can build the CLI
 from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates.
-`lsp-server` remains unpublished.)
+`lsp-server` joined this list in epic #173 WS7 — the root `forgedb` crate gained an **optional** dependency on it (the
+non-default `lsp` feature drives the bundled `forgedb-lsp` binary), and crates.io requires optional deps to resolve, so
+`forgedb-lsp-server` must be published **before** the next `forgedb` publish. It was the one compiler-internal left off
+crates.io until WS7 made `forgedb` depend on it.)
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)

@@ -23,11 +23,19 @@ Three groups, each treated differently:
 CLI from the registry**. NOT a stable API ([SEMVER.md §4](./SEMVER.md)):
 
 - `forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
-  `forgedb-backup`, `forgedb-watcher`, and the root `forgedb` CLI binary.
+  `forgedb-backup`, `forgedb-watcher`, `forgedb-lsp-server`, and the root `forgedb`
+  CLI binary.
+  - `forgedb-lsp-server` joined this list in epic #173 WS7: the `forgedb` crate now
+    has an **optional** dependency on it (the non-default `lsp` feature drives the
+    bundled `forgedb-lsp` binary). crates.io requires every dependency — optional
+    included — to be resolvable, so **publish `forgedb-lsp-server` before the next
+    `forgedb` publish** (and it must be on the registry for
+    `cargo install forgedb --features lsp` to build). Same publish-gap rule as the
+    substrate crates.
 
 **Not published:**
 
-- `forgedb-lsp-server`; `apps/inspector/src-tauri` (`publish = false`).
+- `apps/inspector/src-tauri` (`publish = false`).
 
 > There is **no single coordinated version**. Do not run a script that rewrites every crate to
 > one version — that contradicts the substrate design. Bump only the crate(s) whose public API,

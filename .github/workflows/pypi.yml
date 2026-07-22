@@ -1,0 +1,132 @@
+# PyPI distribution for the `forgedb` CLI — epic #173 WS7 / issue #185.
+#
+# The ONE channel cargo-dist can't drive (dist has no PyPI support). maturin
+# `bindings = "bin"` (see pyproject.toml) wraps the compiled `forgedb` binary —
+# plus the bundled `forgedb-lsp`, via the crate's `lsp` feature — into a
+# self-contained console wheel per platform, so `uv tool install forgedb` /
+# `uvx forgedb` and `pip install forgedb` deliver the CLI with no Rust toolchain.
+#
+# Runs off the SAME `v*` tag that drives dist-workspace.toml's release.yml, and
+# derives the wheel version from the crate version (pyproject `dynamic`), keeping
+# this channel in lockstep. Wheel targets mirror #182's matrix
+# (manylinux/musllinux ↔ the gnu/musl Linux targets). Independent of dist — it
+# shares only the "cross-build works" prerequisite.
+#
+# Go-live is user-gated: publishing needs the `PYPI_API_TOKEN` secret and a real
+# tag; until then this only builds+validates wheels on pushes/PRs.
+name: PyPI
+
+on:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+  pull_request:
+    paths:
+      - pyproject.toml
+      - .github/workflows/pypi.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-gnu
+            runner: ubuntu-22.04
+            target: x86_64
+            manylinux: auto
+          - name: linux-aarch64-gnu
+            runner: ubuntu-22.04
+            target: aarch64
+            manylinux: auto
+          - name: linux-x86_64-musl
+            runner: ubuntu-22.04
+            target: x86_64
+            manylinux: musllinux_1_2
+          - name: macos-x86_64
+            runner: macos-13
+            target: x86_64
+            manylinux: 'off'
+          - name: macos-aarch64
+            runner: macos-14
+            target: aarch64
+            manylinux: 'off'
+          - name: windows-x86_64
+            runner: windows-latest
+            target: x64
+            manylinux: 'off'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      # bindings/features come from pyproject.toml ([tool.maturin]); this only
+      # needs the target + release + output dir. A `bin` wheel is
+      # py3-none-<platform> — one wheel per platform, no per-interpreter builds.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Smoke-test the wheel (native runners only)
+        if: ${{ matrix.name == 'linux-x86_64-gnu' || startsWith(matrix.name, 'macos') || startsWith(matrix.name, 'windows') }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m venv .venv
+          # shellcheck disable=SC1091
+          if [ -f .venv/bin/activate ]; then source .venv/bin/activate; else source .venv/Scripts/activate; fi
+          pip install forgedb --no-index --find-links dist --force-reinstall
+          forgedb --version
+          # The bundled server ships as a sibling script, so `forgedb lsp` resolves it.
+          command -v forgedb-lsp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-22.04
+    # Tag pushes only — PRs and manual runs build+validate but never publish.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    environment: pypi
+    permissions:
+      # Kept for a future switch to PyPI Trusted Publishing (OIDC); harmless with token auth.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Provided once PyPI is provisioned (user-gated). Omit to use Trusted Publishing.
+          password: ${{ secrets.PYPI_API_TOKEN }}

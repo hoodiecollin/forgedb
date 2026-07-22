@@ -46,6 +46,20 @@ categories = ["database", "command-line-utilities", "development-tools"]
 name = "forgedb"
 path = "src/main.rs"
 
+# The language server binary. Behind the non-default `lsp` feature so a lean
+# `cargo install forgedb` skips the async LSP stack; release archives build with
+# `--features lsp` to ship `forgedb-lsp` alongside `forgedb` in one dist app
+# (epic #173 WS7). `forgedb lsp` resolves the sibling and hands off to it.
+[[bin]]
+name = "forgedb-lsp"
+path = "src/bin/forgedb-lsp.rs"
+required-features = ["lsp"]
+
+[features]
+default = []
+# Build the bundled `forgedb-lsp` language-server binary.
+lsp = ["dep:forgedb-lsp-server"]
+
 [dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.1.0" }
 forgedb-codegen = { path = "crates/codegen", version = "0.1.0" }
@@ -54,6 +68,9 @@ forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 forgedb-backup = { path = "crates/backup", version = "0.1.0" }
 forgedb-coordinator = { path = "crates/coordinator", version = "0.1.0" }
+# Bundled only under the `lsp` feature (drives the `forgedb-lsp` binary). Also a
+# dev-dependency below so the CLI↔LSP parity test always links it, feature or not.
+forgedb-lsp-server = { path = "crates/lsp-server", version = "0.1.0", optional = true }
 clap = { version = "4.4", features = ["derive", "cargo"] }
 anyhow = "1.0"
 thiserror = "2.0"
@@ -74,3 +91,8 @@ forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

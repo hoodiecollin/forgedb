@@ -82,7 +82,7 @@ fn resolve_server(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Err(CliError::Other(format!(
         "the ForgeDB language server ('{bin}') was not found next to `forgedb` or on PATH.\n\
          It ships alongside the `forgedb` CLI — reinstall from a release archive, build it with \
-         `cargo build -p forgedb-lsp-server`, or pass `--server-path <path>`.",
+         `cargo build --features lsp --bin forgedb-lsp`, or pass `--server-path <path>`.",
         bin = exe_name(SERVER_BIN),
     )))
 }
