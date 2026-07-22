@@ -5,6 +5,7 @@ pub mod coordinate;
 pub mod dev;
 pub mod generate;
 pub mod init;
+pub mod lsp;
 pub mod migrate;
 pub mod tenant;
 pub mod validate;
