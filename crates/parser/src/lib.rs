@@ -180,6 +180,6 @@ pub use ast::{
     Model, Projection, RelationType, Schema, Struct,
 };
 pub use lexer::{Lexer, Token};
-pub use parser::Parser;
+pub use parser::{ParsedSchema, Parser};
 // The single positioned schema-validation authority (consumed by the CLI + LSP).
 pub use validate::{collect_naming_errors, collect_structure_errors, validate_schema};
