@@ -62,6 +62,10 @@ pub struct Lexer {
     position: usize,
     pub line: usize,
     pub column: usize,
+    /// Start position of the most recently produced token, recorded *after*
+    /// leading whitespace/comments are skipped so positions point at the token
+    /// itself (not the preceding indentation).
+    token_start: Position,
 }
 
 impl Lexer {
@@ -71,6 +75,7 @@ impl Lexer {
             position: 0,
             line: 1,
             column: 1,
+            token_start: Position { line: 1, column: 1 },
         }
     }
 
@@ -212,6 +217,12 @@ impl Lexer {
 
     pub fn next_token(&mut self) -> Result<Token, String> {
         let had_whitespace = self.skip_whitespace_with_flag();
+        // Record the token's true start (after skipping indentation/whitespace);
+        // comment recursion re-enters here and overwrites this with the real token.
+        self.token_start = Position {
+            line: self.line,
+            column: self.column,
+        };
 
         match self.current_char() {
             None => Ok(Token::Eof),
@@ -330,14 +341,10 @@ impl Lexer {
     }
 
     pub fn next_token_with_pos(&mut self) -> Result<TokenWithPos, String> {
-        let pos = Position {
-            line: self.line,
-            column: self.column,
-        };
         let token = self.next_token()?;
         Ok(TokenWithPos {
             token,
-            position: pos,
+            position: self.token_start,
         })
     }
 
