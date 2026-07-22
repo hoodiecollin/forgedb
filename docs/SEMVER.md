@@ -57,7 +57,7 @@ version matrix). Each is versioned **independently** and pins are intentionally
 - A substrate crate follows Cargo semver: a breaking change to its public API or
   its on-disk/on-wire format bumps its major (or, pre-1.0, its minor).
 - The generated `Cargo.toml` pins each substrate crate with a **caret range**
-  (e.g. `forgedb-storage = "0.1.5"`, `forgedb-wal = "0.2"`), so a compatible
+  (e.g. `forgedb-storage = "0.2"`, `forgedb-wal = "0.2"`), so a compatible
   patch/minor is picked up automatically but an incompatible major is not.
 - **On-disk format** is part of the substrate ABI: a change to the columnar
   layout, WAL framing, or manifest that a prior binary cannot read is a breaking
