@@ -42,12 +42,19 @@ Whole-word, buffer-wide reference rename.
 ```
 forgedb-lsp-server/
 ├── src/
-│   ├── main.rs           # LSP server; parses via forgedb-parser, wires features
+│   ├── main.rs           # LSP binary; parses via forgedb-parser, wires the event loop
+│   ├── lib.rs            # reusable surface (re-exports to_lsp_diagnostics for the parity test)
 │   ├── diagnostics.rs    # thin mapper: compiler ValidationError -> LSP Diagnostic
 │   ├── completion.rs     # code completion (grammar-driven + AST references)
 │   └── hover.rs          # hover information
 └── Cargo.toml            # depends on forgedb-parser + forgedb-validation
 ```
+
+The crate builds **both** a `forgedb-lsp` binary and a `forgedb_lsp_server`
+library. The library exists so the diagnostic mapper can be exercised outside the
+LSP event loop: the root crate's `tests/lsp_cli_parity.rs` fixture imports
+`to_lsp_diagnostics` and asserts the editor and `forgedb validate` emit the same
+diagnostic set over `examples/*` (epic #173 WS3).
 
 ## Usage
 

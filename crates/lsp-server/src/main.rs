@@ -14,12 +14,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-mod completion;
-mod diagnostics;
-mod hover;
-
-use completion::get_completions;
-use hover::get_hover_info;
+use forgedb_lsp_server::{completion::get_completions, diagnostics, hover::get_hover_info};
 
 #[derive(Debug, Clone)]
 struct Document {
