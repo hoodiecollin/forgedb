@@ -1,5 +1,5 @@
 use crate::{error::CliError, ui, Result};
-use forgedb_parser::{ComponentProtocol, FieldType, Parser, RelationType};
+use forgedb_parser::{validate_schema, ComponentProtocol, FieldType, Parser};
 use std::fs;
 use std::path::Path;
 
@@ -30,15 +30,37 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     let schema_content = fs::read_to_string(&schema_path)
         .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path, e)))?;
 
-    // Parse schema
+    // Parse schema structurally (syntax/structural errors are fatal here), then
+    // run the single positioned schema-validation authority
+    // (`forgedb_parser::validate_schema`) — the same API the LSP consumes — to
+    // surface ALL semantic diagnostics with positions rather than just the first.
     let mut parser = Parser::new(&schema_content)
         .map_err(|e| CliError::SchemaValidation(format!("Lexer error: {}", e)))?;
 
     let schema = parser
-        .parse()
+        .parse_unvalidated()
         .map_err(|e| CliError::SchemaValidation(format!("Parser error: {}", e)))?;
 
     ui::success("Schema syntax valid");
+
+    // Schema-level semantic errors (naming, duplicates, dangling relations/type
+    // references, projection/index field references) are ALWAYS fatal — they are
+    // not advisory, so they fail regardless of `--strict`.
+    let diagnostics = validate_schema(&schema);
+    if !diagnostics.is_empty() {
+        println!();
+        for d in &diagnostics {
+            ui::error(&d.to_string());
+        }
+        println!();
+        ui::error(&format!(
+            "Validation failed with {} error(s)",
+            diagnostics.len()
+        ));
+        return Err(CliError::SchemaValidation(
+            "Schema validation failed".to_string(),
+        ));
+    }
 
     // Count statistics
     let model_count = schema.models.len();
@@ -66,63 +88,13 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Check for semantic issues
+    // Beyond this point the schema is already known semantically valid (the
+    // `validate_schema` gate above is fatal). What remains are checks that are
+    // NOT pure-schema diagnostics and therefore stay CLI-only:
+    //   - filesystem: `--components` verifies referenced component files exist;
+    //   - advisory lints: no-id / no-timestamp warnings (soft, exit 0).
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-
-    // Validate model names (PascalCase)
-    for model in &schema.models {
-        if !is_pascal_case(&model.name) {
-            errors.push(format!(
-                "Model '{}' should be in PascalCase (e.g., 'User', 'BlogPost')",
-                model.name
-            ));
-        }
-
-        // Validate field names (snake_case)
-        for field in &model.fields {
-            if !is_snake_case(&field.name) {
-                errors.push(format!(
-                    "Field '{}.{}' should be in snake_case (e.g., 'user_id', 'created_at')",
-                    model.name, field.name
-                ));
-            }
-
-            // Check for duplicate field names (case-insensitive)
-            let duplicate_count = model
-                .fields
-                .iter()
-                .filter(|f| f.name.to_lowercase() == field.name.to_lowercase())
-                .count();
-
-            if duplicate_count > 1 {
-                errors.push(format!(
-                    "Duplicate field name '{}.{}' (field names must be unique)",
-                    model.name, field.name
-                ));
-            }
-        }
-    }
-
-    // Validate relations reference existing models
-    for model in &schema.models {
-        for field in &model.fields {
-            if let FieldType::Relation(rel_type) = &field.field_type {
-                let target = match rel_type {
-                    RelationType::OneToMany(t) => t,
-                    RelationType::RequiredReference(t) => t,
-                    RelationType::OptionalReference(t) => t,
-                    RelationType::ManyToMany(t) => t,
-                };
-                if !schema.models.iter().any(|m| &m.name == target) {
-                    errors.push(format!(
-                        "Relation '{}.{}' references unknown model '{}'",
-                        model.name, field.name, target
-                    ));
-                }
-            }
-        }
-    }
 
     // --components: check that component references are well-formed and that
     // tsx:// / jsx:// component files exist on disk relative to the schema directory.
@@ -276,36 +248,6 @@ fn find_schema_file() -> Result<String> {
         "No schema file found. Expected one of: schema.forge, schema.lang, schema.forgedb"
             .to_string(),
     ))
-}
-
-fn is_pascal_case(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    // First character should be uppercase
-    let mut chars = s.chars();
-    let first = chars.next().unwrap();
-    if !first.is_uppercase() {
-        return false;
-    }
-
-    // No underscores or spaces
-    if s.contains('_') || s.contains(' ') {
-        return false;
-    }
-
-    true
-}
-
-fn is_snake_case(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    // Should be all lowercase with underscores
-    s.chars()
-        .all(|c| c.is_lowercase() || c == '_' || c.is_numeric())
 }
 
 #[cfg(test)]

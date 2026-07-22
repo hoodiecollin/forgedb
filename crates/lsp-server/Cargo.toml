@@ -13,10 +13,15 @@ name = "forgedb-lsp"
 path = "src/main.rs"
 
 [dependencies]
+# The LSP speaks the REAL grammar/semantics by consuming the compiler directly —
+# `parse_recover()` for a resilient partial AST + all diagnostics, `validate_schema`
+# via that, and `ValidationError`/`Position` as the diagnostic vocabulary. It never
+# reimplements the language (the old private regex `parser.rs` was deleted in #173 WS2d).
+forgedb-parser = { path = "../parser", version = "0.1.0" }
+forgedb-validation = { path = "../validation", version = "0.1.0" }
 tower-lsp = "0.20"
 tokio = { version = "1.35", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-regex = "1.10"
 
 [dev-dependencies]

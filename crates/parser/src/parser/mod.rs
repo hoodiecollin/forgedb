@@ -1,3 +1,3 @@
 mod core;
 
-pub use core::Parser;
+pub use core::{ParsedSchema, Parser};

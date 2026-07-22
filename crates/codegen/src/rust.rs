@@ -9699,10 +9699,10 @@ mod tests {
     fn test_rust_generation_with_quote() {
         // Create a simple schema
         let schema = Schema {
-            models: vec![Model {
+            models: vec![Model { position: None,
                 name: "User".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -9714,7 +9714,7 @@ mod tests {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "email".to_string(),
                         field_type: FieldType::String,
                         auto_generate: false,
@@ -9726,7 +9726,7 @@ mod tests {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "age".to_string(),
                         field_type: FieldType::OptionalStructType("Age".to_string()),
                         auto_generate: false,
@@ -9772,9 +9772,9 @@ mod tests {
     fn test_multiple_models() {
         let schema = Schema {
             models: vec![
-                Model {
+                Model { position: None,
                     name: "User".to_string(),
-                    fields: vec![Field {
+                    fields: vec![Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -9790,9 +9790,9 @@ mod tests {
                     projections: Vec::new(),
                     soft_delete: false,
                 },
-                Model {
+                Model { position: None,
                     name: "Post".to_string(),
-                    fields: vec![Field {
+                    fields: vec![Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,

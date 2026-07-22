@@ -1,5 +1,7 @@
 /// Abstract Syntax Tree representation
 
+use forgedb_validation::Position;
+
 /// Constraint parameter value
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstraintParam {
@@ -140,6 +142,9 @@ pub struct Field {
     pub is_computed: bool,            // @computed directive
     pub fulltext_indexed: bool,       // @fulltext directive (Sprint 18)
     pub is_materialized: bool,        // @materialized directive (Sprint 19)
+    /// Source position of the field name (1-based line/column). `None` when the
+    /// node is synthesized rather than parsed (e.g. test fixtures, migrations).
+    pub position: Option<Position>,
 }
 
 /// Represents a struct definition (Sprint 8)
@@ -147,6 +152,8 @@ pub struct Field {
 pub struct Struct {
     pub name: String,
     pub fields: Vec<Field>,
+    /// Source position of the struct name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 /// A user-declared top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
@@ -157,6 +164,8 @@ pub struct Struct {
 pub struct EnumDef {
     pub name: String,
     pub variants: Vec<String>,
+    /// Source position of the enum name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +175,8 @@ pub struct Model {
     pub composite_indexes: Vec<CompositeIndex>,
     pub projections: Vec<Projection>, // @projection(name: a, b) directives (#113)
     pub soft_delete: bool,            // @soft_delete directive at model level (Sprint 19)
+    /// Source position of the model name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,60 +202,11 @@ impl Schema {
         self.enums.iter().find(|e| e.name == name)
     }
 
-    /// Validate all relations in the schema
-    pub fn validate_relations(&self) -> Result<(), String> {
-        for model in &self.models {
-            for field in &model.fields {
-                if let FieldType::Relation(rel_type) = &field.field_type {
-                    let target = rel_type.target_model();
-                    // Check if target model exists
-                    if self.find_model(target).is_none() {
-                        return Err(format!(
-                            "Model '{}' field '{}' references undefined model '{}'",
-                            model.name, field.name, target
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate struct references (Sprint 8)
-    pub fn validate_struct_references(&self) -> Result<(), String> {
-        // Validate structs don't contain variable-length types
-        for struct_def in &self.structs {
-            for field in &struct_def.fields {
-                if !field.field_type.is_fixed_size() {
-                    return Err(format!(
-                        "Struct '{}' field '{}' contains variable-length type. Structs can only contain fixed-size types.",
-                        struct_def.name, field.name
-                    ));
-                }
-            }
-        }
-
-        // Validate struct references in models.  A bare PascalCase identifier is
-        // parsed as a `StructType`; the enum-resolution pass has already rewritten
-        // any that name a declared enum into `FieldType::Enum`.  So a remaining
-        // `StructType` that resolves to neither a struct nor an enum is an unknown
-        // named type (#enum: report both possibilities).
-        for model in &self.models {
-            for field in &model.fields {
-                if let Some(struct_name) = field.field_type.struct_name() {
-                    if self.find_struct(struct_name).is_none()
-                        && self.find_enum(struct_name).is_none()
-                    {
-                        return Err(format!(
-                            "Model '{}' field '{}' references unknown type '{}' (no such struct or enum)",
-                            model.name, field.name, struct_name
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
+    // Schema-level semantic validation (relation targets, struct/enum references,
+    // fixed-size struct fields, duplicate names, naming conventions) lives in
+    // `crate::validate` — the single positioned authority consumed by the parser,
+    // the CLI, and the LSP. See that module for the rationale on why it lives in
+    // this crate rather than `forgedb-validation`.
 
     /// Detect one-to-many relationships by finding matching reference and collection fields
     pub fn detect_relations(&self) -> Vec<RelationPair> {

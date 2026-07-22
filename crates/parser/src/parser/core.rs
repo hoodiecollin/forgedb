@@ -3,13 +3,32 @@ use crate::ast::{
     Field, FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
-use forgedb_validation::{validate_field_name, validate_model_name, Position};
+use forgedb_validation::{Position, ValidationError};
+
+/// The result of a resilient parse ([`Parser::parse_recover`]): a best-effort
+/// (possibly partial) [`Schema`] plus every diagnostic collected along the way —
+/// syntax errors recovered from during parsing *and* the semantic diagnostics
+/// from [`crate::validate::validate_schema`] — each positioned and sorted by
+/// source location. This is the shape the LSP consumes to report diagnostics and
+/// offer symbols on a buffer that does not fully parse.
+#[derive(Debug, Clone)]
+pub struct ParsedSchema {
+    pub schema: Schema,
+    pub diagnostics: Vec<ValidationError>,
+}
 
 pub struct Parser {
     tokens: Vec<Token>,
     tokens_with_pos: Vec<TokenWithPos>,
     position: usize,
     use_validation: bool,
+    /// When set, the field/member loops record a diagnostic and skip to the next
+    /// boundary instead of aborting the parse (see [`Parser::parse_recover`]).
+    /// The fail-fast [`Parser::parse`]/[`Parser::parse_unvalidated`] paths leave
+    /// this `false`, so their behavior is unchanged.
+    recovering: bool,
+    /// Syntax diagnostics accumulated during a recovering parse.
+    recovery_diagnostics: Vec<ValidationError>,
 }
 
 impl Parser {
@@ -29,6 +48,8 @@ impl Parser {
             tokens_with_pos,
             position: 0,
             use_validation,
+            recovering: false,
+            recovery_diagnostics: Vec::new(),
         })
     }
 
@@ -38,6 +59,111 @@ impl Parser {
         } else {
             None
         }
+    }
+
+    /// Position of the token at `idx` (used to anchor a recovered diagnostic at
+    /// the start of the member/declaration it came from, not wherever the cursor
+    /// happened to stop).
+    fn position_at(&self, idx: usize) -> Option<Position> {
+        self.tokens_with_pos.get(idx).map(|t| t.position)
+    }
+
+    /// Build a positioned diagnostic from a parse-error message.
+    fn diag(message: String, position: Option<Position>) -> ValidationError {
+        let err = ValidationError::new(message);
+        match position {
+            Some(p) => err.with_position(p),
+            None => err,
+        }
+    }
+
+    /// Recover from a bad member (field or model directive) by skipping to the
+    /// next member boundary. A member is a single line — it never spans a newline
+    /// or contains braces — so the next `Newline`/`}`/EOF is a safe resync point.
+    /// The closing `}`/EOF is left unconsumed so the enclosing loop can see it.
+    fn recover_to_member_boundary(&mut self) {
+        while !matches!(
+            self.current_token(),
+            Token::Newline | Token::RBrace | Token::Eof
+        ) {
+            self.advance();
+        }
+        self.skip_newlines();
+    }
+
+    /// Is the next significant token at or after `idx` (skipping newlines) an
+    /// opening brace? Used to spot a bare model header (`Name {`) — the one
+    /// top-level construct with no leading keyword — during recovery.
+    fn next_significant_is_lbrace(&self, idx: usize) -> bool {
+        let mut i = idx;
+        while matches!(self.tokens.get(i), Some(Token::Newline)) {
+            i += 1;
+        }
+        matches!(self.tokens.get(i), Some(Token::LBrace))
+    }
+
+    /// Recover from a bad *declaration* by skipping the whole broken block. From
+    /// the declaration's start token, scan forward: if this declaration has an
+    /// opening `{`, consume through its balanced closing `}` (to EOF if
+    /// unterminated); otherwise — a header with no brace — stop at the next clear
+    /// declaration boundary (a `struct`/`enum` keyword, or a bare `Name {` model
+    /// header) so a following valid declaration is not swallowed. Always advances
+    /// past `start`, guaranteeing top-level progress.
+    fn synchronize_from(&mut self, start: usize) {
+        let n = self.tokens.len();
+        let mut i = start;
+
+        while i < n {
+            match &self.tokens[i] {
+                Token::LBrace => {
+                    // This declaration's block: balance from here through its match.
+                    let mut depth = 0i32;
+                    let mut j = i;
+                    while j < n {
+                        match self.tokens[j] {
+                            Token::LBrace => depth += 1,
+                            Token::RBrace => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.position = j + 1;
+                                    return;
+                                }
+                            }
+                            Token::Eof => {
+                                self.position = j;
+                                return;
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    self.position = n; // unterminated — consume to the end
+                    return;
+                }
+                Token::Eof => {
+                    self.position = i;
+                    return;
+                }
+                // A clear next-declaration boundary (past our own start token):
+                // stop here rather than scanning into it for a brace.
+                Token::KwStruct | Token::KwEnum if i > start => {
+                    self.position = i;
+                    return;
+                }
+                Token::Ident(_) if i > start && self.next_significant_is_lbrace(i + 1) => {
+                    self.position = i;
+                    return;
+                }
+                _ => i += 1,
+            }
+        }
+        self.position = n;
+    }
+
+    /// Record a recovered syntax diagnostic anchored at token `at`.
+    fn recover_diag(&mut self, message: String, at: usize) {
+        let pos = self.position_at(at);
+        self.recovery_diagnostics.push(Self::diag(message, pos));
     }
 
     fn current_token(&self) -> &Token {
@@ -528,12 +654,10 @@ impl Parser {
         };
         self.advance();
 
-        // Validate field name
-        if self.use_validation {
-            if let Err(e) = validate_field_name(&name, field_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Naming, duplicate, and reference checks are deferred to
+        // `crate::validate` (the single positioned authority), run after the
+        // whole schema is assembled. Only structural/syntactic errors are fatal
+        // during parsing.
 
         // Expect colon
         self.expect(Token::Colon)?;
@@ -680,6 +804,7 @@ impl Parser {
             is_computed,
             fulltext_indexed,
             is_materialized,
+            position: field_pos,
         })
     }
 
@@ -702,12 +827,7 @@ impl Parser {
         };
         self.advance();
 
-        // Validate struct name
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, struct_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/duplicate/reference validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -715,33 +835,49 @@ impl Parser {
 
         // Parse fields
         let mut fields = Vec::new();
-        let mut field_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
-            let field = self.parse_field()?;
-
-            // Check for duplicate field name
-            if field_names.contains(&field.name) {
-                return Err(format!(
-                    "Duplicate field name '{}' in struct '{}'",
-                    field.name, name
-                ));
+            let member_start = self.position;
+            match self.parse_field() {
+                Ok(field) => {
+                    fields.push(field);
+                    self.skip_newlines();
+                }
+                Err(e) if self.recovering => {
+                    self.recover_diag(e, member_start);
+                    self.recover_to_member_boundary();
+                    if self.position == member_start {
+                        self.advance();
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            field_names.insert(field.name.clone());
-
-            fields.push(field);
-            self.skip_newlines();
         }
 
-        // Expect closing brace
-        self.expect(Token::RBrace)?;
+        // Expect closing brace.
+        if let Err(e) = self.expect(Token::RBrace) {
+            if self.recovering {
+                self.recover_diag(e, self.position);
+            } else {
+                return Err(e);
+            }
+        }
 
         if fields.is_empty() {
-            return Err(format!("Struct '{}' has no fields", name));
+            let e = format!("Struct '{}' has no fields", name);
+            if self.recovering {
+                self.recovery_diagnostics.push(Self::diag(e, struct_pos));
+            } else {
+                return Err(e);
+            }
         }
 
-        Ok(Struct { name, fields })
+        Ok(Struct {
+            name,
+            fields,
+            position: struct_pos,
+        })
     }
 
     /// Parse a top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
@@ -766,11 +902,7 @@ impl Parser {
         };
         self.advance();
 
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, enum_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/variant/duplicate validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -779,7 +911,6 @@ impl Parser {
 
         // Parse variant list.
         let mut variants = Vec::new();
-        let mut seen = std::collections::HashSet::new();
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
             let variant = match self.current_token() {
                 Token::Ident(s) => s.clone(),
@@ -793,22 +924,7 @@ impl Parser {
             };
             self.advance();
 
-            // Variant naming: PascalCase (reuse the model-name rule: leading
-            // uppercase, alphanumerics), and unique within the enum.
-            if self.use_validation {
-                if let Err(e) = validate_model_name(&variant, None) {
-                    return Err(format!(
-                        "Enum '{}' variant '{}' must be PascalCase: {}",
-                        name, variant, e
-                    ));
-                }
-            }
-            if !seen.insert(variant.clone()) {
-                return Err(format!(
-                    "Duplicate variant '{}' in enum '{}'",
-                    variant, name
-                ));
-            }
+            // Variant PascalCase + uniqueness are checked by `crate::validate`.
             variants.push(variant);
 
             // Separator: comma or newline; trailing comma optional.
@@ -829,7 +945,11 @@ impl Parser {
             return Err(format!("Enum '{}' has no variants", name));
         }
 
-        Ok(EnumDef { name, variants })
+        Ok(EnumDef {
+            name,
+            variants,
+            position: enum_pos,
+        })
     }
 
     fn parse_model(&mut self) -> Result<Model, String> {
@@ -848,12 +968,7 @@ impl Parser {
         };
         self.advance();
 
-        // Validate model name
-        if self.use_validation {
-            if let Err(e) = validate_model_name(&name, model_pos) {
-                return Err(e.to_string());
-            }
-        }
+        // Name/duplicate/reference validation is deferred to `crate::validate`.
 
         // Expect opening brace
         self.skip_newlines();
@@ -861,112 +976,57 @@ impl Parser {
 
         // Parse fields and directives
         let mut fields = Vec::new();
-        let mut field_names = std::collections::HashSet::new();
         let mut composite_indexes = Vec::new();
         let mut projections = Vec::new();
         let mut soft_delete = false;
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::RBrace | Token::Eof) {
-            // Check for directive
-            if matches!(self.current_token(), Token::At) {
-                // Try to parse as composite index first
-                let start_pos = self.position;
-                match self.parse_directive() {
-                    Ok(composite_index) => {
-                        composite_indexes.push(composite_index);
-                        self.skip_newlines();
-                    }
-                    Err(_) => {
-                        // Reset position and try to parse as model-level directive
-                        self.position = start_pos;
-                        self.advance(); // skip @
-                        let directive_name = match self.current_token() {
-                            Token::Ident(s) => s.clone(),
-                            _ => {
-                                return Err(format!(
-                                    "Expected directive name after '@', found {:?}",
-                                    self.current_token()
-                                ))
-                            }
-                        };
+            let member_start = self.position;
+            match self.parse_model_member(
+                &mut fields,
+                &mut composite_indexes,
+                &mut projections,
+                &mut soft_delete,
+            ) {
+                Ok(()) => {}
+                Err(e) if self.recovering => {
+                    // Record the bad member, skip to the next line, keep going —
+                    // one malformed field/directive should not blank out the rest
+                    // of the model for the LSP.
+                    self.recover_diag(e, member_start);
+                    self.recover_to_member_boundary();
+                    if self.position == member_start {
                         self.advance();
-
-                        match directive_name.as_str() {
-                            "soft_delete" => {
-                                soft_delete = true;
-                                self.skip_newlines();
-                            }
-                            "projection" => {
-                                let projection = self.parse_projection_directive()?;
-                                projections.push(projection);
-                                self.skip_newlines();
-                            }
-                            _ => {
-                                return Err(format!(
-                                    "Unknown model directive: @{}",
-                                    directive_name
-                                ));
-                            }
-                        }
                     }
                 }
-            } else {
-                let field = self.parse_field()?;
-
-                // Check for duplicate field name
-                if field_names.contains(&field.name) {
-                    return Err(format!(
-                        "Duplicate field name '{}' in model '{}'",
-                        field.name, name
-                    ));
-                }
-                field_names.insert(field.name.clone());
-
-                fields.push(field);
-                self.skip_newlines();
+                Err(e) => return Err(e),
             }
         }
 
-        // Expect closing brace
-        self.expect(Token::RBrace)?;
+        // Expect closing brace.
+        if let Err(e) = self.expect(Token::RBrace) {
+            if self.recovering {
+                self.recover_diag(e, self.position);
+            } else {
+                return Err(e);
+            }
+        }
 
         if fields.is_empty() {
-            return Err(format!("Model '{}' has no fields", name));
-        }
-
-        // Validate composite indexes reference existing fields
-        for comp_idx in &composite_indexes {
-            for field_name in &comp_idx.fields {
-                if !field_names.contains(field_name) {
-                    return Err(format!(
-                        "Composite index in model '{}' references undefined field '{}'",
-                        name, field_name
-                    ));
-                }
+            let e = format!("Model '{}' has no fields", name);
+            if self.recovering {
+                // Keep the (empty) model so its symbol still exists for the LSP.
+                self.recovery_diagnostics
+                    .push(Self::diag(e, model_pos));
+            } else {
+                return Err(e);
             }
         }
 
-        // Structural checks on projections (#113): referenced fields must exist,
-        // and projection names must be unique.  Type-based checks (reject
-        // relation/virtual fields) live in the validation crate.
-        let mut projection_names = std::collections::HashSet::new();
-        for proj in &projections {
-            if !projection_names.insert(proj.name.clone()) {
-                return Err(format!(
-                    "Duplicate @projection name '{}' in model '{}'",
-                    proj.name, name
-                ));
-            }
-            for field_name in &proj.fields {
-                if !field_names.contains(field_name) {
-                    return Err(format!(
-                        "@projection '{}' in model '{}' references undefined field '{}'",
-                        proj.name, name, field_name
-                    ));
-                }
-            }
-        }
+        // Duplicate field names, composite-index field references, and
+        // projection name/field checks are deferred to `crate::validate` (the
+        // single positioned authority), run once the whole schema is assembled.
 
         Ok(Model {
             name,
@@ -974,50 +1034,122 @@ impl Parser {
             composite_indexes,
             projections,
             soft_delete,
+            position: model_pos,
         })
     }
 
+    /// Parse a single member of a model body — a field, or a model-level
+    /// directive (`@index(...)`, `@projection(...)`, `@soft_delete`) — appending
+    /// it to the relevant accumulator. Extracted from the `parse_model` loop so a
+    /// recovering parse can catch a member's error and skip to the next line
+    /// without duplicating the body logic.
+    fn parse_model_member(
+        &mut self,
+        fields: &mut Vec<Field>,
+        composite_indexes: &mut Vec<CompositeIndex>,
+        projections: &mut Vec<Projection>,
+        soft_delete: &mut bool,
+    ) -> Result<(), String> {
+        if matches!(self.current_token(), Token::At) {
+            // Try to parse as a composite index first.
+            let start_pos = self.position;
+            match self.parse_directive() {
+                Ok(composite_index) => {
+                    composite_indexes.push(composite_index);
+                    self.skip_newlines();
+                }
+                Err(_) => {
+                    // Reset and try to parse as a model-level directive.
+                    self.position = start_pos;
+                    self.advance(); // skip @
+                    let directive_name = match self.current_token() {
+                        Token::Ident(s) => s.clone(),
+                        _ => {
+                            return Err(format!(
+                                "Expected directive name after '@', found {:?}",
+                                self.current_token()
+                            ))
+                        }
+                    };
+                    self.advance();
+
+                    match directive_name.as_str() {
+                        "soft_delete" => {
+                            *soft_delete = true;
+                            self.skip_newlines();
+                        }
+                        "projection" => {
+                            let projection = self.parse_projection_directive()?;
+                            projections.push(projection);
+                            self.skip_newlines();
+                        }
+                        _ => {
+                            return Err(format!("Unknown model directive: @{}", directive_name));
+                        }
+                    }
+                }
+            }
+        } else {
+            let field = self.parse_field()?;
+            fields.push(field);
+            self.skip_newlines();
+        }
+        Ok(())
+    }
+
+    /// Parse the input into a [`Schema`], running the full positioned semantic
+    /// validation ([`crate::validate::validate_schema`]) and failing fast on the
+    /// first diagnostic to preserve the historical `Result<Schema, String>`
+    /// contract. Naming diagnostics are gated by the parser's `use_validation`
+    /// flag (see [`Self::new_with_validation`]); structural/reference diagnostics
+    /// always run.
     pub fn parse(&mut self) -> Result<Schema, String> {
+        let schema = self.parse_unvalidated()?;
+
+        let mut errors = Vec::new();
+        if self.use_validation {
+            crate::validate::collect_naming_errors(&schema, &mut errors);
+        }
+        crate::validate::collect_structure_errors(&schema, &mut errors);
+
+        if let Some(first) = errors.first() {
+            return Err(first.to_string());
+        }
+
+        Ok(schema)
+    }
+
+    /// Parse the input into a [`Schema`] performing only *structural* parsing:
+    /// tokens are assembled into the AST and enum field-type references are
+    /// resolved, but no schema-level semantic validation is run. Syntactic
+    /// errors (unexpected tokens, malformed directives, empty models/structs,
+    /// composite-index arity) are still fatal.
+    ///
+    /// The returned schema may therefore contain semantic defects (duplicate
+    /// names, dangling relations, bad casing). Callers that want those reported —
+    /// the CLI `forgedb validate` command and the LSP — run
+    /// [`crate::validate::validate_schema`] on the result to collect **all**
+    /// positioned diagnostics instead of only the first. (Error recovery for
+    /// mid-keystroke buffers is #173 WS2c.)
+    pub fn parse_unvalidated(&mut self) -> Result<Schema, String> {
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut models = Vec::new();
-        let mut struct_names = std::collections::HashSet::new();
+        // Names of declared enums, used only to resolve bare-identifier field
+        // types below (duplicate detection is deferred to `crate::validate`).
         let mut enum_names = std::collections::HashSet::new();
-        let mut model_names = std::collections::HashSet::new();
         self.skip_newlines();
 
         while !matches!(self.current_token(), Token::Eof) {
             // Dispatch on the leading keyword: struct / enum / (bare) model.
             if matches!(self.current_token(), Token::KwStruct) {
-                let struct_def = self.parse_struct()?;
-
-                // Check for duplicate struct name
-                if struct_names.contains(&struct_def.name) {
-                    return Err(format!("Duplicate struct name '{}'", struct_def.name));
-                }
-                struct_names.insert(struct_def.name.clone());
-
-                structs.push(struct_def);
+                structs.push(self.parse_struct()?);
             } else if matches!(self.current_token(), Token::KwEnum) {
                 let enum_def = self.parse_enum()?;
-
-                // Check for duplicate enum name
-                if enum_names.contains(&enum_def.name) {
-                    return Err(format!("Duplicate enum name '{}'", enum_def.name));
-                }
                 enum_names.insert(enum_def.name.clone());
-
                 enums.push(enum_def);
             } else {
-                let model = self.parse_model()?;
-
-                // Check for duplicate model name
-                if model_names.contains(&model.name) {
-                    return Err(format!("Duplicate model name '{}'", model.name));
-                }
-                model_names.insert(model.name.clone());
-
-                models.push(model);
+                models.push(self.parse_model()?);
             }
 
             self.skip_newlines();
@@ -1039,17 +1171,103 @@ impl Parser {
             }
         }
 
+        Ok(Schema {
+            structs,
+            enums,
+            models,
+        })
+    }
+
+    /// Resilient parse (#173 WS2c): parse the input into a best-effort
+    /// [`ParsedSchema`] — a partial [`Schema`] plus **all** diagnostics — instead
+    /// of aborting on the first error. This is the entry point for the LSP, where
+    /// a buffer is usually mid-edit and blanking every diagnostic/symbol on a
+    /// single typo is unacceptable.
+    ///
+    /// Recovery is two-tier: a malformed field or model directive is recorded and
+    /// skipped to the next line (the rest of its model still parses); a malformed
+    /// *declaration* is recorded and skipped as a whole balanced block (the rest
+    /// of the file still parses). After the partial AST is assembled it is run
+    /// through [`crate::validate::validate_schema`], so the returned diagnostics
+    /// contain both recovered syntax errors and every semantic error, positioned
+    /// and sorted by source location.
+    ///
+    /// Unlike [`Self::parse`], this always succeeds — an empty or unparseable
+    /// buffer yields an empty schema and (possibly) diagnostics rather than an
+    /// error. (Lexer errors are still fatal at [`Self::new`]; the LSP surfaces
+    /// those as a single diagnostic.)
+    pub fn parse_recover(&mut self) -> ParsedSchema {
+        enum Decl {
+            Struct(Struct),
+            Enum(EnumDef),
+            Model(Model),
+        }
+
+        let prev_recovering = self.recovering;
+        self.recovering = true;
+        self.recovery_diagnostics.clear();
+
+        let mut structs = Vec::new();
+        let mut enums = Vec::new();
+        let mut models = Vec::new();
+        let mut enum_names = std::collections::HashSet::new();
+
+        self.skip_newlines();
+        while !matches!(self.current_token(), Token::Eof) {
+            let decl_start = self.position;
+            let result = if matches!(self.current_token(), Token::KwStruct) {
+                self.parse_struct().map(Decl::Struct)
+            } else if matches!(self.current_token(), Token::KwEnum) {
+                self.parse_enum().map(Decl::Enum)
+            } else {
+                self.parse_model().map(Decl::Model)
+            };
+
+            match result {
+                Ok(Decl::Struct(s)) => structs.push(s),
+                Ok(Decl::Enum(e)) => {
+                    enum_names.insert(e.name.clone());
+                    enums.push(e);
+                }
+                Ok(Decl::Model(m)) => models.push(m),
+                Err(e) => {
+                    self.recover_diag(e, decl_start);
+                    self.synchronize_from(decl_start);
+                }
+            }
+
+            // Guarantee forward progress even if a parse returned without
+            // consuming and recovery could not advance.
+            if self.position == decl_start {
+                self.advance();
+            }
+            self.skip_newlines();
+        }
+
+        // Resolve enum field-type references over whatever models we recovered.
+        for model in &mut models {
+            for field in &mut model.fields {
+                Self::resolve_enum_field_type(&mut field.field_type, &enum_names);
+            }
+        }
+
         let schema = Schema {
             structs,
             enums,
             models,
         };
 
-        // Validate relations and struct references
-        schema.validate_relations()?;
-        schema.validate_struct_references()?;
+        let mut diagnostics = std::mem::take(&mut self.recovery_diagnostics);
+        diagnostics.extend(crate::validate::validate_schema(&schema));
+        // Present diagnostics in source order (unpositioned ones last).
+        diagnostics.sort_by_key(|d| {
+            d.position
+                .map(|p| (p.line, p.column))
+                .unwrap_or((usize::MAX, usize::MAX))
+        });
 
-        Ok(schema)
+        self.recovering = prev_recovering;
+        ParsedSchema { schema, diagnostics }
     }
 
     /// Rewrite `StructType(name)`/`OptionalStructType(name)` → `Enum(name)`/
@@ -1087,6 +1305,36 @@ mod tests {
             .find(|f| f.name == field)
             .expect("field not found");
         &f.constraints
+    }
+
+    /// 2a (epic #173): parsed AST nodes carry the source position of their name,
+    /// so the LSP and unified validation can map diagnostics to editor ranges.
+    /// Positions are 1-based line/column.
+    #[test]
+    fn parsed_nodes_carry_source_positions() {
+        // Line-numbered so the expected positions are unambiguous:
+        // 1: User {          2:   id: +uuid       3:   email: &string   4: }
+        // 6: struct Point {  7:   x: i32          8: }
+        // 10: enum Status {  11:   Active         12:   Inactive         13: }
+        let src = "User {\n  id: +uuid\n  email: &string\n}\n\nstruct Point {\n  x: i32\n}\n\nenum Status {\n  Active\n  Inactive\n}\n";
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+
+        let user = schema.find_model("User").unwrap();
+        let upos = user.position.expect("model carries a position");
+        assert_eq!((upos.line, upos.column), (1, 1), "User model name");
+
+        let id = user.fields.iter().find(|f| f.name == "id").unwrap();
+        let idpos = id.position.expect("field carries a position");
+        assert_eq!((idpos.line, idpos.column), (2, 3), "id field name");
+
+        let email = user.fields.iter().find(|f| f.name == "email").unwrap();
+        assert_eq!(email.position.unwrap().line, 3, "email field line");
+
+        let point = schema.find_struct("Point").unwrap();
+        assert_eq!(point.position.unwrap().line, 6, "Point struct line");
+
+        let status = schema.find_enum("Status").unwrap();
+        assert_eq!(status.position.unwrap().line, 10, "Status enum line");
     }
 
     #[test]
@@ -1352,5 +1600,135 @@ mod tests {
             .parse()
             .unwrap_err();
         assert!(err.contains("Duplicate enum name 'S'"), "got: {err}");
+    }
+
+    // ---- #173 WS2c: resilient parse (`parse_recover`) --------------------------
+
+    fn recover(input: &str) -> ParsedSchema {
+        Parser::new(input).unwrap().parse_recover()
+    }
+
+    /// A valid schema parses identically under recovery, with no diagnostics —
+    /// parity with the fatal path.
+    #[test]
+    fn recover_valid_schema_matches_parse() {
+        let input = "User {\n  id: +uuid\n  email: string\n}\nPost {\n  id: +uuid\n}\n";
+        let recovered = recover(input);
+        assert!(recovered.diagnostics.is_empty(), "no diagnostics: {:?}", recovered.diagnostics);
+        assert_eq!(recovered.schema, Parser::new(input).unwrap().parse().unwrap());
+    }
+
+    /// Empty / whitespace-only input is not an error under recovery (unlike the
+    /// fatal path, which rejects an empty schema).
+    #[test]
+    fn recover_empty_input_is_not_an_error() {
+        let recovered = recover("\n  \n");
+        assert!(recovered.diagnostics.is_empty());
+        assert!(recovered.schema.models.is_empty());
+    }
+
+    /// Declaration-level recovery: a header with no opening brace is reported, and
+    /// the valid declarations on either side of it both survive.
+    #[test]
+    fn recover_skips_a_broken_declaration_and_keeps_the_rest() {
+        let input = "\
+User {
+  id: +uuid
+}
+
+Broken
+  id: +uuid
+
+Post {
+  id: +uuid
+}
+";
+        let recovered = recover(input);
+        let names: Vec<&str> = recovered.schema.models.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"User"), "User survived: {names:?}");
+        assert!(names.contains(&"Post"), "Post survived after recovery: {names:?}");
+        assert!(
+            recovered.diagnostics.iter().any(|d| d.position.is_some()),
+            "the broken declaration produced a positioned diagnostic"
+        );
+    }
+
+    /// Field-level recovery: one malformed field does not blank out its model —
+    /// the surrounding good fields still parse, and the model is still produced.
+    #[test]
+    fn recover_skips_a_broken_field_and_keeps_the_model() {
+        let input = "User {\n  id: +uuid\n  @@@ : broken\n  email: string\n}\n";
+        let recovered = recover(input);
+        let user = recovered
+            .schema
+            .find_model("User")
+            .expect("User model still produced despite a bad field");
+        let fields: Vec<&str> = user.fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(fields.contains(&"id") && fields.contains(&"email"), "good fields survived: {fields:?}");
+        assert!(!recovered.diagnostics.is_empty(), "the bad field was reported");
+    }
+
+    /// Recovered partial AST is still run through `validate_schema`, so semantic
+    /// diagnostics (here a dangling relation) are merged with syntax diagnostics.
+    #[test]
+    fn recover_merges_semantic_diagnostics() {
+        let input = "User {\n  id: +uuid\n  pet: *Ghost\n}\n";
+        let recovered = recover(input);
+        assert!(
+            recovered
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("references undefined model 'Ghost'")),
+            "semantic diagnostics included: {:?}",
+            recovered.diagnostics
+        );
+    }
+
+    /// Diagnostics come back ordered by source position.
+    #[test]
+    fn recover_diagnostics_are_sorted_by_position() {
+        // Two dangling relations on different lines + a snake_case violation.
+        let input = "User {\n  id: +uuid\n  BadName: string\n  a: *Nope\n}\n";
+        let recovered = recover(input);
+        let lines: Vec<usize> = recovered
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.position.map(|p| p.line))
+            .collect();
+        let mut sorted = lines.clone();
+        sorted.sort();
+        assert_eq!(lines, sorted, "diagnostics sorted by line: {lines:?}");
+    }
+
+    /// A mid-keystroke buffer with an unterminated block terminates (no infinite
+    /// loop) and yields a diagnostic rather than hanging or panicking.
+    #[test]
+    fn recover_handles_unterminated_block() {
+        let recovered = recover("User {\n  id: +uuid\n  email:");
+        assert!(!recovered.diagnostics.is_empty(), "unterminated buffer is diagnosed");
+    }
+
+    /// Multiple independent broken declarations each produce a diagnostic and the
+    /// good one between them survives.
+    #[test]
+    fn recover_reports_multiple_broken_declarations() {
+        let input = "\
+A
+  x: u32
+
+Good {
+  id: +uuid
+}
+
+B
+  y: u32
+";
+        let recovered = recover(input);
+        assert!(recovered.schema.find_model("Good").is_some(), "middle valid model survived");
+        assert!(
+            recovered.diagnostics.len() >= 2,
+            "both broken declarations reported: {:?}",
+            recovered.diagnostics
+        );
     }
 }
