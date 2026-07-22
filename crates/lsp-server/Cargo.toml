@@ -8,9 +8,11 @@ repository = "https://github.com/hoodiecollin/forgedb"
 keywords = ["database", "lsp", "forgedb", "language-server"]
 categories = ["database", "development-tools"]
 
-[[bin]]
-name = "forgedb-lsp"
-path = "src/main.rs"
+# Library-only. The `forgedb-lsp` binary that ships this server lives in the root
+# `forgedb` crate behind its non-default `lsp` feature, so one dist "app" carries
+# both `forgedb` and `forgedb-lsp` (epic #173 WS7). This crate is never a dist app.
+[package.metadata.dist]
+dist = false
 
 [dependencies]
 # The LSP speaks the REAL grammar/semantics by consuming the compiler directly —
