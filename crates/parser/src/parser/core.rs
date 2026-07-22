@@ -680,6 +680,7 @@ impl Parser {
             is_computed,
             fulltext_indexed,
             is_materialized,
+            position: field_pos,
         })
     }
 
@@ -741,7 +742,11 @@ impl Parser {
             return Err(format!("Struct '{}' has no fields", name));
         }
 
-        Ok(Struct { name, fields })
+        Ok(Struct {
+            name,
+            fields,
+            position: struct_pos,
+        })
     }
 
     /// Parse a top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
@@ -829,7 +834,11 @@ impl Parser {
             return Err(format!("Enum '{}' has no variants", name));
         }
 
-        Ok(EnumDef { name, variants })
+        Ok(EnumDef {
+            name,
+            variants,
+            position: enum_pos,
+        })
     }
 
     fn parse_model(&mut self) -> Result<Model, String> {
@@ -974,6 +983,7 @@ impl Parser {
             composite_indexes,
             projections,
             soft_delete,
+            position: model_pos,
         })
     }
 
@@ -1087,6 +1097,36 @@ mod tests {
             .find(|f| f.name == field)
             .expect("field not found");
         &f.constraints
+    }
+
+    /// 2a (epic #173): parsed AST nodes carry the source position of their name,
+    /// so the LSP and unified validation can map diagnostics to editor ranges.
+    /// Positions are 1-based line/column.
+    #[test]
+    fn parsed_nodes_carry_source_positions() {
+        // Line-numbered so the expected positions are unambiguous:
+        // 1: User {          2:   id: +uuid       3:   email: &string   4: }
+        // 6: struct Point {  7:   x: i32          8: }
+        // 10: enum Status {  11:   Active         12:   Inactive         13: }
+        let src = "User {\n  id: +uuid\n  email: &string\n}\n\nstruct Point {\n  x: i32\n}\n\nenum Status {\n  Active\n  Inactive\n}\n";
+        let schema = Parser::new(src).unwrap().parse().unwrap();
+
+        let user = schema.find_model("User").unwrap();
+        let upos = user.position.expect("model carries a position");
+        assert_eq!((upos.line, upos.column), (1, 1), "User model name");
+
+        let id = user.fields.iter().find(|f| f.name == "id").unwrap();
+        let idpos = id.position.expect("field carries a position");
+        assert_eq!((idpos.line, idpos.column), (2, 3), "id field name");
+
+        let email = user.fields.iter().find(|f| f.name == "email").unwrap();
+        assert_eq!(email.position.unwrap().line, 3, "email field line");
+
+        let point = schema.find_struct("Point").unwrap();
+        assert_eq!(point.position.unwrap().line, 6, "Point struct line");
+
+        let status = schema.find_enum("Status").unwrap();
+        assert_eq!(status.position.unwrap().line, 10, "Status enum line");
     }
 
     #[test]

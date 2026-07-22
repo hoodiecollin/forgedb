@@ -1,5 +1,7 @@
 /// Abstract Syntax Tree representation
 
+use forgedb_validation::Position;
+
 /// Constraint parameter value
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstraintParam {
@@ -140,6 +142,9 @@ pub struct Field {
     pub is_computed: bool,            // @computed directive
     pub fulltext_indexed: bool,       // @fulltext directive (Sprint 18)
     pub is_materialized: bool,        // @materialized directive (Sprint 19)
+    /// Source position of the field name (1-based line/column). `None` when the
+    /// node is synthesized rather than parsed (e.g. test fixtures, migrations).
+    pub position: Option<Position>,
 }
 
 /// Represents a struct definition (Sprint 8)
@@ -147,6 +152,8 @@ pub struct Field {
 pub struct Struct {
     pub name: String,
     pub fields: Vec<Field>,
+    /// Source position of the struct name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 /// A user-declared top-level `enum Name { V1, V2, ... }` (#enum).  A sibling of
@@ -157,6 +164,8 @@ pub struct Struct {
 pub struct EnumDef {
     pub name: String,
     pub variants: Vec<String>,
+    /// Source position of the enum name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +175,8 @@ pub struct Model {
     pub composite_indexes: Vec<CompositeIndex>,
     pub projections: Vec<Projection>, // @projection(name: a, b) directives (#113)
     pub soft_delete: bool,            // @soft_delete directive at model level (Sprint 19)
+    /// Source position of the model name (`None` when synthesized).
+    pub position: Option<Position>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -7,10 +7,10 @@ fn test_detect_many_to_many() {
         structs: vec![],
         enums: vec![],
         models: vec![
-            Model {
+            Model { position: None,
                 name: "Post".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -22,7 +22,7 @@ fn test_detect_many_to_many() {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "tags".to_string(),
                         field_type: FieldType::Relation(RelationType::OneToMany(
                             "Tag".to_string(),
@@ -41,10 +41,10 @@ fn test_detect_many_to_many() {
                 projections: Vec::new(),
                 soft_delete: false,
             },
-            Model {
+            Model { position: None,
                 name: "Tag".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -56,7 +56,7 @@ fn test_detect_many_to_many() {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "posts".to_string(),
                         field_type: FieldType::Relation(RelationType::OneToMany(
                             "Post".to_string(),
@@ -93,10 +93,10 @@ fn test_no_m2m_with_fk() {
         structs: vec![],
         enums: vec![],
         models: vec![
-            Model {
+            Model { position: None,
                 name: "User".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -108,7 +108,7 @@ fn test_no_m2m_with_fk() {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "posts".to_string(),
                         field_type: FieldType::Relation(RelationType::OneToMany(
                             "Post".to_string(),
@@ -127,10 +127,10 @@ fn test_no_m2m_with_fk() {
                 projections: Vec::new(),
                 soft_delete: false,
             },
-            Model {
+            Model { position: None,
                 name: "Post".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -142,7 +142,7 @@ fn test_no_m2m_with_fk() {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "author".to_string(),
                         field_type: FieldType::Relation(RelationType::RequiredReference(
                             "User".to_string(),

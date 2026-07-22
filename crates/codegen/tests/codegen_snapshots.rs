@@ -13,10 +13,10 @@ use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
 /// Helper to create a simple test schema with one model
 fn simple_user_schema() -> Schema {
     Schema {
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "User".to_string(),
             fields: vec![
-                Field {
+                Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -28,7 +28,7 @@ fn simple_user_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "email".to_string(),
                     field_type: FieldType::String,
                     auto_generate: false,
@@ -40,7 +40,7 @@ fn simple_user_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "age".to_string(),
                     field_type: FieldType::OptionalStructType("u32".to_string()),
                     auto_generate: false,
@@ -66,9 +66,9 @@ fn simple_user_schema() -> Schema {
 fn multi_model_schema() -> Schema {
     Schema {
         models: vec![
-            Model {
+            Model { position: None,
                 name: "User".to_string(),
-                fields: vec![Field {
+                fields: vec![Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -84,10 +84,10 @@ fn multi_model_schema() -> Schema {
                 projections: Vec::new(),
                 soft_delete: false,
             },
-            Model {
+            Model { position: None,
                 name: "Post".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -99,7 +99,7 @@ fn multi_model_schema() -> Schema {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "title".to_string(),
                         field_type: FieldType::String,
                         auto_generate: false,
@@ -471,10 +471,10 @@ fn test_api_openapi_doc_structure() {
 #[test]
 fn test_different_field_types() {
     let schema = Schema {
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "ComplexModel".to_string(),
             fields: vec![
-                Field {
+                Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -486,7 +486,7 @@ fn test_different_field_types() {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "count".to_string(),
                     field_type: FieldType::I64,
                     auto_generate: false,
@@ -498,7 +498,7 @@ fn test_different_field_types() {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "price".to_string(),
                     field_type: FieldType::F64,
                     auto_generate: false,
@@ -510,7 +510,7 @@ fn test_different_field_types() {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "active".to_string(),
                     field_type: FieldType::Bool,
                     auto_generate: false,
@@ -522,7 +522,7 @@ fn test_different_field_types() {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "created_at".to_string(),
                     field_type: FieldType::Timestamp,
                     auto_generate: false,
@@ -553,10 +553,10 @@ fn complex_types_schema() -> Schema {
     
     Schema {
         structs: vec![
-            Struct {
+            Struct { position: None,
                 name: "Address".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "street".to_string(),
                         field_type: FieldType::Char(100),
                         auto_generate: false,
@@ -568,7 +568,7 @@ fn complex_types_schema() -> Schema {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "city".to_string(),
                         field_type: FieldType::Char(50),
                         auto_generate: false,
@@ -582,10 +582,10 @@ fn complex_types_schema() -> Schema {
                     },
                 ],
             },
-            Struct {
+            Struct { position: None,
                 name: "Location".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "lat".to_string(),
                         field_type: FieldType::F64,
                         auto_generate: false,
@@ -597,7 +597,7 @@ fn complex_types_schema() -> Schema {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "lon".to_string(),
                         field_type: FieldType::F64,
                         auto_generate: false,
@@ -613,10 +613,10 @@ fn complex_types_schema() -> Schema {
             },
         ],
         enums: vec![],
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "Place".to_string(),
             fields: vec![
-                Field {
+                Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -628,7 +628,7 @@ fn complex_types_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "name".to_string(),
                     field_type: FieldType::Char(200),
                     auto_generate: false,
@@ -640,7 +640,7 @@ fn complex_types_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "address".to_string(),
                     field_type: FieldType::StructType("Address".to_string()),
                     auto_generate: false,
@@ -652,7 +652,7 @@ fn complex_types_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "location".to_string(),
                     field_type: FieldType::OptionalStructType("Location".to_string()),
                     auto_generate: false,
@@ -664,7 +664,7 @@ fn complex_types_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "tags".to_string(),
                     field_type: FieldType::FixedArray(Box::new(FieldType::Char(20)), 5),
                     auto_generate: false,
@@ -676,7 +676,7 @@ fn complex_types_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "scores".to_string(),
                     field_type: FieldType::FixedArray(Box::new(FieldType::F64), 10),
                     auto_generate: false,
@@ -898,9 +898,9 @@ Tag {
 fn fk_schema() -> Schema {
     Schema {
         models: vec![
-            Model {
+            Model { position: None,
                 name: "Author".to_string(),
-                fields: vec![Field {
+                fields: vec![Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -916,10 +916,10 @@ fn fk_schema() -> Schema {
                 projections: Vec::new(),
                 soft_delete: false,
             },
-            Model {
+            Model { position: None,
                 name: "Post".to_string(),
                 fields: vec![
-                    Field {
+                    Field { position: None,
                         name: "id".to_string(),
                         field_type: FieldType::Uuid,
                         auto_generate: true,
@@ -931,7 +931,7 @@ fn fk_schema() -> Schema {
                         fulltext_indexed: false,
                         is_materialized: false,
                     },
-                    Field {
+                    Field { position: None,
                         name: "title".to_string(),
                         field_type: FieldType::String,
                         auto_generate: false,
@@ -944,7 +944,7 @@ fn fk_schema() -> Schema {
                         is_materialized: false,
                     },
                     // Required FK reference (no storage column, must default)
-                    Field {
+                    Field { position: None,
                         name: "author_id".to_string(),
                         field_type: FieldType::Relation(RelationType::RequiredReference(
                             "Author".to_string(),
@@ -959,7 +959,7 @@ fn fk_schema() -> Schema {
                         is_materialized: false,
                     },
                     // Optional FK reference
-                    Field {
+                    Field { position: None,
                         name: "editor_id".to_string(),
                         field_type: FieldType::Relation(RelationType::OptionalReference(
                             "Author".to_string(),
@@ -987,10 +987,10 @@ fn fk_schema() -> Schema {
 /// Schema where a model has a OneToMany virtual relation and a Component field.
 fn component_schema() -> Schema {
     Schema {
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "Product".to_string(),
             fields: vec![
-                Field {
+                Field { position: None,
                     name: "id".to_string(),
                     field_type: FieldType::Uuid,
                     auto_generate: true,
@@ -1002,7 +1002,7 @@ fn component_schema() -> Schema {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "name".to_string(),
                     field_type: FieldType::String,
                     auto_generate: false,
@@ -1015,7 +1015,7 @@ fn component_schema() -> Schema {
                     is_materialized: false,
                 },
                 // OneToMany virtual relation
-                Field {
+                Field { position: None,
                     name: "reviews".to_string(),
                     field_type: FieldType::Relation(RelationType::OneToMany(
                         "Review".to_string(),
@@ -1030,7 +1030,7 @@ fn component_schema() -> Schema {
                     is_materialized: false,
                 },
                 // Component reference
-                Field {
+                Field { position: None,
                     name: "card".to_string(),
                     field_type: FieldType::Component(ComponentReference {
                         protocol: ComponentProtocol::Tsx,
@@ -1160,9 +1160,9 @@ fn test_typescript_kebab_case_multi_word() {
     use forgedb_parser::ast::IndexType;
 
     let schema = Schema {
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "UserProfile".to_string(),
-            fields: vec![Field {
+            fields: vec![Field { position: None,
                 name: "id".to_string(),
                 field_type: FieldType::Uuid,
                 auto_generate: true,
@@ -1193,10 +1193,10 @@ fn test_typescript_u32_u64_are_number() {
     use forgedb_parser::ast::IndexType;
 
     let schema = Schema {
-        models: vec![Model {
+        models: vec![Model { position: None,
             name: "Counter".to_string(),
             fields: vec![
-                Field {
+                Field { position: None,
                     name: "count_u32".to_string(),
                     field_type: FieldType::U32,
                     auto_generate: false,
@@ -1208,7 +1208,7 @@ fn test_typescript_u32_u64_are_number() {
                     fulltext_indexed: false,
                     is_materialized: false,
                 },
-                Field {
+                Field { position: None,
                     name: "count_u64".to_string(),
                     field_type: FieldType::U64,
                     auto_generate: false,
