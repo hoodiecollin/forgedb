@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-backup"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "forgedb-storage",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-codegen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "forgedb-parser",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-migrations"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-parser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgedb-validation",
 ]
@@ -1513,7 +1513,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-validation"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "forgedb-wal"
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-watcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "forgedb-codegen",
