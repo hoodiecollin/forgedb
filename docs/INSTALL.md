@@ -14,28 +14,64 @@ cargo install forgedb
 This builds the CLI from the published crates and drops `forgedb` in
 `~/.cargo/bin`. Update later with `cargo install forgedb --force`.
 
-## 2. Prebuilt binaries (no toolchain needed)
+## 2. Package managers & prebuilt binaries (no Rust toolchain needed)
 
-> **Not available yet.** No release has been tagged, so there are no prebuilt
-> binaries to download. Until the first tag is pushed, use `cargo install`
-> (above) or `--git` (below). The release workflow that will attach these assets
-> is authored but not yet exercised.
+> **Activates with the first tagged release.** These channels all repackage the
+> per-platform binaries attached to a
+> [GitHub Release](https://github.com/hoodiecollin/forgedb/releases). The release
+> pipeline (cargo-dist + a maturin PyPI sidecar) is wired and validated, but no
+> `v*` tag has been pushed yet — until then, use `cargo install` (above) or
+> `--git` (below). The commands below are what each channel will be once a
+> release is cut; every channel ships the same `forgedb` binary (plus the bundled
+> `forgedb-lsp` language server) and stays version-locked to the crate release.
 
-Once a release is tagged, it attaches prebuilt binaries to its
-[GitHub Release](https://github.com/hoodiecollin/forgedb/releases). Download the
-archive for your platform, extract, and put `forgedb` on your `PATH`:
+**Shell one-liner (macOS / Linux):**
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh | sh
+```
+
+**PowerShell (Windows):**
+
+```powershell
+powershell -c "irm https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.ps1 | iex"
+```
+
+**Homebrew (macOS / Linux):**
+
+```bash
+brew install hoodiecollin/tap/forgedb
+```
+
+**npm** (published under a personal scope — the unscoped name was unavailable):
+
+```bash
+npm install -g @hoodiecollin/forgedb    # or: npx @hoodiecollin/forgedb --help
+```
+
+**uv / pip (PyPI):**
+
+```bash
+uv tool install forgedb    # or: uvx forgedb --help
+pip install forgedb
+```
+
+**Direct download.** Each release also attaches raw archives — grab the one for
+your platform, extract, and put `forgedb` on your `PATH`:
 
 | Platform | Asset |
 |---|---|
-| Linux x86_64 | `forgedb-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `forgedb-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS (Intel) | `forgedb-<version>-x86_64-apple-darwin.tar.gz` |
-| macOS (Apple Silicon) | `forgedb-<version>-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `forgedb-<version>-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc) | `forgedb-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux x86_64 (musl) | `forgedb-x86_64-unknown-linux-musl.tar.xz` |
+| Linux aarch64 | `forgedb-aarch64-unknown-linux-gnu.tar.xz` |
+| macOS (Intel) | `forgedb-x86_64-apple-darwin.tar.xz` |
+| macOS (Apple Silicon) | `forgedb-aarch64-apple-darwin.tar.xz` |
+| Windows x86_64 | `forgedb-x86_64-pc-windows-msvc.zip` |
 
 ```bash
-tar -xzf forgedb-<version>-<target>.tar.gz
-sudo mv forgedb /usr/local/bin/     # or anywhere on your PATH
+tar -xf forgedb-<target>.tar.xz
+sudo mv forgedb forgedb-lsp /usr/local/bin/     # or anywhere on your PATH
 forgedb --help
 ```
 
