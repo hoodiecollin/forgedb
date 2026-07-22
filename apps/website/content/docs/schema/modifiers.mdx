@@ -8,25 +8,36 @@ Modifiers are sigils that adorn a field's type. Three are **prefix** modifiers (
 
 | Symbol | Name | Position | Meaning | Valid on |
 |--------|------|----------|---------|----------|
-| `+` | auto-generate | prefix | Fill the value on insert | `u32`, `u64`, `uuid`, `timestamp` only |
+| `+` | auto-generate | prefix | Fill on create (`uuid`/`timestamp` today; integer is a marker) | `u32`, `u64`, `uuid`, `timestamp` only |
 | `&` | unique | prefix | Value must be unique (enforced) | any type |
 | `^` | indexed | prefix | Build an index for fast lookups | any type |
 | `?` | nullable | postfix (or prefix) | Value may be absent | any type |
 
 ## `+` — auto-generate
 
-`+` tells ForgeDB to generate the value on insert, so callers never supply it. It is
-**only valid on** `u32`, `u64`, `uuid`, and `timestamp`:
+`+` marks a field ForgeDB fills for you. On **create** (`db.create_<model>`, and the REST
+`POST /api/<model>` that routes through it), an omitted or nil `+uuid` gets a fresh
+`Uuid::new_v4()` and an omitted or zero `+timestamp` gets the current time — so callers
+never supply them. It is **only valid on** `u32`, `u64`, `uuid`, and `timestamp`:
 
 ```forge
-id: +uuid            // random UUID on insert
-seq: +u64            // auto-incrementing counter
-created_at: +timestamp
+id: +uuid            // fresh UUID on create when omitted/nil
+seq: +u64            // primary-key marker — NOT yet auto-incremented (see below)
+created_at: +timestamp   // current time on create when omitted/zero
 ```
 
 <Callout type="warning" title="`+` is type-restricted">
 `+` on any other type — e.g. `name: +string` — is a fatal parse error. Only the four
 generatable types above are allowed.
+</Callout>
+
+<Callout type="warning" title="Integer `+` is a marker, not yet auto-incremented">
+`+u32`/`+u64` currently only *mark* the primary-key / auto field — the generator does not
+yet synthesize a value for them, so a create must still supply the integer id. Auto-increment
+for integer keys (a monotonic, restart-safe, reuse-free counter) is planned; it is
+deliberately not shipped as a subtly-wrong version that could reuse a deleted id. `+uuid` and
+`+timestamp` are fully synthesized today. See
+[issue #187](https://github.com/hoodiecollin/forgedb/issues/187).
 </Callout>
 
 ## `&` — unique

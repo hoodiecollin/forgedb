@@ -46,7 +46,7 @@ is skipped by design — see the root CLAUDE.md).
 | `project-management` | Synthetic | 8 | Org→Team→Project→Issue hierarchy, sub-issue self-ref, label M2M, dual composite indexes |
 | `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log |
 | `ecommerce-store` | Synthetic | 9 | Product variants, `CartItem`/`OrderItem` joins, money as `i64` minor units, SKU/order-number natural keys |
-| `iot-sensors` | Synthetic | 3 + struct | `+u64` high-volume PK, fixed array `[f64; 3]`, `struct Calibration`, append-heavy telemetry |
+| `iot-sensors` | Synthetic | 3 + struct | `+u64` high-volume PK (not auto-incremented yet, [#187](https://github.com/hoodiecollin/forgedb/issues/187)), fixed array `[f64; 3]`, `struct Calibration`, append-heavy telemetry |
 
 ## Provenance & licensing
 
