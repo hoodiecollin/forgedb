@@ -69,8 +69,9 @@ Post {
 
 ## Many-to-many
 
-When **both** models list the other with `[..]` and neither side is a foreign key, the
-parser auto-detects a many-to-many relationship and generates a junction table.
+When **both** models list the other with a `[OtherModel]` field (written `[..]` in the table
+above) and neither side is a foreign key, the parser auto-detects a many-to-many relationship
+and generates a junction table.
 
 <Compare>
 ```forge

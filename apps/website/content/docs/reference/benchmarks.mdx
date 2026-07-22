@@ -102,13 +102,15 @@ column-pruned sequential scans and an ordered/range index:
 
 | scenario | ForgeDB (before) | ForgeDB (now) | SQLite | redb | DuckDB |
 |---|---|---|---|---|---|
-| `scan_aggregate` | 32.4 ms | **186 µs** (projected) | 352 µs | 632 µs | **92 µs** |
+| `scan_aggregate` | 32.4 ms | **568 µs** (186 µs w/ `@projection`) | 352 µs | 632 µs | **92 µs** |
 | `scan_sort_top10` | 32.6 ms | **37 µs** (index) | 4.35 µs | 809 µs | 491 µs |
 
 The 32 ms was ~80 000 per-row syscalls in hashmap order, **not** a columnar-layout penalty.
-ForgeDB now bulk-loads each scanned column once and decodes from memory. On the aggregate
-DuckDB's vectorized fold still leads (92 µs vs 186 µs), but ForgeDB now beats SQLite and
-redb. On the sorted top-N, ForgeDB's ordered index (37 µs) beats DuckDB's full scan.
+ForgeDB now bulk-loads each scanned column once and decodes from memory. A plain full-table
+aggregate lands at **568 µs** — ahead of redb (632 µs) but still behind SQLite (352 µs);
+adding a column-pruning `@projection` that reads only the aggregated column drops it to
+**186 µs**, which does beat both. DuckDB's vectorized fold leads either way (92 µs). On the
+sorted top-N, ForgeDB's ordered index (37 µs) beats DuckDB's full scan.
 
 ## Footprint
 
