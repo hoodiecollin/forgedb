@@ -75,9 +75,10 @@ The workspace splits cleanly into three tiers.
 ### Compiler internals (the CLI's implementation; published for install only, NOT a stable API)
 
 `forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
-`forgedb-backup`, `forgedb-watcher`. Published to crates.io only so `cargo install forgedb`
-resolves; see [SEMVER.md §4](./SEMVER.md) and [`CLAUDE.md`](../CLAUDE.md) (the authoritative
-workspace inventory). `forgedb-lsp-server` is unpublished.
+`forgedb-backup`, `forgedb-watcher`, `forgedb-lsp-server`. Published to crates.io only so
+`cargo install forgedb` resolves; see [SEMVER.md §4](./SEMVER.md) and [`CLAUDE.md`](../CLAUDE.md)
+(the authoritative workspace inventory). (`forgedb-lsp-server` joined this list in epic #173
+WS7 — the `forgedb` crate optionally depends on it for the bundled `forgedb-lsp` binary.)
 
 ### Dependency direction
 
