@@ -252,7 +252,10 @@ impl RustGenerator {
             // `WalOperation::Raw` via `if let` — currently the only variant, so
             // the pattern is irrefutable, but the `if let` stays forward-compatible
             // if the op set ever grows again (#89 durable write path).
-            #![allow(dead_code, unused_imports, irrefutable_let_patterns)]
+            // `unused_mut`: `create_*` takes `mut record` to synthesize `+` auto
+            // fields (#187); a model with no synthesizable auto field never mutates
+            // it, so the `mut` is conditionally unused.
+            #![allow(dead_code, unused_imports, irrefutable_let_patterns, unused_mut)]
 
             use std::collections::HashMap;
             use std::path::{Path, PathBuf};
@@ -317,6 +320,18 @@ impl RustGenerator {
             proc_macro2::Literal::u32_unsuffixed(format_version);
         tokens.extend(quote! {
             const EXPECTED_FORMAT_VERSION: u32 = #__expected_format_version;
+        });
+
+        // serde default for an omitted `+timestamp` auto field (#187): a zero
+        // sentinel that `create_*` replaces with `Timestamp::now()`.  `Timestamp`
+        // is a substrate newtype that cannot derive `Default` in generated code
+        // (orphan rule), so `#[serde(default = ...)]` on auto timestamp fields
+        // points here.  Unused when a schema has no `+timestamp`; the module-level
+        // `#![allow(dead_code)]` covers that.
+        tokens.extend(quote! {
+            fn __forgedb_default_ts() -> Timestamp {
+                Timestamp::from_seconds(0)
+            }
         });
 
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
@@ -605,7 +620,7 @@ impl RustGenerator {
         let fields: Vec<_> = model
             .fields
             .iter()
-            .map(Self::model_struct_field)
+            .map(|f| Self::model_struct_field(f, true))
             .collect();
 
         // Generate columnar storage fields
@@ -5032,7 +5047,12 @@ impl RustGenerator {
     /// does, with the `utoipa` Timestamp `value_type` annotation and nullable
     /// wrapping.  Shared by the model struct and every projection struct (#113)
     /// so a projected field's type never drifts from the model's.
-    fn model_struct_field(field: &forgedb_parser::Field) -> TokenStream {
+    ///
+    /// `auto_default` adds the `+` auto-generate serde defaults (#187) so a
+    /// create body may omit those fields — emitted for the model struct, but NOT
+    /// for read-only projection structs (which are never deserialized from a
+    /// create body).
+    fn model_struct_field(field: &forgedb_parser::Field, auto_default: bool) -> TokenStream {
         let field_name = format_ident!("{}", field.name);
         let field_type = Self::map_field_type_ident(&field.field_type);
 
@@ -5066,11 +5086,62 @@ impl RustGenerator {
             (quote! {}, quote! {})
         };
 
-        if field.is_nullable() {
-            quote! { #schema_attr #serde_attr pub #field_name: Option<#field_type> }
+        // `+` auto-generate fields (#187) may be omitted from a create body — the
+        // server synthesizes them (`create_*`) — so they deserialize with a serde
+        // default.  `Uuid` defaults to nil (its `Default`); `Timestamp` cannot
+        // derive `Default` in generated code, so its default points at the emitted
+        // `__forgedb_default_ts`.  Integer `+u32`/`+u64` autos are NOT yet
+        // synthesized (#187), so they stay required (no default) to avoid a silent
+        // `id = 0`.
+        let serde_default = if auto_default && field.auto_generate {
+            match &field.field_type {
+                forgedb_parser::FieldType::Uuid => quote! { #[serde(default)] },
+                forgedb_parser::FieldType::Timestamp => {
+                    quote! { #[serde(default = "__forgedb_default_ts")] }
+                }
+                _ => quote! {},
+            }
         } else {
-            quote! { #schema_attr #serde_attr pub #field_name: #field_type }
+            quote! {}
+        };
+
+        if field.is_nullable() {
+            quote! { #schema_attr #serde_attr #serde_default pub #field_name: Option<#field_type> }
+        } else {
+            quote! { #schema_attr #serde_attr #serde_default pub #field_name: #field_type }
         }
+    }
+
+    /// Emit the `+` auto-generate value synthesis for a model's create path
+    /// (#187): for each `+uuid`/`+timestamp` field, fill it in when the caller
+    /// left it unset (a nil UUID / a zero timestamp), so `create_<model>` (Rust,
+    /// and REST through it) generates ids/timestamps rather than requiring them in
+    /// the body.  Integer `+u32`/`+u64` auto-increment is not yet synthesized
+    /// (#187) — a monotonic, restart-safe, reuse-free counter is a separate
+    /// change — so those must still be supplied.  Operates on a `mut record`.
+    fn generate_auto_synthesis(model: &forgedb_parser::Model) -> TokenStream {
+        let stmts: Vec<TokenStream> = model
+            .fields
+            .iter()
+            .filter(|f| f.auto_generate)
+            .filter_map(|f| {
+                let name = format_ident!("{}", f.name);
+                match &f.field_type {
+                    forgedb_parser::FieldType::Uuid => Some(quote! {
+                        if record.#name.is_nil() {
+                            record.#name = Uuid::new_v4();
+                        }
+                    }),
+                    forgedb_parser::FieldType::Timestamp => Some(quote! {
+                        if record.#name.as_seconds() == 0 {
+                            record.#name = Timestamp::now();
+                        }
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+        quote! { #(#stmts)* }
     }
 
     /// The model's identity field (`id` or an `+auto` field), if any.  A
@@ -5496,7 +5567,8 @@ impl RustGenerator {
         for proj in &model.projections {
             let proj_ident = format_ident!("{}{}", model.name, Self::projection_pascal(&proj.name));
             let fields = Self::projected_field_set(model, proj);
-            let struct_field_defs: Vec<_> = fields.iter().map(|f| Self::model_struct_field(f)).collect();
+            let struct_field_defs: Vec<_> =
+                fields.iter().map(|f| Self::model_struct_field(f, false)).collect();
 
             let read_at_name = format_ident!("read_{}_at", proj.name);
             let get_name = format_ident!("get_{}", proj.name);
@@ -6812,9 +6884,13 @@ impl RustGenerator {
                  `Ok(false)` if the id is absent.",
                 model.name
             );
+            let auto_synth = Self::generate_auto_synthesis(model);
             methods.push(quote! {
                 #[doc = #create_doc]
-                pub fn #create_fn(&mut self, record: #model_ident) -> Result<#id_type, ValidationError> {
+                pub fn #create_fn(&mut self, mut record: #model_ident) -> Result<#id_type, ValidationError> {
+                    // #187: synthesize omitted `+` auto fields (uuid/timestamp) before
+                    // integrity checks so a create body may omit id/created_at.
+                    #auto_synth
                     #(#fk_checks)*
                     self.#storage_field.insert(record)
                 }
@@ -7634,6 +7710,7 @@ impl RustGenerator {
             let get_fn = format_ident!("get_{}", snake);
             let all_fn = format_ident!("all_{}", snake);
             let snap_field = format_ident!("{}", snake);
+            let auto_synth = Self::generate_auto_synthesis(model);
 
             // Unique checks (insert) for ConcurrentTxHandle.
             let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
@@ -7747,7 +7824,9 @@ impl RustGenerator {
 
             concurrent_model_methods.push(quote! {
                 /// Stage the creation of a #model_name in a concurrent transaction.
-                pub fn #create_fn(&mut self, record: #model_name) -> Result<#id_type, TxError> {
+                pub fn #create_fn(&mut self, mut record: #model_name) -> Result<#id_type, TxError> {
+                    // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
+                    #auto_synth
                     #validate_fn(&record)?;
                     #(#unique_checks_insert)*
                     #(#fk_checks)*
@@ -8078,6 +8157,7 @@ impl RustGenerator {
         let get_fn = format_ident!("get_{}", snake);
         let all_fn = format_ident!("all_{}", snake);
         let validate_fn = format_ident!("validate_{}", snake);
+        let auto_synth = Self::generate_auto_synthesis(model);
 
         // `&unique` checks: (1) against the committed index (same as the non-txn
         // path) and (2) against the staged-unique buffer (`staged_unique_keys`) so
@@ -8236,8 +8316,10 @@ impl RustGenerator {
 
         quote! {
             #[doc = #create_doc]
-            pub fn #create_fn(&mut self, record: #model_name) -> Result<#id_type, TxError> {
+            pub fn #create_fn(&mut self, mut record: #model_name) -> Result<#id_type, TxError> {
                 self.#mark_fn();
+                // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
+                #auto_synth
                 // #91 field constraints.
                 #validate_fn(&record)?;
                 // #91 `&unique` (committed index; within-txn duplicate = honest limit).

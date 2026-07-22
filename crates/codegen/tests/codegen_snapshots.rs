@@ -136,6 +136,67 @@ fn test_rust_generation_multiple_models() {
     insta::assert_snapshot!(result.code);
 }
 
+/// Guard for the `+` auto-generate synthesis + create contract (#187/#188).
+/// A model with `+uuid` and `+timestamp` auto fields must:
+///   * carry serde defaults so a create body may omit them (uuid → `#[serde(default)]`,
+///     timestamp → `#[serde(default = "__forgedb_default_ts")]`);
+///   * emit the `__forgedb_default_ts` helper;
+///   * synthesize omitted values in `create_<model>` (`Uuid::new_v4()` for a nil
+///     uuid, `Timestamp::now()` for a zero timestamp), over a `mut record`.
+#[test]
+fn test_rust_generation_auto_generate_synthesis() {
+    fn auto_field(name: &str, ft: FieldType) -> Field {
+        Field {
+            position: None,
+            name: name.to_string(),
+            field_type: ft,
+            auto_generate: true,
+            unique: false,
+            indexed: false,
+            constraints: vec![],
+            index_type: IndexType::Hash,
+            is_computed: false,
+            fulltext_indexed: false,
+            is_materialized: false,
+        }
+    }
+    let schema = Schema {
+        models: vec![Model {
+            position: None,
+            name: "Event".to_string(),
+            fields: vec![
+                auto_field("id", FieldType::Uuid),
+                auto_field("created_at", FieldType::Timestamp),
+            ],
+            composite_indexes: vec![],
+            projections: Vec::new(),
+            soft_delete: false,
+        }],
+        structs: vec![],
+        enums: vec![],
+    };
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // serde defaults let a create body omit auto fields.
+    assert!(code.contains("#[serde(default)]"), "uuid auto field needs #[serde(default)]");
+    assert!(
+        code.contains("#[serde(default = \"__forgedb_default_ts\")]"),
+        "timestamp auto field needs the default-fn attr"
+    );
+    assert!(
+        code.contains("fn __forgedb_default_ts() -> Timestamp"),
+        "the timestamp default helper must be emitted"
+    );
+
+    // create_<model> synthesizes omitted values over a `mut record`.
+    assert!(
+        code.contains("pub fn create_event(&mut self, mut record: Event)"),
+        "create takes `mut record` for synthesis"
+    );
+    assert!(code.contains("record.id = Uuid::new_v4()"), "nil uuid → new_v4");
+    assert!(code.contains("record.created_at = Timestamp::now()"), "zero timestamp → now");
+}
+
 #[test]
 fn test_rust_generation_has_utoipa_derives() {
     let schema = simple_user_schema();
@@ -2438,7 +2499,7 @@ Post {
         "duplicate &unique email is rejected via the unique index");
 
     // Database-level validated wrappers add FK existence (sibling access).
-    assert!(code.contains("pub fn create_post(&mut self, record: Post) -> Result<Uuid, ValidationError>"),
+    assert!(code.contains("pub fn create_post(&mut self, mut record: Post) -> Result<Uuid, ValidationError>"),
         "create_<model> wrapper");
     assert!(code.contains("pub fn update_post(") && code.contains("-> Result<bool, ValidationError>"),
         "update_<model> wrapper");
@@ -5294,7 +5355,7 @@ Post {
 
     // Scoped per-model write + read methods exist on the handle.
     assert!(
-        code.contains("pub fn create_user(&mut self, record: User) -> Result<Uuid, TxError>")
+        code.contains("pub fn create_user(&mut self, mut record: User) -> Result<Uuid, TxError>")
             && code.contains("pub fn update_user(")
             && code.contains("pub fn delete_user("),
         "TxHandle exposes scoped create/update/delete per model"
