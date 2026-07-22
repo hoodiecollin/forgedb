@@ -1,16 +1,21 @@
 //! ForgeDB Validation
 //!
-//! Schema and data validation for ForgeDB with support for constraints, HTTP validation,
-//! and error reporting.
+//! The diagnostic vocabulary and reusable predicates that ForgeDB's schema
+//! validation is built from, plus HTTP-status helpers.
 //!
 //! # Overview
 //!
-//! This crate provides comprehensive validation capabilities for ForgeDB, including:
+//! This crate provides:
 //!
-//! - **Schema validation** - Validate schema definitions for correctness
-//! - **Constraint validation** - Enforce field constraints (@unique, @email, @min, etc.)
-//! - **HTTP validation** - Validate HTTP endpoint definitions and status codes
-//! - **Error reporting** - Detailed validation errors with position information
+//! - **Diagnostic types** - [`ValidationError`] (message + [`Position`] + suggestion),
+//!   the shared currency of positioned schema diagnostics.
+//! - **Naming predicates** - [`is_snake_case`] / [`is_pascal_case`] and the
+//!   [`validate_field_name`] / [`validate_model_name`] convenience checks.
+//! - **HTTP validation** - Validate HTTP endpoint definitions and status codes.
+//!
+//! The *schema walk itself* — the single `validate_schema(&Schema)` that applies
+//! these to a parsed AST — lives in `forgedb-parser`, which owns the AST (see the
+//! architecture note below for why it cannot live here).
 //!
 //! # Architecture
 //!
@@ -27,15 +32,22 @@
 //! 3. **Constraint Validation** - Check constraint parameters and applicability
 //! 4. **HTTP Validation** - Validate HTTP endpoints and status codes (if applicable)
 //!
-//! > **Current state (see epic #173):** steps 2–3 above describe the *intended*
-//! > home for schema validation, but they are **not** yet the live path. The CLI
-//! > `validate` command (`src/commands/validate.rs`) currently performs its schema
-//! > checks inline and does not route through the `validate_*` helpers here, and
-//! > the parser runs its own relation/struct-reference checks. These helpers carry
-//! > positions (`Position`) but are consumed today only by `forgedb-migrations` and
-//! > the parser's `Position` re-export. Consolidating these three implementations
-//! > into one positioned, reusable API — shared by the CLI and the LSP — is tracked
-//! > in epic #173 (WS2b).
+//! > **Where the schema walk lives (epic #173 WS2b — DONE).** The single
+//! > positioned schema-validation authority is
+//! > [`forgedb_parser::validate_schema`](../forgedb_parser/validate/fn.validate_schema.html),
+//! > **not** a function in this crate. It has to live in `forgedb-parser`: it
+//! > needs the `Schema` AST, and `forgedb-parser` already depends on
+//! > `forgedb-validation` (for `Position`/`ValidationError`), so a reverse
+//! > dependency would be a cycle. The three former implementations (the parser's
+//! > built-in checks, the CLI's inline `src/commands/validate.rs` loops, and the
+//! > `validate_*` helpers here) are consolidated into that one function; the CLI
+//! > and the LSP both consume it.
+//! >
+//! > This crate is the **diagnostic vocabulary + reusable predicates** that
+//! > `validate_schema` builds on: [`ValidationError`], [`Position`],
+//! > [`validate_field_name`], [`validate_model_name`], [`is_snake_case`],
+//! > [`is_pascal_case`]. The `HttpValidator`/`StatusCodeMapper` surface is a
+//! > separate HTTP-status concern.
 //!
 //! # Examples
 //!
