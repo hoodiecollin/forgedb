@@ -9,8 +9,8 @@ IDE support for ForgeDB schema files (`.forge`): syntax highlighting, Language S
 - **Types**: `string`, `u32`, `i64`, `f64`, `bool`, `uuid`, `timestamp`, `decimal`, `json`, enums, etc.
 - **Symbols**: `+` (auto-generate), `&` (unique), `^` (index), `*` (required relation), `?` (optional/nullable)
 - **Directives**: `@email`, `@url`, `@min`, `@max`, `@computed`, `@index`, `@fulltext`, etc.
-- **Relations**: `[Model]` (array), `*Model` (single)
-- **Comments**: `//` (line) and `/* */` (block)
+- **Relations**: `[Model]` (one-to-many / many-to-many), `*Model` (required FK), `?Model` (optional FK)
+- **Comments**: `//` (line comments only)
 - **Component References**: `tsx://`, `jsx://`, `api://`
 
 ### 📝 Code Snippets
@@ -26,31 +26,40 @@ Speed up schema authoring with intelligent snippets:
 
 **Field Snippets:**
 - `fid` - UUID primary key
-- `femail` - Email field with validation
-- `fstring` - Required string field
-- `fstringopt` - Optional string field
-- `fstringuniq` - Unique string field
+- `fidauto` - Auto-increment u64 primary key
+- `femail` - Unique, indexed email field with validation
+- `fstring` - String field
+- `fstringopt` - Nullable string field
+- `fstringuniq` - Unique string field (`&`)
+- `fstringidx` - Indexed string field (`^`)
 - `fbool` - Boolean field
 - `fnum` - Numeric field
+- `fdecimal` - Exact decimal field
+- `fjson` - JSON field
+- `fchar` - Fixed-length char field
 - `ftimestamp` - Timestamp field
-- `farray` - Array relation
-- `frel` - Single relation
+- `farray` - One-to-many / many-to-many relation
+- `frel` - Required relation (`*Model`)
+- `frelopt` - Optional relation (`?Model`)
 - `fcomputed` - Computed field
+- `fminmax` - Numeric field with `@min`/`@max`
+- `flength` - String field with `@length`
+- `fpattern` - String field with `@pattern`
 - `fcomponent` - Component reference
 - `fapi` - API route handler
 
 **Directive Snippets:**
 - `dindex` - Composite index
-- `dunique` - Unique constraint
 - `ddefault` - Default value
 - `dondel` - On delete behavior
 - `dfulltext` - Full-text search
+- `dsoftdelete` - Model-level soft delete
 
 ### 🔧 Editor Features
 
 - **Auto-closing pairs**: Brackets, quotes, and parentheses
 - **Bracket matching**: Highlight matching `{}`, `[]`, `()`
-- **Comment toggling**: Line and block comments
+- **Comment toggling**: Line comments (`//`)
 - **Smart indentation**: Auto-indent inside blocks
 - **Code folding**: Collapse model and struct definitions
 
