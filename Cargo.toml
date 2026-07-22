@@ -91,3 +91,8 @@ forgedb-migrations = { path = "crates/migrations", version = "0.1.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
