@@ -143,7 +143,7 @@ forgedb-auth = "0.1"
 forgedb-query-params = "0.1"
 forgedb-compaction = "0.1"
 forgedb-txn = "0.1"
-forgedb-coordinator = "0.1"
+forgedb-coordinator = "0.2"
 regex = "1"
 rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
 serde = {{ version = "1", features = ["derive"] }}

@@ -458,7 +458,7 @@ forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"
 forgedb-txn = "0.1"
-forgedb-coordinator = "0.1"
+forgedb-coordinator = "0.2"
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
 uuid = {{ version = "1", features = ["v4", "serde"] }}
