@@ -21,8 +21,10 @@ targets = ["rust", "typescript", "api", "stubs"]
 | `output` | string | `"./generated"` | Output directory for generated files. |
 | `targets` | string[] | *(all targets)* | Which targets to emit. When absent, all are enabled. |
 
-Valid `targets` values are `rust`, `typescript`, `api`, and `stubs`. When the key is
-absent, every target is generated.
+Valid `targets` values are `rust`, `typescript`, `api`, `openapi`, and `stubs`, plus the
+opt-in `wasm` (browser read-replica) and `ffi` (C-ABI engine). When the key is absent, the
+default set (`rust`, `typescript`, `api`, `openapi`, `stubs`) is generated; `wasm`/`ffi` are
+emitted only when explicitly listed.
 
 <Callout type="note" title="CLI flags override these">
 `--schema` and `--output` on the `forgedb generate` command take precedence over the

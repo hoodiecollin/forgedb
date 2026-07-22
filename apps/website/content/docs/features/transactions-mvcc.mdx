@@ -27,10 +27,11 @@ db.transaction(|tx| {
 Atomic **multi-model** commit rides a transaction journal (`_txn_journal.log`, reusing the
 WAL's opaque framing), so a commit spanning several models is all-or-nothing across them.
 
-<Callout type="note" title="FK ordering within a batch">
-A child's foreign key validates against **committed** rows. When you bulk-load parents and
-children, commit the parents first (one transaction) and the children second — a child
-inserted in the same uncommitted transaction as its parent cannot yet see it.
+<Callout type="note" title="FK visibility within a transaction">
+A foreign key validates against rows **visible to the transaction** — committed rows *plus*
+rows staged earlier in the same transaction (read-your-writes). So creating a parent and then
+its child in **one** transaction is valid, as long as the parent is staged first. (Split
+across *separate* transactions, the child's parent must already be committed.)
 </Callout>
 
 ## Tier 2 — optimistic concurrent writers

@@ -19,7 +19,7 @@ The target defaults to `all`.
 
 | Target | Kind | Produces |
 |---|---|---|
-| `all` | standalone | Every enabled artifact (`rust`, `api`, `openapi`, `stubs`, and `ffi` if listed in `[generate].targets`). |
+| `all` | standalone | Every default artifact (`rust`, `typescript`, `api`, `openapi`, `stubs`) — plus the opt-in `wasm`/`ffi` when listed in `[generate].targets`. |
 | `rust` | standalone | `database.rs` — the tailored Rust database. |
 | `api` | standalone | `api.rs` — the REST API + OpenAPI document. |
 | `openapi` | standalone | `openapi.json` — the OpenAPI 3.1 document (offline). |

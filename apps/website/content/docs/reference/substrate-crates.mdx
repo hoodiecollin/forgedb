@@ -56,10 +56,11 @@ read is a breaking (major) bump. See [versioning & stability](/docs/reference/se
 ## Not substrate
 
 `forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
-`forgedb-backup`, and `forgedb-watcher` are also on crates.io, but **only so `cargo install
-forgedb` can build the CLI from the registry**. They are compiler internals — explicitly
-*not* a stable public API. Do not build a product on top of them. `forgedb-lsp-server` is
-unpublished. See [versioning & stability §4](/docs/reference/semver/).
+`forgedb-backup`, `forgedb-watcher`, and `forgedb-lsp-server` are also on crates.io, but
+**only so `cargo install forgedb` can build the CLI from the registry** (the optional `lsp`
+feature pulls in `forgedb-lsp-server`, and crates.io requires optional deps to resolve). They
+are compiler internals — explicitly *not* a stable public API. Do not build a product on top
+of them. See [versioning & stability §4](/docs/reference/semver/).
 
 ## Publish discipline
 
