@@ -193,8 +193,11 @@ in `crates/`:
   ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
   so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
-**Internal (0.1.0):** (compiler internals — `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`,
-and now `lsp-server` are **published to crates.io** 0.1.0, but **only** so `cargo install forgedb` can build the CLI
+**Internal (compiler internals):** `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher` are at
+**0.2.0** on crates.io (republished 2026-07-22 to carry the WS2/WS3 API changes — positioned AST, `enums`,
+`parse_recover`, `EnumDef`; MINOR bump so the still-published `forgedb` 0.1.0's `^0.1.0` pins stay on the old 0.1.0
+crates and `cargo install forgedb` is unaffected); `lsp-server` is at **0.1.0** (first publish, WS7). They are
+**published to crates.io** but **only** so `cargo install forgedb` can build the CLI
 from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates.
 `lsp-server` joined this list in epic #173 WS7 — the root `forgedb` crate gained an **optional** dependency on it (the
 non-default `lsp` feature drives the bundled `forgedb-lsp` binary), and crates.io requires optional deps to resolve, so
