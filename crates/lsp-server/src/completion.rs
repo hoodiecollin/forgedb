@@ -1,15 +1,13 @@
-// Code completion for ForgeDB schemas
+// Code completion for ForgeDB schemas.
 //
-// Provides intelligent autocomplete suggestions
+// Type/modifier/directive suggestions are driven by the REAL grammar (via the
+// `forgedb_parser` AST for model/struct/enum references); there is no private
+// language model here anymore.
 
+use forgedb_parser::Schema;
 use tower_lsp::lsp_types::{CompletionItem, CompletionItemKind, Position};
-use crate::parser::Schema;
 
-pub fn get_completions(
-    content: &str,
-    position: Position,
-    schema: &Option<Schema>,
-) -> Vec<CompletionItem> {
+pub fn get_completions(content: &str, position: Position, schema: &Schema) -> Vec<CompletionItem> {
     let lines: Vec<&str> = content.lines().collect();
     if position.line as usize >= lines.len() {
         return vec![];
@@ -19,106 +17,55 @@ pub fn get_completions(
     let before_cursor = &current_line[..position.character.min(current_line.len() as u32) as usize];
 
     // Context-aware completions
-    if before_cursor.trim_end().ends_with(':') {
-        // After colon - suggest field types and modifiers
-        return get_type_completions(schema);
-    }
-
     if before_cursor.trim_end().ends_with('@') {
         // After @ - suggest directives
         return get_directive_completions();
     }
 
     if before_cursor.contains(':') && !before_cursor.contains('@') {
-        // In type position - suggest types
+        // In type position (after the colon) - suggest modifiers/types/references
         return get_type_completions(schema);
     }
 
     vec![]
 }
 
-fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
+fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
     let mut completions = vec![];
 
-    // Modifiers — order matches schema language reference: + ~ ^ & * ?
-    completions.push(CompletionItem {
-        label: "+".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Auto-generate on create".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Value is automatically generated when the record is created (UUID v4 or auto-increment)".to_string()
-        )),
-        ..Default::default()
-    });
+    // Field modifiers (prefix, before the type). ForgeDB has NO `~` auto-update
+    // modifier — order matches the schema reference: + & ^ * ?.
+    let modifiers = [
+        ("+", "Auto-generate on create", "Value is generated when the record is created (u32/u64 auto-increment, uuid, or timestamp)"),
+        ("&", "Unique", "Adds a unique constraint — no two records can share this value"),
+        ("^", "Index", "Creates a database index on this field for faster lookups"),
+        ("*", "Required foreign-key relation", "Marks this field as a required foreign-key reference to another model"),
+        ("?", "Optional (nullable)", "Marks this field as optional (may be null)"),
+    ];
+    for (label, detail, doc) in modifiers {
+        completions.push(CompletionItem {
+            label: label.to_string(),
+            kind: Some(CompletionItemKind::OPERATOR),
+            detail: Some(detail.to_string()),
+            documentation: Some(tower_lsp::lsp_types::Documentation::String(doc.to_string())),
+            ..Default::default()
+        });
+    }
 
-    completions.push(CompletionItem {
-        label: "~".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Auto-update on modify".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Value is automatically set to the current timestamp whenever the record is updated".to_string()
-        )),
-        ..Default::default()
-    });
-
-    completions.push(CompletionItem {
-        label: "^".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Index".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Creates a database index on this field for faster lookups".to_string()
-        )),
-        ..Default::default()
-    });
-
-    completions.push(CompletionItem {
-        label: "&".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Unique".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Adds a unique constraint — no two records can share the same value for this field".to_string()
-        )),
-        ..Default::default()
-    });
-
-    completions.push(CompletionItem {
-        label: "*".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Required foreign-key relation".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Marks this field as a required foreign-key reference to another model".to_string()
-        )),
-        ..Default::default()
-    });
-
-    completions.push(CompletionItem {
-        label: "?".to_string(),
-        kind: Some(CompletionItemKind::OPERATOR),
-        detail: Some("Optional".to_string()),
-        documentation: Some(tower_lsp::lsp_types::Documentation::String(
-            "Marks this field as optional (nullable)".to_string()
-        )),
-        ..Default::default()
-    });
-
-    // Primitive types
+    // Primitive types — the ACTUAL ForgeDB scalar set (no u8/u16/i8/i16/f32).
     let primitive_types = [
-        ("string", "Variable-length string"),
+        ("string", "Variable-length UTF-8 string"),
         ("bool", "Boolean (true/false)"),
-        ("u8", "Unsigned 8-bit integer (0-255)"),
-        ("u16", "Unsigned 16-bit integer"),
         ("u32", "Unsigned 32-bit integer"),
         ("u64", "Unsigned 64-bit integer"),
-        ("i8", "Signed 8-bit integer"),
-        ("i16", "Signed 16-bit integer"),
         ("i32", "Signed 32-bit integer"),
         ("i64", "Signed 64-bit integer"),
-        ("f32", "32-bit floating point"),
         ("f64", "64-bit floating point"),
+        ("decimal", "Exact fixed-point decimal (money/quantity)"),
+        ("json", "Arbitrary JSON value (not indexable/filterable)"),
         ("uuid", "UUID v4"),
         ("timestamp", "Unix timestamp (i64)"),
     ];
-
     for (type_name, description) in &primitive_types {
         completions.push(CompletionItem {
             label: type_name.to_string(),
@@ -128,7 +75,7 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
         });
     }
 
-    // char(n) type
+    // char(n) fixed-length string
     completions.push(CompletionItem {
         label: "char(100)".to_string(),
         kind: Some(CompletionItemKind::TYPE_PARAMETER),
@@ -138,87 +85,64 @@ fn get_type_completions(schema: &Option<Schema>) -> Vec<CompletionItem> {
         ..Default::default()
     });
 
-    // Model and struct references (if schema is available)
-    if let Some(schema) = schema {
-        for model in &schema.models {
-            completions.push(CompletionItem {
-                label: model.name.clone(),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Model reference".to_string()),
-                ..Default::default()
-            });
+    // Model references (and their [Model] one-to-many form).
+    for model in &schema.models {
+        completions.push(CompletionItem {
+            label: model.name.clone(),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some("Model reference".to_string()),
+            ..Default::default()
+        });
+        completions.push(CompletionItem {
+            label: format!("[{}]", model.name),
+            kind: Some(CompletionItemKind::CLASS),
+            detail: Some("One-to-many relation".to_string()),
+            ..Default::default()
+        });
+    }
 
-            // Array reference
-            completions.push(CompletionItem {
-                label: format!("[{}]", model.name),
-                kind: Some(CompletionItemKind::CLASS),
-                detail: Some("Array of model".to_string()),
-                ..Default::default()
-            });
-        }
+    // Struct types — inline struct names are valid field types.
+    for s in &schema.structs {
+        let field_summary: String = s
+            .fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        completions.push(CompletionItem {
+            label: s.name.clone(),
+            kind: Some(CompletionItemKind::STRUCT),
+            detail: Some(format!("Struct type ({} fields)", s.fields.len())),
+            documentation: if field_summary.is_empty() {
+                None
+            } else {
+                Some(tower_lsp::lsp_types::Documentation::String(format!(
+                    "Fields: {field_summary}"
+                )))
+            },
+            ..Default::default()
+        });
+    }
 
-        // Struct types — inline struct names are valid field types.
-        for s in &schema.structs {
-            let field_summary: String = s
-                .fields
-                .iter()
-                .map(|f| f.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            completions.push(CompletionItem {
-                label: s.name.clone(),
-                kind: Some(CompletionItemKind::STRUCT),
-                detail: Some(format!("Struct type ({} fields)", s.fields.len())),
-                documentation: if field_summary.is_empty() {
-                    None
-                } else {
-                    Some(tower_lsp::lsp_types::Documentation::String(format!(
-                        "Fields: {}",
-                        field_summary
-                    )))
-                },
-                ..Default::default()
-            });
-        }
+    // Enum types — referenced by their bare PascalCase name.
+    for e in &schema.enums {
+        completions.push(CompletionItem {
+            label: e.name.clone(),
+            kind: Some(CompletionItemKind::ENUM),
+            detail: Some(format!("Enum type ({} variants)", e.variants.len())),
+            documentation: if e.variants.is_empty() {
+                None
+            } else {
+                Some(tower_lsp::lsp_types::Documentation::String(format!(
+                    "Variants: {}",
+                    e.variants.join(", ")
+                )))
+            },
+            ..Default::default()
+        });
     }
 
     completions
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parser::parse_schema;
-
-    /// Struct names appear in type-position completions.
-    #[test]
-    fn test_struct_completions_included() {
-        let schema = parse_schema("struct Address {\n  street: string\n}\n");
-        let content = "User {\n  home: ";
-        let position = Position { line: 1, character: 8 };
-        let items = get_completions(content, position, &schema);
-        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
-        assert!(
-            labels.contains(&"Address"),
-            "expected Address in completions, got: {labels:?}"
-        );
-    }
-
-    /// Struct completions carry STRUCT kind.
-    #[test]
-    fn test_struct_completion_kind() {
-        let schema = parse_schema("struct Point {\n  x: f64\n  y: f64\n}\n");
-        let content = "Shape {\n  center: ";
-        let position = Position { line: 1, character: 10 };
-        let items = get_completions(content, position, &schema);
-        let point_item = items.iter().find(|i| i.label == "Point");
-        assert!(point_item.is_some(), "Point completion must be present");
-        assert_eq!(
-            point_item.unwrap().kind,
-            Some(CompletionItemKind::STRUCT),
-            "struct completion must have STRUCT kind"
-        );
-    }
 }
 
 fn get_directive_completions() -> Vec<CompletionItem> {
@@ -228,7 +152,7 @@ fn get_directive_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::PROPERTY),
             detail: Some("Email validation".to_string()),
             documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Validates that the field contains a valid email address".to_string()
+                "Validates that the field contains a valid email address".to_string(),
             )),
             insert_text: Some("email".to_string()),
             ..Default::default()
@@ -238,7 +162,7 @@ fn get_directive_completions() -> Vec<CompletionItem> {
             kind: Some(CompletionItemKind::PROPERTY),
             detail: Some("URL validation".to_string()),
             documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Validates that the field contains a valid URL".to_string()
+                "Validates that the field contains a valid URL".to_string(),
             )),
             insert_text: Some("url".to_string()),
             ..Default::default()
@@ -247,9 +171,6 @@ fn get_directive_completions() -> Vec<CompletionItem> {
             label: "@min(value)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
             detail: Some("Minimum value/length".to_string()),
-            documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Sets the minimum value for numbers or minimum length for strings".to_string()
-            )),
             insert_text: Some("min($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
@@ -258,82 +179,147 @@ fn get_directive_completions() -> Vec<CompletionItem> {
             label: "@max(value)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
             detail: Some("Maximum value/length".to_string()),
-            documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Sets the maximum value for numbers or maximum length for strings".to_string()
-            )),
             insert_text: Some("max($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
-            label: "@regex(pattern)".to_string(),
+            label: "@pattern(regex)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Regex validation".to_string()),
-            insert_text: Some("regex($1)".to_string()),
+            detail: Some("Regex validation (enforced)".to_string()),
+            documentation: Some(tower_lsp::lsp_types::Documentation::String(
+                "Rejects values that do not match the regex at runtime (422). `@regex` is an alias.".to_string(),
+            )),
+            insert_text: Some("pattern($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
             label: "@length(n)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Exact length".to_string()),
+            detail: Some("String length".to_string()),
             insert_text: Some("length($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
-            label: "@unique".to_string(),
-            kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Unique constraint".to_string()),
-            insert_text: Some("unique".to_string()),
-            ..Default::default()
-        },
-        CompletionItem {
             label: "@index(fields...)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Composite index".to_string()),
+            detail: Some("Composite index (model level)".to_string()),
             documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Creates a composite index on multiple fields".to_string()
+                "Creates a composite index on multiple fields".to_string(),
             )),
             insert_text: Some("index($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
+            label: "@on_delete(action)".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Foreign-key on-delete behavior (enforced)".to_string()),
+            documentation: Some(tower_lsp::lsp_types::Documentation::String(
+                "restrict (default) | cascade | set_null".to_string(),
+            )),
+            insert_text: Some("on_delete(${1|restrict,cascade,set_null|})".to_string()),
+            insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        },
+        CompletionItem {
             label: "@fulltext".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Full-text search index".to_string()),
+            detail: Some("Full-text search marker (semantic-only)".to_string()),
             insert_text: Some("fulltext".to_string()),
             ..Default::default()
         },
         CompletionItem {
             label: "@computed".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Computed field".to_string()),
-            documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "Marks this field as computed (not stored in database)".to_string()
-            )),
+            detail: Some("Computed field marker (semantic-only)".to_string()),
             insert_text: Some("computed".to_string()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@materialized".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Materialized marker (semantic-only)".to_string()),
+            insert_text: Some("materialized".to_string()),
             ..Default::default()
         },
         CompletionItem {
             label: "@default(value)".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Default value".to_string()),
+            detail: Some("Default value marker (semantic-only)".to_string()),
             insert_text: Some("default($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
         CompletionItem {
-            label: "@on_delete(action)".to_string(),
+            label: "@soft_delete".to_string(),
             kind: Some(CompletionItemKind::PROPERTY),
-            detail: Some("Foreign key on delete behavior".to_string()),
-            documentation: Some(tower_lsp::lsp_types::Documentation::String(
-                "cascade | set_null | restrict".to_string()
-            )),
-            insert_text: Some("on_delete(${1|cascade,set_null,restrict|})".to_string()),
+            detail: Some("Soft-delete (model level)".to_string()),
+            insert_text: Some("soft_delete".to_string()),
+            ..Default::default()
+        },
+        CompletionItem {
+            label: "@projection(name: fields)".to_string(),
+            kind: Some(CompletionItemKind::PROPERTY),
+            detail: Some("Named column projection (model level)".to_string()),
+            insert_text: Some("projection($1)".to_string()),
             insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
             ..Default::default()
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgedb_parser::Parser;
+
+    fn parse(src: &str) -> Schema {
+        Parser::new(src).unwrap().parse_recover().schema
+    }
+
+    /// Struct names appear in type-position completions with STRUCT kind.
+    #[test]
+    fn struct_completions_included_with_kind() {
+        let schema = parse("struct Address {\n  street: string\n}\n");
+        let content = "User {\n  home: ";
+        let position = Position { line: 1, character: 8 };
+        let items = get_completions(content, position, &schema);
+        let item = items.iter().find(|i| i.label == "Address");
+        assert!(item.is_some(), "expected Address struct completion");
+        assert_eq!(item.unwrap().kind, Some(CompletionItemKind::STRUCT));
+    }
+
+    /// Enum names appear in type-position completions (a real-grammar gap the old
+    /// private parser could not see).
+    #[test]
+    fn enum_completions_included() {
+        let schema = parse("enum Status {\n  Active\n  Inactive\n}\n");
+        let content = "User {\n  status: ";
+        let position = Position { line: 1, character: 10 };
+        let items = get_completions(content, position, &schema);
+        let item = items.iter().find(|i| i.label == "Status");
+        assert!(item.is_some(), "expected Status enum completion");
+        assert_eq!(item.unwrap().kind, Some(CompletionItemKind::ENUM));
+    }
+
+    /// Type completions expose real scalars (decimal/json) and never the phantom
+    /// `u8`/`f32` or the non-existent `~` modifier.
+    #[test]
+    fn type_completions_match_real_grammar() {
+        let schema = parse("");
+        let content = "User {\n  x: ";
+        let position = Position { line: 1, character: 5 };
+        let labels: Vec<String> = get_completions(content, position, &schema)
+            .into_iter()
+            .map(|i| i.label)
+            .collect();
+        assert!(labels.contains(&"decimal".to_string()));
+        assert!(labels.contains(&"json".to_string()));
+        assert!(!labels.contains(&"u8".to_string()), "u8 is not a ForgeDB type");
+        assert!(!labels.contains(&"f32".to_string()), "f32 is not a ForgeDB type");
+        assert!(!labels.contains(&"~".to_string()), "~ is not a ForgeDB modifier");
+    }
 }

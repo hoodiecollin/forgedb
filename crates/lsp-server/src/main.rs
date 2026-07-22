@@ -1,33 +1,30 @@
-// Sprint 22: Language Server Protocol for ForgeDB
+// ForgeDB Language Server
 //
-// Provides rich IDE features:
-// - Real-time diagnostics
-// - Code completion
-// - Hover information
-// - Go to definition
-// - Rename refactoring
+// Editor features (diagnostics, completion, hover, goto-definition, rename) driven
+// by the REAL ForgeDB compiler. The server parses buffers with
+// `forgedb_parser::Parser::parse_recover` — a resilient partial parse that yields a
+// best-effort AST plus every diagnostic the compiler would emit — so what the editor
+// shows matches `forgedb validate` exactly. There is no private grammar here.
 
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use forgedb_parser::{ParsedSchema, Parser, Schema};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::*;
+use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-mod parser;
-mod diagnostics;
 mod completion;
+mod diagnostics;
 mod hover;
 
-use parser::{parse_schema, Schema};
-use diagnostics::validate_schema;
 use completion::get_completions;
 use hover::get_hover_info;
 
 #[derive(Debug, Clone)]
 struct Document {
     content: String,
-    schema: Option<Schema>,
+    parsed: ParsedSchema,
 }
 
 struct Backend {
@@ -44,20 +41,27 @@ impl Backend {
     }
 
     async fn update_document(&self, uri: Url, content: String, version: i32) {
-        let schema = parse_schema(&content);
-        let doc = Document {
-            content: content.clone(),
-            schema: schema.clone(),
+        let (parsed, mut lsp_diagnostics) = match Parser::new(&content) {
+            // Resilient parse: partial AST + all compiler diagnostics.
+            Ok(mut parser) => {
+                let parsed = parser.parse_recover();
+                let diags = diagnostics::to_lsp_diagnostics(&parsed.diagnostics, &content);
+                (parsed, diags)
+            }
+            // Lexer errors are fatal (no token stream to recover from). Surface the
+            // message as a single diagnostic and keep an empty schema.
+            Err(message) => (empty_parsed(), vec![lexer_error_diagnostic(&message)]),
         };
 
-        let mut docs = self.documents.write().await;
-        docs.insert(uri.to_string(), doc);
+        // Sort by position so the editor's problem list is stable.
+        lsp_diagnostics.sort_by_key(|d| (d.range.start.line, d.range.start.character));
 
-        // Publish diagnostics
-        if let Some(schema) = schema {
-            let diagnostics = validate_schema(&schema, &content);
-            self.client.publish_diagnostics(uri, diagnostics, Some(version)).await;
-        }
+        let doc = Document { content, parsed };
+        self.documents.write().await.insert(uri.to_string(), doc);
+
+        self.client
+            .publish_diagnostics(uri, lsp_diagnostics, Some(version))
+            .await;
     }
 }
 
@@ -105,7 +109,6 @@ impl LanguageServer for Backend {
         let uri = params.text_document.uri;
         let content = params.text_document.text;
         let version = params.text_document.version;
-
         self.update_document(uri, content, version).await;
     }
 
@@ -123,7 +126,10 @@ impl LanguageServer for Backend {
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         self.client
-            .log_message(MessageType::INFO, format!("Saved: {}", params.text_document.uri))
+            .log_message(
+                MessageType::INFO,
+                format!("Saved: {}", params.text_document.uri),
+            )
             .await;
     }
 
@@ -133,7 +139,7 @@ impl LanguageServer for Backend {
 
         let docs = self.documents.read().await;
         if let Some(doc) = docs.get(&uri.to_string()) {
-            let completions = get_completions(&doc.content, position, &doc.schema);
+            let completions = get_completions(&doc.content, position, &doc.parsed.schema);
             return Ok(Some(CompletionResponse::Array(completions)));
         }
 
@@ -146,7 +152,7 @@ impl LanguageServer for Backend {
 
         let docs = self.documents.read().await;
         if let Some(doc) = docs.get(&uri.to_string()) {
-            return Ok(get_hover_info(&doc.content, position, &doc.schema));
+            return Ok(get_hover_info(&doc.content, position, &doc.parsed.schema));
         }
 
         Ok(None)
@@ -160,29 +166,22 @@ impl LanguageServer for Backend {
         let position = params.text_document_position_params.position;
 
         let docs = self.documents.read().await;
-        if let Some(doc) = docs.get(&uri.to_string()) {
-            if let Some(schema) = &doc.schema {
-                // Find word at position
-                if let Some(word) = get_word_at_position(&doc.content, position) {
-                    // Search models first, then struct definitions.
-                    let def_pos = find_model_definition(schema, &word)
-                        .or_else(|| find_struct_definition(schema, &word));
-
-                    if let Some(def_pos) = def_pos {
-                        let location = Location {
-                            uri: uri.clone(),
-                            range: Range {
-                                start: def_pos,
-                                end: Position {
-                                    line: def_pos.line,
-                                    character: def_pos.character + word.len() as u32,
-                                },
-                            },
-                        };
-                        return Ok(Some(GotoDefinitionResponse::Scalar(location)));
-                    }
-                }
-            }
+        // A word under the cursor can name a model, a struct, or an enum.
+        if let Some(doc) = docs.get(&uri.to_string())
+            && let Some(word) = get_word_at_position(&doc.content, position)
+            && let Some(def_pos) = find_definition(&doc.parsed.schema, &word)
+        {
+            let location = Location {
+                uri: uri.clone(),
+                range: Range {
+                    start: def_pos,
+                    end: Position {
+                        line: def_pos.line,
+                        character: def_pos.character + word.chars().count() as u32,
+                    },
+                },
+            };
+            return Ok(Some(GotoDefinitionResponse::Scalar(location)));
         }
 
         Ok(None)
@@ -194,25 +193,106 @@ impl LanguageServer for Backend {
         let new_name = params.new_name;
 
         let docs = self.documents.read().await;
-        if let Some(doc) = docs.get(&uri.to_string()) {
-            if let Some(schema) = &doc.schema {
-                if let Some(old_name) = get_word_at_position(&doc.content, position) {
-                    // Find all references
-                    let edits = find_all_references(schema, &doc.content, &old_name, &new_name);
+        if let Some(doc) = docs.get(&uri.to_string())
+            && let Some(old_name) = get_word_at_position(&doc.content, position)
+        {
+            let edits = find_all_references(&doc.content, &old_name, &new_name);
 
-                    let mut changes = HashMap::new();
-                    changes.insert(uri.clone(), edits);
+            let mut changes = HashMap::new();
+            changes.insert(uri.clone(), edits);
 
-                    return Ok(Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }));
-                }
-            }
+            return Ok(Some(WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }));
         }
 
         Ok(None)
     }
+}
+
+/// An empty [`ParsedSchema`] for the fatal-lexer-error path (no tokens to walk).
+fn empty_parsed() -> ParsedSchema {
+    ParsedSchema {
+        schema: Schema {
+            structs: Vec::new(),
+            enums: Vec::new(),
+            models: Vec::new(),
+        },
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Convert a compiler [`forgedb_validation::Position`] (1-based line/column) into an
+/// LSP [`Position`] (0-based line/character).
+fn to_lsp_position(pos: forgedb_validation::Position) -> Position {
+    Position {
+        line: pos.line.saturating_sub(1) as u32,
+        character: pos.column.saturating_sub(1) as u32,
+    }
+}
+
+/// Resolve a name to the position of its model / struct / enum definition.
+fn find_definition(schema: &Schema, name: &str) -> Option<Position> {
+    let pos = schema
+        .models
+        .iter()
+        .find(|m| m.name == name)
+        .and_then(|m| m.position)
+        .or_else(|| {
+            schema
+                .structs
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.position)
+        })
+        .or_else(|| {
+            schema
+                .enums
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.position)
+        })?;
+    Some(to_lsp_position(pos))
+}
+
+/// Turn a fatal lexer error string (which embeds "line N, column M") into a
+/// diagnostic anchored at that position, falling back to the document start.
+fn lexer_error_diagnostic(message: &str) -> Diagnostic {
+    let start = parse_line_column(message)
+        .map(|(l, c)| Position {
+            line: (l.saturating_sub(1)) as u32,
+            character: (c.saturating_sub(1)) as u32,
+        })
+        .unwrap_or(Position { line: 0, character: 0 });
+
+    Diagnostic {
+        range: Range {
+            start,
+            end: Position {
+                line: start.line,
+                character: start.character + 1,
+            },
+        },
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("forgedb".to_string()),
+        message: message.to_string(),
+        ..Default::default()
+    }
+}
+
+/// Extract the first `line N` / `column M` pair from a lexer error message.
+fn parse_line_column(message: &str) -> Option<(usize, usize)> {
+    let after = |marker: &str| -> Option<usize> {
+        let idx = message.find(marker)? + marker.len();
+        let digits: String = message[idx..]
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        digits.parse().ok()
+    };
+    Some((after("line ")?, after("column ")?))
 }
 
 fn get_word_at_position(content: &str, position: Position) -> Option<String> {
@@ -224,22 +304,17 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     let line = lines[position.line as usize];
     let char_pos = position.character as usize;
 
-    if char_pos > line.len() {
+    let chars: Vec<char> = line.chars().collect();
+    if char_pos > chars.len() {
         return None;
     }
 
-    // Find word boundaries
     let mut start = char_pos;
     let mut end = char_pos;
 
-    let chars: Vec<char> = line.chars().collect();
-
-    // Go backwards to find start
     while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
         start -= 1;
     }
-
-    // Go forwards to find end
     while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
         end += 1;
     }
@@ -251,33 +326,15 @@ fn get_word_at_position(content: &str, position: Position) -> Option<String> {
     }
 }
 
-fn find_model_definition(schema: &Schema, model_name: &str) -> Option<Position> {
-    schema.models.iter()
-        .find(|m| m.name == model_name)
-        .map(|m| m.position)
-}
-
-/// Find the definition position of a struct by name.
-fn find_struct_definition(schema: &Schema, struct_name: &str) -> Option<Position> {
-    schema.structs.iter()
-        .find(|s| s.name == struct_name)
-        .map(|s| s.position)
-}
-
-fn find_all_references(
-    _schema: &Schema,
-    content: &str,
-    old_name: &str,
-    new_name: &str,
-) -> Vec<TextEdit> {
+fn find_all_references(content: &str, old_name: &str, new_name: &str) -> Vec<TextEdit> {
     let mut edits = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
 
     for (line_idx, line) in lines.iter().enumerate() {
-        // `search_from` is a *byte* offset into `line`.  `str::find` returns byte
-        // offsets, so all arithmetic here is byte-based.  We convert to char counts
-        // only when building LSP `Position` values (which are UTF-16 char-unit based,
-        // but for ASCII schema names char count == byte count == UTF-16 unit count).
+        // `search_from` is a *byte* offset into `line`. `str::find` returns byte
+        // offsets, so all arithmetic here is byte-based. We convert to char counts
+        // only when building LSP `Position` values (UTF-16 units; for ASCII schema
+        // names char count == byte count == UTF-16 unit count).
         let mut search_from: usize = 0;
 
         while search_from <= line.len() {
@@ -287,20 +344,16 @@ fn find_all_references(
             let byte_start = search_from + pos;
             let byte_end = byte_start + old_name.len();
 
-            // Word-boundary checks: inspect the char immediately before/after the
-            // match using byte slices to avoid mixing byte and char indexing.
-            // `.chars().last()` / `.chars().next()` never panic regardless of input.
             let is_word_start = line[..byte_start]
                 .chars()
                 .last()
-                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
             let is_word_end = line[byte_end..]
                 .chars()
                 .next()
-                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
 
             if is_word_start && is_word_end {
-                // Convert byte offsets to char counts for LSP character positions.
                 let char_start = line[..byte_start].chars().count() as u32;
                 let char_end = char_start + old_name.chars().count() as u32;
 
@@ -319,8 +372,6 @@ fn find_all_references(
                 });
             }
 
-            // Advance past the end of the current match to avoid an infinite loop.
-            // `byte_end` is always a valid UTF-8 char boundary (end of `old_name`).
             search_from = byte_end;
         }
     }
@@ -333,46 +384,71 @@ async fn main() {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
-    let (service, socket) = LspService::new(|client| Backend::new(client));
+    let (service, socket) = LspService::new(Backend::new);
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::parse_schema;
 
-    /// goto_definition finds a model definition by name.
-    #[test]
-    fn test_find_model_definition_returns_position() {
-        let schema = parse_schema("User {\n  id: +uuid\n}\n").unwrap();
-        let pos = find_model_definition(&schema, "User");
-        assert!(pos.is_some(), "should find User model definition");
-        assert_eq!(pos.unwrap().line, 0);
+    fn parse(src: &str) -> Schema {
+        Parser::new(src).unwrap().parse_recover().schema
     }
 
-    /// goto_definition returns None for an unknown model.
+    /// goto_definition finds a model definition and returns a 0-based position.
     #[test]
-    fn test_find_model_definition_unknown_returns_none() {
-        let schema = parse_schema("User {\n  id: +uuid\n}\n").unwrap();
-        assert!(find_model_definition(&schema, "Post").is_none());
+    fn find_model_definition_returns_zero_based_position() {
+        let schema = parse("User {\n  id: +uuid\n}\n");
+        let pos = find_definition(&schema, "User").expect("should find User");
+        assert_eq!(pos.line, 0);
     }
 
-    /// goto_definition finds a struct definition by name.
+    /// goto_definition returns None for an unknown name.
     #[test]
-    fn test_find_struct_definition_returns_position() {
-        let schema =
-            parse_schema("struct Address {\n  street: string\n}\n").unwrap();
-        let pos = find_struct_definition(&schema, "Address");
-        assert!(pos.is_some(), "should find Address struct definition");
-        assert_eq!(pos.unwrap().line, 0);
+    fn find_definition_unknown_returns_none() {
+        let schema = parse("User {\n  id: +uuid\n}\n");
+        assert!(find_definition(&schema, "Post").is_none());
     }
 
-    /// goto_definition falls back to structs when a word is not a model name.
+    /// goto_definition resolves struct definitions.
     #[test]
-    fn test_find_struct_definition_unknown_returns_none() {
-        let schema =
-            parse_schema("struct Address {\n  street: string\n}\n").unwrap();
-        assert!(find_struct_definition(&schema, "Location").is_none());
+    fn find_struct_definition_returns_position() {
+        let schema = parse("struct Address {\n  street: string\n}\n");
+        let pos = find_definition(&schema, "Address").expect("should find Address");
+        assert_eq!(pos.line, 0);
+    }
+
+    /// goto_definition resolves enum definitions (new in the compiler re-point).
+    #[test]
+    fn find_enum_definition_returns_position() {
+        let schema = parse("enum Status {\n  Active\n  Inactive\n}\n");
+        let pos = find_definition(&schema, "Status").expect("should find Status");
+        assert_eq!(pos.line, 0);
+    }
+
+    /// 1-based compiler positions convert to 0-based LSP positions.
+    #[test]
+    fn position_conversion_is_zero_based() {
+        let p = to_lsp_position(forgedb_validation::Position { line: 3, column: 5 });
+        assert_eq!(p.line, 2);
+        assert_eq!(p.character, 4);
+    }
+
+    /// Lexer error messages yield a diagnostic anchored at the reported position.
+    #[test]
+    fn lexer_error_is_positioned() {
+        let d = lexer_error_diagnostic("Unexpected character '#' at line 2, column 4");
+        assert_eq!(d.range.start.line, 1);
+        assert_eq!(d.range.start.character, 3);
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    /// rename collects word-boundary references across the buffer.
+    #[test]
+    fn rename_finds_word_boundary_references() {
+        let content = "User {\n  id: +uuid\n}\n\nPost {\n  author: *User\n}\n";
+        let edits = find_all_references(content, "User", "Account");
+        assert_eq!(edits.len(), 2, "should rename both User occurrences");
     }
 }

@@ -1,259 +1,115 @@
-// Diagnostics for ForgeDB schema validation
+// Map compiler diagnostics onto LSP diagnostics.
 //
-// Provides real-time error checking and validation
+// The LSP does NOT reimplement validation. `forgedb_parser::Parser::parse_recover`
+// returns every diagnostic the compiler would — recovered syntax errors merged with
+// the semantic errors from `forgedb_parser::validate_schema` — each carrying a 1-based
+// source `Position`. This module is the thin adapter that turns those into 0-based LSP
+// `Diagnostic`s, so editor squiggles match `forgedb validate` exactly (WS3 parity).
 
+use forgedb_validation::ValidationError;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
-use crate::parser::{Schema, Field, FieldType, FieldModifier};
 
-pub fn validate_schema(schema: &Schema, _content: &str) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
+/// Convert compiler diagnostics (1-based line/column) into LSP diagnostics (0-based).
+///
+/// `content` is consulted only to size each squiggle to the identifier under the
+/// reported position; the diagnostics themselves come straight from the compiler.
+pub fn to_lsp_diagnostics(errors: &[ValidationError], content: &str) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = content.lines().collect();
 
-    // Validate models
-    for model in &schema.models {
-        // Check for duplicate field names
-        let mut field_names = std::collections::HashSet::new();
-        for field in &model.fields {
-            if !field_names.insert(&field.name) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: field.position,
-                        end: Position {
-                            line: field.position.line,
-                            character: field.position.character + field.name.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Duplicate field name '{}'", field.name),
-                    ..Default::default()
+    errors
+        .iter()
+        .map(|err| {
+            let range = err
+                .position
+                .map(|pos| range_at(&lines, pos.line, pos.column))
+                .unwrap_or_else(|| Range {
+                    start: Position { line: 0, character: 0 },
+                    end: Position { line: 0, character: 0 },
                 });
-            }
 
-            // Validate field
-            validate_field(field, &mut diagnostics);
-        }
+            let message = match &err.suggestion {
+                Some(s) => format!("{}\nSuggestion: {}", err.message, s),
+                None => err.message.clone(),
+            };
 
-        // Check for auto-generated primary key field (+)
-        let has_primary_key = model.fields.iter().any(|f| {
-            f.modifiers.contains(&FieldModifier::AutoGenerate)
-        });
-
-        if !has_primary_key {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: model.position,
-                    end: Position {
-                        line: model.position.line,
-                        character: model.position.character + model.name.len() as u32,
-                    },
-                },
-                severity: Some(DiagnosticSeverity::WARNING),
-                message: format!("Model '{}' should have a primary key field", model.name),
-                ..Default::default()
-            });
-        }
-    }
-
-    // Check for undefined model references
-    let model_names: std::collections::HashSet<_> = schema.models.iter()
-        .map(|m| &m.name)
-        .collect();
-
-    for model in &schema.models {
-        for field in &model.fields {
-            check_model_references(&field.field_type, &model_names, field, &mut diagnostics);
-        }
-    }
-
-    diagnostics
-}
-
-fn validate_field(field: &Field, diagnostics: &mut Vec<Diagnostic>) {
-    // Check for invalid modifier combinations
-    if field.modifiers.contains(&FieldModifier::AutoGenerate) {
-        // Auto-generated fields should not be optional
-        if is_optional(&field.field_type) {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: field.position,
-                    end: Position {
-                        line: field.position.line,
-                        character: field.position.character + field.name.len() as u32,
-                    },
-                },
+            Diagnostic {
+                range,
                 severity: Some(DiagnosticSeverity::ERROR),
-                message: "Auto-generated field (+) cannot be optional".to_string(),
+                source: Some("forgedb".to_string()),
+                message,
                 ..Default::default()
-            });
-        }
-    }
+            }
+        })
+        .collect()
+}
 
-    // Validate directives
-    for directive in &field.directives {
-        match directive.name.as_str() {
-            "min" | "max" => {
-                // Should have exactly one argument
-                if directive.args.len() != 1 {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: field.position,
-                            end: Position {
-                                line: field.position.line,
-                                character: field.position.character + 50,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message: format!("@{} directive requires exactly one argument", directive.name),
-                        ..Default::default()
-                    });
-                }
+/// Build a 0-based LSP range covering the identifier starting at a 1-based
+/// (`line`, `column`) source position. Falls back to a single-character span when
+/// the position lands past end-of-line (e.g. a "missing token" diagnostic).
+fn range_at(lines: &[&str], line: usize, column: usize) -> Range {
+    let line0 = line.saturating_sub(1);
+    let col0 = column.saturating_sub(1);
 
-                // Argument should be a number for numeric types
-                if let Some(arg) = directive.args.first() {
-                    if arg.parse::<i64>().is_err() && arg.parse::<f64>().is_err() {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: field.position,
-                                end: Position {
-                                    line: field.position.line,
-                                    character: field.position.character + 50,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!("@{} directive argument must be a number", directive.name),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            "email" | "url" => {
-                // Should be applied to string fields
-                if !matches!(unwrap_type(&field.field_type), FieldType::String) {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: field.position,
-                            end: Position {
-                                line: field.position.line,
-                                character: field.position.character + 50,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: format!("@{} directive is typically used with string fields", directive.name),
-                        ..Default::default()
-                    });
-                }
-            }
-            "computed" => {
-                // Computed fields shouldn't have modifiers
-                if !field.modifiers.is_empty() {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: field.position,
-                            end: Position {
-                                line: field.position.line,
-                                character: field.position.character + 50,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: "@computed fields should not have modifiers".to_string(),
-                        ..Default::default()
-                    });
-                }
-            }
-            "on_delete" => {
-                // Should be on required FK fields (*)
-                if !field.modifiers.contains(&FieldModifier::RequiredFk) {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: field.position,
-                            end: Position {
-                                line: field.position.line,
-                                character: field.position.character + 50,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::WARNING),
-                        message: "@on_delete should be used on relation fields".to_string(),
-                        ..Default::default()
-                    });
-                }
+    let word_len = lines
+        .get(line0)
+        .map(|l| {
+            l.chars()
+                .skip(col0)
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .count()
+        })
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
 
-                // Validate argument
-                if let Some(arg) = directive.args.first() {
-                    if !["cascade", "set_null", "restrict"].contains(&arg.as_str()) {
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: field.position,
-                                end: Position {
-                                    line: field.position.line,
-                                    character: field.position.character + 50,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message: format!("Invalid on_delete action: {}. Must be cascade, set_null, or restrict", arg),
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            _ => {
-                // Unknown directive - warning
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: field.position,
-                        end: Position {
-                            line: field.position.line,
-                            character: field.position.character + 50,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    message: format!("Unknown directive: @{}", directive.name),
-                    ..Default::default()
-                });
-            }
-        }
+    Range {
+        start: Position {
+            line: line0 as u32,
+            character: col0 as u32,
+        },
+        end: Position {
+            line: line0 as u32,
+            character: (col0 + word_len) as u32,
+        },
     }
 }
 
-fn is_optional(field_type: &FieldType) -> bool {
-    matches!(field_type, FieldType::Optional(_))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgedb_parser::Parser;
 
-fn unwrap_type(field_type: &FieldType) -> &FieldType {
-    match field_type {
-        FieldType::Optional(inner) => unwrap_type(inner),
-        FieldType::Array(inner) => unwrap_type(inner),
-        _ => field_type,
+    /// A duplicate-name schema produces a positioned ERROR diagnostic sourced "forgedb".
+    #[test]
+    fn duplicate_model_maps_to_positioned_error() {
+        let src = "User {\n  id: +uuid\n}\n\nUser {\n  id: +uuid\n}\n";
+        let parsed = Parser::new(src).unwrap().parse_recover();
+        let diags = to_lsp_diagnostics(&parsed.diagnostics, src);
+        assert!(!diags.is_empty(), "expected at least one diagnostic");
+        let d = &diags[0];
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(d.source.as_deref(), Some("forgedb"));
     }
-}
 
-fn check_model_references(
-    field_type: &FieldType,
-    model_names: &std::collections::HashSet<&String>,
-    field: &Field,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    match field_type {
-        FieldType::Model(name) => {
-            if !model_names.contains(name) {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: field.position,
-                        end: Position {
-                            line: field.position.line,
-                            character: field.position.character + 50,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    message: format!("Undefined model reference: '{}'", name),
-                    ..Default::default()
-                });
-            }
-        }
-        FieldType::Array(inner) | FieldType::Optional(inner) => {
-            check_model_references(inner, model_names, field, diagnostics);
-        }
-        FieldType::FixedArray(inner, _) => {
-            check_model_references(inner, model_names, field, diagnostics);
-        }
-        _ => {}
+    /// A naming-convention violation surfaces the compiler's suggestion in the message.
+    #[test]
+    fn suggestion_is_appended_to_message() {
+        let src = "user {\n  id: +uuid\n}\n";
+        let parsed = Parser::new(src).unwrap().parse_recover();
+        let diags = to_lsp_diagnostics(&parsed.diagnostics, src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("Suggestion:")),
+            "expected a suggestion in: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// 1-based compiler positions become 0-based LSP ranges spanning the identifier.
+    #[test]
+    fn positions_convert_to_zero_based_word_ranges() {
+        let lines = ["User {", "  bad name: string", "}"];
+        let r = range_at(&lines, 2, 3); // 1-based line 2, col 3 -> "bad"
+        assert_eq!(r.start.line, 1);
+        assert_eq!(r.start.character, 2);
+        assert_eq!(r.end.character, 5, "should span the 3-char word 'bad'");
     }
 }
