@@ -174,6 +174,21 @@ enum Commands {
     #[command(subcommand)]
     Tenant(TenantCommands),
 
+    /// Run the ForgeDB language server over stdio (used by editor extensions).
+    ///
+    /// Thin launcher for the sibling `forgedb-lsp` binary shipped alongside the
+    /// CLI — keeps the async LSP stack out of the main binary (epic #173 WS4).
+    Lsp {
+        /// Explicit path to the `forgedb-lsp` server binary (otherwise resolved
+        /// next to `forgedb`, then on PATH)
+        #[arg(long)]
+        server_path: Option<std::path::PathBuf>,
+
+        /// Extra arguments forwarded to the language server
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Start the Tier 3 MVCC commit coordinator (multi-process writers, #84)
     Coordinate {
         /// Data root directory to coordinate.
@@ -581,6 +596,10 @@ fn run(cli: Cli) -> Result<()> {
                 dest_suffix,
             }),
         },
+
+        Commands::Lsp { server_path, args } => {
+            commands::lsp::run(commands::lsp::LspOptions { server_path, args })
+        }
 
         Commands::Coordinate { root, socket, fsync, fsync_interval } => {
             commands::coordinate::run(commands::coordinate::CoordinateOptions {

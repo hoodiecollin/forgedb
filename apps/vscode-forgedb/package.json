@@ -104,10 +104,15 @@
     "configuration": {
       "title": "ForgeDB",
       "properties": {
+        "forgedb.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `forgedb` CLI. When empty, `forgedb` is resolved from your `PATH`. The extension launches the language server via this CLI's `forgedb lsp` subcommand (which ships alongside the CLI — [epic #173](https://github.com/hoodiecollin/forgedb/issues/173) WS4). Set this if `forgedb` is installed somewhere not on `PATH`."
+        },
         "forgedb.lspServerPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Absolute path to the `forgedb-lsp` language-server binary. When empty, the server is resolved from the installed `forgedb` CLI (per the ForgeDB extension distribution model — [epic #173](https://github.com/hoodiecollin/forgedb/issues/173) WS4). Set this only to override with a specific build."
+          "markdownDescription": "Absolute path to the `forgedb-lsp` language-server binary. Overrides `#forgedb.path#` — use it to point at a specific server build (e.g. a local `target/debug/forgedb-lsp`). When empty, the server is resolved from the installed `forgedb` CLI."
         },
         "forgedb.autoGenerateOnSave": {
           "type": "boolean",
