@@ -1,0 +1,45 @@
+# PyPI packaging for the `forgedb` CLI — epic #173 WS7 / issue #185.
+#
+# maturin `bindings = "bin"` wraps the compiled `forgedb` binary (plus the
+# bundled `forgedb-lsp`, via `features = ["lsp"]`) into platform wheels, so
+# `uv tool install forgedb` / `uvx forgedb` and `pip install forgedb` deliver the
+# CLI with no Rust toolchain. This is the one distribution channel cargo-dist
+# can't handle (dist does not publish to PyPI); everything else is driven by
+# dist-workspace.toml. The wheel version is read from the crate version in
+# Cargo.toml (`dynamic = ["version"]`), keeping this channel in lockstep with the
+# `v*` tag that drives all the others.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "forgedb"
+description = "ForgeDB — an application database generator. Compiles a declarative .forge schema into tailored Rust database code, a TypeScript SDK, and a REST API."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Collin Kokotas" }]
+keywords = ["database", "codegen", "orm", "cli", "generator"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: Software Development :: Code Generators",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/hoodiecollin/forgedb"
+Repository = "https://github.com/hoodiecollin/forgedb"
+
+[tool.maturin]
+# Package the crate's binaries (`forgedb` + the feature-gated `forgedb-lsp`) as a
+# console wheel rather than a Python extension module.
+bindings = "bin"
+features = ["lsp"]
+manifest-path = "Cargo.toml"
+strip = true
