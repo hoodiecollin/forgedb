@@ -1,6 +1,8 @@
 ---
 title: "Durability & crash safety"
 description: "How generated writes stay crash-safe — a per-model write-ahead log fsynced before columns, torn-tail recovery, a single-writer directory lock, and a bounded WAL."
+purpose: "orientation"
+structure: "C"
 ---
 
 Generated ForgeDB writes are crash-safe. Every `insert`/`update`/`delete` durably records
