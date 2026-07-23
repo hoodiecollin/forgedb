@@ -271,7 +271,7 @@ export default function Home() {
               </p>
             </div>
             <Button asChild variant="outline">
-              <Link href="/docs/reference/benchmarks/">
+              <Link href="/docs/benchmarks/">
                 See the numbers <ArrowRight className="size-4" />
               </Link>
             </Button>

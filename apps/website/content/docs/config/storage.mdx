@@ -1,6 +1,7 @@
 ---
 title: "[storage]"
 description: "The [storage] table — WAL fsync policy, checkpoint interval, and compaction, with their durability tradeoffs."
+purpose: "reference"
 ---
 
 The `[storage]` table carries generate-time storage and durability knobs.
@@ -48,7 +49,7 @@ correct today; only the "the syscall is physically absent" optimization is pendi
 </Callout>
 
 See [durability](/docs/features/durability/) for the full crash-safety model and
-[benchmarks](/docs/reference/benchmarks/) for the fair barrier-vs-relaxed comparison.
+[benchmarks](/docs/benchmarks/) for the fair barrier-vs-relaxed comparison.
 
 ## `wal_checkpoint_interval` (Tier B, default 1000)
 

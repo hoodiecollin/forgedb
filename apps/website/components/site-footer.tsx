@@ -25,7 +25,7 @@ const cols: { title: string; links: { title: string; href: string }[] }[] = [
     title: "Reference",
     links: [
       { title: "Configuration", href: "/docs/config/overview/" },
-      { title: "Benchmarks", href: "/docs/reference/benchmarks/" },
+      { title: "Benchmarks", href: "/docs/benchmarks/" },
       { title: "Deployment", href: "/docs/reference/deployment/" },
       { title: "Versioning", href: "/docs/reference/semver/" },
     ],
