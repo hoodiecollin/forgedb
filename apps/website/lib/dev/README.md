@@ -24,10 +24,10 @@ and **Accept** to splice it into the `.mdx`. The page reloads to show the change
 ## How the loop works
 
 ```
-overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl
+overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl + briefs/<id>.md
    ▲                                        │ (rewrite-watch.ts exits ─▶ wakes Claude)
    │ short-poll GET                         ▼
-   └───── proposals/<id>.json ◀── Claude writes proposal (honoring STYLE.md)
+   └───── proposals/<id>.json ◀── Claude reads brief, writes proposal
    Accept ──▶ route splices candidate into content/**.mdx ──▶ reload
 ```
 
@@ -37,8 +37,18 @@ overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl
 - **Staleness guard** — the page stamps a hash of the MDX body; if the file
   changes after render, the offsets are stale, so the route refuses the
   submit/accept (409) rather than corrupt the file. Reload to continue.
-- **Tone** — `content/STYLE.md` is loaded into every rewrite. Edit it to steer
-  the output; changes take effect on the next request.
+- **Style loader** — style lives in `content/style/`: a shared `spine.md` plus one
+  register per tier (`terse.md` 2–3, `deeper.md` 5–6, `technical.md` 7–10). Each
+  request's brief composes `spine + <tier register>` (`rewrite-style.ts`), keyed off
+  the target's tier and the page's `purpose`/`structure` frontmatter. Edit the style
+  files to steer output; changes take effect on the next request.
+- **Brief** — when a request lands, the route writes `.rewrite-queue/briefs/<id>.md`
+  (`rewrite-brief.ts`): the request context, the exact source slice, the composed
+  style, grounding rules, and the required proposal shape — everything the generator
+  needs in one file. Regenerate on demand with `bun scripts/rewrite-brief.ts <id>`.
+- **Page frontmatter** — `purpose: orientation|reference|marketing` and (Build-C only)
+  `structure: "C"` drive register strictness and the two-body warning. See
+  `content/style/spine.md`.
 
 ## Files
 
@@ -48,6 +58,8 @@ overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl
 | `rewrite-target.ts` | DOM click/selection → source target (section/block/span) |
 | `rewrite-types.ts` | shared protocol types |
 | `rewrite-queue.ts` | fs-backed queue + splice + staleness re-check |
+| `rewrite-style.ts` | style loader — composes `spine + <tier register>` |
+| `rewrite-brief.ts` | per-request generation brief → `.rewrite-queue/briefs/<id>.md` |
 | `rewrite-hash.ts` | content fingerprint for the staleness guard |
 | `rewrite-atoms.ts` | jotai state (mode, feedback default) |
 | `../../components/dev/rewrite-overlay.tsx` | the overlay UI |

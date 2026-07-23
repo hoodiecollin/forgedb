@@ -57,6 +57,23 @@ export function resolveDocFile(slug: string[]): string | null {
   return fileForSlug(slug);
 }
 
+export interface DocMeta {
+  purpose: "orientation" | "reference" | "marketing";
+  /** "C" = two-body page (terse + detailed native bodies); else "B". */
+  structure: "B" | "C";
+}
+
+/** Read the style-relevant frontmatter (purpose, structure) for a slug. Dev rewrite tool. */
+export function docMetaForSlug(slug: string[]): DocMeta | null {
+  const file = fileForSlug(slug);
+  if (!file) return null;
+  const { data } = matter(fs.readFileSync(file, "utf8"));
+  return {
+    purpose: (data.purpose as DocMeta["purpose"]) ?? "orientation",
+    structure: data.structure === "C" ? "C" : "B",
+  };
+}
+
 /** Load a single doc by slug, or null if no matching file exists. */
 export function getDocBySlug(slug: string[]): DocFile | null {
   const file = fileForSlug(slug);

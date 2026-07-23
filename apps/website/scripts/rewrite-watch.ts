@@ -38,10 +38,19 @@ function unprocessed(): RewriteRequest[] {
 function report(pending: RewriteRequest[]): never {
   console.log(`\n${pending.length} rewrite request(s) awaiting a proposal:`);
   for (const r of pending) {
+    const brief = path.join(QUEUE_DIR, "briefs", `${r.id}.md`);
+    const briefRef = fs.existsSync(brief)
+      ? brief
+      : `(missing — run: bun scripts/rewrite-brief.ts ${r.id})`;
     console.log(
       `  ${r.id}  [${r.target.kind}]  /${r.slug.join("/")}  —  ${JSON.stringify(r.instruction)}`,
     );
+    console.log(`         brief: ${briefRef}`);
   }
+  console.log(
+    `\nRead each brief (it carries the composed style + original + output spec), ` +
+      `then write .rewrite-queue/proposals/<id>.json.`,
+  );
   process.exit(0);
 }
 

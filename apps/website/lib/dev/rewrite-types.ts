@@ -8,6 +8,13 @@
 export type TargetKind = "section" | "block" | "span";
 
 /**
+ * Which register the target block is written in — picks the style register file
+ * (see rewrite-style.ts). Until the tiered-MDX vocabulary lands, every rendered
+ * block is the page body, so this defaults to `terse`.
+ */
+export type Tier = "terse" | "deeper" | "technical";
+
+/**
  * How a proposal is surfaced before it touches the file.
  * - `diff`   — one rewrite, shown as a diff to accept/reject (default).
  * - `candidates` — N alternatives to pick from.
@@ -29,6 +36,8 @@ export interface RewriteTarget {
   selectedText: string;
   /** Rendered text of the target, for context + showing the user what they picked. */
   renderedText: string;
+  /** Register of this block; defaults to `terse` until tiered blocks exist. */
+  tier?: Tier;
 }
 
 /** A request the overlay POSTs to the route; persisted to requests.jsonl. */
@@ -44,6 +53,10 @@ export interface RewriteRequest {
   mode: FeedbackMode;
   /** Content fingerprint of the .mdx body at render time (staleness guard). */
   docHash?: string;
+  /** Snapshot of the page's purpose from frontmatter, for register strictness. */
+  purpose?: "orientation" | "reference" | "marketing";
+  /** Page structure: "C" = two-body (keep terse + detailed in sync); else "B". */
+  structure?: "B" | "C";
 }
 
 /** One candidate rewrite within a proposal. */
