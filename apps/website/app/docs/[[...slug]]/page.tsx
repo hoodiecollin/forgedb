@@ -8,6 +8,8 @@ import { getAllDocSlugs, getDocBySlug } from "@/lib/mdx";
 import { extractToc } from "@/lib/toc";
 import { docMeta } from "@/lib/docs-nav";
 import { rehypePrettyCodeOptions } from "@/lib/rehype-code";
+import { remarkSourceMap } from "@/lib/dev/remark-source-map";
+import { hashContent } from "@/lib/dev/rewrite-hash";
 import { mdxComponents } from "@/components/mdx/mdx-components";
 import { Toc } from "@/components/docs/toc";
 import { DocsPager } from "@/components/docs/pager";
@@ -59,13 +61,26 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
           ) : null}
         </header>
 
+        {process.env.NODE_ENV === "development" ? (
+          // Staleness fingerprint for the local prose-rewrite tool: if the .mdx
+          // body changes after this render, stamped offsets are stale and a
+          // splice is refused server-side. Never emitted in the export build.
+          <span hidden data-rewrite-doc-hash={hashContent(doc.content)} />
+        ) : null}
+
         <div className="text-[15px]">
           <MDXRemote
             source={doc.content}
             components={mdxComponents}
             options={{
               mdxOptions: {
-                remarkPlugins: [remarkGfm],
+                // Dev-only: stamp source offsets onto blocks so the in-browser
+                // rewrite tool can map a rendered element back to the .mdx.
+                // Never added to the production export build.
+                remarkPlugins:
+                  process.env.NODE_ENV === "development"
+                    ? [remarkGfm, remarkSourceMap]
+                    : [remarkGfm],
                 rehypePlugins: [rehypeSlug, [rehypePrettyCode, rehypePrettyCodeOptions]],
               },
             }}

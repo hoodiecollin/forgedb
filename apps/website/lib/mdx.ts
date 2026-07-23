@@ -52,6 +52,11 @@ export function hrefForSlug(slug: string[]): string {
   return slug.length === 0 ? "/docs/" : `/docs/${slug.join("/")}/`;
 }
 
+/** Absolute path to the `.mdx` backing a slug, or null. Used by the dev rewrite tool. */
+export function resolveDocFile(slug: string[]): string | null {
+  return fileForSlug(slug);
+}
+
 /** Load a single doc by slug, or null if no matching file exists. */
 export function getDocBySlug(slug: string[]): DocFile | null {
   const file = fileForSlug(slug);
