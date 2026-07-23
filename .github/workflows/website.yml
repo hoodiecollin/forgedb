@@ -57,19 +57,19 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
 
-      # Cache bun's global download cache + Next's incremental build cache. Keyed on the
-      # lockfile + source so unrelated pushes still hit. Paths are workspace-root-relative
-      # (the cache action ignores the job's working-directory).
-      - name: Cache bun + Next build
+      # Cache ONLY bun's download cache (deps), keyed on the lockfile. We deliberately do
+      # NOT cache apps/website/.next/cache: restoring Next's persistent webpack cache across
+      # commits served STALE compiled CSS (a globals.css edit shipped byte-identical CSS and
+      # the fix never reached prod). The static-export build is fast, so recompiling CSS
+      # fresh every run is the right trade — correctness over a marginal cache hit.
+      # (`website-` keys from the old bun+Next cache are abandoned; `-bun-` starts clean.)
+      - name: Cache bun install
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.bun/install/cache
-            apps/website/.next/cache
-          key: website-${{ runner.os }}-${{ hashFiles('apps/website/bun.lock') }}-${{ github.sha }}
+          path: ~/.bun/install/cache
+          key: website-bun-${{ runner.os }}-${{ hashFiles('apps/website/bun.lock') }}
           restore-keys: |
-            website-${{ runner.os }}-${{ hashFiles('apps/website/bun.lock') }}-
-            website-${{ runner.os }}-
+            website-bun-${{ runner.os }}-
 
       # Node/npm are preinstalled on the runner; install the Vercel CLI globally. `vercel
       # build` still uses bun for the project itself (it detects apps/website/bun.lock).
