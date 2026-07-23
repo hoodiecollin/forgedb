@@ -22,15 +22,23 @@ reads your schema at runtime.
 
 ## The version interlock
 
-Every generated app bakes in an `EXPECTED_FORMAT_VERSION` derived from your migration lineage.
-On open it reads one opaque `format_version` integer from each data-dir manifest and
-**refuses a mismatch** rather than mis-decode stale bytes. A regenerated app will not silently
-read a not-yet-migrated directory, and the transformer will not apply the wrong range. The
-version is the only cross-schema handshake — it never reads column names or types to
-"self-heal." A fresh database baselines at `format_version = 1`; each recorded migration bumps
-it by one.
+Before touching data, a generated app checks one version number. Every app bakes in the format
+version its schema expects, and each data directory records the version it was written at. On a
+mismatch the app **refuses to open** rather than mis-read stale bytes. A fresh database starts
+at version 1, and each recorded migration bumps it by one.
+
+<DiveDeeper summary="why one integer is the only cross-schema handshake">
+The `format_version` is one opaque integer per data-dir manifest, derived from your migration
+lineage. It is the only cross-schema handshake between a generated app and a directory: the
+check never reads column names or types to "self-heal." That makes it fail-fast in both
+directions. A regenerated app won't silently read a not-yet-migrated directory, and the
+transformer won't apply the wrong version range to one.
+</DiveDeeper>
 
 ## Additive changes — automatic
+
+Adding a new model or a new nullable field needs no data step. Record the change, regenerate,
+restart, and the app backfills the new column on reopen. Existing rows are never rewritten.
 
 ```bash
 # 1. Edit schema.forge — add the new nullable field AT THE END of the model.
@@ -41,22 +49,35 @@ forgedb generate
 # 4. Restart. Existing rows are backfilled with defaults on first open.
 ```
 
+Two constraints. Append new fields at the **end** of the model, because columns are addressed
+by position, not by name. And a new non-null field backfills to the type's zero value, not its
+`@default` (so prefer nullable when the zero is not meaningful).
+
+<DiveDeeper summary="how reopen backfills without touching existing rows">
 On reopen, generated recovery anchors on the tombstone row count (the authoritative committed
-count) and backfills any column shorter than the anchor — the new field — with its default.
-Existing rows are never touched. **Constraints:** append new fields at the **end** of the
-model (columns are position-addressed), and prefer nullable when the type zero is not
-meaningful (new non-null fields backfill to the type zero, not `@default`).
+count) and backfills any column shorter than that anchor. The short column is the new field;
+every other column already matches the anchor, so existing rows are left untouched. This is why
+fields must be appended at the end: a mid-model insert would shift every later column off its
+anchored length.
+</DiveDeeper>
 
 ## Data-rewriting changes — hop classification
 
-For anything reopen backfill cannot do, `forgedb migrate create --auto` still **records** the
-change as a versioned hop and classifies it:
+Every other change rewrites data at rest — a type change, a dropped column or model, a
+nullable→NOT-NULL narrowing, a `&unique` add, a required field with no default. Running
+`forgedb migrate create --auto` records the change as a versioned hop and classifies it.
+Structural changes it can rewrite on its own. For changes where it can't know the new value (a
+type re-encode, or filling a new required field), it scaffolds a `transform.rs` for you to
+complete.
 
-- **`Auto`** — the differ can prove the new-row body (drop a field/model, rename, add a
-  `&unique`). No authoring needed.
-- **`Authored`** — the differ cannot know the value (a type re-encode, a nullable→NOT-NULL
-  fill, a required-add-without-default). `migrate create` writes a scaffold at
-  `migrations/<id>/transform.rs` for you to fill in and freeze.
+<DiveDeeper summary="the two hop kinds, Auto and Authored">
+`migrate create --auto` labels each hop `Auto` or `Authored`. `Auto` is a change whose new-row
+body the differ can prove on its own: dropping a field or model, a rename, adding a `&unique`.
+`Authored` is one where the value can't be derived (a type re-encode, a nullable→NOT-NULL fill,
+a required-add-without-default), so `migrate create` scaffolds `migrations/<id>/transform.rs`.
+You fill in every TODO and freeze it. `authored_transform(model, row)` receives each row as
+JSON after the automatic ops and returns it reshaped for the next version.
+</DiveDeeper>
 
 ## Lifecycle — `migrate create` → `migrate up`
 
@@ -79,22 +100,22 @@ forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
 # 5. Point the regenerated app at ./data-migrated.
 ```
 
-`migrate up` generates the transformer crate for the range, `cargo build`s it, and runs it. It
-writes a **fresh destination** and leaves the source untouched, so the original *is* your
-rollback. `--from` defaults to the version detected from the source manifests and `--to` to the
+`migrate up` builds the transformer crate for the range, compiles it, and runs it. It writes a
+**fresh destination** and leaves the source untouched, so the original is your rollback.
+`--from` defaults to the version detected from the source manifests, and `--to` to the
 lineage's current version.
 
-### How the transformer works
-
-For a `--from B --to G` range, ForgeDB emits a self-contained crate: one typed module per
-version (`vN.rs`, each carrying its own version open-guard), any frozen authored bodies
-embedded verbatim, and a `main.rs` that is a **fixed straight-line chain** of named
-`transform_vN_to_vM` hop functions — no runtime step interpreter. Each hop reads every row
-through the `vN` typed structs, applies the baked structural ops then the authored transform,
-and writes through `vM`'s `insert` (which preserves record ids, so foreign keys stay valid).
-Multi-hop ranges replay through temp dirs and publish with a single atomic rename. The crate
-depends only on your app's substrate — never on `forgedb-parser` or `forgedb-migrations`, and
-it never parses a `.forge` at runtime.
+<ImplementationDetails summary="the generated transformer crate, exactly">
+For a `--from B --to G` range, ForgeDB emits a self-contained crate at `migrations/transform/`:
+one typed module per version (`vN.rs`, each carrying its own version open-guard), any frozen
+authored bodies embedded verbatim, and a `main.rs` that is a fixed straight-line chain of named
+`transform_vN_to_vM` hop functions. There is no runtime step interpreter. Each hop reads every
+row through the `vN` typed structs, applies the baked structural ops then the authored
+transform, and writes through `vM`'s `insert`, which preserves record ids so foreign keys stay
+valid. Multi-hop ranges replay through temp dirs and publish with a single atomic rename. The
+crate depends only on your app's substrate (storage, types), never on `forgedb-parser` or
+`forgedb-migrations`, and it never parses a `.forge` at runtime.
+</ImplementationDetails>
 
 ## Per-tenant sweep
 
@@ -106,8 +127,8 @@ forgedb migrate up --tenant-root ./tenants --to 2
 # migrates ./tenants/<t> → ./tenants/<t>-migrated-v2 for every tenant data dir
 ```
 
-It builds the transformer once and runs it per tenant independently: a tenant that fails (or
-is at an unexpected version — the open-guard refuses it) is reported and skipped with its source
+It builds the transformer once and runs it per tenant independently. A tenant that fails, or is
+at an unexpected version the open-guard refuses, is reported and skipped with its source
 unchanged, and the command exits non-zero if any tenant failed.
 
 ## Limits

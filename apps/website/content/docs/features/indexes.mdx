@@ -3,14 +3,10 @@ title: "Indexes"
 description: "Generated secondary indexes and find_by_* / get_by_* probes — single scalar, foreign-key, composite, nullable, and ordered range indexes — with honest notes on the exact-match hash limit."
 purpose: "orientation"
 ---
-
-ForgeDB generates in-memory secondary indexes and typed probe methods so reads never scan
-the whole table. Each indexed field gets a `value → {id}` map maintained in lockstep with
-your writes and rebuilt on reopen. Probes are an O(1) index lookup that resolves candidates
-through the version-aware read path — not a scan.
-
-All of this is generated per model. The index maps live in generated code over the existing
-storage; no runtime engine reads your schema.
+ForgeDB generates an in-memory secondary index and typed probe methods for each
+field you mark, so a lookup by that field is an index hit, not a table scan. The
+maps are generated per model over the existing storage; nothing reads your schema
+at runtime.
 
 ## Declaring indexes
 
@@ -39,9 +35,18 @@ let snap = db.user.snapshot();
 let past = db.user.find_by_status_at(&snap, "admin");
 ```
 
-The index is maintained around the durable write boundary: added on insert, remove-old +
-add-new on update (superseding-version aware), dropped on delete. On reopen it is rebuilt
-folded into the same id-scan that rebuilds `id_to_row`, reading only the indexed columns.
+<DiveDeeper summary="how the index stays in sync across writes and reopen">
+
+The map is kept in step with the durable write boundary. An insert adds the id under
+its value, an update removes the old value and adds the new one, and a delete drops it.
+The update path is aware of the superseding version — the new committed row that
+replaces the old one — so a stale bucket never lingers. On reopen the index is rebuilt
+inside the same id-scan that rebuilds `id_to_row`, reading only the indexed columns
+rather than making a separate pass. A probe is an O(1) map hit whose candidate ids
+resolve through the version-aware read path, so it sees exactly the committed rows a
+scan would.
+
+</DiveDeeper>
 
 ## Foreign-key indexes
 
@@ -70,13 +75,23 @@ Event {
 }
 ```
 
-This generates `find_by_<a>_and_<b>` (and `_at`) keyed by a collision-free length-prefixed
-concatenation of the component keys, so `("ab","c")` and `("a","bc")` never collide.
+This generates `find_by_<a>_and_<b>` (and `_at`), keyed on the combination.
 
 <Callout type="warning" title="Composite hash indexes answer exact-match only">
 A composite index answers `a = ? AND b = ?`. It does **not** answer a prefix or a range over
 its components — that is a B-tree feature and out of scope for the hash index.
 </Callout>
+
+<ImplementationDetails summary="the collision-free composite key, exactly">
+
+The composite key is a length-prefixed concatenation of the component keys: each part is
+written with its byte length ahead of it, so `("ab","c")` and `("a","bc")` produce
+distinct keys and never collide in the shared map. The parts join in declared order into
+one opaque hash key, which is why the index answers only the full `a = ? AND b = ?`
+equality — there is no order within the key to walk for a prefix or a range. That makes
+composite exact-match by construction, not by omission.
+
+</ImplementationDetails>
 
 ## Nullable indexes
 
@@ -87,8 +102,8 @@ strings), so `find_by_<field>(None)` probes the unset bucket:
 let unassigned = db.ticket.find_by_assignee(None);
 ```
 
-The index key is null-distinct and type-tagged, so `None` and the literal string `"null"`
-cannot collide.
+The index key is null-distinct and type-tagged, so `None` never collides with the literal
+string `"null"`.
 
 ## Ordered / range indexes
 
@@ -111,15 +126,23 @@ This generates `find_by_<field>_range`:
 let top = db.post.find_by_views_range(Some(100), None, /* descending */ true, /* limit */ Some(10));
 ```
 
-The range walk is O(offset + limit) in value order. The ordered index is **parallel** to the
-exact-match hash index, not a replacement — the hash index still serves `&unique`, FK, and
-reverse-FK lookups. Eligibility is automatic by field type; there is no directive to choose
-between hash and ordered.
-
 <Callout type="note" title="Ordered-index exclusions">
 `f64` is excluded (no clean total order). **Nullable** ordered indexes are deferred. Decimal
 keys are normalized (scale-invariant), so `1.0` and `1.00` share a bucket.
 </Callout>
+
+<DiveDeeper summary="why the ordered index is separate from the hash index">
+
+A hash index keys by a tagged string, and string order is not value order, so it can serve
+equality but never a range or an ordered top-N. The ordered index is a second, parallel map
+— a `BTreeMap` keyed by the field's typed value — that sorts in value order, so
+`find_by_<field>_range` walks it in O(offset + limit). It is added alongside the hash index,
+not in place of it: the hash path still serves `&unique`, FK, and reverse-FK lookups, and the
+extra per-write B-tree insert is negligible against the fsync barrier on the write path.
+Eligibility is purely by field type; there is no directive to opt in or to choose between the
+two.
+
+</DiveDeeper>
 
 ## Limits
 

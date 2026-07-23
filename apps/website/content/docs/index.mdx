@@ -3,10 +3,9 @@ title: "What is ForgeDB"
 description: "An application-database generator — one schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec."
 purpose: "orientation"
 ---
-
 ForgeDB is an **application-database generator**. You write one declarative `.forge`
-schema and ForgeDB transpiles it into tailored Rust database code, a TypeScript SDK, a
-REST API, and an OpenAPI spec — all specialized to your schema at compile time.
+schema, and ForgeDB compiles it into Rust database code, a TypeScript SDK, a REST API,
+and an OpenAPI spec — each tailored to your schema.
 
 ```forge
 User {
@@ -35,11 +34,26 @@ relations, API routes — is generated and tailored per app.
 
 ## The generation pipeline
 
-A single schema drives every artifact:
+One schema produces four artifacts:
 
 - **`database.rs`** — a tailored Rust database over columnar storage
 - **`types.ts`** — TypeScript types + a typed client SDK
 - **`api.rs`** — a REST API with an OpenAPI document
 - **stubs/README** — a placeholder README for computed-field / component implementations you write yourself (no UI or component code is generated)
+
+<DiveDeeper summary="how one schema becomes every artifact">
+
+The schema runs through a fixed pipeline. The parser lexes it into an AST, validation
+checks it, then codegen runs one generator per artifact: `RustGenerator` → `database.rs`,
+`TypeScriptGenerator` → `types.ts`, `ApiGenerator` → `api.rs`, and `OpenApiGenerator` for
+the spec. Two opt-in generators add more surface — `WasmGenerator` for a browser
+read-replica and `TransformGenerator` for an offline migration bin.
+
+Each generator reads the same validated schema and emits code specialized to it. None of
+them ship inside your app, and none read the `.forge` at runtime — the tailored logic is
+baked in at compile time. Your generated code links only schema-agnostic substrate crates
+(storage, WAL, types), which know nothing about any specific schema.
+
+</DiveDeeper>
 
 Read on for [installation](/docs/installation/) and the [quickstart](/docs/quickstart/).

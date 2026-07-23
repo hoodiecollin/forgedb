@@ -3,12 +3,10 @@ title: "Backup & restore"
 description: "Lock-free full-snapshot backup and restore over a ForgeDB data directory, with an overview of offset-based point-in-time recovery and honest notes on what is deferred."
 purpose: "orientation"
 ---
-
-Because ForgeDB storage is append-only under a row-count anchor, a backup is a **lock-free
-byte snapshot** — no MVCC, no per-row versions, and no need to pause writes. The `forgedb`
-CLI is schema-blind: it snapshots and restores opaque bytes over the `forgedb-backup`
-substrate, reading each model/junction directory's `manifest.json` and column files, never
-your `.forge` schema.
+A backup is a lock-free byte snapshot of a data directory. Because ForgeDB storage is
+append-only, taking one never pauses writes and never captures a half-written row. The
+`forgedb` CLI is schema-blind — it copies opaque column bytes and never reads your `.forge`
+schema.
 
 ## Full snapshots
 
@@ -23,14 +21,8 @@ forgedb backup restore ./backups/base.forgebk --output ./restored
 forgedb backup list ./backups/base.forgebk --json
 ```
 
-### Why it's lock-free and torn-row-free
-
-Each model/junction directory's manifest names a **row anchor** (the appended-last file:
-`tombstones.bin` at 1 byte/row for models, the right-side column for junctions). The
-committed row count `N` is that anchor's length, and every column's committed byte length is a
-pure function of `N` plus the fixed layout. So the snapshot reads exactly the committed prefix
-of each column, and any concurrent append **past** the watermark is simply excluded — you can
-never capture a torn row. Restore is atomic (temp dir + rename).
+Restore writes into a fresh directory and refuses a non-empty target unless you pass
+`--overwrite`.
 
 <Callout type="note" title="Restore reopens a durable directory">
 A restored directory is opened by your generated app exactly like any other data directory —
@@ -38,33 +30,54 @@ recovery, the single-writer lock, and checkpointing all apply. See
 [Durability & crash safety](/docs/features/durability/).
 </Callout>
 
+<ImplementationDetails summary="why the snapshot is lock-free and can't tear a row">
+
+Each model or junction directory's manifest names a **row anchor**: the appended-last file —
+`tombstones.bin` at 1 byte per row for models, the right-side column for junctions. The
+committed row count `N` is that anchor's length, and every column's committed byte length is a
+pure function of `N` plus the fixed layout. So the snapshot reads exactly the committed prefix
+of each column, and any concurrent append past that watermark is excluded — no torn row can be
+captured. Restore stages into a temp directory and publishes with a single rename, so a crash
+mid-restore leaves no partial target.
+
+</ImplementationDetails>
+
 ## Point-in-time recovery (offset-based)
 
-Point-in-time recovery is "restore a base, then replay a globally-ordered change log up to a
-chosen point." The replay needs the generated per-model decode/apply logic, so — like
-`checkpoint` and `compact` — the **replay step runs inside your generated app**, not the CLI.
-
-Every archive header records a `base_offset`: the durable replication broker
-(`_replication.log`) end offset at snapshot time. PITR restores the base, places the retained
-broker log alongside it, then replays frames `(base_offset .. target]` through the generated
-`apply_frame` (the same path the [browser read-replica](/docs/features/browser-replica/)
-uses):
+Point-in-time recovery restores a base, then replays a globally-ordered change log up to a
+chosen point. Recovery is **offset-based** only — you recover to a broker offset, not to a
+timestamp. The replay needs the generated per-model decode/apply logic, so — like `checkpoint`
+and `compact` — the replay step runs inside your generated app, not the CLI:
 
 ```rust
 let mut db = Database::open_at("./recovered".into());
 let applied = db.recover_to(o_base, target)?;   // applies frames (o_base .. target]
 ```
 
-Replay detaches the broker so replayed mutations don't re-record, applies only frames in range
-by their opaque broker offset (never a decoded field), then `commit()`s. Recovery is
-idempotent by id — the superseding-version append means `get`/`all` still resolve one record
-per id even if a boundary frame were re-applied.
+`o_base` is the archive header's `base_offset` (from `forgedb backup list --json`); `target` is
+the offset you want to reach.
 
 <Callout type="warning" title="Retain the replication log for PITR">
 The backup archive does **not** include `_replication.log` (it is a root-level file, not a
 model directory). Retain it separately, back to the oldest base you intend to recover to — a
 base at `O_base` plus a log covering `(O_base .. target]` is the complete recovery input.
 </Callout>
+
+<DiveDeeper summary="how base_offset anchors replay, and why re-applying a frame is safe">
+
+Every archive header records a `base_offset`: the durable replication broker's
+(`_replication.log`) end offset at snapshot time. The generated mutation records a change to the
+broker only after its column commit, so every frame at or below `base_offset` is already present
+in the archive's committed bytes. Replay therefore starts strictly after it, applying only
+frames in `(base_offset .. target]` by their opaque broker offset — never a decoded field —
+through the same `apply_frame` the [browser read-replica](/docs/features/browser-replica/) uses.
+
+During replay the broker is detached so replayed mutations don't re-record into the log being
+read, then reattached. Replay is idempotent by id: the superseding-version append (each write
+appends a new record that supersedes the prior one) means `get`/`all` resolve one record per id
+even if a boundary frame is applied twice.
+
+</DiveDeeper>
 
 ## Limits
 

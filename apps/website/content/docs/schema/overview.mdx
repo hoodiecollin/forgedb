@@ -3,32 +3,37 @@ title: "Schema language"
 description: "The .forge schema language — top-level declarations, a worked example, and a map of the reference."
 purpose: "orientation"
 ---
-
 A `.forge` file is the single source of truth for a ForgeDB application. You write
 declarative models, structs, and enums; ForgeDB transpiles them at compile time into
-tailored Rust database code, a TypeScript SDK, a REST API, and an OpenAPI spec.
-The schema is a *compile-time input to generation* — never a runtime input to a generic
-engine.
+tailored Rust database code, a TypeScript SDK, a REST API, and an OpenAPI spec. Your
+schema is read once, when you generate — never by a running engine.
 
 ## Top-level declarations
 
-A `.forge` file is a sequence of top-level declarations. There are three kinds:
+A `.forge` file is a sequence of top-level declarations, which may appear in any order.
+There are three kinds:
 
-- **`model`** — an entity that becomes a stored table (declared by name, no keyword):
-  `User { ... }`. Models have persisted columns, relations, and optionally
-  model-level directives.
-- **`struct`** — a reusable, embedded, fixed-size value type: `struct Address { ... }`.
-  Struct fields must all be fixed-size (no `string`, no relations). A struct is inlined
-  into whatever model embeds it, not stored as its own table.
-- **`enum`** — a closed set of named variants: `enum OrderStatus { Pending, Paid }`.
-  Stored as a 1-byte discriminant and referenced from a field by its bare name.
+- **`model`** — an entity that becomes a stored table, declared by name with no keyword:
+  `User { ... }`. Models hold columns, relations, and optional model-level directives.
+- **`struct`** — a reusable value type embedded into a model: `struct Address { ... }`.
+  Its fields must all be fixed-size — no `string`, no relations.
+- **`enum`** — a closed set of named variants: `enum OrderStatus { Pending, Paid }`,
+  referenced from a field by its bare name.
 
-Declarations may appear in any order — an `enum` or `struct` can be declared before or
-after the models that use it.
+<DiveDeeper summary="how structs and enums are stored">
+
+A struct is inlined into whatever model embeds it, not stored as its own table — the
+embedding model lays out the struct's fields directly, which is why those fields must be
+fixed-size. An enum is stored as a 1-byte discriminant, with variants mapped to `0..N` in
+declaration order, and serialized as the variant-name string, so REST, TypeScript, and
+JSON all agree on `"Paid"`. Order is free because the parser resolves every struct and
+enum name across the whole file before wiring fields to them.
+
+</DiveDeeper>
 
 ## A worked schema
 
-Here is a small but complete blog schema exercising every top-level declaration kind:
+A small but complete blog schema exercising every top-level declaration kind:
 
 ```forge
 // A closed set of states — an enum, not a free string.

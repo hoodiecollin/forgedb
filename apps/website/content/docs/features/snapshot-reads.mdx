@@ -3,17 +3,28 @@ title: "Point-in-time reads"
 description: "Lock-free watermark snapshots and time-travel reads — generated get_at/all_at, REST ?as_of and /snapshot — with the honest note that the token is a row-count watermark, not a wall-clock instant."
 purpose: "orientation"
 ---
+ForgeDB gives you consistent point-in-time reads without per-row version metadata. A
+snapshot is a **row-count watermark** — a single cutoff into the append-only log — and
+reading "as of" that watermark returns the state as it was when the watermark was taken.
 
-ForgeDB gives you consistent point-in-time reads with **zero version machinery**. A snapshot
-is nothing more than a **row-count watermark**: because storage is append-only, reading "as of
-watermark W" means resolving the newest version of each id whose row index is below W. No
-`xmin`/`xmax`, no version chains — just a cutoff into an append-only log.
+<DiveDeeper summary="why a row-count watermark is enough">
+
+Because storage is append-only, every update and delete is a new row version appended past
+the old one, never an in-place edit. So "the state at time T" is just "every id's newest
+version whose row index is below the cutoff W." Resolving a read against W is a cutoff
+comparison, not a walk of version chains.
+
+That is what buys the simplicity: no `xmin`/`xmax`, no per-row visibility bits, no vacuum of
+dead tuples on the read path. The cost lives elsewhere — dead versions accumulate until
+in-process compaction reclaims them, and compaction renumbers rows, which is why a pinned
+watermark is only valid within one compaction epoch (see Limits).
+
+</DiveDeeper>
 
 ## Watermark snapshots in generated Rust
 
 `Database::snapshot()` captures a `DatabaseSnapshot` — one watermark per model and junction,
-taken atomically on the single writer, so it is a clean commit boundary. Reads then resolve
-against that watermark:
+taken atomically on the single writer. Reads then resolve against that watermark:
 
 ```rust
 let snap = db.snapshot();
@@ -26,10 +37,20 @@ let post = db.get_post_at(&snap, id);       // Option<Post> as of the snapshot
 let all_posts = db.all_post_at(&snap);      // Vec<Post> as of the snapshot
 ```
 
-Snapshot isolation across mutation falls out for free: `get_at` / `all_at` resolve the newest
-version *within* the watermark per id, so a snapshot captured before an update or delete still
-resolves the old value. Index probes have `_at` variants too — see
-[Indexes](/docs/features/indexes/).
+Index probes have `_at` variants too — see [Indexes](/docs/features/indexes/).
+
+<DiveDeeper summary="how snapshot isolation across mutation falls out">
+
+The capture is atomic because it routes through the one writer — no mutation can interleave
+between reading each model's row count, so the per-model watermarks form a clean commit
+boundary.
+
+Isolation then follows from newest-within-watermark resolution. `get_at` / `all_at` resolve
+the newest version of an id that still sits *below* the captured cutoff. A snapshot taken
+before an update resolves the pre-update version; one taken before a delete still resolves
+the live value, because the tombstoning version was appended after the cutoff.
+
+</DiveDeeper>
 
 ## Point-in-time reads over REST
 
@@ -47,10 +68,20 @@ curl "http://localhost:8080/snapshot"
 # → { "watermarks": { "Post": 1450, "User": 320 } }
 ```
 
-The `?as_of` branch swaps only the row source — it routes through the **same** generated
-filter/sort/paginate body as a live list, so there is no parallel handler. A non-numeric
-`as_of` is a 400. `/snapshot` is the read-side peer of `/metrics` in the unauthenticated ops
-routes (models only; junctions are deferred).
+A client reads `/snapshot`, then passes a model's watermark back as `?as_of=`. A non-numeric
+`as_of` is a 400.
+
+<DiveDeeper summary="how ?as_of reuses the live handler">
+
+The `?as_of` branch swaps only the row source — it routes through the same generated
+filter/sort/paginate body as a live list, so there is no parallel point-in-time handler to
+drift out of sync with the live one.
+
+`/snapshot` is the read-side peer of `/metrics` in the unauthenticated ops routes: opaque
+`usize` watermarks over a fixed per-schema key set. It reports models only; junctions are
+deferred.
+
+</DiveDeeper>
 
 <Callout type="warning" title="The token is a row-count watermark, not a wall-clock instant">
 `as_of` is an opaque `usize` row-count watermark, never a timestamp. There is no
@@ -65,7 +96,21 @@ separate, heavier feature. For offset-based recovery over the replication log, s
 - **Epoch-scoped.** Watermarks are valid only within a compaction epoch — an in-process
   `compact()` renumbers rows, so a client must discard pinned tokens when it detects a reopen.
 - **REST `list ?as_of` still reads full rows server-side** to filter and sort; only the wire
-  is not shrunk. The newest-version *resolution* is sub-linear (a per-id binary search over an
-  ascending version index), so it does not scan the whole watermark.
-- Single-process/single-writer capture: the snapshot is atomic *because* capture routes through
-  the one writer.
+  is not shrunk.
+- **Single-process/single-writer capture.** The snapshot is atomic because capture routes
+  through the one writer.
+
+<ImplementationDetails summary="the newest-version resolution, exactly">
+
+Newest-version resolution is sub-linear, so an `?as_of` read does not scan the whole
+watermark. Each id carries a per-id ascending list of its physical row versions (appended in
+row order, so already sorted). A point read binary-searches that list with
+`partition_point(|&r| r < watermark)`: the newest visible version is the last element below
+the cutoff (#159). If that newest version is a tombstone, the id resolves to `None` — deleted
+as of the snapshot.
+
+`all_at` reuses the same per-id search instead of two O(watermark) passes, so a deleted id is
+filtered out and an updated id appears exactly once, at its newest in-watermark version — no
+duplicate rows.
+
+</ImplementationDetails>

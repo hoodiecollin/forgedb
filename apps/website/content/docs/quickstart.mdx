@@ -3,10 +3,9 @@ title: "Quickstart"
 description: "From an empty directory to a running, type-safe database server with a typed TypeScript client — the whole init → generate → build → serve loop."
 purpose: "orientation"
 ---
-
-This guide takes you from an empty directory to a running, type-safe database server with
-a typed TypeScript client — the whole `init → generate → build → serve` loop. Every
-command and output below is from a real run against the published crates.
+This is the whole `init → generate → build → serve` loop: from an empty directory to a
+running, type-safe database server with a typed TypeScript client. Every command and output
+below is from a real run against the published crates.
 
 <Callout type="note" title="A generator, not a runtime ORM">
 You write a declarative `.forge` schema; ForgeDB transpiles it into tailored Rust database
@@ -96,11 +95,19 @@ forgedb generate api          # → generated/api.rs (+ package.json, tsconfig.j
 forgedb generate node --sdk   # → generated/types.ts  (the REST SDK; `bun --sdk` is equivalent)
 ```
 
-Or `forgedb generate all` for everything at once (adds the OpenAPI spec). Output
-goes to `./generated/` by default (`--output` to change it). The Rust generator emits one
-tailored `database.rs` per schema — typed structs, columnar storage, indexes, relation
-traversal, validation, and a crash-safe write path — none of it reflects over your schema
-at runtime.
+Or `forgedb generate all` for everything at once (adds the OpenAPI spec). Output goes to
+`./generated/` by default (`--output` to change it). Every generator tailors its code to
+your specific models; nothing reads the schema at run time.
+
+<DiveDeeper summary="what's inside the generated database.rs">
+
+The Rust generator emits one `database.rs` per schema: typed structs, columnar storage,
+indexes, relation traversal, validation, and a crash-safe write path. All of it is produced
+at compile time against your models, so there is no generic engine reflecting over the
+schema while the app runs. That is the invariant the project is built on: the schema feeds
+generation, not a runtime query engine.
+
+</DiveDeeper>
 
 ## 4. Build
 
@@ -115,8 +122,7 @@ they resolve from crates.io. See the substrate version matrix in
 
 ## 5. Run the server
 
-The generated `main.rs` is a 12-factor axum server configured entirely from the
-environment:
+The generated `main.rs` is an axum server configured entirely from the environment:
 
 ```bash
 FORGEDB_PORT=3000 FORGEDB_DATA=./data ./target/debug/myblog
@@ -133,14 +139,23 @@ Key environment variables:
 | `FORGEDB_TENANT` | *(unset)* | tenant this process serves |
 | `FORGEDB_LOG_FORMAT` | *(text)* | `json` for machine-parseable log lines |
 
-The server exposes **operational routes** that need no auth — designed for load-balancer
-and Kubernetes probes:
+The server also exposes **operational routes** that need no auth:
 
 ```bash
 curl localhost:3000/health    # {"status":"ok"}      — liveness (never touches the DB)
 curl localhost:3000/ready     # {"status":"ready"}   — acquires a read lock
 curl localhost:3000/metrics   # {"model_count":3,"rows_per_model":{"Post":0,"Tag":0,"User":0},"total_rows":0}
 ```
+
+<DiveDeeper summary="liveness vs readiness, and what each probe checks">
+
+The three routes map to standard load-balancer and Kubernetes probes. `/health` is
+liveness: it returns `ok` without opening the database, so a live-but-busy process still
+reports healthy. `/ready` is readiness: it acquires a read lock, so it reports ready only
+once the data directory is actually openable. `/metrics` returns per-model row counts for
+scraping. None require auth because none expose row data, only status and counts.
+
+</DiveDeeper>
 
 ## 6. Use the REST API
 

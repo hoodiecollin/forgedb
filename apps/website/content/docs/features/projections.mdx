@@ -3,11 +3,7 @@ title: "Column projections"
 description: "Declare @projection(name: cols) to generate a narrow <Model>Card struct and reads that materialize only the selected columns, plus a REST ?projection=<name> closed set."
 purpose: "orientation"
 ---
-
-Because storage is columnar, ForgeDB can materialize **just the columns you ask for** instead
-of the whole record. A model-level `@projection` directive generates a tailored struct plus
-narrow read methods that touch only the primary key and the selected columns — never the full
-row.
+ForgeDB stores each column separately, so a read can pull back just the columns you name instead of the whole record. A model-level `@projection` directive generates a narrow struct plus read methods that touch only the primary key and the selected columns.
 
 ## Declaring a projection
 
@@ -23,14 +19,11 @@ Post {
 }
 ```
 
-This generates a `PostCard` struct (PK + `title` + `slug`) and narrow read methods. Only
-scalar and foreign-key fields may be projected — relation (virtual collection) fields are
-rejected at compile time.
+This generates a `PostCard` struct — the PK plus `title` and `slug` — and narrow read methods. Only scalar and foreign-key fields can be projected; relation (virtual collection) fields are rejected at compile time.
 
 ## Generated narrow reads
 
-The projection reads materialize only the projected columns, and have live and snapshot
-(`_at`) forms:
+The narrow reads come in live and snapshot (`_at`) forms, and materialize only the projected columns:
 
 ```rust
 let card = db.post.get_card(id);          // Option<PostCard> — reads only PK + title + slug
@@ -41,17 +34,15 @@ let snap = db.post.snapshot();
 let past = db.post.get_card_at(&snap, id);
 ```
 
-<Callout type="note" title="One decode path, no drift">
-The projection decoder and the full-record `read_at` both delegate to the same generated
-per-field decode body — there is no second read path to drift, and full-record output is
-unchanged. The projection just decodes fewer columns.
-</Callout>
+<DiveDeeper summary="why there's only one decode path">
+
+The projection decoder and the full-record read both delegate to the same generated per-field decode body — the projection simply stops after the columns it was asked for. There is no separate narrow read path that could drift from the full read, and adding a projection leaves full-record output unchanged.
+
+</DiveDeeper>
 
 ## Projections over REST
 
-A projection is exposed to the REST API as a **generated closed set** — named declared
-projections only, never an ad-hoc `?fields=` column list, so the wire never carries a runtime
-column list:
+A projection is exposed over REST as a closed set of declared names: `?projection=<name>`, never an ad-hoc `?fields=` column list.
 
 ```bash
 # Get one record, projected:
@@ -61,16 +52,18 @@ curl "http://localhost:8080/api/post/<id>?projection=card"
 curl "http://localhost:8080/api/post?projection=card"
 ```
 
-An unknown projection name is a 400; omitting `?projection` returns the full record. The
-TypeScript SDK gets a matching `PostCard` type plus `getPostCard` / `listPostCard`.
+An unknown projection name is a 400; omitting `?projection` returns the full record. The TypeScript SDK gets a matching `PostCard` type plus `getPostCard` / `listPostCard`.
+
+<DiveDeeper summary="why the projection set is closed, not ad-hoc">
+
+An ad-hoc `?fields=title,slug` would put a runtime column list on the wire and make the server assemble an arbitrary response shape per request. ForgeDB keeps the response shape a compile-time decision instead: each declared projection generates its own typed struct and handler, so the server only emits shapes it was generated to emit. The cost is flexibility — you select from the projections you declared, not an arbitrary column subset per call — in exchange for a typed surface end to end, from the Rust struct through the REST name to the TS type.
+
+</DiveDeeper>
 
 ## Limits
 
-- **Declared projections only.** No ad-hoc `?fields=` selection — the projected column set is
-  a closed, compile-time set per model.
+- **Declared projections only.** No ad-hoc `?fields=` selection — the projected column set is a closed, compile-time set per model.
 - **Relation fields cannot be projected** (rejected at compile time).
-- REST `list` projection shrinks only the **wire** — the server still reads full rows to
-  filter and sort, so the column-skip win is on the point-`get` and browser-replica paths (a
-  narrow read faults in only the projected columns). See
+- REST `list` projection shrinks only the **wire** — the server still reads full rows to filter and sort, so the column-skip win is on the point-`get` and browser-replica paths (a narrow read faults in only the projected columns). See
   [Browser read-replica](/docs/features/browser-replica/) for the fault-in behavior and
   [Point-in-time reads](/docs/features/snapshot-reads/) for the `_at` snapshot forms.
