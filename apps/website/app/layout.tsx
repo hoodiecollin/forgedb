@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { SiteHeader } from "@/components/site-header";
 import { SiteFooter } from "@/components/site-footer";
 import { CommandMenu } from "@/components/docs/search";
+import { DevMount } from "./dev-mount";
 
 // Brand typography (docs/brand): Space Grotesk for display/wordmark/body,
 // JetBrains Mono for code, CLI, and labels.
@@ -56,6 +57,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <SiteFooter />
           </div>
           <CommandMenu />
+          <DevMount />
         </Providers>
         {/*
           Vercel Web Analytics — TEMPORARY launch-week calibration baseline (#194).

@@ -9,6 +9,7 @@
 		"build": "next build",
 		"start": "next start --port 3100",
 		"typecheck": "tsc --noEmit",
+		"rewrite:watch": "bun scripts/rewrite-watch.ts",
 		"search-index": "bun run scripts/build-search-index.ts",
 		"clean": "rm -rf .next out public/search-index.json",
 		"ui:add": "shadcn@latest add"
