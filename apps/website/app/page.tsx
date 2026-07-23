@@ -176,7 +176,7 @@ export default function Home() {
             <span className="text-primary">generator</span>
           </h1>
           <p className="mx-auto mt-6 max-w-2xl text-balance text-lg text-muted-foreground sm:text-xl">
-            Write one <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[0.9em]">.forge</code>{" "}
+            Write one <code>.forge</code>{" "}
             schema. ForgeDB compiles it into a tailored Rust database, a TypeScript SDK, a REST
             API, and an OpenAPI spec — specialized to your schema at compile time. Not a runtime ORM.
           </p>

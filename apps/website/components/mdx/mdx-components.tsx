@@ -123,22 +123,12 @@ export const mdxComponents: MDXComponents = {
       {...props}
     />
   ),
-  code: ({ className, ...props }) => (
-    <code
-      className={cn(
-        // Inline code only; block code is styled by rehype-pretty-code inside <Pre>.
-        // `py-px` hugs the glyphs so the chip doesn't tower over the line. We let
-        // prose chips wrap normally (nowrap would overflow long multi-word spans on
-        // narrow screens); table chips get `whitespace-nowrap` on the <td> instead,
-        // where the overflow-x-auto wrapper is a safe fallback and narrow columns
-        // otherwise break flags like `--verbose` mid-token at the hyphen.
-        "rounded border border-border/40 bg-muted/60 px-1 py-px font-mono text-[0.85em] text-foreground",
-        "[pre_&]:border-0 [pre_&]:bg-transparent [pre_&]:p-0 [pre_&]:text-inherit",
-        className,
-      )}
-      {...props}
-    />
-  ),
+  // Inline `<code>` is styled globally (`code:not(pre code)` in globals.css) so MDX,
+  // callouts, and TSX chips all match — no per-component override needed here. Table
+  // cells (<td> above) add `whitespace-nowrap` + `text-xs`: prose chips wrap normally
+  // (nowrap would overflow long multi-word spans on narrow screens), but narrow table
+  // columns otherwise break flags like `--verbose` mid-token at the hyphen, and the
+  // overflow-x-auto wrapper is a safe fallback there.
   pre: Pre,
   figure: ({ className, ...props }) => <figure className={cn("my-4", className)} {...props} />,
   figcaption: ({ className, ...props }) => (

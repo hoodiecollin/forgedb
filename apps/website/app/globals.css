@@ -166,6 +166,17 @@
   html {
     @apply font-sans;
     }
+
+  /*
+   * Canonical inline-code chip. Targets every inline `code` — MDX prose, callouts,
+   * and hand-written TSX — in ONE place so they never drift. Fenced blocks
+   * (`pre > code`) are excluded; those are styled by rehype-pretty-code inside <Pre>.
+   * Kept tight (`py-px`) so chips hug the line instead of towering over it. Table
+   * cells add `whitespace-nowrap` + `text-xs` on top (see the <td> in mdx-components).
+   */
+  code:not(pre code) {
+    @apply rounded border border-border/40 bg-muted/60 px-1 py-px font-mono text-[0.85em] text-foreground;
+    }
 }
 
 /*

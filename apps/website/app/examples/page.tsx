@@ -16,11 +16,10 @@ export default function ExamplesPage() {
       <header className="mb-10 max-w-2xl">
         <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Example schemas</h1>
         <p className="mt-3 text-lg text-muted-foreground">
-          {catalog.length} realistic <code className="rounded bg-muted px-1 font-mono text-[0.9em]">.forge</code>{" "}
+          {catalog.length} realistic <code>.forge</code>{" "}
           applications exercising the schema language across many domains. Some are adapted from
           well-known open-source apps and classic sample databases; others are synthetic. Every one
-          passes <code className="rounded bg-muted px-1 font-mono text-[0.9em]">validate --strict</code> and{" "}
-          <code className="rounded bg-muted px-1 font-mono text-[0.9em]">generate all</code>.
+          passes <code>validate --strict</code> and <code>generate all</code>.
         </p>
       </header>
 
