@@ -4,3 +4,9 @@
 
 # Vercel CLI working dir (created by `vercel link` / `vercel build`; holds pulled env).
 .vercel
+
+# Local-only in-browser prose-rewrite dev tool. The POST route handler is
+# incompatible with `output: "export"`, so it must never reach a deploy build;
+# the queue is scratch state. Both stay on local working copies only.
+app/api/dev-rewrite/
+.rewrite-queue/

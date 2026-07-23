@@ -8,7 +8,12 @@ import type { NextConfig } from "next";
  * at build time; search runs client-side over a prebuilt static index.
  */
 const nextConfig: NextConfig = {
-  output: "export",
+  // Static export is a *deploy* concern (no-server hosting). It also forbids
+  // dynamic route handlers even under `next dev`, which the local-only prose
+  // rewrite tool needs — so scope it to production builds. `next dev` runs as a
+  // normal Node server; `next build` (NODE_ENV=production, incl. CI/Vercel)
+  // still exports to ./out unchanged.
+  output: process.env.NODE_ENV === "production" ? "export" : undefined,
   images: { unoptimized: true },
   devIndicators: false,
   // Trailing slashes keep the static export's directory-per-route URLs stable
