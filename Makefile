@@ -15,6 +15,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         website-install website website-build website-typecheck website-secrets \
+        website-rewrite-watch \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
@@ -120,13 +121,22 @@ website-install:
 website:
 	cd $(WEBSITE) && $(BUN) run dev
 
-## Build the website to a static export (apps/website/out; host-agnostic).
+## Build the website to a static export (apps/website/out; host-agnostic). Wrapped
+## so a LOCAL build stashes the gitignored dev rewrite route (incompatible with
+## output: export) and restores it after — a no-op on CI where the route is absent.
 website-build:
-	cd $(WEBSITE) && $(BUN) run build
+	cd $(WEBSITE) && $(BUN) scripts/website-build.ts
 
 ## Typecheck the website.
 website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
+
+## LOCAL DEV: wake watcher for the in-browser prose-rewrite tool. Blocks until the
+## docs overlay posts a rewrite request, then exits so Claude Code can draft the
+## proposal (which the overlay picks up + you accept/reject). Run alongside `make
+## website`. See apps/website/content/STYLE.md for the tone guide it honors.
+website-rewrite-watch:
+	cd $(WEBSITE) && $(BUN) run rewrite:watch
 
 ## Push deploy secrets from 1Password ("Private/forgedb.dev deploy") into the repo's
 ## GitHub Actions secrets. Each value pipes straight from `op` to `gh` — it is never
