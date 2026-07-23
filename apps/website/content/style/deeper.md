@@ -41,6 +41,23 @@ the cost is acceptable.
 - One concrete number or identifier where it sharpens the point, not a spec sheet of them.
 - Still subject to the spine: em-dash discipline, emphasis budget, no worn refrains.
 
+## How to emit it in MDX
+
+A Tier-2 block is the `<DiveDeeper>` component. Put it in the body right after the terse
+claim it expands; the reader opens it in place. An optional `summary` gives the one-line
+hint shown while it's collapsed.
+
+```mdx
+Writes are crash-safe — killing the process mid-write never loses a saved row.
+
+<DiveDeeper summary="how the ordering guarantees it">
+The guarantee comes from ordering. Each model has a write-ahead log…
+</DiveDeeper>
+```
+
+Blank lines around the inner content so the Markdown inside renders. Keep one idea per
+block; if a second, deeper thing wants telling, that's a separate `<ImplementationDetails>`.
+
 ## Example (terse claim → deeper expansion)
 
 **Terse body said:** "Writes are crash-safe; killing the process mid-write never loses a

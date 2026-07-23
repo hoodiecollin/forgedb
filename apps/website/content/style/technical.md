@@ -57,6 +57,22 @@ Depth is not license to drift.
 - It should read like the best of `docs/ARCHITECTURE.md`: complete, exact, and trusting the
   reader to keep up — without the worn refrains or the em-dash pile-ups.
 
+## How to emit it in MDX
+
+A Tier-3 block is the `<ImplementationDetails>` component — same shape as `<DiveDeeper>`,
+placed after the deeper block it goes beyond. It collapses by default and only exists when
+the earn-its-place gate above is met.
+
+```mdx
+<ImplementationDetails summary="the recovery invariant, exactly">
+Recovery runs per model in `recover_from_wal` on `Database::open_at`…
+</ImplementationDetails>
+```
+
+(A Build-C detailed-native body is *not* wrapped in this component — it's the page's whole
+body in the detailed voice, swapped in when the reader's preference is "detailed". The
+`<ImplementationDetails>` tag is only for the optional Tier-3 block on a Build-B page.)
+
 ## Example (Implementation details block)
 
 **Deeper said:** recovery "trims the partial tail back to the last consistent row and
