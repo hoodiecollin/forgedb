@@ -116,7 +116,10 @@ export const mdxComponents: MDXComponents = {
   ),
   td: ({ className, ...props }) => (
     <td
-      className={cn("border-b border-border/40 px-4 py-2.5 align-top [&_code]:text-xs", className)}
+      className={cn(
+        "border-b border-border/40 px-4 py-2.5 align-top [&_code]:whitespace-nowrap [&_code]:text-xs",
+        className,
+      )}
       {...props}
     />
   ),
@@ -124,7 +127,12 @@ export const mdxComponents: MDXComponents = {
     <code
       className={cn(
         // Inline code only; block code is styled by rehype-pretty-code inside <Pre>.
-        "rounded border border-border/50 bg-muted/60 px-1.5 py-0.5 font-mono text-[0.85em] text-foreground",
+        // `py-px` hugs the glyphs so the chip doesn't tower over the line. We let
+        // prose chips wrap normally (nowrap would overflow long multi-word spans on
+        // narrow screens); table chips get `whitespace-nowrap` on the <td> instead,
+        // where the overflow-x-auto wrapper is a safe fallback and narrow columns
+        // otherwise break flags like `--verbose` mid-token at the hyphen.
+        "rounded border border-border/40 bg-muted/60 px-1 py-px font-mono text-[0.85em] text-foreground",
         "[pre_&]:border-0 [pre_&]:bg-transparent [pre_&]:p-0 [pre_&]:text-inherit",
         className,
       )}
