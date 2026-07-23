@@ -9,8 +9,9 @@ export type TargetKind = "section" | "block" | "span";
 
 /**
  * Which register the target block is written in — picks the style register file
- * (see rewrite-style.ts). Until the tiered-MDX vocabulary lands, every rendered
- * block is the page body, so this defaults to `terse`.
+ * (see rewrite-style.ts). The `<DiveDeeper>`/`<ImplementationDetails>` vocabulary
+ * exists (data-tier on the rendered block), but the overlay doesn't yet read it,
+ * so requests still default to `terse` until that detection is wired.
  */
 export type Tier = "terse" | "deeper" | "technical";
 
@@ -36,7 +37,7 @@ export interface RewriteTarget {
   selectedText: string;
   /** Rendered text of the target, for context + showing the user what they picked. */
   renderedText: string;
-  /** Register of this block; defaults to `terse` until tiered blocks exist. */
+  /** Register of this block; defaults to `terse` until the overlay reads data-tier. */
   tier?: Tier;
 }
 

@@ -11,6 +11,7 @@ import { rehypePrettyCodeOptions } from "@/lib/rehype-code";
 import { remarkSourceMap } from "@/lib/dev/remark-source-map";
 import { hashContent } from "@/lib/dev/rewrite-hash";
 import { mdxComponents } from "@/components/mdx/mdx-components";
+import { DetailToggle } from "@/components/docs/detail-toggle";
 import { Toc } from "@/components/docs/toc";
 import { DocsPager } from "@/components/docs/pager";
 import { DocsBreadcrumb } from "@/components/docs/breadcrumb";
@@ -47,6 +48,9 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
 
   const toc = extractToc(doc.content);
   const meta = docMeta(doc.href);
+  // Only surface the verbosity control on pages that actually have deeper blocks
+  // to expand — otherwise it would toggle nothing.
+  const hasTiers = /<(DiveDeeper|ImplementationDetails)\b/.test(doc.content);
 
   return (
     <div className="flex gap-8">
@@ -58,6 +62,11 @@ export default async function DocPage({ params }: { params: Promise<Params> }) {
           </h1>
           {doc.frontmatter.description ? (
             <p className="mt-2 text-lg text-muted-foreground">{doc.frontmatter.description}</p>
+          ) : null}
+          {hasTiers ? (
+            <div className="mt-4 flex justify-end">
+              <DetailToggle />
+            </div>
           ) : null}
         </header>
 

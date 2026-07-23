@@ -4,6 +4,7 @@ import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { Pre } from "@/components/mdx/pre";
 import { Callout } from "@/components/mdx/callout";
+import { DiveDeeper, ImplementationDetails } from "@/components/mdx/tier";
 
 function anchor(id?: string) {
   return id ? (
@@ -142,4 +143,6 @@ export const mdxComponents: MDXComponents = {
   ),
   Callout,
   Compare,
+  DiveDeeper,
+  ImplementationDetails,
 };
