@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
+import { Analytics } from "@vercel/analytics/next";
 import { Space_Grotesk, JetBrains_Mono } from "next/font/google";
 import { cn } from "@/lib/utils";
 import { SiteHeader } from "@/components/site-header";
@@ -56,6 +57,13 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           </div>
           <CommandMenu />
         </Providers>
+        {/*
+          Vercel Web Analytics — TEMPORARY launch-week calibration baseline (#194).
+          Runs alongside the PostHog `/relay` proxy so we can cross-check pageview
+          totals and confirm the reverse proxy is capturing correctly, then it is
+          removed. Inert off-Vercel / in local dev.
+        */}
+        <Analytics />
       </body>
     </html>
   );
