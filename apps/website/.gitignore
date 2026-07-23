@@ -1,0 +1,6 @@
+# Local env overrides — real keys live in 1Password / GitHub Actions secrets, never here.
+# `.env.example` (committed) documents the expected vars.
+.env*.local
+
+# Vercel CLI working dir (created by `vercel link` / `vercel build`; holds pulled env).
+.vercel
