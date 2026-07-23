@@ -175,7 +175,7 @@
    * cells add `whitespace-nowrap` + `text-xs` on top (see the <td> in mdx-components).
    */
   code:not(pre code) {
-    @apply rounded border border-border/40 bg-muted/60 px-1 py-px font-mono text-[0.85em] text-foreground;
+    @apply rounded bg-muted/60 px-1 py-px font-mono text-[0.85em] text-foreground;
     }
 }
 
