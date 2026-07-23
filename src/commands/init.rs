@@ -306,7 +306,7 @@ fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticat
     fs::write(main_rs_path, main_rs)?;
 
     ui::step("🦀", "Created Rust project files");
-    ui::info("Run 'forgedb generate --rust' to generate the database code");
+    ui::info("Run 'forgedb generate rust' to generate the database code");
     Ok(())
 }
 
