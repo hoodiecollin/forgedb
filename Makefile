@@ -14,7 +14,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
-        website-install website website-build website-typecheck \
+        website-install website website-build website-typecheck website-secrets \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
@@ -127,6 +127,18 @@ website-build:
 ## Typecheck the website.
 website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
+
+## Push deploy secrets from 1Password ("Private/forgedb.dev deploy") into the repo's
+## GitHub Actions secrets. Each value pipes straight from `op` to `gh` — it is never
+## printed, echoed, or stored in a shell variable (this is why it's a direct shell pipe,
+## not a TS wrapper: keeping the secret off any intermediate is the safer default here).
+## Run once the 1Password item's values are filled in (+ `vercel link` for the two IDs).
+website-secrets:
+	@op read "op://Private/forgedb.dev deploy/posthog project key" | gh secret set NEXT_PUBLIC_POSTHOG_KEY
+	@op read "op://Private/forgedb.dev deploy/vercel token"        | gh secret set VERCEL_TOKEN
+	@op read "op://Private/forgedb.dev deploy/vercel org id"       | gh secret set VERCEL_ORG_ID
+	@op read "op://Private/forgedb.dev deploy/vercel project id"   | gh secret set VERCEL_PROJECT_ID
+	@echo "✓ Pushed NEXT_PUBLIC_POSTHOG_KEY, VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID to GitHub Actions"
 
 ## Install the VS Code extension's JS dependencies.
 extension-install:
