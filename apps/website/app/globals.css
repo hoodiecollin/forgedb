@@ -203,7 +203,10 @@
     background-color: color-mix(in oklch, var(--primary) 16%, transparent);
     padding: 0.1rem 0.15rem;
   }
-  [data-line] {
+  /* Block-code gutter. Scoped to `pre` — rehype-pretty-code also wraps INLINE code
+   * in a `<span data-line>`, so an unscoped rule leaks this 1.15rem horizontal
+   * padding onto every inline chip (a `+` chip becomes a ~52px-wide pill). */
+  pre [data-line] {
     padding: 0 1.15rem;
   }
 }
