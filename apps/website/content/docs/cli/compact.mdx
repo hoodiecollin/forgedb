@@ -3,17 +3,16 @@ title: "forgedb compact"
 description: "Inspect database statistics and get maintenance recommendations. Offline compaction is deprecated."
 purpose: "reference"
 ---
-
-Database maintenance and inspection. The read-only `stats` and `analyze` subcommands work
-over a data directory; the mutating `run` and `vacuum` subcommands are **deprecated and exit
-non-zero**.
+Database maintenance and inspection. The read-only `stats` and `analyze` subcommands
+work over a data directory; the mutating `run` and `vacuum` subcommands are **deprecated
+and exit non-zero**.
 
 <Callout type="warning" title="Offline compaction is removed">
 `compact run` and `compact vacuum` mutate nothing and exit non-zero (code 6). Their
-tombstone-based algorithm is unsafe against the generated mutation surface — it reclaims
+tombstone-based algorithm is unsafe against the generated mutation surface: it reclaims
 nothing from updates and can **resurrect deleted rows**. Generated databases compact
-automatically in-process under the single-writer lock, or you can call `Database::compact()`
-from your running app. That path is keep-set-based and never resurrects deletes.
+automatically in-process under the single-writer lock, or call `Database::compact()` from
+your running app. That path is keep-set-based and never resurrects deletes.
 </Callout>
 
 ## Subcommands
@@ -50,7 +49,7 @@ forgedb compact analyze [--data-dir <DIR>] [--json]
 
 ## Examples
 
-Show database-wide statistics as JSON:
+Database-wide statistics as JSON:
 
 ```bash
 forgedb compact stats --data-dir ./data --json

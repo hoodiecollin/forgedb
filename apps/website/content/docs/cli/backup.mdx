@@ -3,10 +3,10 @@ title: "forgedb backup"
 description: "Create, restore, and inspect lock-free snapshot archives of a ForgeDB data directory."
 purpose: "reference"
 ---
-
 Snapshot backup and restore for a database directory. `create` takes a lock-free full
-snapshot (or an incremental byte-tail delta); `restore` materializes an archive (or a base +
-incremental chain) atomically; `list` inspects an archive without restoring it.
+snapshot, or an incremental byte-tail delta with `--incremental`. `restore` materializes an
+archive, or a base + incremental chain, atomically. `list` inspects an archive without
+restoring it.
 
 ## Subcommands
 

@@ -3,7 +3,6 @@ title: "Installation"
 description: "Install the forgedb CLI via cargo, prebuilt binaries, or from source — plus the Rust toolchain requirement and the substrate crate version matrix."
 purpose: "reference"
 ---
-
 ForgeDB ships as a single CLI binary, `forgedb`. Pick whichever install method fits —
 they all give you the same tool.
 
@@ -55,7 +54,7 @@ real tag push. If a prebuilt asset isn't available for your platform yet, use
 
 ## 3. `cargo install --git` (latest from source)
 
-To track the tip of `main` (or before a release is cut):
+To track the tip of `main`, or before a release is cut:
 
 ```bash
 cargo install --git https://github.com/hoodiecollin/forgedb forgedb
@@ -75,9 +74,9 @@ cargo install --path .         # or install it onto your PATH
 ## Substrate crate versions
 
 A ForgeDB-generated app is **not** dependency-free: its generated Rust code links a set of
-small, **schema-agnostic** runtime crates published on crates.io (the "substrate").
-`forgedb init` pins these in the generated `Cargo.toml`, so you normally don't manage them
-by hand — this table is the reference for what a given CLI generates against.
+small, schema-agnostic runtime crates published on crates.io (the "substrate").
+`forgedb init` pins these in the generated `Cargo.toml`, so you don't manage them by hand.
+This table records what a given CLI generates against.
 
 | Crate | Version | Role |
 |---|---|---|
@@ -91,10 +90,9 @@ by hand — this table is the reference for what a given CLI generates against.
 | `forgedb-txn` | `0.1` | MVCC Tier-2 commit sequencer (LSN + conflict detection) |
 | `forgedb-coordinator` | `0.2` | MVCC Tier-3 multi-process write coordinator |
 
-These are schema-agnostic substrate: they know nothing about any specific schema. All
-schema-tailored logic (types, tables, queries, filters, relations, API routes) is
-*generated* per app at compile time — never reconstructed at runtime by a generic engine.
-See [core concepts](/docs/concepts/) for the identity invariant.
+These crates know nothing about any specific schema. Every schema-tailored surface —
+types, tables, queries, filters, relations, API routes — is generated per app at compile
+time. See [core concepts](/docs/concepts/) for the identity invariant.
 
 <Callout type="note" title="Version lines are independent">
 Version pins are intentionally **not** normalized across the substrate — each crate has an

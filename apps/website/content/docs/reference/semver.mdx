@@ -3,9 +3,7 @@ title: "Versioning & stability"
 description: "ForgeDB's compatibility policy across four surfaces — schema language, substrate ABI, the CLI, and the compiler-internals carve-out — and what 1.0 will mean."
 purpose: "reference"
 ---
-
-ForgeDB commits to stability across four distinct surfaces, each with its own version line
-and its own rules.
+ForgeDB commits to stability across four surfaces, each with its own version line and its own rules.
 
 <Callout type="warning" title="Current status: pre-1.0">
 Everything below describes the policy that takes effect at **1.0**. While ForgeDB is
@@ -33,14 +31,14 @@ request/response shapes for a given schema stay backward compatible within `1.x`
 modifiers, or relation kinds; new nullable fields appended to a model; new API endpoints or
 optional query parameters; new fields *added* to a response object.
 
-**Breaking (major bump only):** removing/renaming a type, directive, modifier, or field;
+**Breaking (major bump only):** removing or renaming a type, directive, modifier, or field;
 changing the meaning or default of a directive; changing a field's type; changing an
 existing route, method, or request/response shape; tightening validation so a previously
 valid schema is rejected.
 
 This is the same additive-vs-breaking boundary the [migration](/docs/features/migrations/)
-gate enforces at the *data* level — the schema-language policy and the data-migration
-policy agree on what "breaking" means.
+gate enforces at the *data* level. The schema-language policy and the data-migration policy
+agree on what "breaking" means.
 
 ## 2. Substrate ABI
 
@@ -55,8 +53,8 @@ are intentionally not normalized.
 - **On-disk format is part of the ABI:** a change to the columnar layout, WAL framing, or
   manifest that a prior binary cannot read is breaking and bumps the owning crate's major,
   with a documented migration path.
-- The CLI that *generates* against a substrate version and the substrate move together —
-  `forgedb init` always pins versions the current CLI is known-compatible with.
+- The CLI that *generates* against a substrate version moves with the substrate — `forgedb
+  init` always pins versions the current CLI is known-compatible with.
 
 At **1.0**, each substrate crate at `1.x` guarantees ABI + format compatibility within its
 major.

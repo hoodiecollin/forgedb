@@ -3,7 +3,6 @@ title: "Scalar types"
 description: "Every .forge scalar type with its Rust and TypeScript mapping, storage layout, and index/filter/sort behavior."
 purpose: "reference"
 ---
-
 These are the primitive types a field can hold. For composite types (relations, arrays,
 inline structs) see [relations](/docs/schema/relations/); for closed value sets see
 [enums](/docs/schema/enums/).
@@ -33,24 +32,23 @@ variable-length UTF-8 text. Likewise the `~` auto-update modifier does not exist
 ## Integers, floats, and booleans
 
 `u32`/`u64`/`i32`/`i64` are unsigned/signed integers; `f64` is a 64-bit float; `bool` is
-`true`/`false`. All ride fixed-width columns and are fully indexable, filterable, and
-sortable.
+`true`/`false`. All ride fixed-width columns and are indexable, filterable, and sortable.
 
-`f64` is filterable and sortable, but does **not** yet get an ordered/range index (there
-is no clean total order for floats — `NaN` breaks `Ord`). Equality filters and sorting
-still work.
+`f64` is filterable and sortable, but does **not** yet get an ordered/range index: floats
+have no clean total order, since `NaN` breaks `Ord`. Equality filters and sorting still
+work.
 
 ## `string`
 
-Variable-length UTF-8 text, stored on the variable-length column. Fully indexable,
-filterable, and sortable. A hash index on a string is **exact-match only** (see
+Variable-length UTF-8 text, stored on the variable-length column. Indexable, filterable,
+and sortable. A hash index on a string is **exact-match only** (see
 [indexes](/docs/schema/indexes-and-projections/)).
 
 ## `char(N)`
 
-A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Because it is
-fixed-width, it can live inside a [struct](/docs/schema/relations/#inline-structs) — where
-`string` cannot. Requires the parenthesized size: `code: char(8)`.
+A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Being fixed-width, it can
+live inside a [struct](/docs/schema/relations/#inline-structs) — where `string` cannot.
+Requires the parenthesized size: `code: char(8)`.
 
 ## `uuid`
 
@@ -77,7 +75,7 @@ JSON has no total order the generated closed-set matcher can key on, so `^`/`&`,
 
 Exact fixed-point (`rust_decimal::Decimal`) for money and quantities where `f64` would
 drift. It rides the fixed **16-byte column** (like `uuid`) and serializes to and from JSON
-as a **string** (precision-preserving — TS types it `string`).
+as a string (precision-preserving — TS types it `string`).
 
 Because `Decimal` is `Ord` + `Hash`, `decimal` **is** filterable, sortable, and indexable.
 The index key is normalized (`.normalize()`), so scale-only differences like `1.0` and

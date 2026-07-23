@@ -3,15 +3,14 @@ title: "Indexes & projections"
 description: "Single-field ^ indexes, composite @index, @projection partial reads, and the &unique constraint in .forge."
 purpose: "reference"
 ---
-
-ForgeDB builds in-memory secondary indexes from your schema so lookups and filters do not
-scan every row. This page covers the four index/projection surfaces.
+ForgeDB builds in-memory secondary indexes from your schema so lookups and filters skip a
+full-table scan. This page covers the four index and projection surfaces.
 
 ## Single-field index — `^`
 
-The `^` [modifier](/docs/schema/modifiers/) builds a secondary index on a field. Each
-indexed scalar gets a `find_by_<field>` / `get_by_<field>` probe that resolves candidates
-in O(1) instead of scanning, and index-served REST filters.
+The `^` [modifier](/docs/schema/modifiers/) indexes a field. Each indexed scalar gets a
+`find_by_<field>` / `get_by_<field>` probe that resolves candidates in O(1) instead of
+scanning, plus index-served REST filters.
 
 ```forge
 Post {
@@ -28,10 +27,10 @@ answer prefix or range queries (`views > 100`, `slug LIKE ...`).
 
 ### Ordered indexes by type
 
-Ordered/range queries are served automatically for **non-nullable** indexed fields of an
-`Ord`-key type — `u32`, `u64`, `i32`, `i64`, `timestamp`, and `decimal`. For these, a
-parallel ordered index backs a `find_by_<field>_range(min, max, descending, limit)` method
-that walks values in order (range and top-N in O(offset + limit)).
+Ordered and range queries are served automatically for **non-nullable** indexed fields of an
+`Ord`-key type — `u32`, `u64`, `i32`, `i64`, `timestamp`, and `decimal`. These get a
+parallel ordered index backing `find_by_<field>_range(min, max, descending, limit)`, which
+walks values in order (range and top-N in O(offset + limit)).
 
 ```forge
 Post {
@@ -41,13 +40,13 @@ Post {
 ```
 
 `f64` (no clean total order), nullable fields, and `string` get the exact-match hash index
-only. The choice is automatic by field type — there is no directive to force it.
+only. The choice follows field type — there is no directive to force it.
 
 ## Unique — `&unique`
 
 The `&` modifier is the uniqueness constraint. On `insert`/`update` the generated code
 probes the field's index and rejects a value already held by a different row (HTTP **409**).
-A unique field is also indexed, so it is fast to look up.
+A unique field is also indexed, so lookups on it are fast.
 
 ```forge
 User {
@@ -111,7 +110,7 @@ db.post.all_card();     // narrow scan, skips other columns
 ```
 </Compare>
 
-Projections are also exposed over REST as a **closed set** — `GET /api/post?projection=card`
+Projections are exposed over REST as a **closed set** — `GET /api/post?projection=card`
 selects a declared projection by name. There is no ad-hoc `?fields=` column list; only
 declared projection names are valid (an unknown name is a 400).
 

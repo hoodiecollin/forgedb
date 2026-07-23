@@ -3,8 +3,7 @@ title: "Models & fields"
 description: "Model and field syntax in .forge — the field form, modifier positions, and the parser-enforced declaration rules."
 purpose: "reference"
 ---
-
-A **model** is an entity that becomes a stored table. You declare it by name (no keyword)
+A **model** is an entity that becomes a stored table. Declare it by name — no keyword —
 followed by a block of fields.
 
 ## Model syntax
@@ -52,8 +51,7 @@ Field names must be **unique within a model** — a duplicate `id` is rejected.
 ## Modifier positions
 
 The prefix modifiers `+` (auto-generate), `&` (unique), and `^` (indexed) appear
-**between the colon and the type name**. Any combination is allowed and order among them
-does not matter:
+**between the colon and the type name**. Any combination is allowed, in any order:
 
 ```forge
 field: +type      // auto-generate
@@ -63,7 +61,7 @@ field: +&^type    // all three (any combination)
 ```
 
 The nullable modifier `?` is different: it appears **after the type** (postfix), though a
-prefix form also works. See [modifiers](/docs/schema/modifiers/) for the full rules.
+prefix form also parses. See [modifiers](/docs/schema/modifiers/) for the full rules.
 
 ```forge
 field: string?    // nullable string (postfix — the idiomatic form)
@@ -99,6 +97,6 @@ Post {
   braces — newlines are significant.
 - A field's `@` directives must follow its type on the same logical line (before the next
   newline or the next constraint).
-- Definitions may span multiple lines freely; horizontal whitespace is insignificant.
+- Definitions may span multiple lines; horizontal whitespace is insignificant.
 
 See [comments & whitespace](/docs/schema/comments/) for the details.

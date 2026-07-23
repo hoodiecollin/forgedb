@@ -3,11 +3,10 @@ title: "[runtime]"
 description: "The [runtime] table — replication, changefeed capacity, and cascade depth, baked into database.rs at generate time."
 purpose: "reference"
 ---
-
-The `[runtime]` table carries generate-time behavior knobs. They are
-schema-blind and baked into the emitted `database.rs` — change one and run `forgedb
-generate` for it to take effect. Defaults reproduce the prior output byte-for-byte, with
-the one sanctioned exception that `replication` defaults to **off**.
+The `[runtime]` table carries generate-time behavior knobs, schema-blind and baked
+into the emitted `database.rs`. Change one and run `forgedb generate` for it to take
+effect. Defaults reproduce the prior output byte-for-byte; the one exception is
+`replication`, which defaults to **off**.
 
 ```toml
 [runtime]
@@ -27,11 +26,11 @@ max_cascade_depth = 64     # Tier B — @on_delete(cascade) recursion bound
 ## `replication` (Tier A, default off)
 
 When `true`, `open_at` attaches a `DurableBroker` that records every committed change to a
-CRC-framed append-only log (`<root>/_replication.log`). This is what powers the generated
+CRC-framed append-only log (`<root>/_replication.log`). It powers the generated
 `/replicate` WebSocket endpoint and the browser read-replica follower.
 
-When `false` (the default), no broker is emitted at all. The write path's `if let
-Some(broker)` guard becomes statically dead code the compiler removes.
+When `false` (the default), no broker is emitted. The write path's `if let Some(broker)`
+guard becomes static dead code the compiler removes.
 
 <Callout type="warning" title="Replication costs a second barrier per write">
 With `replication = true`, each `insert`/`update`/`delete` fsyncs the broker log *in
@@ -47,9 +46,9 @@ browser read-replica.
 ## `changefeed_capacity` (Tier B, default 1024)
 
 The capacity of the in-process changefeed broadcast channel (used by the `/subscribe` and
-`/live-query` WebSocket endpoints) and the durable broker's buffer. It is a fan-out
-buffer, **not** on the durable write path, so tuning it has no measured write-latency
-effect — it is free to raise for a high subscriber count.
+`/live-query` WebSocket endpoints) and the durable broker's buffer. It is a fan-out buffer,
+**not** on the durable write path, so raising it has no measured write-latency cost. Raise
+it freely for a high subscriber count.
 
 ## `max_cascade_depth` (Tier B, default 64)
 

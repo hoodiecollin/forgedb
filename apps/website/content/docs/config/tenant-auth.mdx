@@ -3,7 +3,6 @@ title: "[tenant] & [auth]"
 description: "The [tenant] and [auth] tables — the per-tenant data root and the verify-only JWT tenant guard that bridges to FORGEDB_* env at runtime."
 purpose: "reference"
 ---
-
 The `[tenant]` and `[auth]` tables configure ForgeDB's process-per-tenant multi-tenancy
 and its verify-only JWT tenant guard. Both are deployment config — never read from a
 `.forge` schema.
@@ -29,7 +28,7 @@ processes open under. At runtime the server resolves its data dir from `FORGEDB_
 ## `[auth]`
 
 The generated server can guard every REST + WebSocket data route with a **verify-only**
-JWT tenant check. ForgeDB *verifies* tokens your identity provider issues — it never issues
+JWT tenant check. ForgeDB verifies tokens your identity provider issues; it never issues
 them, and it does no row-level authorization.
 
 ```toml
@@ -59,10 +58,9 @@ leeway_secs = 60
 
 The generated server's guard verifies an asymmetric JWT against a **static PEM public key**,
 pins the algorithm, checks `exp`/`nbf`/`iss`/`aud` with the configured skew, extracts the
-`tenant_claim`, and
-cross-checks it against the process's own tenant. A wrong tenant returns **403**; a
-missing or invalid token returns **401**. On success an opaque `Principal` is injected. The
-guard knows nothing about your models, rows, or fields.
+`tenant_claim`, and cross-checks it against the process's own tenant. A wrong tenant returns
+403; a missing or invalid token returns 401. On success an opaque `Principal` is injected.
+The guard knows nothing about your models, rows, or fields.
 
 <Callout type="note" title="What it does not do">
 The auth layer is verify-only: no token issuance, and no per-principal / row-level
@@ -71,11 +69,10 @@ authorization. It answers "is this a valid token for *this* tenant?" — nothing
 
 ## FORGEDB_* env bridge
 
-Multi-tenancy is process-per-tenant and 12-factor: the running server reads its auth
-config from the environment, not from `forgedb.toml`. The `[auth]` table is the
-*declarative source* that `forgedb tenant create` translates into the exact `FORGEDB_*`
-exports an operator copies into their process manager. Enabling the guard sets the
-following (empty when `enabled = false`):
+The running server reads its auth config from the environment, not from `forgedb.toml`.
+The `[auth]` table is the declarative source that `forgedb tenant create` translates into
+the `FORGEDB_*` exports an operator copies into their process manager. Enabling the guard
+sets these (empty when `enabled = false`):
 
 | Config key | Env export |
 |---|---|
@@ -87,8 +84,8 @@ following (empty when `enabled = false`):
 | `algorithms` (first) | `FORGEDB_JWT_ALG` |
 | `leeway_secs` | `FORGEDB_JWT_LEEWAY` |
 
-The guard turns on at runtime when `FORGEDB_JWT_PUBKEY` is set, and `FORGEDB_TENANT` is then
-required so the token's tenant claim has something to be cross-checked against. Full env
+The guard turns on at runtime when `FORGEDB_JWT_PUBKEY` is set. `FORGEDB_TENANT` is then
+required so the token's tenant claim has something to cross-check against. Full env
 reference: [deployment](/docs/reference/deployment/).
 
 <Callout type="warning" title="JWKS-by-URL is not wired into the generated server yet">

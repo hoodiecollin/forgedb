@@ -3,12 +3,11 @@ title: "forgedb migrate"
 description: "Record, build, and run schema migrations that rewrite data-at-rest across format versions."
 purpose: "reference"
 ---
-
-Schema evolution follows the generate-then-compile model: you edit `schema.forge`,
-regenerate, and rebuild. Additive changes (a new model, a new nullable field) are preserved
-automatically on reopen. Everything else rewrites data-at-rest, and `forgedb migrate` drives
-that end to end via a generated offline transformer. See the
-[migrations feature guide](/docs/features/migrations/) for the full workflow.
+Schema evolution follows the generate-then-compile model: edit `schema.forge`, regenerate,
+rebuild. Additive changes (a new model, a new nullable field) survive automatically on
+reopen. Everything else rewrites data-at-rest, and `forgedb migrate` drives that through a
+generated offline transformer. The [migrations feature guide](/docs/features/migrations/)
+has the full workflow.
 
 ## Subcommands
 
@@ -81,7 +80,7 @@ forgedb migrate up [--from F] [--to T] [--src S --dest D] [--tenant-root R] [--o
 | `--dest-suffix <SUF>` | string (`-migrated-v<to>`) | Per-tenant destination suffix. |
 
 <Callout type="note" title="up writes a fresh destination">
-`migrate up` builds the transformer, `cargo build`s it, and runs it — writing a **fresh**
+`migrate up` builds the transformer, `cargo build`s it, and runs it, writing a **fresh**
 destination and leaving the source untouched, so the original is your rollback. The app must
 be stopped (offline / exclusive-writer). `build`, `run`, and `generate transform` are the
 lower-level primitives `up` composes.

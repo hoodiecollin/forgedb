@@ -3,11 +3,10 @@ title: "Deployment"
 description: "Running a generated ForgeDB app in production — the Docker/compose path, the FORGEDB_* environment, graceful shutdown, and health checks."
 purpose: "reference"
 ---
-
 A ForgeDB-generated app is a single self-contained axum binary. `forgedb init` emits a
 blessed container path (multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`)
-and a 12-factor `main.rs` configured entirely from the environment. There is no config
-file at runtime — the binary reads its settings from `FORGEDB_*` env vars.
+and a 12-factor `main.rs` configured entirely from the environment. There is no runtime
+config file; the binary reads its settings from `FORGEDB_*` env vars.
 
 ## The environment
 
@@ -69,9 +68,9 @@ docker run -p 3000:3000 -v myblog-data:/data myblog
 ```
 
 The generated `Dockerfile` is multi-stage: a `rust:1-slim` builder running `cargo build
---release --locked`, and a `debian:bookworm-slim` runtime with only `ca-certificates` +
-`curl`, a non-root `forgedb` user, `/data` as a `VOLUME`, `FORGEDB_HOST=0.0.0.0` baked as
-a default, and a `HEALTHCHECK` that curls `/health`.
+--release --locked`, then a `debian:bookworm-slim` runtime carrying only `ca-certificates`
++ `curl`. That runtime runs as a non-root `forgedb` user, mounts `/data` as a `VOLUME`,
+bakes `FORGEDB_HOST=0.0.0.0` as a default, and `HEALTHCHECK`s by curling `/health`.
 
 ### Compose
 
@@ -97,9 +96,8 @@ directory refuses to start (it does not corrupt). Do **not** point two server pr
 the same `FORGEDB_DATA/<tenant>` dir. Concurrent *readers* are fine.
 </Callout>
 
-Scale a single tenant **vertically** (one process) and scale **across** tenants
-horizontally (one process each — process-per-tenant). Manage tenant directories with
-`forgedb tenant {create,list,drop}`.
+Scale a single tenant **vertically** (one process) and scale across tenants horizontally
+(one process per tenant). Manage tenant directories with `forgedb tenant {create,list,drop}`.
 
 ```bash
 forgedb tenant create acme --root ./data          # make ./data/acme

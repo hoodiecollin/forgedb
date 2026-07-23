@@ -3,7 +3,6 @@ title: "forgedb generate"
 description: "Transpile a .forge schema into tailored Rust, a REST API, OpenAPI, stubs, or a language runtime binding."
 purpose: "reference"
 ---
-
 Transpile your schema into code. A target is either a **standalone artifact** (`all`,
 `rust`, `api`, `openapi`, `stubs`, `ffi`, `transform`) or a **runtime** (`python`, `node`,
 `bun`, `browser`) paired with a mode flag (`--sdk`, `--runtime`, or `--replica`).
@@ -55,9 +54,9 @@ target **requires** a mode. Not-yet-implemented combinations (`python --sdk`,
 | `--to <N>` | u32 | Destination format version — `transform` target only. |
 
 <Callout type="note" title="Generate-time config is baked in">
-The schema-blind `[runtime]`/`[storage]` knobs from `forgedb.toml` are resolved into the
-codegen config baked into `database.rs`, so `generate` produces the tailored behavior you
-configured. See [configuration](/docs/config/overview/).
+The schema-blind `[runtime]`/`[storage]` knobs in `forgedb.toml` are baked into
+`database.rs` at generate time, so the emitted code carries the behavior you configured.
+See [configuration](/docs/config/overview/).
 </Callout>
 
 ## Examples

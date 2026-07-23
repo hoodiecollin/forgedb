@@ -3,10 +3,9 @@ title: "forgedb build"
 description: "Validate, regenerate, and compile production-ready ForgeDB artifacts for native or WASM targets."
 purpose: "reference"
 ---
-
 Produce production artifacts end to end: validate the schema, regenerate the code (baking
-in the `[runtime]`/`[storage]` config from `forgedb.toml`), then compile. `build` always
-regenerates with force so a repeated build never fails on existing files.
+the `[runtime]`/`[storage]` config from `forgedb.toml` into the output), then compile.
+`build` always regenerates with force, so a repeated build never fails on existing files.
 
 ## Synopsis
 

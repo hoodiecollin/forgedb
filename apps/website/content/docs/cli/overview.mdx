@@ -3,11 +3,10 @@ title: "CLI reference"
 description: "The forgedb command-line tool — global flags and every subcommand for generating, building, and operating a ForgeDB database."
 purpose: "reference"
 ---
-
-The `forgedb` CLI is the entire toolchain: it scaffolds a project, transpiles your
+The `forgedb` CLI is the whole toolchain: it scaffolds a project, transpiles your
 `.forge` schema into tailored Rust/TypeScript/REST artifacts, builds them, and operates
-the resulting database (migrations, compaction, backups, tenancy, and the multi-process
-commit coordinator).
+the database (migrations, compaction, backups, tenancy, and the multi-process commit
+coordinator).
 
 ```bash
 forgedb <command> [flags]
@@ -16,7 +15,7 @@ forgedb --help
 
 ## Global flags
 
-These flags are accepted on every command.
+Accepted on every command.
 
 | Flag | Type / default | Meaning |
 |---|---|---|
@@ -47,6 +46,6 @@ See [configuration](/docs/config/overview/) for the full set of tables and keys.
 
 ## Exit codes
 
-Commands exit `0` on success and non-zero on failure. Deprecated paths
+Commands exit `0` on success, non-zero on failure. The deprecated paths
 (`compact run`, `compact vacuum`) exit non-zero even though they are otherwise valid
 subcommands — see [compact](/docs/cli/compact/).

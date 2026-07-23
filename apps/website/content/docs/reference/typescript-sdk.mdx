@@ -3,7 +3,6 @@ title: "TypeScript SDK"
 description: "The generated TypeScript SDK — typed CRUD over the REST API, ListResult, per-model Create types, and typed errors, publishable to npm."
 purpose: "reference"
 ---
-
 `forgedb generate typescript` (or `generate all`) emits a `types.ts` SDK that mirrors the
 generated REST contract exactly. It provides typed CRUD per model, a typed error, and — so
 you can publish it — a `package.json` and `tsconfig.json` alongside it.
@@ -12,7 +11,7 @@ you can publish it — a `package.json` and `tsconfig.json` alongside it.
 
 The SDK exports a single `ForgeDBClient` class with **flat, model-suffixed** methods
 (`get<Model>` / `list<Model>` / `create<Model>` / `update<Model>` / `delete<Model>`) — there
-is no per-model sub-object. For a model `Post`, faithful to the real REST responses:
+is no per-model sub-object. For a model `Post`, matching the REST responses:
 
 | Method | REST call | Returns |
 |---|---|---|
@@ -68,7 +67,7 @@ so you can branch on `409` (unique / dangling-FK conflict) versus `422` (field c
 
 ```typescript
 try {
-  await posts.create(input);
+  await db.createPost(input);
 } catch (e) {
   if (e instanceof ForgeDBError && e.status === 422) {
     // validation failure — inspect e.body

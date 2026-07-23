@@ -3,15 +3,13 @@ title: "Directives"
 description: "Every @ directive in .forge — which are enforced at write time, which are semantic-only markers, and their argument syntax."
 purpose: "reference"
 ---
-
 Directives are `@`-prefixed annotations on a field or a model. Some are **enforced** at
-write time (a violation is rejected with an HTTP status); the rest are **semantic-only**
-markers today — parsed and carried through, but not yet enforced by the generated code.
+write time — a violation is rejected with an HTTP status. The rest are semantic-only
+markers: parsed and carried through, but not yet enforced by the generated code.
 
 ## Argument syntax
 
-Directive arguments accept **numbers**, **bare identifiers**, and **quoted string
-literals**:
+Directive arguments accept numbers, bare identifiers, and quoted string literals:
 
 ```forge
 age: u32 @min(13) @max(150)
@@ -21,12 +19,11 @@ phone: string @pattern("^[0-9]+$")
 ```
 
 Quoted strings support the escapes `\"`, `\\`, `\n`, `\t`, `\r`. An unterminated or
-multiline string is a lex error. `@default(pending)` and `@default("pending")` are
-equivalent.
+multiline string is a lex error.
 
 ## Enforced directives
 
-These are checked by the generated code and reject a bad write.
+The generated code checks these and rejects a bad write.
 
 | Directive | Args | Applies to | Effect |
 |-----------|------|-----------|--------|
@@ -56,8 +53,8 @@ User {
 ### `@pattern` / `@regex`
 
 The generated `validate_<model>` compiles a per-field regex and rejects a non-matching
-string with a field-constraint error (HTTP **422**), at the top of `insert`/`update`. A
-nullable field is only validated when `Some`.
+string with a field-constraint error (HTTP **422**). A nullable field is validated only
+when `Some`.
 
 ```forge
 User {
@@ -70,12 +67,12 @@ User {
 Declares what happens to a child when its referenced parent is deleted. Enforced in the
 generated `Database::delete_<parent>` wrapper (which the REST `DELETE` route goes through):
 
-- **`restrict`** (also the **default** when `@on_delete` is absent) — refuse to delete a
-  parent that still has a live child referencing it → **409**.
-- **`cascade`** — recursively delete every referencing child (each child's own
-  `@on_delete` rules fire; a cycle is bounded by a max depth).
-- **`set_null`** — null each referencing child's FK. **Only valid on an optional FK
-  (`?Target`)** — `set_null` on a required `*Target` is a hard codegen error.
+- **`restrict`** (the default when `@on_delete` is absent) — refuses to delete a parent
+  that still has a live child referencing it → 409.
+- **`cascade`** — recursively deletes every referencing child; each child's own
+  `@on_delete` rules fire, and a cycle is bounded by a max depth.
+- **`set_null`** — nulls each referencing child's FK. Valid only on an optional FK
+  (`?Target`); `set_null` on a required `*Target` is a hard codegen error.
 
 ```forge
 Post {

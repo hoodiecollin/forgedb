@@ -3,10 +3,8 @@ title: "forgedb validate"
 description: "Parse and validate a .forge schema, its naming conventions, and optionally its UI component references."
 purpose: "reference"
 ---
-
 Parse the schema, report its statistics (models, fields, relations), and check semantic
-rules such as PascalCase model names. Use it as a fast pre-flight before `generate` or in
-CI.
+rules such as PascalCase model names. Use it as a pre-flight before `generate` or in CI.
 
 ## Synopsis
 
@@ -31,8 +29,8 @@ expression feature. Do not rely on it to catch anything today.
 </Callout>
 
 <Callout type="warning" title="`--strict` does not check computed/view fields">
-Despite older descriptions, `--strict` does **not** enforce `@computed`/view implementations
-— that enforcement lands with the same `@computed(<expr>)` feature
+`--strict` does **not** enforce `@computed`/view implementations — that enforcement lands
+with the `@computed(<expr>)` feature
 ([#46](https://github.com/hoodiecollin/forgedb/issues/46)). Its only effect today is to turn
 `--components` file-reference errors into a non-zero exit. Malformed syntax and semantic
 errors (bad names, dangling relations, duplicate fields) already fail validation *without*

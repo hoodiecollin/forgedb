@@ -3,11 +3,10 @@ title: "Configuration"
 description: "What forgedb.toml is, how it is discovered, the precedence rules, and the binding-time tier model that governs every knob."
 purpose: "reference"
 ---
-
-ForgeDB reads a single project config file, `forgedb.toml`, at **generate time**. It
-holds schema-blind knobs — deployment and behavior settings that are not part of your
-`.forge` schema. The schema describes your data shape; `forgedb.toml` describes how the
-generated code and the running process behave.
+ForgeDB reads one project config file, `forgedb.toml`, at **generate time**. It holds
+schema-blind knobs: deployment and behavior settings that are not part of your `.forge`
+schema. The schema describes your data shape; `forgedb.toml` describes how the generated
+code and the running process behave.
 
 <Callout type="note" title="Config is schema-blind">
 Nothing in `forgedb.toml` is per-model or field-aware. If a setting depended on a
@@ -17,8 +16,8 @@ with entirely different schemas could share the same `forgedb.toml` verbatim.
 
 ## Discovery
 
-`forgedb.toml` is auto-discovered in the current working directory. If no file is
-present, ForgeDB uses built-in defaults silently. You can point at an explicit path:
+`forgedb.toml` is auto-discovered in the current working directory. With no file present,
+ForgeDB uses built-in defaults silently. Point at an explicit path instead:
 
 ```bash
 forgedb generate all                 # discovers ./forgedb.toml (or defaults)
@@ -30,7 +29,7 @@ a missing `./forgedb.toml` is not (defaults apply).
 
 ## Precedence
 
-For any given setting, the highest-priority source wins:
+For any setting, the highest-priority source wins:
 
 1. An explicit CLI flag (`--output`, `--schema`, …)
 2. The value in the loaded `forgedb.toml`
@@ -38,8 +37,8 @@ For any given setting, the highest-priority source wins:
 
 ## Binding-time tiers
 
-Every runtime/storage knob binds at one of three times. Knowing the tier tells you *when*
-a change takes effect and how "baked in" it is.
+Every runtime/storage knob binds at one of three times. The tier tells you *when* a
+change takes effect and how baked-in it is.
 
 | Tier | Name | Mechanism | When it binds |
 |---|---|---|---|
@@ -47,10 +46,10 @@ a change takes effect and how "baked in" it is.
 | **B** | Baked const | Same code, a tailored number baked as a `const` (e.g. checkpoint interval, cascade depth, the fsync *policy value*). | `forgedb generate` |
 | **C** | Process-start env | Read once at process start from a `FORGEDB_*` environment variable (host, port, data dir, JWT settings). | Server launch |
 
-Tiers A and B are baked into `database.rs` when you run `forgedb generate` — change them
-and regenerate. Tier C is read fresh at each process start, so you can change it per
-deployment without regenerating. The `[runtime]` and `[storage]` tables are Tiers A/B;
-the `[auth]` table bridges to Tier-C `FORGEDB_*` env at runtime (see [tenant &
+Tiers A and B bake into `database.rs` at `forgedb generate` — change them and regenerate.
+Tier C is read fresh at each process start, so you change it per deployment without
+regenerating. The `[runtime]` and `[storage]` tables are Tiers A/B; the `[auth]` table
+bridges to Tier-C `FORGEDB_*` env at runtime (see [tenant &
 auth](/docs/config/tenant-auth/)).
 
 <Callout type="warning" title="fsync is Tier B today">
@@ -76,8 +75,8 @@ keys.
 
 ## Defaults are byte-identical
 
-The generated `database.rs` with an empty `[runtime]`/`[storage]` config is
-**byte-identical** to the fully-defaulted output — with one deliberate exception:
-`[runtime].replication` defaults to **off**. An unused durable replication broker would
-pay a second `F_FULLFSYNC` barrier per write for nothing, so it is omitted unless you opt
-in. See [`[runtime]`](/docs/config/runtime/).
+Generated `database.rs` from an empty `[runtime]`/`[storage]` config is **byte-identical**
+to the fully-defaulted output, with one deliberate exception: `[runtime].replication`
+defaults to **off**. An unused durable replication broker would pay a second `F_FULLFSYNC`
+barrier per write for nothing, so it is omitted unless you opt in. See
+[`[runtime]`](/docs/config/runtime/).

@@ -3,9 +3,8 @@ title: "[storage]"
 description: "The [storage] table — WAL fsync policy, checkpoint interval, and compaction, with their durability tradeoffs."
 purpose: "reference"
 ---
-
-The `[storage]` table carries generate-time storage and durability knobs.
-They are schema-blind and baked into `database.rs` at generate time — change one and run
+The `[storage]` table holds generate-time storage and durability knobs. They are
+schema-blind and baked into `database.rs` when you generate — change one and run
 `forgedb generate`. Defaults are byte-identical to the prior output.
 
 ```toml
@@ -54,10 +53,10 @@ See [durability](/docs/features/durability/) for the full crash-safety model and
 ## `wal_checkpoint_interval` (Tier B, default 1000)
 
 Bakes `const WAL_CHECKPOINT_INTERVAL`. After this many mutations to a collection, the
-generated code checkpoints: it fsyncs every column and tombstone file **then** truncates
-the WAL (that order is load-bearing — columns durable before the WAL is discarded). This
-bounds WAL growth and reopen-replay cost. A lower value keeps the WAL smaller at the cost
-of more frequent checkpoints.
+generated code checkpoints: it fsyncs every column and tombstone file, then truncates the
+WAL. Columns reach disk before the WAL is discarded, so a crash between the two loses no
+committed row. This bounds WAL growth and reopen-replay cost. A lower value keeps the WAL
+smaller at the cost of more frequent checkpoints.
 
 ## `compaction` (Tier A, default on)
 

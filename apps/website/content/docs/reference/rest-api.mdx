@@ -3,10 +3,9 @@ title: "Generated REST API"
 description: "The shape of the REST + WebSocket API ForgeDB generates from your schema — CRUD routes, query parameters, operational routes, and realtime streams."
 purpose: "reference"
 ---
-
 `forgedb generate api` emits an axum router tailored to your schema. Every model gets a
-full CRUD route set; the whole database gets operational and realtime routes. Nothing is
-interpreted at runtime — each handler is generated for exactly one schema.
+full CRUD route set; the whole database gets operational and realtime routes. Each handler
+is generated for one schema — nothing is interpreted at runtime.
 
 ## CRUD routes per model
 
@@ -29,7 +28,7 @@ key type.
 { "data": [ /* records */ ], "total": 137, "limit": 20, "offset": 0 }
 ```
 
-`total` is the count of matches before pagination.
+`total` counts matches before pagination.
 
 ## Query parameters (list + read)
 
@@ -67,13 +66,13 @@ a token:
 | `GET /metrics` | `{"model_count", "rows_per_model", "total_rows"}` | Minimal per-model row counts (JSON, not Prometheus text). |
 | `GET /snapshot` | `{"watermarks": {"<Model>": <n>}}` | Current per-model watermarks (for `?as_of=` reads). |
 
-Point your liveness probe at `/health` and readiness at `/ready`. See
+Point liveness probes at `/health`, readiness at `/ready`. See
 [deployment](/docs/reference/deployment/).
 
 ## WebSocket routes
 
-Realtime streams. `/subscribe` and `/live-query` sit **behind** the tenant guard;
-`/replicate` also sits behind it.
+Realtime streams. `/subscribe`, `/live-query`, and `/replicate` all sit **behind** the
+tenant guard.
 
 | Route | Kind | Payload |
 |---|---|---|
@@ -89,7 +88,7 @@ always available; their broadcast buffer is `[runtime].changefeed_capacity`.
 </Callout>
 
 WebSocket clients send the JWT in the `Authorization` header. Behind a reverse proxy,
-forward the `Upgrade`/`Connection` headers so these routes work — see
+forward the `Upgrade`/`Connection` headers. See
 [deployment](/docs/reference/deployment/).
 
 ## Related
