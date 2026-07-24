@@ -3,9 +3,9 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, GenConfig, HopPlan, ModelOp, NapiGenerator, OpenApiGenerator,
-    PyO3Generator, RustGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator,
-    VersionSchema, WasmGenerator,
+    ApiGenerator, FfiGenerator, GenConfig, GoGenerator, HopPlan, ModelOp, NapiGenerator,
+    OpenApiGenerator, PyO3Generator, RustGenerator, TransformGenerator, TransformPlan,
+    TypeScriptGenerator, VersionSchema, WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -6132,4 +6132,140 @@ fn test_transform_bin_embeds_frozen_authored_body() {
 fn test_transform_generation_snapshot() {
     let (main, _crate_out) = sample_transform_crate();
     insta::assert_snapshot!(main);
+}
+
+/// The multi-model + FK + M2M + integer-PK schema shared by the Go binding
+/// guard tests (mirrors the PyO3/NAPI fixture so coverage is comparable).
+fn go_binding_schema() -> Schema {
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  age: i32?
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string
+  author: *User
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  label: string
+  posts: [Post]
+}
+
+Reading {
+  id: +u64
+  value: i64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    parser.parse().unwrap()
+}
+
+#[test]
+fn test_go_generation_binding() {
+    // Experimental Golang binding (RFC #203) — the per-schema cgo wrapper over the
+    // SAME generated FFI C-ABI. Schema-tailored Go structs + typed methods that
+    // reference the generated per-model C symbols by name; rows/ids cross cgo as
+    // opaque JSON. No generic query builder, no `switch model` (the red line).
+    let schema = go_binding_schema();
+    let code = GoGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // Package + cgo boundary + the schema-invariant lifecycle spine.
+    assert!(code.contains("package forgedb"), "emits a Go package");
+    assert!(code.contains("import \"C\""), "binds the C ABI over cgo");
+    assert!(code.contains("EXPERIMENTAL"), "carries the experimental marker");
+    assert!(code.contains("func Open(root string) (*DB, error)"), "the Open lifecycle entry");
+    assert!(flat.contains("func(db*DB)Commit()error"), "Commit wraps forgedb_commit");
+    assert!(flat.contains("C.forgedb_open("), "Open calls forgedb_open");
+    assert!(flat.contains("C.forgedb_free_buffer("), "buffers freed via forgedb_free_buffer");
+
+    // One row struct per model; typed fields; nullable FK/scalar handling.
+    for m in ["User", "Post", "Tag", "Reading"] {
+        assert!(code.contains(&format!("type {m} struct {{")), "row struct for {m}");
+    }
+    // `+uuid` id carries omitempty (serde default lets a create body omit it).
+    assert!(code.contains("Id string `json:\"id,omitempty\"`"), "uuid id is an omitempty string");
+    // `i32?` nullable scalar → pointer.
+    assert!(code.contains("Age *int32 `json:\"age\"`"), "nullable i32 maps to *int32");
+    // `*User` FK is stored as the uuid reference id → string.
+    assert!(code.contains("Author string `json:\"author\"`"), "required FK maps to a string id");
+    // integer-PK model's id type flows through.
+    assert!(code.contains("Id uint64 `json:\"id,omitempty\"`") || code.contains("Id uint64 `json:\"id\"`"), "u64 PK id is uint64");
+
+    // Per-model CRUD + snapshot reads, each keyed by the model's snake symbol.
+    for (name, snake) in [("User", "user"), ("Post", "post"), ("Reading", "reading")] {
+        for op in ["Insert", "Get", "Count", "All", "Update", "Delete"] {
+            assert!(code.contains(&format!("func (db *DB) {op}{name}(")), "method {op}{name}");
+        }
+        assert!(code.contains(&format!("C.forgedb_{snake}_insert(")), "insert calls the C symbol");
+        assert!(code.contains(&format!("func (db *DB) Get{name}At(")), "snapshot _at read for {name}");
+    }
+
+    // Relation traversal: forward FK, reverse 1:M, and M2M getters/link/unlink.
+    assert!(code.contains("func (db *DB) PostAuthor(") && flat.contains("C.forgedb_post_author("),
+        "forward FK Post.author");
+    assert!(code.contains("func (db *DB) UserPosts(") && flat.contains("C.forgedb_user_posts("),
+        "reverse 1:M User.posts");
+    assert!(flat.contains("C.forgedb_link_post_tag(") && flat.contains("C.forgedb_unlink_post_tag("),
+        "M2M link/unlink for Post<->Tag");
+    assert!(code.contains("func (db *DB) Link"), "an M2M Link method is generated");
+
+    // Identity red line: no generic runtime query surface, ever.
+    for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."] {
+        assert!(!code.contains(forbidden), "must not emit generic query surface: {forbidden}");
+    }
+}
+
+#[test]
+fn test_go_calls_match_ffi_symbols() {
+    // Anti-drift guard: every `C.forgedb_*` symbol the generated Go binding calls
+    // MUST be a symbol the FFI generator actually emits for the same schema. The
+    // Go generator re-derives relation names independently (mirroring the FFI
+    // derivation); this proves the two never disagree, so the Go binding can
+    // never reference a nonexistent C symbol.
+    let schema = go_binding_schema();
+    let go_code = GoGenerator::generate(&schema).unwrap().code;
+    let ffi_flat: String = FfiGenerator::generate(&schema)
+        .unwrap()
+        .code
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+
+    // Extract every `C.forgedb_<name>` symbol referenced by the Go binding.
+    let mut go_symbols: Vec<String> = Vec::new();
+    let bytes = go_code.as_bytes();
+    let needle = b"C.forgedb_";
+    let mut i = 0;
+    while let Some(pos) = go_code[i..].find("C.forgedb_") {
+        let start = i + pos + 2; // skip "C."
+        let mut end = start + (needle.len() - 2); // past "forgedb_"
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        go_symbols.push(go_code[start..end].to_string());
+        i = end;
+    }
+    go_symbols.sort();
+    go_symbols.dedup();
+    assert!(
+        go_symbols.len() > 10,
+        "expected the Go binding to reference many C symbols, found {}",
+        go_symbols.len()
+    );
+
+    // Each must appear as an `extern \"C\" fn <sym>(` in the FFI output.
+    for sym in &go_symbols {
+        assert!(
+            ffi_flat.contains(&format!("fn{sym}(")),
+            "Go calls C.{sym} but the FFI generator emits no such symbol (drift!)"
+        );
+    }
 }
