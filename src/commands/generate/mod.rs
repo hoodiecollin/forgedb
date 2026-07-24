@@ -1,7 +1,7 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, NapiGenerator, OpenApiGenerator, PyO3Generator, RustGenerator,
-    StubGenerator, TypeScriptGenerator, WasmGenerator,
+    ApiGenerator, FfiGenerator, GoGenerator, NapiGenerator, OpenApiGenerator, PyO3Generator,
+    RustGenerator, StubGenerator, TypeScriptGenerator, WasmGenerator,
 };
 use forgedb_parser::Parser;
 use std::fs;
@@ -223,6 +223,16 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         }
         "napi" => {
             generated_files.extend(generate_napi_binding(
+                &schema,
+                &output_path,
+                force,
+                format_version,
+            )?);
+        }
+        // Experimental Golang binding (RFC #203). Resolved from `go --runtime`;
+        // rides the FFI cdylib over cgo — adds no new C symbol / substrate dep.
+        "go" => {
+            generated_files.extend(generate_go_binding(
                 &schema,
                 &output_path,
                 force,
@@ -539,6 +549,56 @@ fn generate_napi_binding(
     Ok(files)
 }
 
+/// Generate the **experimental** Golang binding (RFC #203): a per-schema Go cgo
+/// package (`go/forgedb.go` + `go/forgedb.h`) that binds the SAME generated
+/// native FFI C-ABI over cgo, alongside the FFI engine crate itself (`ffi/`, the
+/// `cdylib` the Go package links). Rides the existing C-ABI unchanged — adds no
+/// new C symbol and no new substrate dep. A `go.mod` scaffold is written only
+/// when absent. Build order: `cargo build --release` in `ffi/`, then `go build`
+/// in `go/`.
+fn generate_go_binding(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+    format_version: u32,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    ui::warning(
+        "the `go` binding target is EXPERIMENTAL — its Go API and the underlying C ABI are \
+         unstable and not covered by v1 stability (RFC #203)",
+    );
+
+    // The FFI engine crate (cdylib) the Go package links against — reused
+    // verbatim, so Go requires no new C symbol.
+    let mut files = generate_ffi_engine(schema, output_path, force, format_version)?;
+
+    let go_dir = output_path.join("go");
+    fs::create_dir_all(&go_dir)?;
+
+    // The generated Go cgo package.
+    let go_result =
+        GoGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let go_path = go_dir.join("forgedb.go");
+    write_file(&go_path, &go_result.code, force)?;
+    files.push((go_path, go_result));
+
+    // The C header cgo `#include`s (declares the `forgedb_*` prototypes).
+    let header_result =
+        GoGenerator::generate_header(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let header_path = go_dir.join("forgedb.h");
+    write_file(&header_path, &header_result.code, force)?;
+    files.push((header_path, header_result));
+
+    // User-editable `go.mod` — written only when absent (like every other
+    // binding scaffold; a `--force` regenerate never clobbers it).
+    let go_mod_path = go_dir.join("go.mod");
+    if !go_mod_path.exists() {
+        fs::write(&go_mod_path, GoGenerator::go_mod_scaffold("forgedb"))?;
+        ui::info(&format!("  ✓ {} (Go module scaffold)", go_mod_path.display()));
+    }
+
+    Ok(files)
+}
+
 /// The `maturin` build config for the generated PyO3 binding.
 const PYO3_PYPROJECT_SCAFFOLD: &str = r#"[build-system]
 requires = ["maturin>=1.5,<2.0"]
@@ -715,7 +775,7 @@ fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
     }
 
     // Runtime targets — a mode is mandatory.
-    let runtimes = ["python", "node", "bun", "browser"];
+    let runtimes = ["python", "node", "bun", "browser", "go"];
     if !runtimes.contains(&target.as_str()) {
         return Err(CliError::Other(format!(
             "Unknown target: {target}. Valid: standalone (all, rust, api, openapi, stubs, ffi, transform) \
@@ -736,6 +796,8 @@ fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
         ("node", GenerateMode::Runtime) | ("bun", GenerateMode::Runtime) => Ok("napi".to_string()),
         // Python native binding — PyO3.
         ("python", GenerateMode::Runtime) => Ok("pyo3".to_string()),
+        // Go native binding — experimental cgo over the FFI cdylib (RFC #203).
+        ("go", GenerateMode::Runtime) => Ok("go".to_string()),
         // Browser read-replica follower — the decomposed `generate wasm`.
         ("browser", GenerateMode::Replica) => Ok("wasm".to_string()),
 
