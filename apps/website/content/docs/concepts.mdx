@@ -4,24 +4,13 @@ description: "The generator-identity invariant, the generation pipeline that tur
 purpose: "orientation"
 structure: "C"
 ---
-
-ForgeDB is an **application-database generator** — a compile-time code-generation tool,
-**not** a runtime ORM or query engine. A declarative `.forge` schema is transpiled into
-tailored Rust database code plus a TypeScript SDK, a REST API, and an OpenAPI spec.
-End users need only their schema, the `forgedb` CLI, and config.
+ForgeDB is a code generator, not a database engine you point at a schema at runtime. You write a `.forge` schema; the `forgedb` CLI turns it into tailored Rust database code, a TypeScript SDK, a REST API, and an OpenAPI document. You ship those. Nothing ForgeDB publishes reads your schema while your app runs.
 
 ## The identity invariant
 
-**The app's schema is a *compile-time input to generation*, never a *runtime input to a
-generic engine*.** The schema-specific surface — types, tables, queries, filters,
-relations, API routes, validation — is generated and tailored per app. ForgeDB never
-ships a general-purpose library that reconstructs that surface at runtime by reflecting
-over a schema.
+Your schema is read once, at build time, to generate code. Everything specific to your app — its types, tables, queries, filters, relations, API routes, validation — is generated for that schema and compiled in. There is no general-purpose engine that reconstructs any of it at runtime.
 
-Generated code is not dependency-free — it links the schema-agnostic **substrate** crates
-(storage, WAL, types, and their peers) — but it never depends on a ForgeDB ORM or a
-runtime that reads your schema. A generated, schema-tailored query/filter builder is fine
-(it is just generated code); a generic, schema-agnostic query builder is not.
+The generated code is not standalone. It links a fixed set of shared **substrate** crates (storage, the write-ahead log, the type system, and their peers), but those crates know nothing about your schema. You get type-safe code shaped for exactly your data; the cost is that changing the schema means regenerating and recompiling.
 
 <Callout type="note" title="The test a feature must pass">
 (1) Is the app's tailored data logic still **generated per-schema at compile time**, and
@@ -30,132 +19,37 @@ rather than a generic runtime that interprets schemas? If either fails, the feat
 rejected or redesigned.
 </Callout>
 
-**Still rejected:** a generic ORM or dynamic query builder that interprets an arbitrary
-schema at runtime; making the schema a runtime input to a general-purpose engine; or
-hollowing out generated code by moving tailored logic into a shipped generic library.
+Rejected outright: a generic ORM or query builder that interprets an arbitrary schema at runtime, or moving your app's tailored logic into a shipped generic library.
 
 ## The generation pipeline
 
-A single `.forge` file drives every artifact. The CLI (root crate `forgedb`) orchestrates
-the pipeline; each stage is a distinct crate.
+One `.forge` file drives every output. The CLI parses it to an AST, validates it (types, relations, directives), then runs a set of generators — one per artifact: the Rust database code, the TypeScript SDK client, the axum REST API, an OpenAPI 3.1 document, an optional browser read-replica, and an offline data-migration binary. It generates no UI or component code — a stubs folder just marks where your hand-written code goes.
 
-```
-schema.forge
-   │
-   ▼
-forgedb-parser        lexer → tokens → AST
-   │
-   ▼
-forgedb-validation    semantic checks (types, relations, directives)
-   │
-   ▼
-forgedb-codegen       one generator per artifact:
-   ├─ RustGenerator        → database.rs   (storage, CRUD, indexes, relations, txns)
-   ├─ TypeScriptGenerator  → types.ts      (typed SDK client)
-   ├─ ApiGenerator         → api.rs        (axum REST + WS routes)
-   ├─ StubGenerator        → stubs/README  (placeholder for hand-written impls; no UI codegen)
-   ├─ OpenApiGenerator     → openapi.json  (offline OpenAPI 3.1 document)
-   ├─ WasmGenerator        → replica/*     (browser read-replica; opt-in)
-   └─ TransformGenerator   → migrations/transform/*  (offline data migration bin)
-```
+The generated Rust is snapshot-tested, but **a passing snapshot does not prove the code compiles** — the snapshots only compare strings. So codegen changes are also verified by generating for a real multi-model schema and compiling the result. That check has caught real bugs.
 
-Rust output is built with `quote!` + `prettyplease` and snapshot-tested with `insta`.
-**Snapshot pass ≠ output compiles** — codegen changes are also compile-tested by
-generating for a real multi-model schema and `cargo check`ing the emitted crate. That
-discipline is load-bearing and has caught real codegen bugs.
-
-The [quickstart](/docs/quickstart/) walks the CLI side of this pipeline
-(`init → generate → build → serve`).
+The [quickstart](/docs/quickstart/) walks the CLI side of this (`init → generate → build → serve`).
 
 ## The two kinds of published runtime
 
-Publishing runtimes with programmatic APIs is expected, not forbidden — as long as they
-stay on the schema-agnostic side of the line. There are two kinds, both fine:
+ForgeDB does publish libraries with real APIs. They come in two kinds, both on the schema-agnostic side of the line.
 
-### 1. Schema-agnostic substrate
+**Substrate** is the crates the generated code links — storage, types, the WAL, the change feed, auth, query-string parsing, compaction. Real APIs, none of which read your schema. The query-string parser, for one, turns a URL into a generic filter/sort/pagination; every field-aware step is generated per model.
 
-The crates the generated code links against — `forgedb-storage`, `forgedb-types`,
-`forgedb-wal`, `forgedb-changefeed`, `forgedb-auth`, `forgedb-query-params`,
-`forgedb-compaction`, and their peers. These have real programmatic APIs, but they know
-**nothing** about any specific schema. For example, `forgedb-query-params` parses a URL
-query string into a generic `Filter`/`Sort`/`Pagination`; every field-aware step
-(matching, comparing, index probing) is generated per model.
-
-### 2. Access / transport glue
-
-Layers over the already-generated, schema-specific API — language bindings (Python / Node
-/ Deno FFI), a WASM host, a subscription socket. They expose the tailored, generated
-surface to another language or channel; the tailored logic stays generated.
-
-So generated code depends on the schema-agnostic substrate crates, but never on a ForgeDB
-ORM or a runtime that reads your schema.
+**Transport glue** is the layers that carry the already-generated API to another language or channel — language bindings, a browser host, a subscription socket. They expose the generated surface; they don't regenerate it.
 
 ## Storage model
 
-The engine is **append-only columnar** storage over positional files. Each model and each
-many-to-many junction is a directory:
+Storage is append-only and columnar. Each model, and each many-to-many link table, is a directory of column files. A write only appends bytes; it never rewrites committed data. An update or delete appends a new version of the row (a delete appends a tombstoned version), and the generated code resolves the latest version per id.
 
-```
-<data-root>/
-  <model>/
-    manifest.json            # physical layout: columns, value sizes, kinds, row anchor
-    tombstones.bin           # 1 byte per row (liveness / delete marker)
-    fixed/
-      uuid_0.bin             # fixed-width columns (uuid=16B, u64/i64/f64=8B, bool=1B, …)
-      u64_1.bin
-    string_data_0.bin        # variable-length column payloads
-    string_offsets_0.bin     # + offsets, one pair per variable column
-```
-
-The rest of the system is built on a few key properties:
-
-- **Append-only.** A write appends; it never mutates committed bytes. Updates and deletes
-  are *superseding-version appends* (a new row version; delete appends a tombstoned
-  version). Latest-version-per-id resolution is generated per model.
-- **Self-describing length.** Every column's committed byte length is a pure function of
-  the row count + layout, so a reader derives the durable prefix from file lengths — no
-  persisted checkpoint marker is load-bearing.
-- **Watermark snapshots.** A snapshot is just a row-count watermark; point-in-time reads
-  resolve the newest version *within* the watermark. No `xmin`/`xmax`, no version chains.
-- **Durability.** Generated writes journal an opaque row blob to a per-model WAL + fsync
-  *before* touching columns; recovery truncates a torn column tail and replays the WAL
-  tail. A directory lock refuses a second writer (the [single-writer contract](/docs/what-v1-is/)).
+Because nothing is mutated in place, a lot falls out cheaply: a **snapshot is just a row-count mark**, so point-in-time reads need no per-row version metadata, and readers never block the writer. Two costs come with it. Dead versions accumulate until an in-process compaction reclaims them, and that compaction renumbers the surviving rows — so a snapshot taken before it does not survive it. Only one process may write to a directory at a time; a directory lock refuses a second writer (the [single-writer contract](/docs/what-v1-is/)).
 
 ## The request path
 
-The generated `api.rs` builds its own axum router — there is no shipped generic HTTP
-server. Every field-aware step is generated per model; the substrate crates on the path
-interpret no schema.
-
-```
-HTTP request
-   │
-   ▼
-axum router (generated in api.rs)
-   ├─ __ops_routes()   /health /ready /metrics /snapshot   (unauthenticated)
-   └─ tenant guard ──► __data_routes()
-        │                 REST CRUD + list (?filter/sort/paginate)
-        │                 WS /subscribe /live-query /replicate
-        ▼
-   forgedb-auth (verify JWT + tenant cross-check, when configured)
-        │
-        ▼
-   generated per-model handlers
-        ├─ forgedb-query-params  (parse the query string → generic Filter/Sort/Pagination)
-        ├─ generated closed-set matcher / comparator (all field-aware logic)
-        └─ generated Database (read/write over forgedb-storage + forgedb-wal)
-```
+The REST server is generated as well: `api.rs` builds its own axum router, and there is no generic HTTP server shipped. A request hits either the operational routes (health, readiness, metrics, snapshot) or, past an optional tenant guard, the data routes — CRUD, list with filter/sort/paginate, and WebSocket subscribe, live-query, and replicate. When auth is configured, it verifies the JWT and cross-checks the tenant. Every field-aware step past that point is generated per model; the substrate on the path reads no schema.
 
 ## Design decisions and their trade-offs
 
-- **Compile-time generation over a runtime engine.** Type safety and monomorphized,
-  per-schema code; the cost is that schema changes require regeneration + recompilation.
-- **Append-only + superseding versions over in-place mutation.** Keeps snapshots, backup,
-  and the change feed simple and correct; the cost is that storage grows with dead
-  versions until in-process compaction reclaims them.
-- **Watermark snapshots over MVCC version chains.** No per-row version metadata; the cost
-  is that a compaction renumbers rows within an epoch, so pinned watermarks are
-  epoch-scoped.
-- **Substrate / compiler-internals split.** Generated code links only schema-agnostic
-  crates; the compiler crates stay off the runtime path, which is what makes the generator
-  identity verifiable.
+- **Compile-time generation over a runtime engine.** Type-safe, per-schema code; the cost is that a schema change needs regeneration and recompilation.
+- **Append-only over in-place mutation.** Snapshots, backup, and the change feed stay simple and correct; the cost is storage grows with dead versions until compaction reclaims them.
+- **Watermark snapshots over version chains.** No per-row version metadata; the cost is that a compaction renumbers rows, so a pinned snapshot is scoped to the epoch it was taken in.
+- **Substrate / compiler split.** Generated code links only schema-agnostic crates, which is what makes the identity claim checkable rather than a promise.

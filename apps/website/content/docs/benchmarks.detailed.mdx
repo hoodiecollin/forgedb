@@ -1,0 +1,151 @@
+---
+title: "Benchmarks"
+description: "How ForgeDB's generated code compares to SQLite, redb, DuckDB, and PostgreSQL — measured at matched durability, always alongside on-disk footprint."
+purpose: "orientation"
+structure: "C"
+---
+These are comparative benchmarks of ForgeDB's **generated** database code against established engines. ForgeDB is a compile-time generator, not a general-purpose engine: a `.forge` schema is transpiled into tailored Rust that links a schema-agnostic substrate (columns, WAL, change-feed). A `get(id)` is a direct index probe plus a column read compiled for exactly one schema — no query parser, no planner, no network hop in the generated path. That constrains both who it is fair to compare against and what is honest to measure.
+
+<Callout type="warning" title="Never read a number in isolation">
+Every result is reported **alongside its durability setting and on-disk footprint**. Throughput at a relaxed fsync tier is not comparable to throughput at a barrier tier — the difference is durability, not engine quality. The tables below label the tier of each row.
+</Callout>
+
+All numbers are macOS (Apple Silicon, APFS SSD), 2026-07-18/20. Relative shape is the signal; absolute fsync-bound numbers are storage-hardware-specific. The harness lives in `benchmarks/` (a detached cargo project); every engine runs the same numbered scenarios over one deterministic seeded corpus, with `bench.forge` and its hand-verified 1:1 `schema.sql` mapping as the shared data model.
+
+## Who we compare against
+
+| Engine | Model | Why it's here |
+|---|---|---|
+| **SQLite** | Embedded, single-writer, row-store | The canonical embedded DB, closest to ForgeDB's write model. The primary comparison. |
+| **redb** | Embedded, pure-Rust KV | Closest on deployment shape — generated Rust linking a substrate crate, no external process. |
+| **DuckDB** | Embedded, columnar | Closest on storage model. Expected to win vectorized scans — showing that is honest. |
+| **PostgreSQL** | Client/server, row-store | The industry reference; carries parse + plan + socket cost we don't. Anchors "what a real RDBMS costs", not head-to-head. |
+
+SQLite and redb are the fair fights — embedded, in-process, single-writer. DuckDB is included precisely because its columnar model is expected to win scans and lose point ops. PostgreSQL every op carries a parse-plan-protocol round-trip the embedded engines do not, so its read latencies measure the client/server boundary, not the engine head-to-head. A PGlite (Postgres-in-WASM) cut in the JS suite isolates that further: in-process PGlite (95–149 µs) is actually slower than server Postgres over a socket (26–60 µs), so for this engine the WASM execution cost, not the transport, dominates.
+
+## Writes at matched durability
+
+The write comparison hinges entirely on a durability-guarantee mismatch. The raw ~100× single-insert gap a naive comparison shows is almost all durability level, not engine efficiency. Measured per durable op on this host:
+
+| Primitive | per-op | What it is |
+|---|---|---|
+| Rust `File::sync_all()` | ~3.5 ms | On macOS this is `fcntl(F_FULLFSYNC)` — a true barrier flush. |
+| `libc fcntl(F_FULLFSYNC)` | ~3.7 ms | The macOS barrier primitive directly. |
+| `libc::fsync()` | ~27 µs | Plain fsync — flushes to the drive cache, not a barrier. |
+| SQLite `synchronous=FULL` (default) | ~113 µs | Uses plain `fsync()`. |
+| SQLite `FULL` + `fullfsync=1` | ~4.0 ms | Uses `F_FULLFSYNC` — the same barrier as ForgeDB. |
+
+`forgedb-wal` at `FsyncPolicy::Always` calls `File::sync_all()`, which on macOS is `F_FULLFSYNC`. SQLite's out-of-box `synchronous=FULL` uses plain `fsync()`, a weaker guarantee. So writes are reported at two tiers, and no chart ever mixes them.
+
+**Barrier tier** — every engine fsyncs a real device barrier per commit:
+
+| Engine (barrier) | `insert_user` |
+|---|---|
+| ForgeDB (`fsync=always`, default) | 3.89 ms |
+| SQLite (`fullfsync=1`) | 3.90 ms |
+| redb (`immediate`) | 3.94 ms |
+
+The three barrier engines are at parity: the `F_FULLFSYNC` barrier itself is essentially the entire ~3.9 ms. ForgeDB's residual over the raw barrier (~0.5 ms) is serde plus column appends plus index maintenance. One subtlety in the default: `insert` fsyncs the WAL once. When `[runtime].replication = true` it also records to the durable replication broker (`DurableBroker::record` under `FsyncPolicy::Always`), a second `F_FULLFSYNC`, so the `replication_on` variant is ~7.35 ms ≈ two barriers. Replication defaults **off**, so the default single insert pays one barrier. The writer rate in the concurrency run (~270 inserts/s) independently corroborates one barrier per insert, since a double barrier would land near ~135/s.
+
+**Relaxed tier** — fsync deferred or batched, which is a real power-loss window:
+
+| Engine (relaxed) | `insert_user` |
+|---|---|
+| **ForgeDB (`fsync=never`)** | **37 µs** |
+| SQLite (`default`, plain fsync) | 64 µs |
+| DuckDB | 208 µs |
+| redb (`eventual`) | 331 µs |
+
+At the relaxed tier ForgeDB-`fsync=never` is the fastest of all. The `F_FULLFSYNC` barrier is essentially the whole write latency, so removing it turns a write into a page-cache append of tens of µs — an ~80–110× swing in the configuration matrix. The cost is a genuine durability window: a crash can lose recently-acknowledged writes. Never compare a ForgeDB barrier number against a competitor's relaxed number; that is barrier-vs-no-barrier, not an engine deficit. The lever is [`[storage].fsync`](/docs/config/storage/), a policy baked in at generate time.
+
+## Group commit for bulk load
+
+A per-row insert pays one `F_FULLFSYNC` per row — the un-batched anti-pattern, which is where the 50.7 s `bulk_load/10000` came from. Wrapping the load in a `db.transaction` makes staged rows use the buffered (no-fsync) WAL append and pay a single barrier at commit. Durability is preserved: the transaction commits atomically or rolls back, and a crash before the commit flush drops the staged rows via journal-driven recovery.
+
+| `bulk_load/10000` (fair, batched/grouped) | time |
+|---|---|
+| **ForgeDB (`bulk_load_grouped`)** | **373 ms** |
+| SQLite (one-txn batch) | 851 ms |
+| DuckDB (one-txn batch) | 1.33 s |
+
+Grouped ForgeDB beats SQLite and DuckDB at 10k rows at matched durability (10 000 rows re-measured 50.7 s → 373 ms, ~136×; the per-row barrier cost falls from ~10 ms to ~37 µs). Two caveats keep this honest. First, do not compare against the per-row `bulk_load_posts` path — that is the anti-pattern, not a fair number. Second, the residual for one very large transaction is the commit-time full reindex (`__reindex_committed` rebuilds the model's `id_to_row` plus indexes, superlinear in one giant txn), so moderate batch sizes beat one all-in-one transaction; an FK is validated against committed rows, so a batch must commit parents before children.
+
+## Reads and traversals
+
+Point and probe latency, all in-process, smaller is faster:
+
+| scenario | ForgeDB | SQLite | redb | DuckDB | PostgreSQL |
+|---|---|---|---|---|---|
+| `point_lookup` | 3.48 µs | — | 0.62 µs | 87 µs | 26 µs |
+| `index_probe` | 3.67 µs | — | 1.11 µs | 83 µs | 28.9 µs |
+| `reverse_fk` | 36.9 µs | — | 3.94 µs | 106 µs | 32.4 µs |
+| `m2m` | 5.94 µs | — | 1.62 µs | 196 µs | 59.5 µs |
+
+<Callout type="note" title="redb's B-tree beats ForgeDB on point reads">
+redb wins point lookups and reverse-FK traversal — the gap is real. ForgeDB full-materializes each child record on `reverse_fk`, which is the largest residual. DuckDB loses every point op by 1–2 orders of magnitude, expected for a columnar analytical engine. PostgreSQL's latencies are the client/server round-trip, the cost that axis exists to show.
+</Callout>
+
+The residuals are mechanical, not mysterious. redb's B-tree `get` beats ForgeDB's generated `id_to_row` lookup plus positional column read on `point_lookup`, and its 2-table hop beats the generated `index_probe`. The `reverse_fk` gap is the widest: ForgeDB runs `find_by`+`get` and materializes the full record for every child, whereas redb walks a multimap of packed value blobs. DuckDB's columnar layout is the wrong shape for row-at-a-time access, which is why a single point op costs ~23× a ForgeDB read and ~90× a redb read. PostgreSQL's 26–60 µs is parse + plan + IPC over the socket; it still beats DuckDB's point lookup despite the socket, because columnar is worse for point ops than the round-trip is.
+
+## Scans and aggregates
+
+DuckDB is built to win these, and it does; showing that is honest. Two shapes run over the 10 000-post corpus: `scan_aggregate` is `COUNT + SUM(views) WHERE published` (a full-table aggregate), and `scan_sort_top10` is the top-10 posts by `views (>= 50 000)` (a filtered scan, sort, and page).
+
+| scenario | ForgeDB (before) | ForgeDB (now) | SQLite | redb | DuckDB |
+|---|---|---|---|---|---|
+| `scan_aggregate` | 32.4 ms | **568 µs** (186 µs w/ `@projection`) | 352 µs | 632 µs | **92 µs** |
+| `scan_sort_top10` | 32.6 ms | **37 µs** (index) | 4.35 µs | 809 µs | 491 µs |
+
+The original 32 ms was not a columnar-layout penalty. `__scan_all` walked `id_to_row.values()` in hashmap (random) order and did a positional `read_*` syscall per column per row — roughly 80 000 `pread`s with neither columnar sequential locality nor row-store contiguity. The column-pruned scan iterates the live rows in physical order and bulk-loads each scanned column once with `FixedColumn::gather_buffered` / `VariableColumn::gather_buffered` — a zero-copy `mmap` alias of the dense prefix in the churn-free case, else one gathered copy — then decodes from memory through the same per-field decoder `read_at` uses. A single `Tombstones::live_indices` read replaces the per-row liveness check. That is two bulk reads per column instead of a syscall per row per column, dropping `scan_aggregate` to 568 µs (ahead of redb, behind SQLite). A declared `@projection(agg: views, published)` bulk-loads only the aggregated columns and never the `title` `String`, dropping it to 186 µs, which beats both. The residual against DuckDB is that ForgeDB still materializes a narrow row and folds row-wise rather than vectorized — the read-path shape, not the mutation model.
+
+`scan_sort_top10` became index-served. `views: ^u64` gets a parallel `BTreeMap` ordered index keyed by the typed value, alongside the untouched exact-match hash index, and a generated `find_by_views_range(min, max, descending, limit)` walks it in O(offset+limit) — the same ordered-range shape SQLite's B-tree `idx_post_views` uses, which is why comparing them is apples-to-apples. The residual 37 µs versus SQLite's 4.35 µs is the 10 full-record `get()`s (each ≈ the 3.5 µs point-lookup materialize), not the index walk. The ordered index covers non-nullable `u32/u64/i32/i64/timestamp/decimal`; `f64` (no clean total order) and nullable are deferred, and hash indexes remain exact-match only with no range or prefix support.
+
+## Footprint
+
+On-disk bytes for a shared 41 500-row corpus (1 000 users + 10 000 posts + 500 tags + 30 000 M2M links), each engine loaded via its simplest durable path and measured after a checkpoint:
+
+| engine | on-disk |
+|---|---|
+| **ForgeDB** | **1.88 MB** |
+| DuckDB | 4.01 MB |
+| SQLite | 4.80 MB |
+| redb | 8.54 MB |
+
+ForgeDB has the smallest footprint — ~2.6× smaller than SQLite, ~4.5× smaller than redb — which is the flip side of the slower point reads. Columnar files pack a column's values contiguously with no per-row B-tree page overhead and no per-row key repetition. redb is largest because a B-tree KV stores the full 16-byte key beside every value in every table and repeats ids across the secondary and multimap index tables.
+
+<Callout type="warning" title="Updates grow storage until compaction">
+Updates and deletes append superseding or tombstoned versions (append-only storage), so storage **grows** with churn. Measured: 2 000 updates to one user grew a table to 247.3 KB; in-process `compact()` reclaimed it to 84.3 KB (66%). See [compaction](/docs/config/storage/).
+</Callout>
+
+The churn is the cost side of append-only storage, and it is measured rather than hidden. Each update appends a new row version; `compact()` reclaims the dead versions in place off the hot write turn. This is the tradeoff append-only buys elsewhere — snapshots, lock-free readers, and MVCC with no `xmin`/`xmax` — priced against churn growth and version indirection.
+
+## Concurrency under a live writer
+
+Reads are lock-free. The run captures a `DatabaseReader` and a `DatabaseSnapshot`, moves the writable `Database` into a background thread that inserts continuously, and points N reader threads at the captured handle. If reads serialized against the writer, the `(+writer)` column would collapse toward the writer's rate.
+
+| readers | reads/s (idle) | reads/s (+writer) | writer writes/s |
+|---|---|---|---|
+| 1 | 274 644 | 271 262 | 273 |
+| 2 | 295 867 | 302 747 | 265 |
+| 4 | 338 970 | 334 061 | 264 |
+| 8 | 139 621 | 164 031 | 271 |
+
+The `(+writer)` column stays within noise of idle at 1, 2, and 4 readers: a live writer does not throttle reads, which confirms the single-writer, concurrent-reader model. The writer's ~270 inserts/s corroborates one `F_FULLFSYNC` barrier per insert (~3.7 ms ⇒ ~270/s; the earlier double barrier would be ~135/s). Two limits hold. This is one writer plus N readers, the v1 contract. And each reader sees a snapshot: rows appended after it captured its handle are invisible, which is the isolation guarantee, not a miss. Read throughput scales to about 4 threads then falls off at 8, past this host's performance-core count — scheduling and oversubscription, not a lock.
+
+## Where ForgeDB wins and loses
+
+**Wins:** cold bulk load with no parser, matched-durability write parity, the fastest relaxed write tier, the smallest footprint, no-network latency, and generated relation traversal with no runtime join planner.
+
+**Loses (fine to show):** point reads versus redb's B-tree; reverse-FK, which full-materializes each child today; analytical aggregates versus DuckDB's vectorized fold; and anything needing a range or prefix index beyond the ordered index, since hash indexes are exact-match only.
+
+These are not four verdicts on one storage decision. They separate into independent axes: columnar layout (kept — smallest footprint), append-only mutation (the axis under study — it buys snapshots, lock-free readers, and MVCC, at the cost of churn growth), durability policy (the `F_FULLFSYNC` barrier, orthogonal to layout), and generated-read-path quality (fixable in codegen and index choice, as the scan and ordered-index work shows).
+
+## Running
+
+```bash
+make bench            # embedded suites (ForgeDB + SQLite + redb + DuckDB)
+make bench-footprint  # on-disk footprint + ForgeDB churn bloat
+make bench-concurrency# reader throughput under a live writer
+```
+
+All targets run from the repo root and pass `--manifest-path benchmarks/Cargo.toml`; there is no need to `cd` into `benchmarks/`. Full methodology, the concurrency and configuration matrices, and per-engine cuts live in `docs/BENCHMARKS.md`. The durability lever behind the two write tiers is [`[storage].fsync`](/docs/config/storage/); the crash-safety model the barrier guarantees is [durability](/docs/features/durability/).

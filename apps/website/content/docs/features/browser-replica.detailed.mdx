@@ -1,0 +1,50 @@
+---
+title: "Browser read-replica"
+description: "The WASM read-replica — the same generated database.rs running in the browser, following the durable replication broker over /replicate, persisting to IndexedDB or OPFS. Read-only and local-first, not \"faster\"."
+purpose: "orientation"
+structure: "C"
+---
+The browser read-replica is the **same generated `database.rs`** compiled to `wasm32`, running in a Web Worker as a read-only follower. It catches up from the server's durable replication broker over `/replicate`, persists per-column files to IndexedDB or OPFS, and answers arbitrary generated queries against a local store. Your UI queries a local WASM instance instead of the network, with the same filter, sort, index, traversal, and snapshot semantics as the server, byte-for-byte.
+
+<Callout type="warning" title="It's a local-first store, not a faster store">
+The replica is **not** a "faster store." It is a local-first, identity-preserving store that runs the *same* generated code as the server. Justify it on local querying, offline reads, and cross-entity consistency, not on beating V8 at raw compute. For most apps, a well-cached TypeScript SDK plus a subscribe-WS is the lighter, faster-to-first-paint default.
+</Callout>
+
+## How it works
+
+The replica compiles the generated `database.rs` to `wasm32` with **zero codegen branches**. The storage facade absorbs the target difference: `forgedb-storage` is a `cfg` re-export that resolves to `forgedb-storage-web` on `wasm32`, so generated code keeps `use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};` verbatim and stays byte-identical across targets. A pure-TypeScript store would be a second implementation of all field-aware query logic that must stay bit-identical to the Rust engine forever, a permanent drift surface the single-implementation design avoids.
+
+The engine runs inside a dedicated Web Worker; the main thread holds a generated `ReplicaClient` RPC shim that calls into it (`open`, `applyWire`, `commit`, `watermark`).
+
+Replication is fed by the durable broker in `forgedb-changefeed::durable`. The server records each committed change to a CRC-framed, append-only replication log at a monotonic global offset (the opaque cross-model ordering token). The replica connects to `/replicate?after=<offset>` and receives `PersistedEvent { offset, model, row_index, kind, bytes }` frames on the wire (`PersistedEvent::to_wire`). It decodes each with `from_wire` and replays it through the generated `apply_frame`: dispatch is by the opaque `model` tag, ordering is by the broker `offset`, and the committed row `bytes` are applied verbatim. No field is ever decoded during routing.
+
+Persistence goes through the `storage-web` backend, which writes one file per column with byte-identical positional layout to the native engine, so partial fault-in and the manifest/backup format work unchanged. Under OPFS the columns are discrete per-column files. Because the engine runs in a Worker, the storage arena faults columns in **synchronously** from OPFS sync-access handles (`createSyncAccessHandle`, a Worker-only API): untouched columns never load, and an index rebuild on reopen reads only the indexed columns. First paint is architecturally protected, because wasm fetch, compile, instantiate, and hydration all happen off the main thread; the initial render uses SSR data, a loading state, or a network fetch, and the local store becomes queryable a beat later.
+
+## Resume semantics
+
+`open` hydrates the in-memory arenas from OPFS/IDB via `persist::hydrate`, reads the persisted resume offset from a `_watermark` arena blob (`watermark_key`), and returns it so the caller reconnects with `/replicate?after=W`. `applyWire` decodes one frame with `PersistedEvent::from_wire`, replays it through `apply_frame`, and advances the watermark only when the frame's `offset` exceeds the current one. Because frames are ordered and idempotent by absolute offset, a return visit resumes cleanly: hydrate from the persisted watermark `W`, connect `after=W`, catch up the bounded gap (durable replay stitched to the live tail), and stay live, with **0 frames re-applied**. A dropped connection resumes from the stored offset with no refetch.
+
+`persist` writes in a crash-recoverable order: the grown column tails first, then the watermark marker last. If a persist is interrupted, the watermark still points at a fully-durable prefix, so the next `open` reconnects from a position the local columns can back.
+
+| Visit | What it pays | Outcome |
+| --- | --- | --- |
+| Cold (first) | wasm download + compile + hydrate + catch-up | A genuine tax versus a plain network fetch. |
+| Warm (return) | HTTP cache + persisted OPFS; resume from stored `W` | Skips re-downloading the dataset; 0 frames re-applied. Where the replica clearly wins. |
+
+## When to reach for it
+
+The replica earns its cost in three places, mostly *not* raw speed. **Identity** is the real reason: it is literally the same generated code as the server, so there is no second query engine to keep bit-identical. **Scale** is the one place it wins on performance: at tens of thousands of rows and up, packed columnar `ArrayBuffer`s with tight decode loops and lazy fault-in beat a JS object graph on memory (no per-object header overhead, no pointer chasing) and avoid GC pauses on scan, filter, and sort. And the **opaque-byte format** is shared: `apply_frame` replays the `/replicate` row bytes through the same write path, and `storage-web` persists them with the native positional layout, so a pure-TS store would have to re-invent both the decode path and an IDB schema.
+
+Against a well-cached SDK, the line is where a *cache* stops being enough and you want a *replica*. A query cache only knows what it has fetched, so a novel filter, sort, or relation traversal is a cache miss and a round trip; the replica answers arbitrary generated queries locally. The cache holds the slices you've seen; the replica holds the whole tenant dataset offline. A normalized cache assembles views from independently-fetched slices that can disagree; the replica gives watermark snapshot consistency, including many-to-many traversal, locally.
+
+Connection economics differ too. The replica uses one durable stream per client and pushes query cost to the client; the SDK realtime path uses potentially many per-view live queries and keeps query cost on the server, where each live query re-runs `all() + filter` at O(rows) per matched event per connection, with no coalescing. The SDK's plain REST reads also ride the full HTTP caching stack (CDN, HTTP cache, ETags), which a WebSocket bypasses. The clean framing: the replica replaces both the SDK read-cache and its subscribe-WS with one local queryable store fed by one durable stream, trading the wasm cold-start tax and HTTP-layer caching for local query execution.
+
+## Limits
+
+- **Read-only.** The replica is a read-only follower today. Writes still round-trip to the server, so there is no write-latency or offline-write advantage yet; the advantage is entirely on the read/query side.
+- **Not a compute win on small data.** V8 is fast at object manipulation, and crossing the JS-to-wasm-to-Worker boundary has real per-call cost. The wins are identity, scale at tens of thousands of rows and up, and the opaque-byte format, not raw FLOPS. An app holding a few thousand rows and doing many small reads is plausibly faster and lighter in pure TS.
+- **Cold-start tax is real and unmeasured per schema.** The `.wasm` binary is a separate sibling asset (hundreds of KB to low-MB depending on schema and features); its size, compile time, and time-to-first-local-query are not yet benchmarked, so any perf pitch needs real cold/warm numbers, not the compile-test proofs that exist today.
+- **Live-query scaling on the SDK path.** The realtime SDK surface re-runs `all() + filter` at O(rows) per matched event per connection, with no coalescing or debounce. This caps how far the SDK realtime path scales before the replica, which moves that cost client-side, becomes the only answer.
+- **No wall-clock time-travel** locally either. Snapshot tokens are row-count watermarks, not instants (see [Point-in-time reads](/docs/features/snapshot-reads/)).
+
+See [Live queries & change feed](/docs/features/live-queries/) for the in-process realtime surfaces on the SDK path.

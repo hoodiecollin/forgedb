@@ -4,18 +4,11 @@ description: "Atomic generated transactions, optimistic concurrent writers, a mu
 purpose: "orientation"
 structure: "C"
 ---
-
-ForgeDB gives you an atomic transaction boundary and a path from a single in-process writer
-up to multiple writer processes on one machine. It is built as three strict-superset tiers
-over the existing append-only / watermark engine — **no `xmin`/`xmax`, no per-row version
-metadata, no on-disk format break.** Each tier adds capability without changing the storage
-model beneath it.
+ForgeDB gives you an atomic transaction boundary and a way to grow from one writer to several writer processes on a single machine. It is built in three tiers over the existing append-only engine, each adding capability without changing the on-disk format — no per-row version columns, no rewrite of stored data.
 
 ## Tier 1 — generated transactions
 
-A single writer wraps work in `db.transaction(|tx| … )`. Staged appends become visible
-**atomically** at commit (advance the watermark + fsync the WAL); a rollback truncates every
-touched column back to its pre-transaction length and rolls the per-model WAL tail back.
+Wrap a group of writes in `db.transaction(|tx| … )`. Everything staged inside becomes visible together at commit, or not at all. If the closure returns an error, every touched row is rolled back to where it started.
 
 ```rust
 db.transaction(|tx| {
@@ -26,8 +19,7 @@ db.transaction(|tx| {
 // Either both rows are visible, or neither is.
 ```
 
-Atomic **multi-model** commit rides a transaction journal (`_txn_journal.log`, reusing the
-WAL's opaque framing), so a commit spanning several models is all-or-nothing across them.
+A transaction can span several models and still commit all-or-nothing across them.
 
 <Callout type="note" title="FK visibility within a transaction">
 A foreign key validates against rows **visible to the transaction** — committed rows *plus*
@@ -38,47 +30,32 @@ across *separate* transactions, the child's parent must already be committed.)
 
 ## Tier 2 — optimistic concurrent writers
 
-Tier 2 lets many transactions **prepare concurrently** while commit is **serialized**. The
-`forgedb-txn` substrate crate provides a `CommitSequencer`: at the serialized commit point it
-assigns a monotonic commit LSN and detects write-write conflicts over an in-memory
-`id → last-committer` map. Losers roll back (the Tier-1 truncate) and retry.
-
-The conflict map is purely in-memory — rebuilt empty on open, never persisted — so Tier 2
-adds no on-disk format change. `forgedb-txn` is schema-agnostic and knows no model or field.
+Many transactions can do their work at the same time; only the final commit happens one at a time. At that point ForgeDB checks whether two writers touched the same row. If they did, the later one rolls back and retries. Nothing is stored for this check — it lives in memory only, so Tier 2 adds nothing to the on-disk format.
 
 ## Tier 3 — multi-process writers (single machine)
 
-Tier 3 coordinates multiple writer **processes** on one machine. A standalone coordinator
-process holds the single-writer directory lock on behalf of all clients and serializes the
-commit turn:
+Tier 3 lets several separate processes write to the same data directory on one machine. You run a coordinator process:
 
 ```bash
 forgedb coordinate ./data
 ```
 
-Coordinated clients then open **lock-free** and connect to the coordinator:
+Each writer connects to it instead of taking the directory lock itself:
 
 ```rust
 // Connect-first; no DirLock held by the client.
 let db = Database::connect("./data".into(), "/path/to/coordinator.sock")?;
 ```
 
-The coordinator (`forgedb-coordinator` substrate) is a pure **control plane** — it holds the
-lock, serializes the commit turn, and sequences the LSN, but has **no `forgedb-storage`
-dependency** and never writes columns or decodes row bytes. The schema-aware column write
-stays in generated data-plane code, run under a granted turn. A coordinated writer is also a
-lightweight follower: it re-derives peer appends from disk so other writers' committed rows
-become visible, applying only the delta of new rows on the coordinator's log-tail signal.
+The coordinator hands out the write turn and never touches your data — the actual column writes stay in each process's generated code. Each writer also picks up other writers' committed rows automatically.
 
-If no coordinator is running, `connect` returns `CoordinatorUnavailable` (surfaced as HTTP
-503). A coordinated client and a standalone self-locking writer are mutually exclusive.
+If no coordinator is running, `connect` fails with `CoordinatorUnavailable` (HTTP 503). A process that uses the coordinator and a plain single-process writer cannot run against the same directory at the same time.
+
+**Single machine only.** Tier 3 coordinates processes on one host. Writers spread across multiple machines are a separate future product, not this tier.
 
 ## Group commit — fast bulk loads
 
-A per-row `insert` pays one fsync barrier each, which dominates bulk loads. Group commit
-rides the Tier-1 transaction: rows staged inside a transaction use a **buffered** WAL append
-(no per-record fsync), and durability is the single WAL flush + column barrier already done
-at commit. A whole transaction pays **one** barrier instead of one per row.
+Each single `insert` normally waits for its own disk flush, and that flush dominates bulk loads. Put the rows inside a transaction and the whole batch pays one flush instead of one per row.
 
 ```rust
 // One fsync barrier for the whole batch, not one per row.
@@ -90,10 +67,7 @@ db.transaction(|tx| {
 })?;
 ```
 
-This is durability-correct: staged rows are invisible (past the watermark) until commit, and
-the commit flushes the staged WAL durable **before** writing the journal commit marker, so a
-crash before the commit loses only not-yet-committed data. The single-write committed path is
-unchanged and keeps its per-op fsync.
+This stays crash-safe: staged rows are invisible until commit, and a crash before commit loses only data that was never committed. The ordinary single-write path is unchanged and keeps its per-write flush.
 
 <Callout type="tip" title="Prefer moderate batches over one giant transaction">
 Once the fsync barrier is removed, a single very large transaction's commit-time reindex
@@ -103,13 +77,13 @@ generally load faster than one enormous transaction.
 
 ## Limits
 
-- **Concurrent prepare, serialized commit.** The ceiling is one physical append point per
-  column, so writers prepare in parallel but commit serially — the serialized section
-  includes the committing writer's fsync. True parallel append needs segmented columns (a
-  separate, larger effort).
-- **Single machine.** Tier 3 coordinates processes on one host over Unix sockets. Multi-machine
-  writers (network + consensus) are a separate future product, not this tier.
-- Group commit reduces fsyncs, not the commit-time reindex cost of a single huge transaction.
+- **Concurrent prepare, serialized commit.** Writers prepare in parallel but commit one at a
+  time, and that serialized step includes the committing writer's disk flush. Truly parallel
+  appends would need a larger change to the storage layout.
+- **Single machine.** Tier 3 runs on one host, over Unix sockets. Multi-machine writers are a
+  separate future product.
+- Group commit removes the per-row flush; it does not reduce the cost of rebuilding indexes at
+  commit time for one very large transaction.
 
 See [Durability & crash safety](/docs/features/durability/) for the single-writer directory
 lock these tiers build on.
