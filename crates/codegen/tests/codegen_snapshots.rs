@@ -6244,6 +6244,20 @@ fn test_go_generation_binding() {
     // M2M snapshot-scoped `_at` traversal getter (takes a *Snapshot).
     assert!(code.contains("snap *Snapshot, id string) ([]"), "an M2M _at getter over a snapshot");
 
+    // Arrow columnar export (separate file; only when exportable columns exist).
+    assert!(GoGenerator::needs_arrow(&schema), "schema has arrow-exportable columns");
+    let arrow = GoGenerator::generate_arrow(&schema).expect("arrow file emitted").code;
+    assert!(arrow.contains("arrow-go/v18/arrow/cdata"), "imports arrow-go cdata");
+    assert!(arrow.contains("cdata.ImportCArray("), "imports the FFI C-Data-Interface export");
+    assert!(
+        arrow.contains("func (db *DB) ExportReadingValueArrow() (arrow.Array, error)"),
+        "a per-column Export<Model><Field>Arrow method (i64 value column)"
+    );
+    assert!(arrow.contains("C.forgedb_reading_value_export_arrow("), "calls the FFI export symbol");
+    // The arrow-go require lands in go.mod only when needed.
+    assert!(GoGenerator::go_mod_scaffold("forgedb", true).contains("arrow-go/v18"), "go.mod pins arrow-go when needed");
+    assert!(!GoGenerator::go_mod_scaffold("forgedb", false).contains("arrow-go"), "no arrow dep when unneeded");
+
     // Identity red line: no generic runtime query surface, ever.
     for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."] {
         assert!(!code.contains(forbidden), "must not emit generic query surface: {forbidden}");
@@ -6258,7 +6272,13 @@ fn test_go_calls_match_ffi_symbols() {
     // derivation); this proves the two never disagree, so the Go binding can
     // never reference a nonexistent C symbol.
     let schema = go_binding_schema();
-    let go_code = GoGenerator::generate(&schema).unwrap().code;
+    // Concatenate every generated Go file so the guard also covers the arrow +
+    // async-bridge C calls, not just the main package file.
+    let mut go_code = GoGenerator::generate(&schema).unwrap().code;
+    go_code.push_str(&GoGenerator::generate_async_bridge().code);
+    if let Some(arrow) = GoGenerator::generate_arrow(&schema) {
+        go_code.push_str(&arrow.code);
+    }
     let ffi_flat: String = FfiGenerator::generate(&schema)
         .unwrap()
         .code
