@@ -58,11 +58,13 @@ pub mod wasm;
 pub mod ffi;
 pub mod pyo3;
 pub mod napi;
+pub mod go;
 
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
 pub use ffi::FfiGenerator;
+pub use go::GoGenerator;
 pub use napi::NapiGenerator;
 pub use openapi::OpenApiGenerator;
 pub use pyo3::PyO3Generator;
