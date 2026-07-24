@@ -19,6 +19,15 @@ export interface DocFile {
   content: string;
 }
 
+/**
+ * The URL segment that selects a Build-C page's detailed-native body. A page
+ * `foo.mdx` (terse, canonical) may have a sibling `foo.detailed.mdx` rendered
+ * at `/docs/.../foo/detailed/`. Both are statically generated; the terse body
+ * is canonical and search-indexed, the detailed variant is reached via the
+ * on-page toggle.
+ */
+export const DETAILED_SEGMENT = "detailed";
+
 /** Recursively collect every `.mdx` file under content/docs as slug arrays. */
 export function getAllDocSlugs(): string[][] {
   const out: string[][] = [];
@@ -27,6 +36,10 @@ export function getAllDocSlugs(): string[][] {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) {
         walk(full, [...prefix, entry.name]);
+      } else if (entry.isFile() && entry.name.endsWith(".detailed.mdx")) {
+        // `foo.detailed.mdx` -> ["...", "foo", "detailed"] (its own route).
+        const base = entry.name.replace(/\.detailed\.mdx$/, "");
+        out.push([...prefix, base, DETAILED_SEGMENT]);
       } else if (entry.isFile() && entry.name.endsWith(".mdx")) {
         const base = entry.name.replace(/\.mdx$/, "");
         out.push(base === "index" ? prefix : [...prefix, base]);
@@ -37,7 +50,24 @@ export function getAllDocSlugs(): string[][] {
   return out;
 }
 
+/** Whether a slug names a Build-C detailed variant with a backing file. */
+export function isDetailedSlug(slug: string[]): boolean {
+  if (slug.length === 0 || slug[slug.length - 1] !== DETAILED_SEGMENT) return false;
+  return fs.existsSync(path.join(DOCS_DIR, ...slug.slice(0, -1)) + ".detailed.mdx");
+}
+
+/** Whether a (base, non-detailed) slug has a detailed-native sibling — i.e. a Build-C page. */
+export function hasDetailedVariant(slug: string[]): boolean {
+  if (slug.length === 0) return false;
+  return fs.existsSync(path.join(DOCS_DIR, ...slug) + ".detailed.mdx");
+}
+
 function fileForSlug(slug: string[]): string | null {
+  // A detailed variant resolves to its `.detailed.mdx` sibling, when present.
+  if (slug.length >= 1 && slug[slug.length - 1] === DETAILED_SEGMENT) {
+    const detailed = path.join(DOCS_DIR, ...slug.slice(0, -1)) + ".detailed.mdx";
+    if (fs.existsSync(detailed)) return detailed;
+  }
   const candidates =
     slug.length === 0
       ? [path.join(DOCS_DIR, "index.mdx")]
@@ -91,9 +121,13 @@ export function getDocBySlug(slug: string[]): DocFile | null {
   };
 }
 
-/** Load every doc (used by the search-index builder). */
+/**
+ * Load every canonical doc (used by the search-index builder). Detailed-native
+ * Build-C variants are excluded — the terse body is the canonical, indexed page.
+ */
 export function getAllDocs(): DocFile[] {
   return getAllDocSlugs()
+    .filter((slug) => !isDetailedSlug(slug))
     .map((slug) => getDocBySlug(slug))
     .filter((d): d is DocFile => d !== null);
 }
