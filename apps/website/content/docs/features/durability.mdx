@@ -4,57 +4,19 @@ description: "How generated writes stay crash-safe — a per-model write-ahead l
 purpose: "orientation"
 structure: "C"
 ---
-
-Generated ForgeDB writes are crash-safe. Every `insert`/`update`/`delete` durably records
-what it is about to do **before** it touches the columnar storage files, so a crash — even
-`kill -9` mid-write — never loses an acknowledged row and never corrupts the data
-directory. This is generated per model over the schema-agnostic `forgedb-wal` and
-`forgedb-storage` substrate crates; there is no runtime engine reading your schema.
+Writes are crash-safe. If the process is killed mid-write — even with `kill -9` — you never lose a row that was already acknowledged, and the data directory never ends up corrupt. ForgeDB generates this write path per model; nothing reads your schema at runtime.
 
 ## The durable write path
 
-The storage engine is append-only columnar: a write appends bytes to positional column
-files and never mutates committed bytes. On top of that, each model gets a per-model
-**write-ahead log (WAL)**. The order is load-bearing:
-
-1. The write serializes the record to an **opaque row blob** and appends it to the model's
-   WAL, then fsyncs (`FsyncPolicy::Always`). The WAL entry is schema-blind — CRC-framed
-   bytes at an absolute row index, never a decoded field.
-2. Only after the WAL is durable does the write append to the columns.
-
-Because the WAL commit happens first, a crash between step 1 and step 2 leaves a WAL entry
-with no corresponding (or a half-written) column tail — which recovery repairs.
-
-<Callout type="note" title="Why write the WAL first">
-If columns were written first and the process died mid-append, you'd have a torn row with
-no record of the intended value. Journaling the opaque blob first means recovery always
-has an authoritative copy of every acknowledged write to replay.
-</Callout>
+Every `insert`, `update`, and `delete` first records what it is about to do in a per-model log, flushes that record to disk, and only **then** writes the data columns. Because the log lands first, a crash partway through leaves behind a record that recovery can replay.
 
 ## Recovery and torn-tail repair
 
-Recovery runs on open (`Database::open_at`), per model, via a generated
-`recover_from_wal`:
-
-- It derives the durable, self-consistent column prefix from the **column file lengths**
-  themselves — every committed column's byte length is a pure function of the row count
-  plus the fixed layout, so no persisted checkpoint marker is load-bearing.
-- It **truncates a torn column tail** back to that minimum-consistent prefix
-  (`truncate_to_rows`), discarding a half-written row.
-- It then **idempotently replays the WAL tail** by absolute row index, restoring any
-  acknowledged write whose column bytes didn't make it.
-
-This has been proven end to end: torn-tail repair, recovery of a lost committed row, and an
-unclean crash mid-run that loses **zero** acknowledged rows. Run the proof yourself with
-`make crash-test` — it generates real database code, inserts rows, `abort()`s the process
-without a clean shutdown or flush, then reopens in a fresh process and asserts every committed
-row survives (plus a torn-WAL-tail discard).
+On open, ForgeDB checks each model, discards any half-written row at the end of the columns, and replays the log to restore anything that was acknowledged but never reached the columns. You can run the proof yourself with `make crash-test`: it generates real database code, inserts rows, kills the process with no clean shutdown, reopens in a fresh process, and asserts every committed row survived.
 
 ## Single-writer directory lock
 
-`open_at` acquires a `forgedb_storage::DirLock` on the data directory. A second writer
-process refuses to open rather than risk corrupting the append-only files. This is the v1
-contract: **single writer per process, per data directory.**
+One process writes to a data directory at a time. A second writer that tries to open the same directory is refused rather than allowed to race. This is the v1 contract: single writer per process, per data directory.
 
 <Callout type="warning" title="Single-writer-per-process is the v1 contract">
 Concurrent writers are not handled by simply opening the directory twice — the lock refuses
@@ -64,22 +26,11 @@ that. Multi-process writes are coordinated by a separate control plane; see
 
 ## Bounding the WAL — checkpointing
 
-Left alone, the WAL would grow forever. A generated `checkpoint()` bounds it:
-
-1. It fsyncs every column and tombstone file (columns durable **first** — load-bearing).
-2. Only then does it truncate the WAL.
-
-Checkpointing is auto-invoked once a model accumulates a threshold of writes
-(`WAL_CHECKPOINT_INTERVAL`), and `Database::checkpoint()` forces it across all collections.
-Recovery is unchanged and still correct after a checkpoint: it derives the durable prefix
-from column file lengths, not from a persisted checkpoint LSN, so no durable marker is
-load-bearing. The WAL stays bounded — sawtoothed, not monotonically growing — and a crash
-after a checkpoint recovers only the small post-checkpoint tail, not the whole history.
+Left alone, the log would grow forever. So ForgeDB flushes the columns to disk and then trims the log once a model has taken a set number of writes. The log sawtooths instead of growing without bound, and a crash right after a trim only has to replay the small recent tail.
 
 ## Configuring durability
 
-The fsync policy is not hard-coded. The `[storage].fsync` knob controls the fsync barrier
-for all WALs, the transaction journal, and the replication broker:
+Fsync is a knob, not a fixed choice:
 
 ```toml
 [storage]
@@ -87,7 +38,7 @@ fsync = "always"   # "always" | "never"
 wal_checkpoint_interval = 1000
 ```
 
-`always` (the default) fsyncs on every commit for full crash safety.
+`always`, the default, flushes on every commit for full crash safety.
 
 <Callout type="warning" title="`never` trades safety for throughput">
 Setting `fsync = "never"` removes the `F_FULLFSYNC` barrier from the write path — much
@@ -101,10 +52,10 @@ directory.
 
 ## Limits
 
-- **Single writer per process, per data directory** — enforced by the directory lock.
-- **Junction (many-to-many) link crash recovery** is outside the per-model WAL boundary: a
-  junction has no WAL, so a torn link can duplicate a pair (append-only; traversal is
-  latest-wins and not deduped).
-- The `checkpoint` interval is a generated constant tunable through
-  [`[storage].wal_checkpoint_interval`](/docs/config/storage/); `fsync` is a baked policy
-  value selected at generate time.
+- **One writer per process, per data directory** — enforced by the directory lock. Multi-process
+  writes go through a separate coordinator; see [Transactions & MVCC](/docs/features/transactions-mvcc/).
+- Many-to-many link tables have no log of their own, so a crash mid-link can leave a duplicate
+  pair. Traversal is latest-wins and does not dedupe.
+- The checkpoint interval is tunable through
+  [`[storage].wal_checkpoint_interval`](/docs/config/storage/); `fsync` is baked in when you
+  generate, not changed at runtime.

@@ -1,0 +1,118 @@
+---
+title: "Durability & crash safety"
+description: "How generated writes stay crash-safe — a per-model write-ahead log fsynced before columns, torn-tail recovery, a single-writer directory lock, and a bounded WAL."
+purpose: "orientation"
+structure: "C"
+---
+Generated ForgeDB writes are crash-safe. Every `insert`/`update`/`delete` durably records
+what it is about to do **before** it touches the columnar storage files, so a crash — even
+`kill -9` mid-write — never loses an acknowledged row and never corrupts the data directory.
+This path is generated per model over the schema-agnostic `forgedb-wal` and `forgedb-storage`
+substrate crates; no runtime engine reads your schema.
+
+## The durable write path
+
+The storage engine is append-only columnar: a write appends bytes to positional column files
+and never mutates committed bytes. On top of that, each model gets a per-model **write-ahead
+log (WAL)**, and the two steps run in a fixed order that recovery depends on:
+
+1. The write serializes the record to an opaque row blob and appends it to the model's WAL,
+   then fsyncs under `FsyncPolicy::Always`. The WAL entry is schema-blind: CRC-framed bytes at
+   an absolute row index, never a decoded field.
+2. Only after the WAL is durable does the write append to the columns.
+
+Committing the WAL first means a crash between step 1 and step 2 leaves a WAL entry whose
+column tail is missing or half-written, which recovery repairs.
+
+<Callout type="note" title="Why write the WAL first">
+If columns were written first and the process died mid-append, you'd have a torn row with
+no record of the intended value. Journaling the opaque blob first means recovery always
+has an authoritative copy of every acknowledged write to replay.
+</Callout>
+
+## Recovery and torn-tail repair
+
+Recovery runs on open (`Database::open_at`), per model, in a generated `recover_from_wal`:
+
+- It derives the durable, self-consistent column prefix from the **column file lengths**
+  themselves. Every committed column's byte length is a pure function of the row count plus
+  the fixed layout, so no persisted checkpoint marker is needed for correctness.
+- It truncates a torn column tail back to that minimum-consistent prefix with
+  `truncate_to_rows`, discarding a half-written row.
+- It then idempotently replays the WAL tail by absolute row index, restoring any acknowledged
+  write whose column bytes didn't reach disk. A record whose columns already landed re-appends
+  to the same index and is a no-op.
+
+The three crash windows and what recovery does with each:
+
+| Crash window | On-disk state | Recovery |
+| --- | --- | --- |
+| Before the WAL fsync | No WAL entry, no column bytes | The write was never acknowledged; nothing to restore. |
+| After WAL fsync, before columns | WAL entry present, column tail missing or torn | Truncate the torn tail, replay the WAL entry. |
+| After columns, before WAL truncate | Columns durable, WAL still holds the entry | Replay re-appends to the same index — a no-op. |
+
+This has been proven end to end: torn-tail repair, recovery of a lost committed row, and an
+unclean crash mid-run that loses **zero** acknowledged rows. Run the proof yourself with
+`make crash-test` — it generates real database code, inserts rows, `abort()`s the process
+without a clean shutdown or flush, then reopens in a fresh process and asserts every committed
+row survives (plus a torn-WAL-tail discard).
+
+## Single-writer directory lock
+
+`open_at` acquires a `forgedb_storage::DirLock` on the data directory. A second writer process
+refuses to open rather than risk corrupting the append-only files. This is the v1 contract:
+**single writer per process, per data directory.**
+
+<Callout type="warning" title="Single-writer-per-process is the v1 contract">
+Concurrent writers are not handled by simply opening the directory twice — the lock refuses
+that. Multi-process writes are coordinated by a separate control plane; see
+[Transactions & MVCC](/docs/features/transactions-mvcc/).
+</Callout>
+
+## Bounding the WAL — checkpointing
+
+Left alone, the WAL grows forever. A generated `checkpoint()` bounds it in a fixed order:
+
+1. It fsyncs every column and tombstone file (columns durable **first**).
+2. Only then does it truncate the WAL.
+
+Checkpointing auto-invokes once a model accumulates `WAL_CHECKPOINT_INTERVAL` writes, and
+`Database::checkpoint()` forces it across all collections. Recovery stays correct afterward
+because it derives the durable prefix from column file lengths, not from a persisted checkpoint
+LSN. The checkpoint order is the one part that cannot be reordered: if the WAL were truncated
+before the columns were durable, a crash in between would drop acknowledged writes with no
+record to replay. The WAL stays bounded — sawtoothed, not monotonically growing — so a crash
+after a checkpoint recovers only the small post-checkpoint tail, not the whole history.
+
+## Configuring durability
+
+The fsync policy is not hard-coded. The `[storage].fsync` knob controls the fsync barrier
+for all WALs, the transaction journal, and the replication broker:
+
+```toml
+[storage]
+fsync = "always"   # "always" | "never"
+wal_checkpoint_interval = 1000
+```
+
+`always` (the default) fsyncs on every commit for full crash safety.
+
+<Callout type="warning" title="`never` trades safety for throughput">
+Setting `fsync = "never"` removes the `F_FULLFSYNC` barrier from the write path — much
+faster, but a crash can lose recently-acknowledged writes. Use it only when the durability
+requirement genuinely allows it.
+</Callout>
+
+See [storage configuration](/docs/config/storage/) for the full set of storage knobs, and
+[Backup & restore](/docs/features/backup-restore/) for taking snapshots of a durable data
+directory.
+
+## Limits
+
+- **Single writer per process, per data directory** — enforced by the directory lock.
+- **Junction (many-to-many) link crash recovery** is outside the per-model WAL boundary: a
+  junction has no WAL, so a torn link can duplicate a pair (append-only; traversal is
+  latest-wins and not deduped).
+- The `checkpoint` interval is a generated constant tunable through
+  [`[storage].wal_checkpoint_interval`](/docs/config/storage/); `fsync` is a baked policy
+  value selected at generate time.
