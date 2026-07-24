@@ -63,6 +63,13 @@ enum GoRelOp {
         method: String,
         target: String,
     },
+    /// Snapshot-scoped M2M query getter: all linked records for a (uuid) id as of
+    /// a `*Snapshot` → `[]Target`.
+    VecAt {
+        sym: String,
+        method: String,
+        target: String,
+    },
     /// M2M link (both uuid ids) → `error`.
     Link { sym: String, method: String },
     /// M2M unlink (both uuid ids) → `(bool, error)`.
@@ -78,6 +85,11 @@ impl GoGenerator {
         let mut code = String::new();
         code.push_str(Self::file_header());
         code.push_str(SPINE);
+        code.push_str(ASYNC_SPINE);
+
+        // --- Generated enum + inline-struct types ---
+        code.push_str(&Self::enum_types(schema));
+        code.push_str(&Self::struct_types(schema));
 
         // --- Per-model row structs ---
         for model in schema.models.iter() {
@@ -87,6 +99,11 @@ impl GoGenerator {
         // --- Per-model CRUD + snapshot reads ---
         for m in &models {
             code.push_str(&Self::crud_methods(m));
+        }
+
+        // --- Per-model async CRUD (over the FFI completion bridge) ---
+        for m in &models {
+            code.push_str(&Self::async_methods(m));
         }
 
         // --- Relation traversal ---
@@ -126,7 +143,13 @@ impl GoGenerator {
                  int32_t forgedb_{s}_update(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, ForgeError** err_out);\n\
                  int32_t forgedb_{s}_delete(Db* db, const uint8_t* id, size_t id_len, ForgeError** err_out);\n\
                  bool forgedb_{s}_get_at(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
-                 bool forgedb_{s}_all_at(Db* db, const Snapshot* snap, uint8_t** out, size_t* out_len, ForgeError** err_out);\n",
+                 bool forgedb_{s}_all_at(Db* db, const Snapshot* snap, uint8_t** out, size_t* out_len, ForgeError** err_out);\n\
+                 void forgedb_{s}_insert_async(Db* db, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void forgedb_{s}_get_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n\
+                 void forgedb_{s}_count_async(Db* db, uint64_t token);\n\
+                 void forgedb_{s}_all_async(Db* db, uint64_t token);\n\
+                 void forgedb_{s}_update_async(Db* db, const uint8_t* id, size_t id_len, const uint8_t* record, size_t record_len, uint64_t token);\n\
+                 void forgedb_{s}_delete_async(Db* db, const uint8_t* id, size_t id_len, uint64_t token);\n",
                 name = m.name,
                 s = s,
             ));
@@ -138,6 +161,9 @@ impl GoGenerator {
                 h.push_str(&match op {
                     GoRelOp::ForwardFk { sym, .. } | GoRelOp::Vec { sym, .. } => format!(
                         "bool forgedb_{sym}(Db* db, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
+                    ),
+                    GoRelOp::VecAt { sym, .. } => format!(
+                        "bool forgedb_{sym}(Db* db, const Snapshot* snap, const uint8_t* id, size_t id_len, uint8_t** out, size_t* out_len, ForgeError** err_out);\n"
                     ),
                     GoRelOp::Link { sym, .. } => format!(
                         "bool forgedb_{sym}(Db* db, const uint8_t* left, size_t left_len, const uint8_t* right, size_t right_len, ForgeError** err_out);\n"
@@ -156,10 +182,27 @@ impl GoGenerator {
         })
     }
 
+    /// The `forgedb_async.go` companion file: the exported cgo completion
+    /// callback. It MUST be separate from `forgedb.go` because cgo forbids C
+    /// definitions in the preamble of any file that uses `//export`, and
+    /// `forgedb.go` carries the registration shim (a definition). Schema-invariant.
+    pub fn generate_async_bridge() -> GeneratedCode {
+        GeneratedCode {
+            description: "Go async completion bridge (//export callback)".to_string(),
+            code: ASYNC_BRIDGE_FILE.to_string(),
+        }
+    }
+
     /// A `go.mod` for the generated Go package. User-editable, so the CLI writes
     /// it ONLY when absent (like every other binding scaffold).
     pub fn go_mod_scaffold(module: &str) -> String {
         format!("module {module}\n\ngo 1.21\n")
+    }
+
+    /// A `README.md` documenting the build order and cgo caveats. Written only
+    /// when absent (a scaffold, like `go.mod`).
+    pub fn readme_scaffold() -> &'static str {
+        README_SCAFFOLD
     }
 
     // --- Derivation (shared by `generate` and `generate_header`) --------------
@@ -292,11 +335,17 @@ impl GoGenerator {
                     sym: fwd_name,
                     target: m.model2.clone(),
                 });
-                // Reserve the snapshot-scoped `_at` name in `seen` (not surfaced
-                // as a Go method in this first cut) so downstream families dedup
-                // exactly as the FFI derivation does.
+                // The snapshot-scoped forward getter (inserted into `seen` at the
+                // same point as the FFI derivation, so downstream families dedup
+                // identically).
                 let fwd_at_name = format!("{snake1}_{}_at", m.field1);
-                seen.insert(fwd_at_name);
+                if seen.insert(fwd_at_name.clone()) {
+                    ops.push(GoRelOp::VecAt {
+                        method: to_pascal_case(&fwd_at_name),
+                        sym: fwd_at_name,
+                        target: m.model2.clone(),
+                    });
+                }
             }
 
             let rev_name = format!("{snake2}_{}", m.field2);
@@ -497,6 +546,104 @@ func (db *DB) All{name}At(snap *Snapshot) ([]{name}, error) {{
         )
     }
 
+    fn async_methods(m: &GoModel) -> String {
+        let GoModel { name, snake, id_go } = m;
+        format!(
+            r#"
+// Insert{name}Async inserts a {name} on the async worker, yielding the new id.
+func (db *DB) Insert{name}Async(rec {name}) <-chan Result[{id_go}] {{
+	body, err := json.Marshal(rec)
+	if err != nil {{
+		return erroredResult[{id_go}](err)
+	}}
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_insert_async(db.ptr, bytesPtr(body), C.size_t(len(body)), t)
+	}}, func(b []byte) ({id_go}, error) {{
+		var id {id_go}
+		err := json.Unmarshal(b, &id)
+		return id, err
+	}})
+}}
+
+// Get{name}Async fetches a {name} by id on the async worker (Value nil if absent).
+func (db *DB) Get{name}Async(id {id_go}) <-chan Result[*{name}] {{
+	idBytes, err := json.Marshal(id)
+	if err != nil {{
+		return erroredResult[*{name}](err)
+	}}
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_get_async(db.ptr, bytesPtr(idBytes), C.size_t(len(idBytes)), t)
+	}}, func(b []byte) (*{name}, error) {{
+		if b == nil {{
+			return nil, nil
+		}}
+		var rec {name}
+		if err := json.Unmarshal(b, &rec); err != nil {{
+			return nil, err
+		}}
+		return &rec, nil
+	}})
+}}
+
+// Count{name}Async returns the live {name} row count on the async worker.
+func (db *DB) Count{name}Async() <-chan Result[int64] {{
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_count_async(db.ptr, t)
+	}}, func(b []byte) (int64, error) {{
+		var n int64
+		err := json.Unmarshal(b, &n)
+		return n, err
+	}})
+}}
+
+// All{name}Async returns every live {name} on the async worker.
+func (db *DB) All{name}Async() <-chan Result[[]{name}] {{
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_all_async(db.ptr, t)
+	}}, func(b []byte) ([]{name}, error) {{
+		var recs []{name}
+		err := json.Unmarshal(b, &recs)
+		return recs, err
+	}})
+}}
+
+// Update{name}Async replaces a {name} by id on the async worker (false if absent).
+func (db *DB) Update{name}Async(id {id_go}, rec {name}) <-chan Result[bool] {{
+	idBytes, err := json.Marshal(id)
+	if err != nil {{
+		return erroredResult[bool](err)
+	}}
+	body, err := json.Marshal(rec)
+	if err != nil {{
+		return erroredResult[bool](err)
+	}}
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_update_async(db.ptr, bytesPtr(idBytes), C.size_t(len(idBytes)), bytesPtr(body), C.size_t(len(body)), t)
+	}}, func(b []byte) (bool, error) {{
+		var ok bool
+		err := json.Unmarshal(b, &ok)
+		return ok, err
+	}})
+}}
+
+// Delete{name}Async deletes a {name} by id on the async worker (false if absent).
+func (db *DB) Delete{name}Async(id {id_go}) <-chan Result[bool] {{
+	idBytes, err := json.Marshal(id)
+	if err != nil {{
+		return erroredResult[bool](err)
+	}}
+	return runAsync(func(t C.uint64_t) {{
+		C.forgedb_{snake}_delete_async(db.ptr, bytesPtr(idBytes), C.size_t(len(idBytes)), t)
+	}}, func(b []byte) (bool, error) {{
+		var ok bool
+		err := json.Unmarshal(b, &ok)
+		return ok, err
+	}})
+}}
+"#
+        )
+    }
+
     fn relation_method(op: &GoRelOp) -> String {
         match op {
             GoRelOp::ForwardFk {
@@ -543,6 +690,29 @@ func (db *DB) {method}(id string) ([]{target}, error) {{
 	var outLen C.size_t
 	var e *C.ForgeError
 	ok := C.forgedb_{sym}(db.ptr, bytesPtr(idBytes), C.size_t(len(idBytes)), &out, &outLen, &e)
+	if !bool(ok) {{
+		return nil, takeError(e)
+	}}
+	var recs []{target}
+	if err := json.Unmarshal(takeBuffer(out, outLen), &recs); err != nil {{
+		return nil, err
+	}}
+	return recs, nil
+}}
+"#
+            ),
+            GoRelOp::VecAt { sym, method, target } => format!(
+                r#"
+// {method} returns the linked {target} records for the given id as of a snapshot.
+func (db *DB) {method}(snap *Snapshot, id string) ([]{target}, error) {{
+	idBytes, err := json.Marshal(id)
+	if err != nil {{
+		return nil, err
+	}}
+	var out *C.uint8_t
+	var outLen C.size_t
+	var e *C.ForgeError
+	ok := C.forgedb_{sym}(db.ptr, snap.ptr, bytesPtr(idBytes), C.size_t(len(idBytes)), &out, &outLen, &e)
 	if !bool(ok) {{
 		return nil, takeError(e)
 	}}
@@ -620,47 +790,94 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
         .to_string()
     }
 
-    /// The Go type for a struct field — a pointer for a nullable scalar, and
-    /// `json.RawMessage` for any JSON/struct/array/virtual-relation field (a
-    /// lossless passthrough that matches whatever serde emits).
+    /// The Go type for a struct field — a pointer for a nullable value type, and
+    /// `json.RawMessage` for any JSON/`char(N)`/fixed-array/virtual-relation field
+    /// (a lossless passthrough that matches whatever serde emits).
     fn go_field_type(field: &forgedb_parser::Field) -> String {
         let (base, is_raw) = Self::go_scalar_type(&field.field_type);
         if is_raw {
             // `json.RawMessage` holds `null` natively, so it already covers the
-            // nullable case (optional struct, virtual relation collection).
+            // nullable case (virtual relation collection, char/array).
             "json.RawMessage".to_string()
         } else if field.is_nullable() {
             format!("*{base}")
         } else {
-            base.to_string()
+            base
         }
     }
 
     /// Map a scalar field type to its Go type. The bool is `true` when the field
-    /// must be represented as `json.RawMessage` (JSON value, inline struct,
-    /// `char(N)`, fixed array, or a virtual relation collection).
-    fn go_scalar_type(ft: &FieldType) -> (&'static str, bool) {
+    /// must be represented as `json.RawMessage` (JSON value, `char(N)`, fixed
+    /// array, or a virtual relation collection). Enums and inline structs map to
+    /// their generated Go named types.
+    fn go_scalar_type(ft: &FieldType) -> (String, bool) {
         match ft {
-            FieldType::U32 => ("uint32", false),
-            FieldType::U64 => ("uint64", false),
-            FieldType::I32 => ("int32", false),
-            FieldType::I64 => ("int64", false),
-            FieldType::F64 => ("float64", false),
-            FieldType::Bool => ("bool", false),
-            FieldType::String | FieldType::Uuid => ("string", false),
-            // Timestamp serializes as an i64; decimal + enum serialize as strings.
-            FieldType::Timestamp => ("int64", false),
-            FieldType::Decimal => ("string", false),
-            FieldType::Enum(_) => ("string", false),
+            FieldType::U32 => ("uint32".to_string(), false),
+            FieldType::U64 => ("uint64".to_string(), false),
+            FieldType::I32 => ("int32".to_string(), false),
+            FieldType::I64 => ("int64".to_string(), false),
+            FieldType::F64 => ("float64".to_string(), false),
+            FieldType::Bool => ("bool".to_string(), false),
+            FieldType::String | FieldType::Uuid => ("string".to_string(), false),
+            // Timestamp serializes as an i64; decimal serializes as a string.
+            FieldType::Timestamp => ("int64".to_string(), false),
+            FieldType::Decimal => ("string".to_string(), false),
+            // An enum serializes as its variant-name string → its generated
+            // `type <Name> string`; an inline struct → its generated Go struct.
+            FieldType::Enum(name) => (name.clone(), false),
+            FieldType::StructType(name) | FieldType::OptionalStructType(name) => {
+                (name.clone(), false)
+            }
             // FK scalars are stored as the (uuid) reference id.
             FieldType::Relation(RelationType::RequiredReference(_))
-            | FieldType::Relation(RelationType::OptionalReference(_)) => ("string", false),
+            | FieldType::Relation(RelationType::OptionalReference(_)) => {
+                ("string".to_string(), false)
+            }
             // Nullable wraps a scalar; return the inner mapping (the `*` is added
             // by `go_field_type` via `is_nullable`).
             FieldType::Nullable(inner) => Self::go_scalar_type(inner),
             // JSON passthrough for everything whose exact shape we don't type.
-            _ => ("json.RawMessage", true),
+            _ => ("json.RawMessage".to_string(), true),
         }
+    }
+
+    /// Emit a Go named type per declared enum (`type <Name> string` + a const per
+    /// variant), matching the serde variant-name string representation.
+    fn enum_types(schema: &Schema) -> String {
+        let mut s = String::new();
+        for e in &schema.enums {
+            s.push_str(&format!(
+                "\n// {name} is a generated enum (serialized as its variant name).\ntype {name} string\n\nconst (\n",
+                name = e.name
+            ));
+            for v in &e.variants {
+                s.push_str(&format!("\t{}{} {} = \"{}\"\n", e.name, v, e.name, v));
+            }
+            s.push_str(")\n");
+        }
+        s
+    }
+
+    /// Emit a Go struct per declared inline struct (fixed-size fields only), so a
+    /// struct-typed model field is fully typed rather than `json.RawMessage`.
+    fn struct_types(schema: &Schema) -> String {
+        let mut s = String::new();
+        for st in &schema.structs {
+            s.push_str(&format!(
+                "\n// {name} is a generated inline struct.\ntype {name} struct {{\n",
+                name = st.name
+            ));
+            for field in &st.fields {
+                s.push_str(&format!(
+                    "\t{} {} `json:\"{}\"`\n",
+                    go_field_name(&field.name),
+                    Self::go_field_type(field),
+                    field.name
+                ));
+            }
+            s.push_str("}\n");
+        }
+        s
     }
 
     /// The experimental-marked file header + `package`/cgo/imports preamble.
@@ -702,14 +919,27 @@ package forgedb
 #cgo LDFLAGS: -L${SRCDIR}/../ffi/target/release -lforgedb_ffi_engine -Wl,-rpath,${SRCDIR}/../ffi/target/release
 #include <stdlib.h>
 #include "forgedb.h"
+
+// forgedbGoCompletion is the exported Go async-completion callback (defined in
+// forgedb_async.go). This preamble only DECLARES it and wraps registration in a
+// shim — the exported symbol itself must live in a file that has no C
+// definitions, per cgo's //export rule.
+extern void forgedbGoCompletion(uint64_t token, int32_t status, uint8_t* payload, size_t payload_len);
+static inline void forgedbGoRegister(void) { forgedb_set_completion_callback(forgedbGoCompletion); }
 */
 import "C"
 
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"unsafe"
 )
+
+// Build the sibling FFI cdylib this package links against. Run `go generate`
+// once (and after any schema change) before `go build`.
+//go:generate sh -c "cd ../ffi && cargo build --release"
 
 // Keep the encoding/json import used even for a schema with no id-bearing models.
 var _ = json.RawMessage(nil)
@@ -839,6 +1069,157 @@ func Version() string {
 }
 "#;
 
+/// The `README.md` scaffold: build order + cgo caveats for the Go binding.
+const README_SCAFFOLD: &str = r#"# ForgeDB Go binding (experimental)
+
+Generated Go package binding a ForgeDB app database over cgo. **Experimental** —
+the Go API and the underlying C ABI are unstable and may change without notice
+(not covered by v1 stability).
+
+## Build
+
+The package links the sibling `../ffi` crate's shared library, so build that
+first (this is what `go generate` does):
+
+```sh
+go generate ./...        # builds ../ffi via `cargo build --release`
+go build ./...
+```
+
+Equivalently, by hand:
+
+```sh
+(cd ../ffi && cargo build --release)   # emits libforgedb_ffi_engine.{dylib,so,dll}
+CGO_ENABLED=1 go build ./...
+```
+
+Regenerate `../ffi` (and re-run `go generate`) whenever the `.forge` schema
+changes — the C ABI is tailored per schema.
+
+## Caveats
+
+- **cgo is required** (`CGO_ENABLED=1`, the default with a C toolchain present).
+  A pure-Go / cross-compiled build without a C toolchain will not work.
+- **Cross-compilation** needs a matching C cross-toolchain and a `../ffi` cdylib
+  built for the target — plain `GOOS`/`GOARCH` switching is not enough.
+- **Single writer per process**: `Open` takes an exclusive directory lock, same
+  as every ForgeDB writer.
+- **Async threading contract**: do not mix the `*Async` methods with synchronous
+  methods concurrently on the same `*DB` handle — while async ops are outstanding
+  the engine's worker thread is the handle's sole accessor.
+"#;
+
+/// The static `forgedb_async.go`: the exported cgo completion callback. Its
+/// preamble contains ONLY declarations (per cgo's `//export` rule); the registry
+/// + registration shim live in `forgedb.go`.
+const ASYNC_BRIDGE_FILE: &str = r#"// Code generated by ForgeDB. DO NOT EDIT.
+//
+// EXPERIMENTAL: the async completion bridge for the Go binding. This file is kept
+// separate from forgedb.go because cgo forbids C definitions in the preamble of a
+// file that uses //export.
+package forgedb
+
+/*
+#include <stdint.h>
+#include <stddef.h>
+#include "forgedb.h"
+*/
+import "C"
+
+import "unsafe"
+
+// forgedbGoCompletion is invoked by the engine's async worker thread when an
+// async op finishes. It copies the (engine-owned) payload, frees it, and hands
+// the result to the waiting goroutine via the token registry in forgedb.go.
+//
+//export forgedbGoCompletion
+func forgedbGoCompletion(token C.uint64_t, status C.int32_t, payload *C.uint8_t, payloadLen C.size_t) {
+	var b []byte
+	if payload != nil {
+		b = C.GoBytes(unsafe.Pointer(payload), C.int(payloadLen))
+		C.forgedb_free_buffer(payload, payloadLen)
+	}
+	deliverCompletion(uint64(token), int(status), b)
+}
+"#;
+
+/// The schema-invariant async plumbing: the token→channel registry, the generic
+/// `runAsync` driver over the FFI completion bridge, and one-time callback
+/// registration. The exported completion callback itself lives in the separate
+/// `forgedb_async.go` (cgo forbids C definitions in an `//export` file).
+const ASYNC_SPINE: &str = r#"
+// Result carries the outcome of an async operation delivered on its channel.
+type Result[T any] struct {
+	Value T
+	Err   error
+}
+
+// asyncResult is the raw completion payload handed from the C callback thread.
+type asyncResult struct {
+	status  int
+	payload []byte
+}
+
+var (
+	asyncCompletions sync.Map // uint64 token -> chan asyncResult
+	asyncNextToken   atomic.Uint64
+	asyncRegister    sync.Once
+)
+
+// deliverCompletion is called (via the exported callback) on the engine's async
+// worker thread with a finished op's token + result. It hands the payload to the
+// waiting goroutine. Defined here (not in the //export file) so the registry
+// stays in one place.
+func deliverCompletion(token uint64, status int, payload []byte) {
+	if ch, ok := asyncCompletions.LoadAndDelete(token); ok {
+		ch.(chan asyncResult) <- asyncResult{status: status, payload: payload}
+	}
+}
+
+// ensureAsyncRegistered installs the process-wide completion callback exactly
+// once, lazily on the first async op.
+func ensureAsyncRegistered() {
+	asyncRegister.Do(func() { C.forgedbGoRegister() })
+}
+
+// runAsync issues an async op: it reserves a token, enqueues the C call, and
+// returns a channel that yields the decoded result on completion. `call` runs
+// synchronously (the engine reads any arg bytes before returning), so caller
+// buffers never outlive the call.
+//
+// NOTE: async and sync ops must not be used concurrently on the SAME handle —
+// while async ops are outstanding the engine's worker is the handle's sole
+// accessor (the FFI async threading contract).
+func runAsync[T any](call func(token C.uint64_t), decode func([]byte) (T, error)) <-chan Result[T] {
+	ensureAsyncRegistered()
+	out := make(chan Result[T], 1)
+	token := asyncNextToken.Add(1)
+	ch := make(chan asyncResult, 1)
+	asyncCompletions.Store(token, ch)
+	call(C.uint64_t(token))
+	go func() {
+		r := <-ch
+		var zero T
+		if r.status != 0 {
+			out <- Result[T]{Value: zero, Err: &Error{Code: r.status, Message: string(r.payload)}}
+			return
+		}
+		v, err := decode(r.payload)
+		out <- Result[T]{Value: v, Err: err}
+	}()
+	return out
+}
+
+// erroredResult yields a channel that immediately delivers an error (used when
+// argument marshaling fails before an async op is issued).
+func erroredResult[T any](err error) <-chan Result[T] {
+	out := make(chan Result[T], 1)
+	var zero T
+	out <- Result[T]{Value: zero, Err: err}
+	return out
+}
+"#;
+
 /// The `forgedb.h` fixed preamble: guard, includes, opaque handle typedefs, and
 /// the schema-invariant spine prototypes.
 const HEADER_PREAMBLE: &str = r#"/* Code generated by ForgeDB. DO NOT EDIT. */
@@ -867,4 +1248,8 @@ void forgedb_error_free(ForgeError* err);
 void forgedb_free_buffer(uint8_t* ptr, size_t len);
 Snapshot* forgedb_snapshot(Db* db, ForgeError** err_out);
 void forgedb_snapshot_free(Snapshot* snap);
+
+/* --- async completion bridge (schema-invariant) --- */
+typedef void (*ForgeCompletion)(uint64_t token, int32_t status, uint8_t* payload, size_t payload_len);
+void forgedb_set_completion_callback(ForgeCompletion cb);
 "#;
