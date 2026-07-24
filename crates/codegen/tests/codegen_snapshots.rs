@@ -6138,6 +6138,8 @@ fn test_transform_generation_snapshot() {
 /// guard tests (mirrors the PyO3/NAPI fixture so coverage is comparable).
 fn go_binding_schema() -> Schema {
     let src = r#"
+enum Status { Draft, Published }
+
 User {
   id: +uuid
   email: &string
@@ -6148,6 +6150,7 @@ User {
 Post {
   id: +uuid
   title: string
+  status: Status
   author: *User
   tags: [Tag]
 }
@@ -6216,6 +6219,30 @@ fn test_go_generation_binding() {
     assert!(flat.contains("C.forgedb_link_post_tag(") && flat.contains("C.forgedb_unlink_post_tag("),
         "M2M link/unlink for Post<->Tag");
     assert!(code.contains("func (db *DB) Link"), "an M2M Link method is generated");
+
+    // Typed rows: enums map to a generated `type <Name> string` + consts; the
+    // enum-typed field uses it (not a bare string / json.RawMessage).
+    assert!(code.contains("type Status string"), "enum generates a named Go type");
+    assert!(code.contains("StatusDraft Status = \"Draft\""), "enum variant const");
+    assert!(code.contains("Status Status `json:\"status\"`"), "enum-typed field uses the enum type");
+
+    // Async CRUD over the completion bridge: generic Result[T] + per-model methods
+    // returning channels, plus the exported-callback registration shim.
+    assert!(code.contains("type Result[T any] struct"), "generic async Result type");
+    assert!(code.contains("func runAsync["), "the generic async driver");
+    assert!(code.contains("C.forgedbGoRegister()"), "registers the completion callback");
+    for (name, snake) in [("User", "user"), ("Post", "post"), ("Reading", "reading")] {
+        for (op, sym) in [
+            ("Insert", "insert"), ("Get", "get"), ("Count", "count"),
+            ("All", "all"), ("Update", "update"), ("Delete", "delete"),
+        ] {
+            assert!(code.contains(&format!("func (db *DB) {op}{name}Async(")), "async {op}{name}");
+            assert!(code.contains(&format!("C.forgedb_{snake}_{sym}_async(")), "async C symbol {snake}_{sym}");
+        }
+    }
+
+    // M2M snapshot-scoped `_at` traversal getter (takes a *Snapshot).
+    assert!(code.contains("snap *Snapshot, id string) ([]"), "an M2M _at getter over a snapshot");
 
     // Identity red line: no generic runtime query surface, ever.
     for forbidden in ["forgedb_query", "switch model", "predicate", "QueryBuilder", "reflect."] {
