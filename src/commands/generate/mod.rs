@@ -588,6 +588,19 @@ fn generate_go_binding(
     write_file(&async_path, &async_result.code, force)?;
     files.push((async_path, async_result));
 
+    // Arrow columnar export (only when the schema has exportable columns) — the
+    // ONE part of the Go binding that pulls an external module (arrow-go).
+    let needs_arrow = GoGenerator::needs_arrow(schema);
+    if let Some(arrow_result) = GoGenerator::generate_arrow(schema) {
+        let arrow_path = go_dir.join("forgedb_arrow.go");
+        write_file(&arrow_path, &arrow_result.code, force)?;
+        files.push((arrow_path, arrow_result));
+        ui::warning(
+            "the Go Arrow export uses the external module `github.com/apache/arrow-go/v18` \
+             (added to go.mod) — run `go mod tidy` in the `go/` dir before `go build`",
+        );
+    }
+
     // The C header cgo `#include`s (declares the `forgedb_*` prototypes).
     let header_result =
         GoGenerator::generate_header(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
@@ -599,7 +612,10 @@ fn generate_go_binding(
     // binding scaffold; a `--force` regenerate never clobbers it).
     let go_mod_path = go_dir.join("go.mod");
     if !go_mod_path.exists() {
-        fs::write(&go_mod_path, GoGenerator::go_mod_scaffold("forgedb"))?;
+        fs::write(
+            &go_mod_path,
+            GoGenerator::go_mod_scaffold("forgedb", needs_arrow),
+        )?;
         ui::info(&format!("  ✓ {} (Go module scaffold)", go_mod_path.display()));
     }
 
