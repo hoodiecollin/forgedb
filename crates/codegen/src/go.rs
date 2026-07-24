@@ -76,6 +76,13 @@ enum GoRelOp {
     Unlink { sym: String, method: String },
 }
 
+/// One Arrow-exportable column: the `Export<Model><Field>Arrow` Go method and its
+/// `forgedb_<snake>_<field>_export_arrow` C symbol suffix.
+struct ArrowCol {
+    sym: String,
+    method: String,
+}
+
 impl GoGenerator {
     /// Generate the `forgedb.go` package for a schema.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
@@ -175,10 +182,92 @@ impl GoGenerator {
             }
         }
 
+        let arrow = Self::arrow_columns(schema);
+        if !arrow.is_empty() {
+            h.push_str("\n/* --- Arrow columnar export --- */\n");
+            for c in &arrow {
+                h.push_str(&format!(
+                    "bool forgedb_{}(Db* db, struct ArrowSchema* out_schema, struct ArrowArray* out_array, ForgeError** err_out);\n",
+                    c.sym
+                ));
+            }
+        }
+
         h.push_str("\n#endif /* FORGEDB_H */\n");
         Ok(GeneratedCode {
             description: format!("Go binding C header ({} models)", models.len()),
             code: h,
+        })
+    }
+
+    /// The Arrow-exportable columns (same filter as the FFI Arrow ops): each
+    /// id-bearing model's non-null fixed-width primitive / uuid / required-FK
+    /// columns.
+    fn arrow_columns(schema: &Schema) -> Vec<ArrowCol> {
+        let mut cols = Vec::new();
+        for model in schema
+            .models
+            .iter()
+            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+        {
+            let snake = RustGenerator::to_snake_case(&model.name);
+            for field in &model.fields {
+                if RustGenerator::arrow_export_format(&field.field_type).is_some() {
+                    cols.push(ArrowCol {
+                        sym: format!("{snake}_{}_export_arrow", field.name),
+                        method: format!(
+                            "Export{}{}Arrow",
+                            model.name,
+                            to_pascal_case(&field.name)
+                        ),
+                    });
+                }
+            }
+        }
+        cols
+    }
+
+    /// Generate the `forgedb_arrow.go` companion (only when the schema has
+    /// Arrow-exportable columns): per-column `Export<Model><Field>Arrow` methods
+    /// that import the FFI's Arrow C-Data-Interface export into an `arrow.Array`
+    /// via `arrow-go`'s `cdata`. Returns `None` (no file, no dep) when there are
+    /// no exportable columns.
+    ///
+    /// NOTE: this is the ONE place the Go binding pulls an external module
+    /// (`github.com/apache/arrow-go/v18`); the caller surfaces that to the user.
+    pub fn generate_arrow(schema: &Schema) -> Option<GeneratedCode> {
+        let cols = Self::arrow_columns(schema);
+        if cols.is_empty() {
+            return None;
+        }
+        let mut body = String::new();
+        for c in &cols {
+            body.push_str(&format!(
+                r#"
+// {method} exports the live column as an Arrow array (zero-copy mmap alias when
+// the live rows are a dense prefix, a gathered copy otherwise). The caller owns
+// the result and MUST call Release() on it.
+func (db *DB) {method}() (arrow.Array, error) {{
+	var sch C.ArrowSchema
+	var arr C.ArrowArray
+	var e *C.ForgeError
+	if !bool(C.forgedb_{sym}(db.ptr, &sch, &arr, &e)) {{
+		return nil, takeError(e)
+	}}
+	_, a, err := cdata.ImportCArray(
+		(*cdata.CArrowArray)(unsafe.Pointer(&arr)),
+		(*cdata.CArrowSchema)(unsafe.Pointer(&sch)),
+	)
+	return a, err
+}}
+"#,
+                method = c.method,
+                sym = c.sym,
+            ));
+        }
+        Some(GeneratedCode {
+            description: format!("experimental Go Arrow export ({} columns)", cols.len()),
+            code: format!("{ARROW_FILE_HEADER}{body}"),
         })
     }
 
@@ -194,9 +283,21 @@ impl GoGenerator {
     }
 
     /// A `go.mod` for the generated Go package. User-editable, so the CLI writes
-    /// it ONLY when absent (like every other binding scaffold).
-    pub fn go_mod_scaffold(module: &str) -> String {
-        format!("module {module}\n\ngo 1.21\n")
+    /// it ONLY when absent (like every other binding scaffold). When the schema
+    /// has Arrow-exportable columns, the arrow-go require is included (run
+    /// `go mod tidy` to populate `go.sum`).
+    pub fn go_mod_scaffold(module: &str, needs_arrow: bool) -> String {
+        let mut m = format!("module {module}\n\ngo 1.21\n");
+        if needs_arrow {
+            m.push_str("\nrequire github.com/apache/arrow-go/v18 v18.7.0\n");
+        }
+        m
+    }
+
+    /// Whether the schema exposes any Arrow-exportable column (drives the
+    /// `forgedb_arrow.go` file + the arrow-go `go.mod` require).
+    pub fn needs_arrow(schema: &Schema) -> bool {
+        !Self::arrow_columns(schema).is_empty()
     }
 
     /// A `README.md` documenting the build order and cgo caveats. Written only
@@ -1096,6 +1197,10 @@ CGO_ENABLED=1 go build ./...
 Regenerate `../ffi` (and re-run `go generate`) whenever the `.forge` schema
 changes — the C ABI is tailored per schema.
 
+If the package includes `forgedb_arrow.go` (columnar Arrow export), it depends on
+the external module `github.com/apache/arrow-go/v18` (already listed in `go.mod`).
+Run `go mod tidy` once to populate `go.sum` before building.
+
 ## Caveats
 
 - **cgo is required** (`CGO_ENABLED=1`, the default with a C toolchain present).
@@ -1107,6 +1212,30 @@ changes — the C ABI is tailored per schema.
 - **Async threading contract**: do not mix the `*Async` methods with synchronous
   methods concurrently on the same `*DB` handle — while async ops are outstanding
   the engine's worker thread is the handle's sole accessor.
+"#;
+
+/// The `forgedb_arrow.go` preamble: package + cgo + the arrow-go imports.
+const ARROW_FILE_HEADER: &str = r#"// Code generated by ForgeDB. DO NOT EDIT.
+//
+// EXPERIMENTAL: Arrow columnar export for the Go binding. This file pulls the
+// external module github.com/apache/arrow-go/v18 — run `go mod tidy` before
+// building. It imports the FFI's Arrow C-Data-Interface export (zero-copy where
+// possible) into an arrow.Array.
+package forgedb
+
+/*
+#include <stdint.h>
+#include <stddef.h>
+#include "forgedb.h"
+*/
+import "C"
+
+import (
+	"unsafe"
+
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/cdata"
+)
 "#;
 
 /// The static `forgedb_async.go`: the exported cgo completion callback. Its
@@ -1252,4 +1381,31 @@ void forgedb_snapshot_free(Snapshot* snap);
 /* --- async completion bridge (schema-invariant) --- */
 typedef void (*ForgeCompletion)(uint64_t token, int32_t status, uint8_t* payload, size_t payload_len);
 void forgedb_set_completion_callback(ForgeCompletion cb);
+
+/* --- Arrow C Data Interface (abi.h layout; matches arrow-go's cdata) --- */
+struct ArrowSchema {
+  const char* format;
+  const char* name;
+  const char* metadata;
+  int64_t flags;
+  int64_t n_children;
+  struct ArrowSchema** children;
+  struct ArrowSchema* dictionary;
+  void (*release)(struct ArrowSchema*);
+  void* private_data;
+};
+struct ArrowArray {
+  int64_t length;
+  int64_t null_count;
+  int64_t offset;
+  int64_t n_buffers;
+  int64_t n_children;
+  const void** buffers;
+  struct ArrowArray** children;
+  struct ArrowArray* dictionary;
+  void (*release)(struct ArrowArray*);
+  void* private_data;
+};
+typedef struct ArrowSchema ArrowSchema;
+typedef struct ArrowArray ArrowArray;
 "#;
