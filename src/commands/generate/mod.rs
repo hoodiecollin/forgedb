@@ -581,6 +581,13 @@ fn generate_go_binding(
     write_file(&go_path, &go_result.code, force)?;
     files.push((go_path, go_result));
 
+    // The async completion bridge (the `//export` callback — a separate file, per
+    // cgo's rule that an `//export` file's preamble carries no C definitions).
+    let async_result = GoGenerator::generate_async_bridge();
+    let async_path = go_dir.join("forgedb_async.go");
+    write_file(&async_path, &async_result.code, force)?;
+    files.push((async_path, async_result));
+
     // The C header cgo `#include`s (declares the `forgedb_*` prototypes).
     let header_result =
         GoGenerator::generate_header(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
@@ -594,6 +601,12 @@ fn generate_go_binding(
     if !go_mod_path.exists() {
         fs::write(&go_mod_path, GoGenerator::go_mod_scaffold("forgedb"))?;
         ui::info(&format!("  ✓ {} (Go module scaffold)", go_mod_path.display()));
+    }
+
+    let readme_path = go_dir.join("README.md");
+    if !readme_path.exists() {
+        fs::write(&readme_path, GoGenerator::readme_scaffold())?;
+        ui::info(&format!("  ✓ {} (Go binding README)", readme_path.display()));
     }
 
     Ok(files)
