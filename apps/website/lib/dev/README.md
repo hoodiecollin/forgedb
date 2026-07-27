@@ -1,8 +1,18 @@
 # In-browser prose rewrite (LOCAL DEV ONLY)
 
-Highlight prose on a rendered `/docs/**` page and have Claude Code rewrite the
-backing `.mdx` live. Everything here is gated to `NODE_ENV === "development"` and
-never ships in the static export.
+Highlight prose on a rendered page and have Claude Code rewrite the backing source
+live. Works on two kinds of page, over **two coordinate systems**:
+
+- **`/docs/**`** — offset-based. Blocks are stamped with `data-src-*` char offsets
+  into the `.mdx` body by `remark-source-map.ts`; a splice replaces that range.
+- **`/` (the landing page)** — key-based. Marketing copy lives in a typed content
+  module (`content/landing.ts`) as `dd`-tagged **markdown/MDX** strings; each
+  rendered element is stamped with `data-content-key="hero.heading"` by
+  `components/markdown.tsx`. The route resolves that key to the backing literal's
+  range with the TypeScript compiler API (`content-target.ts`) and splices there.
+
+Everything here is gated to `NODE_ENV === "development"` and never ships in the
+static export.
 
 ## Run it
 
@@ -11,11 +21,20 @@ make website              # dev server on http://localhost:3100
 make website-rewrite-watch   # (in Claude's session) wake watcher — see below
 ```
 
-Open any docs page, press **⌥E** (or click the **Rewrite** button, bottom-right).
+Open any docs page **or the landing page**, press **⌥E** (or click the **Rewrite**
+button, bottom-right).
+
+On a **docs** page:
 
 - **Click a paragraph / list / callout** → rewrite that block.
 - **Click a heading** → rewrite the whole section (toggle to just the heading).
 - **Drag-select text** → rewrite that span (toggle to the enclosing block).
+
+On the **landing** page:
+
+- **Click any copy** (heading, subhead, feature title/body, stat, CTA…) → rewrite
+  that whole content slot. Each slot is one string in `content/landing.ts`, so a
+  rewrite edits exactly that literal; sub-span narrowing within a slot isn't wired.
 
 Type an instruction (or a preset chip), pick **Diff** (one rewrite) or **3
 options**, and **Send**. Claude drafts a proposal; review the diff / candidates
@@ -31,12 +50,19 @@ overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl + bri
    Accept ──▶ route splices candidate into content/**.mdx ──▶ reload
 ```
 
-- **Source mapping** — `remark-source-map.ts` stamps `data-src-start/end`
+- **Source mapping (docs)** — `remark-source-map.ts` stamps `data-src-start/end`
   (content-space char offsets) on every block; `rewrite-target.ts` turns a
   click/selection into a source range.
-- **Staleness guard** — the page stamps a hash of the MDX body; if the file
-  changes after render, the offsets are stale, so the route refuses the
-  submit/accept (409) rather than corrupt the file. Reload to continue.
+- **Key resolution (landing)** — `components/markdown.tsx` stamps
+  `data-content-key`; `content-target.ts` parses the content module with the
+  TypeScript compiler API and resolves a key path (`features.items.0.body`) to the
+  backing literal's inner char range. The value is the body of a `dd`` tagged
+  template, so the brief tells the generator to preserve indentation (dedent strips
+  it at runtime) and keep it valid inline Markdown/MDX (`<code>`, links, `<Hl>`).
+- **Staleness guard** — docs pages stamp a hash of the MDX body; content requests
+  hash the whole content module at request time. If the source changes after that,
+  the offsets/keys are stale, so the route refuses submit/accept (409) rather than
+  corrupt the file. Reload to continue.
 - **Style loader** — style lives in `content/style/`: a shared `spine.md` plus one
   register per tier (`terse.md` 2–3, `deeper.md` 5–6, `technical.md` 7–10). Each
   request's brief composes `spine + <tier register>` (`rewrite-style.ts`), keyed off
@@ -54,8 +80,9 @@ overlay ──POST /api/dev-rewrite──▶ .rewrite-queue/requests.jsonl + bri
 
 | File | Role |
 |------|------|
-| `remark-source-map.ts` | stamps source offsets onto blocks (dev-only remark plugin) |
-| `rewrite-target.ts` | DOM click/selection → source target (section/block/span) |
+| `remark-source-map.ts` | stamps source offsets onto docs blocks (dev-only remark plugin) |
+| `content-target.ts` | key-based targets: `data-content-key` → content-module literal range (TS AST) + enqueue |
+| `rewrite-target.ts` | DOM click/selection → source target (section/block/span/content) |
 | `rewrite-types.ts` | shared protocol types |
 | `rewrite-queue.ts` | fs-backed queue + splice + staleness re-check |
 | `rewrite-style.ts` | style loader — composes `spine + <tier register>` |
