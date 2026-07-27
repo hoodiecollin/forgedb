@@ -48,8 +48,9 @@ const inlineComponents: MDXComponents = {
  * - `as` sets the wrapper element (defaults to `span` inline, `div` block); the
  *   host keeps its `className`, so existing typography is preserved verbatim.
  * - `contentKey` stamps `data-content-key`, the anchor the in-browser rewrite
- *   tool maps a rendered element back to a slot in the content module (phase 2;
- *   see `lib/dev/README.md`).
+ *   tool maps a rendered element back to a slot in the content module (see
+ *   `lib/dev/README.md`). Emitted only under `NODE_ENV === "development"`, so it
+ *   never ships in the static export.
  */
 export function Markdown({
   source,
@@ -65,8 +66,13 @@ export function Markdown({
   contentKey?: string;
 }) {
   const Wrapper = as ?? (inline ? "span" : "div");
+  // Spread the anchor in only under dev, so the prop is entirely absent from the
+  // production render *and* the RSC payload (passing `undefined` still serializes
+  // the key). Statically false in prod → dead-code-eliminated.
+  const devAttrs =
+    process.env.NODE_ENV === "development" && contentKey ? { "data-content-key": contentKey } : {};
   return (
-    <Wrapper className={className} data-content-key={contentKey}>
+    <Wrapper className={className} {...devAttrs}>
       <MDXRemote
         source={source}
         components={inline ? inlineComponents : contentComponents}
