@@ -1,7 +1,8 @@
 use crate::{error::CliError, ui, Result};
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, GoGenerator, NapiGenerator, OpenApiGenerator, PyO3Generator,
-    RustGenerator, StubGenerator, TypeScriptGenerator, WasmGenerator,
+    ApiGenerator, FfiGenerator, GoGenerator, GoSdkGenerator, NapiGenerator, OpenApiGenerator,
+    PyO3Generator, PythonSdkGenerator, RustGenerator, RustSdkGenerator, StubGenerator,
+    TypeScriptGenerator, WasmGenerator,
 };
 use forgedb_parser::Parser;
 use std::fs;
@@ -239,6 +240,18 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 format_version,
             )?);
         }
+        // REST client SDKs (#118/#205/#206). Resolved from `python|go|rust --sdk`.
+        // Transport clients over the generated REST API — no on-disk format, so
+        // they take no `format_version`.
+        "rust-sdk" => {
+            generated_files.extend(generate_rust_sdk(&schema, &output_path, force)?);
+        }
+        "python-sdk" => {
+            generated_files.extend(generate_python_sdk(&schema, &output_path, force)?);
+        }
+        "go-sdk" => {
+            generated_files.extend(generate_go_sdk(&schema, &output_path, force)?);
+        }
         _ => {
             return Err(CliError::Other(format!(
                 "Unknown target: {}. Valid: standalone (all, rust, api, openapi, stubs, ffi, transform) \
@@ -389,6 +402,20 @@ fn generate_all(
     // project enables it by listing `ffi` in `[generate].targets`.
     if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "ffi")) {
         files.extend(generate_ffi_engine(schema, output_path, force, format_version)?);
+    }
+
+    // REST client SDKs (#118/#205/#206) — also OPT-IN (the default `all` skips
+    // them; a project enables one by listing `rust-sdk`/`python-sdk`/`go-sdk` in
+    // `[generate].targets`).  Each emits a portable network client, no on-disk
+    // format, so none take `format_version`.
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "rust-sdk")) {
+        files.extend(generate_rust_sdk(schema, output_path, force)?);
+    }
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "python-sdk")) {
+        files.extend(generate_python_sdk(schema, output_path, force)?);
+    }
+    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "go-sdk")) {
+        files.extend(generate_go_sdk(schema, output_path, force)?);
     }
 
     Ok(files)
@@ -628,6 +655,101 @@ fn generate_go_binding(
     Ok(files)
 }
 
+/// Generate the Rust REST client SDK crate (#206): a `reqwest`-based async client
+/// (`rust-sdk/src/lib.rs`) over the generated REST API, plus a `Cargo.toml`
+/// scaffold written only when absent. A transport client — links none of the
+/// forgedb substrate crates, only `reqwest`/`serde`. Build with `cargo build` in
+/// `rust-sdk/`.
+fn generate_rust_sdk(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let sdk_dir = output_path.join("rust-sdk");
+    let src_dir = sdk_dir.join("src");
+    fs::create_dir_all(&src_dir)?;
+
+    let mut files = Vec::new();
+    let result =
+        RustSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let lib_path = src_dir.join("lib.rs");
+    write_file(&lib_path, &result.code, force)?;
+    files.push((lib_path, result));
+
+    let cargo_path = sdk_dir.join("Cargo.toml");
+    if !cargo_path.exists() {
+        fs::write(
+            &cargo_path,
+            RustSdkGenerator::cargo_toml_scaffold("forgedb-client"),
+        )?;
+        ui::info(&format!("  ✓ {} (Rust SDK scaffold)", cargo_path.display()));
+    }
+    Ok(files)
+}
+
+/// Generate the Python REST client SDK (#118): a stdlib-`urllib` client module
+/// (`python-sdk/forgedb_client.py`) over the generated REST API, plus a
+/// `pyproject.toml` scaffold written only when absent. Dependency-free. Install
+/// with `pip install .` in `python-sdk/`.
+fn generate_python_sdk(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let sdk_dir = output_path.join("python-sdk");
+    fs::create_dir_all(&sdk_dir)?;
+
+    let mut files = Vec::new();
+    let result =
+        PythonSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let py_path = sdk_dir.join("forgedb_client.py");
+    write_file(&py_path, &result.code, force)?;
+    files.push((py_path, result));
+
+    let pyproject_path = sdk_dir.join("pyproject.toml");
+    if !pyproject_path.exists() {
+        fs::write(&pyproject_path, PythonSdkGenerator::pyproject_scaffold())?;
+        ui::info(&format!(
+            "  ✓ {} (Python SDK pyproject)",
+            pyproject_path.display()
+        ));
+    }
+    Ok(files)
+}
+
+/// Generate the Go REST client SDK (#205): a pure-stdlib `net/http` client
+/// package (`go-sdk/client.go`) over the generated REST API, plus `go.mod` /
+/// `README.md` scaffolds written only when absent. No cgo, no external module.
+/// Build with `go build` in `go-sdk/`.
+fn generate_go_sdk(
+    schema: &forgedb_parser::Schema,
+    output_path: &Path,
+    force: bool,
+) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    let sdk_dir = output_path.join("go-sdk");
+    fs::create_dir_all(&sdk_dir)?;
+
+    let mut files = Vec::new();
+    let result =
+        GoSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let go_path = sdk_dir.join("client.go");
+    write_file(&go_path, &result.code, force)?;
+    files.push((go_path, result));
+
+    let mod_path = sdk_dir.join("go.mod");
+    if !mod_path.exists() {
+        fs::write(&mod_path, GoSdkGenerator::go_mod_scaffold("forgedb-client"))?;
+        ui::info(&format!("  ✓ {} (Go SDK module scaffold)", mod_path.display()));
+    }
+
+    let readme_path = sdk_dir.join("README.md");
+    if !readme_path.exists() {
+        fs::write(&readme_path, GoSdkGenerator::readme_scaffold())?;
+        ui::info(&format!("  ✓ {} (Go SDK README)", readme_path.display()));
+    }
+    Ok(files)
+}
+
 /// The `maturin` build config for the generated PyO3 binding.
 const PYO3_PYPROJECT_SCAFFOLD: &str = r#"[build-system]
 requires = ["maturin>=1.5,<2.0"]
@@ -773,10 +895,24 @@ fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {
 fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
     let target = raw.to_lowercase();
 
+    // `rust` is dual-axis: the standalone database core (no mode) OR the REST
+    // client SDK crate (`--sdk`, #206). It is the one runtime with no in-process
+    // FFI binding to be a client *of* — it *is* the generated core — so `--sdk` is
+    // its only mode.
+    if target == "rust" {
+        return match mode {
+            None => Ok("rust".to_string()),
+            Some(GenerateMode::Sdk) => Ok("rust-sdk".to_string()),
+            Some(m) => Err(CliError::Other(format!(
+                "`generate rust {}` is not supported — `generate rust` emits the database core, \
+                 `generate rust --sdk` emits the REST client crate",
+                m.flag()
+            ))),
+        };
+    }
+
     // Standalone artifacts — the mode axis does not apply.
-    const STANDALONE: &[&str] = &[
-        "all", "rust", "api", "openapi", "stubs", "ffi", "transform",
-    ];
+    const STANDALONE: &[&str] = &["all", "api", "openapi", "stubs", "ffi", "transform"];
     if STANDALONE.contains(&target.as_str()) {
         if let Some(m) = mode {
             return Err(CliError::Other(format!(
@@ -827,13 +963,13 @@ fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
         ("python", GenerateMode::Runtime) => Ok("pyo3".to_string()),
         // Go native binding — experimental cgo over the FFI cdylib (RFC #203).
         ("go", GenerateMode::Runtime) => Ok("go".to_string()),
+        // REST client SDKs (#118/#205) — network clients over the generated API.
+        ("python", GenerateMode::Sdk) => Ok("python-sdk".to_string()),
+        ("go", GenerateMode::Sdk) => Ok("go-sdk".to_string()),
         // Browser read-replica follower — the decomposed `generate wasm`.
         ("browser", GenerateMode::Replica) => Ok("wasm".to_string()),
 
         // Recognised-but-not-in-this-milestone combinations.
-        ("python", GenerateMode::Sdk) => Err(CliError::Other(
-            "`generate python --sdk` (Python HTTP SDK, #118) is not yet implemented".to_string(),
-        )),
         ("node", GenerateMode::Replica) | ("bun", GenerateMode::Replica) => Err(CliError::Other(
             "`generate node|bun --replica` (server-side WASM replica, #121) is not yet implemented"
                 .to_string(),
