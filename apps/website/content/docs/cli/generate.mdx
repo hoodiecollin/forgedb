@@ -5,7 +5,8 @@ purpose: "reference"
 ---
 Transpile your schema into code. A target is either a **standalone artifact** (`all`,
 `rust`, `api`, `openapi`, `stubs`, `ffi`, `transform`) or a **runtime** (`python`, `node`,
-`bun`, `browser`) paired with a mode flag (`--sdk`, `--runtime`, or `--replica`).
+`bun`, `go`, `rust`, `browser`) paired with a mode flag (`--sdk`, `--runtime`, or
+`--replica`). The REST client SDKs (`--sdk`) ship for TypeScript, Python, Rust, and Go.
 
 ## Synopsis
 
@@ -26,15 +27,21 @@ The target defaults to `all`.
 | `stubs` | standalone | placeholder stubs README (no UI codegen today). |
 | `ffi` | standalone | C-ABI FFI bindings. |
 | `transform` | standalone | The offline migration transformer crate (requires `--from`/`--to`; see [migrations](/docs/features/migrations/)). |
-| `python --runtime` | runtime | PyO3 in-process native binding. |
 | `node --sdk` / `bun --sdk` | runtime | TypeScript REST client SDK. |
+| `python --sdk` | runtime | Python REST client (stdlib `urllib`). |
+| `rust --sdk` | runtime | Rust REST client crate (`reqwest`). Bare `rust` is the standalone database above. |
+| `go --sdk` | runtime | Go REST client package (stdlib `net/http`). |
+| `python --runtime` | runtime | PyO3 in-process native binding. |
 | `node --runtime` / `bun --runtime` | runtime | NAPI-RS in-process native binding. |
+| `go --runtime` | runtime | Experimental cgo in-process binding over the FFI cdylib. |
 | `browser --replica` | runtime | WASM in-process read-replica follower. |
 
 <Callout type="warning" title="Standalone targets take no mode">
-Passing `--sdk`/`--runtime`/`--replica` to a standalone target is an error. A runtime
-target **requires** a mode. Not-yet-implemented combinations (`python --sdk`,
-`node|bun --replica`) error explicitly. The old flat verbs `generate typescript` /
+Passing `--sdk`/`--runtime`/`--replica` to a bare standalone target (e.g. `api --sdk`)
+is an error, and a runtime target **requires** a mode. The one crossover is `rust`:
+bare `rust` emits the standalone database, while `rust --sdk` emits the REST client
+crate. The `node|bun --replica` combination (server-side WASM replica) is not yet
+implemented and errors explicitly. The old flat verbs `generate typescript` /
 `generate wasm` were renamed — use `node --sdk` / `browser --replica`.
 </Callout>
 
@@ -77,6 +84,14 @@ Generate the TypeScript REST SDK for Node:
 
 ```bash
 forgedb generate node --sdk
+```
+
+Generate a REST client SDK for another language on your stack:
+
+```bash
+forgedb generate python --sdk   # -> python-sdk/  (urllib)
+forgedb generate rust --sdk     # -> rust-sdk/    (reqwest)
+forgedb generate go --sdk       # -> go-sdk/      (net/http)
 ```
 
 Fail CI if generated code is stale:
