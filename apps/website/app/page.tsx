@@ -12,14 +12,13 @@ import {
   Globe,
   History,
   Boxes,
-  Zap,
 } from "lucide-react";
 import { site } from "@/lib/site";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { CodeBlock } from "@/components/code-block";
 import { CopyCommand } from "@/components/marketing/copy-command";
-import { GitHubIcon, ForgeMark } from "@/components/icons";
+import { GitHubIcon } from "@/components/icons";
+import { AnimatedForgeMark } from "@/components/animated-forgemark";
 import { Markdown } from "@/components/markdown";
 import { landing, type IconKey } from "@/content/landing";
 
@@ -45,12 +44,10 @@ export default function Home() {
           aria-hidden
           className="pointer-events-none absolute inset-0 -z-10 bg-[radial-gradient(60%_50%_at_50%_-10%,color-mix(in_oklch,var(--primary)_22%,transparent),transparent)]"
         />
-        <div className="mx-auto max-w-screen-xl px-4 py-20 text-center sm:px-6 sm:py-28">
-          <ForgeMark className="mx-auto mb-6 size-16" />
-          <Badge variant="secondary" className="mb-5 gap-1.5 rounded-full px-3 py-1">
-            <Zap className="size-3.5 text-primary" />
-            <Markdown inline source={landing.hero.badge} contentKey="hero.badge" />
-          </Badge>
+        <div className="mx-auto max-w-screen-xl px-4 py-16 text-center sm:px-6 sm:pt-18 sm:pb-26">
+          {/* Hero-only animated mark (2c: 256px on desktop, stepped down on smaller
+              screens). The static ForgeMark stays in the header/footer/favicon. */}
+          <AnimatedForgeMark className="mx-auto mb-8 size-40 sm:mb-10 sm:size-56 lg:mb-11 lg:size-64" />
           <Markdown
             as="h1"
             inline
