@@ -32,11 +32,28 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh | sh
 ```
 
+Once the `get.forgedb.dev` alias is live this shortens to:
+
+```bash
+curl -fsSL https://get.forgedb.dev/install.sh | sh
+```
+
 **PowerShell (Windows):**
 
 ```powershell
 powershell -c "irm https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.ps1 | iex"
+# or, once the alias is live:  irm https://get.forgedb.dev/install.ps1 | iex
 ```
+
+**winget (Windows):**
+
+```powershell
+winget install ForgeDB.ForgeDB
+```
+
+**MSI (Windows).** Each release also attaches
+`forgedb-x86_64-pc-windows-msvc.msi` — a double-click installer that registers an
+Add/Remove Programs entry (good for offline / managed environments).
 
 **Homebrew (macOS / Linux):**
 
@@ -75,7 +92,35 @@ sudo mv forgedb forgedb-lsp /usr/local/bin/     # or anywhere on your PATH
 forgedb --help
 ```
 
-## 3. `cargo install --git` (latest from source)
+## 3. Docker
+
+A multi-arch image (`linux/amd64` + `linux/arm64`) bundling `forgedb` and
+`forgedb-lsp`, published on every release. Bind-mount your schema/output dir at
+`/work`:
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/hoodiecollin/forgedb generate all --output ./generated
+# also on Docker Hub:  docker run --rm -v "$PWD:/work" hoodiecollin/forgedb --help
+```
+
+The image repackages the same release binaries as the native install (no runtime
+Rust toolchain).
+
+## 4. Nix (flake)
+
+Run without installing, or add ForgeDB to your own flake. Builds from source over
+the committed `Cargo.lock`:
+
+```bash
+nix run    github:hoodiecollin/forgedb -- --help     # run once
+nix profile install github:hoodiecollin/forgedb      # install to your profile
+nix develop github:hoodiecollin/forgedb              # dev shell (rust + tooling)
+```
+
+In a flake, add `forgedb.url = "github:hoodiecollin/forgedb";` and reference
+`forgedb.packages.${system}.default`.
+
+## 5. `cargo install --git` (latest from source)
 
 To track the tip of `main` (or before a release is cut):
 
@@ -86,7 +131,7 @@ cargo install --git https://github.com/hoodiecollin/forgedb forgedb
 This builds the whole workspace from source, so no crates need to be published
 first.
 
-## 4. Build from a clone
+## 6. Build from a clone
 
 ```bash
 git clone https://github.com/hoodiecollin/forgedb
