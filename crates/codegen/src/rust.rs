@@ -5153,6 +5153,32 @@ impl RustGenerator {
             .find(|f| f.name == "id" || f.auto_generate)
     }
 
+    /// Whether the server synthesizes this field's value on create, so it may be
+    /// omitted from a create body.  Mirrors `generate_auto_synthesis` +
+    /// `model_struct_field`'s `#[serde(default)]`: only `+uuid` / `+timestamp`
+    /// autos are filled in server-side today.  `+u32`/`+u64` autos are NOT yet
+    /// synthesized (#187), so they stay required — as does any non-auto id.  The
+    /// REST-SDK generators use this to compute a `<Model>Create` input that
+    /// actually round-trips (avoiding the #188 class of "omit id → 422" bug that
+    /// the TS SDK's blanket `Omit<Model,'id'>` hits on non-uuid identities).
+    pub(crate) fn is_server_synthesized(field: &forgedb_parser::Field) -> bool {
+        field.auto_generate
+            && matches!(
+                field.field_type,
+                forgedb_parser::FieldType::Uuid | forgedb_parser::FieldType::Timestamp
+            )
+    }
+
+    /// The fields a `create` body carries: every field the server does not
+    /// synthesize itself (see [`Self::is_server_synthesized`]).  Order preserved.
+    pub(crate) fn creatable_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        model
+            .fields
+            .iter()
+            .filter(|f| !Self::is_server_synthesized(f))
+            .collect()
+    }
+
     /// PascalCase a snake_case projection name (`list_row` → `ListRow`) for the
     /// generated struct suffix.
     pub(crate) fn projection_pascal(name: &str) -> String {
