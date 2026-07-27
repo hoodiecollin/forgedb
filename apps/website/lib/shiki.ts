@@ -11,7 +11,7 @@ let hp: Promise<Highlighter> | null = null;
 function getHighlighter(): Promise<Highlighter> {
   hp ??= createHighlighter({
     themes: ["github-light", "github-dark"],
-    langs: ["bash", "rust", "typescript", "tsx", "json", "toml", "sql", forgeLang],
+    langs: ["bash", "rust", "typescript", "tsx", "python", "go", "json", "toml", "sql", forgeLang],
   });
   return hp;
 }
