@@ -19,8 +19,10 @@ cargo-dist-version = "0.32.0"
 ci = "github"
 # Build the bundled language server binary into every archive.
 features = ["lsp"]
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew", "npm"]
+# The installers to generate for each app. `msi` gives Windows an Add/Remove
+# Programs entry + enterprise/offline install (WiX); winget is driven by a
+# separate workflow (dist has no winget publisher) — see .github/workflows/winget.yml.
+installers = ["shell", "powershell", "homebrew", "npm", "msi"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = [
     "aarch64-apple-darwin",

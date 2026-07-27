@@ -34,6 +34,7 @@ edition = "2024"
 name = "forgedb"
 version = "0.1.0"
 edition.workspace = true
+authors = ["Collin Kokotas"]
 license = "MIT OR Apache-2.0"
 description = "ForgeDB — an application database generator. Compiles a declarative .forge schema into tailored Rust database code, a TypeScript SDK, and a REST API."
 repository = "https://github.com/hoodiecollin/forgedb"
@@ -41,6 +42,12 @@ homepage = "https://github.com/hoodiecollin/forgedb"
 readme = "README.md"
 keywords = ["database", "codegen", "orm", "cli", "generator"]
 categories = ["database", "command-line-utilities", "development-tools"]
+
+[package.metadata.wix]
+upgrade-guid = "5521CC3D-47B3-47B7-BC83-24BDB265C090"
+path-guid = "1F1F428E-E518-46CE-989F-600C9F5CB2FA"
+license = false
+eula = false
 
 [[bin]]
 name = "forgedb"
