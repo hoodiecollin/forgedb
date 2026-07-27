@@ -2,10 +2,12 @@
 title: "What is ForgeDB"
 description: "An application-database generator — one schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec."
 purpose: "orientation"
+structure: "C"
 ---
 ForgeDB is an **application-database generator**. You write one declarative `.forge`
-schema, and ForgeDB compiles it into Rust database code, a TypeScript SDK, a REST API,
-and an OpenAPI spec — each tailored to your schema.
+schema, and ForgeDB compiles it into a tailored Rust database, a typed TypeScript SDK, a
+REST API, and an OpenAPI spec — each shaped for exactly your schema. Typed REST clients for
+Python, Rust, and Go come from the same schema.
 
 ```forge
 User {
@@ -27,33 +29,28 @@ Post {
 ```
 
 <Callout type="note" title="A generator, not a runtime ORM">
-The app's schema is a *compile-time input to generation*, never a *runtime input to a
-generic engine*. Every schema-specific surface — types, tables, queries, filters,
-relations, API routes — is generated and tailored per app.
+Your schema is read once, when you build — never while your app runs. Every
+schema-specific piece (types, tables, queries, filters, relations, API routes) is
+generated ahead of time, not reconstructed by a generic engine at request time.
 </Callout>
 
 ## The generation pipeline
 
-One schema produces four artifacts:
+One schema produces the core artifacts:
 
 - **`database.rs`** — a tailored Rust database over columnar storage
-- **`types.ts`** — TypeScript types + a typed client SDK
+- **`types.ts`** — TypeScript types and a typed client SDK
 - **`api.rs`** — a REST API with an OpenAPI document
-- **stubs/README** — a placeholder README for computed-field / component implementations you write yourself (no UI or component code is generated)
+- **stubs/README** — a placeholder for the computed-field and component code you write yourself (no UI is generated)
 
-<DiveDeeper summary="how one schema becomes every artifact">
+Opt-in targets add REST clients for [Python, Rust, and Go](/docs/cli/generate/) and a
+browser read-replica, all from the same schema.
 
-The schema runs through a fixed pipeline. The parser lexes it into an AST, validation
-checks it, then codegen runs one generator per artifact: `RustGenerator` → `database.rs`,
-`TypeScriptGenerator` → `types.ts`, `ApiGenerator` → `api.rs`, and `OpenApiGenerator` for
-the spec. Two opt-in generators add more surface — `WasmGenerator` for a browser
-read-replica and `TransformGenerator` for an offline migration bin.
+## Why a generator, not a runtime
 
-Each generator reads the same validated schema and emits code specialized to it. None of
-them ship inside your app, and none read the `.forge` at runtime — the tailored logic is
-baked in at compile time. Your generated code links only schema-agnostic substrate crates
-(storage, WAL, types), which know nothing about any specific schema.
-
-</DiveDeeper>
+You get code shaped for your exact schema: the types, queries, and routes are fixed at
+compile time, so the compiler catches a mismatch before the app runs. The cost is
+directness. Changing the schema means regenerating and recompiling, not editing a config
+that a running server rereads.
 
 Read on for [installation](/docs/installation/) and the [quickstart](/docs/quickstart/).

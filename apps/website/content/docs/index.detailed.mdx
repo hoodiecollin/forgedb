@@ -1,0 +1,110 @@
+---
+title: "What is ForgeDB"
+description: "An application-database generator — one schema compiles into a tailored Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec."
+purpose: "orientation"
+structure: "C"
+---
+ForgeDB is a compile-time code generator, not a runtime ORM or query engine. One
+declarative `.forge` schema is transpiled into a tailored Rust database crate plus a typed
+TypeScript SDK, an axum REST API, and an offline OpenAPI 3.1 document. Opt-in targets emit
+REST clients for Rust (`reqwest`), Python (stdlib `urllib`), and Go (`net/http`), plus a
+WASM browser read-replica. The generated crate links a fixed set of `forgedb-*` substrate
+crates and nothing that reflects over your schema while the app runs.
+
+```forge
+User {
+  id: +uuid
+  name: string @length(1, 100)
+  email: &string @email
+  created_at: +timestamp
+  posts: [Post]
+}
+
+Post {
+  id: +uuid
+  title: string @length(1, 200)
+  views: ^u64
+  published: bool
+  author: *User
+  created_at: +timestamp
+}
+```
+
+<Callout type="note" title="A generator, not a runtime ORM">
+Your schema is read once, at generation time — never while your app runs. Every
+schema-specific piece (types, tables, queries, filters, relations, API routes) is emitted
+per app and compiled in, not reconstructed by a generic engine at request time.
+</Callout>
+
+## The generation pipeline
+
+A single `.forge` file drives every artifact. The root `forgedb` crate is the CLI; each
+stage of the pipeline is a distinct crate.
+
+```
+schema.forge
+   │
+   ▼
+forgedb-parser        lexer → tokens → AST
+   │
+   ▼
+forgedb-validation    semantic checks (types, relations, directives)
+   │
+   ▼
+forgedb-codegen       one generator per artifact:
+   ├─ RustGenerator        → database.rs        (storage, CRUD, indexes, relations, txns)
+   ├─ TypeScriptGenerator  → types.ts           (typed SDK client)
+   ├─ ApiGenerator         → api.rs             (axum REST router + handlers)
+   ├─ OpenApiGenerator     → openapi.json       (OpenAPI 3.1, offline)
+   ├─ StubGenerator        → stubs README       (marks your hand-written code)
+   ├─ RustSdkGenerator     → rust-sdk/     ┐
+   ├─ PythonSdkGenerator   → python-sdk/   ├ opt-in REST clients
+   ├─ GoSdkGenerator       → go-sdk/       ┘
+   ├─ WasmGenerator        → replica/           (opt-in browser read-replica)
+   └─ TransformGenerator   → migrations/transform/  (opt-in offline data migration)
+```
+
+Every generator reads the same validated AST and emits code specialized to it. None of
+them ship inside your app, and none read the `.forge` at runtime. The tailored logic is
+baked in when you build. What the generated code *does* link is the substrate: `forgedb-storage`
+(columnar storage), `forgedb-wal` (the write-ahead log), `forgedb-types` (the type system),
+and their peers — crates that operate on opaque bytes and row positions, never on your
+models.
+
+The generated Rust is snapshot-tested with `insta`, but a passing snapshot does not prove
+the output compiles — the snapshots compare generated code as strings. So a codegen change
+is also verified by generating for a real multi-model schema and compiling the emitted
+`database.rs` and `api.rs`. That second check has caught real bugs a green snapshot let
+through.
+
+## Why a generator, not a runtime
+
+The schema is consumed exactly once, at generation time, to produce code. Everything
+specific to your app — its types, tables, CRUD, queries, filters, relations, API routes,
+validation — is generated for that schema and compiled in. There is no general-purpose
+engine that reconstructs any of it by reflecting over a `.forge` file at runtime.
+
+That constraint is what makes the type safety real: a field rename, a wrong type, a missing
+relation surfaces as a compile error in the generated crate, not as a runtime exception in a
+generic driver. The trade-off is directness. A schema change is a regenerate-and-recompile
+step, not a config a running server rereads, and the generated code is versioned alongside
+the app rather than discovered dynamically.
+
+<Callout type="note" title="The test a feature must pass">
+(1) Is the app's tailored data logic still **generated per-schema at compile time**, and
+(2) does every published artifact stay **schema-agnostic substrate or transport glue**
+rather than a generic runtime that interprets schemas? If either fails, the feature is
+rejected or redesigned.
+</Callout>
+
+The libraries ForgeDB does publish fall on the schema-agnostic side of that line. *Substrate*
+is the crates the generated code links — storage, types, the WAL, the change feed, auth,
+query-string parsing — with real APIs that read no schema. *Transport glue* is the layers
+that carry the already-generated surface to another language or channel: the Python, Rust, and
+Go clients, the browser host, the subscription socket. Rejected outright is a generic ORM or
+dynamic query builder that interprets an arbitrary schema at runtime. A generated,
+schema-tailored query and filter builder is fine — it is just generated code.
+
+The [core concepts](/docs/concepts/) page walks the substrate/compiler split in full;
+[installation](/docs/installation/) and the [quickstart](/docs/quickstart/) walk the CLI
+side (`init → generate → build → serve`).
