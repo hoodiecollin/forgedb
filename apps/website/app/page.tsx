@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { site } from "@/lib/site";
 import { Button } from "@/components/ui/button";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { CodeBlock } from "@/components/code-block";
 import { CopyCommand } from "@/components/marketing/copy-command";
 import { GitHubIcon } from "@/components/icons";
@@ -82,7 +83,7 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Code showcase */}
+      {/* Code showcase — the schema (the single input) */}
       <section className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
         <div className="mx-auto mb-10 max-w-2xl text-center">
           <Markdown
@@ -100,9 +101,54 @@ export default function Home() {
             contentKey="showcase.body"
           />
         </div>
-        <div className="grid items-start gap-4 lg:grid-cols-2">
-          <CodeBlock code={landing.showcase.schema} lang="forge" filename="schema.forge" />
-          <CodeBlock code={landing.showcase.sdk} lang="typescript" filename="app.ts" />
+        <CodeBlock
+          className="mx-auto max-w-3xl"
+          code={landing.showcase.schema}
+          lang="forge"
+          filename="schema.forge"
+        />
+      </section>
+
+      {/* Multi-language clients — the typed output, in every language */}
+      <section className="border-y border-border/50 bg-muted/20">
+        <div className="mx-auto max-w-screen-xl px-4 py-16 sm:px-6">
+          <div className="mx-auto mb-10 max-w-2xl text-center">
+            <Markdown
+              as="h2"
+              inline
+              className="text-3xl font-semibold tracking-tight"
+              source={landing.clients.heading}
+              contentKey="clients.heading"
+            />
+            <Markdown
+              as="p"
+              inline
+              className="mt-3 text-muted-foreground"
+              source={landing.clients.body}
+              contentKey="clients.body"
+            />
+          </div>
+          <Tabs defaultValue={landing.clients.tabs[0]?.id} className="mx-auto w-full max-w-3xl">
+            <TabsList className="self-center">
+              {landing.clients.tabs.map((t) => (
+                <TabsTrigger key={t.id} value={t.id}>
+                  {t.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            {landing.clients.tabs.map((t) => (
+              <TabsContent key={t.id} value={t.id} className="mt-4">
+                <CodeBlock code={t.code} lang={t.lang} filename={t.filename} />
+              </TabsContent>
+            ))}
+          </Tabs>
+          <Markdown
+            as="p"
+            inline
+            className="mx-auto mt-6 max-w-2xl text-center text-sm text-muted-foreground"
+            source={landing.clients.note}
+            contentKey="clients.note"
+          />
         </div>
       </section>
 

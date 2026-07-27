@@ -53,6 +53,18 @@ export interface StepItem {
   lang: string;
 }
 
+export interface ClientTab {
+  /** stable tab id (radix value) */
+  id: string;
+  /** tab label (plain text) */
+  label: string;
+  /** shiki language + CodeBlock filename */
+  lang: string;
+  filename: string;
+  /** code sample (plain source, not markdown) */
+  code: string;
+}
+
 export interface LandingCopy {
   hero: {
     badge: string;
@@ -66,7 +78,12 @@ export interface LandingCopy {
     heading: string;
     body: string;
     schema: string;
-    sdk: string;
+  };
+  clients: {
+    heading: string;
+    body: string;
+    note: string;
+    tabs: ClientTab[];
   };
   invariant: {
     lead: string;
@@ -100,11 +117,13 @@ export interface LandingCopy {
 export const landing = {
   hero: {
     badge: dd`Schema-first · compile-time · pre-1.0`,
-    heading: dd`The application-database <Hl>generator</Hl>`,
+    heading: dd`Your schema *is* the <Hl>database</Hl>`,
     subhead: dd`
-      Write one <code>.forge</code> schema. ForgeDB compiles it into a tailored
-      Rust database, a TypeScript SDK, a REST API, and an OpenAPI spec —
-      specialized to your schema at compile time. Not a runtime ORM.
+      Write one <code>.forge</code> schema. ForgeDB compiles it into a real
+      columnar database, a REST API, and typed clients for
+      <Hl>TypeScript, Python, Rust, and Go</Hl> — every type, query, and route
+      tailored to your schema at compile time. Not a runtime ORM. Nothing reflects
+      your schema at runtime.
     `,
     ctaPrimary: dd`Get started`,
     ctaGithub: dd`GitHub`,
@@ -112,11 +131,11 @@ export const landing = {
   },
 
   showcase: {
-    heading: dd`One schema in, a full stack out`,
+    heading: dd`Write the schema. Get the stack.`,
     body: dd`
-      The schema-specific surface — types, queries, filters, relations, routes —
-      is generated and tailored per app. No generic engine reflects your schema
-      at runtime.
+      Every type, query, filter, relation, and route is generated and tailored to
+      *your* models — then compiled. The database that runs already knows your
+      data by name; nothing reflects a schema at runtime.
     `,
     schema: dd`
       // schema.forge — the single source of truth
@@ -140,58 +159,169 @@ export const landing = {
         @projection(card: title, slug, views)
       }
     `,
-    sdk: dd`
-      // generated TypeScript SDK — fully typed from your schema
-      import { ForgeDBClient } from "./generated/types";
+  },
 
-      const db = new ForgeDBClient("http://localhost:3000");
-
-      // createPost() is typed to PostCreate; returns the new id
-      const id = await db.createPost({
-        title: "Hello, ForgeDB",
-        slug: "hello-forgedb",
-        views: 0,
-        published: true,
-        author: userId,
-      });
-
-      // listPost() → ListResult<Post> { data, total, limit, offset }
-      const { data, total } = await db.listPost({
-        filter: { published: true },
-        sort: "views",
-        order: "desc",
-        limit: 10,
-      });
+  clients: {
+    heading: dd`Typed clients in the languages you already ship`,
+    body: dd`
+      The same schema generates a network client for every language on your stack
+      — dataclasses in Python, structs in Rust and Go, interfaces in TypeScript.
+      Same methods, same shapes, no hand-written HTTP and no drift between them.
     `,
+    note: dd`
+      Prefer to embed the database instead of calling it over HTTP? The same
+      schema also generates <Hl>in-process native bindings</Hl> — PyO3 for Python,
+      NAPI-RS for Node and Bun, and a WASM read-replica for the browser.
+      [See the generate command →](/docs/cli/generate/)
+    `,
+    tabs: [
+      {
+        id: "ts",
+        label: "TypeScript",
+        lang: "typescript",
+        filename: "app.ts",
+        code: dd`
+          import { ForgeDBClient } from "./generated/types";
+
+          const db = new ForgeDBClient("http://localhost:3000");
+
+          // createPost() is typed to PostCreate; returns the new id
+          const id = await db.createPost({
+            title: "Hello, ForgeDB",
+            slug: "hello-forgedb",
+            views: 0,
+            published: true,
+            author: userId,
+          });
+
+          // listPost() → ListResult<Post> { data, total, limit, offset }
+          const { data, total } = await db.listPost({
+            filter: { published: true },
+            sort: "views",
+            order: "desc",
+            limit: 10,
+          });
+        `,
+      },
+      {
+        id: "py",
+        label: "Python",
+        lang: "python",
+        filename: "app.py",
+        code: dd`
+          from forgedb_client import ForgeDbClient, PostCreate, ListOptions
+
+          db = ForgeDbClient("http://localhost:3000")
+
+          # create_post() takes a typed PostCreate; returns the new id
+          post_id = db.create_post(PostCreate(
+              title="Hello, ForgeDB",
+              slug="hello-forgedb",
+              views=0,
+              published=True,
+              author=user_id,
+          ))
+
+          # list_post() → ListResult { data, total, limit, offset }
+          page = db.list_post(ListOptions(
+              filter={"published": "true"},
+              sort="views",
+              order="desc",
+              limit=10,
+          ))
+        `,
+      },
+      {
+        id: "rs",
+        label: "Rust",
+        lang: "rust",
+        filename: "main.rs",
+        code: dd`
+          use forgedb_client::{ForgeDbClient, PostCreate, ListOptions, SortOrder};
+
+          let db = ForgeDbClient::new("http://localhost:3000");
+
+          // create_post() takes a typed &PostCreate; returns the new id
+          let id = db.create_post(&PostCreate {
+              title: "Hello, ForgeDB".into(),
+              slug: "hello-forgedb".into(),
+              views: 0,
+              published: true,
+              author: user_id,
+          }).await?;
+
+          // list_post() → ListResult<Post> { data, total, limit, offset }
+          let page = db.list_post(&ListOptions {
+              filter: vec![("published".into(), "true".into())],
+              sort: Some("views".into()),
+              order: Some(SortOrder::Desc),
+              limit: Some(10),
+              ..Default::default()
+          }).await?;
+        `,
+      },
+      {
+        id: "go",
+        label: "Go",
+        lang: "go",
+        filename: "main.go",
+        code: dd`
+          import client "forgedb-client"
+
+          db := client.NewClient("http://localhost:3000")
+
+          // CreatePost takes a typed *PostCreate; returns the new id
+          id, err := db.CreatePost(&client.PostCreate{
+              Title:     "Hello, ForgeDB",
+              Slug:      "hello-forgedb",
+              Views:     0,
+              Published: true,
+              Author:    userID,
+          })
+
+          // ListPost → *ListResult[Post] { Data, Total, Limit, Offset }
+          limit := 10
+          page, err := db.ListPost(&client.ListOptions{
+              Filter: map[string]string{"published": "true"},
+              Sort:   "views",
+              Order:  "desc",
+              Limit:  &limit,
+          })
+        `,
+      },
+    ],
   },
 
   invariant: {
     lead: dd`
-      The invariant: your schema is a <Hl>compile-time input to generation</Hl>,
-      never a runtime input to a generic engine.
+      Your schema is a <Hl>compile-time input to generation</Hl> — never a runtime
+      input to a generic engine.
     `,
     body: dd`
-      Generated code links only schema-agnostic substrate crates — storage, WAL,
-      change feed, auth — that know nothing about any specific schema. The
-      tailored data logic stays generated. [Read the concepts →](/docs/concepts/)
+      That one decision is why there's no query planner to fight, no ORM to
+      out-clever, and no schema drift to chase down. The generated code already
+      knows your data; the substrate it links — storage, WAL, change feed, auth —
+      knows nothing about it, and never will. [Read the concepts →](/docs/concepts/)
     `,
   },
 
   features: {
-    heading: dd`Batteries generated in`,
+    heading: dd`A real database, batteries generated in`,
     body: dd`
-      Durability, concurrency, real-time, and multi-tenancy — generated per
-      schema over a small, published substrate. Each is honest about its limits.
+      Durability, concurrency, real-time, multi-tenancy — the things you'd bolt on
+      later are generated per schema over a small, published substrate. And every
+      one is honest about exactly where its limits are.
     `,
     learnMore: dd`Learn more`,
     items: [
       {
         icon: "ShieldCheck",
         href: "/docs/concepts/",
-        title: dd`Compile-time type safety`,
+        title: dd`End-to-end type safety`,
         body: dd`
-          Your schema becomes tailored Rust and TypeScript types. Schema drift is
-          impossible — the types are generated, not reflected at runtime.
+          Your schema becomes tailored types in Rust, TypeScript, Python, and Go.
+          Schema drift is impossible — the types are generated at compile time,
+          never reflected at runtime.
         `,
       },
       {
@@ -278,7 +408,7 @@ export const landing = {
     `,
     cta: dd`See the numbers`,
     items: [
-      { value: dd`1 schema`, label: dd`→ Rust DB + TS SDK + REST API + OpenAPI` },
+      { value: dd`4 languages`, label: dd`typed REST clients from one schema — TypeScript, Python, Rust, Go` },
       { value: dd`1.88 MB`, label: dd`on-disk footprint — smallest of the embedded four` },
       { value: dd`0.37 s`, label: dd`group-commit bulk load of 10k rows` },
       { value: dd`0 deps`, label: dd`on any runtime ORM — only schema-agnostic substrate` },
@@ -311,8 +441,8 @@ export const landing = {
         n: "02",
         title: dd`Generate`,
         body: dd`
-          Transpile the schema into tailored Rust, a TypeScript SDK, a REST API,
-          and an OpenAPI spec.
+          Transpile the schema into a tailored Rust database, a REST API, an
+          OpenAPI spec, and typed clients for every language on your stack.
         `,
         code: dd`forgedb generate all --output ./generated`,
         lang: "bash",
@@ -331,10 +461,10 @@ export const landing = {
   },
 
   cta: {
-    heading: dd`Generate your database`,
+    heading: dd`Stop writing the same data layer`,
     body: dd`
-      Install the CLI, write a schema, and ship a typed full-stack database in
-      minutes.
+      Install the CLI, write one schema, and let ForgeDB generate the database, the
+      API, and the typed clients — so you build features, not plumbing.
     `,
     primary: dd`Start the quickstart`,
     secondary: dd`Browse the docs`,
