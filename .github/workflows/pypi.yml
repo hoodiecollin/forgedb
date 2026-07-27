@@ -12,8 +12,10 @@
 # (manylinux/musllinux ↔ the gnu/musl Linux targets). Independent of dist — it
 # shares only the "cross-build works" prerequisite.
 #
-# Go-live is user-gated: publishing needs the `PYPI_API_TOKEN` secret and a real
-# tag; until then this only builds+validates wheels on pushes/PRs.
+# Go-live is user-gated: publishing uses PyPI **Trusted Publishing (OIDC)** — no
+# stored secret. Before the first real tag, register a *pending publisher* on
+# PyPI (project `forgedb`, repo `hoodiecollin/forgedb`, workflow `pypi.yml`,
+# environment `pypi`); until then this only builds+validates wheels on pushes/PRs.
 name: PyPI
 
 on:
@@ -116,7 +118,8 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     environment: pypi
     permissions:
-      # Kept for a future switch to PyPI Trusted Publishing (OIDC); harmless with token auth.
+      # OIDC token exchange for Trusted Publishing — this is what authenticates
+      # the upload; no PyPI password/token secret is stored.
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
@@ -128,5 +131,5 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # Provided once PyPI is provisioned (user-gated). Omit to use Trusted Publishing.
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          # No `password:` — the action mints a short-lived OIDC token and PyPI's
+          # pending/registered Trusted Publisher for this repo+workflow authorizes it.
