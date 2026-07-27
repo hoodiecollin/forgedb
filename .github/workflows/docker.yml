@@ -1,0 +1,102 @@
+# Docker image for the `forgedb` CLI — epic #181 / Docker channel.
+#
+# Runs AFTER a GitHub Release is published (release.yml must have uploaded the
+# per-platform tarballs the Dockerfile fetches). Builds a multi-arch image
+# (linux/amd64 + linux/arm64) and pushes to GHCR always, and to Docker Hub when
+# its credentials are configured.
+#
+# Registries / go-live gating:
+#   - GHCR (ghcr.io/hoodiecollin/forgedb): auth via the built-in GITHUB_TOKEN — no
+#     secret to provision (only needs repo → Settings → Actions → workflow write).
+#   - Docker Hub (docker.io/hoodiecollin/forgedb): needs `DOCKERHUB_USERNAME` +
+#     `DOCKERHUB_TOKEN` secrets. Absent → the image still ships to GHCR; Docker Hub
+#     is skipped (not failed).
+name: Docker
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+  packages: write # push to GHCR
+
+jobs:
+  image:
+    name: build & push (multi-arch)
+    runs-on: ubuntu-22.04
+    # Skip prereleases; only stable tags get an image + `latest`.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Resolve the tag (release event or manual input) and the bare version.
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+      # Only push to Docker Hub when creds exist (secrets can't be used in `if:`
+      # directly, so surface presence as a step output first).
+      - name: Detect Docker Hub credentials
+        id: hub
+        shell: bash
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Docker Hub secrets not set — pushing to GHCR only."
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: ${{ steps.hub.outputs.enabled == 'true' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/hoodiecollin/forgedb
+            name=docker.io/hoodiecollin/forgedb,enable=${{ steps.hub.outputs.enabled }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.v.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.v.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            REPO=${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
