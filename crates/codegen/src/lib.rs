@@ -48,7 +48,10 @@
 //! ```
 
 pub mod config;
+pub mod go_sdk;
+pub mod python_sdk;
 pub mod rust;
+pub mod rust_sdk;
 pub mod typescript;
 pub mod api;
 pub mod openapi;
@@ -65,10 +68,13 @@ pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
 pub use ffi::FfiGenerator;
 pub use go::GoGenerator;
+pub use go_sdk::GoSdkGenerator;
+pub use python_sdk::PythonSdkGenerator;
 pub use napi::NapiGenerator;
 pub use openapi::OpenApiGenerator;
 pub use pyo3::PyO3Generator;
 pub use rust::RustGenerator;
+pub use rust_sdk::RustSdkGenerator;
 pub use stubs::StubGenerator;
 pub use transform::{HopPlan, ModelOp, TransformCrate, TransformGenerator, TransformPlan, VersionSchema};
 pub use typescript::TypeScriptGenerator;
