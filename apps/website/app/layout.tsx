@@ -40,6 +40,14 @@ export const metadata: Metadata = {
     siteName: "ForgeDB",
     type: "website",
   },
+  // The site ships its own next-themes dark mode, so the Dark Reader extension
+  // should not re-theme it. Left unlocked, Dark Reader mutates SVG fills and shiki
+  // inline styles *before* React hydrates → floods the console with unpatchable
+  // hydration mismatches (`data-darkreader-inline-*`). This <meta name="darkreader-lock">
+  // tells the extension to leave the page alone, which is both correct and silences them.
+  // (Content value is arbitrary — Dark Reader keys off the tag's name; Next drops
+  // `other` entries whose value is an empty string, so it must be non-empty.)
+  other: { "darkreader-lock": "forgedb" },
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
