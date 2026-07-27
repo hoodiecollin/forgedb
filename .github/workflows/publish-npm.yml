@@ -1,0 +1,71 @@
+# Custom npm publish job for the `forgedb` CLI — epic #173 WS7 / issue #184.
+#
+# Replaces cargo-dist's built-in `npm` publisher (which authenticates with a
+# long-lived `NPM_TOKEN`) with **npm Trusted Publishing (OIDC)** — the same
+# tokenless model `pypi.yml` uses for PyPI. npm made OIDC trusted publishing GA
+# on 2025-07-31 and is deprecating classic tokens (2025-12-09); short-lived,
+# workflow-scoped OIDC credentials replace a stored secret and npm emits build
+# provenance automatically.
+#
+# Wired into the release pipeline as a cargo-dist CUSTOM PUBLISH JOB: dist-
+# workspace.toml lists `publish-jobs = ["homebrew", "./publish-npm"]`, so dist
+# calls this reusable workflow from the generated release.yml (after `host`,
+# before `announce`) and passes the release `plan` as an input — keeping the npm
+# channel in the release DAG and `dist generate --check` green. The npm *package*
+# is still built by dist (`npm` stays in `installers`); only the publish step is
+# ours.
+#
+# Requirements (npm trusted publishing): npm CLI >= 11.5.1 and Node >= 22.14, and
+# `id-token: write` on this job. Node 22 LTS ships an older npm, so we upgrade npm
+# to the >= 11.5.1 floor before publishing.
+#
+# Go-live is user-gated: before the first real tag, register a **trusted
+# publisher** for `@hoodiecollin/forgedb` on npmjs.com (GitHub Actions, repo
+# `hoodiecollin/forgedb`, workflow `publish-npm.yml`, environment `npm`). No
+# `NPM_TOKEN` secret is stored.
+name: Publish (npm)
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: dist release plan (JSON) — passed by cargo-dist
+        required: true
+        type: string
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-22.04
+    # Skip on prereleases unless the plan opts them in — mirrors dist's built-in
+    # publisher gate so a `-prerelease` tag doesn't push to the npm latest dist-tag.
+    if: ${{ !fromJson(inputs.plan).announcement_is_prerelease || fromJson(inputs.plan).publish_prereleases }}
+    environment: npm
+    permissions:
+      # OIDC token exchange for npm Trusted Publishing — authenticates the publish
+      # and lets npm attach provenance. No password/token secret is used. dist's
+      # generated caller escalates id-token:write to this job (release.yml); this
+      # job needs no repo checkout, so no `contents` scope is requested.
+      id-token: write
+    env:
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - name: Fetch npm packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: npm/
+          merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm >= 11.5.1 (trusted-publishing floor)
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+      - name: Publish via OIDC trusted publishing
+        run: |
+          for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
+            pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
+            npm publish --access public "./npm/${pkg}"
+          done

@@ -39,4 +39,8 @@ tap = "hoodiecollin/homebrew-tap"
 # npm scope for the `npm install` package (=> @hoodiecollin/forgedb).
 npm-scope = "@hoodiecollin"
 # Actually publish to the tap and npm registry on a real `v*` release.
-publish-jobs = ["homebrew", "npm"]
+# npm uses a CUSTOM publish job (`./publish-npm` => .github/workflows/publish-npm.yml)
+# that authenticates with npm Trusted Publishing (OIDC), not a stored NPM_TOKEN —
+# aligning the npm channel with PyPI (`pypi.yml`). `npm` stays in `installers` so
+# dist still builds the npm package; only the publish step is overridden.
+publish-jobs = ["homebrew", "./publish-npm"]
