@@ -1,0 +1,101 @@
+---
+title: "What pre-1.0 is (and isn't)"
+description: "An honest account of the guarantees and deliberate limits of ForgeDB before 1.0 — the single-writer contract, what's enforced, and what's explicitly deferred."
+purpose: "orientation"
+structure: "C"
+---
+ForgeDB is built perimeter-first. The advanced features — live queries, multi-tenancy, snapshots, backup, single-writer/many-reader — are real and shipped, sitting on a generated core that the pre-1.0 releases brought to a design-partner bar. The writes are crash-safe, with a small set of deliberate limits enumerated below.
+
+The pre-1.0 target is a design partner: someone who can install, scaffold, deploy, use the typed SDK, and operate a real app inside the contract that follows. It is not an unattended, arbitrary-scale, multi-writer deployment. Every maturity claim here is checkable against the code; this page states the release bar so you don't have to reconstruct it from source. The stability promises that arrive at 1.0 are still ahead; see [versioning & stability](/docs/reference/semver/).
+
+## The core contract
+
+**Single writer per data directory.** On open, a generated process takes an advisory lock (`DirLock`) on the data directory. A second writer that finds the lock held refuses to start rather than race the column files; the guard is safety-first, never best-effort. Concurrent readers never contend for it, because they read against an append-only watermark rather than a shared cursor, so a live writer does not block them. That is why the scaling model is one process per tenant, not many writers per directory: a tenant is a separate directory with its own lock and scales out independently, while a single dataset scales up on its one writer.
+
+The schema is a compile-time input. The entire schema-tailored surface — types, tables, queries, filters, relations, API routes, validation — is emitted per app at generation time and compiled in. No shipped artifact reads a `.forge` file while the app runs; the `forgedb-*` crates the generated code links are schema-agnostic substrate. This is the identity invariant, covered in full under [core concepts](/docs/concepts/).
+
+<Callout type="note" title="Scope moves; this page records the pre-1.0 release bar">
+Three items originally deferred out of the pre-1.0 scope have since landed *after* that
+scope was locked — **multi-writer** (MVCC Tiers 1–3), the **migrations data-transform
+engine**, and the **cross-process broker**. This page records the pre-1.0 *release scope* as
+it was decided; it is the honest floor, not a ceiling. Still genuinely deferred: PITR /
+incremental backup, row-level authorization, and JWT issuance.
+</Callout>
+
+## What pre-1.0 guarantees
+
+### Durable, crash-safe writes
+
+A `kill -9` mid-write loses zero acknowledged rows and never corrupts the directory. Each generated `insert`/`update`/`delete` journals an opaque row blob to a per-model write-ahead log and fsyncs it before touching any column. If the process dies in between, reopen finds a logged record with a missing or half-written column tail, trims that torn tail back to the last consistent row, and idempotently replays the logged record.
+
+Recovery derives the durable row count from file lengths, not a persisted marker. It computes the minimum-consistent count `n` such that every fixed column's length equals `n × width` and every variable column matches its `n`-th offset entry, then calls `truncate_to_rows(n)` to discard the torn tail. It replays the WAL by absolute row index starting at `n`, which is idempotent: a record whose columns already reached disk re-appends to the same index and is a no-op. Because `n` comes from file lengths rather than an LSN, a checkpoint that fsyncs columns then truncates the WAL leaves recovery correct with no durable checkpoint marker.
+
+The WAL stays bounded: a generated `checkpoint()` fsyncs the columns and then truncates the WAL, auto-invoked on an interval, so reopen never replays whole history. Only that order — columns durable, then WAL truncated — cannot be reordered without opening a crash window. The fsync itself is the write-latency lever, and it is configurable via [`[storage].fsync`](/docs/config/storage/).
+
+### Readable, queryable data
+
+The REST `list` endpoint returns live rows with filter (`?<field>=`), sort (`?sort=`), and pagination (`?limit&offset`), shaped as `{data,total,limit,offset}`. Indexed scalar fields (`^`), foreign keys, composite `@index(a,b)`, and nullable fields get O(1) `find_by_*`/`get_by_*` probes rather than full scans. Relation traversal is generated per model: forward FK, reverse one-to-many, many-to-many, and eager-load. Every field-aware step is generated code; the substrate on the path (the query-string parser) turns a URL into a generic filter/sort/pagination and reads no schema.
+
+### Enforced data integrity
+
+Writes refuse to commit a record that breaks integrity, and every check is generated per field. `@min`/`@max`/`@length`/`@email`/`@url` constraints return 422, `&unique` returns 409, and foreign-key existence for `*Target`/`?Target` returns 409. `@pattern`/`@regex` compile to a per-field `LazyLock<Regex>` and return 422 on a non-match. `@on_delete` is enforced on the parent side: the default `restrict` refuses to delete a referenced parent with 409, `cascade` deletes recursively, and `set_null` clears an optional FK. Both the direct Rust API and the REST layer enforce all of them.
+
+### Bounded storage
+
+Update and delete leave dead row versions behind, because storage is append-only and never rewrites a committed row in place. A generated `compact()` reclaims them in-process under the single-writer lock, auto-invoked at a dead-row threshold, and it renumbers the surviving rows. There is no background compaction thread — one would contend for the writer's directory lock, and the renumber would invalidate any live reader's watermark. A snapshot taken before a compaction does not survive it, for the same reason.
+
+### Snapshots, readers, and change feeds
+
+The snapshot is a watermark, not a copy. Append-only storage means a committed row is never overwritten, so a reader that remembers the row count at a moment sees exactly the rows that existed then; later appends land past its watermark and stay invisible to it. There is no `xmin`/`xmax` version chain to walk and no snapshot to materialize, which is what keeps concurrent readers lock-free under a live writer. Read-only reader handles open the columns without the write lock.
+
+The change feed carries typed insert/update/delete events, with WebSocket subscriptions and stateful live queries layered on top. All three — snapshots, the feed, live queries — are in-process: they broadcast within the writing process, so a separate process does not observe them without the cross-process broker (which landed after the scope was locked; see the note above).
+
+### Multi-tenancy (physical)
+
+Isolation is directory-per-tenant, with a verify-only JWT tenant guard in front of the data routes; one process serves one tenant. The guard extracts a configured tenant claim from an algorithm-pinned asymmetric JWT and cross-checks it against the process's tenant, returning 403 on a mismatch. It reads no schema — it is the same schema-agnostic class as the change feed.
+
+### Distribution & tooling
+
+`cargo install forgedb` builds the CLI from crates.io; prebuilt binaries come from the release workflow; the generated TypeScript SDK is full-CRUD and typed; observability routes, a container deploy path, and a stated semver policy round it out. See [installation](/docs/installation/) and [quickstart](/docs/quickstart/) for the operator path.
+
+## What pre-1.0 is *not* (deferred, by design)
+
+### Concurrency
+
+- **Single writer per data directory** is the contract. Scale across tenants horizontally (one process per tenant), not by adding writers to one directory.
+- The change feed, live queries, and snapshots are **in-process**. Cross-process observation needs the broker, which is present but was not part of the locked pre-1.0 scope.
+
+### Migrations
+
+- **Additive changes are data-preserving on reopen.** Adding a model or a nullable/appended field survives regeneration. Breaking changes (type change, field/model removal, non-null add, adding `&unique`) go through the documented dump → regenerate → reload path. New non-null fields backfill to type-zero (not `@default`) and must be appended at the end, because recovery derives column layout from position.
+
+### Auth
+
+- **Verify-only.** ForgeDB verifies asymmetric JWTs your identity provider issues (JWKS or static PEM, with `exp`/`nbf`/`iss`/`aud` and skew checks) and cross-checks a tenant claim. It does not issue tokens, and does not do row-level or per-principal authorization. The guard is tenant-level: right tenant → allowed, wrong tenant → 403.
+
+### API / SDK
+
+- The REST **create** body is the whole record — you supply auto (`+`) fields (`id`, `created_at`) and virtual relation fields (as `null`). The direct Rust `db.create_<model>` path auto-generates `+` fields; the REST layer does not yet. `create` returns the new id, not the full record.
+- SDK ids are typed `string` uniformly (integer-PK callers pass `String(n)`).
+- No WebSocket/subscription client in the generated SDK yet (REST only).
+
+### Query capability
+
+- Scalar, foreign-key, and composite (`@index(a,b)`) indexes are **hash exact-match** — they answer `field = value` and `a = ? AND b = ?` in O(1). Ordered-eligible scalar types (`u32`/`u64`/`i32`/`i64`/`timestamp`/`decimal`) additionally get a parallel ordered (BTreeMap) index that backs `find_by_<field>_range(min, max, descending, limit)` for range scans and top-N. The two coexist: the hash index answers equality, the ordered index answers ranges without a full scan.
+- What is deferred follows from that split: `f64` and nullable fields have no ordered index yet, prefix search would need a different structure again, the snapshot (`_at`) ordered form is absent, and many-to-many junction lookups stay linear (`unlink_<a>_<b>` and `unlink_all_*` walk the junction).
+
+### Operations
+
+- `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text format.
+- The release workflow is authored and validated but **not yet exercised by a real tag push**.
+
+### Not a general-purpose engine
+
+- No generic or dynamic query builder or ORM that interprets an arbitrary schema at runtime. A generated, schema-tailored query/filter builder is fine and present; a schema-agnostic runtime one is rejected by the identity invariant.
+
+<Callout type="tip" title="Where the authoritative status lives">
+The repo's `CLAUDE.md` "Known issues / backlog" section and `docs/V1_ROADMAP.md` carry
+the code-grounded status of every feature, with "LANDED" markers, guard tests, and honest
+limits. Where any marketing-style description promises more than this page, this page and
+the roadmap are correct.
+</Callout>

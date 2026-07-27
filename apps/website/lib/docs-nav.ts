@@ -21,7 +21,7 @@ export const docsNav: NavGroup[] = [
     title: "Introduction",
     items: [
       { title: "What is ForgeDB", href: "/docs/" },
-      { title: "What v1 is (and isn't)", href: "/docs/what-v1-is/" },
+      { title: "What pre-1.0 is (and isn't)", href: "/docs/what-pre-1-0-is/" },
       { title: "Core concepts", href: "/docs/concepts/" },
       { title: "Benchmarks", href: "/docs/benchmarks/" },
       { title: "Installation", href: "/docs/installation/" },

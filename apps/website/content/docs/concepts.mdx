@@ -41,7 +41,7 @@ ForgeDB does publish libraries with real APIs. They come in two kinds, both on t
 
 Storage is append-only and columnar. Each model, and each many-to-many link table, is a directory of column files. A write only appends bytes; it never rewrites committed data. An update or delete appends a new version of the row (a delete appends a tombstoned version), and the generated code resolves the latest version per id.
 
-Because nothing is mutated in place, a lot falls out cheaply: a **snapshot is just a row-count mark**, so point-in-time reads need no per-row version metadata, and readers never block the writer. Two costs come with it. Dead versions accumulate until an in-process compaction reclaims them, and that compaction renumbers the surviving rows — so a snapshot taken before it does not survive it. Only one process may write to a directory at a time; a directory lock refuses a second writer (the [single-writer contract](/docs/what-v1-is/)).
+Because nothing is mutated in place, a lot falls out cheaply: a **snapshot is just a row-count mark**, so point-in-time reads need no per-row version metadata, and readers never block the writer. Two costs come with it. Dead versions accumulate until an in-process compaction reclaims them, and that compaction renumbers the surviving rows — so a snapshot taken before it does not survive it. Only one process may write to a directory at a time; a directory lock refuses a second writer (the [single-writer contract](/docs/what-pre-1-0-is/)).
 
 ## The request path
 
