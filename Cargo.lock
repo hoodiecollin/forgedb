@@ -1307,7 +1307,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forgedb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1368,7 +1368,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-codegen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "forgedb-parser",
@@ -1386,7 +1386,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-compaction"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "log",
@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-query-params"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_urlencoded",

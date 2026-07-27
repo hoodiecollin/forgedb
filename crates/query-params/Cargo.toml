@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-query-params"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Query parameter parsing and validation for ForgeDB REST API endpoints"
