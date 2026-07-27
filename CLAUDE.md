@@ -193,16 +193,17 @@ in `crates/`:
   ≤1. The `_replication.log` is resumable/secondary (clients fsync their own columns+WAL before `Committed`),
   so `never`/`periodic` never risk committed client data — only rewind replication on a coordinator crash.
 
-**Internal (compiler internals):** `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher` are at
-**0.2.0** on crates.io (republished 2026-07-22 to carry the WS2/WS3 API changes — positioned AST, `enums`,
-`parse_recover`, `EnumDef`; MINOR bump so the still-published `forgedb` 0.1.0's `^0.1.0` pins stay on the old 0.1.0
-crates and `cargo install forgedb` is unaffected); `lsp-server` is at **0.1.0** (first publish, WS7). They are
-**published to crates.io** but **only** so `cargo install forgedb` can build the CLI
-from the registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates.
-`lsp-server` joined this list in epic #173 WS7 — the root `forgedb` crate gained an **optional** dependency on it (the
-non-default `lsp` feature drives the bundled `forgedb-lsp` binary), and crates.io requires optional deps to resolve, so
-`forgedb-lsp-server` must be published **before** the next `forgedb` publish. It was the one compiler-internal left off
-crates.io until WS7 made `forgedb` depend on it.)
+**Internal (compiler internals):** `parser`, `codegen`, `validation`, `migrations`, `backup`, `watcher`,
+`lsp-server` are **published to crates.io** but **only** so `cargo install forgedb` can build the CLI from the
+registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates. Their
+version lines drift independently — derive the current numbers per the *Workspace layout* note above (do not trust
+prose). Historical shape: the internals were republished 2026-07-22 to carry the WS2/WS3 API changes (positioned AST,
+`enums`, `parse_recover`, `EnumDef`); `lsp-server` first-published in WS7 (epic #173) when the root `forgedb` crate
+gained an **optional** dependency on it (the non-default `lsp` feature drives the bundled `forgedb-lsp` binary, and
+crates.io requires optional deps to resolve, so `forgedb-lsp-server` had to be published before `forgedb` next was).
+The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-27 republish cascade, which also bumped
+`codegen` for the REST-SDK generators and `compaction`/`query-params` for bugfixes), so
+`cargo install forgedb --features lsp` builds both `forgedb` + `forgedb-lsp` from the registry.
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
   `ApiGenerator`, `StubGenerator`, and the REST client SDK generators
