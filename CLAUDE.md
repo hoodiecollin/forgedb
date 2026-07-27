@@ -205,7 +205,10 @@ non-default `lsp` feature drives the bundled `forgedb-lsp` binary), and crates.i
 crates.io until WS7 made `forgedb` depend on it.)
 - `parser` — lexer + parser → AST (`crates/parser/src/ast.rs`)
 - `codegen` — code generators; exports `RustGenerator`, `TypeScriptGenerator`,
-  `ApiGenerator`, `StubGenerator` (each `::generate(&schema) -> GeneratedCode`)
+  `ApiGenerator`, `StubGenerator`, and the REST client SDK generators
+  `RustSdkGenerator` / `PythonSdkGenerator` / `GoSdkGenerator` (#206/#118/#205 — the
+  Rust/Python/Go siblings of the TS SDK; `generate <rust|python|go> --sdk`) (each
+  `::generate(&schema) -> GeneratedCode`)
 - `validation`, `migrations`, `backup`, `changefeed`,
   `watcher`, `lsp-server`  (`query-params` + `compaction` are now **published** — see the
   published-crates list above)
@@ -241,6 +244,9 @@ schema.forge → parser (lexer→AST) → validation → codegen
   ├─ StubGenerator       → placeholder stubs README (no UI/component codegen today)
   ├─ OpenApiGenerator    → openapi.json (offline OpenAPI 3.1)
   ├─ WasmGenerator       → replica/* (browser read-replica; opt-in)
+  ├─ RustSdkGenerator    → rust-sdk/*   (reqwest REST client crate; `rust --sdk`, opt-in)
+  ├─ PythonSdkGenerator  → python-sdk/* (stdlib-urllib REST client; `python --sdk`, opt-in)
+  ├─ GoSdkGenerator      → go-sdk/*     (net/http REST client; `go --sdk`, opt-in)
   └─ TransformGenerator  → migrations/transform/* (offline data-migration bin)
 ```
 
