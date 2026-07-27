@@ -28,6 +28,18 @@ export interface DocFile {
  */
 export const DETAILED_SEGMENT = "detailed";
 
+/**
+ * Absolute path to the `.detailed.mdx` body backing a *base* (non-detailed) slug.
+ * The docs root (`[]`) is served by `index.mdx`, so its detailed sibling is
+ * `index.detailed.mdx` at `/docs/detailed/`; every other page is a leaf `X.mdx`
+ * paired with `X.detailed.mdx`.
+ */
+function detailedFileForBase(base: string[]): string {
+  return base.length === 0
+    ? path.join(DOCS_DIR, "index.detailed.mdx")
+    : path.join(DOCS_DIR, ...base) + ".detailed.mdx";
+}
+
 /** Recursively collect every `.mdx` file under content/docs as slug arrays. */
 export function getAllDocSlugs(): string[][] {
   const out: string[][] = [];
@@ -37,9 +49,11 @@ export function getAllDocSlugs(): string[][] {
       if (entry.isDirectory()) {
         walk(full, [...prefix, entry.name]);
       } else if (entry.isFile() && entry.name.endsWith(".detailed.mdx")) {
-        // `foo.detailed.mdx` -> ["...", "foo", "detailed"] (its own route).
+        // `foo.detailed.mdx` -> [..., "foo", "detailed"]; `index.detailed.mdx`
+        // is a directory page's detailed sibling, so it drops the `index`
+        // segment (root -> /docs/detailed/), mirroring how `index.mdx` maps.
         const base = entry.name.replace(/\.detailed\.mdx$/, "");
-        out.push([...prefix, base, DETAILED_SEGMENT]);
+        out.push(base === "index" ? [...prefix, DETAILED_SEGMENT] : [...prefix, base, DETAILED_SEGMENT]);
       } else if (entry.isFile() && entry.name.endsWith(".mdx")) {
         const base = entry.name.replace(/\.mdx$/, "");
         out.push(base === "index" ? prefix : [...prefix, base]);
@@ -53,19 +67,18 @@ export function getAllDocSlugs(): string[][] {
 /** Whether a slug names a Build-C detailed variant with a backing file. */
 export function isDetailedSlug(slug: string[]): boolean {
   if (slug.length === 0 || slug[slug.length - 1] !== DETAILED_SEGMENT) return false;
-  return fs.existsSync(path.join(DOCS_DIR, ...slug.slice(0, -1)) + ".detailed.mdx");
+  return fs.existsSync(detailedFileForBase(slug.slice(0, -1)));
 }
 
 /** Whether a (base, non-detailed) slug has a detailed-native sibling — i.e. a Build-C page. */
 export function hasDetailedVariant(slug: string[]): boolean {
-  if (slug.length === 0) return false;
-  return fs.existsSync(path.join(DOCS_DIR, ...slug) + ".detailed.mdx");
+  return fs.existsSync(detailedFileForBase(slug));
 }
 
 function fileForSlug(slug: string[]): string | null {
   // A detailed variant resolves to its `.detailed.mdx` sibling, when present.
   if (slug.length >= 1 && slug[slug.length - 1] === DETAILED_SEGMENT) {
-    const detailed = path.join(DOCS_DIR, ...slug.slice(0, -1)) + ".detailed.mdx";
+    const detailed = detailedFileForBase(slug.slice(0, -1));
     if (fs.existsSync(detailed)) return detailed;
   }
   const candidates =
