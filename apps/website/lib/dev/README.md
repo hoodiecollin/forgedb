@@ -16,9 +16,20 @@ static export.
 
 ## Run it
 
+One command brings up both halves (dev server + wake watcher) — run it **in
+Claude Code's session** so it wakes to draft each proposal:
+
+```bash
+make website-rewrite      # dev server (background, :3100) + wake watcher
+```
+
+The dev server starts once and is reused across wake cycles (logs →
+`.next/dev-server.log`); the command prints its pid so you can `kill` it when
+done. If you already run the dev server elsewhere, use the watcher alone:
+
 ```bash
 make website              # dev server on http://localhost:3100
-make website-rewrite-watch   # (in Claude's session) wake watcher — see below
+make website-rewrite-watch   # wake watcher only (in Claude's session)
 ```
 
 Open any docs page **or the landing page**, press **⌥E** (or click the **Rewrite**

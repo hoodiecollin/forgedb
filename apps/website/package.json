@@ -10,6 +10,7 @@
 		"start": "next start --port 3100",
 		"typecheck": "tsc --noEmit",
 		"rewrite:watch": "bun scripts/rewrite-watch.ts",
+		"rewrite:dev": "bun scripts/dev-rewrite.ts",
 		"rewrite:brief": "bun scripts/rewrite-brief.ts",
 		"search-index": "bun run scripts/build-search-index.ts",
 		"clean": "rm -rf .next out public/search-index.json",

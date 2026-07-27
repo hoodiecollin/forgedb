@@ -15,7 +15,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         website-install website website-build website-typecheck website-secrets \
-        website-rewrite-watch \
+        website-rewrite website-rewrite-watch \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
@@ -131,10 +131,17 @@ website-build:
 website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
 
-## LOCAL DEV: wake watcher for the in-browser prose-rewrite tool. Blocks until the
-## docs overlay posts a rewrite request, then exits so Claude Code can draft the
-## proposal (which the overlay picks up + you accept/reject). Run alongside `make
-## website`. See apps/website/content/STYLE.md for the tone guide it honors.
+## LOCAL DEV: one command for the in-browser prose-rewrite loop — brings up the dev
+## server (background, reused across cycles) AND the wake watcher. Edit docs prose or
+## landing copy with ⌥E in the browser. Run this in Claude Code's session so it wakes
+## to draft each proposal. Prefer this over running `website` + `website-rewrite-watch`
+## separately. See apps/website/lib/dev/README.md.
+website-rewrite:
+	cd $(WEBSITE) && $(BUN) run rewrite:dev
+
+## LOCAL DEV: wake watcher only (no dev server). Blocks until the overlay posts a
+## rewrite request, then exits so Claude Code can draft the proposal. Use when the dev
+## server is already running elsewhere; otherwise prefer `website-rewrite` above.
 website-rewrite-watch:
 	cd $(WEBSITE) && $(BUN) run rewrite:watch
 
