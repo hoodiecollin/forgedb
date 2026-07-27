@@ -3,9 +3,10 @@
 //! Uses insta for snapshot testing to ensure generated code remains stable.
 
 use forgedb_codegen::{
-    ApiGenerator, FfiGenerator, GenConfig, GoGenerator, HopPlan, ModelOp, NapiGenerator,
-    OpenApiGenerator, PyO3Generator, RustGenerator, TransformGenerator, TransformPlan,
-    TypeScriptGenerator, VersionSchema, WasmGenerator,
+    ApiGenerator, FfiGenerator, GenConfig, GoGenerator, GoSdkGenerator, HopPlan, ModelOp,
+    NapiGenerator, OpenApiGenerator, PyO3Generator, PythonSdkGenerator, RustGenerator,
+    RustSdkGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
+    WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
@@ -6315,4 +6316,174 @@ fn test_go_calls_match_ffi_symbols() {
             "Go calls C.{sym} but the FFI generator emits no such symbol (drift!)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// REST client SDKs (#118 Python / #205 Go / #206 Rust): full-parity siblings of
+// the TypeScript SDK. One shared schema exercises every codepath the parity
+// surface touches — enum, @projection, required/optional FK, one-to-many virtual
+// relation, decimal, json (+ nullable json), nullable scalar, +auto fields, and a
+// multi-word model name (kebab-case). Named asserts guard the load-bearing
+// surface (CRUD + projection methods, error/list types, field-type mapping, and
+// the #188-correct create-input that omits ONLY server-synthesized +uuid/
+// +timestamp autos); the snapshot locks the exact output.
+// ---------------------------------------------------------------------------
+
+/// The shared SDK-parity fixture, parsed from source for readability.
+fn sdk_parity_schema() -> Schema {
+    let src = r#"
+        enum Role { Admin, Member, Guest }
+
+        Account {
+            id: +uuid
+            email: &string @email
+            role: Role
+            balance: decimal
+            metadata: json?
+            bio: string?
+            login_count: u64
+            created_at: +timestamp
+            projects: [Project]
+            @projection(summary: email, role)
+        }
+
+        Project {
+            id: +uuid
+            name: string
+            owner: *Account
+            reviewer: ?Account
+            tags: json
+            priority: i32?
+            @projection(card: name)
+        }
+
+        AuditEvent {
+            id: +uuid
+            kind: string
+            at: +timestamp
+        }
+    "#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    parser.parse().unwrap()
+}
+
+#[test]
+fn test_rust_sdk_generation_snapshot() {
+    let schema = sdk_parity_schema();
+    let code = RustSdkGenerator::generate(&schema).unwrap().code;
+
+    // Enum + model + create + projection types.
+    assert!(code.contains("pub enum Role {"), "enum type missing");
+    assert!(code.contains("pub struct Account {"), "model struct missing");
+    assert!(code.contains("pub struct AccountSummary {"), "projection struct missing");
+
+    // Full CRUD surface (snake_case methods).
+    for m in ["get_account", "list_account", "create_account", "update_account", "delete_account"] {
+        assert!(code.contains(&format!("pub async fn {m}(")), "missing method {m}");
+    }
+    // Projection read methods.
+    assert!(code.contains("pub async fn get_account_summary("), "projection get missing");
+    assert!(code.contains("pub async fn list_account_summary("), "projection list missing");
+
+    // Shared surface.
+    assert!(code.contains("pub struct ForgeDbError"), "typed error missing");
+    assert!(code.contains("ListResult<Account>"), "paginated list result missing");
+
+    // Field-type mapping: FK -> uuid String (required) / Option<String> (optional);
+    // decimal -> String; json + one-to-many virtual relation -> opaque Value.
+    assert!(code.contains("pub owner: String"), "required FK should be String");
+    assert!(code.contains("pub reviewer: Option<String>"), "optional FK should be Option<String>");
+    assert!(code.contains("pub balance: String"), "decimal should be String");
+    assert!(code.contains("pub tags: serde_json::Value"), "json should be opaque Value");
+    assert!(code.contains("pub projects: serde_json::Value"), "virtual relation should be opaque Value");
+
+    // Multi-word model -> kebab-case route.
+    assert!(code.contains("/api/audit-event/"), "multi-word model should kebab-case");
+
+    // #188-correct create input: AuditEvent's create omits BOTH +auto fields
+    // (id: +uuid, at: +timestamp), leaving only `kind`.
+    assert!(
+        code.contains("pub struct AuditEventCreate {\n    pub kind: String,\n}"),
+        "create input must omit +uuid/+timestamp autos (got:\n{})",
+        &code[code.find("pub struct AuditEventCreate").unwrap_or(0)..]
+            .chars().take(120).collect::<String>()
+    );
+
+    insta::assert_snapshot!(code);
+}
+
+#[test]
+fn test_go_sdk_generation_snapshot() {
+    let schema = sdk_parity_schema();
+    let code = GoSdkGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("type Role string"), "string-typed enum missing");
+    assert!(code.contains("RoleAdmin Role = \"Admin\""), "enum const missing");
+    assert!(code.contains("type Account struct {"), "model struct missing");
+    assert!(code.contains("type AccountSummary struct {"), "projection struct missing");
+
+    // Full CRUD surface (exported PascalCase methods).
+    for m in ["GetAccount", "ListAccount", "CreateAccount", "UpdateAccount", "DeleteAccount"] {
+        assert!(code.contains(&format!("func (c *Client) {m}(")), "missing method {m}");
+    }
+    assert!(code.contains("func (c *Client) GetAccountSummary("), "projection get missing");
+    assert!(code.contains("func (c *Client) ListAccountSummary("), "projection list missing");
+
+    assert!(code.contains("type ForgeDbError struct"), "typed error missing");
+    assert!(code.contains("ListResult[Account]"), "generic list result missing");
+
+    // FK -> string / *string; decimal -> string; json + virtual -> json.RawMessage.
+    assert!(code.contains("Owner string `json:\"owner\"`"), "required FK should be string");
+    assert!(code.contains("Reviewer *string `json:\"reviewer\"`"), "optional FK should be *string");
+    assert!(code.contains("Balance string `json:\"balance\"`"), "decimal should be string");
+    assert!(code.contains("Tags json.RawMessage `json:\"tags\"`"), "json should be RawMessage");
+    assert!(code.contains("Projects json.RawMessage `json:\"projects\"`"), "virtual relation opaque");
+
+    assert!(code.contains("/api/audit-event/"), "multi-word model should kebab-case");
+
+    // #188-correct create input.
+    assert!(
+        code.contains("type AuditEventCreate struct {\n\tKind string `json:\"kind\"`\n}"),
+        "create input must omit +uuid/+timestamp autos"
+    );
+
+    insta::assert_snapshot!(code);
+}
+
+#[test]
+fn test_python_sdk_generation_snapshot() {
+    let schema = sdk_parity_schema();
+    let code = PythonSdkGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("class Role(str, Enum):"), "str Enum missing");
+    assert!(code.contains("class Account:"), "model dataclass missing");
+    assert!(code.contains("class AccountSummary:"), "projection dataclass missing");
+
+    // Full CRUD surface (snake_case methods).
+    for m in ["get_account", "list_account", "create_account", "update_account", "delete_account"] {
+        assert!(code.contains(&format!("def {m}(")), "missing method {m}");
+    }
+    assert!(code.contains("def get_account_summary("), "projection get missing");
+    assert!(code.contains("def list_account_summary("), "projection list missing");
+
+    assert!(code.contains("class ForgeDbError(Exception):"), "typed error missing");
+    assert!(code.contains("class ListResult(Generic[T]):"), "list result missing");
+
+    // FK -> str / Optional[str]; decimal -> str; json + virtual -> Any.
+    assert!(code.contains("owner: str"), "required FK should be str");
+    assert!(code.contains("reviewer: Optional[str] = None"), "optional FK should be Optional[str]");
+    assert!(code.contains("balance: str"), "decimal should be str");
+    assert!(code.contains("tags: Any = None"), "json should be Any (defaulted)");
+    assert!(code.contains("projects: Any = None"), "virtual relation should be Any (defaulted)");
+
+    assert!(code.contains("/api/audit-event/"), "multi-word model should kebab-case");
+
+    // #188-correct create input: AuditEventCreate carries only `kind`.
+    let create_idx = code.find("class AuditEventCreate:").expect("create dataclass present");
+    let create_block: String = code[create_idx..].chars().take(200).collect();
+    assert!(create_block.contains("kind: str"), "create keeps required kind");
+    assert!(!create_block.contains("id:") && !create_block.contains("at:"),
+        "create must omit +uuid/+timestamp autos, got:\n{create_block}");
+
+    insta::assert_snapshot!(code);
 }

@@ -1,0 +1,583 @@
+---
+source: crates/codegen/tests/codegen_snapshots.rs
+expression: code
+---
+#![allow(dead_code, clippy::all)]
+use serde::{Deserialize, Serialize};
+/// `Role` enum — serialized as its variant-name string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Role {
+    Admin,
+    Member,
+    Guest,
+}
+/// `Account` — mirrors the wire shape of the generated model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Account {
+    pub id: String,
+    pub email: String,
+    pub role: Role,
+    pub balance: String,
+    pub metadata: serde_json::Value,
+    pub bio: Option<String>,
+    pub login_count: u64,
+    pub created_at: i64,
+    pub projects: serde_json::Value,
+}
+/// Input to `create_account` — a `Account` without the fields the server
+/// synthesizes (`+uuid`/`+timestamp` autos).
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountCreate {
+    pub email: String,
+    pub role: Role,
+    pub balance: String,
+    pub metadata: serde_json::Value,
+    pub bio: Option<String>,
+    pub login_count: u64,
+    pub projects: serde_json::Value,
+}
+/// Projection `summary` of `Account` — PK + declared columns only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountSummary {
+    pub id: String,
+    pub email: String,
+    pub role: Role,
+}
+/// `Project` — mirrors the wire shape of the generated model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub owner: String,
+    pub reviewer: Option<String>,
+    pub tags: serde_json::Value,
+    pub priority: Option<i32>,
+}
+/// Input to `create_project` — a `Project` without the fields the server
+/// synthesizes (`+uuid`/`+timestamp` autos).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectCreate {
+    pub name: String,
+    pub owner: String,
+    pub reviewer: Option<String>,
+    pub tags: serde_json::Value,
+    pub priority: Option<i32>,
+}
+/// Projection `card` of `Project` — PK + declared columns only.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectCard {
+    pub id: String,
+    pub name: String,
+}
+/// `AuditEvent` — mirrors the wire shape of the generated model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub id: String,
+    pub kind: String,
+    pub at: i64,
+}
+/// Input to `create_audit_event` — a `AuditEvent` without the fields the server
+/// synthesizes (`+uuid`/`+timestamp` autos).
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditEventCreate {
+    pub kind: String,
+}
+/// Raised on any non-2xx response (except a get / update / delete 404, which
+/// the corresponding methods surface as `None` / `false`), and on transport
+/// failures (`status == 0`). Carries the HTTP status and the parsed `{ error }`
+/// body when present.
+#[derive(Debug, Clone)]
+pub struct ForgeDbError {
+    pub status: u16,
+    pub message: String,
+    pub body: Option<serde_json::Value>,
+}
+impl std::fmt::Display for ForgeDbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ForgeDB error (status {}): {}", self.status, self.message)
+    }
+}
+impl std::error::Error for ForgeDbError {}
+impl ForgeDbError {
+    /// A transport/client-side failure (connection refused, body decode, …):
+    /// `status == 0`, no server body.
+    fn transport(e: reqwest::Error) -> Self {
+        Self {
+            status: 0,
+            message: e.to_string(),
+            body: None,
+        }
+    }
+}
+/// A page of list results — mirrors the REST list endpoint's response envelope.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListResult<T> {
+    pub data: Vec<T>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+}
+/// Sort direction for a list query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+impl SortOrder {
+    fn as_str(self) -> &'static str {
+        match self {
+            SortOrder::Asc => "asc",
+            SortOrder::Desc => "desc",
+        }
+    }
+}
+/// Options for a list query. `filter` holds exact-match `?field=value` pairs
+/// matched by the generated per-model filter server-side.
+#[derive(Debug, Clone, Default)]
+pub struct ListOptions {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub sort: Option<String>,
+    pub order: Option<SortOrder>,
+    pub filter: Vec<(String, String)>,
+}
+/// The REST create/update response body (`{ "id": "..." }`).
+#[derive(Deserialize)]
+struct CreatedId {
+    id: String,
+}
+/// Percent-encode one URL path segment (RFC 3986 unreserved set passes through),
+/// so an arbitrary string id is safe to interpolate into the path.
+fn encode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+/// A typed async client for a ForgeDB app's REST API.
+pub struct ForgeDbClient {
+    base_url: String,
+    http: reqwest::Client,
+}
+impl ForgeDbClient {
+    /// Build a client targeting `base_url` (a trailing slash is trimmed).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http: reqwest::Client::new(),
+        }
+    }
+    /// Build a client over a caller-supplied `reqwest::Client` (custom timeouts,
+    /// default headers, a proxy, …).
+    pub fn with_client(base_url: impl Into<String>, http: reqwest::Client) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http,
+        }
+    }
+    /// Build the `?limit=&offset=&sort=&order=&<filter>` query pairs for a list.
+    fn list_query(&self, options: &ListOptions) -> Vec<(String, String)> {
+        let mut q: Vec<(String, String)> = Vec::new();
+        if let Some(v) = options.limit {
+            q.push(("limit".to_string(), v.to_string()));
+        }
+        if let Some(v) = options.offset {
+            q.push(("offset".to_string(), v.to_string()));
+        }
+        if let Some(v) = &options.sort {
+            q.push(("sort".to_string(), v.clone()));
+        }
+        if let Some(v) = options.order {
+            q.push(("order".to_string(), v.as_str().to_string()));
+        }
+        for (k, val) in &options.filter {
+            q.push((k.clone(), val.clone()));
+        }
+        q
+    }
+    /// Map a non-2xx response to a typed `ForgeDbError`, extracting the server's
+    /// `{ error }` message when the body is JSON; pass a 2xx response through.
+    async fn assert_ok(
+        &self,
+        response: reqwest::Response,
+    ) -> std::result::Result<reqwest::Response, ForgeDbError> {
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let status = response.status().as_u16();
+        let body = response.json::<serde_json::Value>().await.ok();
+        let message = body
+            .as_ref()
+            .and_then(|b| b.get("error"))
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        Err(ForgeDbError {
+            status,
+            message,
+            body,
+        })
+    }
+}
+impl ForgeDbClient {
+    /// Get a `Account` by id, or `None` if it does not exist.
+    pub async fn get_account(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<Account>, ForgeDbError> {
+        let url = format!("{}/api/account/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = self.assert_ok(response).await?;
+        response.json::<Account>().await.map(Some).map_err(ForgeDbError::transport)
+    }
+    /// List `Account` rows with optional pagination, sort, and exact-match filters.
+    pub async fn list_account(
+        &self,
+        options: &ListOptions,
+    ) -> std::result::Result<ListResult<Account>, ForgeDbError> {
+        let url = format!("{}/api/account", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&self.list_query(options))
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<ListResult<Account>>().await.map_err(ForgeDbError::transport)
+    }
+    /// Create a `Account`. Returns the new id. Errors (`ForgeDbError`) on a
+    /// constraint (422) or integrity conflict (409).
+    pub async fn create_account(
+        &self,
+        data: &AccountCreate,
+    ) -> std::result::Result<String, ForgeDbError> {
+        let url = format!("{}/api/account", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<CreatedId>().await.map(|r| r.id).map_err(ForgeDbError::transport)
+    }
+    /// Replace a `Account` by id (whole-record PUT). Returns `false` if the id
+    /// does not exist; errors on a constraint/conflict.
+    pub async fn update_account(
+        &self,
+        id: &str,
+        data: &Account,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/account/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .put(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+    /// Delete a `Account` by id. Returns `true` if deleted, `false` if absent.
+    /// Errors (409) if `@on_delete(restrict)` children block it.
+    pub async fn delete_account(
+        &self,
+        id: &str,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/account/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+    /// Get the `summary` projection of a `Account` by id, or `None` if absent.
+    pub async fn get_account_summary(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<AccountSummary>, ForgeDbError> {
+        let url = format!("{}/api/account/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("projection", "summary")])
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = self.assert_ok(response).await?;
+        response
+            .json::<AccountSummary>()
+            .await
+            .map(Some)
+            .map_err(ForgeDbError::transport)
+    }
+    /// List `Account` rows as the `summary` projection (PK + declared columns).
+    pub async fn list_account_summary(
+        &self,
+        options: &ListOptions,
+    ) -> std::result::Result<ListResult<AccountSummary>, ForgeDbError> {
+        let url = format!("{}/api/account", self.base_url);
+        let mut q = self.list_query(options);
+        q.push(("projection".to_string(), "summary".to_string()));
+        let response = self
+            .http
+            .get(&url)
+            .query(&q)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response
+            .json::<ListResult<AccountSummary>>()
+            .await
+            .map_err(ForgeDbError::transport)
+    }
+    /// Get a `Project` by id, or `None` if it does not exist.
+    pub async fn get_project(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<Project>, ForgeDbError> {
+        let url = format!("{}/api/project/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = self.assert_ok(response).await?;
+        response.json::<Project>().await.map(Some).map_err(ForgeDbError::transport)
+    }
+    /// List `Project` rows with optional pagination, sort, and exact-match filters.
+    pub async fn list_project(
+        &self,
+        options: &ListOptions,
+    ) -> std::result::Result<ListResult<Project>, ForgeDbError> {
+        let url = format!("{}/api/project", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&self.list_query(options))
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<ListResult<Project>>().await.map_err(ForgeDbError::transport)
+    }
+    /// Create a `Project`. Returns the new id. Errors (`ForgeDbError`) on a
+    /// constraint (422) or integrity conflict (409).
+    pub async fn create_project(
+        &self,
+        data: &ProjectCreate,
+    ) -> std::result::Result<String, ForgeDbError> {
+        let url = format!("{}/api/project", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<CreatedId>().await.map(|r| r.id).map_err(ForgeDbError::transport)
+    }
+    /// Replace a `Project` by id (whole-record PUT). Returns `false` if the id
+    /// does not exist; errors on a constraint/conflict.
+    pub async fn update_project(
+        &self,
+        id: &str,
+        data: &Project,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/project/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .put(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+    /// Delete a `Project` by id. Returns `true` if deleted, `false` if absent.
+    /// Errors (409) if `@on_delete(restrict)` children block it.
+    pub async fn delete_project(
+        &self,
+        id: &str,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/project/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+    /// Get the `card` projection of a `Project` by id, or `None` if absent.
+    pub async fn get_project_card(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<ProjectCard>, ForgeDbError> {
+        let url = format!("{}/api/project/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .get(&url)
+            .query(&[("projection", "card")])
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = self.assert_ok(response).await?;
+        response.json::<ProjectCard>().await.map(Some).map_err(ForgeDbError::transport)
+    }
+    /// List `Project` rows as the `card` projection (PK + declared columns).
+    pub async fn list_project_card(
+        &self,
+        options: &ListOptions,
+    ) -> std::result::Result<ListResult<ProjectCard>, ForgeDbError> {
+        let url = format!("{}/api/project", self.base_url);
+        let mut q = self.list_query(options);
+        q.push(("projection".to_string(), "card".to_string()));
+        let response = self
+            .http
+            .get(&url)
+            .query(&q)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<ListResult<ProjectCard>>().await.map_err(ForgeDbError::transport)
+    }
+    /// Get a `AuditEvent` by id, or `None` if it does not exist.
+    pub async fn get_audit_event(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<AuditEvent>, ForgeDbError> {
+        let url = format!("{}/api/audit-event/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = self.assert_ok(response).await?;
+        response.json::<AuditEvent>().await.map(Some).map_err(ForgeDbError::transport)
+    }
+    /// List `AuditEvent` rows with optional pagination, sort, and exact-match filters.
+    pub async fn list_audit_event(
+        &self,
+        options: &ListOptions,
+    ) -> std::result::Result<ListResult<AuditEvent>, ForgeDbError> {
+        let url = format!("{}/api/audit-event", self.base_url);
+        let response = self
+            .http
+            .get(&url)
+            .query(&self.list_query(options))
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<ListResult<AuditEvent>>().await.map_err(ForgeDbError::transport)
+    }
+    /// Create a `AuditEvent`. Returns the new id. Errors (`ForgeDbError`) on a
+    /// constraint (422) or integrity conflict (409).
+    pub async fn create_audit_event(
+        &self,
+        data: &AuditEventCreate,
+    ) -> std::result::Result<String, ForgeDbError> {
+        let url = format!("{}/api/audit-event", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        let response = self.assert_ok(response).await?;
+        response.json::<CreatedId>().await.map(|r| r.id).map_err(ForgeDbError::transport)
+    }
+    /// Replace a `AuditEvent` by id (whole-record PUT). Returns `false` if the id
+    /// does not exist; errors on a constraint/conflict.
+    pub async fn update_audit_event(
+        &self,
+        id: &str,
+        data: &AuditEvent,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/audit-event/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .put(&url)
+            .json(data)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+    /// Delete a `AuditEvent` by id. Returns `true` if deleted, `false` if absent.
+    /// Errors (409) if `@on_delete(restrict)` children block it.
+    pub async fn delete_audit_event(
+        &self,
+        id: &str,
+    ) -> std::result::Result<bool, ForgeDbError> {
+        let url = format!("{}/api/audit-event/{}", self.base_url, encode_segment(id));
+        let response = self
+            .http
+            .delete(&url)
+            .send()
+            .await
+            .map_err(ForgeDbError::transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(false);
+        }
+        self.assert_ok(response).await?;
+        Ok(true)
+    }
+}
