@@ -7,8 +7,11 @@ import type { TargetKind } from "./rewrite-types";
 
 export interface DetectedTarget {
   kind: TargetKind;
-  srcStart: number;
-  srcEnd: number;
+  /** Offset-based (docs) targets carry a source range; content targets don't. */
+  srcStart?: number;
+  srcEnd?: number;
+  /** Content-based (marketing) targets carry a content-module slot key instead. */
+  contentKey?: string;
   /** For spans: the exact selected text (generator narrows within the block). */
   selectedText: string;
   /** Rendered text of the target, shown to the user. */
@@ -22,6 +25,32 @@ export function stampedBlock(node: Node | null): HTMLElement | null {
   let el = node instanceof HTMLElement ? node : node?.parentElement ?? null;
   while (el && el.dataset.srcStart === undefined) el = el.parentElement;
   return el && el.dataset.srcStart !== undefined ? el : null;
+}
+
+/** Nearest ancestor-or-self carrying a `data-content-key` (content-module slot). */
+export function contentBlock(node: Node | null): HTMLElement | null {
+  let el = node instanceof HTMLElement ? node : node?.parentElement ?? null;
+  while (el && el.dataset.contentKey === undefined) el = el.parentElement;
+  return el && el.dataset.contentKey !== undefined ? el : null;
+}
+
+/**
+ * Content-key target(s) for a click: the nearest element with `data-content-key`,
+ * as a single whole-slot target. (Sub-span narrowing within a slot isn't wired —
+ * a slot is one string in the content module.)
+ */
+export function detectContentTargets(clickTarget: Node | null): DetectedTarget[] {
+  const el = contentBlock(clickTarget);
+  if (!el) return [];
+  return [
+    {
+      kind: "content",
+      contentKey: el.dataset.contentKey,
+      selectedText: "",
+      renderedText: (el.textContent ?? "").trim(),
+      rect: el.getBoundingClientRect(),
+    },
+  ];
 }
 
 const startOf = (el: HTMLElement) => Number(el.dataset.srcStart);

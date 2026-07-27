@@ -15,10 +15,28 @@ import matter from "gray-matter";
 import { hashContent } from "./rewrite-hash";
 import type { RewriteRequest, RewriteProposal } from "./rewrite-types";
 
-/** Content fingerprint of a doc's MDX body — for the staleness guard. */
+/**
+ * The splice coordinate space for a file and where it begins in the raw bytes.
+ *
+ * - `.mdx`/`.md` docs: offsets are content-space (post-frontmatter), so the body
+ *   is the frontmatter-stripped content and `base` is where it starts in `raw`.
+ * - Any other file (e.g. a `.ts` content module): offsets are raw-file offsets,
+ *   so the body is the whole file and `base` is 0. This keeps content-module
+ *   splicing free of gray-matter's frontmatter handling entirely.
+ */
+function bodyAndBase(raw: string, absPath: string): { body: string; base: number } {
+  if (absPath.endsWith(".mdx") || absPath.endsWith(".md")) {
+    const { content } = matter(raw);
+    const base = raw.indexOf(content);
+    return { body: content, base: base < 0 ? 0 : base };
+  }
+  return { body: raw, base: 0 };
+}
+
+/** Content fingerprint of a file's splice body — for the staleness guard. */
 export function contentHashOfFile(absPath: string): string {
-  const { content } = matter(fs.readFileSync(absPath, "utf8"));
-  return hashContent(content);
+  const raw = fs.readFileSync(absPath, "utf8");
+  return hashContent(bodyAndBase(raw, absPath).body);
 }
 
 const QUEUE_DIR = path.join(process.cwd(), ".rewrite-queue");
@@ -121,16 +139,13 @@ export function acceptProposal(
   }
 
   const raw = fs.readFileSync(abs, "utf8");
-  const { content } = matter(raw);
+  const { body, base } = bodyAndBase(raw, abs);
 
   // Staleness backstop: if the body changed since the browser rendered it, the
   // offsets are stale and splicing would corrupt the file. Refuse.
-  if (expectedHash && hashContent(content) !== expectedHash) {
+  if (expectedHash && hashContent(body) !== expectedHash) {
     throw new Error("STALE: source changed since render — reload the page and retry");
   }
-
-  const base = raw.indexOf(content); // frontmatter + delimiters length
-  if (base < 0) throw new Error(`could not locate content body in ${abs}`);
 
   const start = base + proposal.srcStart;
   const end = base + proposal.srcEnd;

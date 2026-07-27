@@ -42,8 +42,9 @@ function report(pending: RewriteRequest[]): never {
     const briefRef = fs.existsSync(brief)
       ? brief
       : `(missing — run: bun scripts/rewrite-brief.ts ${r.id})`;
+    const where = r.contentKey ? `${r.contentModule}:${r.contentKey}` : `/${r.slug.join("/")}`;
     console.log(
-      `  ${r.id}  [${r.target.kind}]  /${r.slug.join("/")}  —  ${JSON.stringify(r.instruction)}`,
+      `  ${r.id}  [${r.target.kind}]  ${where}  —  ${JSON.stringify(r.instruction)}`,
     );
     console.log(`         brief: ${briefRef}`);
   }

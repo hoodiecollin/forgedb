@@ -14,7 +14,13 @@ import { useAtom } from "jotai";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { rewriteModeAtom, feedbackModeAtom } from "@/lib/dev/rewrite-atoms";
-import { detectTargets, stampedBlock, type DetectedTarget } from "@/lib/dev/rewrite-target";
+import {
+  detectTargets,
+  detectContentTargets,
+  stampedBlock,
+  contentBlock,
+  type DetectedTarget,
+} from "@/lib/dev/rewrite-target";
 import type { FeedbackMode, RewriteProposal } from "@/lib/dev/rewrite-types";
 
 const API = "/api/dev-rewrite/";
@@ -27,6 +33,14 @@ function slugFromPath(pathname: string): string[] | null {
   return parts.slice(1);
 }
 
+/**
+ * Content-module id for a page that stores its copy in a typed content module
+ * (see content-target.ts), or null. One page → one module for now.
+ */
+function moduleForPath(pathname: string): string | null {
+  return pathname.replace(/\/+$/, "") === "" ? "landing" : null;
+}
+
 const insideUI = (n: EventTarget | null) =>
   n instanceof Element && n.closest("[data-rewrite-ui]") !== null;
 
@@ -35,6 +49,7 @@ type Phase = "idle" | "picking" | "pending" | "review";
 export function RewriteOverlay() {
   const pathname = usePathname();
   const slug = slugFromPath(pathname);
+  const contentModule = moduleForPath(pathname);
   const [mode, setMode] = useAtom(rewriteModeAtom);
   const [defaultFeedback] = useAtom(feedbackModeAtom);
 
@@ -61,7 +76,8 @@ export function RewriteOverlay() {
   }, []);
 
   const target = targets[targetIndex] ?? null;
-  const enabled = mode && slug !== null;
+  const editable = slug !== null || contentModule !== null;
+  const enabled = mode && editable;
 
   // ⌥E toggles edit mode anywhere; Esc backs out.
   useEffect(() => {
@@ -84,7 +100,9 @@ export function RewriteOverlay() {
 
     const onMouseUp = (e: MouseEvent) => {
       if (insideUI(e.target) || phase === "pending" || phase === "review") return;
-      const found = detectTargets(e.target as Node);
+      const found = contentModule
+        ? detectContentTargets(e.target as Node)
+        : detectTargets(e.target as Node);
       if (found.length) {
         setStaleMsg(null);
         setTargets(found);
@@ -105,7 +123,7 @@ export function RewriteOverlay() {
         setHoverRect(null);
         return;
       }
-      const block = stampedBlock(e.target as Node);
+      const block = (contentModule ? contentBlock : stampedBlock)(e.target as Node);
       setHoverRect(block ? block.getBoundingClientRect() : null);
     };
 
@@ -117,7 +135,7 @@ export function RewriteOverlay() {
       document.removeEventListener("click", onClickCapture, true);
       document.removeEventListener("mousemove", onMouseMove);
     };
-  }, [enabled, phase, defaultFeedback]);
+  }, [enabled, phase, defaultFeedback, contentModule]);
 
   // Poll for the proposal once a request is in flight.
   useEffect(() => {
@@ -146,32 +164,46 @@ export function RewriteOverlay() {
 
   if (!mode) {
     // Collapsed launcher.
-    return slug !== null ? <Fab active={false} onClick={() => setMode(true)} /> : null;
+    return editable ? <Fab active={false} onClick={() => setMode(true)} /> : null;
   }
-  if (slug === null) return null;
+  if (!editable) return null;
 
   async function submit() {
     if (!target || !instruction.trim()) return;
-    const docHash =
-      document.querySelector("[data-rewrite-doc-hash]")?.getAttribute("data-rewrite-doc-hash") ??
-      undefined;
+
+    // Content-key target: the route resolves offsets + staleness from the module.
+    const body =
+      target.contentKey && contentModule
+        ? {
+            action: "request",
+            contentModule,
+            contentKey: target.contentKey,
+            instruction: instruction.trim(),
+            mode: feedback,
+            target: { kind: target.kind, renderedText: target.renderedText.slice(0, 2000) },
+          }
+        : {
+            action: "request",
+            slug,
+            instruction: instruction.trim(),
+            mode: feedback,
+            docHash:
+              document
+                .querySelector("[data-rewrite-doc-hash]")
+                ?.getAttribute("data-rewrite-doc-hash") ?? undefined,
+            target: {
+              kind: target.kind,
+              srcStart: target.srcStart,
+              srcEnd: target.srcEnd,
+              selectedText: target.selectedText,
+              renderedText: target.renderedText.slice(0, 2000),
+            },
+          };
+
     const res = await fetch(API, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        action: "request",
-        slug,
-        instruction: instruction.trim(),
-        mode: feedback,
-        docHash,
-        target: {
-          kind: target.kind,
-          srcStart: target.srcStart,
-          srcEnd: target.srcEnd,
-          selectedText: target.selectedText,
-          renderedText: target.renderedText.slice(0, 2000),
-        },
-      }),
+      body: JSON.stringify(body),
     });
     if (res.status === 409) {
       setStaleMsg("This page changed on disk since it loaded, so the offsets are stale.");
@@ -311,6 +343,7 @@ const KIND_LABEL: Record<string, string> = {
   section: "Section",
   block: "Block",
   span: "Span",
+  content: "Copy",
 };
 
 /** Clamp a popover to the viewport, anchored just below the target rect. */

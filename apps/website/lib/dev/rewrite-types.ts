@@ -4,8 +4,12 @@
  * queue) alike. See `rewrite-queue.ts` for the fs-backed helpers.
  */
 
-/** How a rewrite target was designated in the browser. */
-export type TargetKind = "section" | "block" | "span";
+/**
+ * How a rewrite target was designated in the browser.
+ * - `section`/`block`/`span` — offset-based, for `.mdx` docs (remark-source-map).
+ * - `content` — key-based, for a typed content module slot (content-target.ts).
+ */
+export type TargetKind = "section" | "block" | "span" | "content";
 
 /**
  * Which register the target block is written in — picks the style register file
@@ -46,8 +50,11 @@ export interface RewriteRequest {
   id: string;
   ts: number;
   status: "pending" | "proposed" | "accepted" | "rejected";
-  /** URL slug segments of the doc, e.g. ["schema", "overview"]. */
+  /** URL slug segments of the doc, e.g. ["schema", "overview"]. Empty for content targets. */
   slug: string[];
+  /** For content-key targets: the content module id (e.g. "landing") and its slot key. */
+  contentModule?: string;
+  contentKey?: string;
   target: RewriteTarget;
   /** The user's free-text instruction ("tighten this", "add an example"). */
   instruction: string;
