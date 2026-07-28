@@ -43,4 +43,4 @@ npm-scope = "@hoodiecollin"
 # that authenticates with npm Trusted Publishing (OIDC), not a stored NPM_TOKEN —
 # aligning the npm channel with PyPI (`pypi.yml`). `npm` stays in `installers` so
 # dist still builds the npm package; only the publish step is overridden.
-publish-jobs = ["homebrew", "./publish-npm", "./docker"]
+publish-jobs = ["homebrew", "./publish-npm"]

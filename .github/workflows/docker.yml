@@ -1,72 +1,82 @@
 # Docker image for the `forgedb` CLI — epic #181 / Docker channel.
 #
-# Wired into the release pipeline as a cargo-dist CUSTOM PUBLISH JOB (same pattern
-# as publish-npm.yml): dist-workspace.toml lists it in `publish-jobs`, so dist
-# calls this reusable workflow from the generated release.yml with `needs:
-# [plan, host]` and passes the release `plan` as an input. That ordering matters:
-# the Dockerfile's `fetch` stage does an UNAUTHENTICATED `curl` of
-# `releases/download/v<version>/forgedb-<triple>.tar.xz`, so the image can only be
-# built once `host` has created the (published, non-draft) GitHub Release and
-# uploaded every per-platform tarball. A custom publish job runs exactly there —
-# after host, before announce — whereas an `on: release: [published]` trigger
-# would never fire (cargo-dist creates the release with the built-in GITHUB_TOKEN,
-# and GitHub suppresses `release` events for GITHUB_TOKEN-authored releases).
+# Triggered by the "Release" workflow (cargo-dist / release.yml) COMPLETING, via
+# `workflow_run`. That ordering is load-bearing: the Dockerfile's `fetch` stage
+# does an UNAUTHENTICATED `curl` of `releases/download/v<version>/forgedb-<triple>
+# .tar.xz`, so the image can only build once release.yml's `host` job has created
+# the (published, non-draft) GitHub Release and uploaded every per-platform
+# tarball. `workflow_run: [completed]` fires only after the whole Release run
+# (build → host → announce) finishes, so the assets are guaranteed present.
 #
-# Builds a multi-arch image (linux/amd64 + linux/arm64), pushes to GHCR always and
-# to Docker Hub when its credentials are configured.
+# Why not `on: release: [published]`? cargo-dist creates the Release with the
+# built-in GITHUB_TOKEN, and GitHub suppresses `release` events for
+# GITHUB_TOKEN-authored releases — that trigger would never fire. `workflow_run`
+# keys off the *workflow completing* (the Release run was triggered by a human tag
+# push), so it is not subject to that suppression.
+#
+# Why not a cargo-dist custom publish job (like publish-npm.yml)? dist hardcodes
+# custom-publish call-site permissions to {id-token, packages} with no way to add
+# `contents: read`, and this job needs checkout (for the Dockerfile / build
+# context). A reusable workflow requesting a scope the caller didn't grant fails
+# the caller at startup, so Docker must stay a standalone workflow_run job with
+# its own permissions.
+#
+# workflow_run runs the copy of this file on the DEFAULT branch (main). Builds a
+# multi-arch image (linux/amd64 + linux/arm64), pushes to GHCR always and to
+# Docker Hub when its credentials are configured.
 #
 # Registries / go-live gating:
 #   - GHCR (ghcr.io/hoodiecollin/forgedb): auth via the built-in GITHUB_TOKEN — no
-#     secret to provision (dist escalates `packages: write` at the call site).
+#     secret to provision (this workflow grants itself `packages: write`).
 #   - Docker Hub (docker.io/hoodiecollin/forgedb): needs `DOCKERHUB_USERNAME` +
-#     `DOCKERHUB_TOKEN` secrets (flow in via the caller's `secrets: inherit`).
-#     Absent → the image still ships to GHCR; Docker Hub is skipped (not failed).
+#     `DOCKERHUB_TOKEN` secrets. Absent → the image still ships to GHCR; Docker Hub
+#     is skipped (not failed).
 #
 # `workflow_dispatch` stays for manual rebuilds of an already-published tag.
 name: Docker
 
 on:
-  workflow_call:
-    inputs:
-      plan:
-        description: dist release plan (JSON) — passed by cargo-dist
-        required: true
-        type: string
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
         description: Release tag to build (e.g. v0.2.0) — must already be published
         required: true
 
+permissions:
+  contents: read
+  packages: write # push to GHCR
+
 jobs:
   image:
     name: build & push (multi-arch)
     runs-on: ubuntu-22.04
-    # Skip prereleases (manual dispatch always runs); on a plan-driven run mirror
-    # dist's built-in publisher gate so a `-prerelease` tag gets no image/`latest`.
-    if: ${{ github.event_name == 'workflow_dispatch' || !fromJson(inputs.plan).announcement_is_prerelease || fromJson(inputs.plan).publish_prereleases }}
-    permissions:
-      contents: read
-      packages: write # push to GHCR
+    # Manual dispatch always runs. For a workflow_run trigger, require the upstream
+    # Release to have SUCCEEDED and the tag to be a stable `v*` (skip prereleases —
+    # a `-rc`/`-beta` tag gets no image or `latest`). head_branch is the tag name
+    # for a tag-triggered upstream run.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           startsWith(github.event.workflow_run.head_branch, 'v') &&
+           !contains(github.event.workflow_run.head_branch, '-')) }}
     env:
-      PLAN: ${{ inputs.plan }}
       TAG_INPUT: ${{ github.event.inputs.tag }}
+      RUN_TAG: ${{ github.event.workflow_run.head_branch }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
-      # Resolve the tag from the dist plan (custom-publish-job run) or the manual
-      # dispatch input, then the bare version the Dockerfile fetches by.
+      # Resolve the tag from the upstream Release run's head_branch (workflow_run)
+      # or the manual dispatch input, then the bare version the Dockerfile fetches by.
       - name: Resolve version
         id: v
         shell: bash
         run: |
-          if [ -n "$PLAN" ]; then
-            tag=$(echo "$PLAN" | jq -r '.announcement_tag')
-          else
-            tag="$TAG_INPUT"
-          fi
+          tag="${TAG_INPUT:-$RUN_TAG}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
