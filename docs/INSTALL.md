@@ -38,22 +38,12 @@ Once the `get.forgedb.dev` alias is live this shortens to:
 curl -fsSL https://get.forgedb.dev/install.sh | sh
 ```
 
-**PowerShell (Windows):**
-
-```powershell
-powershell -c "irm https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.ps1 | iex"
-# or, once the alias is live:  irm https://get.forgedb.dev/install.ps1 | iex
-```
-
-**winget (Windows):**
-
-```powershell
-winget install ForgeDB.ForgeDB
-```
-
-**MSI (Windows).** Each release also attaches
-`forgedb-x86_64-pc-windows-msvc.msi` — a double-click installer that registers an
-Add/Remove Programs entry (good for offline / managed environments).
+> **Windows is not supported yet.** v0.2.0 ships macOS + Linux binaries only —
+> the `forgedb` binary is currently Unix-only (positional-I/O storage + a
+> Unix-socket write coordinator), so even `cargo install` fails on native
+> Windows. Windows support (native binary, the PowerShell installer, MSI, and
+> winget) is tracked for a follow-up release. In the meantime, run ForgeDB under
+> **WSL2**, where it behaves as Linux.
 
 **Homebrew (macOS / Linux):**
 
@@ -86,7 +76,6 @@ your platform, extract, and put `forgedb` on your `PATH`:
 | Linux aarch64 | `forgedb-aarch64-unknown-linux-gnu.tar.xz` |
 | macOS (Intel) | `forgedb-x86_64-apple-darwin.tar.xz` |
 | macOS (Apple Silicon) | `forgedb-aarch64-apple-darwin.tar.xz` |
-| Windows x86_64 | `forgedb-x86_64-pc-windows-msvc.zip` |
 
 ```bash
 tar -xf forgedb-<target>.tar.xz
