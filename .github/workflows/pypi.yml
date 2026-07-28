@@ -13,10 +13,10 @@
 # (manylinux/musllinux ↔ the gnu/musl Linux targets). Independent of dist — it
 # shares only the "cross-build works" prerequisite.
 #
-# Go-live is user-gated: publishing uses PyPI **Trusted Publishing (OIDC)** — no
-# stored secret. Before the first real tag, register a *pending publisher* on
-# PyPI (project `forgedb`, repo `hoodiecollin/forgedb`, workflow `pypi.yml`,
-# environment `pypi`); until then this only builds+validates wheels on pushes/PRs.
+# Publishing uses PyPI **Trusted Publishing (OIDC)** — no stored secret. The
+# pending publisher is registered on PyPI (project `hoodiecollin-forgedb`, repo
+# `hoodiecollin/forgedb`, workflow `pypi.yml`, environment `pypi`); PRs/manual
+# runs only build+validate wheels, and only a stable `v*` tag publishes.
 name: PyPI
 
 on:
@@ -60,10 +60,10 @@ jobs:
             runner: macos-14
             target: aarch64
             manylinux: 'off'
-          - name: windows-x86_64
-            runner: windows-latest
-            target: x64
-            manylinux: 'off'
+          # Windows (windows-x86_64) intentionally omitted: the `forgedb` binary is
+          # currently Unix-only (storage-native positional I/O + coordinator Unix
+          # sockets), so its wheel can't build. Mirrors dist dropping the Windows
+          # target — tracked in #209.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
