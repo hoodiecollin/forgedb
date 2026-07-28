@@ -28,6 +28,15 @@ on:
       - pyproject.toml
       - .github/workflows/pypi.yml
   workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Also publish to PyPI. Use to recover a release whose tag-triggered run
+          got stuck (e.g. a scarce runner never picked up a wheel). Only meaningful
+          when `main` is at the exact version being (re)published — PyPI rejects a
+          duplicate version, so this cannot clobber an existing release.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -53,7 +62,13 @@ jobs:
             target: x86_64
             manylinux: musllinux_1_2
           - name: macos-x86_64
-            runner: macos-13
+            # Cross-compiled on an Apple-Silicon runner (macos-14) rather than a
+            # native Intel one (macos-13): GitHub's Intel-macOS runners are scarce
+            # and being retired, and a `bin` wheel is just the compiled binary, so
+            # x86_64-apple-darwin cross-builds cleanly from arm64. The x86_64 wheel
+            # therefore can't be run on this host — it is excluded from the smoke
+            # test below (only same-arch wheels self-test).
+            runner: macos-14
             target: x86_64
             manylinux: 'off'
           - name: macos-aarch64
@@ -79,8 +94,10 @@ jobs:
           manylinux: ${{ matrix.manylinux }}
           args: --release --out dist
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
-      - name: Smoke-test the wheel (native runners only)
-        if: ${{ matrix.name == 'linux-x86_64-gnu' || startsWith(matrix.name, 'macos') || startsWith(matrix.name, 'windows') }}
+      - name: Smoke-test the wheel (same-arch runners only)
+        # Only wheels whose arch matches the host can self-execute. macos-x86_64 is
+        # cross-built on arm64 (macos-14), so it can't run here — skip it.
+        if: ${{ matrix.name == 'linux-x86_64-gnu' || matrix.name == 'macos-aarch64' }}
         shell: bash
         run: |
           set -euxo pipefail
@@ -115,10 +132,14 @@ jobs:
     name: publish to PyPI
     needs: [wheels, sdist]
     runs-on: ubuntu-22.04
-    # Stable tag pushes only — PRs, manual runs, and `-prerelease` tags
+    # Stable tag pushes publish automatically — PRs and `-prerelease` tags
     # build+validate but never publish (mirrors dist's prerelease gate so PyPI
-    # doesn't burn a version on an rc/beta tag).
-    if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-') }}
+    # doesn't burn a version on an rc/beta tag). A manual dispatch publishes ONLY
+    # when explicitly opted in via the `publish` input (the recovery path for a
+    # tag run whose wheel never got a runner); a plain dispatch just validates.
+    if: >-
+      ${{ (startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.publish) }}
     environment: pypi
     permissions:
       # OIDC token exchange for Trusted Publishing — this is what authenticates
