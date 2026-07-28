@@ -1,69 +1,225 @@
 ---
-title: "TypeScript SDK"
-description: "The generated TypeScript SDK — typed CRUD over the REST API, ListResult, per-model Create types, and typed errors, publishable to npm."
+title: "Client SDKs"
+description: "The generated REST client SDKs — TypeScript, Python, Rust, and Go. Typed CRUD over the REST API with a matching ListResult envelope, per-model Create inputs, and typed errors. Pick your ecosystem."
 purpose: "reference"
 ---
-`forgedb generate typescript` (or `generate all`) emits a `types.ts` SDK that mirrors the
-generated REST contract exactly. It provides typed CRUD per model, a typed error, and — so
-you can publish it — a `package.json` and `tsconfig.json` alongside it.
+`forgedb generate <node|python|rust|go> --sdk` emits a typed REST client that mirrors the
+generated REST contract exactly — the **same methods and shapes in every language**, because
+each one wraps the identical HTTP API. `node` covers Node.js and Bun (they share the
+generated TypeScript client). Pick your ecosystem with the toggle above; the `.forge` schema
+and the REST contract underneath never change.
+
+<Eco lang="node">
+
+```bash
+forgedb generate node --sdk     # → generated/types.ts   (bun --sdk is equivalent)
+```
+
+</Eco>
+
+<Eco lang="python">
+
+```bash
+forgedb generate python --sdk   # → generated/python-sdk/forgedb_client.py
+```
+
+</Eco>
+
+<Eco lang="rust">
+
+```bash
+forgedb generate rust --sdk     # → generated/rust-sdk/   (a reqwest client crate)
+```
+
+</Eco>
+
+<Eco lang="go">
+
+```bash
+forgedb generate go --sdk       # → generated/go-sdk/client.go
+```
+
+</Eco>
 
 ## CRUD methods
 
-The SDK exports a single `ForgeDBClient` class with **flat, model-suffixed** methods
-(`get<Model>` / `list<Model>` / `create<Model>` / `update<Model>` / `delete<Model>`) — there
-is no per-model sub-object. For a model `Post`, matching the REST responses:
+Every SDK exposes a single client with **flat, model-suffixed** methods — there is no
+per-model sub-object. For a model `Post`, each maps one-to-one onto a REST call:
 
-| Method | REST call | Returns |
+| Operation | REST call | Returns |
 |---|---|---|
-| `getPost(id)` | `GET /api/post/{id}` | the record, or `null` on `404` |
-| `listPost(options)` | `GET /api/post` | `ListResult<Post>` |
-| `createPost(input)` | `POST /api/post` | the new `id` (throws `ForgeDBError` on `409`/`422`) |
-| `updatePost(id, record)` | `PUT /api/post/{id}` | `true`, or `false` on `404` |
-| `deletePost(id)` | `DELETE /api/post/{id}` | `true`, or `false` on `404` |
+| get | `GET /api/post/{id}` | the record, or a null / `None` / `nil` miss on `404` |
+| list | `GET /api/post` | a `ListResult` envelope |
+| create | `POST /api/post` | the new `id` (typed error on `409`/`422`) |
+| update | `PUT /api/post/{id}` | `true`, or `false` on `404` |
+| delete | `DELETE /api/post/{id}` | `true`, or `false` on `404` |
+
+The method names follow each language's convention:
+
+<Eco lang="node">
+
+`camelCase`, verb-prefixed — `getPost` / `listPost` / `createPost` / `updatePost` /
+`deletePost` — on a `ForgeDBClient`:
 
 ```typescript
 import { ForgeDBClient } from "./generated/types";
+
 const db = new ForgeDBClient("http://localhost:3000");
 
 const { data, total } = await db.listPost({ limit: 20, sort: "views", order: "desc" });
 const id = await db.createPost({ title: "Hello", views: 0 });
-const post = await db.getPost(id);       // Post | null
+const post = await db.getPost(id);            // Post | null
 await db.updatePost(id, { ...post!, views: 1 });
-await db.deletePost(id);                 // boolean
+await db.deletePost(id);                       // boolean
 ```
 
-## `ListResult<T>`
+</Eco>
 
-`list` returns the paginated envelope, matching the REST list shape:
+<Eco lang="python">
+
+`snake_case`, verb-prefixed — `get_post` / `list_post` / `create_post` / `update_post` /
+`delete_post` — on a `ForgeDbClient` (stdlib `urllib`, no runtime deps):
+
+```python
+from forgedb_client import ForgeDbClient, PostCreate, ListOptions
+
+db = ForgeDbClient("http://localhost:3000")
+
+page = db.list_post(ListOptions(limit=20, sort="views", order="desc"))
+post_id = db.create_post(PostCreate(title="Hello", views=0))
+post = db.get_post(post_id)                    # Post | None
+db.delete_post(post_id)                        # bool
+```
+
+</Eco>
+
+<Eco lang="rust">
+
+`snake_case`, verb-prefixed, every method `async` returning `Result<_, ForgeDbError>` —
+`get_post` / `list_post` / `create_post` / `update_post` / `delete_post` — on a
+`ForgeDbClient` (a `reqwest` crate):
+
+```rust
+use forgedb_client::{ForgeDbClient, PostCreate, ListOptions, SortOrder};
+
+let db = ForgeDbClient::new("http://localhost:3000");
+
+let page = db.list_post(&ListOptions {
+    sort: Some("views".into()),
+    order: Some(SortOrder::Desc),
+    limit: Some(20),
+    ..Default::default()
+}).await?;
+let id = db.create_post(&PostCreate { title: "Hello".into(), views: 0, ..Default::default() }).await?;
+let post = db.get_post(&id).await?;            // Option<Post>
+db.delete_post(&id).await?;                     // bool
+```
+
+</Eco>
+
+<Eco lang="go">
+
+`PascalCase`, verb-prefixed, each returning `(value, error)` — `GetPost` / `ListPost` /
+`CreatePost` / `UpdatePost` / `DeletePost` — on a `Client` from package `forgedbclient`
+(`net/http`, no external modules):
+
+```go
+db := forgedbclient.NewClient("http://localhost:3000")
+
+limit := 20
+page, err := db.ListPost(&forgedbclient.ListOptions{Sort: "views", Order: "desc", Limit: &limit})
+id, err := db.CreatePost(&forgedbclient.PostCreate{Title: "Hello", Views: 0})
+post, err := db.GetPost(id)                     // (*Post, error); nil on 404
+ok, err := db.DeletePost(id)                    // (bool, error)
+```
+
+</Eco>
+
+## The list envelope
+
+`list<Model>` returns a paginated envelope matching the REST list shape — `data`, `total`
+(the match count *before* pagination), `limit`, and `offset`:
+
+<Eco lang="node">
 
 ```typescript
-interface ListResult<T> {
-  data: T[];
-  total: number;   // matches before pagination
-  limit: number;
-  offset: number;
-}
+interface ListResult<T> { data: T[]; total: number; limit: number; offset: number; }
 ```
 
-`list<Model>(options)` accepts pagination (`limit`/`offset`), `sort` + `order`
-(`'asc'|'desc'`), and a per-field `filter` map, mapped onto the REST query parameters (see
+</Eco>
+
+<Eco lang="python">
+
+```python
+@dataclass
+class ListResult(Generic[T]):
+    data: List[T]
+    total: int
+    limit: int
+    offset: int
+```
+
+</Eco>
+
+<Eco lang="rust">
+
+```rust
+pub struct ListResult<T> { pub data: Vec<T>, pub total: usize, pub limit: usize, pub offset: usize }
+```
+
+</Eco>
+
+<Eco lang="go">
+
+```go
+type ListResult[T any] struct { Data []T; Total int; Limit int; Offset int }
+```
+
+</Eco>
+
+The list options accept pagination (`limit`/`offset`), `sort` + `order` (`asc`/`desc`), and
+a per-field exact-match `filter`, mapped onto the REST query parameters (see
 [Generated REST API](/docs/reference/rest-api/)).
 
-## Create input types
+## Create inputs
 
-Each model gets a create-input type that omits the id:
+Each model gets a create-input type that omits the server-assigned `id`; `create<Model>`
+takes it and returns the new id (the REST create responds `{ id }`, not the full record):
+
+<Eco lang="node">
 
 ```typescript
 type PostCreate = Omit<Post, "id">;
 ```
 
-`create<Model>` takes `<Model>Create` and returns the server-assigned id (the REST create
-responds `{ id }`, not the full record).
+</Eco>
+
+<Eco lang="python">
+
+`PostCreate` — a `@dataclass` mirroring `Post` without `id`.
+
+</Eco>
+
+<Eco lang="rust">
+
+`PostCreate` — a `serde` struct mirroring `Post` without `id`; it derives `Default`, so
+`..Default::default()` fills any field you omit.
+
+</Eco>
+
+<Eco lang="go">
+
+`PostCreate` — a struct mirroring `Post` without `id`.
+
+</Eco>
 
 ## Typed errors
 
-Failures surface as a typed `ForgeDBError` carrying the HTTP status and the parsed body,
-so you can branch on `409` (unique / dangling-FK conflict) versus `422` (field constraint):
+A write failure surfaces as a **typed error carrying the HTTP status and the parsed body**,
+so you can branch on `409` (unique / dangling-FK conflict) versus `422` (field constraint).
+A get / update / delete `404` maps to a null / `None` / `false` result instead of raising.
+
+<Eco lang="node">
 
 ```typescript
 try {
@@ -75,20 +231,71 @@ try {
 }
 ```
 
-## Publishable output
+</Eco>
 
-`generate typescript`/`generate all` also emits `package.json` and `tsconfig.json` next to
-`types.ts`, **only if absent** — regenerating (even with `--force`) never clobbers them, so
-your package metadata is safe to edit. The output is strict-`tsc --noEmit` clean and
-npm-publishable.
+<Eco lang="python">
 
-<Callout type="note" title="Honest limits">
-Ids are typed `string` uniformly (URL paths are strings — integer-PK callers pass
-`String(n)`); `create` returns the id, not the full record; and there is no WebSocket /
-subscription client yet — the SDK is REST-only. For realtime, use the raw
-[WebSocket routes](/docs/reference/rest-api/).
+`ForgeDbError(status, message, body)` — raised on any non-2xx write; catch it and branch on
+`.status`.
+
+</Eco>
+
+<Eco lang="rust">
+
+`ForgeDbError { status, message, body }` — the `Err` arm of every method's `Result`; match on
+`.status`.
+
+</Eco>
+
+<Eco lang="go">
+
+`*ForgeDbError{Status, Message, Body}` — the returned `error` on any non-2xx write;
+type-assert it to read `.Status`.
+
+</Eco>
+
+## Vendoring & publishing
+
+The SDK is generated code you vendor into your app, not a registry dependency — regenerating
+overwrites the client but never the packaging file next to it:
+
+<Eco lang="node">
+
+`generate node --sdk` also emits `package.json` + `tsconfig.json` next to `types.ts`, **only
+if absent** — regenerating (even with `--force`) never clobbers them, so your package metadata
+is safe to edit. The output is strict `tsc --noEmit` clean and npm-publishable.
+
+</Eco>
+
+<Eco lang="python">
+
+`generate python --sdk` emits `forgedb_client.py` + a `pyproject.toml` under `python-sdk/`.
+The client is pure stdlib `urllib` — no runtime dependencies to install.
+
+</Eco>
+
+<Eco lang="rust">
+
+`generate rust --sdk` emits a self-contained crate under `rust-sdk/` (its own `Cargo.toml`).
+Add it as a path or git dependency; it pulls `reqwest` + `serde`.
+
+</Eco>
+
+<Eco lang="go">
+
+`generate go --sdk` emits `client.go` + a `go.mod` under `go-sdk/`. Pure `net/http` +
+`encoding/json` — no external modules, no cgo.
+
+</Eco>
+
+<Callout type="note" title="Honest limits (all four SDKs)">
+Ids are typed as a string uniformly (URL paths are strings — integer-PK callers pass the
+stringified value); `create` returns the id, not the full record; and there is **no WebSocket
+/ subscription client yet** — every SDK is REST-only. For realtime, use the raw
+[WebSocket routes](/docs/reference/rest-api/) directly.
 </Callout>
 
 ## Related
 
-- [Generated REST API](/docs/reference/rest-api/) — the wire contract this SDK mirrors.
+- [Generated REST API](/docs/reference/rest-api/) — the wire contract every SDK mirrors.
+- [Quickstart](/docs/quickstart/) — the SDK in the full init → generate → build loop.

@@ -88,7 +88,7 @@ export const docsNav: NavGroup[] = [
     title: "Reference",
     items: [
       { title: "Generated REST API", href: "/docs/reference/rest-api/" },
-      { title: "TypeScript SDK", href: "/docs/reference/typescript-sdk/" },
+      { title: "Client SDKs", href: "/docs/reference/typescript-sdk/" },
       { title: "Substrate crates", href: "/docs/reference/substrate-crates/" },
       { title: "Deployment", href: "/docs/reference/deployment/" },
       { title: "Versioning & stability", href: "/docs/reference/semver/" },
