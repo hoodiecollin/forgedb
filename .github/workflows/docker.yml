@@ -1,49 +1,72 @@
 # Docker image for the `forgedb` CLI — epic #181 / Docker channel.
 #
-# Runs AFTER a GitHub Release is published (release.yml must have uploaded the
-# per-platform tarballs the Dockerfile fetches). Builds a multi-arch image
-# (linux/amd64 + linux/arm64) and pushes to GHCR always, and to Docker Hub when
-# its credentials are configured.
+# Wired into the release pipeline as a cargo-dist CUSTOM PUBLISH JOB (same pattern
+# as publish-npm.yml): dist-workspace.toml lists it in `publish-jobs`, so dist
+# calls this reusable workflow from the generated release.yml with `needs:
+# [plan, host]` and passes the release `plan` as an input. That ordering matters:
+# the Dockerfile's `fetch` stage does an UNAUTHENTICATED `curl` of
+# `releases/download/v<version>/forgedb-<triple>.tar.xz`, so the image can only be
+# built once `host` has created the (published, non-draft) GitHub Release and
+# uploaded every per-platform tarball. A custom publish job runs exactly there —
+# after host, before announce — whereas an `on: release: [published]` trigger
+# would never fire (cargo-dist creates the release with the built-in GITHUB_TOKEN,
+# and GitHub suppresses `release` events for GITHUB_TOKEN-authored releases).
+#
+# Builds a multi-arch image (linux/amd64 + linux/arm64), pushes to GHCR always and
+# to Docker Hub when its credentials are configured.
 #
 # Registries / go-live gating:
 #   - GHCR (ghcr.io/hoodiecollin/forgedb): auth via the built-in GITHUB_TOKEN — no
-#     secret to provision (only needs repo → Settings → Actions → workflow write).
+#     secret to provision (dist escalates `packages: write` at the call site).
 #   - Docker Hub (docker.io/hoodiecollin/forgedb): needs `DOCKERHUB_USERNAME` +
-#     `DOCKERHUB_TOKEN` secrets. Absent → the image still ships to GHCR; Docker Hub
-#     is skipped (not failed).
+#     `DOCKERHUB_TOKEN` secrets (flow in via the caller's `secrets: inherit`).
+#     Absent → the image still ships to GHCR; Docker Hub is skipped (not failed).
+#
+# `workflow_dispatch` stays for manual rebuilds of an already-published tag.
 name: Docker
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        description: dist release plan (JSON) — passed by cargo-dist
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build (e.g. v0.1.0)
+        description: Release tag to build (e.g. v0.2.0) — must already be published
         required: true
-
-permissions:
-  contents: read
-  packages: write # push to GHCR
 
 jobs:
   image:
     name: build & push (multi-arch)
     runs-on: ubuntu-22.04
-    # Skip prereleases; only stable tags get an image + `latest`.
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    # Skip prereleases (manual dispatch always runs); on a plan-driven run mirror
+    # dist's built-in publisher gate so a `-prerelease` tag gets no image/`latest`.
+    if: ${{ github.event_name == 'workflow_dispatch' || !fromJson(inputs.plan).announcement_is_prerelease || fromJson(inputs.plan).publish_prereleases }}
+    permissions:
+      contents: read
+      packages: write # push to GHCR
     env:
+      PLAN: ${{ inputs.plan }}
+      TAG_INPUT: ${{ github.event.inputs.tag }}
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
-      # Resolve the tag (release event or manual input) and the bare version.
+      # Resolve the tag from the dist plan (custom-publish-job run) or the manual
+      # dispatch input, then the bare version the Dockerfile fetches by.
       - name: Resolve version
         id: v
         shell: bash
         run: |
-          tag="${{ github.event.release.tag_name || github.event.inputs.tag }}"
+          if [ -n "$PLAN" ]; then
+            tag=$(echo "$PLAN" | jq -r '.announcement_tag')
+          else
+            tag="$TAG_INPUT"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
