@@ -16,15 +16,46 @@ generation**, never a runtime input to a generic engine. Read the honest scope i
 
 ## 1. Install
 
+Install the `forgedb` CLI for your ecosystem — or use the universal shell installer. Every
+channel gives you the same binary; [installation](/docs/installation/) lists them all.
+
+<Eco lang="node">
+
+```bash
+npm install -g @hoodiecollin/forgedb    # or: bun add -g @hoodiecollin/forgedb
+```
+
+</Eco>
+
+<Eco lang="python">
+
+```bash
+uv tool install hoodiecollin-forgedb    # or: pip install hoodiecollin-forgedb
+```
+
+</Eco>
+
+<Eco lang="rust">
+
 ```bash
 cargo install forgedb
 ```
 
-Other install paths (prebuilt binaries, `--git`, from a clone) are in
-[installation](/docs/installation/). Verify:
+</Eco>
+
+<Eco lang="go">
 
 ```bash
-forgedb --version      # forgedb 0.1.0
+# no Go-native CLI channel — use the universal shell installer (macOS/Linux):
+curl -fsSL https://get.forgedb.dev/install.sh | sh
+```
+
+</Eco>
+
+Verify:
+
+```bash
+forgedb --version      # forgedb 0.2.0
 ```
 
 ## 2. Scaffold a project
@@ -89,11 +120,46 @@ the [schema language](/docs/schema/overview/) for the full grammar.
 
 ## 3. Generate code
 
+The database core and REST API are the same whichever client language you use:
+
 ```bash
 forgedb generate rust         # → generated/database.rs
 forgedb generate api          # → generated/api.rs (+ package.json, tsconfig.json)
-forgedb generate node --sdk   # → generated/types.ts  (the REST SDK; `bun --sdk` is equivalent)
 ```
+
+Then generate the typed client SDK for your ecosystem:
+
+<Eco lang="node">
+
+```bash
+forgedb generate node --sdk   # → generated/types.ts  (bun --sdk is equivalent)
+```
+
+</Eco>
+
+<Eco lang="python">
+
+```bash
+forgedb generate python --sdk # → generated/python-sdk/forgedb_client.py
+```
+
+</Eco>
+
+<Eco lang="rust">
+
+```bash
+forgedb generate rust --sdk   # → generated/rust-sdk/  (a reqwest client crate)
+```
+
+</Eco>
+
+<Eco lang="go">
+
+```bash
+forgedb generate go --sdk     # → generated/go-sdk/client.go
+```
+
+</Eco>
 
 Or `forgedb generate all` for everything at once (adds the OpenAPI spec). Output goes to
 `./generated/` by default (`--output` to change it). Every generator tailors its code to
@@ -202,12 +268,16 @@ fields for now ([#187](https://github.com/hoodiecollin/forgedb/issues/187),
 Full route set per model: `GET /api/<model>` (list, with `?limit&offset&sort&<field>=`),
 `POST /api/<model>` (create), `GET|PUT|DELETE /api/<model>/{id}`.
 
-## 7. Use the typed TypeScript SDK
+## 7. Use the typed client SDK
+
+The SDK you generated in step 3 is full CRUD, faithful to the REST contract — same methods
+and shapes in every language. Pick your ecosystem above:
+
+<Eco lang="node">
 
 `forgedb generate node --sdk` (or `bun --sdk`) emits `generated/types.ts` plus a
-`package.json` and `tsconfig.json` (only if absent — regeneration never clobbers your
-edits), so it's npm-publishable as-is. The client is full CRUD, faithful to the REST
-contract:
+`package.json`/`tsconfig.json` (only if absent — regeneration never clobbers your edits), so
+it's npm-publishable as-is:
 
 ```typescript
 import { ForgeDBClient } from './generated/types';
@@ -231,8 +301,113 @@ await db.updateUser(id, { /* full record */ });
 await db.deleteUser(id);
 ```
 
-Errors surface as a typed `ForgeDBError` carrying the HTTP status and parsed body (except
-get/delete 404s, which return `null`/`false`).
+No SDK? The REST API is plain HTTP — call it with `fetch`:
+
+```typescript
+const res = await fetch('http://localhost:3000/api/user', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    username: 'grace', email: 'grace@example.com', password_hash: 'x', posts: null,
+  }),
+});
+const { id } = await res.json();   // → { id: "<server-generated uuid>" }
+```
+
+</Eco>
+
+<Eco lang="python">
+
+`forgedb generate python --sdk` emits `generated/python-sdk/forgedb_client.py`, a
+stdlib-`urllib` client with no runtime dependencies:
+
+```python
+from forgedb_client import ForgeDbClient, UserCreate, ListOptions
+
+db = ForgeDbClient("http://localhost:3000")
+
+# list → ListResult { data, total, limit, offset }
+page = db.list_user(ListOptions(sort="username", limit=20))
+
+# get → the row, or None on 404
+user = db.get_user("11111111-1111-1111-1111-111111111111")
+
+# create → the new id; raises ForgeDbError on 409/422
+user_id = db.create_user(UserCreate(
+    username="grace",
+    email="grace@example.com",
+    password_hash="x",
+    created_at=0,
+))
+
+# update → False if the id doesn't exist; delete → True/False
+db.delete_user(user_id)
+```
+
+</Eco>
+
+<Eco lang="rust">
+
+`forgedb generate rust --sdk` emits `generated/rust-sdk/`, a `reqwest`-based client crate —
+add it as a path/git dependency and use the typed `ForgeDbClient`:
+
+```rust
+use forgedb_client::{ForgeDbClient, UserCreate, ListOptions};
+
+let db = ForgeDbClient::new("http://localhost:3000");
+
+// list → ListResult<User> { data, total, limit, offset }
+let page = db.list_user(&ListOptions {
+    sort: Some("username".into()),
+    limit: Some(20),
+    ..Default::default()
+}).await?;
+
+// get → Option<User> (None on 404)
+let user = db.get_user("11111111-1111-1111-1111-111111111111").await?;
+
+// create → the new id; Err(ForgeDbError) on 409/422
+let id = db.create_user(&UserCreate {
+    username: "grace".into(),
+    email: "grace@example.com".into(),
+    password_hash: "x".into(),
+    created_at: 0,
+    ..Default::default()
+}).await?;
+```
+
+</Eco>
+
+<Eco lang="go">
+
+`forgedb generate go --sdk` emits `generated/go-sdk/client.go`, a `net/http` client package
+plus a `go.mod`:
+
+```go
+import client "forgedb-client"
+
+db := client.NewClient("http://localhost:3000")
+
+// ListUser → *ListResult[User] { Data, Total, Limit, Offset }
+limit := 20
+page, err := db.ListUser(&client.ListOptions{Sort: "username", Limit: &limit})
+
+// GetUser → (*User, error); nil on 404
+user, err := db.GetUser("11111111-1111-1111-1111-111111111111")
+
+// CreateUser → the new id; non-nil err on 409/422
+id, err := db.CreateUser(&client.UserCreate{
+    Username:     "grace",
+    Email:        "grace@example.com",
+    PasswordHash: "x",
+})
+```
+
+</Eco>
+
+Each SDK surfaces write errors as a typed error carrying the HTTP status and parsed body
+(TS `ForgeDBError`, Python/Rust `ForgeDbError`, Go's returned `error`) and maps get/delete
+404s to a null / `None` / `false` result.
 
 ## Next steps
 
