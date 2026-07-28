@@ -16,14 +16,13 @@ This builds the CLI from the published crates and drops `forgedb` in
 
 ## 2. Package managers & prebuilt binaries (no Rust toolchain needed)
 
-> **Activates with the first tagged release.** These channels all repackage the
-> per-platform binaries attached to a
-> [GitHub Release](https://github.com/hoodiecollin/forgedb/releases). The release
-> pipeline (cargo-dist + a maturin PyPI sidecar) is wired and validated, but no
-> `v*` tag has been pushed yet — until then, use `cargo install` (above) or
-> `--git` (below). The commands below are what each channel will be once a
-> release is cut; every channel ships the same `forgedb` binary (plus the bundled
-> `forgedb-lsp` language server) and stays version-locked to the crate release.
+> **Live as of v0.2.0.** These channels all repackage the per-platform binaries
+> attached to each
+> [GitHub Release](https://github.com/hoodiecollin/forgedb/releases) (driven by
+> cargo-dist + a maturin PyPI sidecar). Every channel ships the same `forgedb`
+> binary (plus the bundled `forgedb-lsp` language server) and stays version-locked
+> to the crate release. macOS + Linux only — Windows isn't supported yet (see the
+> note below).
 
 **Shell one-liner (macOS / Linux):**
 
