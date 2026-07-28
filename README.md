@@ -7,20 +7,23 @@
 
 **An application-database generator.** Write one schema; get a tailored database.
 
+[**forgedb.dev**](https://forgedb.dev) · [Getting Started](./docs/GETTING_STARTED.md) · [Docs](https://forgedb.dev/docs) · [Benchmarks](./docs/BENCHMARKS.md)
+
 </div>
 
 ## What it is
 
 ForgeDB compiles a declarative `.forge` schema — at **compile time** — into a tailored
-Rust database, a typed TypeScript SDK, and a REST API (with an OpenAPI 3.1 spec). It is a
-code generator, **not** an ORM or query engine: your schema is a compile-time input to
-generation, never a runtime input to a generic engine. The generated code is specialized
-per schema over columnar storage, so there is no generic-runtime layer to pay for.
+Rust database, a REST API (with an OpenAPI 3.1 spec), and typed clients for **TypeScript,
+Python, Rust, and Go**. It is a code generator, **not** an ORM or query engine: your schema
+is a compile-time input to generation, never a runtime input to a generic engine. The
+generated code is specialized per schema over columnar storage, so there is no
+generic-runtime layer to pay for — nothing reflects your schema at runtime.
 
 Everything in this repository is open source under `MIT OR Apache-2.0`. See
 [`docs/OPEN_CORE.md`](./docs/OPEN_CORE.md) for the open-core boundary.
 
-> **Status:** early development (0.1.x), **not yet production-ready**. What v1 actually
+> **Status:** early development (0.2.x, pre-1.0), **not yet production-ready**. What v1 actually
 > guarantees — and what it defers — is stated plainly in
 > [`docs/WHAT_V1_IS.md`](./docs/WHAT_V1_IS.md). Trust that over any headline here.
 
@@ -67,8 +70,9 @@ let recent  = db.post.find_by_author_and_created_at(author_id, ts);  // Vec<Post
 db.link_post_tag(post_id, tag_id);                        // many-to-many link
 ```
 
-— plus the matching TypeScript types + client, a REST endpoint per model with
-filter/sort/pagination, and the OpenAPI spec.
+— plus a REST endpoint per model with filter/sort/pagination, the OpenAPI spec, and
+matching typed clients for **TypeScript, Python, Rust, and Go** (same methods, same
+shapes, no hand-written HTTP and no drift between them).
 
 ## How it works
 
@@ -78,9 +82,10 @@ schema.forge
     ▼
 codegen
     ├─→ Rust database code      (columnar storage, typed query API, durable writes)
-    ├─→ TypeScript types + SDK  (models + API client)
     ├─→ REST API (axum)         (CRUD, relation traversal, query params)
     ├─→ OpenAPI 3.1 spec
+    ├─→ typed REST clients      (TypeScript, Python, Rust, Go — one per language)
+    ├─→ in-process bindings     (PyO3, NAPI-RS — embed the DB instead of calling it, opt-in)
     ├─→ browser read-replica    (WASM, opt-in — the same generated engine, in a Worker)
     └─→ migration transformer   (offline, per-version data rewrite)
 ```
@@ -89,8 +94,10 @@ The storage is a **columnar hybrid**: fixed-size types (`u64`, `f64`, `uuid`, �
 packed columns for tight, cache-friendly access; variable-length data (strings, `json`)
 rides an append-only column with an offset index. Because the generated code is monomorphized
 to your exact schema, there is no dynamic dispatch over a generic row type. Performance is
-**measured, not asserted** — the methodology and current numbers live in
-[`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
+**measured, not asserted**, and benchmarked *fairly* — with durability semantics matched
+across engines. At the fsync-barrier tier ForgeDB ties SQLite and redb; relaxed, it's the
+fastest of the group, with the smallest on-disk footprint of the embedded four. The
+methodology and current numbers live in [`docs/BENCHMARKS.md`](./docs/BENCHMARKS.md).
 
 ## What's real today
 
@@ -99,10 +106,10 @@ Implemented and working:
 - Schema parser (lexer → AST) + validation; the `forgedb` CLI
 - Columnar storage engine, WAL, in-process compaction
 - Crash-safe durable writes; MVCC transactions + multi-process write coordination
-- Codegen: Rust database, TypeScript SDK, REST API (+ OpenAPI 3.1)
+- Codegen: Rust database, REST API (+ OpenAPI 3.1), typed REST clients for TypeScript / Python / Rust / Go
 - Secondary + composite indexes, relation traversal, snapshot reads, live queries, backup/restore
 - Multi-tenancy (verify-only JWT), schema migrations, browser read-replica (WASM)
-- LSP server + VS Code extension; language bindings (Python / Node / Bun)
+- LSP server + VS Code extension; in-process native bindings (PyO3 for Python, NAPI-RS for Node / Bun)
 
 Not built (and not near-term): generated UI components. The schema can *reference* UI
 components as contract markers, but ForgeDB does not generate component code today.
@@ -127,16 +134,19 @@ over unknown schemas.
 
 ## Getting started
 
-Install the CLI and scaffold a project:
+Install the CLI (macOS / Linux — Windows via WSL2), then scaffold a project:
 
 ```bash
-cargo install forgedb          # from crates.io
+curl -fsSL https://get.forgedb.dev/install.sh | sh   # prebuilt binary, no Rust toolchain
 
 forgedb init my-app
 cd my-app
 # edit schema.forge, then:
 forgedb dev                    # generate, build, and run the dev server
 ```
+
+The same binary is on every major channel — Homebrew, npm, pip/uv, Docker, Nix, and
+`cargo install forgedb`. See [`docs/INSTALL.md`](./docs/INSTALL.md) for every path.
 
 Or generate from a schema in a cloned checkout:
 
@@ -151,6 +161,9 @@ output, [`docs/INSTALL.md`](./docs/INSTALL.md) for every install path, and
 [`examples/`](./examples/) for worked schemas across many domains.
 
 ## Documentation
+
+The full docs — with an ecosystem toggle for TypeScript / Python / Rust / Go — are hosted at
+[**forgedb.dev/docs**](https://forgedb.dev/docs). The Markdown sources below are the same content.
 
 **Start here**
 - [Getting Started](./docs/GETTING_STARTED.md) — install → scaffold → generate → build → serve
