@@ -67,11 +67,13 @@ brew install hoodiecollin/tap/forgedb
 npm install -g @hoodiecollin/forgedb    # or: npx @hoodiecollin/forgedb --help
 ```
 
-**uv / pip (PyPI):**
+**uv / pip (PyPI):** the PyPI project is `hoodiecollin-forgedb` (bare `forgedb` is
+taken); the installed command is still `forgedb`.
 
 ```bash
-uv tool install forgedb    # or: uvx forgedb --help
-pip install forgedb
+uv tool install hoodiecollin-forgedb        # command on PATH: forgedb
+pip install hoodiecollin-forgedb
+uvx --from hoodiecollin-forgedb forgedb --help
 ```
 
 **Direct download.** Each release also attaches raw archives — grab the one for

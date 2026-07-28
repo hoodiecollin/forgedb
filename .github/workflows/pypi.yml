@@ -3,8 +3,9 @@
 # The ONE channel cargo-dist can't drive (dist has no PyPI support). maturin
 # `bindings = "bin"` (see pyproject.toml) wraps the compiled `forgedb` binary —
 # plus the bundled `forgedb-lsp`, via the crate's `lsp` feature — into a
-# self-contained console wheel per platform, so `uv tool install forgedb` /
-# `uvx forgedb` and `pip install forgedb` deliver the CLI with no Rust toolchain.
+# self-contained console wheel per platform, so `uv tool install hoodiecollin-forgedb`
+# / `pip install hoodiecollin-forgedb` deliver the CLI with no Rust toolchain
+# (bare `forgedb` is taken on PyPI; the installed command is still `forgedb`).
 #
 # Runs off the SAME `v*` tag that drives dist-workspace.toml's release.yml, and
 # derives the wheel version from the crate version (pyproject `dynamic`), keeping
@@ -86,7 +87,7 @@ jobs:
           python -m venv .venv
           # shellcheck disable=SC1091
           if [ -f .venv/bin/activate ]; then source .venv/bin/activate; else source .venv/Scripts/activate; fi
-          pip install forgedb --no-index --find-links dist --force-reinstall
+          pip install hoodiecollin-forgedb --no-index --find-links dist --force-reinstall
           forgedb --version
           # The bundled server ships as a sibling script, so `forgedb lsp` resolves it.
           command -v forgedb-lsp
