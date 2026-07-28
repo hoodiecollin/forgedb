@@ -21,3 +21,27 @@ export const detailAtom = atomWithStorage<DetailLevel>(
   "forgedb-doc-detail",
   "terse",
 );
+
+/**
+ * The reader's global language-ecosystem preference — one sticky choice that
+ * drives every `<Eco>` block across the docs. Switching it swaps the suggested
+ * install command and the runtime/SDK usage examples to the selected language;
+ * the `.forge` schema and generated-code samples never change (they're
+ * language-agnostic).
+ *
+ * `node` covers Node.js and Bun (they share the generated TypeScript SDK).
+ * Persisted two ways: this `atomWithStorage` (localStorage, sticky across pages
+ * and sessions) and a `?eco=` URL query param the toggle writes for shareable
+ * deep links — a `?eco=` present on load overrides the stored value (see
+ * `EcosystemToggle`). Default `node` so SSR and the first client render agree.
+ */
+export type Ecosystem = "node" | "python" | "rust" | "go";
+export const ECOSYSTEMS: Ecosystem[] = ["node", "python", "rust", "go"];
+export const DEFAULT_ECOSYSTEM: Ecosystem = "node";
+export function isEcosystem(v: string): v is Ecosystem {
+  return (ECOSYSTEMS as string[]).includes(v);
+}
+export const ecosystemAtom = atomWithStorage<Ecosystem>(
+  "forgedb-ecosystem",
+  DEFAULT_ECOSYSTEM,
+);

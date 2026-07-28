@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { Pre } from "@/components/mdx/pre";
 import { Callout } from "@/components/mdx/callout";
 import { DiveDeeper, ImplementationDetails } from "@/components/mdx/tier";
+import { Eco } from "@/components/mdx/ecosystem";
 
 function anchor(id?: string) {
   return id ? (
@@ -145,4 +146,5 @@ export const mdxComponents: MDXComponents = {
   Compare,
   DiveDeeper,
   ImplementationDetails,
+  Eco,
 };
