@@ -381,22 +381,20 @@ let id = db.create_user(&UserCreate {
 <Eco lang="go">
 
 `forgedb generate go --sdk` emits `generated/go-sdk/client.go`, a `net/http` client package
-plus a `go.mod`:
+(`forgedbclient`) plus a `go.mod`:
 
 ```go
-import client "forgedb-client"
-
-db := client.NewClient("http://localhost:3000")
+db := forgedbclient.NewClient("http://localhost:3000")
 
 // ListUser → *ListResult[User] { Data, Total, Limit, Offset }
 limit := 20
-page, err := db.ListUser(&client.ListOptions{Sort: "username", Limit: &limit})
+page, err := db.ListUser(&forgedbclient.ListOptions{Sort: "username", Limit: &limit})
 
 // GetUser → (*User, error); nil on 404
 user, err := db.GetUser("11111111-1111-1111-1111-111111111111")
 
 // CreateUser → the new id; non-nil err on 409/422
-id, err := db.CreateUser(&client.UserCreate{
+id, err := db.CreateUser(&forgedbclient.UserCreate{
     Username:     "grace",
     Email:        "grace@example.com",
     PasswordHash: "x",
