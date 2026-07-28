@@ -22,12 +22,6 @@
       "permanent": false
     },
     {
-      "source": "/install.ps1",
-      "has": [{ "type": "host", "value": "get.forgedb.dev" }],
-      "destination": "https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.ps1",
-      "permanent": false
-    },
-    {
       "source": "/",
       "has": [{ "type": "host", "value": "get.forgedb.dev" }],
       "destination": "https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh",
