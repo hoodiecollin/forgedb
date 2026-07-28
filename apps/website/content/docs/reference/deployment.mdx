@@ -135,12 +135,13 @@ supervisord, Windows services) follow the same shape and are documented, not emi
 
 ## Prebuilt CLI binaries
 
-<Callout type="note" title="Release workflow authored, not yet run">
-Tagging a release (`git tag v* && git push --tags`) triggers `.github/workflows/release.yml`,
-which cross-builds the `forgedb` **CLI** for Linux (x86_64/aarch64), macOS (Intel/ARM), and
-Windows and attaches them to a GitHub Release. That workflow is authored and YAML-validated
-but has not yet been run by a real tag push. It ships the CLI; your generated *app* is built
-from its own `Dockerfile`.
+<Callout type="note" title="Distributing the CLI">
+Tagging a release drives a cargo-dist workflow that cross-builds the `forgedb` **CLI** (plus
+the bundled `forgedb-lsp`) for Linux (x86_64 glibc/musl, aarch64) and macOS (Intel/ARM),
+attaches the archives + a shell installer to a GitHub Release, and fans them out to Homebrew,
+npm, and PyPI (a maturin sidecar) — all live as of v0.2.0. **Windows isn't supported yet** (the
+binary is Unix-only); run under WSL2 in the meantime. See [installation](/docs/installation/)
+for every channel. This ships the CLI; your generated *app* is built from its own `Dockerfile`.
 </Callout>
 
 ## Related
