@@ -1,75 +1,193 @@
 ---
 title: "Installation"
-description: "Install the forgedb CLI via cargo, prebuilt binaries, or from source — plus the Rust toolchain requirement and the substrate crate version matrix."
+description: "Every way to install the forgedb CLI — shell installer, Homebrew, npm/bun, PyPI/uv, Docker, Nix, and cargo — plus the per-ecosystem client SDKs and the substrate crate version matrix."
 purpose: "reference"
 ---
-ForgeDB ships as a single CLI binary, `forgedb`. Pick whichever install method fits —
-they all give you the same tool.
+ForgeDB ships as a single CLI binary, `forgedb` (plus a bundled `forgedb-lsp`
+language server). Pick whichever channel fits your stack — they all give you the same
+tool, version-locked to the crate release.
 
-<Callout type="note" title="Rust toolchain requirement">
-Building from source (`cargo install`, `--git`, or from a clone) needs a Rust toolchain
-**≥ 1.85**, since ForgeDB uses **edition 2024**. Prebuilt binaries need no toolchain.
+<Callout type="note" title="Prefer the one-liner">
+Most people should use the [shell installer](#shell-installer) below — no Rust toolchain,
+no package manager, macOS and Linux. `cargo install` is for people who already live in a
+Rust toolchain. Every channel installs the same binary.
 </Callout>
 
-## 1. `cargo install` (from crates.io)
+<Callout type="warning" title="macOS + Linux only (for now)">
+The prebuilt channels ship **macOS and Linux** binaries. The `forgedb` binary is currently
+Unix-only (positional-I/O storage + a Unix-socket write coordinator), so even `cargo
+install` fails on native Windows. Windows support (native binary, MSI, winget) is tracked
+for a follow-up release — until then, run ForgeDB under **WSL2**, where it behaves as Linux.
+</Callout>
 
-The canonical path if you have a Rust toolchain:
+## Shell installer
+
+The fastest path on macOS and Linux — downloads the right prebuilt binary for your platform
+and puts `forgedb` + `forgedb-lsp` on your `PATH`:
 
 ```bash
-cargo install forgedb
+curl -fsSL https://get.forgedb.dev/install.sh | sh
+```
+
+That's an alias for the installer attached to the [latest GitHub
+Release](https://github.com/hoodiecollin/forgedb/releases). The direct form (identical
+bytes) is:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh | sh
+```
+
+## Homebrew
+
+macOS and Linux, via the project tap:
+
+```bash
+brew install hoodiecollin/tap/forgedb
+```
+
+`brew upgrade hoodiecollin/tap/forgedb` later. The formula repackages the same release
+binary — no Rust toolchain.
+
+## npm / bun
+
+Published under a personal scope (the unscoped `forgedb` name was unavailable). The package
+downloads the matching prebuilt binary on install:
+
+```bash
+npm install -g @hoodiecollin/forgedb     # or: bun add -g @hoodiecollin/forgedb
+npx @hoodiecollin/forgedb --help         # or: bunx @hoodiecollin/forgedb --help
+```
+
+## PyPI / uv
+
+The PyPI project is `hoodiecollin-forgedb` (bare `forgedb` is taken); the installed command
+is still `forgedb`. The wheels are self-contained — they bundle the binary, no build step:
+
+```bash
+uv tool install hoodiecollin-forgedb        # command on PATH: forgedb
+pip install hoodiecollin-forgedb
+uvx --from hoodiecollin-forgedb forgedb --help
+```
+
+## Docker
+
+A multi-arch image (`linux/amd64` + `linux/arm64`) bundling `forgedb` and `forgedb-lsp`,
+published on every release. Bind-mount your schema/output dir at `/work`:
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/hoodiecollin/forgedb generate all --output ./generated
+# also on Docker Hub:
+docker run --rm -v "$PWD:/work" hoodiecollin/forgedb --help
+```
+
+The image repackages the same release binaries as the native install (no runtime Rust
+toolchain).
+
+## Nix (flake)
+
+Run without installing, or add ForgeDB to your own flake. Builds from source over the
+committed `Cargo.lock`:
+
+```bash
+nix run    github:hoodiecollin/forgedb -- --help     # run once
+nix profile install github:hoodiecollin/forgedb      # install to your profile
+nix develop github:hoodiecollin/forgedb              # dev shell (rust + tooling)
+```
+
+In a flake, add `forgedb.url = "github:hoodiecollin/forgedb";` and reference
+`forgedb.packages.${system}.default`.
+
+## `cargo install` (from crates.io)
+
+The canonical path if you already have a Rust toolchain (**≥ 1.85**, edition 2024):
+
+```bash
+cargo install forgedb            # add --features lsp to also build forgedb-lsp
+cargo install forgedb --force    # update later
 ```
 
 This builds the CLI from the published crates and drops `forgedb` in `~/.cargo/bin`.
-Update later with:
 
-```bash
-cargo install forgedb --force
-```
+## Direct download
 
-## 2. Prebuilt binaries (no toolchain needed)
-
-Each tagged release attaches prebuilt binaries to its
-[GitHub Release](https://github.com/hoodiecollin/forgedb/releases). Download the archive
-for your platform, extract, and put `forgedb` on your `PATH`:
+Each release also attaches raw archives — grab the one for your platform, extract, and put
+the binaries on your `PATH`:
 
 | Platform | Asset |
 |---|---|
-| Linux x86_64 | `forgedb-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux aarch64 | `forgedb-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS (Intel) | `forgedb-<version>-x86_64-apple-darwin.tar.gz` |
-| macOS (Apple Silicon) | `forgedb-<version>-aarch64-apple-darwin.tar.gz` |
-| Windows x86_64 | `forgedb-<version>-x86_64-pc-windows-msvc.zip` |
+| Linux x86_64 (glibc) | `forgedb-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux x86_64 (musl) | `forgedb-x86_64-unknown-linux-musl.tar.xz` |
+| Linux aarch64 | `forgedb-aarch64-unknown-linux-gnu.tar.xz` |
+| macOS (Intel) | `forgedb-x86_64-apple-darwin.tar.xz` |
+| macOS (Apple Silicon) | `forgedb-aarch64-apple-darwin.tar.xz` |
 
 ```bash
-tar -xzf forgedb-<version>-<target>.tar.gz
-sudo mv forgedb /usr/local/bin/     # or anywhere on your PATH
+tar -xf forgedb-<target>.tar.xz
+sudo mv forgedb forgedb-lsp /usr/local/bin/     # or anywhere on your PATH
 forgedb --help
 ```
 
-<Callout type="warning" title="Release workflow not yet exercised">
-The cross-platform release workflow is authored and validated but not yet triggered by a
-real tag push. If a prebuilt asset isn't available for your platform yet, use
-`cargo install` instead.
-</Callout>
+## From source
 
-## 3. `cargo install --git` (latest from source)
-
-To track the tip of `main`, or before a release is cut:
+Track the tip of `main` (or install before a release is cut):
 
 ```bash
+# latest from git
 cargo install --git https://github.com/hoodiecollin/forgedb forgedb
-```
 
-This builds the whole workspace from source, so no crates need to be published first.
-
-## 4. Build from a clone
-
-```bash
+# or from a clone
 git clone https://github.com/hoodiecollin/forgedb
 cd forgedb
 cargo build --release          # binary at target/release/forgedb
 cargo install --path .         # or install it onto your PATH
 ```
+
+Both build the whole workspace from source, so no crates need to be published first.
+
+## Generated client SDKs (per ecosystem)
+
+Installing the CLI is only half the story — the CLI *generates* a typed REST client for
+each language on your stack. These aren't installed from a registry; you generate them from
+your schema and vendor them into your app. One command each:
+
+### Node.js / Bun
+
+```bash
+forgedb generate node --sdk     # → generated/types.ts  (bun --sdk is equivalent)
+```
+
+Emits a TypeScript client plus a publishable `package.json`/`tsconfig.json`. Import
+`ForgeDBClient` from the generated `types.ts`.
+
+### Python
+
+```bash
+forgedb generate python --sdk   # → generated/python-sdk/forgedb_client.py
+```
+
+A stdlib-`urllib` client (no runtime deps) plus a `pyproject.toml`. Import `ForgeDbClient`
+from `forgedb_client`.
+
+### Rust
+
+```bash
+forgedb generate rust --sdk     # → generated/rust-sdk/  (a reqwest client crate)
+```
+
+A `reqwest`-based client crate — add it as a path/git dependency and use `ForgeDbClient`.
+
+### Go
+
+```bash
+forgedb generate go --sdk       # → generated/go-sdk/client.go
+```
+
+A `net/http` client package plus a `go.mod`. Construct with `client.NewClient(...)`.
+
+See the [quickstart](/docs/quickstart/) for end-to-end usage of each, and
+[`forgedb generate`](/docs/cli/generate/) for the full generator matrix (including the
+in-process native bindings — PyO3, NAPI-RS, and the browser WASM replica).
 
 ## Substrate crate versions
 
@@ -90,9 +208,9 @@ This table records what a given CLI generates against.
 | `forgedb-txn` | `0.1` | MVCC Tier-2 commit sequencer (LSN + conflict detection) |
 | `forgedb-coordinator` | `0.2` | MVCC Tier-3 multi-process write coordinator |
 
-These crates know nothing about any specific schema. Every schema-tailored surface —
-types, tables, queries, filters, relations, API routes — is generated per app at compile
-time. See [core concepts](/docs/concepts/) for the identity invariant.
+These crates know nothing about any specific schema. Every schema-tailored surface — types,
+tables, queries, filters, relations, API routes — is generated per app at compile time. See
+[core concepts](/docs/concepts/) for the identity invariant.
 
 <Callout type="note" title="Version lines are independent">
 Version pins are intentionally **not** normalized across the substrate — each crate has an
