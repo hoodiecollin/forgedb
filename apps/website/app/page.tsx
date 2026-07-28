@@ -77,8 +77,14 @@ export default function Home() {
               </a>
             </Button>
           </div>
-          <div className="mt-6 flex justify-center">
+          <div className="mt-6 flex flex-col items-center gap-2.5">
             <CopyCommand command={landing.hero.install} />
+            <Link
+              href="/docs/installation/"
+              className="text-sm text-muted-foreground underline-offset-4 transition-colors hover:text-foreground hover:underline"
+            >
+              <Markdown inline source={landing.hero.installMore} contentKey="hero.installMore" />
+            </Link>
           </div>
         </div>
       </section>

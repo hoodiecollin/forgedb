@@ -73,6 +73,7 @@ export interface LandingCopy {
     ctaPrimary: string;
     ctaGithub: string;
     install: string;
+    installMore: string;
   };
   showcase: {
     heading: string;
@@ -127,7 +128,8 @@ export const landing = {
     `,
     ctaPrimary: dd`Get started`,
     ctaGithub: dd`GitHub`,
-    install: dd`cargo install forgedb`,
+    install: dd`curl -fsSL https://get.forgedb.dev/install.sh | sh`,
+    installMore: dd`More ways to install — Homebrew, npm, pip, Docker, Nix, cargo →`,
   },
 
   showcase: {
