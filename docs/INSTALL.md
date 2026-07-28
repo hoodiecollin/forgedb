@@ -27,14 +27,15 @@ This builds the CLI from the published crates and drops `forgedb` in
 **Shell one-liner (macOS / Linux):**
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh | sh
+curl -fsSL https://get.forgedb.dev/install.sh | sh
 ```
 
-Once the `get.forgedb.dev` alias is live this shortens to:
+`get.forgedb.dev/install.sh` is an alias (307) for the installer attached to the
+latest GitHub Release. The direct form (identical bytes) is:
 
 ```bash
-curl -fsSL https://get.forgedb.dev/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/hoodiecollin/forgedb/releases/latest/download/forgedb-installer.sh | sh
 ```
 
 > **Windows is not supported yet.** v0.2.0 ships macOS + Linux binaries only —
