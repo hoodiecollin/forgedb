@@ -89,6 +89,7 @@ export const docsNav: NavGroup[] = [
     items: [
       { title: "Generated REST API", href: "/docs/reference/rest-api/" },
       { title: "Client SDKs", href: "/docs/reference/typescript-sdk/" },
+      { title: "Editor support", href: "/docs/reference/editor-support/" },
       { title: "Substrate crates", href: "/docs/reference/substrate-crates/" },
       { title: "Deployment", href: "/docs/reference/deployment/" },
       { title: "Versioning & stability", href: "/docs/reference/semver/" },

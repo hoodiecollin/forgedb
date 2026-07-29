@@ -1,0 +1,92 @@
+---
+title: "Editor support"
+description: "The ForgeDB VS Code extension — syntax highlighting plus a compiler-backed language server (diagnostics, completion, hover, goto-definition, rename) for .forge schemas, and how to install it in VS Code, Cursor, VSCodium, and other editors."
+purpose: "reference"
+---
+`.forge` schemas get first-class editor support from the **ForgeDB Schema Language**
+extension. It is published on both the VS Code Marketplace and Open VSX, so it installs
+in VS Code and in the Open VSX editors (Cursor, VSCodium, Windsurf, code-server, Gitpod).
+
+The extension provides two things: TextMate **syntax highlighting** that ships in the
+package itself, and a set of **language features** backed by the same compiler that powers
+the CLI — the diagnostics you see while typing are the exact errors `forgedb validate`
+would report.
+
+<Callout type="warning" title="The language features need the forgedb CLI installed">
+Syntax highlighting works on its own. Diagnostics, completion, hover, goto-definition, and
+rename are served by the ForgeDB language server, which ships **with the CLI** — the
+extension launches it via `forgedb lsp`. If `forgedb` isn't on your `PATH`, you get
+highlighting but no live diagnostics. [Install the CLI](/docs/installation/) first, or
+point the extension at it with `forgedb.path`.
+</Callout>
+
+## Install
+
+### VS Code
+
+Search **"ForgeDB"** in the Extensions view, or install from the
+[Marketplace listing](https://marketplace.visualstudio.com/items?itemName=forgedb.forgedb).
+From a terminal:
+
+```bash
+code --install-extension forgedb.forgedb
+```
+
+### Cursor, VSCodium, Windsurf, code-server (Open VSX)
+
+These editors resolve extensions from [Open VSX](https://open-vsx.org/extension/forgedb/forgedb)
+rather than the VS Code Marketplace. Search **"ForgeDB"** in their Extensions view — the
+same `forgedb.forgedb` package is published there. The `.vsix` is also attached to each
+[GitHub Release](https://github.com/hoodiecollin/forgedb/releases) if you'd rather install
+from a file (`code --install-extension forgedb.vsix`).
+
+## What you get
+
+The extension activates on any `.forge` file (`onLanguage:forge`).
+
+| Feature | Source | Notes |
+|---|---|---|
+| Syntax highlighting | Bundled TextMate grammar | Works without the CLI. |
+| Diagnostics | Language server | The same errors `forgedb validate` emits, live as you type. Resilient parse: a partial AST plus every compiler diagnostic, so one syntax error doesn't blank the rest. |
+| Completion | Language server | Context-aware suggestions for types, modifiers, and directives. |
+| Hover | Language server | Inline info for the symbol under the cursor. |
+| Goto-definition | Language server | Jump from a bare type reference to its `model` / `struct` / `enum` declaration. |
+| Rename | Language server | Rename a model/struct/enum and its references together. |
+| Snippets | Bundled | Scaffolds for common schema shapes. |
+
+## Commands
+
+Run these from the Command Palette under the **ForgeDB** category. They shell out to the
+CLI, so they need `forgedb` resolvable (see settings below).
+
+| Command | Does |
+|---|---|
+| `ForgeDB: Generate Code` | Runs `forgedb generate` for the current project. |
+| `ForgeDB: Validate Schema` | Runs `forgedb validate` and surfaces the result. |
+| `ForgeDB: Start Dev Mode` | Runs `forgedb dev` — watch the schema and regenerate on change. |
+| `ForgeDB: Create Model` | Inserts a new model scaffold. |
+| `ForgeDB: Restart Language Server` | Restarts the `forgedb lsp` process (use after upgrading the CLI). |
+| `ForgeDB: Show Output` | Opens the extension's output channel. |
+
+## Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `forgedb.path` | `""` (resolve from `PATH`) | Path to the `forgedb` CLI. The extension launches the language server via this CLI's `forgedb lsp` subcommand. Set it if `forgedb` lives somewhere off your `PATH`. |
+| `forgedb.lspServerPath` | `""` (resolve from the CLI) | Absolute path to the `forgedb-lsp` server binary. Overrides `forgedb.path` — point it at a specific build, e.g. a local `target/debug/forgedb-lsp`. |
+| `forgedb.autoGenerateOnSave` | `false` | Run `forgedb generate` automatically whenever a `.forge` file changes. |
+
+<Callout type="note" title="The server binary ships with every install channel">
+Every [install channel](/docs/installation/) that carries the CLI also carries
+`forgedb-lsp` beside it — the shell installer, Homebrew, npm, PyPI, Docker, and the direct
+archives all include both binaries. `cargo install forgedb --features lsp` builds it too.
+So on a normal install you don't set `forgedb.lspServerPath` at all; the extension finds
+the server through the CLI.
+</Callout>
+
+## Next
+
+New to the schema language itself? Start with the [schema
+overview](/docs/schema/overview/) or the [cheatsheet](/docs/schema/cheatsheet/). The
+underlying command the extension drives is documented at
+[`forgedb lsp`](/docs/cli/overview/).

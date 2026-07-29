@@ -145,6 +145,22 @@ cargo install --path .         # or install it onto your PATH
 
 Both build the whole workspace from source, so no crates need to be published first.
 
+## Editor extension
+
+Every install channel above bundles the `forgedb-lsp` language server beside the CLI. To
+light it up in your editor, install the **ForgeDB Schema Language** extension — `.forge`
+syntax highlighting plus compiler-backed diagnostics, completion, hover, goto-definition,
+and rename. It's on the VS Code Marketplace and Open VSX, so it works in VS Code, Cursor,
+VSCodium, Windsurf, and code-server:
+
+```bash
+code --install-extension forgedb.forgedb   # or search "ForgeDB" in the Extensions view
+```
+
+The language features are served by `forgedb lsp`, so the extension needs the CLI on your
+`PATH` (or set `forgedb.path`). Full feature list, settings, and per-editor install notes
+are on the [editor support](/docs/reference/editor-support/) page.
+
 ## Generated client SDKs (per ecosystem)
 
 Installing the CLI is only half the story — the CLI *generates* a typed REST client for
