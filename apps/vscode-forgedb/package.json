@@ -128,13 +128,15 @@
     "watch": "tsc -watch -p ./",
     "package": "vsce package"
   },
+  "//publish": "Publishing is CI-driven on a vscode-v* tag (.github/workflows/vscode-extension.yml) to both the VS Code Marketplace and Open VSX; ovsx is a devDependency so that workflow can bundle it.",
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.80.0",
-    "@vscode/vsce": "^2.20.0",
+    "@vscode/vsce": "^3.9.2",
+    "ovsx": "^0.10.1",
     "typescript": "^5.0.0"
   }
 }
