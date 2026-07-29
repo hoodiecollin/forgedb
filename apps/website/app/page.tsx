@@ -8,9 +8,9 @@ import {
   GitBranch,
   Radio,
   Building2,
-  Archive,
   Globe,
   History,
+  Code2,
   Boxes,
 } from "lucide-react";
 import { site } from "@/lib/site";
@@ -33,7 +33,7 @@ const ICONS: Record<IconKey, LucideIcon> = {
   Building2,
   Globe,
   History,
-  Archive,
+  Code2,
 };
 
 export default function Home() {

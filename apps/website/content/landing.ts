@@ -24,7 +24,7 @@ export type IconKey =
   | "Building2"
   | "Globe"
   | "History"
-  | "Archive";
+  | "Code2";
 
 export interface FeatureItem {
   icon: IconKey;
@@ -383,20 +383,22 @@ export const landing = {
       },
       {
         icon: "History",
-        href: "/docs/features/snapshot-reads/",
-        title: dd`Point-in-time reads`,
+        href: "/docs/features/backup-restore/",
+        title: dd`Snapshots, backup & migrations`,
         body: dd`
-          Lock-free watermark snapshots with zero version machinery — read the
-          database as of an earlier commit over the same REST surface.
+          Lock-free snapshots power point-in-time reads (the database as of an
+          earlier commit) and full-snapshot backup/restore, plus a
+          version-guarded migration workflow.
         `,
       },
       {
-        icon: "Archive",
-        href: "/docs/features/migrations/",
-        title: dd`Backup & migrations`,
+        icon: "Code2",
+        href: "/docs/reference/editor-support/",
+        title: dd`First-class editor support`,
         body: dd`
-          Lock-free full-snapshot backup/restore, plus a version-guarded
-          migration workflow with an offline data transformer.
+          A VS Code and Open VSX extension with \`.forge\` highlighting and
+          compiler-backed diagnostics, completion, hover, and rename — the same
+          errors \`forgedb validate\` emits, live as you type.
         `,
       },
     ],
