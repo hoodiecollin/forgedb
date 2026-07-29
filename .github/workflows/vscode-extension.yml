@@ -1,0 +1,107 @@
+# Publish the ForgeDB VS Code extension — epic #173 WS8 (terminal ship gate).
+#
+# Independent release channel from the CLI: this workflow is driven by its OWN
+# tag namespace, `vscode-v*` (e.g. `vscode-v0.1.0`), NOT the CLI's `v*` release
+# tags. The extension version line (package.json `version`) moves separately from
+# the `forgedb` crate — a `vscode-v*` tag is the single trigger, and the tag must
+# match the manifest version or the run fails fast (see `verify-version`).
+#
+# The extension is packaged ONCE into a `.vsix`, then that identical artifact is
+# pushed to BOTH registries:
+#   - VS Code Marketplace  (via `@vscode/vsce publish`, auth `VSCE_PAT`)
+#   - Open VSX             (via `ovsx publish`,          auth `OVSX_PAT`)
+# Open VSX is what VSCodium / Cursor / Windsurf / code-server / Gitpod resolve
+# from, so publishing both is the max-reach default for near-zero extra work.
+#
+# The `.vsix` is also attached to a GitHub Release for the tag, so a direct
+# download exists independent of either marketplace.
+#
+# GO-LIVE IS USER-GATED (nothing here works until these one-time steps are done):
+#   1. Create the `forgedb` publisher on the VS Code Marketplace
+#      (https://marketplace.visualstudio.com/manage) under an Azure DevOps org,
+#      mint a Marketplace PAT, and store it as the `VSCE_PAT` repo/environment
+#      secret.
+#   2. Create the `forgedb` namespace on Open VSX (https://open-vsx.org), mint an
+#      access token, and store it as the `OVSX_PAT` secret.
+# Each publish step is guarded on its secret being present, so a partial setup
+# (e.g. VS Code only) publishes where it can and skips the other with a notice
+# rather than failing the run.
+name: Publish (VS Code extension)
+
+on:
+  push:
+    tags:
+      - 'vscode-v*'
+  # Manual dry run: package the .vsix and upload it as a run artifact WITHOUT
+  # publishing to either marketplace. Use to validate packaging before tagging.
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach the .vsix to the GitHub Release for the tag
+
+defaults:
+  run:
+    working-directory: apps/vscode-forgedb
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    environment: vscode-marketplace
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install extension dependencies
+        run: bun install --frozen-lockfile
+
+      # A `vscode-v*` tag MUST match package.json `version`; a mismatch means the
+      # manifest wasn't bumped before tagging, so fail before anything publishes.
+      - name: Verify tag matches manifest version
+        if: github.event_name == 'push'
+        run: |
+          manifest="$(bun --print "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#vscode-v}"
+          echo "manifest=$manifest tag=$tag"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match manifest version $manifest (expected tag vscode-v$manifest)"
+            exit 1
+          fi
+
+      # Compiles via the `vscode:prepublish` hook, then bundles a single artifact
+      # both registries publish verbatim.
+      - name: Package .vsix
+        run: bun x @vscode/vsce package -o forgedb.vsix
+
+      - name: Upload .vsix artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgedb-vsix
+          path: apps/vscode-forgedb/forgedb.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: github.event_name == 'push' && env.VSCE_PAT != ''
+        run: bun x @vscode/vsce publish --packagePath forgedb.vsix
+
+      - name: Skip VS Code Marketplace (no VSCE_PAT)
+        if: github.event_name == 'push' && env.VSCE_PAT == ''
+        run: echo "::notice::VSCE_PAT not set — skipping VS Code Marketplace publish."
+
+      - name: Publish to Open VSX
+        if: github.event_name == 'push' && env.OVSX_PAT != ''
+        run: bun x ovsx publish forgedb.vsix
+
+      - name: Skip Open VSX (no OVSX_PAT)
+        if: github.event_name == 'push' && env.OVSX_PAT == ''
+        run: echo "::notice::OVSX_PAT not set — skipping Open VSX publish."
+
+      - name: Attach .vsix to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apps/vscode-forgedb/forgedb.vsix
