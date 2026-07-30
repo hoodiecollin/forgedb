@@ -1,86 +1,109 @@
 import fs from "node:fs";
 import path from "node:path";
 
-/** A single GitHub issue as it appears on the roadmap. */
-export interface RoadmapIssue {
+/**
+ * Forward status of a roadmap item. The roadmap is EPIC-PRIMARY: epics are the
+ * top-level unit and may span releases, so status is derived from an item's own
+ * state + its children, not from a single milestone. `when` (which release) is a
+ * per-item/per-child annotation, not the primary axis.
+ */
+export type Status = "active" | "planned" | "labs" | "ideas";
+
+/** A sub-issue of an epic, annotated with where it lands. */
+export interface ChildIssue {
   number: number;
   title: string;
-  /** github.com issue URL. */
   url: string;
-  /** The issue's label names (lowercased), for the small tag chips. */
-  labels: string[];
+  state: "open" | "closed";
+  /** Milestone title the child targets, or null. */
+  milestone: string | null;
+  /** closed AND its milestone has a published release. */
+  shipped: boolean;
+  /** closed AND milestoned but the release isn't out yet (done, awaiting tag). */
+  pending: boolean;
 }
 
-/** A published core milestone (has a matching non-prerelease GitHub Release). */
-export interface ShippedMilestone {
-  /** e.g. "v0.2.1". */
+/** An epic — a top-level, collapsible initiative that can span releases. */
+export interface EpicItem {
+  kind: "epic";
+  number: number;
   title: string;
-  /** Milestone page URL (its closed-issue list). */
   url: string;
-  /** The matching GitHub Release URL. */
+  state: "open" | "closed";
+  labels: string[];
+  status: Status;
+  children: ChildIssue[];
+  /** Progress: closed children / total children. */
+  done: number;
+  total: number;
+}
+
+/** A standalone issue — no epic parent (a bug fix, a one-off). */
+export interface IssueItem {
+  kind: "issue";
+  number: number;
+  title: string;
+  url: string;
+  state: "open" | "closed";
+  labels: string[];
+  milestone: string | null;
+  shipped: boolean;
+  pending: boolean;
+  status: Status;
+}
+
+export type RoadmapItem = EpicItem | IssueItem;
+
+/** A published core milestone, for the release-overview cards. */
+export interface ShippedMilestone {
+  title: string;
+  url: string;
   releaseUrl: string;
-  /** Release publish date "YYYY-MM-DD", or null. */
   date: string | null;
-  /** Count of issues closed under the milestone. */
   closed: number;
-}
-
-/** The forward-looking buckets: open issues grouped by their label taxonomy. */
-export interface RoadmapBuckets {
-  /** Committed, releasable work — open `plan-next` / `epic`. */
-  next: RoadmapIssue[];
-  /** Experiments / RFCs to measure — open `experiment` / `rfc`. */
-  labs: RoadmapIssue[];
-  /** Speculative, needs design — open `idea`. */
-  ideas: RoadmapIssue[];
-}
-
-/** Done-but-not-yet-tagged: closed issues in a core milestone with no release. */
-export interface PendingRelease {
-  /** e.g. "v0.3.0". */
-  milestone: string;
-  url: string;
-  /** Closed issues awaiting the tag (the interesting, changelog-not-yet set). */
-  done: RoadmapIssue[];
-  /** How many issues remain open under the milestone. */
-  openCount: number;
 }
 
 /** The full roadmap snapshot prebuilt into public/roadmap.json. */
 export interface RoadmapData {
-  /** true when the snapshot was built from live GitHub data. */
   ok: boolean;
-  /** Build date "YYYY-MM-DD" (UTC) — shown in the "snapshot as of" caveat. */
   generatedAt: string;
-  /** The latest published core release, headlining the waterline. */
   latestRelease: { tag: string; url: string; date: string | null } | null;
-  pendingRelease: PendingRelease | null;
-  buckets: RoadmapBuckets;
-  /** Published core milestones, newest first (compact — detail lives in /changelog). */
-  shipped: ShippedMilestone[];
+  /** The next release in flight (open core milestone), for header context. */
+  nextMilestone: { title: string; url: string; done: number; open: number } | null;
+  active: RoadmapItem[];
+  planned: RoadmapItem[];
+  labs: RoadmapItem[];
+  ideas: RoadmapItem[];
+  /** Closed epics (grouped in the Shipped section), if any. */
+  shippedEpics: EpicItem[];
+  /** Compact release cards (newest first) for the Shipped overview. */
+  releases: ShippedMilestone[];
 }
 
-// Written by scripts/build-roadmap.ts in the `prebuild` step (gitignored).
 const DATA_PATH = path.join(process.cwd(), "public", "roadmap.json");
 
 const EMPTY: RoadmapData = {
   ok: false,
   generatedAt: "",
   latestRelease: null,
-  pendingRelease: null,
-  buckets: { next: [], labs: [], ideas: [] },
-  shipped: [],
+  nextMilestone: null,
+  active: [],
+  planned: [],
+  labs: [],
+  ideas: [],
+  shippedEpics: [],
+  releases: [],
 };
 
 /**
  * Read the prebuilt roadmap snapshot. Returns a degraded-but-valid shape if the
- * file is absent or unreadable (e.g. the prebuild step couldn't reach GitHub),
- * so the page renders the caveat rather than crashing the build.
+ * file is absent/unreadable (e.g. the prebuild couldn't reach GitHub), so the
+ * page renders its caveat rather than crashing the build.
  */
 export function getRoadmap(): RoadmapData {
   try {
     const parsed = JSON.parse(fs.readFileSync(DATA_PATH, "utf8")) as Partial<RoadmapData>;
-    return { ...EMPTY, ...parsed, buckets: { ...EMPTY.buckets, ...parsed.buckets } };
+    return { ...EMPTY, ...parsed };
   } catch {
     return EMPTY;
   }
