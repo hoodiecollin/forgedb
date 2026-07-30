@@ -201,6 +201,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &output_path,
                 force,
                 format_version,
+                options.gen_config,
             )?);
         }
         "ffi" => {
@@ -394,7 +395,13 @@ fn generate_all(
     // browser crate most projects don't need; a project enables it by listing
     // `wasm` in `[generate].targets`.
     if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "wasm")) {
-        files.extend(generate_wasm_replica(schema, output_path, force, format_version)?);
+        files.extend(generate_wasm_replica(
+            schema,
+            output_path,
+            force,
+            format_version,
+            gen_config,
+        )?);
     }
 
     // Generate the native FFI engine crate (the Layer-0 C-ABI spine every
@@ -786,6 +793,7 @@ fn generate_wasm_replica(
     output_path: &Path,
     force: bool,
     format_version: u32,
+    gen_config: forgedb_codegen::GenConfig,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let replica_dir = output_path.join("replica");
     let src_dir = replica_dir.join("src");
@@ -825,7 +833,11 @@ fn generate_wasm_replica(
     // follows `/replicate`, and debounces auto-commit. Emitted verbatim (NOT from
     // a schema-aware path) so it cannot become schema-aware — the PM constraint.
     let worker_path = client_dir.join("replica-worker.js");
-    write_file(&worker_path, WasmGenerator::worker_bootstrap(), force)?;
+    write_file(
+        &worker_path,
+        &WasmGenerator::worker_bootstrap_with_config(gen_config),
+        force,
+    )?;
     ui::info(&format!("  ✓ {} (static worker bootstrap)", worker_path.display()));
 
     write_wasm_replica_scaffold(&replica_dir)?;

@@ -172,6 +172,17 @@ pub struct ServerConfig {
     pub metrics: Option<bool>,
 }
 
+/// Generate-time **wasm read-replica** knobs (`[wasm]` table, epic #126).
+/// Schema-blind, substituted into the static Worker bootstrap at generate time
+/// (Tier B). Defaults are byte-identical to today's output.
+#[derive(Debug, Deserialize, Default)]
+pub struct WasmConfig {
+    /// Browser read-replica auto-commit debounce, ms (#148). Default 250.
+    pub commit_debounce_ms: Option<u64>,
+    /// Browser read-replica auto-commit frame ceiling (#148). Default 100.
+    pub commit_max_frames: Option<u64>,
+}
+
 /// Top-level config struct.  Unknown top-level TOML tables are ignored.
 #[derive(Debug, Deserialize, Default)]
 pub struct ForgeConfig {
@@ -189,6 +200,8 @@ pub struct ForgeConfig {
     pub transaction: TransactionConfig,
     #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
+    pub wasm: WasmConfig,
 }
 
 impl ForgeConfig {
@@ -232,6 +245,14 @@ impl ForgeConfig {
                 .unwrap_or(d.page_default_limit),
             page_max_limit: self.server.page_max_limit.unwrap_or(d.page_max_limit),
             metrics: self.server.metrics.unwrap_or(d.metrics),
+            wasm_commit_debounce_ms: self
+                .wasm
+                .commit_debounce_ms
+                .unwrap_or(d.wasm_commit_debounce_ms),
+            wasm_commit_max_frames: self
+                .wasm
+                .commit_max_frames
+                .unwrap_or(d.wasm_commit_max_frames),
         })
     }
 }
@@ -306,6 +327,10 @@ max_retries = 7
 page_default_limit = 25
 page_max_limit = 500
 metrics = false
+
+[wasm]
+commit_debounce_ms = 500
+commit_max_frames = 40
 "#;
         let cfg: ForgeConfig = toml::from_str(src).unwrap();
         let gc = cfg.gen_config().unwrap();
@@ -323,6 +348,8 @@ metrics = false
                 page_default_limit: 25,
                 page_max_limit: 500,
                 metrics: false,
+                wasm_commit_debounce_ms: 500,
+                wasm_commit_max_frames: 40,
             }
         );
     }

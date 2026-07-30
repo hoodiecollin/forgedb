@@ -176,6 +176,15 @@ replication = false
 # route entirely (/health, /ready, /snapshot are unaffected).
 # metrics = true
 
+# Generate-time WASM read-replica knobs (epic #126). Substituted into the static,
+# schema-agnostic Worker bootstrap at generate time.
+[wasm]
+# Browser read-replica auto-commit debounce, ms (#148) — trades persist-write
+# frequency vs the tab-close loss window.
+# commit_debounce_ms = 250
+# Commit immediately once this many replication frames are buffered (#148).
+# commit_max_frames = 100
+
 # Note: the generated server's host/port, log level/format, and graceful-shutdown
 # are DEPLOY-environment config, read from the environment at process start
 # (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT) — 12-factor, not

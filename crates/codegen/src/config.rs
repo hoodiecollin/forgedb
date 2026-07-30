@@ -130,6 +130,17 @@ pub struct GenConfig {
     /// handler nor its route is emitted — the compiler optimizes around code that
     /// isn't there. `/health`, `/ready`, and `/snapshot` are unaffected.
     pub metrics: bool,
+
+    /// **Tier B, default 250 (#148).** Browser read-replica auto-commit debounce
+    /// in milliseconds (`COMMIT_DEBOUNCE_MS` in the static Worker bootstrap).
+    /// Trades persist-write frequency vs the tab-close loss window. Substituted
+    /// into the schema-agnostic bootstrap — the pipe stays schema-blind (#110).
+    pub wasm_commit_debounce_ms: u64,
+
+    /// **Tier B, default 100 (#148).** Browser read-replica auto-commit frame
+    /// ceiling (`COMMIT_MAX_FRAMES`): commit immediately once this many
+    /// replication frames are buffered, regardless of the debounce timer.
+    pub wasm_commit_max_frames: u64,
 }
 
 impl Default for GenConfig {
@@ -154,6 +165,8 @@ impl GenConfig {
         page_default_limit: 50,
         page_max_limit: 1000,
         metrics: true,
+        wasm_commit_debounce_ms: 250,
+        wasm_commit_max_frames: 100,
     };
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,

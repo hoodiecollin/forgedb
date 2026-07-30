@@ -663,6 +663,23 @@ export class ReplicaClient {{
         WORKER_BOOTSTRAP_JS
     }
 
+    /// The Worker bootstrap with the auto-commit debounce/frame-ceiling knobs
+    /// substituted from the generate-time config (#148, epic #126). The template
+    /// stays STATIC and schema-agnostic — only two schema-blind numeric constants
+    /// are swapped, so the pipe still interprets no schema (#110 constraint).
+    /// Default (250 / 100) yields the byte-identical bootstrap.
+    pub fn worker_bootstrap_with_config(config: crate::GenConfig) -> String {
+        WORKER_BOOTSTRAP_JS
+            .replace(
+                "const COMMIT_DEBOUNCE_MS = 250;",
+                &format!("const COMMIT_DEBOUNCE_MS = {};", config.wasm_commit_debounce_ms),
+            )
+            .replace(
+                "const COMMIT_MAX_FRAMES = 100;",
+                &format!("const COMMIT_MAX_FRAMES = {};", config.wasm_commit_max_frames),
+            )
+    }
+
     /// The `Cargo.toml` for the generated replica crate. User-editable config,
     /// so the CLI writes it ONLY when absent (like the TS SDK's `package.json`).
     /// Pins the substrate at the versions the wasm build requires (see the

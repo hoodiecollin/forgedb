@@ -3427,6 +3427,8 @@ Author {
         page_default_limit: 25,
         page_max_limit: 500,
         metrics: true,
+        wasm_commit_debounce_ms: 250,
+        wasm_commit_max_frames: 100,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);
@@ -3784,6 +3786,31 @@ Tag {
     let replica = WasmGenerator::generate(&schema).unwrap().code;
     let client = WasmGenerator::generate_client(&schema).unwrap().code;
     let worker = WasmGenerator::worker_bootstrap();
+
+    // #148 (epic #126, Tier B): the auto-commit debounce/frame ceiling are
+    // substituted from config into the static bootstrap. Default 250/100
+    // (byte-identical); the schema-agnostic template is otherwise unchanged.
+    assert!(
+        worker.contains("const COMMIT_DEBOUNCE_MS = 250;")
+            && worker.contains("const COMMIT_MAX_FRAMES = 100;"),
+        "default worker bootstrap keeps 250ms / 100 frames (#148)"
+    );
+    let custom_worker = WasmGenerator::worker_bootstrap_with_config(GenConfig {
+        wasm_commit_debounce_ms: 500,
+        wasm_commit_max_frames: 40,
+        ..GenConfig::DEFAULT
+    });
+    assert!(
+        custom_worker.contains("const COMMIT_DEBOUNCE_MS = 500;")
+            && custom_worker.contains("const COMMIT_MAX_FRAMES = 40;"),
+        "worker bootstrap commit debounce/frames are configurable (#148)"
+    );
+    // The substitution touches ONLY those two constants — the rest of the static,
+    // schema-agnostic pipe is unchanged (#110 constraint).
+    assert!(
+        custom_worker.contains("replica[method]") && custom_worker.contains("scheduleCommit"),
+        "the bootstrap stays the same schema-agnostic pipe (#148/#110)"
+    );
 
     // --- Client mirrors the Replica read surface exactly ---------------------
     // Every generated read the Replica exposes has a same-named async client
