@@ -1,4 +1,4 @@
-# PyPI distribution for the `forgedb` CLI — epic #173 WS7 / issue #185.
+# PyPI distribution for the `forgedb` CLI — epic #173 / issue #185.
 #
 # The ONE channel cargo-dist can't drive (dist has no PyPI support). maturin
 # `bindings = "bin"` (see pyproject.toml) wraps the compiled `forgedb` binary —

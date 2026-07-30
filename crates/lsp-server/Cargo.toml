@@ -10,7 +10,7 @@ categories = ["database", "development-tools"]
 
 # Library-only. The `forgedb-lsp` binary that ships this server lives in the root
 # `forgedb` crate behind its non-default `lsp` feature, so one dist "app" carries
-# both `forgedb` and `forgedb-lsp` (epic #173 WS7). This crate is never a dist app.
+# both `forgedb` and `forgedb-lsp` (epic #173). This crate is never a dist app.
 [package.metadata.dist]
 dist = false
 
@@ -18,7 +18,7 @@ dist = false
 # The LSP speaks the REAL grammar/semantics by consuming the compiler directly —
 # `parse_recover()` for a resilient partial AST + all diagnostics, `validate_schema`
 # via that, and `ValidationError`/`Position` as the diagnostic vocabulary. It never
-# reimplements the language (the old private regex `parser.rs` was deleted in #173 WS2d).
+# reimplements the language (the old private regex `parser.rs` was deleted in #173).
 forgedb-parser = { path = "../parser", version = "0.2.0" }
 forgedb-validation = { path = "../validation", version = "0.2.0" }
 tower-lsp = "0.20"

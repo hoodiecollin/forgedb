@@ -56,7 +56,7 @@ path = "src/main.rs"
 # The language server binary. Behind the non-default `lsp` feature so a lean
 # `cargo install forgedb` skips the async LSP stack; release archives build with
 # `--features lsp` to ship `forgedb-lsp` alongside `forgedb` in one dist app
-# (epic #173 WS7). `forgedb lsp` resolves the sibling and hands off to it.
+# (epic #173). `forgedb lsp` resolves the sibling and hands off to it.
 [[bin]]
 name = "forgedb-lsp"
 path = "src/bin/forgedb-lsp.rs"

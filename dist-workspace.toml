@@ -1,7 +1,7 @@
 [workspace]
 members = ["cargo:."]
 
-# Config for 'dist' (cargo-dist) — WS7 of epic #173.
+# Config for 'dist' (cargo-dist) — epic #173.
 #
 # One dist "app" = the `forgedb` cargo package, shipping BOTH the `forgedb` CLI
 # and the bundled `forgedb-lsp` language server in every archive. `forgedb-lsp`

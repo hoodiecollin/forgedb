@@ -1,4 +1,4 @@
-# Custom npm publish job for the `forgedb` CLI — epic #173 WS7 / issue #184.
+# Custom npm publish job for the `forgedb` CLI — epic #173 / issue #184.
 #
 # Replaces cargo-dist's built-in `npm` publisher (which authenticates with a
 # long-lived `NPM_TOKEN`) with **npm Trusted Publishing (OIDC)** — the same

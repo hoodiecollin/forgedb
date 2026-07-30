@@ -1,4 +1,4 @@
-# PyPI packaging for the `forgedb` CLI — epic #173 WS7 / issue #185.
+# PyPI packaging for the `forgedb` CLI — epic #173 / issue #185.
 #
 # maturin `bindings = "bin"` wraps the compiled `forgedb` binary (plus the
 # bundled `forgedb-lsp`, via `features = ["lsp"]`) into platform wheels, so

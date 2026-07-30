@@ -1,4 +1,4 @@
-# Publish the ForgeDB VS Code extension — epic #173 WS8 (terminal ship gate).
+# Publish the ForgeDB VS Code extension — epic #173 (terminal ship gate).
 #
 # Independent release channel from the CLI: this workflow is driven by its OWN
 # tag namespace, `vscode-v*` (e.g. `vscode-v0.1.0`), NOT the CLI's `v*` release
