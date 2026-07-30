@@ -186,9 +186,10 @@ replication = false
 # commit_max_frames = 100
 
 # Note: the generated server's host/port, log level/format, and graceful-shutdown
-# are DEPLOY-environment config, read from the environment at process start
-# (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT) — 12-factor, not
-# baked into the binary. See the generated main.rs and docs/DEPLOYMENT.md.
+# drain timeout are DEPLOY-environment config, read from the environment at
+# process start (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT /
+# FORGEDB_SHUTDOWN_TIMEOUT) — 12-factor, not baked into the binary. See the
+# generated main.rs and docs/DEPLOYMENT.md.
 
 # Multi-tenancy (#59): physical, dir-per-tenant isolation. Each tenant's data
 # lives under <root>/<tenant>/, and ONE `forgedb serve` process serves ONE
@@ -205,11 +206,12 @@ root = "./data"
 enabled = false
 # issuer = "https://your-idp.example/"
 # audience = "your-api"
-# tenant_claim = "tenant"          # claim carrying the tenant id
+# tenant_claim = "tenant"          # claim carrying the tenant id (default)
 # jwks_url = "https://your-idp.example/.well-known/jwks.json"
 # public_key_path = "./idp_pub.pem"  # alternative to jwks_url (static key)
-# algorithms = ["RS256"]           # asymmetric only
-# leeway_secs = 60
+# algorithms = ["RS256"]           # asymmetric-only allowlist; multiple allowed,
+#                                  # e.g. ["RS256", "ES256"] (default ["RS256"])
+# leeway_secs = 60                 # clock-skew leeway seconds (default)
 "#,
         project_name
     )

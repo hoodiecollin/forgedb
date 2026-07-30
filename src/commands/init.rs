@@ -184,10 +184,14 @@ mod api;
 //   FORGEDB_DATA         tenant root dir (default: data)
 //   FORGEDB_HOST         bind host (default: 127.0.0.1)
 //   FORGEDB_PORT         bind port (default: 3000)
+//   FORGEDB_SHUTDOWN_TIMEOUT  max seconds to drain in-flight requests on
+//                        SIGINT/SIGTERM before forcing exit (default: 0 = unbounded)
 //
 // Verify-only JWT tenant guard (enabled when FORGEDB_JWT_PUBKEY is set):
 //   FORGEDB_JWT_PUBKEY   path to the IdP's PEM public key (verification key)
-//   FORGEDB_JWT_ALG      signature algorithm (default: RS256; asymmetric only)
+//   FORGEDB_JWT_ALGS     comma-separated signature-algorithm allowlist (default:
+//                        RS256; asymmetric only). FORGEDB_JWT_ALG (singular) is
+//                        still accepted for one algorithm.
 //   FORGEDB_JWT_ISSUER   expected `iss`
 //   FORGEDB_JWT_AUDIENCE expected `aud`
 //   FORGEDB_TENANT_CLAIM claim carrying the tenant id (default: tenant)
@@ -243,10 +247,39 @@ async fn main() {
     tracing::info!(tenant = ?tenant, data_root = %data_root, %addr, "ForgeDB serving");
     // Graceful shutdown (Phase 5 WS2): drain in-flight requests on SIGINT/SIGTERM
     // so a container stop or `Ctrl-C` doesn't sever open connections mid-write.
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("serve");
+    // The drain is unbounded by default (FORGEDB_SHUTDOWN_TIMEOUT unset or 0);
+    // set it to bound how long a stuck in-flight request can hold up the exit
+    // (#142) — after the signal fires, the process force-exits once the deadline
+    // passes even if a connection has not finished draining.
+    let drain_timeout_secs: u64 = std::env::var("FORGEDB_SHUTDOWN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // A watch channel lets the shutdown future signal the watchdog that draining
+    // has begun, so the deadline is measured from the signal, not from boot.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = drain_tx.send(true);
+    });
+    if drain_timeout_secs == 0 {
+        server.await.expect("serve");
+    } else {
+        let watchdog = async move {
+            let mut rx = drain_rx;
+            // Wait until the shutdown signal fires, then start the deadline.
+            let _ = rx.changed().await;
+            tokio::time::sleep(std::time::Duration::from_secs(drain_timeout_secs)).await;
+            tracing::warn!(
+                timeout_secs = drain_timeout_secs,
+                "shutdown drain exceeded FORGEDB_SHUTDOWN_TIMEOUT — forcing exit"
+            );
+        };
+        tokio::select! {
+            r = server => r.expect("serve"),
+            _ = watchdog => std::process::exit(0),
+        }
+    }
 }
 
 /// Resolve on the first shutdown signal — `Ctrl-C` (SIGINT) or, on Unix, SIGTERM
@@ -298,12 +331,28 @@ fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticat
     let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok()?;
     let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
     let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
-    let alg = std::env::var("FORGEDB_JWT_ALG")
-        .ok()
-        .and_then(|a| forgedb_auth::parse_algorithm(&a))
-        .unwrap_or(forgedb_auth::Algorithm::RS256);
+    // Algorithm allowlist (#147): the substrate accepts a full Vec<Algorithm>, so
+    // parse the comma-separated FORGEDB_JWT_ALGS (falling back to the singular
+    // FORGEDB_JWT_ALG for back-compat). Unknown/HS* names are dropped; an empty
+    // list defaults to [RS256]. A static PEM key binds ONE algorithm, so it is
+    // built from the PRIMARY (first) of the allowlist — the allowlist may be
+    // broader than the single static key's own algorithm.
+    let algorithms: Vec<forgedb_auth::Algorithm> = std::env::var("FORGEDB_JWT_ALGS")
+        .or_else(|_| std::env::var("FORGEDB_JWT_ALG"))
+        .unwrap_or_else(|_| "RS256".to_string())
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(forgedb_auth::parse_algorithm)
+        .collect();
+    let algorithms = if algorithms.is_empty() {
+        vec![forgedb_auth::Algorithm::RS256]
+    } else {
+        algorithms
+    };
+    let primary_alg = algorithms[0];
     let cfg = forgedb_auth::AuthConfig {
-        algorithms: vec![alg],
+        algorithms,
         issuer: std::env::var("FORGEDB_JWT_ISSUER").ok(),
         audience: std::env::var("FORGEDB_JWT_AUDIENCE").ok(),
         tenant_claim: std::env::var("FORGEDB_TENANT_CLAIM").unwrap_or_else(|_| "tenant".to_string()),
@@ -313,7 +362,7 @@ fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticat
             .unwrap_or(60),
         required_claims: vec![],
     };
-    let keys = forgedb_auth::KeySource::static_pem(None, pem, alg);
+    let keys = forgedb_auth::KeySource::static_pem(None, pem, primary_alg);
     Some(forgedb_auth::Authenticator::new(cfg, keys, tenant))
 }
 "#;

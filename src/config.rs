@@ -95,8 +95,11 @@ impl AuthConfig {
         if let Some(claim) = &self.tenant_claim {
             out.push(("FORGEDB_TENANT_CLAIM".to_string(), claim.clone()));
         }
-        if let Some(first) = self.algorithms.as_ref().and_then(|a| a.first()) {
-            out.push(("FORGEDB_JWT_ALG".to_string(), first.clone()));
+        // Emit the FULL algorithm allowlist (#147): the substrate accepts a
+        // `Vec<Algorithm>`, so the config must not collapse it to one. Comma-join
+        // into FORGEDB_JWT_ALGS, which the scaffold parses back into the vec.
+        if let Some(algs) = self.algorithms.as_ref().filter(|a| !a.is_empty()) {
+            out.push(("FORGEDB_JWT_ALGS".to_string(), algs.join(",")));
         }
         if let Some(leeway) = self.leeway_secs {
             out.push(("FORGEDB_JWT_LEEWAY".to_string(), leeway.to_string()));
