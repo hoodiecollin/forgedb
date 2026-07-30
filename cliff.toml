@@ -1,0 +1,108 @@
+# git-cliff — CHANGELOG.md generator for the ForgeDB *core* release line (#211).
+#
+# The changelog is the backward-looking, mechanical record of what actually
+# shipped in each `v*` release, generated from the repo's conventional commits
+# (feat:/fix:/perf:/…). It is regenerated at release time (`make changelog`),
+# committed, and consumed by TWO surfaces from one source:
+#   - cargo-dist builds each GitHub Release body from this file (release.yml).
+#   - the website renders it statically at /changelog (apps/website).
+#
+# Scope discipline: this is the CORE (`v[0-9]*`) changelog. The VS Code extension
+# ships on its own `vscode-v*` tag line, and the marketing site / packaging
+# channels are not product releases — commits scoped to them are filtered out
+# below so they never headline a ForgeDB release.
+
+[changelog]
+# A stable preamble kept verbatim at the top of CHANGELOG.md.
+header = """
+# Changelog
+
+All notable changes to the ForgeDB core (the `forgedb` CLI and its published
+substrate crates) are documented here. This file is generated from conventional
+commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
+`make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
+and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
+
+"""
+
+# One section per release. Keep-a-Changelog headings (`## [x.y.z] - date`) so
+# cargo-dist can locate the matching section and the website parser can split on
+# them. Issue refs are linked by a preprocessor below.
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}\
+{% if commit.breaking %}**breaking:** {% endif %}\
+{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}
+"""
+
+footer = """
+"""
+trim = true
+
+[git]
+conventional_commits = true
+# Drop commits that don't follow the conventional format — keeps the log clean
+# rather than surfacing every stray subject.
+filter_unconventional = true
+split_commits = false
+
+# Rewrite the raw subject before parsing/rendering.
+commit_preprocessors = [
+  # Link issue/PR refs so both the GitHub Release body and the website get
+  # clickable references. Single-quoted TOML literal → the regex sees `\(`.
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/hoodiecollin/forgedb/issues/${1}))" },
+]
+
+# First match wins — order matters. Scope-based skips come first so the marketing
+# site / extension / packaging channels never appear in the core changelog.
+#
+# Group names carry an `<!-- N -->` sort-key prefix so `group_by` orders sections
+# logically (Features → Fixes → Performance) instead of alphabetically; the
+# template strips the comment with `striptags`.
+#
+# Only the user-facing axes are kept — features, fixes, performance. Docs,
+# refactors, chores, CI, and unconventional subjects are dropped as changelog
+# noise (`filter_unconventional = true` discards anything with no matching
+# parser). Breaking changes are the exception: `protect_breaking_commits = true`
+# keeps them even when their type is skipped, and they are routed to their own
+# top section here.
+commit_parsers = [
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew)\\)", skip = true },
+  # Any `type!:` / `type(scope)!:` breaking marker headlines its own section,
+  # regardless of the underlying type.
+  { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },
+  { message = "^feat", group = "<!-- 1 -->Features" },
+  { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 3 -->Performance" },
+  # Everything else (docs, refactors, chores, ci, tests, bench, merge, reverts,
+  # and any other type) is changelog noise — skip it explicitly so a stray type
+  # never defaults into a section of its own.
+  { message = ".*", skip = true },
+]
+
+# Breaking changes are surfaced by the explicit `!:`-marker parser above (routed
+# to their own section), so the auto-resurrection of skipped breaking commits is
+# left off — otherwise a skipped `refactor!`/`bench!` reappears under a stray
+# type-named section.
+protect_breaking_commits = false
+filter_commits = false
+
+# Only the CORE release line counts as a release here. Anchored so `vscode-v*`
+# (extension line) and any other prefix are excluded — this is the single point
+# that keeps the two release lines from colliding (see docs/roadmap notes).
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+"
+# Prereleases (`-rc`, `-beta`, …) are not public releases; keep them off the page.
+ignore_tags = "-(rc|alpha|beta)"
+
+topo_order = false
+sort_commits = "oldest"

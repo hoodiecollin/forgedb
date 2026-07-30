@@ -15,7 +15,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         website-install website website-build website-typecheck website-secrets \
-        website-rewrite website-rewrite-watch \
+        website-rewrite website-rewrite-watch changelog \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
@@ -130,6 +130,14 @@ website-build:
 ## Typecheck the website.
 website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
+
+## Regenerate the root CHANGELOG.md from conventional commits (git-cliff, cliff.toml).
+## Run at release time AFTER tagging so the new `v*` tag becomes its own section;
+## cargo-dist reads this file for the GitHub Release body and the website renders it
+## at /changelog. Needs git-cliff on PATH (`brew install git-cliff`).
+changelog:
+	git-cliff --config cliff.toml --output CHANGELOG.md
+	@echo "✓ CHANGELOG.md regenerated — review the diff before committing."
 
 ## LOCAL DEV: one command for the in-browser prose-rewrite loop — brings up the dev
 ## server (background, reused across cycles) AND the wake watcher. Edit docs prose or
