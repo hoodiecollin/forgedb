@@ -478,6 +478,7 @@ impl FieldType {
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16,
+            FieldType::Decimal => 16, // exact decimal is a fixed 16-byte column, like Uuid (#189)
             FieldType::Char(size) => *size,
             FieldType::FixedArray(inner, count) => inner.size_in_bytes(schema) * count,
             FieldType::StructType(name) => {
