@@ -32,7 +32,7 @@ edition = "2024"
 
 [package]
 name = "forgedb"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 authors = ["Collin Kokotas"]
 license = "MIT OR Apache-2.0"
@@ -68,7 +68,7 @@ default = []
 lsp = ["dep:forgedb-lsp-server"]
 
 [dependencies]
-forgedb-parser = { path = "crates/parser", version = "0.2.0" }
+forgedb-parser = { path = "crates/parser", version = "0.2.1" }
 forgedb-codegen = { path = "crates/codegen", version = "0.2.1" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.0" }
 forgedb-migrations = { path = "crates/migrations", version = "0.2.0" }
@@ -88,7 +88,7 @@ toml = "0.8"
 ctrlc = "3.4"
 
 [dev-dependencies]
-forgedb-parser = { path = "crates/parser", version = "0.2.0" }
+forgedb-parser = { path = "crates/parser", version = "0.2.1" }
 forgedb-validation = { path = "crates/validation", version = "0.2.0" }
 forgedb-lsp-server = { path = "crates/lsp-server", version = "0.1.0" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.0" }
