@@ -51,6 +51,21 @@ import type {
   PendingRelease,
 } from "./roadmap";
 
+/**
+ * Marketing / extension / packaging scopes the roadmap excludes, so it stays
+ * "where the ForgeDB CORE is headed." These ship on their own cadence (the site
+ * deploys continuously; the extension on the `vscode-v*` line) — never gated on a
+ * core `v*` release. This mirrors cliff.toml's changelog scope filter
+ * `(website|vscode|npm|pypi|winget|docker|brew|homebrew)`, expressed as issue
+ * LABELS: `website` + `vscode` are the two that exist (packaging work carries no
+ * label today). An issue with any of these labels is dropped from every bucket.
+ */
+const EXCLUDED_SCOPES = new Set(["website", "vscode"]);
+
+function isCoreScoped(labels: string[]): boolean {
+  return !labels.some((l) => EXCLUDED_SCOPES.has(l));
+}
+
 /** A core release tag: `vX.Y.Z` (optionally with a suffix we still treat as core). */
 const CORE_TAG = /^v(\d+)\.(\d+)\.(\d+)/;
 
@@ -142,6 +157,7 @@ export function buildRoadmap(
     const done = realIssues
       .filter((i) => i.state === "closed" && i.milestone?.number === pendingMs.number)
       .map(toIssue)
+      .filter((i) => isCoreScoped(i.labels))
       .sort((a, b) => b.number - a.number);
     pendingRelease = {
       milestone: pendingMs.title,
@@ -157,7 +173,9 @@ export function buildRoadmap(
   const ideas: RoadmapIssue[] = [];
   for (const i of realIssues) {
     if (i.state !== "open") continue;
-    const bucket = bucketOf(i.labels.map((l) => l.name.toLowerCase()));
+    const labels = i.labels.map((l) => l.name.toLowerCase());
+    if (!isCoreScoped(labels)) continue; // drop website/extension/packaging scopes
+    const bucket = bucketOf(labels);
     if (bucket === "next") next.push(toIssue(i));
     else if (bucket === "labs") labs.push(toIssue(i));
     else if (bucket === "ideas") ideas.push(toIssue(i));
