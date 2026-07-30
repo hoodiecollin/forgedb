@@ -146,6 +146,16 @@ pub struct StorageConfig {
     pub compaction_threshold: Option<u64>,
 }
 
+/// Generate-time **transaction** knobs (`[transaction]` table, epic #126).
+/// Schema-blind, baked at generate time (Tier B). Defaults are byte-identical
+/// to today's output.
+#[derive(Debug, Deserialize, Default)]
+pub struct TransactionConfig {
+    /// Default retry count for `transaction_optimistic` (#146). Default 3.
+    /// Per-call control stays available via `transaction_retrying(retries, f)`.
+    pub max_retries: Option<u32>,
+}
+
 /// Top-level config struct.  Unknown top-level TOML tables are ignored.
 #[derive(Debug, Deserialize, Default)]
 pub struct ForgeConfig {
@@ -159,6 +169,8 @@ pub struct ForgeConfig {
     pub runtime: RuntimeConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub transaction: TransactionConfig,
 }
 
 impl ForgeConfig {
@@ -195,6 +207,7 @@ impl ForgeConfig {
                 .changefeed_capacity
                 .unwrap_or(d.changefeed_capacity),
             max_cascade_depth: self.runtime.max_cascade_depth.unwrap_or(d.max_cascade_depth),
+            txn_max_retries: self.transaction.max_retries.unwrap_or(d.txn_max_retries),
         })
     }
 }
@@ -261,6 +274,9 @@ fsync = "never"
 wal_checkpoint_interval = 500
 compaction = false
 compaction_threshold = 250
+
+[transaction]
+max_retries = 7
 "#;
         let cfg: ForgeConfig = toml::from_str(src).unwrap();
         let gc = cfg.gen_config().unwrap();
@@ -274,6 +290,7 @@ compaction_threshold = 250
                 compaction_threshold: 250,
                 changefeed_capacity: 256,
                 max_cascade_depth: 16,
+                txn_max_retries: 7,
             }
         );
     }

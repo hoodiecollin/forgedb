@@ -7202,6 +7202,11 @@ impl RustGenerator {
             return quote! {};
         }
 
+        // Default optimistic-transaction retry count (#146, epic #126): baked
+        // from `[transaction].max_retries`; default 3 (byte-identical).
+        let __txn_max_retries =
+            proc_macro2::Literal::u32_unsuffixed(Self::active_cfg().txn_max_retries);
+
         // Rollback arms: truncate every touched collection's columns + WAL tail
         // back to its recorded pre-txn mark, and clear its txn guard.
         let rollback_arms: Vec<_> = tx_models
@@ -7476,10 +7481,10 @@ impl RustGenerator {
 
             /// Default retry count for `transaction_optimistic` (#83, Tier 2).
             ///
-            /// Override per-call via `transaction_retrying(retries, f)`.
-            /// (`forgedb.toml` `[transaction] max_retries` wiring is a residual —
-            /// the knob is exposed via `transaction_retrying` for now.)
-            const DEFAULT_TXN_RETRIES: u32 = 3;
+            /// Override per-call via `transaction_retrying(retries, f)`.  Baked at
+            /// generate time (#146, epic #126) from `[transaction].max_retries`;
+            /// default 3 (byte-identical).
+            const DEFAULT_TXN_RETRIES: u32 = #__txn_max_retries;
 
             impl Database {
                 /// Run a transaction (MVCC Tier 1, #83).  The closure receives a

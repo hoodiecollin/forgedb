@@ -157,6 +157,13 @@ replication = false
 # Dead row versions per model before auto-compaction fires (#133).
 # compaction_threshold = 1000
 
+# Generate-time TRANSACTION knobs (epic #126). Baked at generate time.
+[transaction]
+# Default retry count for `transaction_optimistic` (#146) — a conflict-losing
+# optimistic transaction is re-run up to max_retries + 1 times. Per-call control
+# stays available via `transaction_retrying(retries, f)`.
+# max_retries = 3
+
 # Note: the generated server's host/port, log level/format, and graceful-shutdown
 # are DEPLOY-environment config, read from the environment at process start
 # (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT) — 12-factor, not

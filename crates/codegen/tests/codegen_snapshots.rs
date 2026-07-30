@@ -3335,6 +3335,10 @@ Author {
         d.contains("ChangeFeed::new(1024)"),
         "default changefeed capacity is 1024 (#135)"
     );
+    assert!(
+        d.contains("constDEFAULT_TXN_RETRIES:u32=3"),
+        "default optimistic-transaction retry count is 3 (#146)"
+    );
     // Default auto-compaction trigger is emitted (#134 ON).
     assert!(
         d.contains("self.dead_since_compaction>=COMPACTION_DEAD_THRESHOLD"),
@@ -3350,6 +3354,7 @@ Author {
         compaction_threshold: 250,
         changefeed_capacity: 64,
         max_cascade_depth: 8,
+        txn_max_retries: 9,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);
@@ -3376,6 +3381,10 @@ Author {
     assert!(
         c.contains("ChangeFeed::new(64)"),
         "changefeed capacity is configurable (#135)"
+    );
+    assert!(
+        c.contains("constDEFAULT_TXN_RETRIES:u32=9"),
+        "optimistic-transaction retry count is configurable (#146)"
     );
     assert!(
         c.contains("forgedb_changefeed::durable::FsyncPolicy::Never"),

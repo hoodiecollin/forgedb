@@ -107,6 +107,12 @@ pub struct GenConfig {
     /// depth (`const MAX_CASCADE_DEPTH`), a structural safety bound against a
     /// pathological FK cycle.
     pub max_cascade_depth: u32,
+
+    /// **Tier B, default 3 (#146).** Default retry count for
+    /// `transaction_optimistic` (`const DEFAULT_TXN_RETRIES`) — a conflict-losing
+    /// Tier-2 optimistic transaction is re-run up to `retries + 1` times.
+    /// Per-call control stays available via `transaction_retrying(retries, f)`.
+    pub txn_max_retries: u32,
 }
 
 impl Default for GenConfig {
@@ -127,6 +133,7 @@ impl GenConfig {
         compaction_threshold: 1000,
         changefeed_capacity: 1024,
         max_cascade_depth: 64,
+        txn_max_retries: 3,
     };
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,
