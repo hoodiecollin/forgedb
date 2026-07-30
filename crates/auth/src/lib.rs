@@ -86,6 +86,10 @@ pub enum AuthError {
     /// The JWKS document or a static key could not be parsed.
     #[error("invalid verification key material: {0}")]
     Key(String),
+    /// Fetching the JWKS document over HTTP failed (#81).
+    #[cfg(feature = "jwks-http")]
+    #[error("failed to fetch JWKS from {url}: {reason}")]
+    Fetch { url: String, reason: String },
 }
 
 impl AuthError {
@@ -120,6 +124,49 @@ pub enum KeySource {
     StaticPem(Vec<StaticKey>),
     /// A parsed JWKS document, e.g. an IdP's `.well-known/jwks.json`.
     Jwks(jsonwebtoken::jwk::JwkSet),
+    /// A JWKS document fetched over HTTP and refreshed on a schedule (#81). The
+    /// cache holds the current key set behind a lock and a background thread
+    /// re-fetches it, so a key rotated in at the IdP is picked up at the next
+    /// refresh. Feature-gated to keep the default dep surface lean.
+    #[cfg(feature = "jwks-http")]
+    JwksHttp(std::sync::Arc<JwksHttpCache>),
+}
+
+/// A JWKS document fetched over HTTP, cached behind a lock, and refreshed by a
+/// background thread (#81). Schema-agnostic — cryptographic material only, the
+/// same class as [`KeySource`]. Cloneable handle (`Arc`) so the refresh thread
+/// and the [`Authenticator`] share one cache.
+#[cfg(feature = "jwks-http")]
+pub struct JwksHttpCache {
+    url: String,
+    keys: std::sync::RwLock<jsonwebtoken::jwk::JwkSet>,
+}
+
+#[cfg(feature = "jwks-http")]
+impl JwksHttpCache {
+    /// Fetch + parse the JWKS document at `url` (blocking).
+    fn fetch(url: &str) -> Result<jsonwebtoken::jwk::JwkSet, AuthError> {
+        let body = ureq::get(url)
+            .call()
+            .map_err(|e| AuthError::Fetch {
+                url: url.to_string(),
+                reason: e.to_string(),
+            })?
+            .into_string()
+            .map_err(|e| AuthError::Fetch {
+                url: url.to_string(),
+                reason: e.to_string(),
+            })?;
+        serde_json::from_str(&body).map_err(|e| AuthError::Key(e.to_string()))
+    }
+
+    /// Re-fetch the JWKS and swap in the new key set. On error the previous set
+    /// is retained (an IdP blip must not lock everyone out mid-rotation).
+    fn refresh(&self) -> Result<(), AuthError> {
+        let set = Self::fetch(&self.url)?;
+        *self.keys.write().unwrap() = set;
+        Ok(())
+    }
 }
 
 impl KeySource {
@@ -132,13 +179,47 @@ impl KeySource {
         }])
     }
 
-    /// Parse a JWKS document (e.g. the body of `.well-known/jwks.json`). Fetching
-    /// it over HTTP + periodic refresh is the deployer's / a future feature's job;
-    /// this constructor is offline and pure so it is fully testable.
+    /// Parse a JWKS document (e.g. the body of `.well-known/jwks.json`). Offline
+    /// and pure (no HTTP) so it is fully testable; for the fetch-and-refresh
+    /// variant see [`KeySource::jwks_url`] (#81).
     pub fn from_jwks_json(json: &str) -> Result<Self, AuthError> {
         let set: jsonwebtoken::jwk::JwkSet =
             serde_json::from_str(json).map_err(|e| AuthError::Key(e.to_string()))?;
         Ok(KeySource::Jwks(set))
+    }
+
+    /// Fetch a JWKS document over HTTP and keep it fresh (#81). Fetches once
+    /// **synchronously** (so a bad URL / unreachable IdP fails loud at startup,
+    /// never a silently-unauthenticated server), then spawns a background thread
+    /// that re-fetches every `refresh_interval` — picking up a rotated-in signing
+    /// key within one interval. On a refresh error the previous key set is kept.
+    #[cfg(feature = "jwks-http")]
+    pub fn jwks_url(
+        url: impl Into<String>,
+        refresh_interval: std::time::Duration,
+    ) -> Result<Self, AuthError> {
+        let url = url.into();
+        // Initial synchronous fetch — fail loud if the IdP is unreachable.
+        let set = JwksHttpCache::fetch(&url)?;
+        let cache = std::sync::Arc::new(JwksHttpCache {
+            url,
+            keys: std::sync::RwLock::new(set),
+        });
+        // Background refresh thread (detached; lives for the process). A zero
+        // interval disables refresh (single startup fetch only).
+        if !refresh_interval.is_zero() {
+            let bg = std::sync::Arc::clone(&cache);
+            std::thread::Builder::new()
+                .name("forgedb-jwks-refresh".into())
+                .spawn(move || loop {
+                    std::thread::sleep(refresh_interval);
+                    if let Err(e) = bg.refresh() {
+                        eprintln!("[forgedb-auth] JWKS refresh failed (keeping current keys): {e}");
+                    }
+                })
+                .ok();
+        }
+        Ok(KeySource::JwksHttp(cache))
     }
 
     fn select(&self, header: &jsonwebtoken::Header) -> Result<DecodingKey, AuthError> {
@@ -154,16 +235,29 @@ impl KeySource {
                 .ok_or_else(|| AuthError::UnknownKey(header.kid.clone()))?;
                 build_static_key(chosen)
             }
-            KeySource::Jwks(set) => {
-                let jwk = match &header.kid {
-                    Some(kid) => set.find(kid),
-                    None => set.keys.first(),
-                }
-                .ok_or_else(|| AuthError::UnknownKey(header.kid.clone()))?;
-                DecodingKey::from_jwk(jwk).map_err(|e| AuthError::Key(e.to_string()))
+            KeySource::Jwks(set) => select_from_jwks(set, header),
+            #[cfg(feature = "jwks-http")]
+            KeySource::JwksHttp(cache) => {
+                let set = cache.keys.read().unwrap();
+                select_from_jwks(&set, header)
             }
         }
     }
+}
+
+/// Select a key from a parsed JWKS set by the token's `kid` (or the sole key
+/// when the token carries none) and build a `DecodingKey`. Shared by the static
+/// `Jwks` and the fetched `JwksHttp` sources (#81).
+fn select_from_jwks(
+    set: &jsonwebtoken::jwk::JwkSet,
+    header: &jsonwebtoken::Header,
+) -> Result<DecodingKey, AuthError> {
+    let jwk = match &header.kid {
+        Some(kid) => set.find(kid),
+        None => set.keys.first(),
+    }
+    .ok_or_else(|| AuthError::UnknownKey(header.kid.clone()))?;
+    DecodingKey::from_jwk(jwk).map_err(|e| AuthError::Key(e.to_string()))
 }
 
 fn build_static_key(k: &StaticKey) -> Result<DecodingKey, AuthError> {
@@ -410,5 +504,26 @@ pub mod axum_mw {
         let status =
             StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::UNAUTHORIZED);
         (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+    }
+}
+
+#[cfg(all(test, feature = "jwks-http"))]
+mod jwks_http_tests {
+    use super::{AuthError, KeySource};
+    use std::time::Duration;
+
+    #[test]
+    fn jwks_url_fails_loud_when_unreachable(){
+        // #81: the initial fetch is synchronous, so an unreachable IdP is a hard
+        // error at construction — never a silently-unauthenticated server. Port 1
+        // on loopback refuses fast. refresh_interval 0 disables the background
+        // thread (this test only exercises the initial fetch).
+        match KeySource::jwks_url("http://127.0.0.1:1/.well-known/jwks.json", Duration::ZERO) {
+            Ok(_) => panic!("unreachable JWKS endpoint must fail loud, not succeed"),
+            Err(e) => assert!(
+                matches!(e, AuthError::Fetch { .. }),
+                "expected a Fetch error, got {e:?}"
+            ),
+        }
     }
 }

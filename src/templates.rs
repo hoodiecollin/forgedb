@@ -213,6 +213,7 @@ enabled = false
 # audience = "your-api"
 # tenant_claim = "tenant"          # claim carrying the tenant id (default)
 # jwks_url = "https://your-idp.example/.well-known/jwks.json"
+# jwks_refresh_secs = 300          # JWKS re-fetch interval for key rotation (#81)
 # public_key_path = "./idp_pub.pem"  # alternative to jwks_url (static key)
 # algorithms = ["RS256"]           # asymmetric-only allowlist; multiple allowed,
 #                                  # e.g. ["RS256", "ES256"] (default ["RS256"])

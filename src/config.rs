@@ -61,6 +61,8 @@ pub struct AuthConfig {
     pub tenant_claim: Option<String>,
     /// JWKS endpoint URL (`.well-known/jwks.json`) to fetch verification keys.
     pub jwks_url: Option<String>,
+    /// JWKS re-fetch interval in seconds for key rotation (#81, default 300).
+    pub jwks_refresh_secs: Option<u64>,
     /// Path to a static PEM public key (alternative to `jwks_url`).
     pub public_key_path: Option<String>,
     /// Allowed signature algorithms (default `["RS256"]`).  Asymmetric only.
@@ -85,6 +87,9 @@ impl AuthConfig {
         }
         if let Some(url) = &self.jwks_url {
             out.push(("FORGEDB_JWKS_URL".to_string(), url.clone()));
+        }
+        if let Some(secs) = self.jwks_refresh_secs {
+            out.push(("FORGEDB_JWKS_REFRESH_SECS".to_string(), secs.to_string()));
         }
         if let Some(iss) = &self.issuer {
             out.push(("FORGEDB_JWT_ISSUER".to_string(), iss.clone()));

@@ -139,7 +139,7 @@ forgedb-storage = "0.2"
 forgedb-types = "0.2"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
-forgedb-auth = "0.1"
+forgedb-auth = {{ version = "0.2", features = ["jwks-http"] }}
 forgedb-query-params = "0.1"
 forgedb-compaction = "0.1"
 forgedb-txn = "0.1"
@@ -196,6 +196,10 @@ mod api;
 //   FORGEDB_JWT_AUDIENCE expected `aud`
 //   FORGEDB_TENANT_CLAIM claim carrying the tenant id (default: tenant)
 //   FORGEDB_JWT_LEEWAY   clock-skew leeway seconds (default: 60)
+//   FORGEDB_JWKS_URL     JWKS endpoint (.well-known/jwks.json) — fetched over
+//                        HTTP + refreshed for key rotation (alternative to
+//                        FORGEDB_JWT_PUBKEY; the static PEM wins if both are set)
+//   FORGEDB_JWKS_REFRESH_SECS  JWKS re-fetch interval seconds (default: 300)
 #[tokio::main]
 async fn main() {
     // Structured logging (Phase 5): the router logs each request as a
@@ -308,29 +312,23 @@ async fn shutdown_signal() {
 }
 
 /// Build the verify-only JWT authenticator from env, or `None` to run without a
-/// tenant guard. Requires FORGEDB_JWT_PUBKEY; when set, FORGEDB_TENANT must name
-/// the tenant this process serves (the value the token's tenant claim is
-/// cross-checked against).
+/// tenant guard. Enabled when EITHER FORGEDB_JWT_PUBKEY (static PEM) OR
+/// FORGEDB_JWKS_URL (JWKS-over-HTTP, #81) is set; FORGEDB_TENANT must then name
+/// the tenant this process serves (cross-checked against the token's tenant
+/// claim). Static PEM takes precedence if both are set.
 ///
-/// JWKS-over-HTTP verification is not yet supported: FORGEDB_JWKS_URL is a
-/// recognized config key, but this server verifies against a static PEM only. If
-/// a JWKS URL is the ONLY configured key source, this refuses to start rather
-/// than silently running UNAUTHENTICATED.
+/// Fail-loud: if a key source is configured but cannot be loaded (unreadable PEM,
+/// or an unreachable/invalid JWKS endpoint), this PANICS rather than falling
+/// through to an unauthenticated server the operator believed was protected.
 fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticator> {
-    // Fail loud: FORGEDB_JWKS_URL set but no static PEM would otherwise fall
-    // through to `None` (no guard) — an unauthenticated server the operator
-    // believed was protected. Refuse to start instead.
-    if std::env::var("FORGEDB_JWT_PUBKEY").is_err() && std::env::var("FORGEDB_JWKS_URL").is_ok() {
-        panic!(
-            "FORGEDB_JWKS_URL is set but JWKS-over-HTTP verification is not supported \
-             by this server yet. Set FORGEDB_JWT_PUBKEY to a static PEM to enable the \
-             JWT guard, or unset FORGEDB_JWKS_URL. Refusing to start UNAUTHENTICATED \
-             while a JWKS URL is configured."
-        );
+    let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok();
+    let jwks_url = std::env::var("FORGEDB_JWKS_URL").ok();
+    // No key source configured → run without a tenant guard.
+    if pubkey_path.is_none() && jwks_url.is_none() {
+        return None;
     }
-    let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok()?;
     let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
-    let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
+
     // Algorithm allowlist (#147): the substrate accepts a full Vec<Algorithm>, so
     // parse the comma-separated FORGEDB_JWT_ALGS (falling back to the singular
     // FORGEDB_JWT_ALG for back-compat). Unknown/HS* names are dropped; an empty
@@ -362,7 +360,22 @@ fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticat
             .unwrap_or(60),
         required_claims: vec![],
     };
-    let keys = forgedb_auth::KeySource::static_pem(None, pem, primary_alg);
+
+    // Key source: a static PEM takes precedence; otherwise fetch the JWKS over
+    // HTTP and refresh it in the background (#81) — a signing key rotated in at
+    // the IdP is picked up within FORGEDB_JWKS_REFRESH_SECS (default 300).
+    let keys = if let Some(pubkey_path) = pubkey_path {
+        let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
+        forgedb_auth::KeySource::static_pem(None, pem, primary_alg)
+    } else {
+        let url = jwks_url.expect("jwks_url is Some when pubkey_path is None");
+        let refresh_secs = std::env::var("FORGEDB_JWKS_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        forgedb_auth::KeySource::jwks_url(&url, std::time::Duration::from_secs(refresh_secs))
+            .expect("fetch JWKS from FORGEDB_JWKS_URL (refusing to start unauthenticated)")
+    };
     Some(forgedb_auth::Authenticator::new(cfg, keys, tenant))
 }
 "#;
