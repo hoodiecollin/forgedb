@@ -36,7 +36,7 @@ pub fn run(options: InitOptions) -> Result<()> {
     // Create Rust files if needed
     if options.rust || !options.api_only {
         create_rust_files(&options)?;
-        // The blessed container deploy path (Phase 5 WS2) targets the generated
+        // The blessed container deploy path (Phase 5) targets the generated
         // Rust server, so it rides along with the Rust scaffold.
         create_deploy_files(&options)?;
     }
@@ -125,7 +125,7 @@ fn create_rust_files(options: &InitOptions) -> Result<()> {
     // forgedb-query-params for list-endpoint filter/sort/paginate (#90 — the
     // query string is parsed by this schema-agnostic substrate; all field-aware
     // filtering/sorting is generated per-model), and tower-http (trace feature)
-    // for the request-logging layer on the generated router (Phase 5 WS1
+    // for the request-logging layer on the generated router (Phase 5
     // observability).  The scaffold `main.rs` installs a `tracing-subscriber`
     // (env-filtered via `RUST_LOG`) so those spans are emitted.
     let cargo_toml = format!(
@@ -198,7 +198,7 @@ mod api;
 //   FORGEDB_JWT_LEEWAY   clock-skew leeway seconds (default: 60)
 #[tokio::main]
 async fn main() {
-    // Structured logging (Phase 5 WS1): the router logs each request as a
+    // Structured logging (Phase 5): the router logs each request as a
     // `tracing` span via tower-http's TraceLayer; install a subscriber that
     // honors `RUST_LOG` (default `info`) so those spans are emitted.  Set
     // FORGEDB_LOG_FORMAT=json for machine-parseable JSON lines (log aggregators);
@@ -245,7 +245,7 @@ async fn main() {
         .await
         .expect("bind listener");
     tracing::info!(tenant = ?tenant, data_root = %data_root, %addr, "ForgeDB serving");
-    // Graceful shutdown (Phase 5 WS2): drain in-flight requests on SIGINT/SIGTERM
+    // Graceful shutdown (Phase 5): drain in-flight requests on SIGINT/SIGTERM
     // so a container stop or `Ctrl-C` doesn't sever open connections mid-write.
     // The drain is unbounded by default (FORGEDB_SHUTDOWN_TIMEOUT unset or 0);
     // set it to bound how long a stuck in-flight request can hold up the exit
@@ -284,7 +284,7 @@ async fn main() {
 
 /// Resolve on the first shutdown signal — `Ctrl-C` (SIGINT) or, on Unix, SIGTERM
 /// (how Docker/Kubernetes ask a container to stop).  Returning from this future
-/// tells `axum::serve` to stop accepting and drain (Phase 5 WS2).
+/// tells `axum::serve` to stop accepting and drain (Phase 5).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -375,11 +375,11 @@ fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticat
     Ok(())
 }
 
-/// Emit the blessed container deploy path (Phase 5 WS2): a multi-stage
+/// Emit the blessed container deploy path (Phase 5): a multi-stage
 /// `Dockerfile`, a `.dockerignore`, and a `docker-compose.yml`.  The image builds
 /// the generated Rust server and runs it as a non-root user with `/data` on a
 /// volume, `FORGEDB_HOST=0.0.0.0`, and a `HEALTHCHECK` against the generated
-/// `/health` endpoint (Phase 5 WS1).  None of this reads `schema.forge` at
+/// `/health` endpoint (Phase 5).  None of this reads `schema.forge` at
 /// runtime — it is ops packaging around the already-generated server binary.
 fn create_deploy_files(options: &InitOptions) -> Result<()> {
     let project_path = Path::new(&options.project_name);
@@ -391,7 +391,7 @@ fn create_deploy_files(options: &InitOptions) -> Result<()> {
     // reproducible (it is copied when present).
     let dockerfile = format!(
         r#"# syntax=docker/dockerfile:1
-# ForgeDB generated-server image (Phase 5 WS2 deploy path).
+# ForgeDB generated-server image (Phase 5 deploy path).
 #
 # Build context expects the generated code present:
 #   forgedb generate all --output ./generated
@@ -424,7 +424,7 @@ VOLUME ["/data"]
 USER forgedb
 EXPOSE 3000
 
-# Liveness against the generated /health endpoint (Phase 5 WS1).
+# Liveness against the generated /health endpoint (Phase 5).
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
     CMD curl -fsS http://localhost:3000/health || exit 1
 
@@ -443,7 +443,7 @@ node_modules/
     fs::write(project_path.join(".dockerignore"), dockerignore)?;
 
     let compose = format!(
-        r#"# ForgeDB generated-server compose file (Phase 5 WS2).
+        r#"# ForgeDB generated-server compose file (Phase 5).
 #   docker compose up --build
 services:
   {bin}:

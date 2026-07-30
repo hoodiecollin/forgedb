@@ -38,7 +38,7 @@ function findOnPath(bin: string): string | undefined {
 ///   1. `forgedb.lspServerPath` — an explicit `forgedb-lsp` binary;
 ///   2. the installed `forgedb` CLI (config `forgedb.path`, else on PATH),
 ///      launched via its `lsp` subcommand, which locates the sibling
-///      `forgedb-lsp` binary itself (epic #173 WS4).
+///      `forgedb-lsp` binary itself (epic #173).
 /// Returns undefined when no CLI/server can be found.
 function resolveServer(): { command: string; args: string[] } | undefined {
     const config = vscode.workspace.getConfiguration('forgedb');
@@ -97,7 +97,7 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 async function startLanguageServer(context: vscode.ExtensionContext) {
-    // The language server ships with the installed `forgedb` CLI (epic #173 WS4):
+    // The language server ships with the installed `forgedb` CLI (epic #173):
     // the extension bundles no binary and downloads nothing. It resolves the
     // server from the user's CLI so editor diagnostics stay in lockstep with the
     // CLI's own compiler (single source of truth — see #175).

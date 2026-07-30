@@ -5,7 +5,7 @@
 //!
 //! Schema validation logically belongs next to the *diagnostic vocabulary*
 //! (`ValidationError` / `Position`) in [`forgedb-validation`], and epic #173
-//! (WS2b) originally proposed extending that crate. But `forgedb-validation`
+//! originally proposed extending that crate. But `forgedb-validation`
 //! cannot see the `Schema` AST: `forgedb-parser` already depends on
 //! `forgedb-validation` (for `Position`/`ValidationError`), so a reverse
 //! dependency would be a cycle. The AST lives here, so the walk that validates

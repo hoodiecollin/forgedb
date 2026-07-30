@@ -177,7 +177,7 @@ enum Commands {
     /// Run the ForgeDB language server over stdio (used by editor extensions).
     ///
     /// Thin launcher for the sibling `forgedb-lsp` binary shipped alongside the
-    /// CLI — keeps the async LSP stack out of the main binary (epic #173 WS4).
+    /// CLI — keeps the async LSP stack out of the main binary (epic #173).
     Lsp {
         /// Explicit path to the `forgedb-lsp` server binary (otherwise resolved
         /// next to `forgedb`, then on PATH)

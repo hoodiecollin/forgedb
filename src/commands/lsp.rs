@@ -7,7 +7,7 @@ use std::process::Command;
 /// The main `forgedb` CLI deliberately stays free of the async LSP stack
 /// (`tokio` / `tower-lsp`): the language server lives in a **sibling
 /// `forgedb-lsp` binary** that ships alongside `forgedb` on every distribution
-/// channel (epic #173 WS4). This subcommand is a thin, synchronous launcher —
+/// channel (epic #173). This subcommand is a thin, synchronous launcher —
 /// it resolves that binary and hands the process off to it, so `forgedb lsp`
 /// and invoking `forgedb-lsp` directly are equivalent. Editor extensions may
 /// use either; routing through `forgedb lsp` keeps binary resolution in one

@@ -3,7 +3,7 @@ use forgedb_parser::{ComponentProtocol, FieldType, ParsedSchema, Parser};
 use std::fs;
 use std::path::Path;
 
-/// The one seam behind CLI↔LSP diagnostic parity (epic #173 WS3).
+/// The one seam behind CLI↔LSP diagnostic parity (epic #173).
 ///
 /// Both surfaces derive their diagnostics from the *same* resilient parse:
 /// `Parser::parse_recover` returns a best-effort AST plus every syntax **and**
@@ -48,7 +48,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
 
     // Resilient parse via the shared CLI↔LSP seam: one call yields a best-effort
     // AST plus every syntax and semantic diagnostic (positioned, source-ordered) —
-    // the exact set the LSP surfaces (WS3 parity). Only a lexer error is fatal here.
+    // the exact set the LSP surfaces (#173 parity). Only a lexer error is fatal here.
     let parsed = parse_and_validate(&schema_content)
         .map_err(|e| CliError::SchemaValidation(format!("Lexer error: {}", e)))?;
     let schema = &parsed.schema;

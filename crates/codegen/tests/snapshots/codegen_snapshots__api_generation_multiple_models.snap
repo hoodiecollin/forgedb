@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 223
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -1072,14 +1073,14 @@ async fn __handle_replicate(
         }
     }
 }
-/// Liveness probe (Phase 5 WS1): 200 as long as the process is up and
+/// Liveness probe (Phase 5): 200 as long as the process is up and
 /// the async runtime is scheduling.  Never touches the database, so it
 /// never blocks on a write lock — the correct signal for a k8s
 /// `livenessProbe` / load-balancer health check.
 async fn __health() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status" : "ok" })))
 }
-/// Readiness probe (Phase 5 WS1): acquires a read lock on the database
+/// Readiness probe (Phase 5): acquires a read lock on the database
 /// and returns 200 once obtained, proving the store opened and the
 /// lock is not wedged — the correct signal for a k8s `readinessProbe`.
 async fn __ready(
@@ -1088,7 +1089,7 @@ async fn __ready(
     let _guard = db.read().await;
     (StatusCode::OK, Json(json!({ "status" : "ready" })))
 }
-/// Minimal metrics (Phase 5 WS1): per-model live row counts + totals,
+/// Minimal metrics (Phase 5): per-model live row counts + totals,
 /// as JSON.  Generated per-schema by naming each model's storage field;
 /// no schema is interpreted at runtime.
 async fn __metrics(
@@ -1157,7 +1158,7 @@ pub fn openapi_json() -> String {
 /// The data-plane routes (CRUD + WS subscriptions) with the database
 /// state still unbound.  Factored out so the tenant-auth guard can wrap
 /// ONLY these routes, leaving the operational endpoints unauthenticated
-/// (Phase 5 WS1).
+/// (Phase 5).
 fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
     Router::new()
         .route(concat!("/api/", "user"), get(list_user))
@@ -1178,7 +1179,7 @@ fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
         .route(concat!("/live-query/", "post"), get(subscribe_live_post))
         .route("/replicate", get(__replicate))
 }
-/// The operational routes (Phase 5 WS1): liveness / readiness / minimal
+/// The operational routes (Phase 5): liveness / readiness / minimal
 /// metrics.  Never behind the tenant-auth guard so infra probes and
 /// metric scrapers reach them without a JWT.
 fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
@@ -1191,7 +1192,7 @@ fn __ops_routes() -> Router<Arc<RwLock<super::Database>>> {
 /// Create the API router with all endpoints (no auth).  A
 /// `tower_http::trace::TraceLayer` wraps every route so each request is
 /// logged as a structured `tracing` span (level via `RUST_LOG`) — the
-/// server-side half of Phase 5 WS1 observability; the scaffold
+/// server-side half of Phase 5 observability; the scaffold
 /// `main.rs` installs the subscriber.
 pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
     __data_routes()
@@ -1216,7 +1217,7 @@ pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
 /// `Authorization` header — a documented limitation); it does NOT cover
 /// the operational
 /// `/health` / `/ready` / `/metrics` routes, which are merged in
-/// AFTER the guard so infra probes stay unauthenticated (Phase 5 WS1).
+/// AFTER the guard so infra probes stay unauthenticated (Phase 5).
 pub fn create_router_with_auth(
     db: Arc<RwLock<super::Database>>,
     auth: Arc<forgedb_auth::Authenticator>,

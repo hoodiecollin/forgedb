@@ -314,7 +314,7 @@ fn test_api_generation_tenant_auth_router() {
 
 #[test]
 fn test_api_generation_observability_endpoints() {
-    // Phase 5 WS1: liveness/readiness/metrics handlers, the unauthenticated ops
+    // Phase 5: liveness/readiness/metrics handlers, the unauthenticated ops
     // routes, and the request-logging layer on the generated router.
     let schema = multi_model_schema();
     let code = ApiGenerator::generate(&schema).unwrap().code;
@@ -1257,7 +1257,7 @@ fn test_typescript_generation_snapshot() {
     let result = TypeScriptGenerator::generate(&schema).unwrap();
     let code = &result.code;
 
-    // H1: URL uses correct template literal, id interpolated + URL-encoded (WS5).
+    // H1: URL uses correct template literal, id interpolated + URL-encoded.
     assert!(
         code.contains("${encodeURIComponent(id)}"),
         "id interpolation missing in template literal"
@@ -1275,7 +1275,7 @@ fn test_typescript_generation_snapshot() {
     );
     // M1: Uuid maps to string
     assert!(code.contains("id: string"), "Uuid should be string");
-    // WS5: full CRUD + typed error + pagination surface.
+    // full CRUD + typed error + pagination surface.
     assert!(code.contains("async updatePost("), "SDK should expose update");
     assert!(code.contains("async deletePost("), "SDK should expose delete");
     assert!(code.contains("export class ForgeDBError"), "SDK should define a typed error");
@@ -2848,7 +2848,7 @@ Account {
 
 #[test]
 fn test_rust_generation_auto_compaction() {
-    // Bounded storage (v1 Phase 4 — #92 Workstream 1): the mutation surface (#66)
+    // Bounded storage (v1 Phase 4 — #92): the mutation surface (#66)
     // leaves dead row versions behind; generated code auto-compacts IN-PROCESS
     // under the single-writer lock once enough accumulate.  The reclaim itself is a
     // schema-agnostic keep-set primitive in `forgedb-compaction` — generated code
@@ -3068,7 +3068,7 @@ User {
 
 #[test]
 fn test_rust_generation_additive_backfill() {
-    // Additive migrations (v1 Phase 4 — #92 Workstream 2): after a field is added
+    // Additive migrations (v1 Phase 4 — #92): after a field is added
     // to the schema and code is regenerated, reopening an existing data dir must
     // NOT wipe rows.  Recovery anchors on the tombstone count (the authoritative
     // committed row count) and BACKFILLS any column shorter than it (a newly-added

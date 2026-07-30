@@ -814,7 +814,7 @@ fn generate_wasm_replica(
     write_file(&db_path, &rust_result.code, force)?;
     files.push((db_path, rust_result));
 
-    // The main-thread async client (#110 #2, WS3): a per-schema TS `ReplicaClient`
+    // The main-thread async client (#110 #2): a per-schema TS `ReplicaClient`
     // that RPCs into the Worker running the engine — mirrors the transport's read
     // surface exactly, invents nothing.
     let client_dir = replica_dir.join("client");
@@ -825,7 +825,7 @@ fn generate_wasm_replica(
     write_file(&client_path, &client_result.code, force)?;
     files.push((client_path, client_result));
 
-    // The STATIC, schema-agnostic Worker bootstrap (WS2). It runs the engine,
+    // The STATIC, schema-agnostic Worker bootstrap. It runs the engine,
     // follows `/replicate`, and debounces auto-commit. Emitted verbatim (NOT from
     // a schema-aware path) so it cannot become schema-aware — the PM constraint.
     let worker_path = client_dir.join("replica-worker.js");
@@ -852,8 +852,8 @@ fn write_wasm_replica_scaffold(replica_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write the npm packaging scaffold for the generated TypeScript SDK (Phase 5
-/// WS5): `package.json` + `tsconfig.json` alongside `types.ts`.  These are
+/// Write the npm packaging scaffold for the generated TypeScript SDK (Phase 5):
+/// `package.json` + `tsconfig.json` alongside `types.ts`.  These are
 /// user-editable config, so they are written ONLY when absent — a regenerate
 /// (even `--force`, which overwrites `types.ts`) never clobbers them.
 fn write_ts_package_scaffold(output_path: &Path) -> Result<()> {

@@ -32,7 +32,7 @@
 //! 3. **Constraint Validation** - Check constraint parameters and applicability
 //! 4. **HTTP Validation** - Validate HTTP endpoints and status codes (if applicable)
 //!
-//! > **Where the schema walk lives (epic #173 WS2b — DONE).** The single
+//! > **Where the schema walk lives (epic #173 — DONE).** The single
 //! > positioned schema-validation authority is
 //! > [`forgedb_parser::validate_schema`](../forgedb_parser/validate/fn.validate_schema.html),
 //! > **not** a function in this crate. It has to live in `forgedb-parser`: it

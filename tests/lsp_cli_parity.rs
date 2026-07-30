@@ -1,4 +1,4 @@
-//! CLI ↔ LSP diagnostic parity — the anti-drift guarantee for epic #173 WS3 (#176).
+//! CLI ↔ LSP diagnostic parity — the anti-drift guarantee for epic #173 (#176).
 //!
 //! `forgedb validate` (the CLI) and the ForgeDB language server must surface the
 //! *same* diagnostic set for any schema. Both derive it from a single shared seam,

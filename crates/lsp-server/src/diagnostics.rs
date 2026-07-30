@@ -4,7 +4,7 @@
 // returns every diagnostic the compiler would — recovered syntax errors merged with
 // the semantic errors from `forgedb_parser::validate_schema` — each carrying a 1-based
 // source `Position`. This module is the thin adapter that turns those into 0-based LSP
-// `Diagnostic`s, so editor squiggles match `forgedb validate` exactly (WS3 parity).
+// `Diagnostic`s, so editor squiggles match `forgedb validate` exactly (#173 parity).
 
 use forgedb_validation::ValidationError;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};

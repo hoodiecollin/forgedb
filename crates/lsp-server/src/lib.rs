@@ -8,9 +8,9 @@
 //
 // The whole server (the tower-lsp event loop and its `Backend`) lives in this
 // library so it can be embedded by the `forgedb-lsp` binary that ships alongside
-// the `forgedb` CLI (epic #173 WS7: one dist app, `forgedb-lsp` gated behind the
+// the `forgedb` CLI (epic #173: one dist app, `forgedb-lsp` gated behind the
 // non-default `lsp` feature of the root crate). The building blocks are also
-// exercised directly: the CLI↔LSP diagnostic-parity fixture (WS3,
+// exercised directly: the CLI↔LSP diagnostic-parity fixture (#173,
 // `tests/lsp_cli_parity.rs` in the root crate) imports `to_lsp_diagnostics` and
 // asserts it stays in lockstep with `forgedb validate` over `examples/*`.
 

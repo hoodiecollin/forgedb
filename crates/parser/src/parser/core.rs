@@ -1130,7 +1130,7 @@ impl Parser {
     /// the CLI `forgedb validate` command and the LSP — run
     /// [`crate::validate::validate_schema`] on the result to collect **all**
     /// positioned diagnostics instead of only the first. (Error recovery for
-    /// mid-keystroke buffers is #173 WS2c.)
+    /// mid-keystroke buffers is #173.)
     pub fn parse_unvalidated(&mut self) -> Result<Schema, String> {
         let mut structs = Vec::new();
         let mut enums = Vec::new();
@@ -1178,7 +1178,7 @@ impl Parser {
         })
     }
 
-    /// Resilient parse (#173 WS2c): parse the input into a best-effort
+    /// Resilient parse (#173): parse the input into a best-effort
     /// [`ParsedSchema`] — a partial [`Schema`] plus **all** diagnostics — instead
     /// of aborting on the first error. This is the entry point for the LSP, where
     /// a buffer is usually mid-edit and blanking every diagnostic/symbol on a
@@ -1602,7 +1602,7 @@ mod tests {
         assert!(err.contains("Duplicate enum name 'S'"), "got: {err}");
     }
 
-    // ---- #173 WS2c: resilient parse (`parse_recover`) --------------------------
+    // ---- #173: resilient parse (`parse_recover`) --------------------------
 
     fn recover(input: &str) -> ParsedSchema {
         Parser::new(input).unwrap().parse_recover()

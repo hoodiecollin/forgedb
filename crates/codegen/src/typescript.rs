@@ -1,6 +1,6 @@
 //! TypeScript types and SDK generator
 //!
-//! Emits an npm-publishable TypeScript client (Phase 5 WS5): typed model
+//! Emits an npm-publishable TypeScript client (Phase 5): typed model
 //! interfaces + create-input types, a shared `ListResult` / `ListOptions` /
 //! `ForgeDBError` surface, and a `ForgeDBClient` with full CRUD (get / list with
 //! pagination + filters + sort / create / update / delete) that faithfully wraps
@@ -359,7 +359,7 @@ export interface ListOptions {\n\
 \n"
     }
 
-    /// An npm `package.json` for the generated SDK (Phase 5 WS5 — publishable).
+    /// An npm `package.json` for the generated SDK (Phase 5 — publishable).
     /// Written next to `types.ts` only if absent, so user edits survive
     /// regeneration.  `npm install && npm run build && npm publish` ships it.
     pub fn package_json_scaffold() -> &'static str {
