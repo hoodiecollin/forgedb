@@ -48,6 +48,7 @@ concurrency:
 
 permissions:
   contents: read
+  issues: read # the roadmap prebuild reads public issues/milestones via `gh`
   pull-requests: write # to post the preview URL on PRs
 
 # The Vercel CLI reads these to resolve the project without a committed .vercel/project.json.
@@ -105,13 +106,16 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 
-      # `next build` runs here — including the `prebuild` search-index + dead-nav-link check.
-      # NEXT_PUBLIC_POSTHOG_KEY is inlined into the client bundle at this step.
+      # `next build` runs here — including the `prebuild` search-index + dead-nav-link
+      # check + roadmap snapshot. NEXT_PUBLIC_POSTHOG_KEY is inlined into the client
+      # bundle at this step; GH_TOKEN lets the roadmap prebuild read issues/milestones
+      # via `gh` (degrades to a caveat-only page if absent).
       - name: Build (on the GH runner)
         run: vercel build ${{ steps.target.outputs.flag }} --token="$VERCEL_TOKEN"
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           NEXT_PUBLIC_POSTHOG_KEY: ${{ secrets.NEXT_PUBLIC_POSTHOG_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Deploy prebuilt output
         id: deploy

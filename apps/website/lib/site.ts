@@ -16,4 +16,5 @@ export const headerNav: { title: string; href: string }[] = [
   { title: "CLI", href: "/docs/cli/overview/" },
   { title: "Examples", href: "/examples/" },
   { title: "Changelog", href: "/changelog/" },
+  { title: "Roadmap", href: "/roadmap/" },
 ];
