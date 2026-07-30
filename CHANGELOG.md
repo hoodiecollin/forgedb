@@ -18,10 +18,12 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **config:** Wire durable replication-log retention ([#137](https://github.com/hoodiecollin/forgedb/issues/137))
 - **go:** De-experimentalize the Go binding ([#204](https://github.com/hoodiecollin/forgedb/issues/204))
 
+## [0.2.1] - 2026-07-30
+
 ### Bug Fixes
 
-- **init:** Refuse to start unauthenticated when FORGEDB_JWKS_URL is set ([#195](https://github.com/hoodiecollin/forgedb/issues/195))
 - **parser:** Add missing Decimal arm to FieldType::size_in_bytes ([#189](https://github.com/hoodiecollin/forgedb/issues/189))
+- **init:** Refuse to start unauthenticated when FORGEDB_JWKS_URL is set ([#195](https://github.com/hoodiecollin/forgedb/issues/195))
 ## [0.2.0] - 2026-07-28
 
 ### Breaking changes
