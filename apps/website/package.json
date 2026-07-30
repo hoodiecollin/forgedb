@@ -5,15 +5,16 @@
 	"type": "module",
 	"scripts": {
 		"dev": "next dev --port 3100",
-		"prebuild": "bun run scripts/build-search-index.ts",
+		"prebuild": "bun run scripts/build-search-index.ts && bun run scripts/build-changelog.ts",
 		"build": "next build",
 		"start": "next start --port 3100",
 		"typecheck": "tsc --noEmit",
+		"changelog": "bun run scripts/build-changelog.ts",
 		"rewrite:watch": "bun scripts/rewrite-watch.ts",
 		"rewrite:dev": "bun scripts/dev-rewrite.ts",
 		"rewrite:brief": "bun scripts/rewrite-brief.ts",
 		"search-index": "bun run scripts/build-search-index.ts",
-		"clean": "rm -rf .next out public/search-index.json",
+		"clean": "rm -rf .next out public/search-index.json public/changelog.json",
 		"ui:add": "shadcn@latest add"
 	},
 	"dependencies": {
@@ -26,6 +27,7 @@
 		"gray-matter": "^4.0.3",
 		"jotai": "^2.11.0",
 		"lucide-react": "^0.469.0",
+		"marked": "^18.0.7",
 		"next": "^16.2.10",
 		"next-mdx-remote": "^5.0.0",
 		"next-themes": "^0.4.6",
