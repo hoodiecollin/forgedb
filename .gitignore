@@ -39,6 +39,7 @@ apps/website/out/
 apps/website/next-env.d.ts
 apps/website/*.tsbuildinfo
 apps/website/public/search-index.json
+apps/website/public/changelog.json
 
 # VS Code extension build artifacts (source is tracked; outputs are not)
 apps/vscode-forgedb/out/
