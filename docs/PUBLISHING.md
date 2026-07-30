@@ -25,7 +25,7 @@ CLI from the registry**. NOT a stable API ([SEMVER.md §4](./SEMVER.md)):
 - `forgedb-parser`, `forgedb-codegen`, `forgedb-validation`, `forgedb-migrations`,
   `forgedb-backup`, `forgedb-watcher`, `forgedb-lsp-server`, and the root `forgedb`
   CLI binary.
-  - `forgedb-lsp-server` joined this list in epic #173 WS7: the `forgedb` crate now
+  - `forgedb-lsp-server` joined this list in epic #173: the `forgedb` crate now
     has an **optional** dependency on it (the non-default `lsp` feature drives the
     bundled `forgedb-lsp` binary). crates.io requires every dependency — optional
     included — to be resolvable, so **publish `forgedb-lsp-server` before the next

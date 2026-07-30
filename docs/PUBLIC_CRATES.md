@@ -60,7 +60,7 @@ crates.io as authoritative.
 `forgedb-backup`, `forgedb-watcher`, and `forgedb-lsp-server` are also on crates.io, but
 **only so that `cargo install forgedb` can build the CLI from the registry**. They are
 compiler internals, explicitly **not** a stable public API — see [SEMVER.md §4](./SEMVER.md)
-and [`CLAUDE.md`](../CLAUDE.md). (`forgedb-lsp-server` joined this list in epic #173 WS7,
+and [`CLAUDE.md`](../CLAUDE.md). (`forgedb-lsp-server` joined this list in epic #173,
 when the `forgedb` crate gained an optional dependency on it for the bundled `forgedb-lsp`
 binary; it must be published before the next `forgedb` publish.)
 

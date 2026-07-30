@@ -53,10 +53,10 @@ This crate is **library-only** — it exposes `run()` (which owns a Tokio runtim
 and serves LSP over stdio) plus the reusable diagnostic mapper. The shipped
 `forgedb-lsp` *binary* lives in the root `forgedb` crate behind its non-default
 `lsp` feature, so one distribution "app" carries both `forgedb` and `forgedb-lsp`
-(epic #173 WS7). The library split also lets the diagnostic mapper be exercised
+(epic #173). The library split also lets the diagnostic mapper be exercised
 outside the LSP event loop: the root crate's `tests/lsp_cli_parity.rs` fixture
 imports `to_lsp_diagnostics` and asserts the editor and `forgedb validate` emit
-the same diagnostic set over `examples/*` (epic #173 WS3).
+the same diagnostic set over `examples/*` (epic #173).
 
 ## Usage
 

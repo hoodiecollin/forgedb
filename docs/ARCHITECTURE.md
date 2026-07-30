@@ -78,7 +78,7 @@ The workspace splits cleanly into three tiers.
 `forgedb-backup`, `forgedb-watcher`, `forgedb-lsp-server`. Published to crates.io only so
 `cargo install forgedb` resolves; see [SEMVER.md §4](./SEMVER.md) and [`CLAUDE.md`](../CLAUDE.md)
 (the authoritative workspace inventory). (`forgedb-lsp-server` joined this list in epic #173
-WS7 — the `forgedb` crate optionally depends on it for the bundled `forgedb-lsp` binary.)
+— the `forgedb` crate optionally depends on it for the bundled `forgedb-lsp` binary.)
 
 ### Dependency direction
 
