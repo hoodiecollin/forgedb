@@ -29,7 +29,17 @@ on:
     paths:
       - 'apps/website/**'
       - '.github/workflows/website.yml'
+  # Manual + release-refresh dispatch (see website-release.yml, which fires this
+  # on a `v*` tag so /changelog reflects a new release). Defaults to production —
+  # a manual dispatch almost always means "deploy the site now"; pass
+  # environment=preview for a throwaway preview build.
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy target'
+        type: choice
+        options: [production, preview]
+        default: production
 
 # One deploy per ref; a newer push supersedes an in-flight one.
 concurrency:
@@ -47,7 +57,7 @@ env:
 
 jobs:
   deploy:
-    name: build & deploy (${{ github.event_name == 'push' && 'production' || 'preview' }})
+    name: build & deploy (${{ github.event_name == 'pull_request' && 'preview' || 'production' }})
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -76,15 +86,18 @@ jobs:
       - name: Install Vercel CLI
         run: npm install -g vercel@latest
 
+      # PRs → preview; a workflow_dispatch honors its `environment` input
+      # (default production); a push to main → production.
       - name: Resolve deploy target
         id: target
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "env=production" >> "$GITHUB_OUTPUT"
-            echo "flag=--prod"    >> "$GITHUB_OUTPUT"
-          else
+          if [ "${{ github.event_name }}" = "pull_request" ] \
+            || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.environment }}" = "preview" ]; }; then
             echo "env=preview" >> "$GITHUB_OUTPUT"
             echo "flag="       >> "$GITHUB_OUTPUT"
+          else
+            echo "env=production" >> "$GITHUB_OUTPUT"
+            echo "flag=--prod"    >> "$GITHUB_OUTPUT"
           fi
 
       - name: Pull Vercel project settings
