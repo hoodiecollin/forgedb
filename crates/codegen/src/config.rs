@@ -113,6 +113,17 @@ pub struct GenConfig {
     /// Tier-2 optimistic transaction is re-run up to `retries + 1` times.
     /// Per-call control stays available via `transaction_retrying(retries, f)`.
     pub txn_max_retries: u32,
+
+    /// **Tier B, default 50 (#141).** List-endpoint page size when the client
+    /// omits `?limit` (`const PAGE_DEFAULT_LIMIT`). A clamp default, not a
+    /// per-model query knob — schema-blind.
+    pub page_default_limit: usize,
+
+    /// **Tier B, default 1000 (#141).** Maximum list-endpoint page size; a client
+    /// `?limit` above this is clamped (`const PAGE_MAX_LIMIT`). The generated
+    /// handler clamps against this baked ceiling rather than the substrate's
+    /// fixed `MAX_LIMIT`, so an app can tailor it without a runtime schema.
+    pub page_max_limit: usize,
 }
 
 impl Default for GenConfig {
@@ -134,6 +145,8 @@ impl GenConfig {
         changefeed_capacity: 1024,
         max_cascade_depth: 64,
         txn_max_retries: 3,
+        page_default_limit: 50,
+        page_max_limit: 1000,
     };
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,

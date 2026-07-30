@@ -21,6 +21,8 @@ use tokio::sync::RwLock;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+const PAGE_DEFAULT_LIMIT: usize = 50;
+const PAGE_MAX_LIMIT: usize = 1000;
 #[utoipa::path(
     get,
     path = "",
@@ -46,7 +48,12 @@ async fn list_user(
     Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    qp.pagination.limit = params
+        .get("limit")
+        .and_then(|__s| __s.parse::<usize>().ok())
+        .unwrap_or(PAGE_DEFAULT_LIMIT)
+        .clamp(1, PAGE_MAX_LIMIT);
     let __as_of: Option<usize> = match params.get("as_of") {
         Some(__w) => {
             match __w.parse::<usize>() {
@@ -357,7 +364,12 @@ async fn list_post(
     Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    qp.pagination.limit = params
+        .get("limit")
+        .and_then(|__s| __s.parse::<usize>().ok())
+        .unwrap_or(PAGE_DEFAULT_LIMIT)
+        .clamp(1, PAGE_MAX_LIMIT);
     let __as_of: Option<usize> = match params.get("as_of") {
         Some(__w) => {
             match __w.parse::<usize>() {

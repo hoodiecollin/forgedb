@@ -173,7 +173,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             write_ts_package_scaffold(&output_path)?;
         }
         "api" => {
-            let result = ApiGenerator::generate(&schema)
+            let result = ApiGenerator::generate_with_config(&schema, options.gen_config)
                 .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("api.rs");
             write_file(&path, &result.code, force)?;
@@ -362,7 +362,7 @@ fn generate_all(
 
     // Generate API
     if enabled("api") {
-        let api_result = ApiGenerator::generate(schema)
+        let api_result = ApiGenerator::generate_with_config(schema, gen_config)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let api_path = output_path.join("api.rs");
         write_file(&api_path, &api_result.code, force)?;

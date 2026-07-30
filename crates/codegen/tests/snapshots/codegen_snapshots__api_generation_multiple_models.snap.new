@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 223
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -88,11 +89,7 @@ async fn list_user(
             (page, total)
         }
         None => {
-            let mut __scan_rows = if let Some(__v) = params.get("email") {
-                db.user.__scan_by_email(__v).unwrap_or_else(|| db.user.__scan_all())
-            } else {
-                db.user.__scan_all()
-            };
+            let mut __scan_rows = db.user.__scan_all();
             __scan_rows.retain(|r| __user_scan_matches(r, &params));
             __user_scan_sort(&mut __scan_rows, &qp.sort);
             let total = __scan_rows.len();
@@ -300,7 +297,6 @@ fn user_apply_sort(
     };
     match sort.field.as_str() {
         "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
-        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
         _ => return,
     }
     if sort.is_descending() {
@@ -325,15 +321,6 @@ fn __user_scan_matches(
             return false;
         }
     }
-    if let Some(want) = params.get("email") {
-        let __ok = match Some(want.clone()) {
-            Some(__w) => record.email == __w,
-            None => false,
-        };
-        if !__ok {
-            return false;
-        }
-    }
     true
 }
 /// Narrow list sort over the scan record (#160) — same arms as
@@ -347,7 +334,333 @@ fn __user_scan_sort(
     };
     match sort.field.as_str() {
         "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
-        "email" => rows.sort_by(|a, b| a.email.cmp(&b.email)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
+}
+#[utoipa::path(
+    get,
+    path = "",
+    tag = "Post",
+    params(
+        (
+            "limit" = Option<usize>,
+            Query,
+            description = "Max rows (clamped to [1, 1000]; default 50)"
+        ),
+        ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
+        ("sort" = Option<String>, Query, description = "Field to sort by"),
+        ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        ),
+    ),
+    responses((status = 200, description = "List all Post", body = Vec<Post>))
+)]
+async fn list_post(
+    Query(params): Query<HashMap<String, String>>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
+    qp.pagination.limit = params
+        .get("limit")
+        .and_then(|__s| __s.parse::<usize>().ok())
+        .unwrap_or(PAGE_DEFAULT_LIMIT)
+        .clamp(1, PAGE_MAX_LIMIT);
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let db = db.read().await;
+    let (page, total) = match __as_of {
+        Some(__w) => {
+            let mut rows: Vec<super::Post> = db
+                .post
+                .all_at(&forgedb_storage::Snapshot::new(__w))
+                .into_iter()
+                .filter(|r| post_event_matches(r, &params))
+                .collect();
+            post_apply_sort(&mut rows, &qp.sort);
+            let total = rows.len();
+            let page: Vec<super::Post> = qp.pagination.apply(&rows).to_vec();
+            (page, total)
+        }
+        None => {
+            let mut __scan_rows = db.post.__scan_all();
+            __scan_rows.retain(|r| __post_scan_matches(r, &params));
+            __post_scan_sort(&mut __scan_rows, &qp.sort);
+            let total = __scan_rows.len();
+            let __page_ids: Vec<_> = qp
+                .pagination
+                .apply(&__scan_rows)
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            let page: Vec<super::Post> = __page_ids
+                .iter()
+                .filter_map(|__id| db.post.get(*__id))
+                .collect();
+            (page, total)
+        }
+    };
+    let body = json!(
+        { "data" : page, "total" : total, "limit" : qp.pagination.limit, "offset" : qp
+        .pagination.offset, }
+    );
+    (StatusCode::OK, Json(body))
+}
+#[utoipa::path(
+    get,
+    path = "/{id}",
+    tag = "Post",
+    params(
+        ("id" = String, Path, description = "Post"),
+        (
+            "as_of" = Option<usize>,
+            Query,
+            description = "Row-count watermark for a point-in-time read (#85); non-numeric → 400"
+        )
+    ),
+    responses(
+        (status = 200, description = "Get Post by ID", body = Post),
+        (status = 404, description = "Not found")
+    )
+)]
+async fn get_post(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let __as_of: Option<usize> = match params.get("as_of") {
+        Some(__w) => {
+            match __w.parse::<usize>() {
+                Ok(__n) => Some(__n),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!(
+                                { "error" : "as_of must be a non-negative integer watermark"
+                                }
+                            ),
+                        ),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let db = db.read().await;
+    let __found = match __as_of {
+        Some(__w) => db.post.get_at(&forgedb_storage::Snapshot::new(__w), key),
+        None => db.post.get(key),
+    };
+    match __found {
+        Some(record) => {
+            let data = serde_json::to_value(&record).unwrap_or(json!(null));
+            (StatusCode::OK, Json(data))
+        }
+        None => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+    }
+}
+#[utoipa::path(
+    post,
+    path = "",
+    tag = "Post",
+    request_body = Post,
+    responses(
+        (status = 201, description = "Create new Post", body = Post),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
+    )
+)]
+async fn create_post(
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let record = match serde_json::from_value::<super::Post>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    match db.create_post(record) {
+        Ok(id) => (StatusCode::CREATED, Json(json!({ "id" : id.to_string() }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+#[utoipa::path(
+    put,
+    path = "/{id}",
+    tag = "Post",
+    params(("id" = String, Path, description = "Post")),
+    request_body = Post,
+    responses(
+        (status = 200, description = "Replace Post by ID", body = Post),
+        (status = 404, description = "Not found"),
+        (
+            status = 409,
+            description = "Integrity conflict (duplicate unique / dangling foreign key)"
+        ),
+        (status = 422, description = "Field constraint violation")
+    )
+)]
+async fn update_post(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let record = match serde_json::from_value::<super::Post>(payload) {
+        Ok(record) => record,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error" : "invalid payload" })),
+            );
+        }
+    };
+    let mut db = db.write().await;
+    match db.update_post(key, record) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "id" : key.to_string() }))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+#[utoipa::path(
+    delete,
+    path = "/{id}",
+    tag = "Post",
+    params(("id" = String, Path, description = "Post")),
+    responses(
+        (status = 204, description = "Delete Post by ID"),
+        (status = 404, description = "Not found"),
+        (status = 409, description = "Referenced by children (on_delete=restrict)")
+    )
+)]
+async fn delete_post(
+    Path(id): Path<String>,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let key = match id.parse::<Uuid>() {
+        Ok(key) => key,
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+        }
+    };
+    let mut db = db.write().await;
+    match db.delete_post(key) {
+        Ok(true) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
+        Err(e) => {
+            let status = StatusCode::from_u16(e.status_code())
+                .unwrap_or(StatusCode::CONFLICT);
+            (status, Json(json!({ "error" : e.to_string() })))
+        }
+    }
+}
+fn post_apply_sort(
+    rows: &mut Vec<super::Post>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "title" => rows.sort_by(|a, b| a.title.cmp(&b.title)),
+        _ => return,
+    }
+    if sort.is_descending() {
+        rows.reverse();
+    }
+}
+/// Narrow closed-set filter over the scan record (#160) — same per-field
+/// checks as `_event_matches`, only the operand type is narrower.
+fn __post_scan_matches(
+    record: &super::PostScanRow,
+    params: &HashMap<String, String>,
+) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("title") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.title == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
+/// Narrow list sort over the scan record (#160) — same arms as
+/// `_apply_sort`.
+fn __post_scan_sort(
+    rows: &mut Vec<super::PostScanRow>,
+    sort: &Option<forgedb_query_params::Sort>,
+) {
+    let Some(sort) = sort.as_ref() else {
+        return;
+    };
+    match sort.field.as_str() {
+        "id" => rows.sort_by(|a, b| a.id.cmp(&b.id)),
+        "title" => rows.sort_by(|a, b| a.title.cmp(&b.title)),
         _ => return,
     }
     if sort.is_descending() {
@@ -368,26 +681,11 @@ fn user_event_matches(record: &super::User, params: &HashMap<String, String>) ->
             return false;
         }
     }
-    if let Some(want) = params.get("email") {
-        let __ok = match Some(want.clone()) {
-            Some(__w) => record.email == __w,
-            None => false,
-        };
-        if !__ok {
-            return false;
-        }
-    }
     true
 }
 /// Typed per-field change detector for the live-query `Updated` diff (#84).
 fn user_record_changed(a: &super::User, b: &super::User) -> bool {
     if a.id != b.id {
-        return true;
-    }
-    if a.email != b.email {
-        return true;
-    }
-    if a.age != b.age {
         return true;
     }
     false
@@ -432,6 +730,96 @@ async fn handle_user_subscription(
                     }
                     forgedb_changefeed::ChangeKind::Deleted => {
                         serde_json::to_string(&super::UserDeleted { user: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Linked => continue,
+                };
+                let Ok(text) = text else {
+                    continue;
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+///Per-model change-feed filter for `Post` (#62): narrow by exact-match `?field=value` query params. Each declared scalar field is checked by name in generated code, parsing the param into the field's type and comparing typed values (#84 — `?n=3` matches a stored `3.0`); the substrate feed never inspects a field. An empty param set matches everything; unknown keys are ignored.
+fn post_event_matches(record: &super::Post, params: &HashMap<String, String>) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("title") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.title == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
+/// Typed per-field change detector for the live-query `Updated` diff (#84).
+fn post_record_changed(a: &super::Post, b: &super::Post) -> bool {
+    if a.id != b.id {
+        return true;
+    }
+    if a.title != b.title {
+        return true;
+    }
+    false
+}
+///WebSocket subscription for `Post` changes (#62 Direction A + #66). Upgrades the connection and streams a typed `PostInserted` / `PostUpdated` / `PostDeleted` JSON event per change, optionally narrowed by `?field=value`.
+async fn subscribe_post(
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_post_subscription(socket, db, params))
+}
+async fn handle_post_subscription(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "Post" {
+                    continue;
+                }
+                let record = { db.read().await.post.read_at(event.row_index) };
+                let Some(record) = record else {
+                    continue;
+                };
+                if !post_event_matches(&record, &params) {
+                    continue;
+                }
+                let text = match event.kind {
+                    forgedb_changefeed::ChangeKind::Inserted => {
+                        serde_json::to_string(
+                            &super::PostInserted {
+                                post: record,
+                            },
+                        )
+                    }
+                    forgedb_changefeed::ChangeKind::Updated => {
+                        serde_json::to_string(&super::PostUpdated { post: record })
+                    }
+                    forgedb_changefeed::ChangeKind::Deleted => {
+                        serde_json::to_string(&super::PostDeleted { post: record })
                     }
                     forgedb_changefeed::ChangeKind::Linked => continue,
                 };
@@ -541,6 +929,100 @@ async fn handle_user_live_query(
         }
     }
 }
+///Live-query WebSocket subscription for `Post` (#62 Direction B). Runs the generated closed-set query (narrow `__scan_all` + `__post_scan_matches`, materializing only matches — #160), streams an initial `PostLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
+async fn subscribe_live_post(
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+    State(db): State<Arc<RwLock<super::Database>>>,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_post_live_query(socket, db, params))
+}
+async fn handle_post_live_query(
+    mut socket: WebSocket,
+    db: Arc<RwLock<super::Database>>,
+    params: HashMap<String, String>,
+) {
+    let mut rx = { db.read().await.changefeed.subscribe() };
+    let mut members: HashMap<Uuid, super::Post> = HashMap::new();
+    {
+        let rows: Vec<super::Post> = {
+            let g = db.read().await;
+            g.post
+                .__scan_all()
+                .into_iter()
+                .filter(|r| __post_scan_matches(r, &params))
+                .filter_map(|r| g.post.get(r.id))
+                .collect()
+        };
+        for r in &rows {
+            members.insert(r.id, r.clone());
+        }
+        let init = super::PostLiveDelta::Init { rows };
+        if let Ok(text) = serde_json::to_string(&init) {
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                return;
+            }
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.model != "Post" {
+                    continue;
+                }
+                let current: Vec<super::Post> = {
+                    let g = db.read().await;
+                    g.post
+                        .__scan_all()
+                        .into_iter()
+                        .filter(|r| __post_scan_matches(r, &params))
+                        .filter_map(|r| g.post.get(r.id))
+                        .collect()
+                };
+                let mut next: HashMap<Uuid, super::Post> = HashMap::new();
+                let mut deltas: Vec<super::PostLiveDelta> = Vec::new();
+                for r in current {
+                    let id = r.id;
+                    match members.get(&id) {
+                        None => {
+                            deltas
+                                .push(super::PostLiveDelta::Added {
+                                    row: r.clone(),
+                                })
+                        }
+                        Some(prev) if post_record_changed(prev, &r) => {
+                            deltas
+                                .push(super::PostLiveDelta::Updated {
+                                    row: r.clone(),
+                                })
+                        }
+                        _ => {}
+                    }
+                    next.insert(id, r);
+                }
+                for id in members.keys() {
+                    if !next.contains_key(id) {
+                        deltas
+                            .push(super::PostLiveDelta::Removed {
+                                id: *id,
+                            });
+                    }
+                }
+                members = next;
+                for d in deltas {
+                    let Ok(text) = serde_json::to_string(&d) else {
+                        continue;
+                    };
+                    if socket.send(Message::Text(text.into())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
 /// Upgrade to a replication stream.  `?after=<offset>` resumes from the
 /// follower's last applied offset (default `0` = cold / from the start
 /// of the retained log).  Tenant-scoped by the router's auth guard.
@@ -614,10 +1096,12 @@ async fn __metrics(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let db = db.read().await;
-    let per_model = json!({ "User" : db.user.row_count(), });
-    let total_rows: usize = 0 + db.user.row_count();
+    let per_model = json!(
+        { "User" : db.user.row_count(), "Post" : db.post.row_count(), }
+    );
+    let total_rows: usize = 0 + db.user.row_count() + db.post.row_count();
     let body = json!(
-        { "model_count" : 1usize, "total_rows" : total_rows, "rows_per_model" :
+        { "model_count" : 2usize, "total_rows" : total_rows, "rows_per_model" :
         per_model, }
     );
     (StatusCode::OK, Json(body))
@@ -638,15 +1122,32 @@ async fn __snapshot(
     State(db): State<Arc<RwLock<super::Database>>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let db = db.read().await;
-    let watermarks = json!({ "User" : db.user.row_count(), });
+    let watermarks = json!(
+        { "User" : db.user.row_count(), "Post" : db.post.row_count(), }
+    );
     (StatusCode::OK, Json(json!({ "watermarks" : watermarks })))
 }
 #[derive(OpenApi)]
 #[openapi(
-    paths(list_user, get_user, create_user, update_user, delete_user),
-    components(schemas(User)),
+    paths(
+        list_user,
+        list_post,
+        get_user,
+        get_post,
+        create_user,
+        create_post,
+        update_user,
+        update_post,
+        delete_user,
+        delete_post,
+    ),
+    components(schemas(User, Post)),
     tags(
-        (name = stringify!(User), description = concat!(stringify!(User), " operations"))
+        (
+            name = stringify!(User),
+            description = concat!(stringify!(User), " operations")
+        ),
+        (name = stringify!(Post), description = concat!(stringify!(Post), " operations"))
     )
 )]
 pub struct ApiDoc;
@@ -668,6 +1169,14 @@ fn __data_routes() -> Router<Arc<RwLock<super::Database>>> {
         )
         .route(concat!("/subscribe/", "user"), get(subscribe_user))
         .route(concat!("/live-query/", "user"), get(subscribe_live_user))
+        .route(concat!("/api/", "post"), get(list_post))
+        .route(concat!("/api/", "post"), post(create_post))
+        .route(
+            concat!("/api/", "post", "/{id}"),
+            get(get_post).put(update_post).delete(delete_post),
+        )
+        .route(concat!("/subscribe/", "post"), get(subscribe_post))
+        .route(concat!("/live-query/", "post"), get(subscribe_live_post))
         .route("/replicate", get(__replicate))
 }
 /// The operational routes (Phase 5 WS1): liveness / readiness / minimal

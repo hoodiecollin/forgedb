@@ -339,6 +339,50 @@ fn test_api_generation_observability_endpoints() {
 }
 
 #[test]
+fn test_api_generation_pagination_knobs() {
+    // #141 (epic #126): the list endpoint clamps against generate-time-baked
+    // page bounds (PAGE_DEFAULT_LIMIT / PAGE_MAX_LIMIT), not the substrate's fixed
+    // consts. Default 50 / 1000 (byte-identical); configurable via [server].
+    let schema = multi_model_schema();
+
+    // Default config: 50 / 1000, and the handler re-derives the limit against them.
+    let d = ApiGenerator::generate(&schema).unwrap().code;
+    assert!(
+        d.contains("const PAGE_DEFAULT_LIMIT: usize = 50"),
+        "default page default limit is 50 (#141)"
+    );
+    assert!(
+        d.contains("const PAGE_MAX_LIMIT: usize = 1000"),
+        "default page max limit is 1000 (#141)"
+    );
+    assert!(
+        d.contains(".unwrap_or(PAGE_DEFAULT_LIMIT)") && d.contains(".clamp(1, PAGE_MAX_LIMIT)"),
+        "the list handler clamps the limit against the baked bounds (#141)"
+    );
+
+    // Custom config: bounds honored.
+    let cfg = GenConfig {
+        page_default_limit: 25,
+        page_max_limit: 500,
+        ..GenConfig::DEFAULT
+    };
+    let c = ApiGenerator::generate_with_config(&schema, cfg).unwrap().code;
+    assert!(
+        c.contains("const PAGE_DEFAULT_LIMIT: usize = 25"),
+        "page default limit is configurable (#141)"
+    );
+    assert!(
+        c.contains("const PAGE_MAX_LIMIT: usize = 500"),
+        "page max limit is configurable (#141)"
+    );
+    // The OpenAPI param description reflects the baked bounds.
+    assert!(
+        c.contains("clamped to [1, 500]; default 25"),
+        "the OpenAPI limit description reflects the baked bounds (#141)"
+    );
+}
+
+#[test]
 fn test_api_generation_snapshot_reads() {
     // #85: point-in-time reads over REST. `?as_of=<watermark>` swaps the row
     // source to the generated `all_at`/`get_at` snapshot reads, `/snapshot`
@@ -3355,6 +3399,8 @@ Author {
         changefeed_capacity: 64,
         max_cascade_depth: 8,
         txn_max_retries: 9,
+        page_default_limit: 25,
+        page_max_limit: 500,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);

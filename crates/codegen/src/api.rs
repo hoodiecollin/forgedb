@@ -1,30 +1,48 @@
 //! REST API server code generator
 
-use crate::{GeneratedCode, Result};
+use crate::{GenConfig, GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
+
+thread_local! {
+    /// The generate-time runtime-behavior config (#126) active for the current
+    /// `ApiGenerator::generate*` call. Mirrors `RustGenerator`'s thread-local
+    /// (that one is module-private): each entry point sets it before emitting,
+    /// and the config-dependent sites (pagination clamp #141, metrics gate #151)
+    /// read it via `active_cfg()`. Safe under parallel tests — set per-thread.
+    static ACTIVE_CONFIG: std::cell::Cell<GenConfig> = const { std::cell::Cell::new(GenConfig::DEFAULT) };
+}
 
 /// API code generator
 pub struct ApiGenerator;
 
 impl ApiGenerator {
-    /// Generate REST API server implementation from schema
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Parsed schema AST
-    ///
-    /// # Returns
-    ///
-    /// Generated API code as a string
+    /// Generate REST API server implementation from schema, using the default
+    /// generate-time config (`GenConfig::DEFAULT`). See `generate_with_config`
+    /// for the #126 configurable-behavior knobs.
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
+        Self::generate_with_config(schema, GenConfig::DEFAULT)
+    }
+
+    /// Generate the REST API server with an explicit generate-time config (#126).
+    /// The config tailors the emitted pagination clamp (#141) and gates the
+    /// `/metrics` route (#151, Tier A). `GenConfig::DEFAULT` reproduces the
+    /// pre-#126 output byte-for-byte.
+    pub fn generate_with_config(schema: &Schema, config: GenConfig) -> Result<GeneratedCode> {
+        ACTIVE_CONFIG.with(|c| c.set(config));
         let code = Self::generate_code(schema)?;
 
         Ok(GeneratedCode {
             code,
             description: format!("REST API server ({} models)", schema.models.len()),
         })
+    }
+
+    /// The generate-time runtime-behavior config (#126) active for the current
+    /// `generate*` call. Read at each config-dependent emission site.
+    fn active_cfg() -> GenConfig {
+        ACTIVE_CONFIG.with(|c| c.get())
     }
 
     /// Generate API server code using quote!
@@ -66,6 +84,19 @@ impl ApiGenerator {
             use utoipa_axum::routes;
         };
         tokens.extend(imports);
+
+        // Pagination clamp bounds (#141, epic #126): baked from
+        // `[server].page_default_limit` / `page_max_limit`; defaults 50 / 1000
+        // (byte-identical). The generated list handler clamps against these
+        // rather than the substrate's fixed consts, so an app can tailor the page
+        // size without a runtime schema. Schema-blind — same value for every app.
+        let cfg = Self::active_cfg();
+        let __page_default_limit = proc_macro2::Literal::usize_unsuffixed(cfg.page_default_limit);
+        let __page_max_limit = proc_macro2::Literal::usize_unsuffixed(cfg.page_max_limit);
+        tokens.extend(quote! {
+            const PAGE_DEFAULT_LIMIT: usize = #__page_default_limit;
+            const PAGE_MAX_LIMIT: usize = #__page_max_limit;
+        });
 
         // Generate handler functions for each model
         for model in &schema.models {
@@ -254,6 +285,14 @@ impl ApiGenerator {
         let model_name_str = &model.name;
         let model_tag = &model.name;
         let list_summary = format!("List all {}", model.name);
+        // #141: the OpenAPI description reflects the generate-time-baked page
+        // bounds (`[server].page_default_limit` / `page_max_limit`), not the
+        // substrate's fixed 50/1000.
+        let __cfg = Self::active_cfg();
+        let limit_param_desc = format!(
+            "Max rows (clamped to [1, {}]; default {})",
+            __cfg.page_max_limit, __cfg.page_default_limit
+        );
         let get_summary = format!("Get {} by ID", model.name);
         let create_summary = format!("Create new {}", model.name);
         let update_summary = format!("Replace {} by ID", model.name);
@@ -328,7 +367,7 @@ impl ApiGenerator {
                 path = "",
                 tag = #model_tag,
                 params(
-                    ("limit" = Option<usize>, Query, description = "Max rows (clamped to [1, 1000]; default 50)"),
+                    ("limit" = Option<usize>, Query, description = #limit_param_desc),
                     ("offset" = Option<usize>, Query, description = "Rows to skip (default 0)"),
                     ("sort" = Option<String>, Query, description = "Field to sort by"),
                     ("order" = Option<String>, Query, description = "asc | desc (default asc)"),
@@ -351,7 +390,18 @@ impl ApiGenerator {
             ) -> (StatusCode, Json<serde_json::Value>) {
                 // Parse the generic query params (sort/order/limit/offset); the
                 // remaining `?field=value` pairs stay in `params` for the filter.
-                let qp = forgedb_query_params::QueryParams::from_map(params.clone());
+                let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
+                // #141: re-derive the page limit against the generate-time-baked
+                // default/max (`PAGE_DEFAULT_LIMIT`/`PAGE_MAX_LIMIT`) instead of the
+                // substrate's fixed `DEFAULT_LIMIT`/`MAX_LIMIT`.  The raw `?limit`
+                // survives in `params` (from_map got a clone), so we recompute it
+                // here: omitted ⇒ the baked default; otherwise clamped to
+                // `[1, PAGE_MAX_LIMIT]`.  Offset is left as the substrate parsed it.
+                qp.pagination.limit = params
+                    .get("limit")
+                    .and_then(|__s| __s.parse::<usize>().ok())
+                    .unwrap_or(PAGE_DEFAULT_LIMIT)
+                    .clamp(1, PAGE_MAX_LIMIT);
                 // #85: optional point-in-time read.  `as_of=<watermark>` is an
                 // opaque row-count position (a `usize`, same class as
                 // limit/offset) — present ⇒ read `all_at(&Snapshot::new(w))`

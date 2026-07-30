@@ -156,6 +156,19 @@ pub struct TransactionConfig {
     pub max_retries: Option<u32>,
 }
 
+/// Generate-time **server/transport** knobs (`[server]` table, epic #126).
+/// Schema-blind, baked at generate time (Tier B). Defaults are byte-identical
+/// to today's output. (The generated server's host/port and shutdown drain are
+/// separate DEPLOY-environment knobs read from env at process start, not baked.)
+#[derive(Debug, Deserialize, Default)]
+pub struct ServerConfig {
+    /// List-endpoint page size when the client omits `?limit` (#141). Default 50.
+    pub page_default_limit: Option<usize>,
+    /// Maximum list-endpoint page size; a larger `?limit` is clamped (#141).
+    /// Default 1000.
+    pub page_max_limit: Option<usize>,
+}
+
 /// Top-level config struct.  Unknown top-level TOML tables are ignored.
 #[derive(Debug, Deserialize, Default)]
 pub struct ForgeConfig {
@@ -171,6 +184,8 @@ pub struct ForgeConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub transaction: TransactionConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 impl ForgeConfig {
@@ -208,6 +223,11 @@ impl ForgeConfig {
                 .unwrap_or(d.changefeed_capacity),
             max_cascade_depth: self.runtime.max_cascade_depth.unwrap_or(d.max_cascade_depth),
             txn_max_retries: self.transaction.max_retries.unwrap_or(d.txn_max_retries),
+            page_default_limit: self
+                .server
+                .page_default_limit
+                .unwrap_or(d.page_default_limit),
+            page_max_limit: self.server.page_max_limit.unwrap_or(d.page_max_limit),
         })
     }
 }
@@ -277,6 +297,10 @@ compaction_threshold = 250
 
 [transaction]
 max_retries = 7
+
+[server]
+page_default_limit = 25
+page_max_limit = 500
 "#;
         let cfg: ForgeConfig = toml::from_str(src).unwrap();
         let gc = cfg.gen_config().unwrap();
@@ -291,6 +315,8 @@ max_retries = 7
                 changefeed_capacity: 256,
                 max_cascade_depth: 16,
                 txn_max_retries: 7,
+                page_default_limit: 25,
+                page_max_limit: 500,
             }
         );
     }
