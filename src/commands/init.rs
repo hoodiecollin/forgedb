@@ -278,7 +278,23 @@ async fn shutdown_signal() {
 /// tenant guard. Requires FORGEDB_JWT_PUBKEY; when set, FORGEDB_TENANT must name
 /// the tenant this process serves (the value the token's tenant claim is
 /// cross-checked against).
+///
+/// JWKS-over-HTTP verification is not yet supported: FORGEDB_JWKS_URL is a
+/// recognized config key, but this server verifies against a static PEM only. If
+/// a JWKS URL is the ONLY configured key source, this refuses to start rather
+/// than silently running UNAUTHENTICATED.
 fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticator> {
+    // Fail loud: FORGEDB_JWKS_URL set but no static PEM would otherwise fall
+    // through to `None` (no guard) — an unauthenticated server the operator
+    // believed was protected. Refuse to start instead.
+    if std::env::var("FORGEDB_JWT_PUBKEY").is_err() && std::env::var("FORGEDB_JWKS_URL").is_ok() {
+        panic!(
+            "FORGEDB_JWKS_URL is set but JWKS-over-HTTP verification is not supported \
+             by this server yet. Set FORGEDB_JWT_PUBKEY to a static PEM to enable the \
+             JWT guard, or unset FORGEDB_JWKS_URL. Refusing to start UNAUTHENTICATED \
+             while a JWKS URL is configured."
+        );
+    }
     let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok()?;
     let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
     let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
