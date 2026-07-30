@@ -5,16 +5,17 @@
 	"type": "module",
 	"scripts": {
 		"dev": "next dev --port 3100",
-		"prebuild": "bun run scripts/build-search-index.ts && bun run scripts/build-changelog.ts",
+		"prebuild": "bun run scripts/build-search-index.ts && bun run scripts/build-changelog.ts && bun run scripts/build-roadmap.ts",
 		"build": "next build",
 		"start": "next start --port 3100",
 		"typecheck": "tsc --noEmit",
 		"changelog": "bun run scripts/build-changelog.ts",
+		"roadmap": "bun run scripts/build-roadmap.ts",
 		"rewrite:watch": "bun scripts/rewrite-watch.ts",
 		"rewrite:dev": "bun scripts/dev-rewrite.ts",
 		"rewrite:brief": "bun scripts/rewrite-brief.ts",
 		"search-index": "bun run scripts/build-search-index.ts",
-		"clean": "rm -rf .next out public/search-index.json public/changelog.json",
+		"clean": "rm -rf .next out public/search-index.json public/changelog.json public/roadmap.json",
 		"ui:add": "shadcn@latest add"
 	},
 	"dependencies": {

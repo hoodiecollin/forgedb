@@ -15,7 +15,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
         website-install website website-build website-typecheck website-secrets \
-        website-rewrite website-rewrite-watch changelog \
+        website-rewrite website-rewrite-watch changelog roadmap \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
@@ -138,6 +138,13 @@ website-typecheck:
 changelog:
 	git-cliff --config cliff.toml --output CHANGELOG.md
 	@echo "✓ CHANGELOG.md regenerated — review the diff before committing."
+
+## Rebuild the website's roadmap snapshot (apps/website/public/roadmap.json) from
+## live GitHub issues/milestones/releases. Gitignored (build-generated, like the
+## search index + changelog); the `prebuild` step runs this on every site build.
+## Needs `gh` authenticated (read-only, public issues).
+roadmap:
+	cd $(WEBSITE) && $(BUN) run roadmap
 
 ## LOCAL DEV: one command for the in-browser prose-rewrite loop — brings up the dev
 ## server (background, reused across cycles) AND the wake watcher. Edit docs prose or
