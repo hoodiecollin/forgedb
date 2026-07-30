@@ -197,8 +197,8 @@ in `crates/`:
 `lsp-server` are **published to crates.io** but **only** so `cargo install forgedb` can build the CLI from the
 registry; per `docs/SEMVER.md` they are explicitly NOT a stable public API, unlike the substrate crates. Their
 version lines drift independently — derive the current numbers per the *Workspace layout* note above (do not trust
-prose). Historical shape: the internals were republished 2026-07-22 to carry the WS2/WS3 API changes (positioned AST,
-`enums`, `parse_recover`, `EnumDef`); `lsp-server` first-published in WS7 (epic #173) when the root `forgedb` crate
+prose). Historical shape: the internals were republished 2026-07-22 to carry the epic #173 API changes (positioned AST,
+`enums`, `parse_recover`, `EnumDef`); `lsp-server` first-published under epic #173 when the root `forgedb` crate
 gained an **optional** dependency on it (the non-default `lsp` feature drives the bundled `forgedb-lsp` binary, and
 crates.io requires optional deps to resolve, so `forgedb-lsp-server` had to be published before `forgedb` next was).
 The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-27 republish cascade, which also bumped
@@ -304,6 +304,34 @@ what's next, exact versions — lives in ground truth, not here:
 - **Substrate versions / publish status:** derive per the *Workspace layout* note above (grep
   `crates/*/Cargo.toml`, `cargo search forgedb-<crate>`, and the scaffold pins). Never trust a
   version written in prose.
+
+### Project management (the ONE tracking model — no parallel systems)
+
+All work is tracked in **GitHub Issues** on `hoodiecollin/forgedb`. There are exactly **two
+orthogonal axes**, and nothing else decomposes work:
+
+- **Milestone = *when* (the release spine).** A core release milestone (`v0.3.0`, …) means
+  *scheduled for that version*. The extension ships on its own `vscode-v*` line; **never** put a
+  `website`- or `vscode`-scoped issue on a core `v*` milestone. Assigning a milestone is the only
+  signal that something is scheduled.
+- **Labels = *what kind / maturity*.** `epic` (umbrella), `rfc` (design captured as an issue —
+  proposals are **not** committed as repo files), `experiment` (a spike to measure), `idea`
+  (speculative; needs a design note first), `bug`, `tech-debt`, `perf`, `config`. Plus
+  **`plan-next` = "committed but not yet scheduled to a version"** — drop it the moment you set a
+  milestone; `plan-next` and a milestone must **never** coexist on one issue (and neither may
+  `idea` + `plan-next` — committed and speculative are mutually exclusive).
+
+**Epics decompose via GitHub *native sub-issues*** (the `Parent issue` / `Sub-issues progress`
+link — `gh api repos/OWNER/REPO/issues/N/sub_issues`), *not* task-list checkboxes (secondary,
+drift-prone) and *not* a labels/fields convention. An epic is a top-level container that MAY span
+releases; each child carries its own milestone. The website `/roadmap` reads exactly this shape
+(epics collapsible, standalone issues alongside) — see [`apps/website/lib/roadmap-transform.ts`].
+
+**Retired — do NOT reintroduce:** the "workstream" decomposition (`WS1`/`WS2`/`Workstream 2` sub-
+tasking of an epic) and the flat 5-bucket roadmap are **dead patterns**. Break an epic into real
+child issues linked as native sub-issues; never invent `WSn` sub-labels or a parallel Project
+field to slice work. The Project board (project #3) is a *view* over issues, never a second source
+of truth.
 
 ### Operating disciplines (guidance, not changelog — follow these)
 
