@@ -383,6 +383,31 @@ fn test_api_generation_pagination_knobs() {
 }
 
 #[test]
+fn test_api_generation_metrics_toggle() {
+    // #151 (epic #126, Tier A): [server].metrics gates emission of the /metrics
+    // handler + route. Default ON (byte-identical); OFF omits both. /health,
+    // /ready, /snapshot are unaffected.
+    let schema = multi_model_schema();
+
+    // Default: /metrics handler + route emitted.
+    let d = ApiGenerator::generate(&schema).unwrap().code;
+    assert!(d.contains("async fn __metrics("), "default emits __metrics (#151)");
+    assert!(d.contains("\"/metrics\""), "default wires the /metrics route (#151)");
+
+    // metrics = false: neither the handler nor the route is emitted; the other
+    // ops endpoints remain.
+    let cfg = GenConfig {
+        metrics: false,
+        ..GenConfig::DEFAULT
+    };
+    let c = ApiGenerator::generate_with_config(&schema, cfg).unwrap().code;
+    assert!(!c.contains("async fn __metrics("), "metrics=false omits __metrics (#151 Tier A)");
+    assert!(!c.contains("\"/metrics\""), "metrics=false omits the /metrics route (#151)");
+    assert!(c.contains("async fn __snapshot("), "/snapshot is unaffected by the metrics toggle");
+    assert!(c.contains("\"/health\"") && c.contains("\"/ready\""), "/health + /ready unaffected");
+}
+
+#[test]
 fn test_api_generation_snapshot_reads() {
     // #85: point-in-time reads over REST. `?as_of=<watermark>` swaps the row
     // source to the generated `all_at`/`get_at` snapshot reads, `/snapshot`
@@ -3401,6 +3426,7 @@ Author {
         txn_max_retries: 9,
         page_default_limit: 25,
         page_max_limit: 500,
+        metrics: true,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);

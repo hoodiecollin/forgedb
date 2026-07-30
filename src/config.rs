@@ -167,6 +167,9 @@ pub struct ServerConfig {
     /// Maximum list-endpoint page size; a larger `?limit` is clamped (#141).
     /// Default 1000.
     pub page_max_limit: Option<usize>,
+    /// Emit the unauthenticated `/metrics` endpoint (#151). Default `true`; set
+    /// `false` to omit the metrics handler + route entirely (Tier A).
+    pub metrics: Option<bool>,
 }
 
 /// Top-level config struct.  Unknown top-level TOML tables are ignored.
@@ -228,6 +231,7 @@ impl ForgeConfig {
                 .page_default_limit
                 .unwrap_or(d.page_default_limit),
             page_max_limit: self.server.page_max_limit.unwrap_or(d.page_max_limit),
+            metrics: self.server.metrics.unwrap_or(d.metrics),
         })
     }
 }
@@ -301,6 +305,7 @@ max_retries = 7
 [server]
 page_default_limit = 25
 page_max_limit = 500
+metrics = false
 "#;
         let cfg: ForgeConfig = toml::from_str(src).unwrap();
         let gc = cfg.gen_config().unwrap();
@@ -317,6 +322,7 @@ page_max_limit = 500
                 txn_max_retries: 7,
                 page_default_limit: 25,
                 page_max_limit: 500,
+                metrics: false,
             }
         );
     }

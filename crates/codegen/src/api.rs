@@ -1324,8 +1324,8 @@ impl ApiGenerator {
     /// infra probes/scrapers reach them without a tenant JWT (documented; a
     /// process serves one tenant, so `/metrics` leaks only that tenant's counts).
     fn generate_ops_handlers(schema: &Schema) -> TokenStream {
-        // Per-model `"model": db.<field>.row_count()` entries for the metrics
-        // JSON object, plus the storage fields for the total-rows sum.
+        // Per-model `"model": db.<field>.row_count()` entries — used by both
+        // `/metrics` and the `/snapshot` watermark map, so kept unconditional.
         let metric_entries: Vec<_> = schema
             .models
             .iter()
@@ -1335,12 +1335,40 @@ impl ApiGenerator {
                 quote! { #name: db.#field.row_count(), }
             })
             .collect();
-        let sum_fields: Vec<_> = schema
-            .models
-            .iter()
-            .map(|model| format_ident!("{}", Self::to_snake_case(&model.name)))
-            .collect();
-        let model_count = schema.models.len();
+
+        // #151 (Tier A): gate the `/metrics` handler on `[server].metrics`. When
+        // off, neither the handler nor (below) its route is emitted; `/snapshot`
+        // — which reuses `metric_entries` — is unaffected. `sum_fields` /
+        // `model_count` are built INSIDE the branch so they aren't unused locals
+        // when metrics is off.
+        let metrics_handler = if Self::active_cfg().metrics {
+            let sum_fields: Vec<_> = schema
+                .models
+                .iter()
+                .map(|model| format_ident!("{}", Self::to_snake_case(&model.name)))
+                .collect();
+            let model_count = schema.models.len();
+            quote! {
+                /// Minimal metrics (Phase 5 WS1): per-model live row counts + totals,
+                /// as JSON.  Generated per-schema by naming each model's storage field;
+                /// no schema is interpreted at runtime.
+                async fn __metrics(
+                    State(db): State<Arc<RwLock<super::Database>>>,
+                ) -> (StatusCode, Json<serde_json::Value>) {
+                    let db = db.read().await;
+                    let per_model = json!({ #(#metric_entries)* });
+                    let total_rows: usize = 0 #( + db.#sum_fields.row_count() )*;
+                    let body = json!({
+                        "model_count": #model_count,
+                        "total_rows": total_rows,
+                        "rows_per_model": per_model,
+                    });
+                    (StatusCode::OK, Json(body))
+                }
+            }
+        } else {
+            quote! {}
+        };
 
         quote! {
             /// Liveness probe (Phase 5 WS1): 200 as long as the process is up and
@@ -1361,22 +1389,7 @@ impl ApiGenerator {
                 (StatusCode::OK, Json(json!({ "status": "ready" })))
             }
 
-            /// Minimal metrics (Phase 5 WS1): per-model live row counts + totals,
-            /// as JSON.  Generated per-schema by naming each model's storage field;
-            /// no schema is interpreted at runtime.
-            async fn __metrics(
-                State(db): State<Arc<RwLock<super::Database>>>,
-            ) -> (StatusCode, Json<serde_json::Value>) {
-                let db = db.read().await;
-                let per_model = json!({ #(#metric_entries)* });
-                let total_rows: usize = 0 #( + db.#sum_fields.row_count() )*;
-                let body = json!({
-                    "model_count": #model_count,
-                    "total_rows": total_rows,
-                    "rows_per_model": per_model,
-                });
-                (StatusCode::OK, Json(body))
-            }
+            #metrics_handler
 
             /// Snapshot token (#85): the current per-model row-count **watermark**
             /// of every model, captured atomically under one read guard on the
@@ -1470,6 +1483,13 @@ impl ApiGenerator {
 
     /// Generate router function
     fn generate_router(schema: &Schema) -> Result<TokenStream> {
+        // #151 (Tier A): emit the `/metrics` route only when the handler is
+        // emitted (`[server].metrics`); otherwise omit it entirely.
+        let metrics_route = if Self::active_cfg().metrics {
+            quote! { .route("/metrics", get(__metrics)) }
+        } else {
+            quote! {}
+        };
         // Generate route registrations
         let routes: Vec<_> = schema
             .models
@@ -1523,7 +1543,7 @@ impl ApiGenerator {
                 Router::new()
                     .route("/health", get(__health))
                     .route("/ready", get(__ready))
-                    .route("/metrics", get(__metrics))
+                    #metrics_route
                     // Snapshot "as of now" token (#85): per-model watermarks.
                     .route("/snapshot", get(__snapshot))
             }

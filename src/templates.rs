@@ -164,6 +164,18 @@ replication = false
 # stays available via `transaction_retrying(retries, f)`.
 # max_retries = 3
 
+# Generate-time SERVER / transport knobs (epic #126). Baked at generate time.
+# (Host/port, log level/format, and shutdown drain are separate DEPLOY-env knobs
+# read from the environment at process start — see the note below.)
+[server]
+# List-endpoint page size when the client omits ?limit (#141).
+# page_default_limit = 50
+# Maximum list-endpoint page size; a larger ?limit is clamped (#141).
+# page_max_limit = 1000
+# Emit the unauthenticated /metrics endpoint (#151). false omits the handler +
+# route entirely (/health, /ready, /snapshot are unaffected).
+# metrics = true
+
 # Note: the generated server's host/port, log level/format, and graceful-shutdown
 # are DEPLOY-environment config, read from the environment at process start
 # (FORGEDB_HOST / FORGEDB_PORT / RUST_LOG / FORGEDB_LOG_FORMAT) — 12-factor, not

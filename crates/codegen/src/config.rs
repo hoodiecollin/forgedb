@@ -124,6 +124,12 @@ pub struct GenConfig {
     /// handler clamps against this baked ceiling rather than the substrate's
     /// fixed `MAX_LIMIT`, so an app can tailor it without a runtime schema.
     pub page_max_limit: usize,
+
+    /// **Tier A, default ON (#151).** Emit the unauthenticated `/metrics`
+    /// endpoint (per-model live row counts). When off, neither the `__metrics`
+    /// handler nor its route is emitted — the compiler optimizes around code that
+    /// isn't there. `/health`, `/ready`, and `/snapshot` are unaffected.
+    pub metrics: bool,
 }
 
 impl Default for GenConfig {
@@ -147,6 +153,7 @@ impl GenConfig {
         txn_max_retries: 3,
         page_default_limit: 50,
         page_max_limit: 1000,
+        metrics: true,
     };
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,
