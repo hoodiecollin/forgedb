@@ -25,7 +25,7 @@ No `text` type. See [scalar types](/docs/schema/scalar-types/).
 
 | Sigil | Position | Meaning | Notes |
 |-------|----------|---------|-------|
-| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only |
+| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — `uuid`/`timestamp` fill on create; integer `+u32`/`+u64` is a marker, **not yet** auto-incremented ([#187](https://github.com/hoodiecollin/forgedb/issues/187)) |
 | `&` | prefix | unique (enforced) | any type; also indexes |
 | `^` | prefix | indexed | any indexable type |
 | `?` | postfix (or prefix) | nullable | any type |

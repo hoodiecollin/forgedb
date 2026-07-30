@@ -134,7 +134,7 @@ Order {
 
 | Symbol | Name          | Position | Meaning                                              | Valid On         | Example           |
 |--------|---------------|----------|------------------------------------------------------|------------------|-------------------|
-| `+`    | Auto-generate | Prefix   | Automatically generate value on insert               | u32, u64, uuid, timestamp | `id: +uuid` |
+| `+`    | Auto-generate | Prefix   | Fill value on insert (`uuid`/`timestamp` only; integer is a marker — see below) | u32, u64, uuid, timestamp | `id: +uuid` |
 | `&`    | Unique        | Prefix   | Field value must be unique (enforced)                | Any type         | `email: &string` |
 | `^`    | Indexed       | Prefix   | Create index on this field for faster queries        | Any type         | `slug: ^string`   |
 | `?`    | Nullable      | Postfix OR Prefix | Field is optional (NULL allowed)         | Any type         | `age: i32?` or `?i32` |
@@ -147,11 +147,17 @@ Order {
 
 **Validation:**
 - `+` (auto-generate) only valid on auto-generatable types: u32, u64, uuid, timestamp (`crates/parser/src/parser/core.rs:526-531`)
+  - **But only `uuid`/`timestamp` are actually synthesized on create today.** `+u32`/`+u64` parse
+    and mark the field, but the generator does not fill an integer value — a create must supply
+    the integer id. Correct integer auto-increment is RFC #187 (blocked on transaction/coordinator
+    sequence-allocation design), deliberately unshipped rather than shipped subtly wrong.
 - `&` (unique) can be applied to any field (no type restriction in parser)
 
 **NOT implemented:**
 - `~` (auto-update) does not exist — the AST `Field` carries only `auto_generate: bool` (the `+`
   modifier). There is no auto-update-on-write modifier.
+- **Integer auto-increment** — `+u32`/`+u64` are parsed and marked but *not synthesized*; only
+  `+uuid`/`+timestamp` fill on create. See RFC #187.
 
 ---
 

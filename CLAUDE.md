@@ -257,7 +257,9 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 ## Schema language quick reference
 
 Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case.
-Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only), `&`
+Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — but only
+`uuid`/`timestamp` are actually synthesized on create; integer `+u32`/`+u64` parse+mark but are
+NOT auto-incremented, RFC #187), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
 FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `char(N)` — **there is no
 `text`**. `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/

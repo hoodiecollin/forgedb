@@ -33,11 +33,13 @@ generatable types above are allowed.
 
 <Callout type="warning" title="Integer `+` is a marker, not yet auto-incremented">
 `+u32`/`+u64` currently only *mark* the primary-key / auto field — the generator does not
-yet synthesize a value for them, so a create must still supply the integer id. Auto-increment
-for integer keys (a monotonic, restart-safe, reuse-free counter) is planned; it is
-deliberately not shipped as a subtly-wrong version that could reuse a deleted id. `+uuid` and
-`+timestamp` are fully synthesized today. See
-[issue #187](https://github.com/hoodiecollin/forgedb/issues/187).
+synthesize a value for them, so a create must still supply the integer id. A correct
+integer auto-increment (a monotonic, restart-safe, reuse-free counter that also holds across
+transactions and the multi-process coordinator) is a design problem, not a quick patch, and
+is being worked through as an RFC — it is deliberately not shipped as a subtly-wrong version
+that could return `id = 0` or reuse a deleted id. `+uuid` and `+timestamp` are fully
+synthesized today; if you need an auto-assigned key now, use `+uuid`. See
+[RFC #187](https://github.com/hoodiecollin/forgedb/issues/187).
 </Callout>
 
 ## `&` — unique
