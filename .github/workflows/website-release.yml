@@ -1,0 +1,53 @@
+# Release → website refresh (#212).
+#
+# The Website workflow (website.yml) is path-filtered to `apps/website/**`, so a
+# release that only changes root CHANGELOG.md / milestone state never retriggers
+# it — the site would keep serving the pre-release /changelog until some unrelated
+# site push happened. This workflow closes that gap.
+#
+# Why a dispatch and not `on: release`: cargo-dist (release.yml) creates the
+# GitHub Release with GITHUB_TOKEN, and events raised by GITHUB_TOKEN do not start
+# new workflow runs — so `on: release` would never fire. The `v*` TAG push is
+# human-originated (you push the tag), so it cascades normally. We hook that and
+# dispatch website.yml, which IS an allowed GITHUB_TOKEN trigger (workflow_dispatch
+# is the documented exception to the no-recursion rule).
+#
+# Why dispatch against `main` (not the tag): the website's canonical content lives
+# on main. A patch release may be tagged on a divergent backport branch; building
+# that commit would regress the rest of the site. So the release must land the new
+# CHANGELOG section on main, and we always rebuild main.
+name: Website release refresh
+
+on:
+  push:
+    tags:
+      # Core release line only — `v1.2.3` / `v1.2.3-rc.1`. `vscode-v*` (the
+      # extension line) starts with a letter after `v`, so it never matches.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+# Needed for `gh workflow run` to dispatch website.yml.
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: website-release-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    # Skip prereleases (`v0.3.0-rc.1`): their `-suffix` shouldn't refresh the
+    # public changelog. A manual dispatch always proceeds.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Dispatch the production website deploy (from main)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Refreshing website for ${{ github.ref_name }} → building main."
+          gh workflow run website.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f environment=production
