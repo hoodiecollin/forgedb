@@ -209,6 +209,18 @@ enum Commands {
         /// `FORGEDB_COORDINATOR_FSYNC_INTERVAL`.
         #[arg(long)]
         fsync_interval: Option<u64>,
+
+        /// Seconds a granted turn may stay un-committed before it is reclaimed
+        /// (#144, default 30). Governs multi-process write fairness vs
+        /// head-of-line blocking. Overridable via `FORGEDB_COORDINATOR_TURN_TIMEOUT`.
+        #[arg(long)]
+        turn_timeout: Option<u64>,
+
+        /// Max protocol frame in MiB (#145, default 16) — bounds per-turn
+        /// write-set size vs memory. Overridable via
+        /// `FORGEDB_COORDINATOR_MAX_FRAME_MIB`.
+        #[arg(long)]
+        max_frame_mib: Option<u64>,
     },
 }
 
@@ -601,14 +613,21 @@ fn run(cli: Cli) -> Result<()> {
             commands::lsp::run(commands::lsp::LspOptions { server_path, args })
         }
 
-        Commands::Coordinate { root, socket, fsync, fsync_interval } => {
-            commands::coordinate::run(commands::coordinate::CoordinateOptions {
-                root,
-                socket,
-                fsync,
-                fsync_interval,
-            })
-        }
+        Commands::Coordinate {
+            root,
+            socket,
+            fsync,
+            fsync_interval,
+            turn_timeout,
+            max_frame_mib,
+        } => commands::coordinate::run(commands::coordinate::CoordinateOptions {
+            root,
+            socket,
+            fsync,
+            fsync_interval,
+            turn_timeout_secs: turn_timeout,
+            max_frame_mib,
+        }),
 
         Commands::Compact(compact_cmd) => match compact_cmd {
             CompactCommands::Run {

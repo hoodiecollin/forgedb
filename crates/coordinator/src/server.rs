@@ -40,7 +40,7 @@ use forgedb_changefeed::durable::{DurableBroker, FsyncPolicy};
 use forgedb_txn::{CommitOutcome, CommitSequencer, Lsn, WriteSet};
 use thiserror::Error;
 
-use crate::{ClientMsg, ServerMsg, decode_msg, encode_msg};
+use crate::{ClientMsg, ServerMsg, decode_msg_with_limit, encode_msg};
 
 /// How long a granted turn may remain un-committed before the coordinator
 /// reclaims it.  A client that crashes or hangs holding a turn loses it after
@@ -107,6 +107,32 @@ pub enum CoordFsync {
     Periodic(u64),
 }
 
+/// Coordinator tunables resolved at process start (#144/#145, epic #126). Not a
+/// per-request or hot-reload knob — bound once when the coordinator opens. All
+/// three fields are schema-blind (a coordinator interprets no schema).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordConfig {
+    /// Replication-log fsync policy (#156).
+    pub fsync: CoordFsync,
+    /// How long a granted turn may remain un-committed before the coordinator
+    /// reclaims it (#144). Governs multi-process write fairness vs head-of-line
+    /// blocking. Default [`TURN_TIMEOUT`] (30s).
+    pub turn_timeout: Duration,
+    /// Maximum protocol frame size the coordinator will decode (#145) — bounds
+    /// per-turn write-set size vs memory. Default [`DEFAULT_MAX_FRAME`] (16 MiB).
+    pub max_frame: usize,
+}
+
+impl Default for CoordConfig {
+    fn default() -> Self {
+        Self {
+            fsync: CoordFsync::default(),
+            turn_timeout: TURN_TIMEOUT,
+            max_frame: crate::DEFAULT_MAX_FRAME,
+        }
+    }
+}
+
 // ── Broker state (its own lock, off the turn critical section — #156 Option A) ──
 
 /// The durable replication broker plus its fsync policy, behind a **separate**
@@ -171,6 +197,12 @@ impl BrokerState {
 struct Shared {
     coord: (Mutex<CoordState>, Condvar),
     broker: Mutex<BrokerState>,
+    /// Max protocol frame the per-connection decoder accepts (#145). Read before
+    /// locking `coord`, so it lives on `Shared` (not `CoordState`).
+    max_frame: usize,
+    /// Turn reclaim / read-timeout deadline (#144). Mirrored on `CoordState` for
+    /// the reclaim path (a `CoordState` method); set once at open, so no drift.
+    turn_timeout: Duration,
 }
 
 // ── Shared coordinator state (behind Mutex + Condvar) ────────────────────────
@@ -182,26 +214,29 @@ struct CoordState {
     pending_turn: Option<PendingTurn>,
     /// Whether the server is shutting down.
     shutdown: bool,
+    /// Turn reclaim deadline (#144); bound once at open.
+    turn_timeout: Duration,
 }
 
 impl CoordState {
-    fn new(seq: CommitSequencer) -> Self {
+    fn new(seq: CommitSequencer, turn_timeout: Duration) -> Self {
         CoordState {
             seq,
             next_turn_id: 1,
             pending_turn: None,
             shutdown: false,
+            turn_timeout,
         }
     }
 
     /// Reclaim a granted turn if the timeout has elapsed (client crashed/hung).
     fn reclaim_timed_out(&mut self) {
         if let Some(ref p) = self.pending_turn {
-            if p.granted_at.elapsed() > TURN_TIMEOUT {
+            if p.granted_at.elapsed() > self.turn_timeout {
                 log::warn!(
                     "coordinator: reclaiming timed-out turn {} (>{:.1}s)",
                     p.turn_id,
-                    TURN_TIMEOUT.as_secs_f64(),
+                    self.turn_timeout.as_secs_f64(),
                 );
                 self.pending_turn = None;
             }
@@ -308,7 +343,7 @@ impl Coordinator {
     /// Returns `Err(DirAlreadyLocked)` if another coordinator process already
     /// holds the lock on this directory.
     pub fn open(root: &Path, socket_path: &Path) -> Result<Self> {
-        Self::open_with_fsync(root, socket_path, CoordFsync::default())
+        Self::open_with_config(root, socket_path, CoordConfig::default())
     }
 
     /// Like [`open`](Self::open) but with an explicit replication-log fsync policy
@@ -316,11 +351,27 @@ impl Coordinator {
     /// pre-#156 durability; `Never`/`Periodic` trade replication-log durability
     /// for commit throughput (no committed client data is ever at risk — see
     /// [`CoordFsync`]).
-    pub fn open_with_fsync(
+    pub fn open_with_fsync(root: &Path, socket_path: &Path, fsync: CoordFsync) -> Result<Self> {
+        Self::open_with_config(
+            root,
+            socket_path,
+            CoordConfig {
+                fsync,
+                ..CoordConfig::default()
+            },
+        )
+    }
+
+    /// Like [`open`](Self::open) but with an explicit [`CoordConfig`] (#144/#145,
+    /// epic #126): the replication-log fsync policy, the turn-reclaim timeout, and
+    /// the max protocol frame. `CoordConfig::default()` reproduces the prior
+    /// behavior (Always fsync, 30s turn timeout, 16 MiB frame cap).
+    pub fn open_with_config(
         root: &Path,
         socket_path: &Path,
-        fsync: CoordFsync,
+        config: CoordConfig,
     ) -> Result<Self> {
+        let fsync = config.fsync;
         std::fs::create_dir_all(root)?;
 
         // Acquire the #89 single-writer lock (spec T3-5): the SAME
@@ -364,12 +415,17 @@ impl Coordinator {
             root: root.to_owned(),
             socket_path: socket_path.to_owned(),
             state: Arc::new(Shared {
-                coord: (Mutex::new(CoordState::new(seq)), Condvar::new()),
+                coord: (
+                    Mutex::new(CoordState::new(seq, config.turn_timeout)),
+                    Condvar::new(),
+                ),
                 broker: Mutex::new(BrokerState {
                     broker,
                     fsync,
                     commits_since_flush: 0,
                 }),
+                max_frame: config.max_frame,
+                turn_timeout: config.turn_timeout,
             }),
             _lock_file: lock_file,
         })
@@ -438,11 +494,11 @@ fn handle_connection(
     mut stream: UnixStream,
     state: Arc<Shared>,
 ) -> io::Result<()> {
-    // Set a read timeout so a hung client cannot block this thread forever.
-    stream.set_read_timeout(Some(TURN_TIMEOUT))?;
+    // Set a read timeout so a hung client cannot block this thread forever (#144).
+    stream.set_read_timeout(Some(state.turn_timeout))?;
 
     loop {
-        let msg: ClientMsg = match decode_msg(&mut stream) {
+        let msg: ClientMsg = match decode_msg_with_limit(&mut stream, state.max_frame) {
             Ok(m) => m,
             Err(e) if is_eof(&e) => break,
             Err(e) => return Err(e),
@@ -521,7 +577,7 @@ fn request_turn_with_wait(
     snapshot_lsn: u64,
 ) -> ServerMsg {
     let (lock, cvar) = &state.coord;
-    let deadline = Instant::now() + TURN_TIMEOUT;
+    let deadline = Instant::now() + state.turn_timeout;
 
     let mut s = lock.lock().unwrap();
     loop {

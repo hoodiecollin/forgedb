@@ -112,8 +112,10 @@ pub enum ServerMsg {
 
 use std::io::{self, Read};
 
-/// Maximum frame payload length: 16 MiB.
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Default maximum frame payload length: 16 MiB (#145). Configurable per
+/// coordinator via [`server::CoordConfig::max_frame`]; the client-side decode of
+/// (small) server responses keeps this default.
+pub const DEFAULT_MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// Encode a message as a length-framed JSON frame: `[4-byte BE length][json bytes]`.
 pub fn encode_msg<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
@@ -126,15 +128,28 @@ pub fn encode_msg<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode one length-framed JSON message from a reader.
+/// Decode one length-framed JSON message from a reader, rejecting frames larger
+/// than [`DEFAULT_MAX_FRAME`]. Used by the client to decode (small) server
+/// responses; the coordinator's per-connection decode uses
+/// [`decode_msg_with_limit`] with its configured cap (#145).
 pub fn decode_msg<T: for<'de> Deserialize<'de>, R: Read>(reader: &mut R) -> io::Result<T> {
+    decode_msg_with_limit(reader, DEFAULT_MAX_FRAME)
+}
+
+/// Decode one length-framed JSON message, rejecting frames larger than
+/// `max_frame` (#145) — the coordinator threads its configured
+/// [`server::CoordConfig::max_frame`] here to bound per-turn write-set memory.
+pub fn decode_msg_with_limit<T: for<'de> Deserialize<'de>, R: Read>(
+    reader: &mut R,
+    max_frame: usize,
+) -> io::Result<T> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME {
+    if len > max_frame {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("coordinator frame too large: {len} bytes"),
+            format!("coordinator frame too large: {len} bytes (max {max_frame})"),
         ));
     }
     let mut payload = vec![0u8; len];
@@ -146,6 +161,37 @@ pub fn decode_msg<T: for<'de> Deserialize<'de>, R: Read>(reader: &mut R) -> io::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_msg_with_limit_rejects_oversized_frame() {
+        // #145: a frame within the limit decodes; one just over is rejected.
+        let msg = ServerMsg::Busy;
+        let encoded = encode_msg(&msg).unwrap();
+        let payload_len = encoded.len() - 4;
+
+        // Exactly at the payload length: accepted.
+        let ok: ServerMsg = decode_msg_with_limit(&mut encoded.as_slice(), payload_len).unwrap();
+        assert!(matches!(ok, ServerMsg::Busy));
+
+        // One byte under the payload length: rejected as too large.
+        let err = decode_msg_with_limit::<ServerMsg, _>(&mut encoded.as_slice(), payload_len - 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // The default cap is 16 MiB.
+        assert_eq!(DEFAULT_MAX_FRAME, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn coord_config_default_reproduces_prior_behavior() {
+        // #144/#145: the default config is the pre-#126 behavior.
+        use crate::server::{CoordConfig, CoordFsync, TURN_TIMEOUT};
+        let d = CoordConfig::default();
+        assert_eq!(d.fsync, CoordFsync::Always);
+        assert_eq!(d.turn_timeout, TURN_TIMEOUT);
+        assert_eq!(d.turn_timeout.as_secs(), 30);
+        assert_eq!(d.max_frame, DEFAULT_MAX_FRAME);
+    }
 
     #[test]
     fn roundtrip_client_request_turn() {
