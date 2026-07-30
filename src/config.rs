@@ -128,6 +128,10 @@ pub struct RuntimeConfig {
     pub changefeed_capacity: Option<usize>,
     /// Maximum `@on_delete(cascade)` recursion depth (#150). Default 64.
     pub max_cascade_depth: Option<u32>,
+    /// Durable replication-log retention: prune the broker log to the last N
+    /// offsets in `maintain()` (#137). Default 0 = keep the full log. Only takes
+    /// effect when `replication` is on.
+    pub replication_log_retention: Option<u64>,
 }
 
 /// Generate-time **storage/durability** knobs (`[storage]` table, epic #126).
@@ -256,6 +260,10 @@ impl ForgeConfig {
                 .wasm
                 .commit_max_frames
                 .unwrap_or(d.wasm_commit_max_frames),
+            replication_log_retention: self
+                .runtime
+                .replication_log_retention
+                .unwrap_or(d.replication_log_retention),
         })
     }
 }
@@ -316,6 +324,7 @@ mod tests {
 replication = true
 changefeed_capacity = 256
 max_cascade_depth = 16
+replication_log_retention = 4096
 
 [storage]
 fsync = "never"
@@ -353,6 +362,7 @@ commit_max_frames = 40
                 metrics: false,
                 wasm_commit_debounce_ms: 500,
                 wasm_commit_max_frames: 40,
+                replication_log_retention: 4096,
             }
         );
     }

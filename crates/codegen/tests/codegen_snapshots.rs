@@ -3429,6 +3429,7 @@ Author {
         metrics: true,
         wasm_commit_debounce_ms: 250,
         wasm_commit_max_frames: 100,
+        replication_log_retention: 0,
     };
     let custom = RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code;
     let c = flatten(&custom);
@@ -3473,6 +3474,53 @@ Author {
     assert!(
         c.contains("self.dead_since_compaction+=1"),
         "the dead-row counter stays live even with auto-compaction off (#134)"
+    );
+}
+
+#[test]
+fn test_rust_generation_replication_log_retention() {
+    // #137 (epic #126, Tier B): maintain() prunes the durable replication log to
+    // the last N offsets ONLY when replication is on AND retention > 0. Default
+    // (or replication off) emits no prune — byte-identical.
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let flatten = |code: &str| -> String { code.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    // replication ON but retention 0 (default): no prune.
+    let off = flatten(&RustGenerator::generate_with_config(&schema, 1, GenConfig::legacy_with_replication()).unwrap().code);
+    assert!(
+        !off.contains(".prune_through("),
+        "retention 0 emits no prune (#137 default byte-identical)"
+    );
+
+    // replication ON + retention 4096: prune the broker to the last 4096 offsets.
+    let cfg = GenConfig {
+        replication: true,
+        replication_log_retention: 4096,
+        ..GenConfig::DEFAULT
+    };
+    let on = flatten(&RustGenerator::generate_with_config(&schema, 1, cfg).unwrap().code);
+    assert!(
+        on.contains(".prune_through(__wm.saturating_sub(4096))"),
+        "retention 4096 prunes to the last 4096 offsets in maintain() (#137)"
+    );
+
+    // retention set but replication OFF: still no prune (no broker exists).
+    let cfg_no_repl = GenConfig {
+        replication: false,
+        replication_log_retention: 4096,
+        ..GenConfig::DEFAULT
+    };
+    let no_repl = flatten(&RustGenerator::generate_with_config(&schema, 1, cfg_no_repl).unwrap().code);
+    assert!(
+        !no_repl.contains(".prune_through("),
+        "retention without replication emits no prune (#137)"
     );
 }
 

@@ -141,6 +141,15 @@ pub struct GenConfig {
     /// ceiling (`COMMIT_MAX_FRAMES`): commit immediately once this many
     /// replication frames are buffered, regardless of the debounce timer.
     pub wasm_commit_max_frames: u64,
+
+    /// **Tier B, default 0 = disabled (#137).** Durable replication-log retention:
+    /// when `> 0` (and `replication` is on), `Database::maintain()` prunes the
+    /// broker log to the last N offsets (`prune_through(watermark − N)`), bounding
+    /// `_replication.log` growth. 0 keeps the full log (byte-identical; today's
+    /// behavior). A follower resuming from an offset older than the retained
+    /// window must re-seed from a fresh backup — the operator's size/resume-window
+    /// tradeoff.
+    pub replication_log_retention: u64,
 }
 
 impl Default for GenConfig {
@@ -167,6 +176,7 @@ impl GenConfig {
         metrics: true,
         wasm_commit_debounce_ms: 250,
         wasm_commit_max_frames: 100,
+        replication_log_retention: 0,
     };
 
     /// The config that reproduces the *pre-#126* emitted code byte-for-byte,

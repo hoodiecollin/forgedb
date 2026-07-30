@@ -140,6 +140,11 @@ replication = false
 # changefeed_capacity = 1024
 # Max @on_delete(cascade) recursion depth — a structural safety bound (#150).
 # max_cascade_depth = 64
+# Durable replication-log retention (#137): when replication is on, maintain()
+# prunes _replication.log to the last N broker offsets. 0 = keep the full log
+# (default). A follower resuming from an offset older than the retained window
+# must re-seed from a fresh backup.
+# replication_log_retention = 0
 
 # Generate-time STORAGE / DURABILITY knobs (epic #126). Also baked at generate
 # time. Defaults are crash-safe and byte-identical to prior releases.

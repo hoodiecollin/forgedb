@@ -6348,6 +6348,27 @@ impl RustGenerator {
         // `generate_database` emission.
         let cfg = Self::active_cfg();
 
+        // Durable replication-log retention (#137, Tier B): when replication is on
+        // AND a retention window is set, `maintain()` prunes the broker log to the
+        // last N offsets, bounding `_replication.log` growth. Emitted ONLY under
+        // both conditions, so the default (replication off, or retention 0) is
+        // byte-identical — no prune code, no unused const.
+        let __replication_prune = if cfg.replication && cfg.replication_log_retention > 0 {
+            let __retention_lit =
+                proc_macro2::Literal::u64_unsuffixed(cfg.replication_log_retention);
+            quote! {
+                // #137: keep only the last #__retention_lit broker offsets.
+                if let Some(__broker) = &self.broker {
+                    if let Ok(mut __b) = __broker.lock() {
+                        let __wm = __b.watermark();
+                        let _ = __b.prune_through(__wm.saturating_sub(#__retention_lit));
+                    }
+                }
+            }
+        } else {
+            quote! {}
+        };
+
         // Changefeed broadcast capacity (#135) + durable-broker in-memory buffer
         // (#136). Default 1024 (byte-identical).
         let __changefeed_capacity = proc_macro2::Literal::usize_unsuffixed(cfg.changefeed_capacity);
@@ -6677,6 +6698,7 @@ impl RustGenerator {
                         }
                     }
                     #(self.#model_field_idents.maintain();)*
+                    #__replication_prune
                 }
 
                 /// Open a read-only handle over the whole database (#56 Direction
