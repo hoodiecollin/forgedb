@@ -231,7 +231,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 format_version,
             )?);
         }
-        // Experimental Golang binding (RFC #203). Resolved from `go --runtime`;
+        // Golang binding (RFC #203). Resolved from `go --runtime`;
         // rides the FFI cdylib over cgo — adds no new C symbol / substrate dep.
         "go" => {
             generated_files.extend(generate_go_binding(
@@ -583,24 +583,20 @@ fn generate_napi_binding(
     Ok(files)
 }
 
-/// Generate the **experimental** Golang binding (RFC #203): a per-schema Go cgo
-/// package (`go/forgedb.go` + `go/forgedb.h`) that binds the SAME generated
-/// native FFI C-ABI over cgo, alongside the FFI engine crate itself (`ffi/`, the
-/// `cdylib` the Go package links). Rides the existing C-ABI unchanged — adds no
-/// new C symbol and no new substrate dep. A `go.mod` scaffold is written only
-/// when absent. Build order: `cargo build --release` in `ffi/`, then `go build`
-/// in `go/`.
+/// Generate the Golang binding (RFC #203): a per-schema Go cgo package
+/// (`go/forgedb.go` + `go/forgedb.h`) that binds the SAME generated native FFI
+/// C-ABI over cgo, alongside the FFI engine crate itself (`ffi/`, the `cdylib`
+/// the Go package links). At NAPI-RS parity (CRUD, snapshot reads, relation
+/// traversal, async CRUD, Arrow export). Rides the existing C-ABI unchanged —
+/// adds no new C symbol and no new substrate dep. A `go.mod` scaffold is written
+/// only when absent. Build order: `cargo build --release` in `ffi/`, then
+/// `go build` in `go/`.
 fn generate_go_binding(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
     format_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    ui::warning(
-        "the `go` binding target is EXPERIMENTAL — its Go API and the underlying C ABI are \
-         unstable and not covered by v1 stability (RFC #203)",
-    );
-
     // The FFI engine crate (cdylib) the Go package links against — reused
     // verbatim, so Go requires no new C symbol.
     let mut files = generate_ffi_engine(schema, output_path, force, format_version)?;
@@ -973,7 +969,7 @@ fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
         ("node", GenerateMode::Runtime) | ("bun", GenerateMode::Runtime) => Ok("napi".to_string()),
         // Python native binding — PyO3.
         ("python", GenerateMode::Runtime) => Ok("pyo3".to_string()),
-        // Go native binding — experimental cgo over the FFI cdylib (RFC #203).
+        // Go native binding — cgo over the FFI cdylib (RFC #203).
         ("go", GenerateMode::Runtime) => Ok("go".to_string()),
         // REST client SDKs (#118/#205) — network clients over the generated API.
         ("python", GenerateMode::Sdk) => Ok("python-sdk".to_string()),

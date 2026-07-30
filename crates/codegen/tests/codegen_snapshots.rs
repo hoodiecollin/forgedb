@@ -6329,8 +6329,8 @@ Reading {
 
 #[test]
 fn test_go_generation_binding() {
-    // Experimental Golang binding (RFC #203) — the per-schema cgo wrapper over the
-    // SAME generated FFI C-ABI. Schema-tailored Go structs + typed methods that
+    // Golang binding (RFC #203) — the per-schema cgo wrapper over the SAME
+    // generated FFI C-ABI. Schema-tailored Go structs + typed methods that
     // reference the generated per-model C symbols by name; rows/ids cross cgo as
     // opaque JSON. No generic query builder, no `switch model` (the red line).
     let schema = go_binding_schema();
@@ -6340,7 +6340,12 @@ fn test_go_generation_binding() {
     // Package + cgo boundary + the schema-invariant lifecycle spine.
     assert!(code.contains("package forgedb"), "emits a Go package");
     assert!(code.contains("import \"C\""), "binds the C ABI over cgo");
-    assert!(code.contains("EXPERIMENTAL"), "carries the experimental marker");
+    // De-experimentalized (#204): the generated Go no longer carries an
+    // experimental/unstable disclaimer (it is at NAPI-RS parity).
+    assert!(
+        !code.to_uppercase().contains("EXPERIMENTAL"),
+        "no experimental marker after de-experimentalization (#204)"
+    );
     assert!(code.contains("func Open(root string) (*DB, error)"), "the Open lifecycle entry");
     assert!(flat.contains("func(db*DB)Commit()error"), "Commit wraps forgedb_commit");
     assert!(flat.contains("C.forgedb_open("), "Open calls forgedb_open");

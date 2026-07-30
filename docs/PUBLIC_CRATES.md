@@ -25,8 +25,8 @@ Two classes ship, both fine under the generator-identity rule (see `CLAUDE.md`):
    auth, query-params, compaction, txn, coordinator). Real programmatic APIs that interpret no
    schema.
 2. **Access/transport glue** over the already-generated surface — the language bindings
-   (Python/PyO3, Node+Bun/NAPI-RS, the wasm read-replica transport, and the **experimental**
-   Golang cgo target, RFC #203). Not covered here — each is generated per schema, not a
+   (Python/PyO3, Node+Bun/NAPI-RS, the wasm read-replica transport, and the Golang cgo
+   target, RFC #203). Not covered here — each is generated per schema, not a
    standalone crate. They ride the generated native FFI C-ABI and interpret no schema.
 
 A generic, schema-reading query builder or ORM is explicitly **not** substrate and is never
