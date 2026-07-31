@@ -307,19 +307,37 @@ what's next, exact versions — lives in ground truth, not here:
 
 ### Project management (the ONE tracking model — no parallel systems)
 
-All work is tracked in **GitHub Issues** on `hoodiecollin/forgedb`. There are exactly **two
-orthogonal axes**, and nothing else decomposes work:
+ForgeDB follows the **ai-pm-playbook** (the portable form of the model worked out here; adopted
+2026-07-31, which added `.github/ISSUE_TEMPLATE/*` and the `surface:*` labels). Section refs below
+(§3.2, §4, §6.1, §9) are to that playbook. All work is tracked in **GitHub Issues** on
+`hoodiecollin/forgedb`. There are exactly **two orthogonal axes**, and nothing else decomposes work:
 
 - **Milestone = *when* (the release spine).** A core release milestone (`v0.3.0`, …) means
-  *scheduled for that version*. The extension ships on its own `vscode-v*` line; **never** put a
-  `website`- or `vscode`-scoped issue on a core `v*` milestone. Assigning a milestone is the only
-  signal that something is scheduled.
+  *scheduled for that version*. Assigning a milestone is the only signal that something is
+  scheduled.
 - **Labels = *what kind / maturity*.** `epic` (umbrella), `rfc` (design captured as an issue —
   proposals are **not** committed as repo files), `experiment` (a spike to measure), `idea`
   (speculative; needs a design note first), `bug`, `tech-debt`, `perf`, `config`. Plus
-  **`plan-next` = "committed but not yet scheduled to a version"** — drop it the moment you set a
-  milestone; `plan-next` and a milestone must **never** coexist on one issue (and neither may
-  `idea` + `plan-next` — committed and speculative are mutually exclusive).
+  **`plan-next` = "committed but not yet scheduled to a version."**
+
+**The commitment ladder** is the spine of the label axis — work is ranked by distance from shipped:
+`idea` → *(Gate 1: accepted `rfc`)* → `plan-next` → *(assign milestone, drop `plan-next`)* →
+in flight → closed-into-milestone → **released** (the GitHub Release tag). "Closed" and "shipped"
+are distinct rungs: an issue closes into its milestone when code merges, and the roadmap keeps
+reading *pending release* until the tag exists.
+
+**Label invariants (§3.2) — enforce on every issue; violations are the #1 drift smell:**
+`plan-next` ⊕ milestone · `idea` ⊕ `plan-next` · `idea` ⊕ milestone (scheduled implies committed) ·
+`experiment` ⊕ {`idea`, `plan-next`, milestone}.
+
+**Surfaces (§6.1).** A `surface:*` label marks a separately shippable product face. This repo uses
+`surface:website` and `surface:ide-extension`; **core is the implicit default and carries no label.**
+**Never put a non-core `surface:*` issue on a core `v*` milestone** — it would read as "done,
+awaiting vX" though it already shipped on its own line, and would never reach the core changelog.
+Non-core surfaces get their own namespace milestones (`vscode-v*`) or deploy continuously. The
+core roadmap excludes them by label prefix — `apps/website/lib/roadmap-transform.ts`
+(`isCoreScoped`) drops any `surface:*` that isn't `surface:core`, so a newly-added surface is
+filtered the moment it exists.
 
 **`experiment` never rides the release spine.** A milestone ships features/fixes/perf — things that
 produce a binary a user installs. An `experiment` is *a spike to measure*; its deliverable is a
@@ -378,6 +396,17 @@ of truth.
    dedup check, the body template, and the epic cross-link). (The historical `docs/proposals/` set
    was removed; git history holds it. Shipped-feature *architecture* reference belongs in
    `docs/ARCHITECTURE.md`.)
+
+6. **Design → plan → spec, in series, before any code (§9).** Three gates, none of them a file:
+   **Gate 1 — design-doc** (`rfc` issue: problem, desired behavior, solution *shape*, alternatives,
+   explicit non-goals). Solution-shaped, not code-shaped; catches *conceptual* gotchas. Accepted →
+   drop `idea`, add `plan-next`. **Gate 2 — implementation-plan** (files to touch, build order,
+   interfaces, blockers, and the BDD scenarios to write), on the issue, after scheduling and before
+   code; catches *execution* gotchas. **Gate 3 — BDD spec-first**: scenarios RED → implement to
+   GREEN → refactor under green. State is **derived from the artifacts' existence**, never from a
+   `needs-design`-style status label, and **effort labels are banned**. Templates for gates 1–2 live
+   in `.github/ISSUE_TEMPLATE/`. When a feature ships, fold its durable design into
+   `docs/ARCHITECTURE.md` and **close the `rfc`**.
 
 ### Current primary focus — storage-model experiment (epic #167)
 
