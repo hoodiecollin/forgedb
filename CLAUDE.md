@@ -321,6 +321,18 @@ orthogonal axes**, and nothing else decomposes work:
   milestone; `plan-next` and a milestone must **never** coexist on one issue (and neither may
   `idea` + `plan-next` — committed and speculative are mutually exclusive).
 
+**`experiment` never rides the release spine.** A milestone ships features/fixes/perf — things that
+produce a binary a user installs. An `experiment` is *a spike to measure*; its deliverable is a
+**decision**, not a shippable artifact. So an `experiment`-labeled issue is **never** put on a `v*`
+milestone (same mutual-exclusion class as `idea` + `plan-next`), and it is likewise mutually exclusive
+with `idea` (a spike you've committed to running is no longer merely speculative) and with `plan-next`.
+Experiments run as an **unscheduled research track**; the *measured conclusion* may then commit new
+feature work — and **that** work, not the spike, is what gets scheduled. Corollary: **never anchor a
+milestone's theme on an experiment's hoped-for outcome** — you cannot schedule a feature whose existence
+the experiment has not yet decided. The `experiment` label is the discipline test: if an issue's primary
+output is a measurement/evaluation/feasibility verdict, it is an experiment (off the spine); if it is
+shippable code that ships regardless of any measurement, it is a feature/perf/`config` item (on the spine).
+
 **Epics decompose via GitHub *native sub-issues*** (the `Parent issue` / `Sub-issues progress`
 link — `gh api repos/OWNER/REPO/issues/N/sub_issues`), *not* task-list checkboxes (secondary,
 drift-prone) and *not* a labels/fields convention. An epic is a top-level container that MAY span
