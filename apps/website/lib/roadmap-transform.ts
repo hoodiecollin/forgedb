@@ -59,12 +59,19 @@ export interface RawEpic {
 }
 
 /**
- * Marketing / extension / packaging scopes excluded from the CORE roadmap (they
- * ship on their own cadence, never gated on a core v* release). Mirrors
- * cliff.toml's `(website|vscode|npm|pypi|winget|docker|brew|homebrew)`, in label
- * form — `website` + `vscode` are the labels that exist.
+ * The core roadmap covers the core product surface only. Every OTHER shippable
+ * surface (`surface:website`, `surface:ide-extension`, …) ships on its own
+ * cadence / tag namespace and is excluded — the playbook's surface-exclusion
+ * rule, in label form. Mirrors cliff.toml's commit-scope filter
+ * `(website|vscode|npm|pypi|winget|docker|brew|homebrew)`.
+ *
+ * Matched by PREFIX rather than an enumerated set, so a new surface label is
+ * excluded the moment it exists (and so the 2026-07-31 rename of the bare
+ * `website` / `vscode` labels to `surface:*` can't silently unfilter them
+ * again). `surface:core` is the core line itself and is never excluded.
  */
-const EXCLUDED_SCOPES = new Set(["website", "vscode"]);
+const SURFACE_PREFIX = "surface:";
+const CORE_SURFACE = "surface:core";
 
 const CORE_TAG = /^v(\d+)\.(\d+)\.(\d+)/;
 
@@ -82,7 +89,7 @@ function labelsOf(i: RawIssue): string[] {
   return i.labels.map((l) => l.name.toLowerCase());
 }
 function isCoreScoped(labels: string[]): boolean {
-  return !labels.some((l) => EXCLUDED_SCOPES.has(l));
+  return !labels.some((l) => l.startsWith(SURFACE_PREFIX) && l !== CORE_SURFACE);
 }
 function has(labels: string[], l: string): boolean {
   return labels.includes(l);
