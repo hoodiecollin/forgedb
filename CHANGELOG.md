@@ -6,7 +6,7 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-30
 
 ### Features
 
@@ -17,6 +17,8 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **config:** Scaffold shutdown-drain timeout ([#142](https://github.com/hoodiecollin/forgedb/issues/142)) + multi-alg JWT allowlist ([#147](https://github.com/hoodiecollin/forgedb/issues/147))
 - **config:** Wire durable replication-log retention ([#137](https://github.com/hoodiecollin/forgedb/issues/137))
 - **go:** De-experimentalize the Go binding ([#204](https://github.com/hoodiecollin/forgedb/issues/204))
+- **coordinator:** Configurable turn-timeout ([#144](https://github.com/hoodiecollin/forgedb/issues/144)) + max-frame ([#145](https://github.com/hoodiecollin/forgedb/issues/145))
+- **auth:** JWKS-over-HTTP fetch + refresh + key rotation ([#81](https://github.com/hoodiecollin/forgedb/issues/81))
 
 ## [0.2.1] - 2026-07-30
 
@@ -24,6 +26,7 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 
 - **parser:** Add missing Decimal arm to FieldType::size_in_bytes ([#189](https://github.com/hoodiecollin/forgedb/issues/189))
 - **init:** Refuse to start unauthenticated when FORGEDB_JWKS_URL is set ([#195](https://github.com/hoodiecollin/forgedb/issues/195))
+
 ## [0.2.0] - 2026-07-28
 
 ### Breaking changes
