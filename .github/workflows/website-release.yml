@@ -1,16 +1,25 @@
-# Release → website refresh (#212).
+# Release → website refresh (#212, race fixed in #217).
 #
 # The Website workflow (website.yml) is path-filtered to `apps/website/**`, so a
 # release that only changes root CHANGELOG.md / milestone state never retriggers
 # it — the site would keep serving the pre-release /changelog until some unrelated
-# site push happened. This workflow closes that gap.
+# site push happened. This workflow closes that gap by dispatching website.yml.
 #
-# Why a dispatch and not `on: release`: cargo-dist (release.yml) creates the
-# GitHub Release with GITHUB_TOKEN, and events raised by GITHUB_TOKEN do not start
-# new workflow runs — so `on: release` would never fire. The `v*` TAG push is
-# human-originated (you push the tag), so it cascades normally. We hook that and
-# dispatch website.yml, which IS an allowed GITHUB_TOKEN trigger (workflow_dispatch
-# is the documented exception to the no-recursion rule).
+# WHY `workflow_run` AND NOT the `v*` tag push (#217): the /roadmap waterline is
+# derived from the live GitHub Releases API, but cargo-dist (the "Release"
+# workflow) doesn't publish the `v*` GitHub Release until its cross-platform build
+# finishes — minutes after the tag is pushed. Firing on the tag rebuilt the site
+# BEFORE the Release existed, so /roadmap showed the just-shipped version as "Next"
+# while /changelog (built from the committed CHANGELOG.md) already showed it out.
+# Triggering on the Release workflow's *completion* guarantees the GitHub Release
+# exists before we rebuild, so both pages agree. (The post-announce cargo-dist hook
+# was the other candidate, but dist grants post-announce jobs no `actions:`/`issues:`
+# permission, so a reusable job there can neither dispatch nor build the roadmap.)
+#
+# Why not `on: release`: cargo-dist creates the Release with GITHUB_TOKEN, and
+# GITHUB_TOKEN-raised events don't start workflows. `workflow_run` keys off the
+# Release *workflow run* (itself started by the human tag push), which fires
+# normally; dispatching website.yml (workflow_dispatch) is an allowed trigger.
 #
 # Why dispatch against `main` (not the tag): the website's canonical content lives
 # on main. A patch release may be tagged on a divergent backport branch; building
@@ -19,11 +28,11 @@
 name: Website release refresh
 
 on:
-  push:
-    tags:
-      # Core release line only — `v1.2.3` / `v1.2.3-rc.1`. `vscode-v*` (the
-      # extension line) starts with a letter after `v`, so it never matches.
-      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_run:
+    # cargo-dist's release pipeline (release.yml `name: Release`). Its run only
+    # exists for a `v*` tag push, so any successful run is a real core release.
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
 
 # Needed for `gh workflow run` to dispatch website.yml.
@@ -37,16 +46,24 @@ concurrency:
 
 jobs:
   refresh:
-    # Skip prereleases (`v0.3.0-rc.1`): their `-suffix` shouldn't refresh the
-    # public changelog. A manual dispatch always proceeds.
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    # A manual dispatch always proceeds. A workflow_run proceeds only when the
+    # Release actually succeeded and the tag is a stable core version — skip
+    # failed releases (nothing published) and prereleases (`v0.3.0-rc.1`, whose
+    # `-suffix` shouldn't refresh the public site). `head_branch` is the tag name
+    # for a tag-triggered source run.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.workflow_run.conclusion == 'success' &&
+           startsWith(github.event.workflow_run.head_branch, 'v') &&
+           !contains(github.event.workflow_run.head_branch, '-')) }}
     runs-on: ubuntu-22.04
     steps:
       - name: Dispatch the production website deploy (from main)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.event.workflow_run.head_branch || 'manual' }}
         run: |
-          echo "Refreshing website for ${{ github.ref_name }} → building main."
+          echo "Release '$REF_NAME' finished → rebuilding the website from main."
           gh workflow run website.yml \
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
