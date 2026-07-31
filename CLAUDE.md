@@ -410,16 +410,29 @@ of truth.
 
 ### Current primary focus — storage-model experiment (epic #167)
 
-Measure append-only vs in-place mutation rather than assert it. "Storage" conflates four
-independent axes — **columnar layout** (keep; smallest footprint), **append-only mutation** (the
+Measure the append-only vs in-place mutation tradeoff rather than assert it. "Storage" conflates
+four independent axes — **columnar layout** (keep; smallest footprint), **append-only mutation** (the
 axis under test; buys snapshots / lock-free readers / MVCC / replica with no `xmin`/`xmax`, costs
 churn growth + version indirection), **durability policy** (the `F_FULLFSYNC` barrier, orthogonal),
-and **generated-read-path quality** (fixable in codegen). The append-only decision lives in codegen
+and **generated-read-path quality** (fixable in codegen). The mutation-model decision lives in codegen
 (`crates/codegen/src/rust.rs`), not substrate, so in-place is a `GenConfig` variant through the
-benchmark config matrix — not a second storage crate. **Phase 1** (read-path confound fixes, strict
-wins) is **complete** (#168 column-pruned scan, #169 ordered/range index, #160 narrow
-materialization, #170 group commit). **Phase 2** (the fixed-width in-place variant) is **RFC #172**.
-Benchmark findings: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+benchmark config matrix — not a second storage crate.
+
+**The verdict is not boolean.** The question is *"is a second storage option worth the
+investment?"* — the two models sit at opposite ends of the perf spectrum, so **both shipping as
+`GenConfig` variants is a legitimate outcome** (two generated variants over one substrate). What the
+matrix must produce is an investment case, not a tiebreak.
+
+**Phase 1** (read-path confound fixes, strict wins) is **complete** (#168 column-pruned scan, #169
+ordered/range index, #160 narrow materialization, #170 group commit). **Phase 2 is re-cut into three
+ordered steps, stopping at the first that decides the question** — #218 (churn scenario: price the
+append tax directly, benchmarks only), then #219 (versioning-off variant: separate the MVCC tax from
+the append tax), then RFC #172 (the fixed-width in-place variant) **only if** a spread worth chasing
+survives. Two of #172's three predicted in-place wins have already weakened: the footprint win is
+measurable without the variant, and the point-read win is refuted by the code (live `get` never
+touches `id_versions` — `rust.rs:894` vs the `_at`-only sites). Per the experiment doctrine above,
+#167 stays **off** the release spine; if the conclusion commits an in-place variant, *that* feature
+gets a milestone. Benchmark findings: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Conventions
 
