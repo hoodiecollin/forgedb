@@ -1,0 +1,164 @@
+# Go binding outside-repo reclose smoke — issue #215 (parent #122, origin #204).
+#
+# Defense-in-depth CI for the Go runtime binding (`forgedb generate go --runtime`).
+# The `test_go_calls_match_ffi_symbols` unit guard proves the generated Go cgo
+# calls line up with the FFI C-ABI symbols *as strings*; this workflow proves the
+# full outside-repo chain actually **builds, links, and runs**:
+#
+#   1. Build the `forgedb` CLI from this checkout (`cargo build --release`).
+#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema
+#      (so the emitted `ffi/Cargo.toml` resolves the substrate crates from
+#      crates.io, not the workspace — the true installed-user path).
+#   3. `forgedb generate go --runtime` → emits `ffi/` (cdylib) + `go/` (cgo pkg).
+#   4. `cargo build --release` the sibling `ffi/` cdylib (the generated cgo
+#      `LDFLAGS` hardcodes `../ffi/target/release`, so release is mandatory).
+#   5. `go mod tidy` (pulls `arrow-go/v18`) + `CGO_ENABLED=1 go build ./...`.
+#   6. Round-trip smoke `go run`: open → insert → get → assert.
+#
+# Toolchain matrix mirrors pypi.yml's same-arch convention: Rust (pinned 1.96 via
+# rust-toolchain.toml) + Go + `CGO_ENABLED=1` + a C compiler, Unix-only (Windows
+# is excluded across every channel — storage-native positional I/O + coordinator
+# Unix sockets; tracked in #209). Triggers only on PRs that touch the Go/FFI
+# generators (or this file) + manual dispatch — the generated binding can only
+# drift when those change.
+name: Go reclose
+
+on:
+  pull_request:
+    paths:
+      - crates/codegen/src/go.rs
+      - crates/codegen/src/ffi.rs
+      - .github/workflows/go-reclose.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reclose:
+    name: go-reclose (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+          - name: macos-aarch64
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust toolchain comes from rust-toolchain.toml (channel 1.96); rustup on
+      # the runner honors it, so no setup-rust action is needed. Cache the
+      # workspace build — two release builds (CLI here + the generated cdylib
+      # below) is the heavy part of this job.
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      # 1. Build the CLI from source.
+      - name: Build the forgedb CLI
+        run: cargo build --release --bin forgedb
+
+      # 2–6. Everything downstream runs in a temp dir OUTSIDE the checkout so the
+      # generated project resolves the substrate crates from crates.io.
+      - name: Reclose — generate, build, link, run
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          WORK="$(mktemp -d "${RUNNER_TEMP}/go-reclose.XXXXXX")"
+          cd "$WORK"
+
+          # 2. Fresh project + a multi-model schema (relations exercise the
+          #    relation-op codegen the single-model init default does not).
+          "$FORGEDB" init app
+          cd app
+          cat > schema.forge <<'SCHEMA'
+          Author {
+            id: +uuid
+            email: &string
+            name: string
+            posts: [Post]
+          }
+
+          Post {
+            id: +uuid
+            title: ^string
+            body: string
+            author: *Author
+          }
+          SCHEMA
+          "$FORGEDB" validate
+
+          # 3. Emit the FFI engine crate + the Go cgo package.
+          "$FORGEDB" generate go --runtime
+
+          # 4. Build the sibling cdylib in RELEASE (the cgo LDFLAGS point at
+          #    ../ffi/target/release). Deps resolve from crates.io.
+          (cd generated/ffi && cargo build --release)
+
+          # 5. Tidy (pulls arrow-go/v18) + compile the package with cgo.
+          (cd generated/go && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go build ./...)
+
+          # 6. Round-trip smoke: a sibling module that links the generated
+          #    package via a replace directive and drives open→insert→get→assert.
+          mkdir -p generated/smoke
+          cat > generated/smoke/go.mod <<'GOMOD'
+          module smoke
+
+          go 1.21
+
+          require forgedb v0.0.0
+
+          replace forgedb => ../go
+          GOMOD
+          cat > generated/smoke/main.go <<'MAIN'
+          package main
+
+          import (
+          	"fmt"
+          	"os"
+
+          	"forgedb"
+          )
+
+          func fail(msg string, err error) {
+          	fmt.Fprintln(os.Stderr, msg, err)
+          	os.Exit(1)
+          }
+
+          func main() {
+          	dir, err := os.MkdirTemp("", "forgedb-go-smoke")
+          	if err != nil {
+          		fail("mktemp:", err)
+          	}
+          	defer os.RemoveAll(dir)
+
+          	db, err := forgedb.Open(dir)
+          	if err != nil {
+          		fail("open:", err)
+          	}
+          	defer db.Close()
+
+          	id, err := db.InsertAuthor(forgedb.Author{Email: "ada@example.com", Name: "Ada"})
+          	if err != nil {
+          		fail("insert:", err)
+          	}
+
+          	got, err := db.GetAuthor(id)
+          	if err != nil {
+          		fail("get:", err)
+          	}
+          	if got == nil || got.Email != "ada@example.com" || got.Name != "Ada" {
+          		fmt.Fprintf(os.Stderr, "assert failed: %+v\n", got)
+          		os.Exit(1)
+          	}
+          	fmt.Printf("OK round-trip: id=%s email=%s name=%s\n", got.Id, got.Email, got.Name)
+          }
+          MAIN
+          (cd generated/smoke && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go run .)
