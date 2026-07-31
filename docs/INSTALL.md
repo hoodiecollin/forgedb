@@ -147,7 +147,7 @@ CLI generates against.
 | `forgedb-storage` | `0.2` | Columnar storage facade (native positional-I/O / wasm arena) |
 | `forgedb-wal` | `0.2` | Write-ahead log (opaque `Raw` durable-write path) |
 | `forgedb-changefeed` | `0.2` | Change-feed broadcast + durable resumable broker substrate |
-| `forgedb-auth` | `0.1` | Verify-only JWT + tenant cross-check middleware |
+| `forgedb-auth` | `0.2` | Verify-only JWT + tenant cross-check middleware (opt-in `jwks-http` fetch/rotation) |
 | `forgedb-query-params` | `0.1` | REST query-string → generic filter/sort/paginate |
 | `forgedb-compaction` | `0.1` | In-process dead-row reclaim (keep-set GC) |
 | `forgedb-txn` | `0.1` | MVCC Tier-2 commit sequencer (monotonic LSN, conflict detect) |
