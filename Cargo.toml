@@ -69,7 +69,7 @@ lsp = ["dep:forgedb-lsp-server"]
 
 [dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.2.0" }
-forgedb-codegen = { path = "crates/codegen", version = "0.2.1" }
+forgedb-codegen = { path = "crates/codegen", version = "0.2.2" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.0" }
 forgedb-migrations = { path = "crates/migrations", version = "0.2.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
