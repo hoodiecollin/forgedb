@@ -430,7 +430,22 @@ append tax directly, benchmarks only), then #219 (versioning-off variant: separa
 the append tax), then RFC #172 (the fixed-width in-place variant) **only if** a spread worth chasing
 survives. Two of #172's three predicted in-place wins have already weakened: the footprint win is
 measurable without the variant, and the point-read win is refuted by the code (live `get` never
-touches `id_versions` — `rust.rs:894` vs the `_at`-only sites). Per the experiment doctrine above,
+touches `id_versions` — `rust.rs:894` vs the `_at`-only sites).
+
+**#218 is BUILT and has produced first results (2026-07-31)** — driver at
+`benchmarks/examples/workload/` (`make bench-workload`; `ARGS="--full" | "--scan-sweep" | "--verify"`),
+the one scenario with an arrival rate. Two structural findings, both in `docs/BENCHMARKS.md`:
+(1) **the scan cliff was an implementation artifact, not a cost of append-only** — `FixedColumn::export`
+loses its zero-copy `mmap` the instant any row is superseded (the dense-prefix condition) and the
+fallback did one syscall per row, costing ~25×/~96× as a **step, not a slope**. **#221 FIXED it
+(2026-07-31)**: `gather` now maps the spanned region once and copies contiguous runs, collapsing the
+cliff to 1.06×/1.21× in a paired stash/restore A/B (churned narrow scan 82.2 ms → 1.1 ms), which
+**fires the pre-registered early exit for #167** — the cliff is removable without a second storage
+engine, and this is a demonstration rather than an inference. (2) **amplification is hard-capped by the generated
+auto-compaction ceiling** at `1 + 4000/live_rows` — an absolute dead-row count, so the cap *tightens*
+as the corpus grows, and the high-amplification state #172 targets is unreachable at realistic size
+under the default config. That weakens the third predicted win too. Also measured: write latency is
+100% fsync-bound and identical across all three engines at every rung. Per the experiment doctrine above,
 #167 stays **off** the release spine; if the conclusion commits an in-place variant, *that* feature
 gets a milestone. Benchmark findings: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
