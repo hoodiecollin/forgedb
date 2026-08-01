@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 223
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -89,8 +88,9 @@ async fn list_user(
             (page, total)
         }
         None => {
-            let mut __scan_rows = db.user.__scan_all();
-            __scan_rows.retain(|r| __user_scan_matches(r, &params));
+            let mut __scan_rows = db
+                .user
+                .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params));
             __user_scan_sort(&mut __scan_rows, &qp.sort);
             let total = __scan_rows.len();
             let __page_ids: Vec<_> = qp
@@ -323,6 +323,28 @@ fn __user_scan_matches(
     }
     true
 }
+/// The same filter over the BORROWED scan view (#224), so a row can be
+/// accepted or rejected before its strings are ever copied out of the
+/// buffered column.  Emitted from the identical per-field checks as
+/// the owned filter above — one predicate, two operand views.
+fn __user_scan_matches_ref(
+    record: &super::UserScanRef<'_>,
+    params: &HashMap<String, String>,
+) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
 /// Narrow list sort over the scan record (#160) — same arms as
 /// `_apply_sort`.
 fn __user_scan_sort(
@@ -405,8 +427,9 @@ async fn list_post(
             (page, total)
         }
         None => {
-            let mut __scan_rows = db.post.__scan_all();
-            __scan_rows.retain(|r| __post_scan_matches(r, &params));
+            let mut __scan_rows = db
+                .post
+                .__scan_all_filtered(|r| __post_scan_matches_ref(r, &params));
             __post_scan_sort(&mut __scan_rows, &qp.sort);
             let total = __scan_rows.len();
             let __page_ids: Vec<_> = qp
@@ -649,6 +672,37 @@ fn __post_scan_matches(
     }
     true
 }
+/// The same filter over the BORROWED scan view (#224), so a row can be
+/// accepted or rejected before its strings are ever copied out of the
+/// buffered column.  Emitted from the identical per-field checks as
+/// the owned filter above — one predicate, two operand views.
+fn __post_scan_matches_ref(
+    record: &super::PostScanRef<'_>,
+    params: &HashMap<String, String>,
+) -> bool {
+    if params.is_empty() {
+        return true;
+    }
+    if let Some(want) = params.get("id") {
+        let __ok = match want.parse::<Uuid>().ok() {
+            Some(__w) => record.id == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    if let Some(want) = params.get("title") {
+        let __ok = match Some(want.clone()) {
+            Some(__w) => record.title == __w,
+            None => false,
+        };
+        if !__ok {
+            return false;
+        }
+    }
+    true
+}
 /// Narrow list sort over the scan record (#160) — same arms as
 /// `_apply_sort`.
 fn __post_scan_sort(
@@ -854,9 +908,8 @@ async fn handle_user_live_query(
         let rows: Vec<super::User> = {
             let g = db.read().await;
             g.user
-                .__scan_all()
+                .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
                 .into_iter()
-                .filter(|r| __user_scan_matches(r, &params))
                 .filter_map(|r| g.user.get(r.id))
                 .collect()
         };
@@ -879,9 +932,8 @@ async fn handle_user_live_query(
                 let current: Vec<super::User> = {
                     let g = db.read().await;
                     g.user
-                        .__scan_all()
+                        .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
                         .into_iter()
-                        .filter(|r| __user_scan_matches(r, &params))
                         .filter_map(|r| g.user.get(r.id))
                         .collect()
                 };
@@ -948,9 +1000,8 @@ async fn handle_post_live_query(
         let rows: Vec<super::Post> = {
             let g = db.read().await;
             g.post
-                .__scan_all()
+                .__scan_all_filtered(|r| __post_scan_matches_ref(r, &params))
                 .into_iter()
-                .filter(|r| __post_scan_matches(r, &params))
                 .filter_map(|r| g.post.get(r.id))
                 .collect()
         };
@@ -973,9 +1024,8 @@ async fn handle_post_live_query(
                 let current: Vec<super::Post> = {
                     let g = db.read().await;
                     g.post
-                        .__scan_all()
+                        .__scan_all_filtered(|r| __post_scan_matches_ref(r, &params))
                         .into_iter()
-                        .filter(|r| __post_scan_matches(r, &params))
                         .filter_map(|r| g.post.get(r.id))
                         .collect()
                 };
