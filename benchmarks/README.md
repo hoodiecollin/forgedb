@@ -42,10 +42,36 @@ rates** (`warmup → steady → burst → recover`), replayed identically by For
 redb at matched durability.
 
 ```bash
-make bench-workload                       # quick smoke matrix (~10 min, fsync-bound)
+make bench-workload                       # quick smoke matrix (fsync-bound)
 make bench-workload ARGS="--full"         # full amplification ladder A = 1..32
 make bench-workload ARGS="--forgedb-only" # skip the comparison engines
+make bench-workload ARGS="--scan-sweep"   # scan path, FIXED-width subject (Metric)
+make bench-workload ARGS="--var-sweep"    # scan path, VARIABLE-width subject (Doc)
+make bench-workload ARGS="--verify"       # driver self-checks
 ```
+
+### The two scan sweeps
+
+Scans are ~1 % of a realistic op mix, far too few samples to locate a cliff, so the scan path
+gets its own modes. They use **different subjects on purpose**, because the fixed-width and
+variable-width column reads are separate code paths with separate failure modes — measuring a
+model that has both reports their sum and separates nothing:
+
+| mode | subject | isolates | shape found |
+|---|---|---|---|
+| `--scan-sweep` | `Metric` (22 fixed columns, no string) | `FixedColumn::export` | a **step** — a lost `mmap` fast path (#221) |
+| `--var-sweep` | `Doc` (4 string columns + 2 fixed) | `VariableColumn::gather_buffered` | a **slope** — cost ∝ amplification (#222) |
+
+`Doc` declares `@projection(meta: seq, kind)` over its *fixed* columns only, so the same model
+under the same churn gives two scan paths: the projection never touches a `VariableColumn` and
+acts as an **in-run control**, which is what makes a slope in the narrow scan attributable to
+the variable path rather than to machine state.
+
+`--var-sweep` runs against the **`churn_probe`** generated variant (`compaction = false` +
+`fsync = "never"`), so it needs `make bench-regen-matrix` first. Compaction-off is required, not
+convenient: the default build caps amplification at `1 + 4000/live_rows`, which on a 10k-row
+corpus is a 1.0×–1.4× range — no lever arm to establish a slope over. Fsync-never only affects
+the preload, and this mode measures reads.
 
 Deliberately **not** a Criterion bench: Criterion is a closed loop (fire, wait, fire), which
 by construction removes the arrival-time variance that burstiness is made of and cannot

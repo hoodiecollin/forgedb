@@ -17,6 +17,7 @@
 //! that burstiness is made of.
 
 mod driver;
+mod doc_targets;
 mod forgedb_target;
 mod redb_target;
 mod sqlite_target;
@@ -371,6 +372,188 @@ fn scan_sweep(live: usize, ladder: &[f64], samples: usize, engines: &[&str]) {
     }
 }
 
+/// One `Doc`-subject measurement point: preload to a state, then time N scans of each
+/// kind. Returns `(projection_p50, narrow_p50, footprint, reached_amplification)`.
+fn doc_point(
+    mut t: Box<dyn WorkloadTarget>,
+    cfg: &WorkloadConfig,
+    samples: usize,
+) -> (u64, u64, u64, Option<f64>) {
+    let amp = driver::preload(t.as_mut(), cfg);
+    let mut out = [0u64; 2];
+    for (i, kind) in [ScanKind::Projection, ScanKind::Narrow].into_iter().enumerate() {
+        let mut h = hdr();
+        for _ in 0..samples {
+            let start = std::time::Instant::now();
+            let _ = t.scan(kind, usize::MAX);
+            let _ = h.record(start.elapsed().as_micros().max(1) as u64);
+        }
+        out[i] = h.value_at_quantile(0.50);
+    }
+    (out[0], out[1], t.footprint(), amp)
+}
+
+fn doc_cfg(live: usize, a: f64, payload: usize, skew: Option<f64>) -> WorkloadConfig {
+    WorkloadConfig {
+        preload: live,
+        target_amplification: a,
+        payload_bytes: payload,
+        preload_churn_skew: skew,
+        update_width: UpdateWidth::AllFields,
+        ..WorkloadConfig::default()
+    }
+}
+
+/// #218: the variable-column sweep — the last unmeasured part of the read path.
+///
+/// `VariableColumn::gather_buffered` ignores the requested indices and reads the whole
+/// committed offsets index plus the whole data region, dead versions included. That is
+/// ~`A x live_bytes` per scan, so unlike the #221 fixed-column cliff (a *step*, flat in
+/// amplification) this should register as a *slope*. Telling those apart is the point:
+/// a step is a lost fast path, a slope is a genuine cost of keeping old versions.
+///
+/// Three tables, each isolating one axis. The `Projection` column is the in-run control
+/// throughout — `@projection(meta: seq, kind)` reads fixed columns only, so it never
+/// touches a `VariableColumn` and should stay flat.
+fn var_sweep(live: usize, samples: usize, full: bool) {
+    let ladder: &[f64] =
+        if full { &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0] } else { &[1.0, 2.0, 4.0, 8.0, 16.0] };
+    let payload = 256usize;
+
+    println!("\n{}", "=".repeat(86));
+    println!("VARIABLE-COLUMN SWEEP — Doc subject, {live} live rows, {samples} scans/point");
+    println!("{}", "=".repeat(86));
+    println!(
+        "  Subject: Doc (4 string columns x {payload} B + 2 fixed). `Projection` reads the two\n  \
+         FIXED columns only — it is the in-run control and should stay flat. `Narrow` drags all\n  \
+         four string columns through VariableColumn::gather_buffered.\n  \
+         redb is omitted from this sweep: it stores each row as one opaque blob, so it has no\n  \
+         per-column read path for the question under test. SQLite is the in-place reference."
+    );
+
+    // --- 1. amplification ladder ------------------------------------------------
+    // Run against the churn_probe build (compaction off) because the DEFAULT build caps
+    // amplification at 1 + 4000/live_rows — on a 10k corpus the whole reachable range is
+    // 1.0x-1.4x, and a slope cannot be established over a 1.4x lever arm.
+    println!("\n  [1] amplification ladder — compaction OFF (churn_probe), uniform churn");
+    println!(
+        "  {:<10} {:>6} {:>10} {:>12} {:>12} {:>10}",
+        "engine", "A req", "A reached", "projection", "narrow", "footprint"
+    );
+    for &a in ladder {
+        let cfg = doc_cfg(live, a, payload, None);
+        let (p, n, fp, amp) = doc_point(
+            Box::new(doc_targets::unbounded::ForgeDocTargetNoCompact::new(payload)),
+            &cfg,
+            samples,
+        );
+        println!(
+            "  {:<10} {:>6} {:>10} {:>12} {:>12} {:>10}",
+            "forgedb-nc",
+            format!("{a:.0}×"),
+            amp.map(|x| format!("{x:.2}×")).unwrap_or_else(|| "—".into()),
+            micros(p),
+            micros(n),
+            human(fp),
+        );
+    }
+
+    // The realistic-configuration reference: same subject on the DEFAULT build, whose
+    // auto-compaction ceiling is the thing that bounds this cost in production.
+    let cfg = doc_cfg(live, 32.0, payload, None);
+    let (p, n, fp, amp) =
+        doc_point(Box::new(doc_targets::compacting::ForgeDocTarget::new(payload)), &cfg, samples);
+    println!(
+        "  {:<10} {:>6} {:>10} {:>12} {:>12} {:>10}   << default build, ceiling-capped",
+        "forgedb",
+        "32×",
+        amp.map(|x| format!("{x:.2}×")).unwrap_or_else(|| "—".into()),
+        micros(p),
+        micros(n),
+        human(fp),
+    );
+
+    let cfg = doc_cfg(live, 1.0, payload, None);
+    let (p, n, fp, _) = doc_point(Box::new(doc_targets::SqliteDocTarget::new(payload)), &cfg, samples);
+    println!(
+        "  {:<10} {:>6} {:>10} {:>12} {:>12} {:>10}",
+        "sqlite", "—", "—", micros(p), micros(n), human(fp)
+    );
+
+    // --- 2. payload size at fixed amplification ---------------------------------
+    // Cost here should track BYTES, not rows — a distinction that does not exist for
+    // fixed-width columns, where value_size is pinned by the type.
+    println!("\n  [2] payload size at A = 8 — does cost track bytes or rows?");
+    println!("  {:<10} {:>8} {:>12} {:>12} {:>12}", "engine", "bytes/col", "projection", "narrow", "live MB");
+    for &bytes in &[64usize, 256, 1024, 4096] {
+        let cfg = doc_cfg(live, 8.0, bytes, None);
+        let (p, n, _, _) = doc_point(
+            Box::new(doc_targets::unbounded::ForgeDocTargetNoCompact::new(bytes)),
+            &cfg,
+            samples,
+        );
+        println!(
+            "  {:<10} {:>8} {:>12} {:>12} {:>12}",
+            "forgedb-nc",
+            bytes,
+            micros(p),
+            micros(n),
+            format!("{:.1}", (live * bytes * 4) as f64 / (1u64 << 20) as f64),
+        );
+    }
+
+    // --- 3. churn skew at fixed amplification -----------------------------------
+    // Skew decides WHERE live rows physically sit. Uniform round-robin updates every key,
+    // so every live row ends up in the tail behind a solid dead head — maximally
+    // clustered. Skewed churn moves a hot few to the tail and leaves the rest at their
+    // original head positions, so live rows sit either side of a dead middle. That is
+    // exactly what determines whether an mmap-based fix pays off, so it is measured
+    // before the fix is designed rather than discovered afterwards.
+    println!("\n  [3] churn skew at A = 8 — where do live rows physically sit?");
+    println!("  {:<10} {:>14} {:>12} {:>12}", "engine", "churn", "projection", "narrow");
+    for (label, skew) in
+        [("round-robin", None), ("uniform-rand", Some(0.0)), ("zipf s=1.0", Some(1.0))]
+    {
+        let cfg = doc_cfg(live, 8.0, payload, skew);
+        let (p, n, _, _) = doc_point(
+            Box::new(doc_targets::unbounded::ForgeDocTargetNoCompact::new(payload)),
+            &cfg,
+            samples,
+        );
+        println!("  {:<10} {:>14} {:>12} {:>12}", "forgedb-nc", label, micros(p), micros(n));
+    }
+
+    // --- 4. amplification ladder under SKEWED churn -----------------------------
+    // Table 1 sweeps A under round-robin churn, which leaves the live set maximally
+    // clustered — the friendliest possible case for a mapped read. Table 3 shows that
+    // scattering the live set costs more, but only at one rung, so it cannot say whether
+    // that penalty is a CONSTANT factor or itself a slope in A. This table is the one
+    // that answers the #167 question: a residual that grows with amplification would be
+    // an inherent cost of accumulating versions, whereas a flat offset is just page
+    // granularity and is paid once.
+    println!("\n  [4] amplification ladder under zipf s=1.0 churn — is the residual a slope?");
+    println!(
+        "  {:<10} {:>6} {:>10} {:>12} {:>12}",
+        "engine", "A req", "A reached", "projection", "narrow"
+    );
+    for &a in ladder {
+        let cfg = doc_cfg(live, a, payload, Some(1.0));
+        let (p, n, _, amp) = doc_point(
+            Box::new(doc_targets::unbounded::ForgeDocTargetNoCompact::new(payload)),
+            &cfg,
+            samples,
+        );
+        println!(
+            "  {:<10} {:>6} {:>10} {:>12} {:>12}",
+            "forgedb-nc",
+            format!("{a:.0}×"),
+            amp.map(|x| format!("{x:.2}×")).unwrap_or_else(|| "—".into()),
+            micros(p),
+            micros(n),
+        );
+    }
+}
+
 fn hdr() -> hdrhistogram::Histogram<u64> {
     hdrhistogram::Histogram::<u64>::new_with_bounds(1, 300_000_000, 3).unwrap()
 }
@@ -396,6 +579,12 @@ fn main() {
     if args.iter().any(|a| a == "--verify") {
         println!("Driver self-checks (#218 Gate 3):");
         std::process::exit(if verify() { 0 } else { 1 });
+    }
+
+    if args.iter().any(|a| a == "--var-sweep") {
+        let (live, samples) = if full { (10_000, 50) } else { (2_000, 20) };
+        var_sweep(live, samples, full);
+        return;
     }
 
     if args.iter().any(|a| a == "--scan-sweep") {

@@ -253,6 +253,31 @@ pub struct WorkloadConfig {
     pub scan_limit: usize,
     /// Call `maintain()` every N ops, or never.
     pub maintain_every: Option<usize>,
+    /// How the preload's amplification-building updates pick their keys.
+    ///
+    /// `None` (the default) is a uniform round-robin — every key updated equally — and
+    /// is what every published #218/#221 number was measured under. Kept as the default
+    /// deliberately: making this axis opt-in means adding it cannot silently restate
+    /// results that were already reported.
+    ///
+    /// `Some(skew)` samples keys by the same Zipf the run schedule uses, and it changes
+    /// *where live rows physically sit*. Append-only re-appends an updated row at the
+    /// tail, so round-robin ends with every live row in the tail and a solid dead head —
+    /// the maximally CLUSTERED live set. Under skew, a hot few move to the tail while
+    /// most keys' live versions stay at their original head positions, leaving live rows
+    /// SPREAD either side of a dead middle. That difference is exactly what decides
+    /// whether an `mmap`-based fix for the variable-column read path pays off, so it has
+    /// to be a knob rather than an assumption.
+    pub preload_churn_skew: Option<f64>,
+    /// Bytes per variable-width (`string`) column, for the `Doc` subject. Ignored by
+    /// the all-fixed-width `Metric` subject.
+    ///
+    /// A first-class axis rather than a constant: the variable-column read path's cost
+    /// is proportional to **bytes**, not rows, so sweeping payload size at fixed
+    /// amplification separates "reads too many rows" from "reads too many bytes" —
+    /// a distinction that simply does not exist for fixed-width columns, where
+    /// `value_size` is pinned by the type.
+    pub payload_bytes: usize,
 }
 
 impl Default for WorkloadConfig {
@@ -273,6 +298,8 @@ impl Default for WorkloadConfig {
             scan_kind: ScanKind::Projection,
             scan_limit: 1_000,
             maintain_every: None,
+            preload_churn_skew: None,
+            payload_bytes: 256,
         }
     }
 }
@@ -487,8 +514,28 @@ pub fn preload<T: WorkloadTarget + ?Sized>(target: &mut T, cfg: &WorkloadConfig)
     }
     if cfg.target_amplification > 1.0 && cfg.preload > 0 {
         let extra = ((cfg.target_amplification - 1.0) * cfg.preload as f64) as usize;
-        for i in 0..extra {
-            target.update((i % cfg.preload) as u64, cfg.update_width);
+        match cfg.preload_churn_skew {
+            // Uniform round-robin — the historical behaviour every published #218/#221
+            // number was measured under.
+            None => {
+                for i in 0..extra {
+                    target.update((i % cfg.preload) as u64, cfg.update_width);
+                }
+            }
+            // Skewed churn. Seed is derived from (not equal to) cfg.seed so the schedule
+            // and the preload do not walk the same sequence in lockstep.
+            Some(skew) => {
+                let mut rng = StdRng::seed_from_u64(cfg.seed ^ 0x5EED_C4A5);
+                let zipf = if skew > 0.0 {
+                    Zipf::new(cfg.preload.max(1_000) as u64, skew).ok()
+                } else {
+                    None
+                };
+                for _ in 0..extra {
+                    let k = sample_rank(&mut rng, zipf.as_ref(), cfg.preload) as u64;
+                    target.update(k, cfg.update_width);
+                }
+            }
         }
     }
     let live = target.live_rows();
