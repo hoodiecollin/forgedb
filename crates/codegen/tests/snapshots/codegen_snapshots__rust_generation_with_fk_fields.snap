@@ -165,6 +165,20 @@ pub struct Author {
 pub struct AuthorScanRow {
     pub id: Uuid,
 }
+///Borrowed narrow scan record for `Author` (#224): the same columns as `AuthorScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+#[derive(Debug, Clone)]
+pub struct AuthorScanRef<'a> {
+    pub id: Uuid,
+}
+impl<'a> AuthorScanRef<'a> {
+    /// Materialize the owned scan record.  Called only for rows that
+    /// survive the filter (#224).
+    pub fn to_owned_row(&self) -> AuthorScanRow {
+        AuthorScanRow {
+            id: self.id.clone(),
+        }
+    }
+}
 ///Storage for Author model
 pub struct AuthorStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -996,8 +1010,18 @@ impl AuthorStorage {
         };
         Some(AuthorScanRow { id: id_value })
     }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<AuthorScanRow> {
+    /// Narrow scan of every live row, filtered on the BORROWED view
+    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
+    /// only the filterable/sortable columns.  Each column is bulk-loaded
+    /// once (`gather_buffered`); each row is then decoded into
+    /// a borrowed view whose `string` fields point straight at that buffer,
+    /// and `keep` runs on it — so a row the filter rejects never allocates.
+    /// Only survivors are materialized as owned rows.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all_filtered(
+        &self,
+        keep: impl Fn(&AuthorScanRef<'_>) -> bool,
+    ) -> Vec<AuthorScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();
         let __rows = self
@@ -1024,9 +1048,17 @@ impl AuthorStorage {
                     .expect("Failed to read from column");
                 Uuid::from_bytes(bytes)
             };
-            rows.push(AuthorScanRow { id: id_value });
+            let __row_ref = AuthorScanRef { id: id_value };
+            if keep(&__row_ref) {
+                rows.push(__row_ref.to_owned_row());
+            }
         }
         rows
+    }
+    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
+    /// that keeps everything, so there is exactly one buffered-scan body.
+    pub fn __scan_all(&self) -> Vec<AuthorScanRow> {
+        self.__scan_all_filtered(|_| true)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
@@ -1131,6 +1163,22 @@ pub struct Post {
 pub struct PostScanRow {
     pub id: Uuid,
     pub title: String,
+}
+///Borrowed narrow scan record for `Post` (#224): the same columns as `PostScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+#[derive(Debug, Clone)]
+pub struct PostScanRef<'a> {
+    pub id: Uuid,
+    pub title: &'a str,
+}
+impl<'a> PostScanRef<'a> {
+    /// Materialize the owned scan record.  Called only for rows that
+    /// survive the filter (#224).
+    pub fn to_owned_row(&self) -> PostScanRow {
+        PostScanRow {
+            id: self.id.clone(),
+            title: self.title.to_string(),
+        }
+    }
 }
 ///Storage for Post model
 pub struct PostStorage {
@@ -2775,8 +2823,18 @@ impl PostStorage {
             title: title_value,
         })
     }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<PostScanRow> {
+    /// Narrow scan of every live row, filtered on the BORROWED view
+    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
+    /// only the filterable/sortable columns.  Each column is bulk-loaded
+    /// once (`gather_buffered`); each row is then decoded into
+    /// a borrowed view whose `string` fields point straight at that buffer,
+    /// and `keep` runs on it — so a row the filter rejects never allocates.
+    /// Only survivors are materialized as owned rows.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all_filtered(
+        &self,
+        keep: impl Fn(&PostScanRef<'_>) -> bool,
+    ) -> Vec<PostScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();
         let __rows = self
@@ -2810,14 +2868,22 @@ impl PostStorage {
             };
             let title_value = __bufs
                 .title_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
-            rows.push(PostScanRow {
+            let __row_ref = PostScanRef {
                 id: id_value,
                 title: title_value,
-            });
+            };
+            if keep(&__row_ref) {
+                rows.push(__row_ref.to_owned_row());
+            }
         }
         rows
+    }
+    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
+    /// that keeps everything, so there is exactly one buffered-scan body.
+    pub fn __scan_all(&self) -> Vec<PostScanRow> {
+        self.__scan_all_filtered(|_| true)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

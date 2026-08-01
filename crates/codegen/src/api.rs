@@ -304,6 +304,8 @@ impl ApiGenerator {
         let has_id = crate::rust::RustGenerator::identity_field(model).is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
+        let scan_matches_ref_fn =
+            format_ident!("__{}_scan_matches_ref", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
         // The live list source+filter+sort+page-materialize.  For an id-bearing
         // model this is the #160 narrow path: filter/sort a scan record (only the
@@ -314,26 +316,45 @@ impl ApiGenerator {
         // resolve candidates from that field's index (O(matches)) instead of
         // scanning every row; else scan all narrow rows.  A parse failure falls
         // back to the full scan (`unwrap_or_else`), so a match is never missed.
+        //
+        // #224: the full-scan arms filter on the BORROWED scan view
+        // (`__scan_all_filtered`), so a row the filter rejects never allocates its
+        // strings — previously every live row was decoded into owned `String`s and
+        // then `retain`ed away.  The pushdown arm still filters owned rows: it
+        // resolves O(matches) candidates through the index and reads them
+        // individually (`__scan_row_at`), so there is no buffered span to borrow
+        // from and nothing to save.
         let pushdown_fields = crate::rust::RustGenerator::scan_pushdown_fields(model);
         let scan_source = if pushdown_fields.is_empty() {
-            quote! { db.#storage_field.__scan_all() }
+            quote! {
+                db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
+            }
         } else {
             let branches = pushdown_fields.iter().map(|f| {
                 let fname = &f.name;
                 let scan_by = format_ident!("__scan_by_{}", f.name);
                 quote! {
                     if let Some(__v) = params.get(#fname) {
-                        db.#storage_field.#scan_by(__v)
-                            .unwrap_or_else(|| db.#storage_field.__scan_all())
+                        match db.#storage_field.#scan_by(__v) {
+                            Some(mut __c) => {
+                                __c.retain(|r| #scan_matches_fn(r, &params));
+                                __c
+                            }
+                            None => db.#storage_field
+                                .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params)),
+                        }
                     }
                 }
             });
-            quote! { #(#branches else)* { db.#storage_field.__scan_all() } }
+            quote! {
+                #(#branches else)* {
+                    db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
+                }
+            }
         };
         let live_list_block = if has_id {
             quote! {
                 let mut __scan_rows = #scan_source;
-                __scan_rows.retain(|r| #scan_matches_fn(r, &params));
                 #scan_sort_fn(&mut __scan_rows, &qp.sort);
                 let total = __scan_rows.len();
                 let __page_ids: Vec<_> = qp.pagination
@@ -701,14 +722,26 @@ impl ApiGenerator {
             return quote! {};
         }
         let scan_ident = format_ident!("{}ScanRow", model.name);
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let snake = Self::to_snake_case(&model.name);
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
         let scan_sort_fn = format_ident!("__{}_scan_sort", snake);
         let field_checks: Vec<_> = model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
-            .map(Self::generate_filter_check)
+            .map(|f| Self::generate_filter_check(f, false))
+            .collect();
+        // #224: the borrowed-view filter comes from the SAME emitter, not a second
+        // predicate — same param keys, same parse, same semantics.  Only the
+        // nullable-string comparison differs, because `Option`'s `PartialEq` is
+        // homogeneous (see `generate_filter_check`).
+        let field_checks_ref: Vec<_> = model
+            .fields
+            .iter()
+            .filter(|f| Self::is_filterable_field(&f.field_type))
+            .map(|f| Self::generate_filter_check(f, true))
             .collect();
         let arms = Self::list_sort_arms(model);
         quote! {
@@ -719,6 +752,21 @@ impl ApiGenerator {
                     return true;
                 }
                 #(#field_checks)*
+                true
+            }
+
+            /// The same filter over the BORROWED scan view (#224), so a row can be
+            /// accepted or rejected before its strings are ever copied out of the
+            /// buffered column.  Emitted from the identical per-field checks as
+            /// the owned filter above — one predicate, two operand views.
+            fn #scan_matches_ref_fn(
+                record: &super::#scan_ref_ident<'_>,
+                params: &HashMap<String, String>,
+            ) -> bool {
+                if params.is_empty() {
+                    return true;
+                }
+                #(#field_checks_ref)*
                 true
             }
 
@@ -800,7 +848,15 @@ impl ApiGenerator {
     ///
     /// The caller guarantees `field` is filterable (`is_filterable_field`); any
     /// other type yields an empty check.
-    fn generate_filter_check(field: &forgedb_parser::Field) -> TokenStream {
+    ///
+    /// `borrowed` selects the operand view (#224).  Only ONE comparison actually
+    /// differs: a **nullable string** on the borrowed view is `Option<&str>`, and
+    /// `Option`'s `PartialEq` is homogeneous — there is no
+    /// `Option<&str> == Option<String>` — so the parsed param has to be borrowed
+    /// too (`Some(__w.as_str())`).  Everything else compiles against both views
+    /// unchanged: non-nullable `&str == String` has a std heterogeneous impl, and
+    /// every non-string field has the same type in both structs.
+    fn generate_filter_check(field: &forgedb_parser::Field, borrowed: bool) -> TokenStream {
         use forgedb_parser::FieldType;
         let fname_str = &field.name;
         let fname = format_ident!("{}", field.name);
@@ -860,7 +916,11 @@ impl ApiGenerator {
         };
 
         let cmp = if nullable {
-            quote! { record.#fname == Some(__w) }
+            if borrowed && matches!(base, FieldType::String) {
+                quote! { record.#fname == Some(__w.as_str()) }
+            } else {
+                quote! { record.#fname == Some(__w) }
+            }
         } else {
             quote! { record.#fname == __w }
         };
@@ -964,7 +1024,7 @@ impl ApiGenerator {
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
-            .map(Self::generate_filter_check)
+            .map(|f| Self::generate_filter_check(f, false))
             .collect();
 
         // Typed per-field change detector for the live-query `Updated` diff (#84),
@@ -1196,7 +1256,10 @@ impl ApiGenerator {
         // filterable columns), co-emitted with the list path. The live-query
         // re-evaluation filters the CHEAP narrow scan and full-materializes only
         // the matching rows, instead of full-decoding every column of every row.
-        let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        // #224: it filters the BORROWED scan view, so a re-run rejects non-matching
+        // rows before their strings are copied — the re-run happens on every change
+        // to the model, so this is the hottest of the three call sites.
+        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(model);
         let model_name_str = &model.name;
@@ -1239,9 +1302,8 @@ impl ApiGenerator {
                     let rows: Vec<super::#model_name> = {
                         let g = db.read().await;
                         g.#storage_field
-                            .__scan_all()
+                            .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
                             .into_iter()
-                            .filter(|r| #scan_matches_fn(r, &params))
                             .filter_map(|r| g.#storage_field.get(r.#id_field))
                             .collect()
                     };
@@ -1270,9 +1332,8 @@ impl ApiGenerator {
                             let current: Vec<super::#model_name> = {
                                 let g = db.read().await;
                                 g.#storage_field
-                                    .__scan_all()
+                                    .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
                                     .into_iter()
-                                    .filter(|r| #scan_matches_fn(r, &params))
                                     .filter_map(|r| g.#storage_field.get(r.#id_field))
                                     .collect()
                             };

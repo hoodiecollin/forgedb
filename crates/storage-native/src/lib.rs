@@ -1058,7 +1058,20 @@ impl BufferedVariableColumn {
         self.slots.is_empty()
     }
 
-    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+    /// The slot's value **borrowed from the buffered span** — no allocation, no
+    /// copy (#224).
+    ///
+    /// #222 made the span an `mmap` alias of the data region, so a scan already
+    /// holds every live string's bytes; this is the read that stops copying them
+    /// back out. The borrow is tied to `&self` and the mapping is owned by `self`,
+    /// so the compiler guarantees the `&str` cannot outlive the pages it points at
+    /// — a *tighter* constraint than the type already operates under, not a new
+    /// aliasing exposure.
+    ///
+    /// UTF-8 is validated on every read (cheap next to the allocation it replaces)
+    /// so an on-disk corruption surfaces as [`io::ErrorKind::InvalidData`] rather
+    /// than as an unchecked `&str`.
+    pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         let &(offset, length) = self.slots.get(slot).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
         })?;
@@ -1070,8 +1083,14 @@ impl BufferedVariableColumn {
         let bytes = self.data.as_slice().get(start..end).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Variable slot out of data bounds")
         })?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// The slot's value as an owned `String`. Kept for callers that genuinely need
+    /// ownership; it is [`read_str`](Self::read_str) plus the copy, so there is one
+    /// decode path and the two can never disagree.
+    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+        self.read_str(slot).map(str::to_owned)
     }
 }
 

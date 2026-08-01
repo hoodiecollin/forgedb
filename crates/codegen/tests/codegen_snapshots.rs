@@ -488,8 +488,14 @@ User {
     // only the page ids (never `all()` on the live path).
     assert!(api_code.contains("fn __user_scan_matches("), "#160: narrow filter helper");
     assert!(api_code.contains("fn __user_scan_sort("), "#160: narrow sort helper");
-    assert!(api_code.contains("db.user.__scan_all()"), "#160: live list scans narrowly");
-    assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
+    // #224 moved the filter INTO the scan (`__scan_all_filtered`), so a rejected
+    // row never allocates its strings — the #160 guarantee is unchanged: the live
+    // list still sources from the narrow scan, never `all()`.
+    assert!(
+        api_code.contains("db.user.__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
+        "#160/#224: live list scans narrowly, filtering during the scan"
+    );
+    assert!(api_code.contains("__user_scan_matches_ref(r, &params)"), "#160: live list filters narrow");
     assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
         "#160: only the paginated page is full-materialized");
     // The as_of branch keeps the full-record path (unchanged correctness).
@@ -504,8 +510,15 @@ User {
         "#160 C: unique-indexed field gets a pushdown scan");
     assert!(api_code.contains("db.user.__scan_by_status(__v)"),
         "#160 C: live list tries index pushdown");
-    assert!(api_code.contains(".unwrap_or_else(|| db.user.__scan_all())"),
-        "#160 C: a parse-failure falls back to the full scan (never misses a match)");
+    // prettyplease wraps the fallback arm across lines; collapse whitespace so the
+    // assertion tracks the shape, not the formatting.
+    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        api_flat.contains(
+            "None => { db.user .__scan_all_filtered(|r| __user_scan_matches_ref("
+        ),
+        "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
+    );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
     // pushdown field — it falls through to the narrow scan.
     assert!(!db_code.contains("fn __scan_by_region("),
@@ -515,7 +528,9 @@ User {
     // (physical row order + `gather_buffered`) instead of a per-row read syscall
     // storm.  A churn-free selection is the dense prefix, so `export` aliases the
     // column via mmap; deleted rows are excluded by one bulk tombstone read.
-    let scan_all = &db_code[db_code.find("pub fn __scan_all").unwrap()..];
+    // #224: `__scan_all` is now the unfiltered alias; the buffered body lives in
+    // `__scan_all_filtered`, which is what these #168 guarantees describe.
+    let scan_all = &db_code[db_code.find("pub fn __scan_all_filtered").unwrap()..];
     let scan_all = &scan_all[..scan_all.find("fn __scan_by_").unwrap_or(scan_all.len())];
     assert!(scan_all.contains("struct __UserScanBufs"),
         "#168: local buffered-column holder emitted");
@@ -3149,8 +3164,10 @@ User {
     assert!(!code.contains(r#"json!({ "data": [] })"#), "list stub is gone");
     // #160: the live list filters the narrow scan through the SAME closed-set
     // matcher as the change-feed / live-query paths (no second predicate parser).
+    // #224: that matcher now runs on the BORROWED scan view, during the scan — the
+    // "one predicate source" guarantee is unchanged; only the operand view is.
     assert!(
-        code.contains("__scan_all()") && code.contains("__user_scan_matches(r, &params)"),
+        code.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
         "list filters the narrow scan via the generated closed-set matcher (no second parser)"
     );
     // The `?as_of` snapshot path keeps the full-record read + the same closed-set
@@ -6647,4 +6664,148 @@ fn test_python_sdk_generation_snapshot() {
         "create must omit +uuid/+timestamp autos, got:\n{create_block}");
 
     insta::assert_snapshot!(code);
+}
+
+#[test]
+fn test_rust_generation_borrowed_scan_view() {
+    // #224: the narrow scan decodes each live row into a BORROWED view first and
+    // materializes an owned row only for the ones a predicate keeps.  Before this,
+    // every live row's strings were allocated and copied out of the buffered span,
+    // then most of them were thrown away by the list handler's `retain`.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  bio: string?
+  age: ^u32
+  score: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The borrowed twin of the scan record: strings borrow from the buffered span,
+    // every other filterable field keeps the owned record's exact type (that is
+    // what lets ONE emitted filter compile against both views).
+    assert!(
+        flat.contains(
+            "pub struct UserScanRef<'a> { pub id: Uuid, pub email: &'a str, \
+             pub bio: Option<&'a str>, pub age: u32, pub score: f64, }"
+        ),
+        "UserScanRef borrows strings and mirrors every other scan field type.\nGot: {flat}"
+    );
+    // Internal by decision (#224): never a wire type, so no Serialize/ToSchema on it.
+    let ref_at = flat.find("pub struct UserScanRef").expect("has UserScanRef");
+    let ref_decl = &flat[ref_at.saturating_sub(120)..ref_at];
+    assert!(
+        !ref_decl.contains("Serialize") && !ref_decl.contains("ToSchema"),
+        "UserScanRef must stay internal — no wire derives.\nGot: {ref_decl}"
+    );
+
+    // The buffered scan reads strings with `read_str` (borrowed) — the whole point.
+    assert!(
+        flat.contains(".email_col .read_str(__slot)"),
+        "buffered scan must borrow the string slot via read_str.\nGot: {flat}"
+    );
+    // The nullable arm slices past the presence tag WITHOUT allocating.
+    assert!(
+        flat.contains("Some(&raw[1..])"),
+        "nullable string borrows past the presence tag instead of copying"
+    );
+
+    // The owned per-row decode (`read_at`, the index-pushdown `__scan_row_at`) is
+    // untouched — it still allocates, because its callers need owned records.
+    assert!(
+        flat.contains(".email_col .read_string(row_index)"),
+        "the positional read path keeps the owned decode"
+    );
+
+    // Filtered scan + the unfiltered alias that delegates to it: one buffered-scan
+    // body, not two.
+    assert!(
+        flat.contains(
+            "pub fn __scan_all_filtered( &self, keep: impl Fn(&UserScanRef<'_>) -> bool, ) \
+             -> Vec<UserScanRow>"
+        ),
+        "__scan_all_filtered takes a predicate over the borrowed view.\nGot: {flat}"
+    );
+    assert!(
+        flat.contains("pub fn __scan_all(&self) -> Vec<UserScanRow> { self.__scan_all_filtered(|_| true) }"),
+        "__scan_all delegates to the filtered scan.\nGot: {flat}"
+    );
+    // Materialization happens once per SURVIVOR, inside the keep branch.
+    assert!(
+        flat.contains("if keep(&__row_ref) { rows.push(__row_ref.to_owned_row()); }"),
+        "only rows the predicate keeps are materialized.\nGot: {flat}"
+    );
+}
+
+#[test]
+fn test_api_generation_borrowed_scan_filter() {
+    // #224: the list filter and the live-query re-run evaluate on the borrowed
+    // scan view, so a row they reject never allocates its strings.
+    let src = r#"
+User {
+  id: +uuid
+  email: &string
+  bio: string?
+  age: ^u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // Both filters exist and are emitted from the same per-field checks.
+    assert!(code.contains("fn __user_scan_matches("), "owned scan filter still emitted");
+    assert!(code.contains("fn __user_scan_matches_ref("), "borrowed scan filter emitted");
+
+    // The REST list source and BOTH live-query scans filter during the scan
+    // instead of decoding everything and `retain`ing afterwards.
+    assert!(
+        flat.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
+        "scan source filters on the borrowed view.\nGot: {flat}"
+    );
+    // At least the three call sites: the REST list source, the live-query initial
+    // scan, and the live-query re-run.  (An indexed model emits one more per
+    // pushdown branch — the fallback when the param does not parse — so this is a
+    // floor, not an exact count.)
+    assert!(
+        flat.matches("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))").count() >= 3,
+        "REST list + live-query init + live-query re-run all filter during the scan.\nGot: {flat}"
+    );
+    assert!(
+        !flat.contains("__scan_rows.retain(|r| __user_scan_matches(r, &params));"),
+        "the post-scan retain over every decoded row is gone"
+    );
+    // The index-pushdown arm still filters OWNED rows: it resolves O(matches)
+    // candidates through the secondary index and reads them individually, so there
+    // is no buffered span to borrow from.
+    assert!(
+        flat.contains("__c.retain(|r| __user_scan_matches(r, &params));"),
+        "the pushdown candidate set keeps the owned filter.\nGot: {flat}"
+    );
+
+    // The ONE comparison that has to differ: `Option`'s PartialEq is homogeneous,
+    // so a nullable string on the borrowed view must borrow the parsed param too.
+    // Every other check is byte-identical between the two filters.
+    let owned = &code[code.find("fn __user_scan_matches(").unwrap()
+        ..code.find("fn __user_scan_matches_ref(").unwrap()];
+    let borrowed = &code[code.find("fn __user_scan_matches_ref(").unwrap()..];
+    assert!(
+        owned.contains("record.bio == Some(__w)"),
+        "owned filter compares Option<String> directly"
+    );
+    assert!(
+        borrowed.contains("record.bio == Some(__w.as_str())"),
+        "borrowed filter compares Option<&str> against a borrowed param"
+    );
+    // Non-nullable strings need no adjustment — std has `&str: PartialEq<String>`.
+    assert!(
+        owned.contains("record.email == __w") && borrowed.contains("record.email == __w"),
+        "non-nullable string comparison is identical in both views"
+    );
 }

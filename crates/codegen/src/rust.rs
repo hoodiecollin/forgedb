@@ -4874,10 +4874,20 @@ impl RustGenerator {
     /// the indexed-field columns) — one body, so the two can never drift, and the
     /// reopen path can fault in just the columns an index needs instead of the
     /// whole record.
+    ///
+    /// `borrowed` selects the **string** decode only (#224): `false` binds an owned
+    /// `String` / `Option<String>` as before; `true` binds `&str` / `Option<&str>`
+    /// borrowed straight out of the buffered span via `read_str`, for the narrow
+    /// scan's borrowed row view.  Every other arm is emitted identically in both
+    /// modes — one decoder with two string arms, not two decoders (PM constraint 2).
+    /// Only a receiver that is a `BufferedVariableColumn` (the scan's `__bufs`
+    /// holder) can satisfy `borrowed = true`; the positional `VariableColumn` path
+    /// has no span to borrow from.
     fn field_read_stmt(
         field: &forgedb_parser::Field,
         receiver: &TokenStream,
         row_index: &TokenStream,
+        borrowed: bool,
     ) -> Option<(proc_macro2::Ident, TokenStream)> {
         let field_col_name = format_ident!("{}_col", field.name);
         let field_value_name = format_ident!("{}_value", field.name);
@@ -4935,6 +4945,30 @@ impl RustGenerator {
                         serde_json::from_str(&raw)
                             .expect("Failed to deserialize json")
                     };
+                }
+            };
+            Some((field_value_name, stmt))
+        } else if Self::is_string_type(&field.field_type) && borrowed {
+            // #224: borrow the slot out of the buffered span instead of allocating
+            // a `String` per field per row.  Same presence-tag decode as the owned
+            // arm below — the tag byte is `0x01`, so slicing at byte 1 is always a
+            // char boundary, exactly as `raw[1..].to_string()` relies on today.
+            let stmt = if field.is_nullable() {
+                quote! {
+                    let #field_value_name = {
+                        let raw = #receiver.#field_col_name.read_str(#row_index)
+                            .expect("Failed to read string");
+                        if raw.as_bytes().first() == Some(&1u8) {
+                            Some(&raw[1..])
+                        } else {
+                            None
+                        }
+                    };
+                }
+            } else {
+                quote! {
+                    let #field_value_name = #receiver.#field_col_name.read_str(#row_index)
+                        .expect("Failed to read string");
                 }
             };
             Some((field_value_name, stmt))
@@ -5272,23 +5306,74 @@ impl RustGenerator {
             .map(|f| Self::generate_scan_by_index(f, &scan_ident))
             .collect();
 
-        // #168: the buffered column scan — emitted by the shared
-        // `generate_buffered_scan_method` helper (over the full filterable
-        // `scan_fields` set here; over a projected subset for `@projection`), so
-        // there is one buffered-scan emitter and one decode path.
+        // #224: the BORROWED twin of the scan record — identical field-for-field
+        // except that `string` becomes `&'a str`, borrowed straight out of the
+        // buffered span the scan already holds.  The list filter runs on this, so a
+        // row that the filter rejects never allocates a `String` at all; only
+        // survivors are materialized as an owned `#scan_ident`.
+        //
+        // INTERNAL by decision (#224): never derived `Serialize`/`ToSchema`, never
+        // reachable from the REST/TS/OpenAPI surface, and never returned — it only
+        // ever appears behind a `&` in a closure argument, so no caller of the
+        // generated crate names its lifetime.
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
+        let ref_field_decls = scan_fields.iter().map(|f| {
+            let fname = format_ident!("{}", f.name);
+            let fty = Self::scan_ref_field_type(f);
+            quote! { pub #fname: #fty }
+        });
+        // `to_owned_row` is where the allocation moved TO: it happens once per
+        // surviving row instead of once per string field of every row.
+        let to_owned_fields = scan_fields.iter().map(|f| {
+            let fname = format_ident!("{}", f.name);
+            if Self::is_string_type(&f.field_type) {
+                if f.is_nullable() {
+                    quote! { #fname: self.#fname.map(str::to_string) }
+                } else {
+                    quote! { #fname: self.#fname.to_string() }
+                }
+            } else {
+                quote! { #fname: self.#fname.clone() }
+            }
+        });
+        let ref_doc = format!(
+            "Borrowed narrow scan record for `{}` (#224): the same columns as \
+             `{}ScanRow`, with `string` fields borrowed from the buffered column \
+             span instead of copied into a `String`.  Filter predicates run on this \
+             so only surviving rows allocate.  Internal — not a wire type, never \
+             exported.",
+            model.name, model.name
+        );
+        let ref_struct_tokens = quote! {
+            #[doc = #ref_doc]
+            #[derive(Debug, Clone)]
+            pub struct #scan_ref_ident<'a> {
+                #(#ref_field_decls,)*
+            }
+
+            impl<'a> #scan_ref_ident<'a> {
+                /// Materialize the owned scan record.  Called only for rows that
+                /// survive the filter (#224).
+                pub fn to_owned_row(&self) -> #scan_ident {
+                    #scan_ident {
+                        #(#to_owned_fields,)*
+                    }
+                }
+            }
+        };
+
+        // #168/#224: the buffered column scan.  `__scan_all_filtered` decodes each
+        // live row into the borrowed view, applies the caller's predicate, and
+        // materializes only survivors; `__scan_all` is that with a predicate that
+        // keeps everything — one buffered-scan body, not two.  `@projection`'s live
+        // `all_<proj>` keeps using the owned emitter below (it returns rows to the
+        // user, so it has nothing to filter against).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
-        let scan_all_doc = "Narrow scan of every live row (#160/#168): the list \
-             endpoint's filter/sort source, decoding only the filterable/sortable \
-             columns.  The page is full-materialized separately, so only `limit` \
-             rows pay a full decode.  #168: iterates live rows in physical order \
-             and bulk-loads each column once (`gather_buffered`) instead of per-row \
-             positional reads.";
-        let scan_all_method = Self::generate_buffered_scan_method(
+        let scan_all_method = Self::generate_filtered_scan_method(
             &scan_ident,
-            &format_ident!("__scan_all"),
+            &scan_ref_ident,
             &buf_holder,
             &scan_fields,
-            scan_all_doc,
         );
 
         let methods = quote! {
@@ -5301,7 +5386,144 @@ impl RustGenerator {
             #scan_all_method
             #(#pushdown)*
         };
+        let struct_tokens = quote! {
+            #struct_tokens
+            #ref_struct_tokens
+        };
         (struct_tokens, methods)
+    }
+
+    /// The borrowed scan-view type for one scan field (#224): `string` becomes
+    /// `&'a str` (`Option<&'a str>` when nullable), every other filterable type is
+    /// byte-for-byte the owned scan record's type.  Keeping the rest identical is
+    /// what lets the SAME generated filter checks compile against both views —
+    /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
+    /// both std, so `record.<field> == <parsed param>` needs no second form.
+    fn scan_ref_field_type(field: &forgedb_parser::Field) -> TokenStream {
+        if Self::is_string_type(&field.field_type) {
+            return if field.is_nullable() {
+                quote! { Option<&'a str> }
+            } else {
+                quote! { &'a str }
+            };
+        }
+        let base = Self::map_field_type_ident(&field.field_type);
+        if field.is_nullable() {
+            quote! { Option<#base> }
+        } else {
+            base
+        }
+    }
+
+    /// Emit the filtered buffered narrow-scan (#224) plus the unfiltered
+    /// `__scan_all` that delegates to it.
+    ///
+    /// Same bulk-load as [`Self::generate_buffered_scan_method`] — one
+    /// `gather_buffered` per column, hoisted out of the row loop — but each slot is
+    /// decoded into the BORROWED view first and only materialized as an owned row
+    /// if the caller's predicate keeps it.  Before this, `__scan_all` decoded every
+    /// live row into owned `String`s and the list handler then `retain`ed most of
+    /// them away; the strings of rejected rows were allocated, copied, and dropped
+    /// without ever being read.
+    fn generate_filtered_scan_method(
+        row_ident: &proc_macro2::Ident,
+        ref_ident: &proc_macro2::Ident,
+        holder: &proc_macro2::Ident,
+        fields: &[&forgedb_parser::Field],
+    ) -> TokenStream {
+        let mut buf_field_decls = Vec::new();
+        let mut buf_inits = Vec::new();
+        let mut buf_read_stmts = Vec::new();
+        let mut buf_field_values = Vec::new();
+        let recv = quote! { __bufs };
+        let slot = quote! { __slot };
+        for field in fields {
+            let fname = format_ident!("{}", field.name);
+            let col_ident = format_ident!("{}_col", field.name);
+            let buffered_ty = if Self::is_string_type(&field.field_type)
+                || Self::is_json_type(&field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedVariableColumn })
+            } else if Self::is_enum_type(&field.field_type)
+                || Self::is_fixed_size_type(&field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedFixedColumn })
+            } else {
+                None // relation/component: no storage column (see field_read_stmt None arm)
+            };
+            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot, true)) {
+                (Some(ty), Some((value_ident, stmt))) => {
+                    buf_field_decls.push(quote! { #col_ident: #ty });
+                    buf_inits.push(quote! {
+                        #col_ident: self.#col_ident.gather_buffered(&__rows)
+                            .expect("Failed to bulk-load scan column")
+                    });
+                    buf_read_stmts.push(stmt);
+                    buf_field_values.push(quote! { #fname: #value_ident });
+                }
+                _ => {
+                    let default_val = Self::default_for_unstored_field(&field.field_type);
+                    buf_field_values.push(quote! { #fname: #default_val });
+                }
+            }
+        }
+
+        quote! {
+            /// Narrow scan of every live row, filtered on the BORROWED view
+            /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
+            /// only the filterable/sortable columns.  Each column is bulk-loaded
+            /// once (`gather_buffered`); each row is then decoded into
+            /// a borrowed view whose `string` fields point straight at that buffer,
+            /// and `keep` runs on it — so a row the filter rejects never allocates.
+            /// Only survivors are materialized as owned rows.  The page is
+            /// full-materialized separately, so only `limit` rows pay a full decode.
+            pub fn __scan_all_filtered(
+                &self,
+                keep: impl Fn(&#ref_ident<'_>) -> bool,
+            ) -> Vec<#row_ident> {
+                // Live rows in ascending physical order — so a churn-free table's
+                // selection is exactly the dense prefix `[0, n)` (zero-copy mmap
+                // bulk load) and column reads march forward.  `id_to_row` repoints
+                // a deleted id at its tombstoned row (delete appends a tombstone,
+                // #66), so filter those out with one bulk tombstone read.
+                let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+                __rows.sort_unstable();
+                let __rows = self.tombstones.live_indices(&__rows)
+                    .expect("Failed to read tombstone liveness");
+                let __n = __rows.len();
+
+                #[allow(non_camel_case_types)]
+                struct #holder {
+                    #(#buf_field_decls,)*
+                }
+                let __bufs = #holder {
+                    #(#buf_inits,)*
+                };
+
+                // Reserve for the whole live set even though a selective filter will
+                // not fill it: that is ONE oversized allocation, freed at the end,
+                // against ~log2(n) reallocations each memcpy-ing every row already
+                // accepted.  Measured on a 20 000-row unfiltered scan, dropping the
+                // reserve cost ~5% — the growth copy is not free at this row count.
+                let mut rows = Vec::with_capacity(__n);
+                for __slot in 0..__n {
+                    #(#buf_read_stmts)*
+                    let __row_ref = #ref_ident {
+                        #(#buf_field_values),*
+                    };
+                    if keep(&__row_ref) {
+                        rows.push(__row_ref.to_owned_row());
+                    }
+                }
+                rows
+            }
+
+            /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
+            /// that keeps everything, so there is exactly one buffered-scan body.
+            pub fn __scan_all(&self) -> Vec<#row_ident> {
+                self.__scan_all_filtered(|_| true)
+            }
+        }
     }
 
     /// Emit a buffered narrow-scan method (#168): bulk-load each column of
@@ -5342,7 +5564,7 @@ impl RustGenerator {
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot)) {
+            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot, false)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -5692,7 +5914,7 @@ impl RustGenerator {
 
         for field in fields {
             let field_name = format_ident!("{}", field.name);
-            match Self::field_read_stmt(field, &recv, &row) {
+            match Self::field_read_stmt(field, &recv, &row, false) {
                 Some((value_ident, stmt)) => {
                     read_statements.push(stmt);
                     // C1: only push to field_values when a binding was emitted.
@@ -6021,7 +6243,7 @@ impl RustGenerator {
                 let field_reads: Vec<_> = read_fields
                     .iter()
                     .filter_map(|f| {
-                        Self::field_read_stmt(f, recv, &row_tok).map(|(_, stmt)| stmt)
+                        Self::field_read_stmt(f, recv, &row_tok, false).map(|(_, stmt)| stmt)
                     })
                     .collect();
 

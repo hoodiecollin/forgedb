@@ -124,13 +124,20 @@ impl BufferedVariableColumn {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
-    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+    /// The slot's value borrowed from the buffered arena — no allocation (#224).
+    /// Browser twin of the native `read_str`; generated code calls this name on
+    /// both targets.
+    pub fn read_str(&self, slot: usize) -> io::Result<&str> {
         let &(offset, length) = self.slots.get(slot).ok_or_else(oob)?;
         let start = offset as usize;
         let end = start + length as usize;
         let bytes = self.data.get(start..end).ok_or_else(oob)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        std::str::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// Owned form of [`read_str`](Self::read_str) — one decode path, plus the copy.
+    pub fn read_string(&self, slot: usize) -> io::Result<String> {
+        self.read_str(slot).map(str::to_owned)
     }
 }
 

@@ -1514,6 +1514,110 @@ fn test_buffered_variable_column_mapped_path_matches_per_row_reads() {
 }
 
 #[test]
+fn test_buffered_variable_read_str_matches_read_string() {
+    // #224: `read_str` borrows out of the buffered span instead of allocating a
+    // `String` per slot.  It is the decode both paths now share — `read_string` is
+    // `read_str(..).map(str::to_owned)` — so the guard is that they agree on every
+    // slot, over BOTH `ColumnExport` arms: the owned copy (small span) and the
+    // `mmap` alias (span >= VAR_MMAP_MIN_BYTES, where `base` rebasing is live).
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_read_str");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // --- owned arm: a handful of tiny values, base == 0 ---
+    let mut small = VariableColumn::new(
+        temp_dir.join("s_data.bin"),
+        temp_dir.join("s_offsets.bin"),
+    )
+    .unwrap();
+    for s in ["", "a", "hello world", "unicode ✓ é"] {
+        small.append_string(s).unwrap();
+    }
+    let buf = small.gather_buffered(&[0, 1, 2, 3]).unwrap();
+    for slot in 0..4usize {
+        assert_eq!(buf.read_str(slot).unwrap(), buf.read_string(slot).unwrap());
+        assert_eq!(buf.read_str(slot).unwrap(), small.read_string(slot).unwrap());
+    }
+    // Out-of-bounds slot: same error kind as `read_string`.
+    let err = buf.read_str(4).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(buf.read_string(4).unwrap_err().kind(), err.kind());
+
+    // --- mapped arm: past VAR_MMAP_MIN_BYTES, so `base` is non-zero on a late span ---
+    let mut big = VariableColumn::new(
+        temp_dir.join("b_data.bin"),
+        temp_dir.join("b_offsets.bin"),
+    )
+    .unwrap();
+    let n = 4000usize;
+    for i in 0..n {
+        if i % 37 == 0 {
+            big.append_string("").unwrap();
+        } else {
+            big.append_string(&format!("row-{i}-{}", "x".repeat(240))).unwrap();
+        }
+    }
+    let check = |idx: &[usize]| {
+        let buf = big.gather_buffered(idx).unwrap();
+        for (slot, &i) in idx.iter().enumerate() {
+            assert_eq!(
+                buf.read_str(slot).unwrap(),
+                big.read_string(i).unwrap(),
+                "slot {slot} (row {i})"
+            );
+        }
+    };
+    // Churn shape (holes between live rows), a late span, reversed order, and a
+    // selection of only empty strings — the same shapes #222's rebase guard uses.
+    check(&(0..n).filter(|i| i % 3 != 0).collect::<Vec<_>>());
+    check(&(3000..3500).collect::<Vec<_>>());
+    check(&(2000..2400).rev().collect::<Vec<_>>());
+    check(&(0..n).filter(|i| i % 37 == 0).collect::<Vec<_>>());
+
+    // Two borrows from one buffer coexist — the borrow is tied to `&self`, so
+    // nothing about `read_str` narrows how a caller may hold slots.
+    let buf = big.gather_buffered(&[10, 11]).unwrap();
+    let (a, b) = (buf.read_str(0).unwrap(), buf.read_str(1).unwrap());
+    assert_ne!(a, b);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_buffered_variable_read_str_rejects_invalid_utf8() {
+    // Validation is per read and stays that way (#224 open question 4): a corrupt
+    // on-disk byte must surface as `InvalidData`, not as unchecked `&str`.
+    use std::io::{Seek, Write};
+
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_read_str_utf8");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let data_path = temp_dir.join("v_data.bin");
+    let mut col =
+        VariableColumn::new(data_path.clone(), temp_dir.join("v_offsets.bin")).unwrap();
+    col.append_string("valid").unwrap();
+    col.append_string("also valid").unwrap();
+    col.flush().unwrap();
+
+    // Corrupt the first byte of slot 1 (`data` is a flat append-only file, so slot 1
+    // starts right after "valid").
+    let mut f = fs::OpenOptions::new().write(true).open(&data_path).unwrap();
+    f.seek(std::io::SeekFrom::Start(5)).unwrap();
+    f.write_all(&[0xFF]).unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let buf = col.gather_buffered(&[0, 1]).unwrap();
+    assert_eq!(buf.read_str(0).unwrap(), "valid");
+    let err = buf.read_str(1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(buf.read_string(1).unwrap_err().kind(), err.kind());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
 fn test_tombstones_live_indices_filters_deleted() {
     let temp_dir = std::env::temp_dir().join("forgedb_test_live_indices");
     let _ = fs::remove_dir_all(&temp_dir);
