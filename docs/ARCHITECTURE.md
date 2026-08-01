@@ -90,8 +90,10 @@ generator identity honest: nothing at runtime reads a schema.
 
 ## Storage model
 
-The engine is **append-only columnar** storage over positional files (not memory-mapped, not
-row-based). Each model and each many-to-many junction is a directory:
+The engine is **append-only columnar** storage over positional files (not row-based). Writes are
+always positional `pwrite`-style appends; *bulk reads* may map a bounded span of a column when the
+span is large enough to be worth it, which is an optimization inside the read path and not a change
+to the layout or the write path. Each model and each many-to-many junction is a directory:
 
 ```
 <data-root>/
@@ -152,6 +154,31 @@ axum router (generated in api.rs)
 
 Every field-aware step — filtering, sorting, the event matcher, index probes — is *generated
 per model*. The substrate crates on this path (`auth`, `query-params`) interpret no schema.
+
+### The list path is a narrow scan, filtered before it allocates
+
+A list request does **not** decode every column of every row. Codegen emits a *narrow scan
+record* per model — the identity field plus the filterable/sortable columns — and the handler
+filters and sorts those, then full-materializes only the paginated page. Each scan column is
+bulk-loaded once (one `gather_buffered` per column, hoisted out of the row loop) rather than read
+per row.
+
+Filtering happens **during** the scan, against a borrowed view. Alongside the owned scan record,
+codegen emits `<Model>ScanRef<'a>`, identical field-for-field except that `string` becomes
+`&'a str` — borrowed straight from the bulk-loaded span, which already holds those bytes. The
+predicate runs on that view and an owned row is materialized only for survivors, so a rejected row
+never allocates a string at all. Two properties make this safe and non-viral:
+
+- The buffered columns live in a local holder inside the generated scan, so a borrowed row cannot
+  escape it. `ScanRef` is internal — no wire derives, never reachable from REST/TS/OpenAPI, and
+  only ever named behind a `&` in a closure argument. **No lifetime appears in any user-facing
+  generated signature.**
+- The borrowed and owned filters are emitted from the *same* per-field checks that the change-feed
+  matcher uses, so there is one predicate source and three operand views — never a second parser.
+
+The same shape backs the live-query re-run, which re-evaluates the closed-set query on every
+change to the model. The win is proportional to how much the filter rejects: an unfiltered list
+still materializes every row.
 
 ---
 
