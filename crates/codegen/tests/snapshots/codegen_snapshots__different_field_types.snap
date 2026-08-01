@@ -174,6 +174,28 @@ pub struct ComplexModelScanRow {
     pub active: bool,
     pub created_at: Timestamp,
 }
+///Borrowed narrow scan record for `ComplexModel` (#224): the same columns as `ComplexModelScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+#[derive(Debug, Clone)]
+pub struct ComplexModelScanRef<'a> {
+    pub id: Uuid,
+    pub count: i64,
+    pub price: f64,
+    pub active: bool,
+    pub created_at: Timestamp,
+}
+impl<'a> ComplexModelScanRef<'a> {
+    /// Materialize the owned scan record.  Called only for rows that
+    /// survive the filter (#224).
+    pub fn to_owned_row(&self) -> ComplexModelScanRow {
+        ComplexModelScanRow {
+            id: self.id.clone(),
+            count: self.count.clone(),
+            price: self.price.clone(),
+            active: self.active.clone(),
+            created_at: self.created_at.clone(),
+        }
+    }
+}
 ///Storage for ComplexModel model
 pub struct ComplexModelStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -1282,8 +1304,18 @@ impl ComplexModelStorage {
             created_at: created_at_value,
         })
     }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<ComplexModelScanRow> {
+    /// Narrow scan of every live row, filtered on the BORROWED view
+    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
+    /// only the filterable/sortable columns.  Each column is bulk-loaded
+    /// once (`gather_buffered`); each row is then decoded into
+    /// a borrowed view whose `string` fields point straight at that buffer,
+    /// and `keep` runs on it — so a row the filter rejects never allocates.
+    /// Only survivors are materialized as owned rows.  The page is
+    /// full-materialized separately, so only `limit` rows pay a full decode.
+    pub fn __scan_all_filtered(
+        &self,
+        keep: impl Fn(&ComplexModelScanRef<'_>) -> bool,
+    ) -> Vec<ComplexModelScanRow> {
         let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
         __rows.sort_unstable();
         let __rows = self
@@ -1348,15 +1380,23 @@ impl ComplexModelStorage {
                     .read_timestamp(__slot)
                     .expect("Failed to read from column"),
             );
-            rows.push(ComplexModelScanRow {
+            let __row_ref = ComplexModelScanRef {
                 id: id_value,
                 count: count_value,
                 price: price_value,
                 active: active_value,
                 created_at: created_at_value,
-            });
+            };
+            if keep(&__row_ref) {
+                rows.push(__row_ref.to_owned_row());
+            }
         }
         rows
+    }
+    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
+    /// that keeps everything, so there is exactly one buffered-scan body.
+    pub fn __scan_all(&self) -> Vec<ComplexModelScanRow> {
+        self.__scan_all_filtered(|_| true)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
