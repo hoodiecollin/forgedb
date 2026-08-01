@@ -42,6 +42,11 @@ homepage = "https://github.com/hoodiecollin/forgedb"
 readme = "README.md"
 keywords = ["database", "codegen", "orm", "cli", "generator"]
 categories = ["database", "command-line-utilities", "development-tools"]
+# `cargo run -- <cmd>` must reach the CLI. Adding the `forgedb-lsp` bin (epic #173)
+# made a bare `cargo run` ambiguous — cargo's ambiguity check counts every declared
+# bin, including one gated behind a non-default `required-features` — which broke
+# every documented `cargo run --` invocation (README, docs/, and `make bench-regen`).
+default-run = "forgedb"
 
 [package.metadata.wix]
 upgrade-guid = "5521CC3D-47B3-47B7-BC83-24BDB265C090"
