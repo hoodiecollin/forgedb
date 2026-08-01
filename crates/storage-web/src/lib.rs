@@ -105,6 +105,28 @@ mod tests {
     }
 
     #[test]
+    fn buffered_variable_read_str_matches_read_string() {
+        // #224: the browser twin of the native borrowed read. Generated code calls
+        // `read_str` on both targets, so the web backend must carry the same name,
+        // the same slot addressing, and the same error kinds.
+        store::clear();
+        let mut v = VariableColumn::new(p("bs/var/s_data.bin"), p("bs/var/s_off.bin")).unwrap();
+        for s in ["", "a", "hello world", "unicode ✓ é"] {
+            v.append_string(s).unwrap();
+        }
+        let buf = v.gather_buffered(&[3, 0, 2, 1]).unwrap();
+        for slot in 0..4usize {
+            assert_eq!(buf.read_str(slot).unwrap(), buf.read_string(slot).unwrap());
+        }
+        assert_eq!(buf.read_str(0).unwrap(), "unicode ✓ é");
+        assert_eq!(buf.read_str(1).unwrap(), "");
+        assert_eq!(
+            buf.read_str(4).unwrap_err().kind(),
+            buf.read_string(4).unwrap_err().kind()
+        );
+    }
+
+    #[test]
     fn fixed_column_gather_matches_native_semantics() {
         store::clear();
         let mut c = FixedColumn::new(p("g/u64.bin"), 8).unwrap();
