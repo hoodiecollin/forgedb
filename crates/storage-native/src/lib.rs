@@ -537,6 +537,17 @@ impl BufferedFixedColumn {
     }
 }
 
+/// Selection size at or above which [`FixedColumn::gather`] maps the spanned
+/// region once and copies out of memory, instead of issuing one `read_exact_at`
+/// per index (#221).
+///
+/// Below this a handful of `pread`s beats a mapping's setup + teardown; above
+/// it the per-row syscall loop dominates completely — a 22-column scan of
+/// 10 000 live rows was 220 000 syscalls (~112 ms) before #221. Deliberately
+/// conservative rather than tuned: the point is to leave tiny gathers exactly
+/// as they were while removing the per-row syscall from bulk scans.
+const GATHER_MMAP_MIN_ROWS: usize = 8;
+
 pub struct FixedColumn {
     file: File,
     row_count: usize,
@@ -785,18 +796,84 @@ impl FixedColumn {
     /// `id_to_row` + tombstone liveness, exactly as `all()` / `all_at()` do
     /// today); `gather` never reads a field name, type, or schema.
     ///
+    /// # Performance (#221)
+    ///
+    /// For a selection of at least [`GATHER_MMAP_MIN_ROWS`] rows this maps the
+    /// spanned region `[min(indices), max(indices)]` **once** and copies out of
+    /// that mapping in contiguous runs, rather than issuing one `read_exact_at`
+    /// per index. Live selections under append-only churn are long runs broken
+    /// by the holes superseded rows leave behind, so runs are typically far
+    /// longer than one row and the copy collapses to a handful of `memcpy`s.
+    ///
+    /// The mapping is held only for the duration of the call and the returned
+    /// buffer is owned, so this relies on a strictly weaker form of the
+    /// aliasing invariant documented on [`ColumnExport`]: the spanned rows are
+    /// committed (`< row_count`, so within the file's length) and no concurrent
+    /// truncation runs, which the single-writer discipline already guarantees.
+    ///
+    /// Known-unmeasured case: a *sparse* selection spanning a very large file
+    /// faults in one page per isolated row, reading more bytes than the
+    /// per-row path would. It still trades syscalls for faults plus readahead,
+    /// and real live sets stay dense (amplification is bounded by the generated
+    /// compaction ceiling), but it has not been benchmarked.
+    ///
     /// # Errors
     ///
     /// Returns `Err(InvalidInput)` if any index is `>= self.len()`.
     pub fn gather(&self, indices: &[usize]) -> io::Result<Vec<u8>> {
-        let mut out = vec![0u8; indices.len() * self.value_size];
-        for (slot, &index) in indices.iter().enumerate() {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Bounds-check the whole selection up front: the mapped path spans
+        // `min..=max`, so an out-of-range index has to be rejected before the
+        // span is computed (and `gather` is all-or-nothing either way).
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for &index in indices {
             if index >= self.row_count {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "Index out of bounds",
                 ));
             }
+            lo = lo.min(index);
+            hi = hi.max(index);
+        }
+
+        let mut out = vec![0u8; indices.len() * self.value_size];
+
+        if indices.len() >= GATHER_MMAP_MIN_ROWS {
+            let offset = (lo * self.value_size) as u64;
+            let map_len = (hi + 1 - lo) * self.value_size;
+            // A failed mapping is not fatal — the per-row loop below produces
+            // byte-identical output — so fall through instead of propagating.
+            let mapped = unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(offset)
+                    .len(map_len)
+                    .map(&self.file)
+            };
+            if let Ok(mmap) = mapped {
+                let src = &mmap[..];
+                let mut slot = 0usize;
+                while slot < indices.len() {
+                    // Extend the run while the selection stays consecutive.
+                    let start = slot;
+                    while slot + 1 < indices.len() && indices[slot + 1] == indices[slot] + 1 {
+                        slot += 1;
+                    }
+                    slot += 1;
+                    let len = (slot - start) * self.value_size;
+                    let s = (indices[start] - lo) * self.value_size;
+                    let d = start * self.value_size;
+                    out[d..d + len].copy_from_slice(&src[s..s + len]);
+                }
+                return Ok(out);
+            }
+        }
+
+        for (slot, &index) in indices.iter().enumerate() {
             let src = (index * self.value_size) as u64;
             let dst = slot * self.value_size;
             self.file
