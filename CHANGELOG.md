@@ -6,6 +6,13 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
+## [0.3.1] - 2026-08-01
+
+### Performance
+
+- **storage:** Map the spanned region in FixedColumn::gather ([#221](https://github.com/hoodiecollin/forgedb/issues/221))
+- **storage:** Bound and map the spanned region in VariableColumn::gather_buffered ([#222](https://github.com/hoodiecollin/forgedb/issues/222))
+
 ## [0.3.0] - 2026-07-30
 
 ### Features
@@ -146,8 +153,6 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **codegen:** NAPI-RS Arrow columnar export (6b)
 - **codegen:** Typed row structs in NAPI and PyO3 wrappers
 - **codegen:** Async NAPI CRUD over a shared RwLock engine handle
-- **benchmarks:** Add ForgeDB-vs-SQLite benchmark harness (first cut)
-- **benchmarks:** Measure SQLite inserts at both durability levels
 - **codegen:** Add GenConfig for generate-time runtime-behavior knobs ([#126](https://github.com/hoodiecollin/forgedb/issues/126))
 - **cli:** Wire [runtime]/[storage] config into generate/build ([#127](https://github.com/hoodiecollin/forgedb/issues/127))
 - **storage:** Add sync_to_drive/barrier coalesced-durability primitives ([#153](https://github.com/hoodiecollin/forgedb/issues/153))
@@ -232,5 +237,4 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **codegen:** Narrow live-query re-run materialization ([#160](https://github.com/hoodiecollin/forgedb/issues/160))
 - **codegen:** Group commit — buffered staging, one barrier per txn ([#170](https://github.com/hoodiecollin/forgedb/issues/170))
 - **codegen:** Column-pruned projected buffered scan (#167/#168)
-- **benchmarks:** Projected scan_aggregate + fair bulk-load framing
 
