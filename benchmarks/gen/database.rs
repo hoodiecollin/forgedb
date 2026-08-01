@@ -9395,6 +9395,1525 @@ impl MetricStorageReader {
 fn validate_metric(record: &Metric) -> Result<(), ValidationError> {
     Ok(())
 }
+///Doc model
+#[repr(C)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Doc {
+    #[serde(default)]
+    pub id: Uuid,
+    pub seq: u64,
+    pub kind: u32,
+    pub body_a: String,
+    pub body_b: String,
+    pub body_c: String,
+    pub body_d: String,
+}
+///Projection `meta` of `Doc` (#113): materializes only PK + declared columns, leaving unselected columns unread.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DocMeta {
+    pub id: Uuid,
+    pub seq: u64,
+    pub kind: u32,
+}
+///Internal narrow scan record for `Doc` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+#[derive(Debug, Clone)]
+pub struct DocScanRow {
+    pub id: Uuid,
+    pub seq: u64,
+    pub kind: u32,
+    pub body_a: String,
+    pub body_b: String,
+    pub body_c: String,
+    pub body_d: String,
+}
+///Storage for Doc model
+pub struct DocStorage {
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
+    row_count: usize,
+    id_col: FixedColumn,
+    seq_col: FixedColumn,
+    kind_col: FixedColumn,
+    body_a_col: VariableColumn,
+    body_b_col: VariableColumn,
+    body_c_col: VariableColumn,
+    body_d_col: VariableColumn,
+    tombstones: forgedb_storage::Tombstones,
+    wal: forgedb_wal::WalManager,
+    writes_since_checkpoint: u64,
+    root: std::path::PathBuf,
+    dead_since_compaction: u64,
+    in_transaction: bool,
+    checkpoint_deferred: bool,
+    compact_deferred: bool,
+    compaction_due: bool,
+    changefeed: Option<forgedb_changefeed::ChangeFeed>,
+    broker: Option<
+        std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
+    >,
+}
+impl DocStorage {
+    /// Open the model's storage, rehydrating the in-memory identity
+    /// index from disk.  The column files are append-only and persist
+    /// across processes; this reconstructs `row_count` and `id_to_row`
+    /// so a fresh process reads data written by a previous one (#65).
+    ///
+    /// The row-count anchor is the tombstone file length (1 byte/row,
+    /// appended last per insert), so a torn insert (columns written
+    /// but the process died before the tombstone append) is excluded
+    /// and its orphaned column tail is overwritten by the next insert.
+    pub fn new() -> Self {
+        Self::new_at(std::path::Path::new("."))
+    }
+    /// Open the model's storage rooted at `root` (#59): every column
+    /// and the tombstone file is joined under it.  `new()` passes `.`
+    /// (the historical CWD-relative layout); a per-tenant process
+    /// passes that tenant's data dir, so filesystem isolation is the
+    /// directory boundary — no query logic, no schema read at runtime.
+    pub fn new_at(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("doc/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            seq_col: FixedColumn::new(root.join("doc/fixed/u64_1.bin"), 8usize)
+                .expect("Failed to create fixed column"),
+            kind_col: FixedColumn::new(root.join("doc/fixed/u32_2.bin"), 4usize)
+                .expect("Failed to create fixed column"),
+            body_a_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_3.bin"),
+                    root.join("doc/variable/string_offsets_3.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_b_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_4.bin"),
+                    root.join("doc/variable/string_offsets_4.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_c_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_5.bin"),
+                    root.join("doc/variable/string_offsets_5.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_d_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_6.bin"),
+                    root.join("doc/variable/string_offsets_6.bin"),
+                )
+                .expect("Failed to create variable column"),
+            tombstones: forgedb_storage::Tombstones::new(root.join("doc/tombstones.bin"))
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("doc/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
+        let n = db.tombstones.len();
+        db.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = db.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
+        }
+        db.write_manifest(root);
+        db
+    }
+    /// Reopen the column handles + recover `row_count`, WITHOUT the
+    /// O(rows × indexes) rehydrate scan (#162-C).  `compact()` uses this:
+    /// after the compaction rewrite renames every file, the open fds are
+    /// stale (a Unix rename leaves them on the old, now-unlinked inode),
+    /// so the handles must be reopened — but the in-memory maps are
+    /// remapped in place (a dense row renumber that needs no column
+    /// reads), so rebuilding them from a full rescan would be wasted work.
+    fn new_at_no_rehydrate(root: &std::path::Path) -> Self {
+        let mut db = Self {
+            id_to_row: std::sync::Arc::new(HashMap::new()),
+            id_versions: std::sync::Arc::new(HashMap::new()),
+            row_count: 0,
+            id_col: FixedColumn::new(root.join("doc/fixed/uuid_0.bin"), 16usize)
+                .expect("Failed to create fixed column"),
+            seq_col: FixedColumn::new(root.join("doc/fixed/u64_1.bin"), 8usize)
+                .expect("Failed to create fixed column"),
+            kind_col: FixedColumn::new(root.join("doc/fixed/u32_2.bin"), 4usize)
+                .expect("Failed to create fixed column"),
+            body_a_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_3.bin"),
+                    root.join("doc/variable/string_offsets_3.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_b_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_4.bin"),
+                    root.join("doc/variable/string_offsets_4.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_c_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_5.bin"),
+                    root.join("doc/variable/string_offsets_5.bin"),
+                )
+                .expect("Failed to create variable column"),
+            body_d_col: VariableColumn::new(
+                    root.join("doc/variable/string_data_6.bin"),
+                    root.join("doc/variable/string_offsets_6.bin"),
+                )
+                .expect("Failed to create variable column"),
+            tombstones: forgedb_storage::Tombstones::new(root.join("doc/tombstones.bin"))
+                .expect("Failed to create tombstones"),
+            wal: forgedb_wal::WalManager::open(
+                    root.join("doc/wal.log"),
+                    forgedb_wal::FsyncPolicy::Always,
+                )
+                .expect("Failed to open WAL"),
+            writes_since_checkpoint: 0,
+            root: root.to_path_buf(),
+            dead_since_compaction: 0,
+            in_transaction: false,
+            checkpoint_deferred: false,
+            compact_deferred: false,
+            compaction_due: false,
+            changefeed: None,
+            broker: None,
+        };
+        db.recover_from_wal();
+        db.write_manifest(root);
+        db
+    }
+    /// Write the physical-layout manifest for this model (#57).  Layout
+    /// metadata only — schema-blind backup/inspector read it; it carries
+    /// no `.forge` semantics.  Written at open, off the insert hot path.
+    fn write_manifest(&self, root: &std::path::Path) {
+        let columns = vec![
+            forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
+            forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
+            16usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path :
+            "fixed/uuid_0.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "seq".to_string(), column_type : forgedb_storage::ColumnType::U64,
+            column_index : 1usize, value_size : 8usize, kind :
+            forgedb_storage::ColumnKind::Fixed, relative_path : "fixed/u64_1.bin"
+            .to_string(), }, forgedb_storage::ColumnMetadata { name : "kind".to_string(),
+            column_type : forgedb_storage::ColumnType::U32, column_index : 2usize,
+            value_size : 4usize, kind : forgedb_storage::ColumnKind::Fixed, relative_path
+            : "fixed/u32_2.bin".to_string(), }, forgedb_storage::ColumnMetadata { name :
+            "body_a".to_string(), column_type : forgedb_storage::ColumnType::String,
+            column_index : 3usize, value_size : 0usize, kind :
+            forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_3.bin".to_string(), }, forgedb_storage::ColumnMetadata
+            { name : "body_b".to_string(), column_type :
+            forgedb_storage::ColumnType::String, column_index : 4usize, value_size :
+            0usize, kind : forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_4.bin".to_string(), }, forgedb_storage::ColumnMetadata
+            { name : "body_c".to_string(), column_type :
+            forgedb_storage::ColumnType::String, column_index : 5usize, value_size :
+            0usize, kind : forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_5.bin".to_string(), }, forgedb_storage::ColumnMetadata
+            { name : "body_d".to_string(), column_type :
+            forgedb_storage::ColumnType::String, column_index : 6usize, value_size :
+            0usize, kind : forgedb_storage::ColumnKind::Variable, relative_path :
+            "variable/string_data_6.bin".to_string(), }
+        ];
+        let __manifest_abs = root.join("doc/manifest.json");
+        let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.compaction_epoch)
+            .unwrap_or(0);
+        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.format_version)
+            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let manifest = forgedb_storage::Manifest {
+            schema_version: 1,
+            row_count: self.row_count,
+            columns,
+            wal_enabled: false,
+            last_checkpoint: self.row_count as u64,
+            compaction_epoch: __compaction_epoch,
+            format_version: __format_version,
+            row_anchor: Some(forgedb_storage::RowAnchor {
+                relative_path: "tombstones.bin".to_string(),
+                bytes_per_row: 1usize,
+            }),
+        };
+        let _ = manifest.save_to(&__manifest_abs);
+    }
+    /// Bump this model's `compaction_epoch` (#76): compaction renumbers
+    /// rows, breaking the append-only byte-tail chain incremental backups
+    /// rely on, so the epoch is incremented to invalidate any incremental
+    /// taken against a pre-compaction base.  Reads + rewrites the manifest
+    /// (temp + rename via `save_to`); best-effort, off the hot path.
+    fn bump_compaction_epoch(&self, root: &std::path::Path) {
+        let __manifest_abs = root.join("doc/manifest.json");
+        if let Ok(mut __m) = forgedb_storage::Manifest::load_from(&__manifest_abs) {
+            __m.compaction_epoch = __m.compaction_epoch.saturating_add(1);
+            let _ = __m.save_to(&__manifest_abs);
+        }
+    }
+    /// Attach a shared change feed (#62 Direction A).  Called by
+    /// `Database::new()`; afterwards each `insert` emits a field-blind
+    /// `(model, row_index)` signal into the feed.
+    pub fn attach_changefeed(&mut self, feed: forgedb_changefeed::ChangeFeed) {
+        self.changefeed = Some(feed);
+    }
+    /// Attach the shared durable replication broker (#82 Direction C).
+    /// Called by `Database::open_at()`; afterwards each mutation is
+    /// durably recorded (with the opaque row bytes + a global offset)
+    /// for a resumable follower, in addition to the change-feed emit.
+    pub fn attach_broker(
+        &mut self,
+        broker: Option<
+            std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>,
+        >,
+    ) {
+        self.broker = broker;
+    }
+    /// Insert a record.  Validates field constraints + `&unique` FIRST
+    /// (#91 Phase 3): a rejected insert commits nothing and returns
+    /// `Err(ValidationError)`; on success returns `Ok(id)`.  (Foreign-key
+    /// existence is checked by `Database::create_<model>`, which has the
+    /// sibling-collection access this storage-scoped method lacks.)
+    pub fn insert(&mut self, record: Doc) -> Result<Uuid, ValidationError> {
+        validate_doc(&record)?;
+        let row_index = self.row_count;
+        let id = record.id;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
+        {
+            let mut __wal_payload = Vec::new();
+            __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+            __wal_payload.push(0u8);
+            __wal_payload.extend_from_slice(&__record_json);
+            self.wal
+                .write(&forgedb_wal::WalEntry::raw("Doc", __wal_payload))
+                .expect("Failed to write WAL record");
+        }
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.seq_col.append_u64(record.seq).expect("Failed to append to column");
+        self.kind_col.append_u32(record.kind).expect("Failed to append to column");
+        self.body_a_col.append_string(&record.body_a).expect("Failed to append string");
+        self.body_b_col.append_string(&record.body_b).expect("Failed to append string");
+        self.body_c_col.append_string(&record.body_c).expect("Failed to append string");
+        self.body_d_col.append_string(&record.body_d).expect("Failed to append string");
+        self.tombstones.append(false).expect("Failed to append tombstone");
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
+        self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Doc", row_index, forgedb_changefeed::ChangeKind::Inserted);
+        }
+        if let Some(__broker) = &self.broker {
+            if let Ok(mut __b) = __broker.lock() {
+                let _ = __b
+                    .record(
+                        "Doc",
+                        row_index as u64,
+                        forgedb_changefeed::ChangeKind::Inserted,
+                        __record_json,
+                    );
+            }
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
+        }
+        Ok(id)
+    }
+    /// Append a superseding version of an existing record (#66).
+    /// Reads resolve newest-version-wins; the prior version's bytes are
+    /// never mutated, so append-only (and thus backup / snapshots) hold.
+    /// Validates field constraints + `&unique` FIRST (#91): a rejected
+    /// update commits nothing and returns `Err(ValidationError)`.
+    /// `Ok(false)` if `id` is absent; `Ok(true)` on a successful update.
+    /// Storage grows with each update until compaction reclaims versions.
+    /// (Foreign-key existence is checked by `Database::update_<model>`,
+    /// which has sibling-collection access this storage-scoped method lacks.)
+    pub fn update(&mut self, id: Uuid, record: Doc) -> Result<bool, ValidationError> {
+        if !self.id_to_row.contains_key(&id) {
+            return Ok(false);
+        }
+        validate_doc(&record)?;
+        let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
+        {
+            let mut __wal_payload = Vec::new();
+            __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+            __wal_payload.push(0u8);
+            __wal_payload.extend_from_slice(&__record_json);
+            self.wal
+                .write(&forgedb_wal::WalEntry::raw("Doc", __wal_payload))
+                .expect("Failed to write WAL record");
+        }
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.seq_col.append_u64(record.seq).expect("Failed to append to column");
+        self.kind_col.append_u32(record.kind).expect("Failed to append to column");
+        self.body_a_col.append_string(&record.body_a).expect("Failed to append string");
+        self.body_b_col.append_string(&record.body_b).expect("Failed to append string");
+        self.body_c_col.append_string(&record.body_c).expect("Failed to append string");
+        self.body_d_col.append_string(&record.body_d).expect("Failed to append string");
+        self.tombstones.append(false).expect("Failed to append tombstone");
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
+        self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Doc", row_index, forgedb_changefeed::ChangeKind::Updated);
+        }
+        if let Some(__broker) = &self.broker {
+            if let Ok(mut __b) = __broker.lock() {
+                let _ = __b
+                    .record(
+                        "Doc",
+                        row_index as u64,
+                        forgedb_changefeed::ChangeKind::Updated,
+                        __record_json,
+                    );
+            }
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
+        }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            if self.in_transaction {
+                self.compact_deferred = true;
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
+                self.compact();
+            } else {
+                self.compaction_due = true;
+            }
+        }
+        Ok(true)
+    }
+    /// Logically delete a record by appending a tombstoned superseding
+    /// version (#66).  `get` then reads the row as absent.  Returns
+    /// `false` if `id` is already absent.  Prior versions stay committed
+    /// (backup-faithful) until compaction reclaims them.
+    pub fn delete(&mut self, id: Uuid) -> bool {
+        let record = match self.get(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        let deleted_row = *self
+            .id_to_row
+            .get(&id)
+            .expect("id present: get succeeded above");
+        let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
+        {
+            let mut __wal_payload = Vec::new();
+            __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+            __wal_payload.push(1u8);
+            __wal_payload.extend_from_slice(&__record_json);
+            self.wal
+                .write(&forgedb_wal::WalEntry::raw("Doc", __wal_payload))
+                .expect("Failed to write WAL record");
+        }
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.seq_col.append_u64(record.seq).expect("Failed to append to column");
+        self.kind_col.append_u32(record.kind).expect("Failed to append to column");
+        self.body_a_col.append_string(&record.body_a).expect("Failed to append string");
+        self.body_b_col.append_string(&record.body_b).expect("Failed to append string");
+        self.body_c_col.append_string(&record.body_c).expect("Failed to append string");
+        self.body_d_col.append_string(&record.body_d).expect("Failed to append string");
+        self.tombstones.append(true).expect("Failed to append tombstone");
+        std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, row_index);
+        std::sync::Arc::make_mut(&mut self.id_versions)
+            .entry(id)
+            .or_default()
+            .push(row_index);
+        self.row_count += 1;
+        if let Some(feed) = &self.changefeed {
+            feed.emit("Doc", deleted_row, forgedb_changefeed::ChangeKind::Deleted);
+        }
+        if let Some(__broker) = &self.broker {
+            if let Ok(mut __b) = __broker.lock() {
+                let _ = __b
+                    .record(
+                        "Doc",
+                        row_index as u64,
+                        forgedb_changefeed::ChangeKind::Deleted,
+                        __record_json,
+                    );
+            }
+        }
+        self.writes_since_checkpoint += 1;
+        if self.writes_since_checkpoint >= WAL_CHECKPOINT_INTERVAL {
+            if self.in_transaction {
+                self.checkpoint_deferred = true;
+            } else {
+                self.checkpoint();
+            }
+        }
+        self.dead_since_compaction += 1;
+        if self.dead_since_compaction >= COMPACTION_DEAD_THRESHOLD {
+            if self.in_transaction {
+                self.compact_deferred = true;
+            } else if self.dead_since_compaction
+                >= COMPACTION_DEAD_THRESHOLD * COMPACTION_DEAD_CEILING_FACTOR
+            {
+                self.compaction_due = false;
+                self.compact();
+            } else {
+                self.compaction_due = true;
+            }
+        }
+        true
+    }
+    /// Apply a replicated change for this model on the read-replica
+    /// follower (#110).  Decodes the opaque row bytes the server journaled
+    /// and replays through the same generated mutation surface.  The
+    /// follower never decodes a field to *route* — `Database::apply_frame`
+    /// already dispatched by the model tag; this only materializes the
+    /// typed record to *apply* it.
+    pub fn apply(
+        &mut self,
+        kind: forgedb_changefeed::ChangeKind,
+        bytes: &[u8],
+    ) -> Result<(), ApplyError> {
+        match kind {
+            forgedb_changefeed::ChangeKind::Inserted => {
+                let record: Doc = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                self.insert(record)?;
+            }
+            forgedb_changefeed::ChangeKind::Updated => {
+                let record: Doc = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.update(id, record)?;
+            }
+            forgedb_changefeed::ChangeKind::Deleted => {
+                let record: Doc = serde_json::from_slice(bytes)
+                    .map_err(|e| ApplyError::Decode(e.to_string()))?;
+                let id = record.id;
+                self.delete(id);
+            }
+            forgedb_changefeed::ChangeKind::Linked => {}
+        }
+        Ok(())
+    }
+    /// Flush this model's columns + tombstones (#110 additive commit).
+    /// Native fsync; wasm arena no-op (durability at the transport's
+    /// IndexedDB/OPFS write boundary).
+    pub fn commit(&mut self) -> std::io::Result<()> {
+        self.id_col.sync_to_drive()?;
+        self.seq_col.sync_to_drive()?;
+        self.kind_col.sync_to_drive()?;
+        self.body_a_col.sync_to_drive()?;
+        self.body_b_col.sync_to_drive()?;
+        self.body_c_col.sync_to_drive()?;
+        self.body_d_col.sync_to_drive()?;
+        self.tombstones.sync_to_drive()?;
+        self.tombstones.barrier()?;
+        Ok(())
+    }
+    fn recover_from_wal(&mut self) {
+        let __anchor = self.tombstones.len();
+        while self.id_col.len() < __anchor {
+            self.id_col.append_uuid([0u8; 16]).expect("Failed to backfill column");
+        }
+        while self.seq_col.len() < __anchor {
+            self.seq_col.append_u64(0).expect("Failed to backfill column");
+        }
+        while self.kind_col.len() < __anchor {
+            self.kind_col.append_u32(0).expect("Failed to backfill column");
+        }
+        while self.body_a_col.len() < __anchor {
+            self.body_a_col.append_string("").expect("Failed to backfill string column");
+        }
+        while self.body_b_col.len() < __anchor {
+            self.body_b_col.append_string("").expect("Failed to backfill string column");
+        }
+        while self.body_c_col.len() < __anchor {
+            self.body_c_col.append_string("").expect("Failed to backfill string column");
+        }
+        while self.body_d_col.len() < __anchor {
+            self.body_d_col.append_string("").expect("Failed to backfill string column");
+        }
+        self.id_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.seq_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.kind_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.body_a_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.body_b_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.body_c_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.body_d_col
+            .truncate_to_rows(__anchor)
+            .expect("Failed to truncate column on recovery");
+        self.row_count = __anchor;
+        let __entries = self
+            .wal
+            .replay(|_| -> std::io::Result<()> { Ok(()) })
+            .expect("Failed to replay WAL on recovery");
+        for __entry in &__entries {
+            if let forgedb_wal::WalOperation::Raw { payload } = &__entry.operation {
+                if payload.len() < 9 {
+                    continue;
+                }
+                let mut __ri = [0u8; 8];
+                __ri.copy_from_slice(&payload[0..8]);
+                let __row_index = u64::from_le_bytes(__ri) as usize;
+                if __row_index < self.row_count {
+                    continue;
+                }
+                let __deleted = payload[8] != 0;
+                let record: Doc = match serde_json::from_slice(&payload[9..]) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                self.id_col
+                    .append_uuid(*record.id.as_bytes())
+                    .expect("Failed to append to column");
+                self.seq_col.append_u64(record.seq).expect("Failed to append to column");
+                self.kind_col
+                    .append_u32(record.kind)
+                    .expect("Failed to append to column");
+                self.body_a_col
+                    .append_string(&record.body_a)
+                    .expect("Failed to append string");
+                self.body_b_col
+                    .append_string(&record.body_b)
+                    .expect("Failed to append string");
+                self.body_c_col
+                    .append_string(&record.body_c)
+                    .expect("Failed to append string");
+                self.body_d_col
+                    .append_string(&record.body_d)
+                    .expect("Failed to append string");
+                self.tombstones
+                    .append(__deleted)
+                    .expect("Failed to append tombstone on recovery");
+                self.row_count += 1;
+            }
+        }
+    }
+    /// Force a WAL checkpoint (#89 step 2): fsync this model's columns,
+    /// then truncate its WAL.  Bounds the WAL and shortens reopen; not
+    /// required for correctness (recovery reads the column lengths).
+    pub fn checkpoint(&mut self) {
+        self.id_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.seq_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.kind_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.body_a_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.body_b_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.body_c_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.body_d_col
+            .sync_to_drive()
+            .expect("Failed to sync column to drive on checkpoint");
+        self.tombstones
+            .sync_to_drive()
+            .expect("Failed to sync tombstones to drive on checkpoint");
+        self.tombstones.barrier().expect("Failed to issue checkpoint device barrier");
+        self.wal.truncate().expect("Failed to truncate WAL on checkpoint");
+        self.writes_since_checkpoint = 0;
+    }
+    /// Reclaim dead row versions in-process (#92 Phase 4): checkpoint,
+    /// rewrite this model's files dropping dead rows, then reopen the column
+    /// handles and remap `id_to_row` / `id_versions` in place (#162-C) — the
+    /// secondary indexes (value→id keyed) carry over unchanged.
+    pub fn compact(&mut self) {
+        if self.in_transaction {
+            self.compact_deferred = true;
+            return;
+        }
+        self.checkpoint();
+        let mut __keep: Vec<usize> = Vec::with_capacity(self.id_to_row.len());
+        for &__row in self.id_to_row.values() {
+            if !self.tombstones.is_deleted(__row).unwrap_or(false) {
+                __keep.push(__row);
+            }
+        }
+        let __config = forgedb_compaction::CompactionConfig::default();
+        let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
+        if __compactor.compact_model_keeping("doc", &__keep).is_ok() {
+            let mut __keep_sorted = __keep;
+            __keep_sorted.sort_unstable();
+            let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __root = self.root.clone();
+            let __feed = self.changefeed.take();
+            let __broker = self.broker.take();
+            *self = Self::new_at_no_rehydrate(&__root);
+            self.changefeed = __feed;
+            self.broker = __broker;
+            let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> = std::collections::HashMap::with_capacity(
+                __old_id_to_row.len(),
+            );
+            for (&__id, &__old_row) in __old_id_to_row.iter() {
+                if __keep_sorted.binary_search(&__old_row).is_ok() {
+                    let __new_row = __keep_sorted
+                        .partition_point(|&__r| __r < __old_row);
+                    __new_id_to_row.insert(__id, __new_row);
+                    __new_id_versions.insert(__id, vec![__new_row]);
+                }
+            }
+            self.id_to_row = std::sync::Arc::new(__new_id_to_row);
+            self.id_versions = std::sync::Arc::new(__new_id_versions);
+            self.bump_compaction_epoch(&__root);
+        }
+        self.dead_since_compaction = 0;
+        self.compaction_due = false;
+    }
+    /// Run a compaction the write path deferred off the hot turn (#162-A).
+    /// The soft dead-row threshold only sets `compaction_due` so a user
+    /// write never stalls on the rewrite+remap; an operator / coordinator
+    /// idle turn calls `Database::maintain()`, which routes here — so the
+    /// reclaim happens off the write path.  A no-op when nothing is due (or
+    /// mid-transaction, where `compact()` would itself defer).
+    pub fn maintain(&mut self) {
+        if self.compaction_due && !self.in_transaction {
+            self.compaction_due = false;
+            self.compact();
+        }
+    }
+    /// Rebuild `id_to_row` + secondary indexes from the committed prefix
+    /// in place (MVCC Tier 1, #83).  A transaction stages rows via
+    /// `__stage_append`, which deliberately does NOT touch the identity or
+    /// secondary index maps; its `commit` calls this once per touched
+    /// collection to make the newly-visible rows resolvable.  It clears the
+    /// maps and re-runs the SAME reopen-rehydration body `new_at` uses
+    /// (last-write-wins per id, tombstone-gated index keys), so the maps
+    /// end up exactly as a fresh reopen would build them — no incremental
+    /// remove-old/add-new bookkeeping to drift.
+    pub fn __reindex_committed(&mut self) {
+        std::sync::Arc::make_mut(&mut self.id_to_row).clear();
+        std::sync::Arc::make_mut(&mut self.id_versions).clear();
+        let n = self.tombstones.len();
+        self.row_count = n;
+        for i in 0..n {
+            let id = {
+                let bytes = self.id_col.read_uuid(i).expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, i);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(i);
+        }
+    }
+    /// Fold only the rows in `[from..row_count)` into the in-memory maps
+    /// (#161-B).  Reuses the live update/delete index maintenance per row,
+    /// so the maps end up exactly as `__reindex_committed` would rebuild
+    /// them — but in O(new rows), not O(all rows × indexes).  A no-op when
+    /// `from >= row_count`.
+    pub fn __reindex_delta(&mut self, from: usize) {
+        let __n = self.row_count;
+        for __r in from..__n {
+            let id = {
+                let bytes = self
+                    .id_col
+                    .read_uuid(__r)
+                    .expect("Failed to read id column");
+                Uuid::from_bytes(bytes)
+            };
+            let __deleted = self.tombstones.is_deleted(__r).unwrap_or(false);
+            std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
+            std::sync::Arc::make_mut(&mut self.id_versions)
+                .entry(id)
+                .or_default()
+                .push(__r);
+            if !__deleted {}
+        }
+    }
+    /// Refresh EVERY column + the tombstone's in-memory `row_count` from
+    /// the on-disk file lengths, then adopt the peer-visible row count
+    /// (MVCC Tier 3, #84 — peer read-currency).  Reads are positional and
+    /// bounded by each column's cached `row_count`; a *peer* process's
+    /// appended rows stay invisible until this re-derives those counts
+    /// from the shared files.  Syncing ONLY the tombstone (as an earlier
+    /// cut did) bumps the row count but leaves every data column bounded
+    /// at its open-time length, so `get`/`read_at` of a peer row reads out
+    /// of bounds — this syncs them all.  Uses the additive
+    /// `*::sync_from_disk` substrate (`storage-native`); writes nothing
+    /// (T3-8: generated data-plane read-refresh, no column append/flush).
+    /// Caller pairs this with `__reindex_committed` to rebuild the maps.
+    pub fn __sync_columns_from_disk(&mut self) {
+        let _ = self.id_col.sync_from_disk();
+        let _ = self.seq_col.sync_from_disk();
+        let _ = self.kind_col.sync_from_disk();
+        let _ = self.body_a_col.sync_from_disk();
+        let _ = self.body_b_col.sync_from_disk();
+        let _ = self.body_c_col.sync_from_disk();
+        let _ = self.body_d_col.sync_from_disk();
+        let _ = self.tombstones.sync_from_disk();
+        self.row_count = self.tombstones.len();
+    }
+    /// Truncate every column + the tombstone back to `rows` (MVCC Tier 1,
+    /// #83).  The transaction rollback primitive: erases staged ahead-rows
+    /// so the collection returns to its pre-txn physical length.  Reuses the
+    /// published `truncate_to_rows` on each column type (no substrate change).
+    /// A no-op past the current length (nothing staged).
+    pub fn __truncate_all_to(&mut self, rows: usize) -> std::io::Result<()> {
+        self.id_col.truncate_to_rows(rows)?;
+        self.seq_col.truncate_to_rows(rows)?;
+        self.kind_col.truncate_to_rows(rows)?;
+        self.body_a_col.truncate_to_rows(rows)?;
+        self.body_b_col.truncate_to_rows(rows)?;
+        self.body_c_col.truncate_to_rows(rows)?;
+        self.body_d_col.truncate_to_rows(rows)?;
+        self.tombstones.truncate_to_rows(rows)?;
+        Ok(())
+    }
+    /// Journal-driven recovery to a committed row-count (MVCC Tier 1, #83,
+    /// M1b).  Called at `open_at` when the `_txn_journal` names a committed
+    /// length for this model that is BELOW the length the columns/WAL
+    /// recovered to — i.e. a transaction staged rows into this collection
+    /// but its journal commit record never landed (a torn / aborted
+    /// commit).  Truncate every column + the tombstone back to
+    /// `committed_len` (erasing the aborted ahead-rows), discard the WAL
+    /// (the committed prefix is already durable in the columns, and the
+    /// aborted staged WAL records must not replay), then reopen to rebuild
+    /// `id_to_row` + secondary indexes from the truncated committed prefix.
+    /// A no-op when `committed_len >= row_count` (nothing aborted).
+    pub fn __recover_to_committed(&mut self, committed_len: usize) {
+        if committed_len >= self.row_count {
+            return;
+        }
+        self.id_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.seq_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.kind_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.body_a_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.body_b_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.body_c_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.body_d_col
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate column on journal recovery");
+        self.tombstones
+            .truncate_to_rows(committed_len)
+            .expect("Failed to truncate tombstones on journal recovery");
+        self.row_count = committed_len;
+        self.wal.truncate().expect("Failed to truncate WAL on journal recovery");
+        let __root = self.root.clone();
+        let __feed = self.changefeed.take();
+        let __broker = self.broker.take();
+        *self = Self::new_at(&__root);
+        self.changefeed = __feed;
+        self.broker = __broker;
+    }
+    /// Stage one physically-appended row for a transaction (MVCC Tier 1,
+    /// #83).  WAL-records the row (durable, `FsyncPolicy::Always`) then
+    /// appends every column + the tombstone at the current physical row
+    /// index, bumps `row_count`, and returns that index — WITHOUT touching
+    /// `id_to_row`, secondary indexes, the change feed, the broker, or the
+    /// checkpoint counter.  The transaction's `commit` applies those
+    /// deferred effects once, atomically; a `rollback` truncates every
+    /// staged row + the staged WAL tail back to the pre-txn mark.  The row
+    /// is invisible to outside readers (whose `get`/`all` clamp at the
+    /// public watermark) until commit advances the watermark past it.
+    pub fn __stage_append(&mut self, record: Doc, deleted: bool) -> usize {
+        let row_index = self.row_count;
+        let __record_json = serde_json::to_vec(&record)
+            .expect("Failed to serialize record");
+        if deleted {
+            {
+                let mut __wal_payload = Vec::new();
+                __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+                __wal_payload.push(1u8);
+                __wal_payload.extend_from_slice(&__record_json);
+                self.wal
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Doc", __wal_payload))
+                    .expect("Failed to write WAL record");
+            }
+        } else {
+            {
+                let mut __wal_payload = Vec::new();
+                __wal_payload.extend_from_slice(&(self.row_count as u64).to_le_bytes());
+                __wal_payload.push(0u8);
+                __wal_payload.extend_from_slice(&__record_json);
+                self.wal
+                    .write_buffered(&forgedb_wal::WalEntry::raw("Doc", __wal_payload))
+                    .expect("Failed to write WAL record");
+            }
+        }
+        self.id_col
+            .append_uuid(*record.id.as_bytes())
+            .expect("Failed to append to column");
+        self.seq_col.append_u64(record.seq).expect("Failed to append to column");
+        self.kind_col.append_u32(record.kind).expect("Failed to append to column");
+        self.body_a_col.append_string(&record.body_a).expect("Failed to append string");
+        self.body_b_col.append_string(&record.body_b).expect("Failed to append string");
+        self.body_c_col.append_string(&record.body_c).expect("Failed to append string");
+        self.body_d_col.append_string(&record.body_d).expect("Failed to append string");
+        self.tombstones.append(deleted).expect("Failed to append tombstone");
+        self.row_count += 1;
+        row_index
+    }
+    /// Run any checkpoint/compaction the transaction guard deferred (MVCC
+    /// Tier 1, #83).  Called by `TxHandle::commit`/rollback once the
+    /// critical section closes and `in_transaction` is cleared, so the
+    /// #96/#92 auto-maintenance still runs — just after the transaction,
+    /// never underneath its rollback marks.  Compaction subsumes a
+    /// checkpoint, so if both are due only compaction runs.
+    pub fn run_deferred_maintenance(&mut self) {
+        if self.compact_deferred {
+            self.compact_deferred = false;
+            self.checkpoint_deferred = false;
+            self.compact();
+        } else if self.checkpoint_deferred {
+            self.checkpoint_deferred = false;
+            self.checkpoint();
+        }
+    }
+    /// Materialize the record at a physical row index, or `None` if
+    /// the row is tombstoned.  Shared read path (#56): `get`,
+    /// `get_at`, and `all_at` all funnel through here.  Public so the
+    /// generated change-feed WS handler (#62) can turn a broadcast
+    /// `(model, row_index)` signal into a typed record.
+    pub fn read_at(&self, row_index: usize) -> Option<Doc> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let seq_value = self
+            .seq_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let kind_value = self
+            .kind_col
+            .read_u32(row_index)
+            .expect("Failed to read from column");
+        let body_a_value = self
+            .body_a_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_b_value = self
+            .body_b_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_c_value = self
+            .body_c_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_d_value = self
+            .body_d_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        Some(Doc {
+            id: id_value,
+            seq: seq_value,
+            kind: kind_value,
+            body_a: body_a_value,
+            body_b: body_b_value,
+            body_c: body_c_value,
+            body_d: body_d_value,
+        })
+    }
+    pub fn get(&self, id: Uuid) -> Option<Doc> {
+        let row_index = *self.id_to_row.get(&id)?;
+        self.read_at(row_index)
+    }
+    /// The number of physically committed rows (the snapshot
+    /// watermark).  Append-only storage guarantees a row's index is
+    /// stable for life, so this count fully defines a read view.
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+    /// Capture a read snapshot at the current committed row count
+    /// (#56, Direction A).  Rows appended after this call are
+    /// invisible to accessors passed the returned snapshot.
+    pub fn snapshot(&self) -> forgedb_storage::Snapshot {
+        forgedb_storage::Snapshot::new(self.row_count)
+    }
+    /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+    /// of `id` committed as of `snap`.  A snapshot captured before a later
+    /// update/delete still resolves the version live as-of capture; a
+    /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
+    pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Doc> {
+        let watermark = snap.watermark();
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
+        }
+        self.read_at(versions[pos - 1])
+    }
+    /// Return every live record committed as of `snap` (#56 + #66).
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
+    pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Doc> {
+        let watermark = snap.watermark();
+        let mut records = Vec::new();
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
+            }
+        }
+        records
+    }
+    /// Return every live (non-deleted) record.  Used by generated
+    /// reverse-relation traversal helpers, which filter this by a
+    /// foreign key.  Order is unspecified (follows the id map).
+    pub fn all(&self) -> Vec<Doc> {
+        let mut records = Vec::new();
+        for id in self.id_to_row.keys() {
+            if let Some(record) = self.get(*id) {
+                records.push(record);
+            }
+        }
+        records
+    }
+    /// The live physical row indices (newest, non-tombstoned version per
+    /// id) in **ascending physical order** — the row set the Arrow
+    /// columnar export reads. Same liveness as `all()`, but tombstone-only
+    /// (no full-record decode). Sorting is load-bearing: on a clean table
+    /// (all inserts, no updates/deletes) the live set is exactly the dense
+    /// prefix `[0, n)`, which lets `export_col_<f>` take the zero-copy
+    /// `mmap` alias fast path; an update/delete-scattered live set sorts to
+    /// a non-prefix and falls back to a gathered copy. Deterministic and
+    /// consistent across every `export_col_*` call within one export batch.
+    pub fn export_live_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for &row in self.id_to_row.values() {
+            if !self.tombstones.is_deleted(row).unwrap_or(true) {
+                indices.push(row);
+            }
+        }
+        indices.sort_unstable();
+        indices
+    }
+    /// Export this column's bytes at the given physical row indices
+    /// (the Arrow columnar-export path). Returns a
+    /// `forgedb_storage::ColumnExport` that is a **zero-copy mmap
+    /// alias** of the on-disk column when `indices` is a dense
+    /// prefix `[0, n)` (no updates/tombstones) and a gathered copy
+    /// otherwise — the ABI is identical either way. The alias-or-copy
+    /// decision over the opaque indices is the storage primitive's;
+    /// the live-set decision stays here (`export_live_indices`).
+    pub fn export_col_id(
+        &self,
+        indices: &[usize],
+    ) -> std::io::Result<forgedb_storage::ColumnExport> {
+        self.id_col.export(indices)
+    }
+    /// Export this column's bytes at the given physical row indices
+    /// (the Arrow columnar-export path). Returns a
+    /// `forgedb_storage::ColumnExport` that is a **zero-copy mmap
+    /// alias** of the on-disk column when `indices` is a dense
+    /// prefix `[0, n)` (no updates/tombstones) and a gathered copy
+    /// otherwise — the ABI is identical either way. The alias-or-copy
+    /// decision over the opaque indices is the storage primitive's;
+    /// the live-set decision stays here (`export_live_indices`).
+    pub fn export_col_seq(
+        &self,
+        indices: &[usize],
+    ) -> std::io::Result<forgedb_storage::ColumnExport> {
+        self.seq_col.export(indices)
+    }
+    /// Export this column's bytes at the given physical row indices
+    /// (the Arrow columnar-export path). Returns a
+    /// `forgedb_storage::ColumnExport` that is a **zero-copy mmap
+    /// alias** of the on-disk column when `indices` is a dense
+    /// prefix `[0, n)` (no updates/tombstones) and a gathered copy
+    /// otherwise — the ABI is identical either way. The alias-or-copy
+    /// decision over the opaque indices is the storage primitive's;
+    /// the live-set decision stays here (`export_live_indices`).
+    pub fn export_col_kind(
+        &self,
+        indices: &[usize],
+    ) -> std::io::Result<forgedb_storage::ColumnExport> {
+        self.kind_col.export(indices)
+    }
+    /// Resolve the newest committed row of `id` as of `snap`
+    /// (#113 projection `_at` support; same logic as `get_at`).
+    /// #159: binary-search the id's version list, not an O(watermark) scan.
+    fn __proj_resolve_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        id: Uuid,
+    ) -> Option<usize> {
+        let watermark = snap.watermark();
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
+        }
+        Some(versions[pos - 1])
+    }
+    /// Row indices of every live record as of `snap` — the newest
+    /// version per id (#113; same logic as `all_at`).  #159: resolve via
+    /// each id's version list instead of two O(watermark) passes.
+    fn __proj_live_rows_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<usize> {
+        let watermark = snap.watermark();
+        let mut rows = Vec::new();
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            rows.push(versions[pos - 1]);
+        }
+        rows
+    }
+    /// Read the projection at a physical row index (subset decode —
+    /// only the projected columns are touched).
+    pub fn read_meta_at(&self, row_index: usize) -> Option<DocMeta> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let seq_value = self
+            .seq_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let kind_value = self
+            .kind_col
+            .read_u32(row_index)
+            .expect("Failed to read from column");
+        Some(DocMeta {
+            id: id_value,
+            seq: seq_value,
+            kind: kind_value,
+        })
+    }
+    /// Fetch the projection for `id` from the live newest version.
+    pub fn get_meta(&self, id: Uuid) -> Option<DocMeta> {
+        let row_index = *self.id_to_row.get(&id)?;
+        self.read_meta_at(row_index)
+    }
+    ///Every live record as projection `meta` (#113 + #168): buffered narrow scan bulk-loading only the projected columns, skipping unselected ones entirely.
+    pub fn all_meta(&self) -> Vec<DocMeta> {
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __DocMetaScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            seq_col: forgedb_storage::BufferedFixedColumn,
+            kind_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __DocMetaScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            seq_col: self
+                .seq_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            kind_col: self
+                .kind_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let seq_value = __bufs
+                .seq_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let kind_value = __bufs
+                .kind_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            rows.push(DocMeta {
+                id: id_value,
+                seq: seq_value,
+                kind: kind_value,
+            });
+        }
+        rows
+    }
+    /// Snapshot-scoped projection point read (#56 + #113).
+    pub fn get_meta_at(
+        &self,
+        snap: &forgedb_storage::Snapshot,
+        id: Uuid,
+    ) -> Option<DocMeta> {
+        let row_index = self.__proj_resolve_at(snap, id)?;
+        self.read_meta_at(row_index)
+    }
+    /// Snapshot-scoped projection scan (#56 + #113).
+    pub fn all_meta_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<DocMeta> {
+        let mut records = Vec::new();
+        for row_index in self.__proj_live_rows_at(snap) {
+            if let Some(record) = self.read_meta_at(row_index) {
+                records.push(record);
+            }
+        }
+        records
+    }
+    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
+    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
+    /// candidate rows and reads them individually.
+    fn __scan_row_at(&self, row_index: usize) -> Option<DocScanRow> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let seq_value = self
+            .seq_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let kind_value = self
+            .kind_col
+            .read_u32(row_index)
+            .expect("Failed to read from column");
+        let body_a_value = self
+            .body_a_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_b_value = self
+            .body_b_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_c_value = self
+            .body_c_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_d_value = self
+            .body_d_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        Some(DocScanRow {
+            id: id_value,
+            seq: seq_value,
+            kind: kind_value,
+            body_a: body_a_value,
+            body_b: body_b_value,
+            body_c: body_c_value,
+            body_d: body_d_value,
+        })
+    }
+    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
+    pub fn __scan_all(&self) -> Vec<DocScanRow> {
+        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
+        __rows.sort_unstable();
+        let __rows = self
+            .tombstones
+            .live_indices(&__rows)
+            .expect("Failed to read tombstone liveness");
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __DocScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            seq_col: forgedb_storage::BufferedFixedColumn,
+            kind_col: forgedb_storage::BufferedFixedColumn,
+            body_a_col: forgedb_storage::BufferedVariableColumn,
+            body_b_col: forgedb_storage::BufferedVariableColumn,
+            body_c_col: forgedb_storage::BufferedVariableColumn,
+            body_d_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __DocScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            seq_col: self
+                .seq_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            kind_col: self
+                .kind_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_a_col: self
+                .body_a_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_b_col: self
+                .body_b_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_c_col: self
+                .body_c_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_d_col: self
+                .body_d_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut rows = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let seq_value = __bufs
+                .seq_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let kind_value = __bufs
+                .kind_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let body_a_value = __bufs
+                .body_a_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let body_b_value = __bufs
+                .body_b_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let body_c_value = __bufs
+                .body_c_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            let body_d_value = __bufs
+                .body_d_col
+                .read_string(__slot)
+                .expect("Failed to read string");
+            rows.push(DocScanRow {
+                id: id_value,
+                seq: seq_value,
+                kind: kind_value,
+                body_a: body_a_value,
+                body_b: body_b_value,
+                body_c: body_c_value,
+                body_d: body_d_value,
+            });
+        }
+        rows
+    }
+    /// Open a read-only handle over this storage (#56 Direction B).
+    /// The handle shares this storage's column files via independent
+    /// (`try_clone`d) descriptors, so it reads the committed prefix
+    /// lock-free — concurrently with, and never blocking, the single
+    /// `&mut self` writer.  Pair it with a `DatabaseSnapshot` captured
+    /// on the writer for a cross-model-consistent read view.
+    pub fn reader(&self) -> DocStorageReader {
+        DocStorageReader {
+            id_to_row: self.id_to_row.clone(),
+            id_versions: self.id_versions.clone(),
+            id_col: self.id_col.reader().expect("Failed to open column reader"),
+            seq_col: self.seq_col.reader().expect("Failed to open column reader"),
+            kind_col: self.kind_col.reader().expect("Failed to open column reader"),
+            body_a_col: self.body_a_col.reader().expect("Failed to open column reader"),
+            body_b_col: self.body_b_col.reader().expect("Failed to open column reader"),
+            body_c_col: self.body_c_col.reader().expect("Failed to open column reader"),
+            body_d_col: self.body_d_col.reader().expect("Failed to open column reader"),
+            tombstones: self
+                .tombstones
+                .reader()
+                .expect("Failed to open tombstones reader"),
+        }
+    }
+}
+///Read-only, lock-free reader handle for Doc storage (#56 Direction B)
+pub struct DocStorageReader {
+    id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
+    id_versions: std::sync::Arc<HashMap<Uuid, Vec<usize>>>,
+    id_col: forgedb_storage::FixedColumnReader,
+    seq_col: forgedb_storage::FixedColumnReader,
+    kind_col: forgedb_storage::FixedColumnReader,
+    body_a_col: forgedb_storage::VariableColumnReader,
+    body_b_col: forgedb_storage::VariableColumnReader,
+    body_c_col: forgedb_storage::VariableColumnReader,
+    body_d_col: forgedb_storage::VariableColumnReader,
+    tombstones: forgedb_storage::TombstonesReader,
+}
+impl DocStorageReader {
+    /// Materialize the record at a physical row index (or `None` if
+    /// tombstoned) — the same shared read path as the writer storage,
+    /// reading through the shared-fd reader columns (#56 Direction B).
+    pub fn read_at(&self, row_index: usize) -> Option<Doc> {
+        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
+            return None;
+        }
+        let id_value = {
+            let bytes = self
+                .id_col
+                .read_uuid(row_index)
+                .expect("Failed to read from column");
+            Uuid::from_bytes(bytes)
+        };
+        let seq_value = self
+            .seq_col
+            .read_u64(row_index)
+            .expect("Failed to read from column");
+        let kind_value = self
+            .kind_col
+            .read_u32(row_index)
+            .expect("Failed to read from column");
+        let body_a_value = self
+            .body_a_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_b_value = self
+            .body_b_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_c_value = self
+            .body_c_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        let body_d_value = self
+            .body_d_col
+            .read_string(row_index)
+            .expect("Failed to read string");
+        Some(Doc {
+            id: id_value,
+            seq: seq_value,
+            kind: kind_value,
+            body_a: body_a_value,
+            body_b: body_b_value,
+            body_c: body_c_value,
+            body_d: body_d_value,
+        })
+    }
+    /// Snapshot-scoped point read (#56 + #66): resolve the newest version
+    /// of `id` committed as of `snap`.  A snapshot captured before a later
+    /// update/delete still resolves the version live as-of capture; a
+    /// tombstoned newest reads as `None` (deleted as-of the snapshot).
+    ///
+    /// #159: binary-search the id's ascending version list for the newest
+    /// physical row `< watermark` — O(log versions), not an O(watermark)
+    /// id-column scan (which made the FK snapshot-probe quadratic).
+    pub fn get_at(&self, snap: &forgedb_storage::Snapshot, id: Uuid) -> Option<Doc> {
+        let watermark = snap.watermark();
+        let versions = self.id_versions.get(&id)?;
+        let pos = versions.partition_point(|&r| r < watermark);
+        if pos == 0 {
+            return None;
+        }
+        self.read_at(versions[pos - 1])
+    }
+    /// Return every live record committed as of `snap` (#56 + #66).
+    /// Resolves the newest version per id, so an updated row appears once
+    /// (its newest version) and a deleted row is excluded — no duplicate
+    /// physical versions leak into the view.
+    ///
+    /// #159: resolve each id via its version list (O(distinct_ids × log v))
+    /// instead of two O(watermark) passes; a tombstoned newest is filtered
+    /// by `read_at`.
+    pub fn all_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<Doc> {
+        let watermark = snap.watermark();
+        let mut records = Vec::new();
+        for versions in self.id_versions.values() {
+            let pos = versions.partition_point(|&r| r < watermark);
+            if pos == 0 {
+                continue;
+            }
+            if let Some(record) = self.read_at(versions[pos - 1]) {
+                records.push(record);
+            }
+        }
+        records
+    }
+}
+/// Field-constraint validation (#91): reject a record whose values
+/// violate a declared `@min`/`@max`/`@length`/`@email`/`@url`/`@pattern`
+/// directive.
+fn validate_doc(record: &Doc) -> Result<(), ValidationError> {
+    Ok(())
+}
 ///Change-feed event: a `User` was inserted (#62).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UserInserted {
@@ -9455,6 +10974,21 @@ pub struct MetricUpdated {
 pub struct MetricDeleted {
     pub metric: Metric,
 }
+///Change-feed event: a `Doc` was inserted (#62).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DocInserted {
+    pub doc: Doc,
+}
+///Change-feed event: a `Doc` was updated (#66); carries the new version.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DocUpdated {
+    pub doc: Doc,
+}
+///Change-feed event: a `Doc` was deleted (#66); carries the record as it was before deletion.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DocDeleted {
+    pub doc: Doc,
+}
 ///Live-query result-set delta for `User` (#62 Direction B): removal-aware membership changes over a generated closed-set query.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -9504,6 +11038,19 @@ pub enum MetricLiveDelta {
     Added { row: Metric },
     /// A record already in the set changed.
     Updated { row: Metric },
+    /// An id left the matching set (deleted, or no longer matches).
+    Removed { id: Uuid },
+}
+///Live-query result-set delta for `Doc` (#62 Direction B): removal-aware membership changes over a generated closed-set query.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum DocLiveDelta {
+    /// The full matching set at subscription time.
+    Init { rows: Vec<Doc> },
+    /// A record newly entered the matching set.
+    Added { row: Doc },
+    /// A record already in the set changed.
+    Updated { row: Doc },
     /// An id left the matching set (deleted, or no longer matches).
     Removed { id: Uuid },
 }
@@ -9901,6 +11448,7 @@ pub struct Database {
     pub post: PostStorage,
     pub tag: TagStorage,
     pub metric: MetricStorage,
+    pub doc: DocStorage,
     pub post_tag_link: PostTagLink,
     /// Shared change feed (#62 Direction A): every collection emits a
     /// field-blind `(model, row_index)` signal here on insert/link.
@@ -9953,6 +11501,7 @@ pub struct DatabaseReader {
     pub post: PostStorageReader,
     pub tag: TagStorageReader,
     pub metric: MetricStorageReader,
+    pub doc: DocStorageReader,
     pub post_tag_link: PostTagLinkReader,
 }
 /// A database-wide read snapshot (#56, Direction A): a row-count
@@ -9966,6 +11515,7 @@ pub struct DatabaseSnapshot {
     pub post: forgedb_storage::Snapshot,
     pub tag: forgedb_storage::Snapshot,
     pub metric: forgedb_storage::Snapshot,
+    pub doc: forgedb_storage::Snapshot,
     pub post_tag_link: forgedb_storage::Snapshot,
 }
 impl Database {
@@ -9979,6 +11529,8 @@ impl Database {
         tag.attach_changefeed(changefeed.clone());
         let mut metric = MetricStorage::new();
         metric.attach_changefeed(changefeed.clone());
+        let mut doc = DocStorage::new();
+        doc.attach_changefeed(changefeed.clone());
         let mut post_tag_link = PostTagLink::new();
         post_tag_link.attach_changefeed(changefeed.clone());
         Self {
@@ -9986,6 +11538,7 @@ impl Database {
             post,
             tag,
             metric,
+            doc,
             post_tag_link,
             changefeed,
             broker: None,
@@ -10089,6 +11642,21 @@ impl Database {
             }
         }
         {
+            let __mf = root.join("doc/manifest.json");
+            if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
+                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                                     but this binary expects v{} — the schema changed \
+                                     since this dir was written.  Run the migration bin \
+                                     to evolve the data (the app never migrates in \
+                                     place); do NOT open stale data with mismatched code.",
+                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                    );
+                }
+            }
+        }
+        {
             let __mf = root.join("post_tag_link/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
                 if __m.format_version != EXPECTED_FORMAT_VERSION {
@@ -10146,6 +11714,9 @@ impl Database {
         let mut metric = MetricStorage::new_at(&root);
         metric.attach_changefeed(changefeed.clone());
         metric.attach_broker(broker.clone());
+        let mut doc = DocStorage::new_at(&root);
+        doc.attach_changefeed(changefeed.clone());
+        doc.attach_broker(broker.clone());
         let mut post_tag_link = PostTagLink::new_at(&root);
         post_tag_link.attach_changefeed(changefeed.clone());
         post_tag_link.attach_broker(broker.clone());
@@ -10154,6 +11725,7 @@ impl Database {
             post,
             tag,
             metric,
+            doc,
             post_tag_link,
             changefeed,
             broker,
@@ -10168,6 +11740,7 @@ impl Database {
                 "Post" => __db.post.__recover_to_committed(__len as usize),
                 "Tag" => __db.tag.__recover_to_committed(__len as usize),
                 "Metric" => __db.metric.__recover_to_committed(__len as usize),
+                "Doc" => __db.doc.__recover_to_committed(__len as usize),
                 _ => {}
             }
         }
@@ -10186,6 +11759,7 @@ impl Database {
             post: self.post.snapshot(),
             tag: self.tag.snapshot(),
             metric: self.metric.snapshot(),
+            doc: self.doc.snapshot(),
             post_tag_link: self.post_tag_link.snapshot(),
         }
     }
@@ -10201,6 +11775,7 @@ impl Database {
         self.post.checkpoint();
         self.tag.checkpoint();
         self.metric.checkpoint();
+        self.doc.checkpoint();
         self.post_tag_link.checkpoint();
     }
     /// Force compaction across every model (#92 Phase 4): reclaim the
@@ -10235,6 +11810,7 @@ impl Database {
         self.post.compact();
         self.tag.compact();
         self.metric.compact();
+        self.doc.compact();
     }
     /// Run maintenance deferred off the hot write turn (#162-A): for
     /// every model, reclaim dead row versions IFF a compaction became
@@ -10254,6 +11830,7 @@ impl Database {
         self.post.maintain();
         self.tag.maintain();
         self.metric.maintain();
+        self.doc.maintain();
     }
     /// Open a read-only handle over the whole database (#56 Direction
     /// B).  The returned `DatabaseReader` shares every collection's
@@ -10266,6 +11843,7 @@ impl Database {
             post: self.post.reader(),
             tag: self.tag.reader(),
             metric: self.metric.reader(),
+            doc: self.doc.reader(),
             post_tag_link: self.post_tag_link.reader(),
         }
     }
@@ -10293,6 +11871,7 @@ impl Database {
             "Post" => self.post.apply(ev.kind, &ev.bytes),
             "Tag" => self.tag.apply(ev.kind, &ev.bytes),
             "Metric" => self.metric.apply(ev.kind, &ev.bytes),
+            "Doc" => self.doc.apply(ev.kind, &ev.bytes),
             "post_tag_link" => {
                 if ev.bytes.len() == 32 {
                     let mut __l = [0u8; 16];
@@ -10354,6 +11933,7 @@ impl Database {
         self.post.attach_broker(None);
         self.tag.attach_broker(None);
         self.metric.attach_broker(None);
+        self.doc.attach_broker(None);
         self.post_tag_link.attach_broker(None);
         const BATCH: usize = 512;
         let mut after = base_offset;
@@ -10384,6 +11964,7 @@ impl Database {
         self.post.attach_broker(Some(broker.clone()));
         self.tag.attach_broker(Some(broker.clone()));
         self.metric.attach_broker(Some(broker.clone()));
+        self.doc.attach_broker(Some(broker.clone()));
         self.post_tag_link.attach_broker(Some(broker.clone()));
         self.broker = Some(broker);
         let applied = result?;
@@ -10403,6 +11984,7 @@ impl Database {
         self.post.commit()?;
         self.tag.commit()?;
         self.metric.commit()?;
+        self.doc.commit()?;
         self.post_tag_link.checkpoint();
         Ok(())
     }
@@ -10542,6 +12124,21 @@ impl Database {
     ) -> Result<bool, ValidationError> {
         self.metric.update(id, record)
     }
+    ///Create a Doc with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `insert`.
+    pub fn create_doc(&mut self, mut record: Doc) -> Result<Uuid, ValidationError> {
+        if record.id.is_nil() {
+            record.id = Uuid::new_v4();
+        }
+        self.doc.insert(record)
+    }
+    ///Update a Doc with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `update`. `Ok(false)` if the id is absent.
+    pub fn update_doc(
+        &mut self,
+        id: Uuid,
+        record: Doc,
+    ) -> Result<bool, ValidationError> {
+        self.doc.update(id, record)
+    }
     ///Delete a User with referential integrity (delete semantics): each child FK's `@on_delete` policy (restrict/cascade/set_null) is applied, this model's M2M junction rows are unlinked, then the row is tombstoned. Returns `Ok(false)` if the id is absent, `Err(ReferencedByChildren)` (409) if a `restrict` child blocks the delete.  The REST DELETE route goes through this wrapper; the direct `db.user.delete` storage path does NOT (it skips these checks).
     pub fn delete_user(&mut self, id: Uuid) -> Result<bool, ValidationError> {
         self.delete_user_cascade(id, 0)
@@ -10641,6 +12238,28 @@ impl Database {
         }
         Ok(self.metric.delete(id))
     }
+    ///Delete a Doc with referential integrity (delete semantics): each child FK's `@on_delete` policy (restrict/cascade/set_null) is applied, this model's M2M junction rows are unlinked, then the row is tombstoned. Returns `Ok(false)` if the id is absent, `Err(ReferencedByChildren)` (409) if a `restrict` child blocks the delete.  The REST DELETE route goes through this wrapper; the direct `db.doc.delete` storage path does NOT (it skips these checks).
+    pub fn delete_doc(&mut self, id: Uuid) -> Result<bool, ValidationError> {
+        self.delete_doc_cascade(id, 0)
+    }
+    /// Internal depth-bounded cascade worker.  `depth` guards a
+    /// pathological FK cycle (bounded by `MAX_CASCADE_DEPTH`).
+    fn delete_doc_cascade(
+        &mut self,
+        id: Uuid,
+        __depth: u32,
+    ) -> Result<bool, ValidationError> {
+        if __depth > MAX_CASCADE_DEPTH {
+            return Err(ValidationError::ReferencedByChildren {
+                model: "Doc",
+                field: "on_delete cascade depth exceeded",
+            });
+        }
+        if self.doc.get(id).is_none() {
+            return Ok(false);
+        }
+        Ok(self.doc.delete(id))
+    }
 }
 /// A scoped transaction handle (MVCC Tier 1, #83).  Exposes exactly the
 /// per-model write surface codegen already emits (`create_/update_/
@@ -10730,6 +12349,17 @@ impl<'db> TxHandle<'db> {
             self.marks.insert("Metric", __rc);
             self.wal_marks.insert("Metric", __wb);
             self.db.metric.in_transaction = true;
+        }
+    }
+    /// Record `#tag`'s pre-txn rollback marks on first touch and set
+    /// its transaction guard (so auto-checkpoint/compaction defer).
+    fn __mark_doc(&mut self) {
+        if !self.marks.contains_key("Doc") {
+            let __rc = self.db.doc.row_count;
+            let __wb = self.db.doc.wal.size().unwrap_or(0);
+            self.marks.insert("Doc", __rc);
+            self.wal_marks.insert("Doc", __wb);
+            self.db.doc.in_transaction = true;
         }
     }
     ///Stage the creation of a User in this transaction (#83).  Validates field constraints + `&unique` (committed index) + FK existence (txn-visible targets), then stages the row; visible only after `commit`.
@@ -11194,6 +12824,77 @@ impl<'db> TxHandle<'db> {
         let __snap = forgedb_storage::Snapshot::new(self.db.metric.row_count);
         self.db.metric.all_at(&__snap)
     }
+    ///Stage the creation of a Doc in this transaction (#83).  Validates field constraints + `&unique` (committed index) + FK existence (txn-visible targets), then stages the row; visible only after `commit`.
+    pub fn create_doc(&mut self, mut record: Doc) -> Result<Uuid, TxError> {
+        self.__mark_doc();
+        if record.id.is_nil() {
+            record.id = Uuid::new_v4();
+        }
+        validate_doc(&record)?;
+        let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.doc.__stage_append(record, false);
+        self.pending_events
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
+        Ok(id)
+    }
+    ///Stage an update of a Doc in this transaction (#83).  `Ok(false)` if the id is not visible to the transaction.
+    pub fn update_doc(&mut self, id: Uuid, record: Doc) -> Result<bool, TxError> {
+        if self.get_doc(id).is_none() {
+            return Ok(false);
+        }
+        self.__mark_doc();
+        validate_doc(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.doc.__stage_append(record, false);
+        self.pending_events
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
+        Ok(true)
+    }
+    ///Stage a delete of a Doc in this transaction (#83).  Appends a tombstoned version; `false` if the id is not visible to the transaction.
+    pub fn delete_doc(&mut self, id: Uuid) -> bool {
+        let record = match self.get_doc(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        self.__mark_doc();
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        let __row = self.db.doc.__stage_append(record, true);
+        self.pending_events
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes,
+                __row,
+                __bytes,
+            ));
+        true
+    }
+    ///Read a Doc within the transaction (#83) with read-your-writes: resolves the newest version over the committed prefix ∪ this txn's staged rows.
+    pub fn get_doc(&self, id: Uuid) -> Option<Doc> {
+        let __snap = forgedb_storage::Snapshot::new(self.db.doc.row_count);
+        self.db.doc.get_at(&__snap, id)
+    }
+    ///Read every live Doc within the transaction (#83), including this txn's own staged rows (read-your-writes).
+    pub fn all_doc(&self) -> Vec<Doc> {
+        let __snap = forgedb_storage::Snapshot::new(self.db.doc.row_count);
+        self.db.doc.all_at(&__snap)
+    }
     /// Commit the transaction (MVCC Tier 1, #83).  Ordering is
     /// load-bearing (mirrors #96's checkpoint order): (1) fsync every
     /// touched collection's columns + per-model WAL, (2) append + fsync
@@ -11230,6 +12931,11 @@ impl<'db> TxHandle<'db> {
                     __journal
                         .push(("Metric".to_string(), self.db.metric.row_count as u64));
                 }
+                "Doc" => {
+                    let _ = self.db.doc.commit();
+                    let _ = self.db.doc.wal.flush();
+                    __journal.push(("Doc".to_string(), self.db.doc.row_count as u64));
+                }
                 _ => {}
             }
         }
@@ -11262,6 +12968,11 @@ impl<'db> TxHandle<'db> {
                     self.db.metric.__reindex_committed();
                     self.db.metric.in_transaction = false;
                     self.db.metric.run_deferred_maintenance();
+                }
+                "Doc" => {
+                    self.db.doc.__reindex_committed();
+                    self.db.doc.in_transaction = false;
+                    self.db.doc.run_deferred_maintenance();
                 }
                 _ => {}
             }
@@ -11333,6 +13044,16 @@ impl<'db> TxHandle<'db> {
                         }
                         self.db.metric.in_transaction = false;
                         self.db.metric.run_deferred_maintenance();
+                    }
+                    "Doc" => {
+                        let __mark = *__mark;
+                        let _ = self.db.doc.__truncate_all_to(__mark);
+                        self.db.doc.row_count = __mark;
+                        if let Some(__wm) = self.wal_marks.get("Doc") {
+                            let _ = self.db.doc.wal.truncate_to(*__wm);
+                        }
+                        self.db.doc.in_transaction = false;
+                        self.db.doc.run_deferred_maintenance();
                     }
                     _ => {}
                 }
@@ -12246,6 +13967,110 @@ impl ConcurrentTxHandle {
         }
         __rows
     }
+    /// Stage the creation of a #model_name in a concurrent transaction.
+    pub fn create_doc(&mut self, mut record: Doc) -> Result<Uuid, TxError> {
+        if record.id.is_nil() {
+            record.id = Uuid::new_v4();
+        }
+        validate_doc(&record)?;
+        let id = record.id;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Inserted,
+                __id_bytes,
+                __bytes,
+            ));
+        Ok(id)
+    }
+    /// Stage an update of a #model_name in a concurrent transaction.
+    pub fn update_doc(&mut self, id: Uuid, record: Doc) -> Result<bool, TxError> {
+        if self.get_doc(id).is_none() {
+            return Ok(false);
+        }
+        validate_doc(&record)?;
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Updated,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                false,
+            ));
+        self.pending_events
+            .push(("Doc", forgedb_changefeed::ChangeKind::Updated, __id_bytes, __bytes));
+        Ok(true)
+    }
+    /// Stage a delete of a #model_name in a concurrent transaction.
+    pub fn delete_doc(&mut self, id: Uuid) -> bool {
+        let record = match self.get_doc(id) {
+            Some(r) => r,
+            None => return false,
+        };
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        let __bytes = serde_json::to_vec(&record).unwrap_or_default();
+        self.buffer
+            .push((
+                "Doc",
+                forgedb_changefeed::ChangeKind::Deleted,
+                __id_bytes.clone(),
+                __bytes.clone(),
+                true,
+            ));
+        self.pending_events
+            .push(("Doc", forgedb_changefeed::ChangeKind::Deleted, __id_bytes, __bytes));
+        true
+    }
+    /// Read a #model_name within the concurrent transaction (read-your-writes).
+    pub fn get_doc(&self, id: Uuid) -> Option<Doc> {
+        let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
+        for (_, _kind, __ib, __bytes, __del) in self.buffer.iter().rev() {
+            if __ib == &__id_bytes {
+                if *__del {
+                    return None;
+                }
+                return serde_json::from_slice(__bytes).ok();
+            }
+        }
+        let __db = self.inner.read().unwrap();
+        __db.doc.get_at(&self.snap.doc, id)
+    }
+    /// Read all live #model_name records visible to this concurrent transaction.
+    pub fn all_doc(&self) -> Vec<Doc> {
+        let __db = self.inner.read().unwrap();
+        let mut __rows = __db.doc.all_at(&self.snap.doc);
+        drop(__db);
+        for (_, _kind, __ib, __bytes, __del) in &self.buffer {
+            let __id_bytes_ref: &Vec<u8> = __ib;
+            if *__del {
+                __rows
+                    .retain(|r| {
+                        serde_json::to_vec(&r.id).unwrap_or_default().as_slice()
+                            != __id_bytes_ref.as_slice()
+                    });
+            } else if let Ok(__rec) = serde_json::from_slice::<Doc>(__bytes) {
+                let __staged_id = __rec.id;
+                if let Some(__pos) = __rows.iter().position(|r| r.id == __staged_id) {
+                    __rows[__pos] = __rec;
+                } else {
+                    __rows.push(__rec);
+                }
+            }
+        }
+        __rows
+    }
 }
 impl Database {
     /// Create a cloneable shared handle for concurrent transactions (#83 Tier 2).
@@ -12313,6 +14138,15 @@ impl Database {
                         self.metric.in_transaction = true;
                     }
                 }
+                "Doc" => {
+                    if !__marks.contains_key("Doc") {
+                        let __rc = self.doc.row_count;
+                        let __wb = self.doc.wal.size().unwrap_or(0);
+                        __marks.insert("Doc", __rc);
+                        __wal_marks.insert("Doc", __wb);
+                        self.doc.in_transaction = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -12347,6 +14181,13 @@ impl Database {
                         let __record: Metric = serde_json::from_slice(__bytes)
                             .map_err(|e| TxError::Io(e.to_string()))?;
                         let __row = self.metric.__stage_append(__record, *__deleted);
+                        __staged_events
+                            .push((*__model_tag, *__kind, __row, __bytes.clone()));
+                    }
+                    "Doc" => {
+                        let __record: Doc = serde_json::from_slice(__bytes)
+                            .map_err(|e| TxError::Io(e.to_string()))?;
+                        let __row = self.doc.__stage_append(__record, *__deleted);
                         __staged_events
                             .push((*__model_tag, *__kind, __row, __bytes.clone()));
                     }
@@ -12402,6 +14243,17 @@ impl Database {
                                 self.metric.run_deferred_maintenance();
                             }
                         }
+                        "Doc" => {
+                            if let Some(&__mark) = __marks.get("Doc") {
+                                let _ = self.doc.__truncate_all_to(__mark);
+                                self.doc.row_count = __mark;
+                                if let Some(&__wm) = __wal_marks.get("Doc") {
+                                    let _ = self.doc.wal.truncate_to(__wm);
+                                }
+                                self.doc.in_transaction = false;
+                                self.doc.run_deferred_maintenance();
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -12431,6 +14283,11 @@ impl Database {
                     let _ = self.metric.commit();
                     let _ = self.metric.wal.flush();
                     __journal.push(("Metric".to_string(), self.metric.row_count as u64));
+                }
+                "Doc" => {
+                    let _ = self.doc.commit();
+                    let _ = self.doc.wal.flush();
+                    __journal.push(("Doc".to_string(), self.doc.row_count as u64));
                 }
                 _ => {}
             }
@@ -12464,6 +14321,11 @@ impl Database {
                     self.metric.__reindex_committed();
                     self.metric.in_transaction = false;
                     self.metric.run_deferred_maintenance();
+                }
+                "Doc" => {
+                    self.doc.__reindex_committed();
+                    self.doc.in_transaction = false;
+                    self.doc.run_deferred_maintenance();
                 }
                 _ => {}
             }
@@ -12745,6 +14607,9 @@ impl Database {
         let __from = self.metric.row_count;
         self.metric.__sync_columns_from_disk();
         self.metric.__reindex_delta(__from);
+        let __from = self.doc.row_count;
+        self.doc.__sync_columns_from_disk();
+        self.doc.__reindex_delta(__from);
     }
     /// Open a data dir as a **coordinated Tier-3 client** of a running
     /// `forgedb coordinate <root>` coordinator, returning a

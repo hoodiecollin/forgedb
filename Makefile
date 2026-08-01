@@ -10,7 +10,7 @@ BENCH := benchmarks/Cargo.toml
 
 ## Config variants for the matrix bench (epic #126): each becomes a generated
 ## module under benchmarks/gen/<name>/. Keep in sync with benchmarks/configs/.
-BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_low changefeed_small
+BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_low changefeed_small churn_probe
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
@@ -75,6 +75,11 @@ bench-concurrency:
 ##   make bench-workload                       # quick smoke matrix
 ##   make bench-workload ARGS="--full"         # full ladder (A = 1..32)
 ##   make bench-workload ARGS="--forgedb-only" # skip the comparison engines
+##   make bench-workload ARGS="--scan-sweep"   # fixed-width scan path (Metric subject)
+##   make bench-workload ARGS="--var-sweep"    # variable-width scan path (Doc subject);
+##                                             # needs `make bench-regen-matrix` first,
+##                                             # it runs against the churn_probe variant
+##   make bench-workload ARGS="--verify"       # driver self-checks
 bench-workload:
 	cargo run --manifest-path $(BENCH) --example workload --release -- $(ARGS)
 

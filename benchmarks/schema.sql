@@ -65,6 +65,19 @@ CREATE TABLE metric (
 );
 CREATE INDEX idx_metric_device ON metric (device_id);
 
+-- #218 Doc: the variable-width scan subject, Metric's mirror image. Four TEXT
+-- columns so a narrow scan is dominated by variable-width reads; `seq`/`kind` are
+-- the fixed-only projection that acts as the in-run control.
+CREATE TABLE doc (
+    id     BLOB PRIMARY KEY NOT NULL,
+    seq    INTEGER NOT NULL,
+    kind   INTEGER NOT NULL,
+    body_a TEXT    NOT NULL,
+    body_b TEXT    NOT NULL,
+    body_c TEXT    NOT NULL,
+    body_d TEXT    NOT NULL
+);
+
 -- Post <-> Tag many-to-many junction (ForgeDB's post_tag_link).
 CREATE TABLE post_tag_link (
     post_id BLOB NOT NULL REFERENCES post (id),

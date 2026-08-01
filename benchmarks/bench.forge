@@ -80,3 +80,39 @@ Metric {
   // 6-field models the pruning win is muted by how little there is to prune.
   @projection(hot: cpu_pct, mem_pct)
 }
+
+// #218: the variable-width scan subject — Metric's mirror image.
+//
+// Metric isolates `FixedColumn::export`. This isolates
+// `VariableColumn::gather_buffered`, which ignores the requested indices and reads
+// the WHOLE offsets index + WHOLE data region (dead versions included) on every
+// scan. That cost is ~A x live-bytes, so unlike the #221 fixed-column cliff — a
+// step — it should show up as a SLOPE in amplification. Distinguishing those two
+// shapes is the whole point: a step is a lost fast path, a slope is a real cost of
+// keeping old versions.
+//
+// Post is the obvious subject and the wrong one: a required FK plus a many-to-many
+// means churn there also drags @on_delete work (the confound Metric is
+// relation-free to avoid), and one string among six fields mutes the signal.
+//
+// The projection is deliberately over the FIXED columns only. Same model, same
+// churn, two scan paths: `meta` touches no string column and should stay flat after
+// #221, while the narrow scan drags all four. That makes the projection an IN-RUN
+// control, so a slope in the narrow scan is attributable to the variable path rather
+// than to machine state — the cross-run comparison that produced the 270us outlier
+// in the #221 writeup cannot happen here.
+//
+// String LENGTH is a driver knob, not a schema one (@length is semantic-only), and
+// it is a first-class axis here in a way it never was for fixed columns: this cost
+// is proportional to bytes, not to rows.
+Doc {
+  id: +uuid
+  seq: u64
+  kind: u32
+  body_a: string
+  body_b: string
+  body_c: string
+  body_d: string
+
+  @projection(meta: seq, kind)
+}
