@@ -32,3 +32,51 @@ Tag {
   name: &string @length(1, 50)
   posts: [Post]
 }
+
+// #218: the update-WIDTH axis, and a fixed-width-only scan subject.
+//
+// Two properties this model exists for, neither expressible on User/Post/Tag:
+//
+// 1. WIDTH. `update` writes the FULL row regardless of what changed — full-record
+//    JSON to the WAL, then an append to EVERY column — so the per-update append tax
+//    scales with total row width. The other models top out at 6 fields, so a
+//    1-field update and an all-field update cost nearly the same there. At 22
+//    columns the difference is measurable, which is what makes "in-place writes
+//    only the changed column" a quantifiable claim rather than an assertion.
+//
+// 2. NO VARIABLE-WIDTH COLUMN. Every field here is fixed-width, so a scan over
+//    Metric exercises `FixedColumn::export` alone. Post's scan additionally drags
+//    `VariableColumn::gather_buffered` (whole-region read) through `title`.
+//    Running both under the same churn separates the two suspected scan cliffs
+//    instead of reporting their sum.
+//
+// Deliberately relation-free: no FK means churn here can't be confounded by
+// @on_delete cascade/restrict work on a parent.
+Metric {
+  id: +uuid
+  recorded_at: +timestamp
+  device_id: ^u64
+  sample_seq: u64
+  region: u32
+  cpu_pct: f64
+  mem_pct: f64
+  disk_pct: f64
+  net_rx_bytes: u64
+  net_tx_bytes: u64
+  req_count: u64
+  err_count: u64
+  p50_micros: u32
+  p95_micros: u32
+  p99_micros: u32
+  queue_depth: u32
+  open_conns: u32
+  gc_pause_micros: u32
+  uptime_secs: i64
+  temp_celsius: f64
+  throttled: bool
+  healthy: bool
+
+  // Column pruning at width 22: a narrow scan should read 2 of 22 columns. On the
+  // 6-field models the pruning win is muted by how little there is to prune.
+  @projection(hot: cpu_pct, mem_pct)
+}

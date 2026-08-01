@@ -35,6 +35,36 @@ CREATE TABLE tag (
 );
 CREATE UNIQUE INDEX idx_tag_name ON tag (name);
 
+-- #218 wide model: 22 columns, all fixed-width, no FK. Drives the update-width
+-- axis (ForgeDB appends every column on update; SQLite rewrites the row) and gives
+-- a scan subject with no TEXT column. f64 -> REAL is the one type mapping not
+-- already covered above.
+CREATE TABLE metric (
+    id              BLOB PRIMARY KEY NOT NULL,
+    recorded_at     INTEGER NOT NULL,
+    device_id       INTEGER NOT NULL,
+    sample_seq      INTEGER NOT NULL,
+    region          INTEGER NOT NULL,
+    cpu_pct         REAL    NOT NULL,
+    mem_pct         REAL    NOT NULL,
+    disk_pct        REAL    NOT NULL,
+    net_rx_bytes    INTEGER NOT NULL,
+    net_tx_bytes    INTEGER NOT NULL,
+    req_count       INTEGER NOT NULL,
+    err_count       INTEGER NOT NULL,
+    p50_micros      INTEGER NOT NULL,
+    p95_micros      INTEGER NOT NULL,
+    p99_micros      INTEGER NOT NULL,
+    queue_depth     INTEGER NOT NULL,
+    open_conns      INTEGER NOT NULL,
+    gc_pause_micros INTEGER NOT NULL,
+    uptime_secs     INTEGER NOT NULL,
+    temp_celsius    REAL    NOT NULL,
+    throttled       INTEGER NOT NULL,
+    healthy         INTEGER NOT NULL
+);
+CREATE INDEX idx_metric_device ON metric (device_id);
+
 -- Post <-> Tag many-to-many junction (ForgeDB's post_tag_link).
 CREATE TABLE post_tag_link (
     post_id BLOB NOT NULL REFERENCES post (id),
