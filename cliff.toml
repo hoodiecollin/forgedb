@@ -77,7 +77,11 @@ commit_preprocessors = [
 # top section here.
 commit_parsers = [
   { message = "^chore\\(release\\)", skip = true },
-  { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew)\\)", skip = true },
+  # Scopes that ship on their own line or ship to nobody. `benchmarks`/`bench` are
+  # the experiment track (CLAUDE.md: experiment work never rides the release spine)
+  # — a benchmark driver produces a measurement, not a binary a user installs, so
+  # `feat(benchmarks)` must never surface as a release feature.
+  { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew|benchmarks|bench)\\)", skip = true },
   # Any `type!:` / `type(scope)!:` breaking marker headlines its own section,
   # regardless of the underlying type.
   { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },
