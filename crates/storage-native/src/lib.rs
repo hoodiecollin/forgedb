@@ -1037,8 +1037,13 @@ impl FixedColumn {
 /// [`BufferedFixedColumn`]: same `read_string` name as [`VariableColumn`],
 /// addressed by **slot** (`0..n` over the selection order).
 pub struct BufferedVariableColumn {
-    data: Vec<u8>,
-    // (absolute offset into `data`, byte length) per slot, in selection order.
+    /// The spanned data region — a lazily-paged `mmap` alias when it is large
+    /// enough to be worth mapping, an owned copy otherwise (#222).
+    data: ColumnExport,
+    /// File offset `data` starts at, so the absolute offsets in `slots` can be
+    /// rebased onto it. Zero when the whole region is buffered.
+    base: u64,
+    // (absolute offset in the data FILE, byte length) per slot, in selection order.
     slots: Vec<(u64, u64)>,
 }
 
@@ -1057,9 +1062,12 @@ impl BufferedVariableColumn {
         let &(offset, length) = self.slots.get(slot).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Slot out of bounds")
         })?;
-        let start = offset as usize;
+        // Slots carry absolute file offsets; `base` is where the buffered span
+        // starts. Touching a mapped page here is what pulls it in — dead versions
+        // between live rows are never addressed, so they are never read.
+        let start = offset.saturating_sub(self.base) as usize;
         let end = start + length as usize;
-        let bytes = self.data.get(start..end).ok_or_else(|| {
+        let bytes = self.data.as_slice().get(start..end).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "Variable slot out of data bounds")
         })?;
         String::from_utf8(bytes.to_vec())
@@ -1075,6 +1083,15 @@ impl BufferedVariableColumn {
 ///
 /// Append methods write to the OS page cache but do **not** call `fsync` per append.
 /// Call [`flush`](VariableColumn::flush) at commit boundaries to guarantee durability.
+/// Spanned-data-region size at or above which [`VariableColumn::gather_buffered`]
+/// maps rather than reads (#222).
+///
+/// Below this the span is small enough that a single bounded read costs less than a
+/// mapping's setup and teardown; above it, mapping is what keeps dead versions inside
+/// the span from being paid for — untouched pages are never faulted in. Conservative
+/// rather than tuned; the shape of the win does not depend on the exact crossover.
+const VAR_MMAP_MIN_BYTES: usize = 64 * 1024;
+
 pub struct VariableColumn {
     data_file: File,
     offsets_file: File,
@@ -1164,28 +1181,49 @@ impl VariableColumn {
     /// [`BufferedVariableColumn`] whose `read_string(slot)` reads from memory
     /// (#168 column scan).
     ///
-    /// Reads the whole committed offsets index and data region **once each**
-    /// (two reads total), then records each selected slot's `(offset, length)`
-    /// in selection order — so a scan over `n` variable rows pays two bulk reads
-    /// instead of `3n` per-row `read_exact_at` syscalls (offset + length + data).
-    /// `indices` are opaque physical row positions; reads no schema.
+    /// Reads only the **spanned** slice of the offsets index and maps only the
+    /// **spanned** data region, so a scan over `n` variable rows pays one bounded
+    /// read plus one mapping rather than `3n` per-row `read_exact_at` syscalls
+    /// (offset + length + data). `indices` are opaque physical row positions;
+    /// reads no schema.
+    ///
+    /// # Performance (#222)
+    ///
+    /// This used to read the **entire** committed offsets index and the **entire**
+    /// data region into owned buffers on every call, ignoring `indices` — dead
+    /// versions included. That made a scan cost `~A x live_bytes`, a slope in
+    /// amplification rather than the fixed columns' step, and it was measured as
+    /// exactly that: at 2 000 live rows the narrow scan went 563 µs -> 5.8 ms
+    /// across A = 1 -> 16, doubling with each doubling of A.
+    ///
+    /// Both reads are now bounded to `[min(indices), max(indices)]`. Append order
+    /// makes data offsets monotonic in row index, so that row span maps to one
+    /// contiguous byte span. The data span is **mapped** rather than read when it
+    /// is large enough to be worth it, which is what removes the slope: dead
+    /// versions inside the span cost address space, not I/O, because only pages
+    /// actually addressed by `read_string` are ever faulted in.
+    ///
+    /// The residual cost is page granularity — a live row drags in its whole page,
+    /// including any dead bytes sharing it — so the win depends on how clustered
+    /// the live set is. Append-only helps here: an updated row is re-appended at
+    /// the tail, so churn tends to concentrate live rows rather than scatter them.
     ///
     /// # Errors
     ///
     /// `InvalidInput` if any index is `>= self.len()`; other errors come from the
     /// underlying reads.
     pub fn gather_buffered(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
-        // One bulk read of the whole committed offsets index (16 bytes/row).
-        let mut offsets = vec![0u8; self.row_count * 16];
-        if !offsets.is_empty() {
-            self.offsets_file.read_exact_at(&mut offsets, 0)?;
+        if indices.is_empty() {
+            return Ok(BufferedVariableColumn {
+                data: ColumnExport::Owned(Vec::new()),
+                base: 0,
+                slots: Vec::new(),
+            });
         }
-        // One bulk read of the whole committed data region.
-        let mut data = vec![0u8; self.current_data_offset as usize];
-        if !data.is_empty() {
-            self.data_file.read_exact_at(&mut data, 0)?;
-        }
-        let mut slots = Vec::with_capacity(indices.len());
+
+        // Bounds-check the whole selection first, and take the row span.
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
         for &index in indices {
             if index >= self.row_count {
                 return Err(io::Error::new(
@@ -1193,12 +1231,62 @@ impl VariableColumn {
                     "Index out of bounds",
                 ));
             }
-            let base = index * 16;
-            let offset = u64::from_le_bytes(offsets[base..base + 8].try_into().unwrap());
-            let length = u64::from_le_bytes(offsets[base + 8..base + 16].try_into().unwrap());
+            lo = lo.min(index);
+            hi = hi.max(index);
+        }
+
+        // Only the spanned slice of the offsets index (16 bytes/row), not all
+        // `row_count` rows.
+        let mut offsets = vec![0u8; (hi + 1 - lo) * 16];
+        self.offsets_file
+            .read_exact_at(&mut offsets, (lo * 16) as u64)?;
+
+        let mut slots = Vec::with_capacity(indices.len());
+        let mut data_lo = u64::MAX;
+        let mut data_hi = 0u64;
+        for &index in indices {
+            let b = (index - lo) * 16;
+            let offset = u64::from_le_bytes(offsets[b..b + 8].try_into().unwrap());
+            let length = u64::from_le_bytes(offsets[b + 8..b + 16].try_into().unwrap());
+            data_lo = data_lo.min(offset);
+            data_hi = data_hi.max(offset + length);
             slots.push((offset, length));
         }
-        Ok(BufferedVariableColumn { data, slots })
+
+        // Every selected row empty (or a zero-length span) — nothing to map.
+        if data_hi <= data_lo {
+            return Ok(BufferedVariableColumn {
+                data: ColumnExport::Owned(Vec::new()),
+                base: data_lo.min(data_hi),
+                slots,
+            });
+        }
+
+        let span = (data_hi - data_lo) as usize;
+        let data = if span >= VAR_MMAP_MIN_BYTES {
+            // A failed mapping is not fatal — the bounded read below yields the
+            // same bytes — so fall through rather than propagate.
+            let mapped = unsafe {
+                memmap2::MmapOptions::new()
+                    .offset(data_lo)
+                    .len(span)
+                    .map(&self.data_file)
+            };
+            match mapped {
+                Ok(m) => ColumnExport::Mapped(m),
+                Err(_) => {
+                    let mut v = vec![0u8; span];
+                    self.data_file.read_exact_at(&mut v, data_lo)?;
+                    ColumnExport::Owned(v)
+                }
+            }
+        } else {
+            let mut v = vec![0u8; span];
+            self.data_file.read_exact_at(&mut v, data_lo)?;
+            ColumnExport::Owned(v)
+        };
+
+        Ok(BufferedVariableColumn { data, base: data_lo, slots })
     }
 
     /// Flush all pending writes to disk (fsync both data and offsets files).

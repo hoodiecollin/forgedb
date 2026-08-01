@@ -1442,6 +1442,78 @@ fn test_buffered_variable_column_matches_per_row_reads() {
 }
 
 #[test]
+fn test_buffered_variable_column_mapped_path_matches_per_row_reads() {
+    // #222: `gather_buffered` now bounds both reads to the selection's row span and
+    // MAPS the data span once it is large enough, instead of reading the whole region.
+    // The test above only covers tiny corpora, which stay on the owned path and always
+    // have base == 0 — so it cannot catch a bad rebase. This one does.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_var_mapped");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = VariableColumn::new(
+        temp_dir.join("v_data.bin"),
+        temp_dir.join("v_offsets.bin"),
+    )
+    .unwrap();
+
+    // ~1 MB of data, comfortably past VAR_MMAP_MIN_BYTES, with empty strings sprinkled
+    // in so zero-length slots are exercised inside a mapped span.
+    let n = 4000usize;
+    for i in 0..n {
+        if i % 37 == 0 {
+            col.append_string("").unwrap();
+        } else {
+            col.append_string(&format!("row-{i}-{}", "x".repeat(240))).unwrap();
+        }
+    }
+
+    let check = |idx: &[usize]| {
+        let buf = col.gather_buffered(idx).unwrap();
+        assert_eq!(buf.len(), idx.len());
+        for (slot, &i) in idx.iter().enumerate() {
+            assert_eq!(
+                buf.read_string(slot).unwrap(),
+                col.read_string(i).unwrap(),
+                "slot {slot} (row {i})"
+            );
+        }
+    };
+
+    // The churn shape: long runs broken by holes where superseded rows were skipped.
+    let holey: Vec<usize> = (0..n).filter(|i| i % 3 != 0).collect();
+    check(&holey);
+
+    // A span that starts late — base is large, so an unrebased offset would read the
+    // wrong bytes (or fall outside the mapping and error).
+    let tail: Vec<usize> = (3000..3500).collect();
+    check(&tail);
+
+    // Selection order is preserved, including fully reversed.
+    let rev: Vec<usize> = (2000..2400).rev().collect();
+    check(&rev);
+
+    // Sparse across the whole file: the mapped span is nearly everything, but only the
+    // addressed pages are ever touched.
+    let sparse: Vec<usize> = (0..n).step_by(97).collect();
+    check(&sparse);
+
+    // Duplicated indices are positional, not deduplicated.
+    check(&[3999, 3999, 0, 0, 2500, 2500]);
+
+    // A selection of only empty strings has a zero-length data span.
+    let empties: Vec<usize> = (0..n).filter(|i| i % 37 == 0).collect();
+    check(&empties);
+
+    // Out-of-bounds anywhere still errors, before anything is mapped.
+    let mut bad: Vec<usize> = (0..100).collect();
+    bad.push(n);
+    assert!(col.gather_buffered(&bad).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
 fn test_tombstones_live_indices_filters_deleted() {
     let temp_dir = std::env::temp_dir().join("forgedb_test_live_indices");
     let _ = fs::remove_dir_all(&temp_dir);
