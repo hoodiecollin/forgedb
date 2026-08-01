@@ -317,6 +317,16 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
 
 ### Mixed workload (the only scenario with an arrival rate)
 20. **Sustained mixed read/create/update/delete/scan under phased load** — `make bench-workload`.
+    Two dedicated scan modes hang off it, because scans are ~1 % of a realistic mix and
+    cannot be sampled well enough there to locate a cliff. They use **different subjects on
+    purpose** — the fixed-width and variable-width column reads are separate code paths with
+    separate failure modes, and a model carrying both reports their sum:
+    `ARGS="--scan-sweep"` over `Metric` (22 fixed columns, no string) isolates
+    `FixedColumn::export` and found a **step** (#221); `ARGS="--var-sweep"` over `Doc`
+    (4 string columns + 2 fixed) isolates `VariableColumn::gather_buffered` and found a
+    **slope** (#222). `--var-sweep` needs `make bench-regen-matrix` first — it runs against
+    the `churn_probe` variant, since the default build's auto-compaction ceiling leaves no
+    amplification range to establish a slope over.
 
 Scenarios 1–19 share a blind spot that this one exists to close. Every one of them is a
 *single operation, timed in isolation, on a database shaped to make that operation easy to
@@ -431,10 +441,16 @@ not an engine deficit).
 
 ## Mixed-workload findings (#218, first run — 2026-07-31)
 
-First results from scenario 20. Corpora are smoke-sized — 1e3 preloaded rows for the mixed run
-(`make bench-workload`), 1e4 for the scan sweep (`ARGS="--scan-sweep"`) — so treat magnitudes as
-directional. The *structural* findings below do not depend on corpus size, and finding 2 gets
-stronger as the corpus grows.
+Results from scenario 20. Corpora are smoke-sized — 1e3 preloaded rows for the mixed run
+(`make bench-workload`), 1e4 for the fixed-width scan sweep (`ARGS="--scan-sweep"`), 2e3 for the
+variable-width one (`ARGS="--var-sweep"`) — so treat magnitudes as directional. The *structural*
+findings below do not depend on corpus size, and finding 2 gets stronger as the corpus grows.
+
+**Headline: both suspected read-path costs turned out to be implementation artifacts, and both are
+fixed.** The fixed-width path had a *step* (#221 — a lost `mmap` fast path, 24.6×/95.5×, flat in
+amplification); the variable-width path had a *slope* (#222 — a whole-region read, linear in
+amplification). Neither was a cost of keeping old versions, and both were removed without a second
+storage engine. That is the pre-registered early-exit condition for experiment #167.
 
 ### 1. The scan cliff was an implementation artifact, not a cost of append-only — found, fixed, measured (#221)
 
@@ -528,13 +544,95 @@ headline (`scan_aggregate` 32.4 ms → 568 µs) described the best case rather t
 After #221 the two modes differ by 1.06×/1.21× instead of 24.6×/95.5×, so the pristine number is now
 a fair description of steady-state behaviour.
 
-**Not yet measured — now the only unaddressed part of the read path.**
-`VariableColumn::gather_buffered` ignores the requested indices and reads the *entire* committed
-offsets index plus the *entire* data region, dead versions included, into an owned buffer. `Metric`
-is all fixed-width by design, so neither this sweep nor #221 touches it; a `Post`-subject sweep
-would. Unlike the fixed-column cliff this one is expected to scale **with** amplification rather
-than step — a scan returning L live rows at amplification A reads ≈ A×L bytes — so it is a
-genuinely different shape of problem and remains open.
+The variable-width half of the read path is finding 1b below — a different shape, measured
+separately, and now also fixed.
+
+### 1b. The variable-column slope — a *slope*, not a step, and also an artifact (#222)
+
+`Metric` is all fixed-width by design, so neither the sweep above nor #221 touches
+`VariableColumn::gather_buffered`, which ignored the requested indices entirely:
+
+```rust
+let mut offsets = vec![0u8; self.row_count * 16];             // ALL physical rows
+let mut data = vec![0u8; self.current_data_offset as usize];  // ENTIRE data region
+```
+
+A scan returning L live bytes read and allocated **A × L**. That is proportional to amplification —
+the shape that would indicate a genuine cost of keeping old versions, as opposed to #221's binary
+step. So it needed its own subject and its own sweep.
+
+**Subject: `Doc`** — relation-free (so churn cannot be confounded by `@on_delete` work the way it
+would be on `Post`), 4 string columns + 2 fixed, with `@projection(meta: seq, kind)` over the
+*fixed* columns only. That projection is the **in-run control**: it never touches a
+`VariableColumn`, so a slope in the narrow scan is attributable to the variable path rather than to
+machine state. Run via `make bench-workload ARGS="--var-sweep"`.
+
+**Method note — the ladder needs `compaction = false`.** Finding 2 caps amplification at
+`1 + 4000/live_rows`, which on a 10k-row corpus is a 1.0×–1.4× range: no lever arm to establish a
+slope over. This sweep therefore runs against a new `churn_probe` generated variant
+(`compaction = false` + `fsync = "never"`). Fsync-never is legitimate here because the mode measures
+*reads*, durability is an orthogonal axis in the #167 framing, and finding 3 already showed writes
+are ~100 % fsync-bound and identical across engines.
+
+Paired stash/restore A/B, 2 000 live rows, 256 B per string column:
+
+| A | narrow scan, before | narrow scan, after | projection (control) |
+|---|---|---|---|
+| 1× | 542 µs | **547 µs** | ~47–57 µs |
+| 2× | 734 µs | **553 µs** | ~57 µs |
+| 4× | 1.4 ms | **555 µs** | ~53–59 µs |
+| 8× | 2.4 ms | **554 µs** | ~57–62 µs |
+| 16× | 5.9 ms | **536 µs** | ~54–59 µs |
+
+Doubling with every doubling of A before; **flat** after. The control held throughout both legs.
+
+Cost now tracks **live** bytes rather than `A × live_bytes` — payload sweep at A = 8:
+
+| bytes/column | before | after |
+|---|---|---|
+| 64 | 632 µs | 373 µs |
+| 256 | 2.2 ms | 557 µs |
+| 1024 | 12.6 ms | 1.2 ms |
+| 4096 | 48.5 ms | 4.6 ms |
+
+What remains still scales with payload size, as it must — you have to read the bytes you asked for.
+
+**The fix.** Both reads are bounded to the selection's row span `[min, max]`; append order makes data
+offsets monotonic in row index, so a row span is one contiguous byte span. The data span is *mapped*
+rather than read once it is worth mapping (64 KiB), which is what removes the slope: dead versions
+inside the span cost address space, not I/O, because only pages actually addressed by `read_string`
+are ever faulted in. `BufferedVariableColumn` now holds a `ColumnExport` plus the `base` offset its
+slots rebase against — private fields, unchanged accessors, so no format/API/codegen change.
+
+**The residual, stated plainly.** Page granularity survives: a live row drags in its whole page,
+including dead bytes sharing it, so the win depends on how clustered the live set is. Append-only
+re-appends an updated row at the tail, which *helps* — round-robin churn ends with every live row in
+the tail behind a solid dead head. Skewed churn scatters them instead:
+
+| churn pattern at A = 8 | before | after |
+|---|---|---|
+| round-robin (clustered) | 2.1 ms | 557 µs |
+| uniform random | 2.3 ms | 922 µs |
+| zipf s = 1.0 (scattered) | 2.3 ms | 1.2 ms |
+
+Before the fix skew was irrelevant — the whole region was read regardless — so this axis only
+becomes meaningful *after* it. Sweeping amplification **under** zipf churn shows the residual is a
+**sublinear** slope rather than a linear one: 2.7× across a 16× amplification range, against 10.9×
+before the fix.
+
+| A | 1× | 2× | 4× | 8× | 16× |
+|---|---|---|---|---|---|
+| narrow, zipf churn, after | 547 µs | 644 µs | 842 µs | 1.1 ms | 1.5 ms |
+
+That residual is also bounded by something the workload cannot escape: the rungs where it is visible
+at all require `compaction = false`. On the default build, amplification is capped at
+`1 + 4000/live_rows`, so the realistic operating range is A ≲ 1.4× at 10k rows and ~1.04× at 100k —
+where the residual is under 1.2×.
+
+**Against the in-place reference**, same subject: ForgeDB's narrow scan is 554 µs vs SQLite's 1.6 ms
+(2.9× faster) and its projection ~55 µs vs SQLite's 1.2 ms (~21× faster, the column-pruning win).
+redb is omitted from this sweep on purpose and the omission is stated in the sweep header: it stores
+each row as one opaque blob, so it has no per-column read path for the question under test.
 
 ### 2. Amplification is hard-capped by auto-compaction — and the cap tightens as the corpus grows
 

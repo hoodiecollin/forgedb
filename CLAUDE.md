@@ -432,9 +432,20 @@ survives. Two of #172's three predicted in-place wins have already weakened: the
 measurable without the variant, and the point-read win is refuted by the code (live `get` never
 touches `id_versions` — `rust.rs:894` vs the `_at`-only sites).
 
-**#218 is BUILT and has produced first results (2026-07-31)** — driver at
-`benchmarks/examples/workload/` (`make bench-workload`; `ARGS="--full" | "--scan-sweep" | "--verify"`),
-the one scenario with an arrival rate. Two structural findings, both in `docs/BENCHMARKS.md`:
+**#218 is BUILT and has DECIDED the read-path question (2026-07-31)** — driver at
+`benchmarks/examples/workload/` (`make bench-workload`; `ARGS="--full" | "--scan-sweep" |
+"--var-sweep" | "--verify"`), the one scenario with an arrival rate. **Both suspected read-path costs
+were implementation artifacts and both are now fixed**: the fixed-width path had a *step* (#221 — a
+lost `mmap` fast path, 24.6×/95.5×, flat in amplification) and the variable-width path had a *slope*
+(#222 — a whole-region read, linear in amplification; 542 µs → 5.9 ms across A = 1→16 became flat at
+~550 µs). Neither was a cost of keeping old versions, and removing them needed no second storage
+engine — **the pre-registered early exit for #167 has fired.** The two sweeps use different subjects
+on purpose (`Metric`, all-fixed, isolates `FixedColumn::export`; `Doc`, string-heavy with a
+fixed-only `@projection` as an in-run control, isolates `VariableColumn::gather_buffered`);
+`--var-sweep` runs against the new `churn_probe` variant because the auto-compaction ceiling leaves no
+amplification range to establish a slope over. Residual after #222: page granularity makes scattered
+churn ~2× costlier than clustered, a **sublinear** slope (2.7× across a 16× amplification range vs
+10.9× before) that is invisible on the default build. Structural findings, all in `docs/BENCHMARKS.md`:
 (1) **the scan cliff was an implementation artifact, not a cost of append-only** — `FixedColumn::export`
 loses its zero-copy `mmap` the instant any row is superseded (the dense-prefix condition) and the
 fallback did one syscall per row, costing ~25×/~96× as a **step, not a slope**. **#221 FIXED it
