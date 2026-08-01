@@ -304,6 +304,11 @@ what's next, exact versions — lives in ground truth, not here:
 - **Substrate versions / publish status:** derive per the *Workspace layout* note above (grep
   `crates/*/Cargo.toml`, `cargo search forgedb-<crate>`, and the scaffold pins). Never trust a
   version written in prose.
+- **What we're working on right now:** open milestones + `gh issue list`. There is deliberately
+  **no "current focus" section in this file**, and one must not be re-added. A focus statement is
+  temporal state: it is stale the moment priorities move, and because it sits in the agent's
+  always-loaded context it gets *acted on* — sending a session off to pick up work that was
+  finished or abandoned. This file is for the durable shape; what is live is a query, not prose.
 
 ### Project management (the ONE tracking model — no parallel systems)
 
@@ -407,58 +412,6 @@ of truth.
    `needs-design`-style status label, and **effort labels are banned**. Templates for gates 1–2 live
    in `.github/ISSUE_TEMPLATE/`. When a feature ships, fold its durable design into
    `docs/ARCHITECTURE.md` and **close the `rfc`**.
-
-### Current primary focus — storage-model experiment (epic #167)
-
-Measure the append-only vs in-place mutation tradeoff rather than assert it. "Storage" conflates
-four independent axes — **columnar layout** (keep; smallest footprint), **append-only mutation** (the
-axis under test; buys snapshots / lock-free readers / MVCC / replica with no `xmin`/`xmax`, costs
-churn growth + version indirection), **durability policy** (the `F_FULLFSYNC` barrier, orthogonal),
-and **generated-read-path quality** (fixable in codegen). The mutation-model decision lives in codegen
-(`crates/codegen/src/rust.rs`), not substrate, so in-place is a `GenConfig` variant through the
-benchmark config matrix — not a second storage crate.
-
-**The verdict is not boolean.** The question is *"is a second storage option worth the
-investment?"* — the two models sit at opposite ends of the perf spectrum, so **both shipping as
-`GenConfig` variants is a legitimate outcome** (two generated variants over one substrate). What the
-matrix must produce is an investment case, not a tiebreak.
-
-**Phase 1** (read-path confound fixes, strict wins) is **complete** (#168 column-pruned scan, #169
-ordered/range index, #160 narrow materialization, #170 group commit). **Phase 2 is re-cut into three
-ordered steps, stopping at the first that decides the question** — #218 (churn scenario: price the
-append tax directly, benchmarks only), then #219 (versioning-off variant: separate the MVCC tax from
-the append tax), then RFC #172 (the fixed-width in-place variant) **only if** a spread worth chasing
-survives. Two of #172's three predicted in-place wins have already weakened: the footprint win is
-measurable without the variant, and the point-read win is refuted by the code (live `get` never
-touches `id_versions` — `rust.rs:894` vs the `_at`-only sites).
-
-**#218 is BUILT and has DECIDED the read-path question (2026-07-31)** — driver at
-`benchmarks/examples/workload/` (`make bench-workload`; `ARGS="--full" | "--scan-sweep" |
-"--var-sweep" | "--verify"`), the one scenario with an arrival rate. **Both suspected read-path costs
-were implementation artifacts and both are now fixed**: the fixed-width path had a *step* (#221 — a
-lost `mmap` fast path, 24.6×/95.5×, flat in amplification) and the variable-width path had a *slope*
-(#222 — a whole-region read, linear in amplification; 542 µs → 5.9 ms across A = 1→16 became flat at
-~550 µs). Neither was a cost of keeping old versions, and removing them needed no second storage
-engine — **the pre-registered early exit for #167 has fired.** The two sweeps use different subjects
-on purpose (`Metric`, all-fixed, isolates `FixedColumn::export`; `Doc`, string-heavy with a
-fixed-only `@projection` as an in-run control, isolates `VariableColumn::gather_buffered`);
-`--var-sweep` runs against the new `churn_probe` variant because the auto-compaction ceiling leaves no
-amplification range to establish a slope over. Residual after #222: page granularity makes scattered
-churn ~2× costlier than clustered, a **sublinear** slope (2.7× across a 16× amplification range vs
-10.9× before) that is invisible on the default build. Structural findings, all in `docs/BENCHMARKS.md`:
-(1) **the scan cliff was an implementation artifact, not a cost of append-only** — `FixedColumn::export`
-loses its zero-copy `mmap` the instant any row is superseded (the dense-prefix condition) and the
-fallback did one syscall per row, costing ~25×/~96× as a **step, not a slope**. **#221 FIXED it
-(2026-07-31)**: `gather` now maps the spanned region once and copies contiguous runs, collapsing the
-cliff to 1.06×/1.21× in a paired stash/restore A/B (churned narrow scan 82.2 ms → 1.1 ms), which
-**fires the pre-registered early exit for #167** — the cliff is removable without a second storage
-engine, and this is a demonstration rather than an inference. (2) **amplification is hard-capped by the generated
-auto-compaction ceiling** at `1 + 4000/live_rows` — an absolute dead-row count, so the cap *tightens*
-as the corpus grows, and the high-amplification state #172 targets is unreachable at realistic size
-under the default config. That weakens the third predicted win too. Also measured: write latency is
-100% fsync-bound and identical across all three engines at every rung. Per the experiment doctrine above,
-#167 stays **off** the release spine; if the conclusion commits an in-place variant, *that* feature
-gets a milestone. Benchmark findings: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Conventions
 
