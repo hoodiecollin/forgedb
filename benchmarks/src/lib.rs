@@ -38,6 +38,13 @@ pub mod v_compaction_low;
 #[allow(warnings)]
 #[path = "../gen/changefeed_small/database.rs"]
 pub mod v_changefeed_small;
+/// #218 high-amplification read probe: `compaction = false` + `fsync = "never"`.
+/// Compaction-off lifts the `1 + 4000/live_rows` auto-compaction ceiling so the
+/// amplification ladder can reach 8x/16x/32x at all; fsync-never keeps the preload
+/// affordable there. Read-path measurements only — see `configs/churn_probe.toml`.
+#[allow(warnings)]
+#[path = "../gen/churn_probe/database.rs"]
+pub mod v_churn_probe;
 
 /// Row counts every scaling scenario sweeps (small / medium / large).
 pub const SIZES: [usize; 3] = [1_000, 100_000, 1_000_000];

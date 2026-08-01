@@ -7,3 +7,4 @@
 /gen/compaction_off/
 /gen/compaction_low/
 /gen/changefeed_small/
+/gen/churn_probe/

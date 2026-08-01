@@ -26,6 +26,16 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# #218 mixed-workload driver. `hdrhistogram` because a sustained-load run is judged
+# on tail latency and a mean would hide exactly the stalls under test. `rand`/
+# `rand_distr` for seeded Zipfian key selection (hot-key skew is what makes churn
+# concentrate). Deliberately NO rate-limiter crate: open-loop pacing needs a fixed
+# precomputed arrival SCHEDULE, and a GCRA limiter (governor et al.) throttles to a
+# rate instead — it would absorb the very stalls this is built to measure, and add
+# non-determinism to a run that must be seed-reproducible.
+hdrhistogram = "7.5"
+rand = "0.8"
+rand_distr = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 redb = "2"
 duckdb = { version = "1", features = ["bundled"] }

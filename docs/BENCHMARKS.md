@@ -315,6 +315,54 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
 18. **On-disk size** per N rows (columnar packing; and update/delete bloat before compaction).
 19. **Peak RSS** during load and during reopen (index rehydrate is O(rows) in memory — measured).
 
+### Mixed workload (the only scenario with an arrival rate)
+20. **Sustained mixed read/create/update/delete/scan under phased load** — `make bench-workload`.
+    Two dedicated scan modes hang off it, because scans are ~1 % of a realistic mix and
+    cannot be sampled well enough there to locate a cliff. They use **different subjects on
+    purpose** — the fixed-width and variable-width column reads are separate code paths with
+    separate failure modes, and a model carrying both reports their sum:
+    `ARGS="--scan-sweep"` over `Metric` (22 fixed columns, no string) isolates
+    `FixedColumn::export` and found a **step** (#221); `ARGS="--var-sweep"` over `Doc`
+    (4 string columns + 2 fixed) isolates `VariableColumn::gather_buffered` and found a
+    **slope** (#222). `--var-sweep` needs `make bench-regen-matrix` first — it runs against
+    the `churn_probe` variant, since the default build's auto-compaction ceiling leaves no
+    amplification range to establish a slope over.
+
+Scenarios 1–19 share a blind spot that this one exists to close. Every one of them is a
+*single operation, timed in isolation, on a database shaped to make that operation easy to
+measure*: nothing mixes mutation kinds, nothing selects rows by a realistic distribution,
+and **nothing has an arrival rate at all** — Criterion is a closed loop by design, which
+removes precisely the timing variance that burstiness consists of.
+
+That blind spot is not cosmetic, because **the append-only tax is history-dependent**: it
+is a function of how mutated the database already is when the next operation lands. A
+pristine-corpus benchmark cannot observe it by construction, so scenarios 1–19 systematically
+measure ForgeDB's best case. Scenario 20 builds the history first and then measures through it.
+
+The driver (`benchmarks/examples/workload/`) applies artillery's model to in-process calls:
+
+- **Open-loop arrival schedule.** Op times are fixed before the run starts, and latency is
+  recorded against *intended* submission time rather than call start. A closed loop stops
+  sending while the system is stalled and so cannot see the stall — the coordinated-omission
+  artifact, under which a database that freezes for a second reports excellent numbers.
+- **Phases** — `warmup → steady → burst → recover`. The burst matters specifically because
+  compaction is what bounds the append tax, so the burst arriving while the compactor is
+  behind is the model's worst moment; steady load never produces that moment.
+- **An amplification ladder** — `A = physical rows / live rows`, stepped 1 → 2 → 4 → 8 → 16 → 32.
+  Every metric is reported as a curve, because the question is not "what does churn cost"
+  but "does the cost stay a bounded constant or fall off a cliff".
+- **A seeded, timing-independent op sequence**, replayed identically by ForgeDB, SQLite and
+  redb at matched durability (one barrier per op everywhere). A slower engine cannot receive
+  an easier workload by falling behind.
+- **Two scan paths kept separate** — the declared `@projection` scan (`FixedColumn::export`)
+  and the internal narrow scan (`VariableColumn::gather_buffered`) — so a cliff can be
+  attributed to a specific call rather than merely observed.
+
+Subject model is `Metric` (22 columns, all fixed-width, no relations), which exists for this
+scenario: it makes the update-*width* axis measurable (ForgeDB writes the whole row on every
+update, so the per-update cost scales with width — a 6-field model cannot show this), and its
+lack of a variable-width column isolates `export` from `gather_buffered`.
+
 ## Methodology guardrails
 
 - **In-process for everyone possible** — SQLite/DuckDB/redb linked in-process; PG over a
@@ -390,6 +438,286 @@ redb-`immediate` (3.94 ms); at the **relaxed** tier ForgeDB-`fsync_never` (**37 
 **fastest** of all — ahead of SQLite-`default` (64 µs), DuckDB (208 µs), and redb-`eventual`
 (331 µs). Never compare across tiers (the ForgeDB-`Always`-vs-DuckDB gap is barrier-vs-no-barrier,
 not an engine deficit).
+
+## Mixed-workload findings (#218, first run — 2026-07-31)
+
+Results from scenario 20. Corpora are smoke-sized — 1e3 preloaded rows for the mixed run
+(`make bench-workload`), 1e4 for the fixed-width scan sweep (`ARGS="--scan-sweep"`), 2e3 for the
+variable-width one (`ARGS="--var-sweep"`) — so treat magnitudes as directional. The *structural*
+findings below do not depend on corpus size, and finding 2 gets stronger as the corpus grows.
+
+**Headline: both suspected read-path costs turned out to be implementation artifacts, and both are
+fixed.** The fixed-width path had a *step* (#221 — a lost `mmap` fast path, 24.6×/95.5×, flat in
+amplification); the variable-width path had a *slope* (#222 — a whole-region read, linear in
+amplification). Neither was a cost of keeping old versions, and both were removed without a second
+storage engine. That is the pre-registered early-exit condition for experiment #167.
+
+### 1. The scan cliff was an implementation artifact, not a cost of append-only — found, fixed, measured (#221)
+
+**The decisive result. It triggered the early exit #218 was designed to look for, and the fix
+has since landed and been measured.**
+
+Paired A/B, `make bench-workload ARGS="--scan-sweep"`, 10 000 live rows, ForgeDB — the fix stashed
+and restored back-to-back on one machine state, so the two legs are directly comparable:
+
+| scan path | state | A = 1.00× | A = 1.20× (req. 2×) | A = 1.20× (req. 4×) | A = 1.20× (req. 8×) | cliff |
+|---|---|---|---|---|---|---|
+| `Projection` (2 of 22 columns, via `@projection`) | before | 460 µs | **11.4 ms** | 11.3 ms | 11.2 ms | **24.6×** |
+| `Projection` | **after** | 548 µs | **572 µs** | 607 µs | 563 µs | **1.06×** |
+| `Narrow` (all 22 columns) | before | 859 µs | **82.2 ms** | 81.9 ms | 81.6 ms | **95.5×** |
+| `Narrow` | **after** | 909 µs | **1.1 ms** | 1.1 ms | 1.1 ms | **1.21×** |
+
+The churned narrow scan went from **82.2 ms to 1.1 ms (75× faster)**; the churned projection from
+**11.4 ms to 572 µs (20× faster)**. The cliff is gone: what remains (1.06×/1.21×) is the expected
+residual, since the repaired path still copies while the pristine path returns an alias with no copy.
+
+Three controls make the pairing trustworthy. The **pristine column barely moves** (460→548 µs,
+859→909 µs, overlapping p99s) — that path was not touched and reports the same either way. The
+**SQLite and redb reference lines agree across legs** (1.1 vs 1.2 ms, 2.4 vs 2.4 ms, 849 vs 950 µs,
+620 vs 622 µs), so both legs saw equivalent machine state. And the **flatness across A = 2/4/8
+survives in both legs** — all three rungs sit at the same reached 1.20× and cost the same, before
+and after.
+
+> **Correction to the first run.** An earlier unpaired sweep reported the pristine column as
+> 270 µs / 817 µs and the cliff as 56× / 137×. The paired run above puts pristine at 460–548 µs /
+> 859–909 µs on an untouched code path, so the earlier pristine figures were the outlier (different
+> machine state), and the honest cliff magnitude is **~25×/~96×**, not 56×/137×. Consequently the
+> claim that pristine ForgeDB is "4.4–4.6× faster than SQLite" was also inflated; the paired figure
+> is **2.2×/2.6×** (see the table below). The direction and the conclusion are unchanged.
+
+**Against the in-place engines, same 10 000-row corpus** — this is what makes the fix worth more
+than removing a regression:
+
+| engine / state | `Projection` p50 | `Narrow` p50 | on-disk |
+|---|---|---|---|
+| **ForgeDB, pristine** (A = 1.00×) | **548 µs** | **909 µs** | **1.4 MB** |
+| **ForgeDB, churned, after #221** (A = 1.20×) | **572 µs** | **1.1 ms** | 1.6 MB |
+| ForgeDB, churned, before #221 (A = 1.20×) | 11.4 ms | 82.2 ms | 1.6 MB |
+| SQLite | 1.2 ms | 2.4 ms | 5.5 MB |
+| redb | 950 µs | 622 µs | 3.9 MB |
+
+Before #221 a churned ForgeDB was **9.5× and 34× slower than SQLite**. After it, a churned ForgeDB
+is **2.1× and 2.2× faster than SQLite** at a quarter of its on-disk size, and trades with redb
+(1.7× faster on the pruned projection, 1.8× slower on the full-width scan, where redb's single-blob
+row layout does one contiguous read). The columnar design delivers what it promises, and it now
+keeps delivering it after the first update instead of discarding it permanently.
+
+A **20 % increase in stored rows** had produced a **25–96× scan regression**. Storing 20 % more data
+cannot inherently cost 96× more to read. That is the signature of a **fast path switching off**,
+and the code said exactly which one:
+
+- `FixedColumn::export` (`crates/storage-native/src/lib.rs`) takes a zero-copy `mmap` **only when
+  the requested indices are the dense prefix `[0, n)`**. Generated `__scan_all` / `all_hot` build
+  their index list from the *live* set, so **one superseded row anywhere** makes the list
+  non-dense and every fixed column falls off the fast path — permanently, until compaction.
+- The fallback, `FixedColumn::gather`, issues **one `read_exact_at` syscall per index**. The
+  projection scan reads 3 columns × 10 000 rows ≈ 30 000 syscalls (≈15 ms); the narrow scan reads
+  22 columns × 10 000 rows ≈ 220 000 syscalls (≈112 ms). The measured times match that arithmetic.
+- `FixedColumn::gather_buffered` is a thin wrapper over `export`, so the narrow scan inherits the
+  same fallback — **both suspected cliffs turn out to be the same root cause**, not two.
+
+**Why this settles something for #167.** The cost was a *step*, not a slope, and the A = 2/4/8
+columns are the evidence: all three landed at the same capped 1.20× (see finding 2) and produced
+**the same scan times within noise**. An inherent cost of versioned storage would grow with the
+number of versions; a lost `mmap` fast path is binary, and it measured as binary — paid in full at
+the first update, flat thereafter. In-place storage would have avoided it only *incidentally*, by
+happening to keep the live set dense. Repairing the read path removed the cliff **without a second
+storage engine**, which is precisely the pre-registered early-exit condition in the #218 plan — and
+the A/B above converts that from an inference about the cause into a demonstration.
+
+**The shipped fix (#221).** `FixedColumn::gather` now bounds-checks the whole selection up front,
+maps the spanned region `[min..=max]` **once**, and copies out of that mapping in *contiguous runs*.
+A live set under churn is long runs broken by the holes superseded rows leave behind, so the copy
+collapses to a handful of `memcpy`s instead of 220 000 syscalls. Selections below
+`GATHER_MMAP_MIN_ROWS` (8) keep the old per-row loop, where a mapping is not worth its setup, and a
+failed mapping falls through to that loop rather than erroring — both paths emit identical bytes.
+No on-disk format change, no API change, no generated-code change: `export` and `gather_buffered`
+already delegate here, so the generated scan picks it up for free.
+
+**The cliff was bimodal, which made it worse than a constant cost** — and that is what the fix
+collapses. Compaction rewrites the live set back into a dense prefix and *restores* the fast path;
+the next update destroys it again. Scan latency therefore oscillated between the two modes
+(≈460 µs and ≈11 ms) depending only on whether any update had landed since the last compaction, and
+under a live mixed workload that condition is essentially always true — so the degraded mode was the
+normal mode. That is exactly why scenarios 1–19 never saw it, and it meant **the Phase 1 #168
+headline (`scan_aggregate` 32.4 ms → 568 µs) described the best case rather than the steady state.**
+After #221 the two modes differ by 1.06×/1.21× instead of 24.6×/95.5×, so the pristine number is now
+a fair description of steady-state behaviour.
+
+The variable-width half of the read path is finding 1b below — a different shape, measured
+separately, and now also fixed.
+
+### 1b. The variable-column slope — a *slope*, not a step, and also an artifact (#222)
+
+`Metric` is all fixed-width by design, so neither the sweep above nor #221 touches
+`VariableColumn::gather_buffered`, which ignored the requested indices entirely:
+
+```rust
+let mut offsets = vec![0u8; self.row_count * 16];             // ALL physical rows
+let mut data = vec![0u8; self.current_data_offset as usize];  // ENTIRE data region
+```
+
+A scan returning L live bytes read and allocated **A × L**. That is proportional to amplification —
+the shape that would indicate a genuine cost of keeping old versions, as opposed to #221's binary
+step. So it needed its own subject and its own sweep.
+
+**Subject: `Doc`** — relation-free (so churn cannot be confounded by `@on_delete` work the way it
+would be on `Post`), 4 string columns + 2 fixed, with `@projection(meta: seq, kind)` over the
+*fixed* columns only. That projection is the **in-run control**: it never touches a
+`VariableColumn`, so a slope in the narrow scan is attributable to the variable path rather than to
+machine state. Run via `make bench-workload ARGS="--var-sweep"`.
+
+**Method note — the ladder needs `compaction = false`.** Finding 2 caps amplification at
+`1 + 4000/live_rows`, which on a 10k-row corpus is a 1.0×–1.4× range: no lever arm to establish a
+slope over. This sweep therefore runs against a new `churn_probe` generated variant
+(`compaction = false` + `fsync = "never"`). Fsync-never is legitimate here because the mode measures
+*reads*, durability is an orthogonal axis in the #167 framing, and finding 3 already showed writes
+are ~100 % fsync-bound and identical across engines.
+
+Paired stash/restore A/B, 2 000 live rows, 256 B per string column:
+
+| A | narrow scan, before | narrow scan, after | projection (control) |
+|---|---|---|---|
+| 1× | 542 µs | **547 µs** | ~47–57 µs |
+| 2× | 734 µs | **553 µs** | ~57 µs |
+| 4× | 1.4 ms | **555 µs** | ~53–59 µs |
+| 8× | 2.4 ms | **554 µs** | ~57–62 µs |
+| 16× | 5.9 ms | **536 µs** | ~54–59 µs |
+
+Doubling with every doubling of A before; **flat** after. The control held throughout both legs.
+
+Cost now tracks **live** bytes rather than `A × live_bytes` — payload sweep at A = 8:
+
+| bytes/column | before | after |
+|---|---|---|
+| 64 | 632 µs | 373 µs |
+| 256 | 2.2 ms | 557 µs |
+| 1024 | 12.6 ms | 1.2 ms |
+| 4096 | 48.5 ms | 4.6 ms |
+
+What remains still scales with payload size, as it must — you have to read the bytes you asked for.
+
+**The fix.** Both reads are bounded to the selection's row span `[min, max]`; append order makes data
+offsets monotonic in row index, so a row span is one contiguous byte span. The data span is *mapped*
+rather than read once it is worth mapping (64 KiB), which is what removes the slope: dead versions
+inside the span cost address space, not I/O, because only pages actually addressed by `read_string`
+are ever faulted in. `BufferedVariableColumn` now holds a `ColumnExport` plus the `base` offset its
+slots rebase against — private fields, unchanged accessors, so no format/API/codegen change.
+
+**The residual, stated plainly.** Page granularity survives: a live row drags in its whole page,
+including dead bytes sharing it, so the win depends on how clustered the live set is. Append-only
+re-appends an updated row at the tail, which *helps* — round-robin churn ends with every live row in
+the tail behind a solid dead head. Skewed churn scatters them instead:
+
+| churn pattern at A = 8 | before | after |
+|---|---|---|
+| round-robin (clustered) | 2.1 ms | 557 µs |
+| uniform random | 2.3 ms | 922 µs |
+| zipf s = 1.0 (scattered) | 2.3 ms | 1.2 ms |
+
+Before the fix skew was irrelevant — the whole region was read regardless — so this axis only
+becomes meaningful *after* it. Sweeping amplification **under** zipf churn shows the residual is a
+**sublinear** slope rather than a linear one: 2.7× across a 16× amplification range, against 10.9×
+before the fix.
+
+| A | 1× | 2× | 4× | 8× | 16× |
+|---|---|---|---|---|---|
+| narrow, zipf churn, after | 547 µs | 644 µs | 842 µs | 1.1 ms | 1.5 ms |
+
+That residual is also bounded by something the workload cannot escape: the rungs where it is visible
+at all require `compaction = false`. On the default build, amplification is capped at
+`1 + 4000/live_rows`, so the realistic operating range is A ≲ 1.4× at 10k rows and ~1.04× at 100k —
+where the residual is under 1.2×.
+
+**Against the in-place reference**, same subject: ForgeDB's narrow scan is 554 µs vs SQLite's 1.6 ms
+(2.9× faster) and its projection ~55 µs vs SQLite's 1.2 ms (~21× faster, the column-pruning win).
+redb is omitted from this sweep on purpose and the omission is stated in the sweep header: it stores
+each row as one opaque blob, so it has no per-column read path for the question under test.
+
+### 2. Amplification is hard-capped by auto-compaction — and the cap tightens as the corpus grows
+
+Not anticipated by the plan, and it invalidates part of the plan's method.
+
+The generated code force-compacts once a model accumulates
+`COMPACTION_DEAD_THRESHOLD × COMPACTION_DEAD_CEILING_FACTOR` dead rows — **1000 × 4 = 4000 by
+default**. That is an **absolute row count, not a ratio**, so the reachable amplification ceiling is
+
+```
+A_max  ≈  1 + 4000 / live_rows
+```
+
+| live rows | max achievable amplification |
+|-----------|------------------------------|
+| 1e3       | ~5×  (measured: requested 16×, reached **4.00×**) |
+| 1e4       | ~1.4× |
+| 1e5       | ~1.04× |
+| 1e6       | ~1.004× |
+
+So the append-only model's bloat is **self-limiting, and increasingly so at scale**: the larger
+the database, the *less* relative garbage it can accumulate before compaction reclaims. Requesting
+A = 16 at 1e3 live rows reached only 4.00×, and the driver now labels such rungs `<< CAPPED`
+rather than reporting them as though high amplification had been measured.
+
+This matters for #167 because the high-amplification steady state that RFC #172's in-place variant
+was meant to rescue **cannot occur at a realistic corpus size under the default config**. It is not
+merely expensive to reach — it is unreachable. Combined with the two already-weakened predictions
+(footprint measurable without building in-place; point-read win refuted by the code), this erodes
+the last of #172's three predicted wins.
+
+**Caveat, stated because it is the honest limit of this result:** this holds for the *default*
+config. With `compaction = false` (the `compaction_off` variant) amplification is unbounded. So an
+in-place investment case is not dead — but it now has to rest on compaction-disabled workloads, or
+on the compaction *pause* cost, rather than on steady-state bloat. Exploring the upper ladder rungs
+at all requires generating against `compaction_off`, which is a correction to the #218 plan's
+method: the ladder as originally specified is unreachable on the default build.
+
+### 3. Write latency is entirely fsync-bound — the storage model is invisible in it
+
+At matched durability, `create` and `update` p50 sit at **~4–5 ms for all three engines, at every
+amplification rung**. ForgeDB, SQLite (`synchronous=FULL` + `fullfsync=1`) and redb
+(`Durability::Immediate`) are indistinguishable, and neither engine's write cost moves with
+accumulated history.
+
+Writes are ~100% `F_FULLFSYNC`. Any write-path difference between append-only and in-place is
+below the durability barrier's noise floor, which confirms — and strengthens — RFC #172's
+"~equal on writes" prediction. It also means write-path comparisons at `FsyncPolicy::Always` cannot
+discriminate between storage models at all; a `fsync_never` pass is required to see anything there.
+
+### 4. Burst saturation is the device barrier, not a model difference
+
+Under the burst phase (2000 ops/s offered), **all three engines fall behind by nearly the same
+margin** — 4.6 s / 3.8 s / 3.9 s wall against a 2.0 s nominal phase. Sustained fsync-per-op simply
+exceeds what the device delivers.
+
+Two consequences. First, "ForgeDB fell behind under burst" is not a ForgeDB finding — reporting it
+as one would be exactly the kind of unfair-durability comparison the guardrails above exist to
+prevent. Second, the resulting ~1.8 s p99s are *queueing delay*, visible only because latency is
+measured against intended submission time; a closed-loop harness would have reported these runs as
+comfortably fast.
+
+### 5. Footprint: ForgeDB smallest by a wide margin, and compaction reclaims mid-run
+
+At ~1.3k live rows: **ForgeDB 402 KB · redb 1.5 MB · SQLite 4.2 MB**. Columnar packing wins clearly,
+consistent with scenario 18.
+
+Amplification was also observed *falling* during a run — 820 KB at 4.11× down to 247 KB at 1.27× —
+i.e. the auto-compactor reclaiming under live mixed load, not just when asked. This is finding 1
+observed dynamically rather than derived from the constant.
+
+### 6. Reopen scales with physical rows, as predicted
+
+Reopen: **29.2 ms → 32.2 ms → 41.3 ms** as accumulated versions rose. The open path rehydrates
+`id_to_row` and every index by walking physical rows, superseded versions included, so this cost is
+inherent to having versions rather than an artifact of the read path — a smarter scan cannot avoid
+it. The growth is real but modest, and bounded by finding 1.
+
+### 7. Mixed-mutation correctness — a gap the suite did not previously cover
+
+Across every run, ForgeDB's live-row count matched both the schedule's implied count and the other
+two engines exactly, under interleaved create/update/delete with skewed key selection. The suite had
+no such test: version-chain and tombstone resolution under *interleaved* mutation was previously
+unguarded, and `make bench-workload ARGS="--verify"` now checks it (along with schedule determinism
+and that the preload actually produces the history it claims).
 
 ## Recent performance work
 

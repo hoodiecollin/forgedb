@@ -1205,6 +1205,74 @@ fn test_fixed_column_gather_full_prefix_matches_reads() {
     fs::remove_dir_all(&temp_dir).unwrap();
 }
 
+#[test]
+fn test_fixed_column_gather_mapped_path_matches_per_row_reads() {
+    // #221: at/above the mmap threshold `gather` maps the spanned region once
+    // and copies contiguous runs out of it. That path must be byte-identical to
+    // the per-row `read_exact_at` loop for every selection shape — the tests
+    // above only exercise selections below the threshold.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_gather_mapped");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("g.bin"), 8).unwrap();
+    for v in 0..1000u64 {
+        col.append_u64(v * 7 + 1).unwrap();
+    }
+
+    let decode = |bytes: &[u8]| -> Vec<u64> {
+        bytes
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let expect = |idx: &[usize]| -> Vec<u64> { idx.iter().map(|&i| col.read_u64(i).unwrap()).collect() };
+
+    // The shape the cliff actually produces: a live set that is long runs
+    // broken by the holes superseded rows left behind.
+    let holey: Vec<usize> = (0..1000).filter(|i| i % 3 != 0).collect();
+    assert_eq!(decode(&col.gather(&holey).unwrap()), expect(&holey));
+
+    // A dense run that is *not* a prefix — `export`'s alias fast path rejects
+    // it, so it lands here as one single-run copy.
+    let run: Vec<usize> = (500..900).collect();
+    assert_eq!(decode(&col.gather(&run).unwrap()), expect(&run));
+
+    // Reversed: no run ever extends, so every slot is its own copy.
+    let rev: Vec<usize> = (0..64).rev().collect();
+    assert_eq!(decode(&col.gather(&rev).unwrap()), expect(&rev));
+
+    // Sparse across the whole file — the mapped span is far larger than the
+    // selection.
+    let sparse: Vec<usize> = (0..1000).step_by(97).collect();
+    assert_eq!(decode(&col.gather(&sparse).unwrap()), expect(&sparse));
+
+    // Duplicated indices must be honoured positionally, not deduplicated.
+    let dupes: Vec<usize> = vec![9, 9, 9, 4, 4, 800, 800, 0, 0, 0];
+    assert_eq!(decode(&col.gather(&dupes).unwrap()), expect(&dupes));
+
+    // Both paths agree across the threshold boundary (GATHER_MMAP_MIN_ROWS = 8;
+    // private to the crate, so spelled out here).
+    for n in [7usize, 8, 9] {
+        let idx: Vec<usize> = (0..n).map(|i| i * 3).collect();
+        assert_eq!(decode(&col.gather(&idx).unwrap()), expect(&idx));
+    }
+
+    // An out-of-bounds index anywhere in a large selection still errors — the
+    // whole selection is bounds-checked before the span is mapped.
+    let mut bad: Vec<usize> = (0..100).collect();
+    bad.push(1000);
+    assert!(col.gather(&bad).is_err());
+
+    // And the generated scan path (gather_buffered → export → gather) agrees.
+    let buf = col.gather_buffered(&holey).unwrap();
+    for (slot, &i) in holey.iter().enumerate() {
+        assert_eq!(buf.read_u64(slot).unwrap(), col.read_u64(i).unwrap());
+    }
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
 // export(): the alias-or-gather columnar-export primitive (the zero-copy fast
 // path behind the bindings' Arrow export). A contiguous dense prefix `[0, n)`
 // aliases the column file via mmap (`ColumnExport::Mapped`); any other selection
@@ -1369,6 +1437,78 @@ fn test_buffered_variable_column_matches_per_row_reads() {
 
     // Out-of-bounds index → error.
     assert!(col.gather_buffered(&[0, 4]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
+fn test_buffered_variable_column_mapped_path_matches_per_row_reads() {
+    // #222: `gather_buffered` now bounds both reads to the selection's row span and
+    // MAPS the data span once it is large enough, instead of reading the whole region.
+    // The test above only covers tiny corpora, which stay on the owned path and always
+    // have base == 0 — so it cannot catch a bad rebase. This one does.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_var_mapped");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = VariableColumn::new(
+        temp_dir.join("v_data.bin"),
+        temp_dir.join("v_offsets.bin"),
+    )
+    .unwrap();
+
+    // ~1 MB of data, comfortably past VAR_MMAP_MIN_BYTES, with empty strings sprinkled
+    // in so zero-length slots are exercised inside a mapped span.
+    let n = 4000usize;
+    for i in 0..n {
+        if i % 37 == 0 {
+            col.append_string("").unwrap();
+        } else {
+            col.append_string(&format!("row-{i}-{}", "x".repeat(240))).unwrap();
+        }
+    }
+
+    let check = |idx: &[usize]| {
+        let buf = col.gather_buffered(idx).unwrap();
+        assert_eq!(buf.len(), idx.len());
+        for (slot, &i) in idx.iter().enumerate() {
+            assert_eq!(
+                buf.read_string(slot).unwrap(),
+                col.read_string(i).unwrap(),
+                "slot {slot} (row {i})"
+            );
+        }
+    };
+
+    // The churn shape: long runs broken by holes where superseded rows were skipped.
+    let holey: Vec<usize> = (0..n).filter(|i| i % 3 != 0).collect();
+    check(&holey);
+
+    // A span that starts late — base is large, so an unrebased offset would read the
+    // wrong bytes (or fall outside the mapping and error).
+    let tail: Vec<usize> = (3000..3500).collect();
+    check(&tail);
+
+    // Selection order is preserved, including fully reversed.
+    let rev: Vec<usize> = (2000..2400).rev().collect();
+    check(&rev);
+
+    // Sparse across the whole file: the mapped span is nearly everything, but only the
+    // addressed pages are ever touched.
+    let sparse: Vec<usize> = (0..n).step_by(97).collect();
+    check(&sparse);
+
+    // Duplicated indices are positional, not deduplicated.
+    check(&[3999, 3999, 0, 0, 2500, 2500]);
+
+    // A selection of only empty strings has a zero-length data span.
+    let empties: Vec<usize> = (0..n).filter(|i| i % 37 == 0).collect();
+    check(&empties);
+
+    // Out-of-bounds anywhere still errors, before anything is mapped.
+    let mut bad: Vec<usize> = (0..100).collect();
+    bad.push(n);
+    assert!(col.gather_buffered(&bad).is_err());
 
     fs::remove_dir_all(&temp_dir).unwrap();
 }

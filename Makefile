@@ -10,7 +10,7 @@ BENCH := benchmarks/Cargo.toml
 
 ## Config variants for the matrix bench (epic #126): each becomes a generated
 ## module under benchmarks/gen/<name>/. Keep in sync with benchmarks/configs/.
-BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_low changefeed_small
+BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_low changefeed_small churn_probe
 
 .PHONY: inspector-install inspector inspector-build inspector-typecheck \
         inspector-app inspector-app-build \
@@ -19,7 +19,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix \
-        bench-footprint bench-concurrency
+        bench-footprint bench-concurrency bench-workload
 
 ## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
 ## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), and the
@@ -66,6 +66,22 @@ bench-footprint:
 ## (#56-B lock-free reads) at 1/2/4/8 reader threads, with and without a writer.
 bench-concurrency:
 	cargo run --manifest-path $(BENCH) --example concurrency --release
+
+## Mixed-workload driver (scenario 20, #218 under experiment #167): sustained
+## read/create/update/delete/scan at phased arrival rates (warmup -> steady -> burst
+## -> recover) across an amplification ladder, vs SQLite + redb at matched durability.
+## NOT a Criterion bench: Criterion's closed loop cannot express burstiness or
+## queueing delay, which is exactly what the append-only tax shows up as.
+##   make bench-workload                       # quick smoke matrix
+##   make bench-workload ARGS="--full"         # full ladder (A = 1..32)
+##   make bench-workload ARGS="--forgedb-only" # skip the comparison engines
+##   make bench-workload ARGS="--scan-sweep"   # fixed-width scan path (Metric subject)
+##   make bench-workload ARGS="--var-sweep"    # variable-width scan path (Doc subject);
+##                                             # needs `make bench-regen-matrix` first,
+##                                             # it runs against the churn_probe variant
+##   make bench-workload ARGS="--verify"       # driver self-checks
+bench-workload:
+	cargo run --manifest-path $(BENCH) --example workload --release -- $(ARGS)
 
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 bench-matrix:

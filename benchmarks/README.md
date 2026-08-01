@@ -18,6 +18,7 @@ make bench-postgres   # PostgreSQL — ephemeral cluster via devbox (see below)
 make bench-pglite     # JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite
 make bench-footprint  # on-disk bytes per corpus (all engines) + ForgeDB churn bloat (scenario 18)
 make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, scenario 16)
+make bench-workload   # sustained MIXED r/c/u/d/scan under phased load (scenario 20, #218)
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
 
 # Config matrix (epic #126): same scenarios across generated config variants.
@@ -29,6 +30,57 @@ The matrix variant modules (`gen/<variant>/`) are **gitignored** (regenerable fr
 `bench.forge` + `configs/*.toml`) — run `make bench-regen-matrix` before `make bench-matrix`.
 Config axes live in `benchmarks/configs/*.toml`; results + interpretation are in
 [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) under "Configuration matrix".
+
+## Mixed-workload driver (`make bench-workload`)
+
+Every Criterion scenario here times **one** operation in isolation on a pristine or
+trivially-shaped database. That cannot measure an append-only engine's churn cost, because
+that cost is *history-dependent* — it depends on how mutated the database already is when
+the next operation lands. `make bench-workload` is the one scenario that builds the history
+first: a seeded mix of reads/creates/updates/deletes/scans, offered at **phased arrival
+rates** (`warmup → steady → burst → recover`), replayed identically by ForgeDB, SQLite and
+redb at matched durability.
+
+```bash
+make bench-workload                       # quick smoke matrix (fsync-bound)
+make bench-workload ARGS="--full"         # full amplification ladder A = 1..32
+make bench-workload ARGS="--forgedb-only" # skip the comparison engines
+make bench-workload ARGS="--scan-sweep"   # scan path, FIXED-width subject (Metric)
+make bench-workload ARGS="--var-sweep"    # scan path, VARIABLE-width subject (Doc)
+make bench-workload ARGS="--verify"       # driver self-checks
+```
+
+### The two scan sweeps
+
+Scans are ~1 % of a realistic op mix, far too few samples to locate a cliff, so the scan path
+gets its own modes. They use **different subjects on purpose**, because the fixed-width and
+variable-width column reads are separate code paths with separate failure modes — measuring a
+model that has both reports their sum and separates nothing:
+
+| mode | subject | isolates | shape found |
+|---|---|---|---|
+| `--scan-sweep` | `Metric` (22 fixed columns, no string) | `FixedColumn::export` | a **step** — a lost `mmap` fast path (#221) |
+| `--var-sweep` | `Doc` (4 string columns + 2 fixed) | `VariableColumn::gather_buffered` | a **slope** — cost ∝ amplification (#222) |
+
+`Doc` declares `@projection(meta: seq, kind)` over its *fixed* columns only, so the same model
+under the same churn gives two scan paths: the projection never touches a `VariableColumn` and
+acts as an **in-run control**, which is what makes a slope in the narrow scan attributable to
+the variable path rather than to machine state.
+
+`--var-sweep` runs against the **`churn_probe`** generated variant (`compaction = false` +
+`fsync = "never"`), so it needs `make bench-regen-matrix` first. Compaction-off is required, not
+convenient: the default build caps amplification at `1 + 4000/live_rows`, which on a 10k-row
+corpus is a 1.0×–1.4× range — no lever arm to establish a slope over. Fsync-never only affects
+the preload, and this mode measures reads.
+
+Deliberately **not** a Criterion bench: Criterion is a closed loop (fire, wait, fire), which
+by construction removes the arrival-time variance that burstiness is made of and cannot
+express queueing delay. Latency is recorded against *intended* submission time, so a stall
+lands in the tail instead of being silently absorbed (coordinated omission).
+
+Runs are fsync-bound by design — the durability barrier is matched across engines rather
+than tuned away, so wall-clock is dominated by `F_FULLFSYNC`. That is the honest cost of the
+comparison, not a harness defect.
 
 ## PostgreSQL via devbox (declarative host deps)
 
