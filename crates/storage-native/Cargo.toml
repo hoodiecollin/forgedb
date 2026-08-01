@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-storage-native"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Native (positional file I/O) columnar storage backend for ForgeDB. Selected by the `forgedb-storage` facade on non-wasm targets."
