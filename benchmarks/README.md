@@ -18,6 +18,7 @@ make bench-postgres   # PostgreSQL — ephemeral cluster via devbox (see below)
 make bench-pglite     # JS/Bun suite: PGlite (Postgres WASM, in-process) vs bun:sqlite
 make bench-footprint  # on-disk bytes per corpus (all engines) + ForgeDB churn bloat (scenario 18)
 make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, scenario 16)
+make bench-workload   # sustained MIXED r/c/u/d/scan under phased load (scenario 20, #218)
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
 
 # Config matrix (epic #126): same scenarios across generated config variants.
@@ -29,6 +30,31 @@ The matrix variant modules (`gen/<variant>/`) are **gitignored** (regenerable fr
 `bench.forge` + `configs/*.toml`) — run `make bench-regen-matrix` before `make bench-matrix`.
 Config axes live in `benchmarks/configs/*.toml`; results + interpretation are in
 [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) under "Configuration matrix".
+
+## Mixed-workload driver (`make bench-workload`)
+
+Every Criterion scenario here times **one** operation in isolation on a pristine or
+trivially-shaped database. That cannot measure an append-only engine's churn cost, because
+that cost is *history-dependent* — it depends on how mutated the database already is when
+the next operation lands. `make bench-workload` is the one scenario that builds the history
+first: a seeded mix of reads/creates/updates/deletes/scans, offered at **phased arrival
+rates** (`warmup → steady → burst → recover`), replayed identically by ForgeDB, SQLite and
+redb at matched durability.
+
+```bash
+make bench-workload                       # quick smoke matrix (~10 min, fsync-bound)
+make bench-workload ARGS="--full"         # full amplification ladder A = 1..32
+make bench-workload ARGS="--forgedb-only" # skip the comparison engines
+```
+
+Deliberately **not** a Criterion bench: Criterion is a closed loop (fire, wait, fire), which
+by construction removes the arrival-time variance that burstiness is made of and cannot
+express queueing delay. Latency is recorded against *intended* submission time, so a stall
+lands in the tail instead of being silently absorbed (coordinated omission).
+
+Runs are fsync-bound by design — the durability barrier is matched across engines rather
+than tuned away, so wall-clock is dominated by `F_FULLFSYNC`. That is the honest cost of the
+comparison, not a harness defect.
 
 ## PostgreSQL via devbox (declarative host deps)
 
