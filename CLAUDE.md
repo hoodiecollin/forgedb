@@ -268,9 +268,11 @@ serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p
 top-level `enum Name { A, B, C }` (PascalCase name + variants), referenced by bare name — 1-byte discriminant column,
 serialized as the variant-name string, filterable/sortable (declaration order)/indexable. Relations: `[Model]`
 one-to-many, `*Model` required FK, `?Model` optional FK, bidirectional `[..]`/`[..]` = many-to-many; `[type; N]`
-fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives: `@min @max @length
-@email @url @default @index @computed @fulltext @materialized` (field-level, mostly semantic-only), **`@pattern`/
-`@regex` ENFORCED** (per-field `LazyLock<Regex>`, non-match → 422; #104), **`@on_delete(restrict|cascade|set_null)`
+fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives — **the validating
+ones are `@min @max @length @email @url @pattern`/`@regex`, all ENFORCED** (violation → 422; `@length` counts
+**chars**, not bytes; `@pattern` is a per-field `LazyLock<Regex>`, #104). **Semantic-only markers** (parsed, carried,
+never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
+modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
 `set_null` optional-FK only), `@soft_delete` + composite `@index(a,b)` + `@projection(name: a, b)` (#113 —
 model-level; generates a partial-read struct/methods over PK + the named columns), `@relations(*|fields)`
