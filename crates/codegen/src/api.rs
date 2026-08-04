@@ -70,7 +70,7 @@ impl ApiGenerator {
                 extract::{Path, Query, State},
                 extract::ws::{Message, WebSocket, WebSocketUpgrade},
                 http::StatusCode,
-                response::{Json, Response},
+                response::{IntoResponse, Json, Response},
                 routing::{delete, get, post, put},
                 Router,
             };
@@ -96,6 +96,32 @@ impl ApiGenerator {
         tokens.extend(quote! {
             const PAGE_DEFAULT_LIMIT: usize = #__page_default_limit;
             const PAGE_MAX_LIMIT: usize = #__page_max_limit;
+        });
+
+        // #229: the list envelope, serialized straight to bytes.  Building it with
+        // `json!` ran `serde_json::to_value(page)` first, which clones every string
+        // of every page row into an intermediate `Value` tree that axum then
+        // serializes again — so every string in a list response was allocated twice
+        // (once decoding it out of the column, once into the `Value`).  A typed
+        // struct with a BORROWED page serializes in one pass and clones nothing.
+        //
+        // The wire shape is unchanged and must stay so: serde emits struct fields
+        // in declaration order, so `data`/`total`/`limit`/`offset` here are
+        // byte-identical to the `json!` literal they replaced.
+        //
+        // Generic over the row type because the `?projection=` arms each carry a
+        // different one; emitted once per file, not per model — it names no field
+        // and no model, so there is nothing schema-specific to generate per model.
+        // `__`-prefixed because this file does `use super::*`, which would otherwise
+        // put it one PascalCase model name away from a collision.
+        tokens.extend(quote! {
+            #[derive(serde::Serialize)]
+            struct __ListEnvelope<'a, T: serde::Serialize> {
+                data: &'a [T],
+                total: usize,
+                limit: usize,
+                offset: usize,
+            }
         });
 
         // Generate handler functions for each model
@@ -223,17 +249,38 @@ impl ApiGenerator {
                 })
                 .collect();
 
+            // #229: serialize the projected record straight to bytes.  The
+            // `serde_json::to_value` this replaced cloned every projected string
+            // into an intermediate `Value` that axum then serialized again.
             get_arms.push(quote! {
                 #name => match db.#storage_field.#get_fn(key) {
-                    Some(r) => (StatusCode::OK, Json(serde_json::to_value(&r).unwrap_or(json!(null)))),
-                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                    Some(r) => (StatusCode::OK, Json(r)).into_response(),
+                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+                        .into_response(),
                 },
             });
+            // #229: build the projected page as a typed `Vec`, then borrow it into
+            // the shared envelope.  This used to `serde_json::to_value` each row
+            // into a `Vec<serde_json::Value>` — a per-row clone of every projected
+            // string on top of the envelope's own.  Each arm has a different row
+            // type, which is why `__ListEnvelope` is generic rather than per-model.
             list_arms.push(quote! {
-                #name => page
-                    .iter()
-                    .map(|r| serde_json::to_value(super::#proj_ident { #(#field_copies),* }).unwrap_or(json!(null)))
-                    .collect(),
+                #name => {
+                    let __data: Vec<super::#proj_ident> = page
+                        .iter()
+                        .map(|r| super::#proj_ident { #(#field_copies),* })
+                        .collect();
+                    (
+                        StatusCode::OK,
+                        Json(__ListEnvelope {
+                            data: &__data,
+                            total,
+                            limit: qp.pagination.limit,
+                            offset: qp.pagination.offset,
+                        }),
+                    )
+                        .into_response()
+                }
             });
         }
 
@@ -242,12 +289,14 @@ impl ApiGenerator {
             if let Some(__proj) = params.get("projection") {
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
-                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" })))
+                        .into_response(),
                 };
                 let db = db.read().await;
                 return match __proj.as_str() {
                     #(#get_arms)*
-                    _ => (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" }))),
+                    _ => (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" })))
+                        .into_response(),
                 };
             }
         };
@@ -255,16 +304,11 @@ impl ApiGenerator {
             // #113: named-projection list (filter/sort/paginate on full rows,
             // then emit only the projection's columns for the page).
             if let Some(__proj) = params.get("projection") {
-                let data: Vec<serde_json::Value> = match __proj.as_str() {
+                return match __proj.as_str() {
                     #(#list_arms)*
-                    _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" }))),
+                    _ => (StatusCode::BAD_REQUEST, Json(json!({ "error": "unknown projection" })))
+                        .into_response(),
                 };
-                return (StatusCode::OK, Json(json!({
-                    "data": data,
-                    "total": total,
-                    "limit": qp.pagination.limit,
-                    "offset": qp.pagination.offset,
-                })));
             }
         };
         (get_block, list_block)
@@ -405,10 +449,15 @@ impl ApiGenerator {
             // closed-set `#filter_fn` the change-feed / live-query paths use (no
             // second predicate parser); sorting uses the generated `#sort_fn`
             // comparator; pagination is clamped by the substrate (MAX_LIMIT).
+            // #229: returns `Response`, not `(StatusCode, Json<serde_json::Value>)`
+            // — the success body is now a typed envelope while the error bodies are
+            // still ad-hoc `json!` objects, so the arms have different body types.
+            // `#[utoipa::path]` documents the response from its own `responses(...)`
+            // attribute, so the OpenAPI document is unchanged by this.
             async fn #list_fn(
                 Query(params): Query<HashMap<String, String>>,
                 State(db): State<Arc<RwLock<super::Database>>>,
-            ) -> (StatusCode, Json<serde_json::Value>) {
+            ) -> Response {
                 // Parse the generic query params (sort/order/limit/offset); the
                 // remaining `?field=value` pairs stay in `params` for the filter.
                 let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
@@ -437,7 +486,8 @@ impl ApiGenerator {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(json!({ "error": "as_of must be a non-negative integer watermark" })),
-                            );
+                            )
+                                .into_response();
                         }
                     },
                     None => None,
@@ -469,13 +519,19 @@ impl ApiGenerator {
                     }
                 };
                 #proj_list_block
-                let body = json!({
-                    "data": page,
-                    "total": total,
-                    "limit": qp.pagination.limit,
-                    "offset": qp.pagination.offset,
-                });
-                (StatusCode::OK, Json(body))
+                // #229: borrow the page into the envelope — no intermediate
+                // `serde_json::Value`, so the page's strings are written to the
+                // socket from the rows themselves rather than cloned first.
+                (
+                    StatusCode::OK,
+                    Json(__ListEnvelope {
+                        data: &page,
+                        total,
+                        limit: qp.pagination.limit,
+                        offset: qp.pagination.offset,
+                    }),
+                )
+                    .into_response()
             }
 
             #[utoipa::path(
@@ -495,13 +551,18 @@ impl ApiGenerator {
                 Path(id): Path<String>,
                 Query(params): Query<HashMap<String, String>>,
                 State(db): State<Arc<RwLock<super::Database>>>,
-            ) -> (StatusCode, Json<serde_json::Value>) {
+            // #229: `Response`, not `(StatusCode, Json<serde_json::Value>)` — the
+            // record is now serialized from its own type, so the success and error
+            // arms carry different body types.  The projection arms above each
+            // carry a *different* record type again, which is the other reason.
+            ) -> Response {
                 // #113 projection takes precedence (a projected read is live-only);
                 // `?as_of=` below applies to the full-record point read.
                 #proj_get_block
                 let key = match id.parse::<#id_type>() {
                     Ok(key) => key,
-                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" }))),
+                    Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid id" })))
+                        .into_response(),
                 };
                 // #85: optional point-in-time read (see the list handler note).
                 let __as_of: Option<usize> = match params.get("as_of") {
@@ -511,7 +572,8 @@ impl ApiGenerator {
                             return (
                                 StatusCode::BAD_REQUEST,
                                 Json(json!({ "error": "as_of must be a non-negative integer watermark" })),
-                            );
+                            )
+                                .into_response();
                         }
                     },
                     None => None,
@@ -522,11 +584,11 @@ impl ApiGenerator {
                     None => db.#storage_field.get(key),
                 };
                 match __found {
-                    Some(record) => {
-                        let data = serde_json::to_value(&record).unwrap_or(json!(null));
-                        (StatusCode::OK, Json(data))
-                    }
-                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" }))),
+                    // #229: straight to bytes — no intermediate `Value` clone of
+                    // every string in the record.
+                    Some(record) => (StatusCode::OK, Json(record)).into_response(),
+                    None => (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+                        .into_response(),
                 }
             }
 
