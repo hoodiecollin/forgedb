@@ -432,6 +432,35 @@ of truth.
    because it makes the docs a liar in the exact moment someone is trusting them. Pair feature docs
    with the feature.
 
+   **There is exactly ONE `develop`, and its name never contains a version.** No `v0.5-develop`
+   beside a `v0.4-develop`. crates.io has one version line per crate and the gap is defined against
+   what is *currently published*, so two cycle branches carrying unpublished substrate changes
+   cannot both be measured — whichever publishes first silently redefines the other's gap. And the
+   milestone already encodes *when*; a version in the branch name is a second scheduling axis,
+   which is the parallel-decomposition anti-pattern. Version-agnostic also means self-advancing:
+   tagging a release turns `develop` into the next cycle with no rename and no workflow edit.
+
+   So what keeps next-cycle work off `develop` is **the milestone, not the branch**:
+
+   > A PR targeting `develop` may not close an issue milestoned later than the cycle in flight
+   > (**derived**: the lowest open `v*` milestone — never configured, never written down).
+
+   A **deny-list on future milestones**, not an allow-list on the current one — so chores, CI fixes
+   and typo PRs close no issue and pass silently, correctly: work with no issue cannot be
+   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop`; since most work
+   here merges locally, run it yourself before merging a branch back:
+
+   ```bash
+   make cycle-scope ISSUE=245        # what the branch closes
+   make cycle-scope PR=250           # or a PR, as CI does
+   ```
+
+   Blocked means *early*, not wrong: keep the branch, let the cycle ship, rebase, land it. The only
+   other correct response is that the issue was mis-scheduled — move the milestone rather than
+   merging past it. **This makes closing the milestone part of the release ritual**: a milestone
+   left open after its tag freezes the derived cycle and blocks legitimate next-cycle work.
+   (Portable form: `ai-pm-playbook` PLAYBOOK §5.3, rules PM008/PM009.)
+
    **Transition note (delete once v0.4.0 is tagged):** `main` currently carries the v0.4.0 gap —
    `develop` was created from it mid-cycle rather than rewinding pushed history. So the reclose is
    expected RED on `main` until #241 closes, and the model is fully in force from v0.5.0. Do not
