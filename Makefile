@@ -233,3 +233,31 @@ index-key-parity:
 ## the fast suite (compiles a crate).
 api-wire-test:
 	cargo test --test api_wire_test -- --ignored --nocapture
+
+.PHONY: scripts-typecheck
+
+## Typecheck the root-level repo tooling in scripts/. The scripts run under bun with no
+## install step; the deps are types only, so this is the one thing that needs them.
+scripts-typecheck:
+	@$(BUN) install --cwd scripts
+	@(cd scripts && $(BUN) x tsc --noEmit)
+
+.PHONY: cycle-scope
+
+## Cycle-scope gate: does this work belong in the release cycle currently in flight?
+## `develop` carries ONE cycle at a time, so work milestoned for a later version must wait
+## on its own branch. The cycle is derived (lowest open v* milestone), never configured.
+##
+##   make cycle-scope ISSUE=245        before merging a branch locally into develop
+##   make cycle-scope ISSUE=233,245    several at once
+##   make cycle-scope PR=250           what CI runs on PRs targeting develop
+##
+## Portable form: ai-pm-playbook §5.3 (PM008/PM009).
+cycle-scope:
+ifdef PR
+	@$(BUN) scripts/check-cycle-scope.ts --pr $(PR)
+else ifdef ISSUE
+	@$(BUN) scripts/check-cycle-scope.ts --issue $(ISSUE)
+else
+	@echo "usage: make cycle-scope ISSUE=<n[,n...]>   (or PR=<n>)"; exit 2
+endif
