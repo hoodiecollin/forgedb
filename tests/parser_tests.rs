@@ -51,6 +51,7 @@ fn test_parse_field_without_symbols() {
     let input = r#"
 User {
   name: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -104,13 +105,15 @@ fn test_parse_multiple_unique_fields() {
 User {
   email: &string
   username: &string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    assert_eq!(model.fields.len(), 2);
+    // 3 fields: the two unique ones under test, plus the mandatory identity (#248).
+    assert_eq!(model.fields.len(), 3);
     assert!(model.fields[0].unique);
     assert!(model.fields[1].unique);
 }
@@ -151,6 +154,7 @@ Model {
   field7: string
   field8: uuid
   field9: timestamp
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -194,6 +198,7 @@ User {
 
 User {
   email: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -284,6 +289,7 @@ fn test_validation_field_name_snake_case() {
     let input = r#"
 User {
   UserName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -314,6 +320,7 @@ fn test_validation_can_be_disabled() {
     let input = r#"
 user_model {
   UserName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new_with_validation(input, false).unwrap();
@@ -363,6 +370,7 @@ fn test_validation_single_char_names() {
     let input = r#"
 A {
   x: u32
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -390,6 +398,7 @@ fn test_validation_numbers_in_names() {
 User123 {
   field_123: u32
   abc_456_def: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -419,6 +428,7 @@ fn test_validation_camel_case_field() {
     let input = r#"
 User {
   userName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -434,6 +444,7 @@ fn test_validation_screaming_snake_case_field() {
     let input = r#"
 User {
   USER_NAME: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -487,6 +498,7 @@ fn test_parse_indexed_symbol_order() {
 User {
   email1: ^&string
   email2: &^string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -689,6 +701,7 @@ fn test_parse_constraint_simple() {
     let input = r#"
 User {
   email: string @email
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -705,6 +718,7 @@ fn test_parse_constraint_with_number_param() {
     let input = r#"
 User {
   age: u32 @min(0) @max(150)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -727,6 +741,7 @@ fn test_parse_constraint_multiple() {
     let input = r#"
 User {
   password: string @min(8) @private
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -743,6 +758,7 @@ fn test_parse_constraint_with_symbols() {
     let input = r#"
 User {
   email: ^&string @email @unique
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -795,6 +811,7 @@ fn test_parse_constraint_empty_params() {
     let input = r#"
 User {
   email: string @email()
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -875,6 +892,7 @@ fn test_parse_constraint_with_pattern() {
     let input = r#"
 User {
   phone: string @pattern(phone_regex)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -901,6 +919,7 @@ fn test_parse_constraint_negative_number() {
     let input = r#"
 Temperature {
   celsius: i32 @min(-273)
+  id: +uuid
 }
 "#;
     let result = Parser::new(input);
@@ -919,6 +938,7 @@ fn test_parse_multiple_constraints_same_type() {
     let input = r#"
 User {
   name: string @min(2) @max(50)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -976,6 +996,7 @@ fn test_constraint_helper_methods() {
 User {
   email: string @email
   age: u32 @min(0) @max(150)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
