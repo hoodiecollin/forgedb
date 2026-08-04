@@ -1696,3 +1696,131 @@ fn test_coalesced_barrier_durability_across_columns() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// #231 — append_tagged: byte-identical to the concatenation it replaces
+//
+// This is the stored format, so a divergence here is a data bug, not a perf
+// regression: every nullable string/json column in every generated database
+// writes through this path, and rows written before and after the change sit
+// in the same file. The guards compare the raw data + offsets bytes against a
+// column built the old way, and round-trip through both readers.
+// ---------------------------------------------------------------------------
+
+/// The corpus the byte-identity guards run over: empty, ASCII, multi-byte
+/// unicode, an embedded NUL (which the tag byte must not be confused with), and
+/// a value long enough to span more than one page.
+fn tagged_corpus() -> Vec<String> {
+    vec![
+        String::new(),
+        "a".to_string(),
+        "hello world".to_string(),
+        "unicode ✓ é 日本語".to_string(),
+        "embedded\u{0}nul".to_string(),
+        "x".repeat(9_000),
+    ]
+}
+
+#[test]
+fn test_append_tagged_is_byte_identical_to_the_concatenation() {
+    let dir = std::env::temp_dir().join("forgedb_test_append_tagged_bytes");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let (new_data, new_offs) = (dir.join("new_data.bin"), dir.join("new_offs.bin"));
+    let (old_data, old_offs) = (dir.join("old_data.bin"), dir.join("old_offs.bin"));
+
+    let mut new_col = VariableColumn::new(new_data.clone(), new_offs.clone()).unwrap();
+    let mut old_col = VariableColumn::new(old_data.clone(), old_offs.clone()).unwrap();
+
+    for value in tagged_corpus() {
+        // The `Some` arm, and the `None` arm interleaved with it, so the offsets
+        // index has to stay aligned across a zero-length tagged row.
+        new_col.append_tagged(1, &value).unwrap();
+        new_col.append_tagged(0, "").unwrap();
+
+        // Exactly what generated code used to build by hand.
+        let mut encoded = String::with_capacity(value.len() + 1);
+        encoded.push('\u{1}');
+        encoded.push_str(&value);
+        old_col.append_string(&encoded).unwrap();
+        old_col.append_string(&String::from('\u{0}')).unwrap();
+    }
+    new_col.flush().unwrap();
+    old_col.flush().unwrap();
+
+    assert_eq!(
+        fs::read(&new_data).unwrap(),
+        fs::read(&old_data).unwrap(),
+        "append_tagged must write the same data bytes as the concatenation"
+    );
+    assert_eq!(
+        fs::read(&new_offs).unwrap(),
+        fs::read(&old_offs).unwrap(),
+        "append_tagged must write the same (offset, length) entries"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_append_tagged_round_trips_through_both_readers() {
+    let dir = std::env::temp_dir().join("forgedb_test_append_tagged_roundtrip");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut col =
+        VariableColumn::new(dir.join("data.bin"), dir.join("offs.bin")).unwrap();
+
+    let corpus = tagged_corpus();
+    for value in &corpus {
+        col.append_tagged(1, value).unwrap();
+        col.append_tagged(0, "").unwrap();
+    }
+
+    // read_string: the tagged row decodes to tag + value, and a None row is
+    // exactly one byte — the distinction `Some("")` vs `None` depends on it.
+    for (i, value) in corpus.iter().enumerate() {
+        let some = col.read_string(i * 2).unwrap();
+        assert_eq!(some, format!("\u{1}{value}"));
+        let none = col.read_string(i * 2 + 1).unwrap();
+        assert_eq!(none, "\u{0}");
+        assert_ne!(some, none, "Some(\"\") must not read back as None");
+    }
+
+    // read_str (#224): the borrowed path generated scans use must agree.
+    let indices: Vec<usize> = (0..corpus.len() * 2).collect();
+    let buf = col.gather_buffered(&indices).unwrap();
+    for slot in 0..indices.len() {
+        assert_eq!(buf.read_str(slot).unwrap(), buf.read_string(slot).unwrap());
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn test_append_tagged_survives_reopen() {
+    let dir = std::env::temp_dir().join("forgedb_test_append_tagged_reopen");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let (data, offs) = (dir.join("data.bin"), dir.join("offs.bin"));
+
+    {
+        let mut col = VariableColumn::new(data.clone(), offs.clone()).unwrap();
+        col.append_tagged(0, "").unwrap();
+        col.append_tagged(1, "kept").unwrap();
+        col.flush().unwrap();
+    }
+
+    // The row count and the running data offset are both recovered from file
+    // lengths on open; a tagged row's length includes its tag byte, so an
+    // off-by-one here would silently corrupt every subsequent append.
+    let mut col = VariableColumn::new(data, offs).unwrap();
+    assert_eq!(col.len(), 2);
+    col.append_tagged(1, "after").unwrap();
+    assert_eq!(col.read_string(0).unwrap(), "\u{0}");
+    assert_eq!(col.read_string(1).unwrap(), "\u{1}kept");
+    assert_eq!(col.read_string(2).unwrap(), "\u{1}after");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
