@@ -69,7 +69,7 @@ const SCHEMA: &str = r#"enum Status { Draft, Published, Archived }
 Kitchen {
   id: +uuid
   s_name: &string
-  s_code: ^char(8)
+  s_code: ^bytes(8)
   n_u32: ^u32
   n_u64: ^u64
   n_i32: ^i32
@@ -82,7 +82,7 @@ Kitchen {
   e_status: ^Status
 
   o_name: ^string?
-  o_code: ^char(8)?
+  o_code: ^bytes(8)?
   o_u32: ^u32?
   o_f64: ^f64?
   o_flag: ^bool?
@@ -265,7 +265,7 @@ fn m_f64(v: &f64) -> String {
         None => String::from('\u{0}'),
     }
 }
-fn m_char<const N: usize>(v: &[u8; N]) -> String {
+fn m_bytes<const N: usize>(v: &[u8; N]) -> String {
     let mut k = String::from('\u{2}');
     k.push('[');
     for (i, b) in v.iter().enumerate() {
@@ -346,10 +346,10 @@ fn parity() {
         check(&format!("f64-{name}"), m_f64(&v), legacy(&v));
         assert_eq!(m_f64(&v), "\u{0}", "{name} must land in the null bucket");
     }
-    // char(N) is [u8; N] -> a JSON array, not a string.
+    // bytes(N) is [u8; N] -> a JSON array, not a string.
     let code: [u8; 8] = *b"hello\0\0\0";
-    check("char8", m_char(&code), legacy(&code));
-    check("char8-zero", m_char(&[0u8; 8]), legacy(&[0u8; 8]));
+    check("bytes8", m_bytes(&code), legacy(&code));
+    check("bytes8-zero", m_bytes(&[0u8; 8]), legacy(&[0u8; 8]));
 
     // --- nullable ---------------------------------------------------------
     check("opt-none", m_opt(&Option::<String>::None, |s: &String| m_string(s)), legacy(&Option::<String>::None));
@@ -377,7 +377,7 @@ fn parity() {
     let ost = Some(Status::Published);
     check("opt-enum", m_opt(&ost, m_status), legacy(&ost));
     let oc = Some(code);
-    check("opt-char8", m_opt(&oc, m_char), legacy(&oc));
+    check("opt-bytes8", m_opt(&oc, m_bytes), legacy(&oc));
 }
 
 /// The observable contract, through the real generated index paths.
