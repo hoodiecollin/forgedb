@@ -234,6 +234,17 @@ index-key-parity:
 api-wire-test:
 	cargo test --test api_wire_test -- --ignored --nocapture
 
+.PHONY: list-scan-test
+
+## List-selection proof (#228): boot the generated router over a CHURNED corpus
+## (updates leaving dead versions, deletes leaving holes) and check the ids + `total`
+## of ~20 filter/sort/pagination combinations against an independently computed
+## oracle. A snapshot compares emitted strings and cannot prove ordering, tie
+## behaviour, or which rows survive a filter — this can. Also #[ignore]d out of the
+## fast suite (compiles a crate).
+list-scan-test:
+	cargo test --test list_scan_test -- --ignored --nocapture
+
 .PHONY: scripts-typecheck
 
 ## Typecheck the root-level repo tooling in scripts/. The scripts run under bun with no

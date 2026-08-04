@@ -37,26 +37,7 @@
 //! cargo test --test api_wire_test -- --ignored --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-/// Repo root — `CARGO_MANIFEST_DIR` is the crate this test compiles under.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Path dep line for a workspace substrate crate.
-fn dep(name: &str, crate_dir: &str) -> String {
-    let path = repo_root().join("crates").join(crate_dir);
-    format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
-}
-
-fn write(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(path, contents).unwrap();
-}
+mod common;
 
 /// Every field class that reaches the wire: string (with escapes), optional,
 /// integer, float, enum, json, required FK, optional FK — plus a projection, so
@@ -88,74 +69,8 @@ Author {
 #[test]
 #[ignore = "compiles a generated crate; run with --ignored (see `make api-wire-test`)"]
 fn rest_read_paths_emit_the_frozen_wire_bytes() {
-    let proj = std::env::temp_dir().join(format!("forgedb-apiwire-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&proj);
-    std::fs::create_dir_all(&proj).unwrap();
-
-    write(&proj.join("schema.forge"), SCHEMA);
-    let forgedb = env!("CARGO_BIN_EXE_forgedb");
-    let gen_status = Command::new(forgedb)
-        .args(["generate", "all", "--output", "src", "--schema", "schema.forge"])
-        .current_dir(&proj)
-        .status()
-        .expect("run forgedb generate");
-    assert!(gen_status.success(), "forgedb generate all failed");
-
-    let mut cargo_toml = String::from(
-        "[package]\nname = \"wiredriver\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n",
-    );
-    for (n, d) in [
-        ("forgedb-storage", "storage"),
-        ("forgedb-types", "types"),
-        ("forgedb-changefeed", "changefeed"),
-        ("forgedb-wal", "wal"),
-        ("forgedb-auth", "auth"),
-        ("forgedb-query-params", "query-params"),
-        ("forgedb-compaction", "compaction"),
-        ("forgedb-txn", "txn"),
-        ("forgedb-coordinator", "coordinator"),
-    ] {
-        cargo_toml.push_str(&dep(n, d));
-    }
-    cargo_toml.push_str("serde = { version = \"1\", features = [\"derive\"] }\n");
-    cargo_toml.push_str("serde_json = \"1\"\n");
-    cargo_toml.push_str("regex = \"1\"\n");
-    cargo_toml.push_str("rust_decimal = { version = \"1\", features = [\"serde-with-str\"] }\n");
-    cargo_toml.push_str("utoipa = { version = \"5\", features = [\"uuid\"] }\n");
-    cargo_toml.push_str("utoipa-axum = \"0.2\"\n");
-    cargo_toml.push_str("axum = { version = \"0.8\", features = [\"ws\"] }\n");
-    cargo_toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
-    cargo_toml.push_str("tower = { version = \"0.5\", features = [\"util\"] }\n");
-    cargo_toml.push_str("tower-http = { version = \"0.6\", features = [\"trace\"] }\n");
-    cargo_toml.push_str("\n[workspace]\n");
-    write(&proj.join("Cargo.toml"), &cargo_toml);
-
-    // `generate all` writes database.rs / api.rs into src/; the driver is the
-    // crate root that mounts them, exactly as the `forgedb init` scaffold does.
-    write(&proj.join("src/main.rs"), DRIVER);
-
-    let target = proj.join("target");
-    let build = Command::new("cargo")
-        .args(["build", "--quiet"])
-        .current_dir(&proj)
-        .env("CARGO_TARGET_DIR", &target)
-        .status()
-        .expect("run cargo build");
-    assert!(build.success(), "driver failed to compile");
-
-    let out = Command::new(target.join("debug/wiredriver"))
-        .arg(proj.join("data"))
-        .output()
-        .expect("run driver");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    println!("{stdout}");
-    assert!(
-        out.status.success(),
-        "driver reported a wire-format mismatch:\n{stdout}\n{stderr}"
-    );
-
-    let _ = std::fs::remove_dir_all(&proj);
+    let (out, proj) = common::generate_compile_run("wiredriver", SCHEMA, DRIVER);
+    common::assert_driver_ok(&out, &proj, "driver reported a wire-format mismatch");
 }
 
 /// The driver: seeds two rows with **fixed** UUIDs (the bytes have to be
