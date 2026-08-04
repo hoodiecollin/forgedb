@@ -56,16 +56,22 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // Syntax + schema-level semantic errors (naming, duplicates, dangling
     // relations/type references, projection/index field references) are ALWAYS
     // fatal — they are not advisory, so they fail regardless of `--strict`.
-    if !parsed.diagnostics.is_empty() {
+    //
+    // Since #237 this list can also carry `Severity::Warning` entries (schema-
+    // language deprecations), so it is partitioned rather than tested for
+    // emptiness — the old `!is_empty()` check would have turned every deprecation
+    // into a hard validation failure.
+    let diag = if parsed.diagnostics.is_empty() {
+        crate::diagnostics::Report::default()
+    } else {
         println!();
-        for d in &parsed.diagnostics {
-            ui::error(&d.to_string());
-        }
+        let counts = crate::diagnostics::report(&parsed.diagnostics);
         println!();
-        ui::error(&format!(
-            "Validation failed with {} error(s)",
-            parsed.diagnostics.len()
-        ));
+        counts
+    };
+
+    if diag.has_errors() {
+        ui::error(&format!("Validation failed with {} error(s)", diag.errors));
         return Err(CliError::SchemaValidation(
             "Schema validation failed".to_string(),
         ));
@@ -234,13 +240,20 @@ pub fn run(options: ValidateOptions) -> Result<()> {
             "Found {} issue(s) — run `validate --strict` to fail on these",
             errors.len()
         ));
-    } else if warnings.is_empty() {
-        ui::success("Validation passed with no issues");
     } else {
-        ui::success(&format!(
-            "Validation passed with {} warning(s)",
-            warnings.len()
-        ));
+        // Schema-level warnings (#237 deprecations) count toward the summary
+        // alongside the CLI-local advisory lints, so the closing line is honest
+        // about everything that was printed. Neither kind affects the exit code —
+        // not even under `--strict`, which escalates lints, not deprecations.
+        let total_warnings = warnings.len() + diag.warnings;
+        if total_warnings == 0 {
+            ui::success("Validation passed with no issues");
+        } else {
+            ui::success(&format!(
+                "Validation passed with {} warning(s)",
+                total_warnings
+            ));
+        }
     }
 
     Ok(())
