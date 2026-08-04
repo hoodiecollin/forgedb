@@ -109,7 +109,8 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     // `validate_schema` gate above is fatal). What remains are checks that are
     // NOT pure-schema diagnostics and therefore stay CLI-only:
     //   - filesystem: `--components` verifies referenced component files exist;
-    //   - advisory lints: no-id / no-timestamp warnings (soft, exit 0).
+    //   - advisory lints: the no-timestamp warning (soft, exit 0). The no-id lint
+    //     was promoted to a fatal schema diagnostic in #248.
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
 
@@ -180,20 +181,12 @@ pub fn run(options: ValidateOptions) -> Result<()> {
     }
 
     // Check for potential issues (warnings)
+    //
+    // The missing-identity advisory that used to live here is gone: #248 made it a
+    // fatal, positioned diagnostic in `crate::validate::collect_structure_errors`,
+    // so it now reaches the LSP too and a schema that would generate uncompilable
+    // code no longer exits 0.
     for model in &schema.models {
-        // Warn if model has no ID field
-        let has_id = model
-            .fields
-            .iter()
-            .any(|f| f.name == "id" || f.auto_generate);
-
-        if !has_id {
-            warnings.push(format!(
-                "Model '{}' has no auto-generated ID field (consider adding 'id: +uuid')",
-                model.name
-            ));
-        }
-
         // Warn if model has no timestamp fields
         let has_timestamp = model
             .fields
