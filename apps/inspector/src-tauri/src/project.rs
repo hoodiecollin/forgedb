@@ -61,15 +61,15 @@ pub struct StructDto {
 pub struct FieldDto {
     pub name: String,
     /// Normalized type discriminant: one of `u32 u64 i32 i64 f64 bool string uuid
-    /// timestamp char fixed_array struct required_ref optional_ref one_to_many
+    /// timestamp bytes fixed_array struct required_ref optional_ref one_to_many
     /// many_to_many component`.
     pub kind: String,
     pub auto: bool,
     pub unique: bool,
     pub indexed: bool,
     pub nullable: bool,
-    /// `char(N)` length.
-    pub char_len: Option<usize>,
+    /// `bytes(N)` length.
+    pub bytes_len: Option<usize>,
     /// `[T; N]` fixed-array length.
     pub array_len: Option<usize>,
     pub fulltext: bool,
@@ -232,7 +232,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         other => (other, false),
     };
 
-    let mut char_len = None;
+    let mut bytes_len = None;
     let mut array_len = None;
     let mut rel_target = None;
     let mut struct_name = None;
@@ -250,9 +250,9 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::Decimal => "decimal",
         FieldType::Uuid => "uuid",
         FieldType::Timestamp => "timestamp",
-        FieldType::Char(n) => {
-            char_len = Some(*n);
-            "char"
+        FieldType::Bytes(n) => {
+            bytes_len = Some(*n);
+            "bytes"
         }
         FieldType::FixedArray(_, n) => {
             array_len = Some(*n);
@@ -303,7 +303,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         unique: f.unique,
         indexed: f.indexed,
         nullable,
-        char_len,
+        bytes_len,
         array_len,
         fulltext: f.fulltext_indexed,
         computed: f.is_computed,
@@ -356,7 +356,7 @@ mod tests {
                 age: i32? @min(0) @max(120)
                 org: *Org
                 bio: string? @length(0, 280)
-                login_code: char(8)
+                login_code: bytes(8)
             }
             "#,
         );
@@ -385,8 +385,8 @@ mod tests {
         assert_eq!(org.rel_target.as_deref(), Some("Org"));
 
         let code = user.fields.iter().find(|f| f.name == "login_code").unwrap();
-        assert_eq!(code.kind, "char");
-        assert_eq!(code.char_len, Some(8));
+        assert_eq!(code.kind, "bytes");
+        assert_eq!(code.bytes_len, Some(8));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

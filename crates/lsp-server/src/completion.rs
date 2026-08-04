@@ -75,12 +75,13 @@ fn get_type_completions(schema: &Schema) -> Vec<CompletionItem> {
         });
     }
 
-    // char(n) fixed-length string
+    // bytes(n) fixed-size byte array. Deliberately NOT offering the deprecated
+    // `char(n)` spelling (#233) — completion is where a name is taught.
     completions.push(CompletionItem {
-        label: "char(100)".to_string(),
+        label: "bytes(100)".to_string(),
         kind: Some(CompletionItemKind::TYPE_PARAMETER),
-        detail: Some("Fixed-length string".to_string()),
-        insert_text: Some("char($1)".to_string()),
+        detail: Some("Fixed-size byte array".to_string()),
+        insert_text: Some("bytes($1)".to_string()),
         insert_text_format: Some(tower_lsp::lsp_types::InsertTextFormat::SNIPPET),
         ..Default::default()
     });

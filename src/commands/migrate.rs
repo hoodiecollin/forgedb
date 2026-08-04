@@ -761,7 +761,7 @@ fn add_field_default_json(
                     FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
                     | FieldType::Timestamp,
                 ) => "0".to_string(),
-                Some(FieldType::String | FieldType::Char(_)) => "\"\"".to_string(),
+                Some(FieldType::String | FieldType::Bytes(_)) => "\"\"".to_string(),
                 _ => "null".to_string(),
             }
         }

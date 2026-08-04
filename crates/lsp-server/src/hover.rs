@@ -119,7 +119,8 @@ fn get_type_info(type_name: &str) -> Option<String> {
         "json" => "**json** — Arbitrary JSON value\n\n`serde_json::Value`, stored in a variable-length column. NOT indexable/filterable/sortable (no total order).",
         "uuid" => "**uuid** — UUID v4\n\n128-bit identifier (16-byte column). Auto-generatable with `+`.",
         "timestamp" => "**timestamp** — Unix timestamp\n\nStored as i64 (seconds since epoch). Auto-generatable with `+`.",
-        "char" => "**char(n)** — Fixed-length string\n\nExactly n bytes in a fixed column. Example: `char(100)`.",
+        "bytes" => "**bytes(n)** — Fixed-size byte array\n\nExactly n raw bytes in a fixed column (`[u8; n]`), serialized as a JSON array of integers. No UTF-8 guarantee and no text semantics — for text use `string`. Example: `bytes(20)` for a git object id.",
+        "char" => "**char(n)** — ⚠️ Deprecated spelling of `bytes(n)`\n\nUse `bytes(n)` instead. Identical storage and generated code; the name was a false friend, since SQL's `CHAR(N)` is fixed-length *text* while this type stores raw bytes. If the field holds text, use `string`.",
         _ => return None,
     };
     Some(s.to_string())
@@ -174,7 +175,7 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Uuid => "uuid".to_string(),
         FieldType::Timestamp => "timestamp".to_string(),
         FieldType::Enum(name) => name.clone(),
-        FieldType::Char(n) => format!("char({n})"),
+        FieldType::Bytes(n) => format!("bytes({n})"),
         FieldType::FixedArray(inner, size) => format!("[{}; {}]", format_field_type(inner), size),
         FieldType::StructType(name) => name.clone(),
         FieldType::OptionalStructType(name) => format!("{name}?"),

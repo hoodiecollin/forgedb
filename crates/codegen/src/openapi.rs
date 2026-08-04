@@ -266,7 +266,7 @@ impl OpenApiGenerator {
             }),
             // char(N) serializes as an N-byte array (`[u8; N]`), so it is a
             // fixed-length array of bytes on the wire, not a string.
-            FieldType::Char(n) => json!({
+            FieldType::Bytes(n) => json!({
                 "type": "array",
                 "items": { "type": "integer", "minimum": 0, "maximum": 255 },
                 "minItems": *n,

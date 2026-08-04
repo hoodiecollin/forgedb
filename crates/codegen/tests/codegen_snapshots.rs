@@ -728,7 +728,7 @@ fn complex_types_schema() -> Schema {
                 fields: vec![
                     Field { position: None,
                         name: "street".to_string(),
-                        field_type: FieldType::Char(100),
+                        field_type: FieldType::Bytes(100),
                         auto_generate: false,
                         unique: false,
                         indexed: false,
@@ -740,7 +740,7 @@ fn complex_types_schema() -> Schema {
                     },
                     Field { position: None,
                         name: "city".to_string(),
-                        field_type: FieldType::Char(50),
+                        field_type: FieldType::Bytes(50),
                         auto_generate: false,
                         unique: false,
                         indexed: false,
@@ -800,7 +800,7 @@ fn complex_types_schema() -> Schema {
                 },
                 Field { position: None,
                     name: "name".to_string(),
-                    field_type: FieldType::Char(200),
+                    field_type: FieldType::Bytes(200),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -836,7 +836,7 @@ fn complex_types_schema() -> Schema {
                 },
                 Field { position: None,
                     name: "tags".to_string(),
-                    field_type: FieldType::FixedArray(Box::new(FieldType::Char(20)), 5),
+                    field_type: FieldType::FixedArray(Box::new(FieldType::Bytes(20)), 5),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -6970,7 +6970,7 @@ enum Status { Draft, Published }
 Kitchen {
   id: +uuid
   s_name: &string
-  s_code: ^char(8)
+  s_code: ^bytes(8)
   n_u32: ^u32
   n_f64: ^f64
   b_flag: ^bool
@@ -7052,11 +7052,11 @@ Owner {
         flat.contains(r"None=>String::from('\u{0}'),"),
         "non-finite floats keep keying into the null bucket"
     );
-    // char(N) is [u8; N] — serde renders it as a JSON array, so the key is
+    // bytes(N) is [u8; N] — serde renders it as a JSON array, so the key is
     // `\u{2}[104,101,...]`, the non-string arm.
     assert!(
         flat.contains(r#"__k.push('[');for(__i,__b)in__v.iter().enumerate()"#),
-        "char(N) keys render the JSON array form"
+        "bytes(N) keys render the JSON array form"
     );
 
     // --- nullable ---------------------------------------------------------
@@ -7077,5 +7077,67 @@ Owner {
     assert!(
         flat.contains(r"match&(record.editor){Some(__v)=>{letmut__buf=[0u8;36];"),
         "an optional FK keys through the Option arm, not as a bare Uuid (#230)"
+    );
+}
+
+/// #233: `char(N)` is a *spelling*, not a distinct type — the deprecated form must
+/// emit byte-identical code across every generator, in every type position.
+///
+/// This is the guarantee that makes the deprecation safe to ship: a user who does
+/// nothing gets exactly the database they had, and a user who runs the suggested
+/// fix gets exactly the same one. It cannot be a snapshot test, because the point
+/// is the *relationship* between two schemas rather than either one's content.
+#[test]
+fn test_generation_char_and_bytes_are_byte_identical() {
+    // Every position `parse_type` handles separately: bare, postfix-nullable,
+    // prefix-nullable, inside a fixed array, and behind index/unique modifiers.
+    let deprecated = r#"
+Thing {
+  id: +uuid
+  code: char(3)
+  opt: char(2)?
+  pre: ?char(4)
+  arr: [char(8); 2]
+  key: ^&char(5)
+  name: string
+}
+"#;
+    let canonical = deprecated.replace("char(", "bytes(");
+
+    let parse = |src: &str| {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        (schema, parser.take_warnings())
+    };
+
+    let (dep_schema, dep_warnings) = parse(deprecated);
+    let (can_schema, can_warnings) = parse(&canonical);
+
+    assert_eq!(
+        dep_warnings.len(),
+        5,
+        "one deprecation per `char` occurrence, including inside `[...]` and behind `^&`"
+    );
+    assert!(
+        can_warnings.is_empty(),
+        "the canonical spelling is silent: {can_warnings:?}"
+    );
+
+    // Every generator, not just the Rust one — the rename touches the type mapping
+    // in each of them, so each is a place the two spellings could diverge.
+    assert_eq!(
+        RustGenerator::generate(&dep_schema).unwrap().code,
+        RustGenerator::generate(&can_schema).unwrap().code,
+        "database.rs"
+    );
+    assert_eq!(
+        ApiGenerator::generate(&dep_schema).unwrap().code,
+        ApiGenerator::generate(&can_schema).unwrap().code,
+        "api.rs"
+    );
+    assert_eq!(
+        TypeScriptGenerator::generate(&dep_schema).unwrap().code,
+        TypeScriptGenerator::generate(&can_schema).unwrap().code,
+        "types.ts"
     );
 }

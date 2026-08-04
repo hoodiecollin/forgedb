@@ -311,7 +311,7 @@ impl NapiGenerator {
 
             // char(N) is [u8; N] in the generated struct; serde serializes as an
             // array of u8 integers; napi maps Vec<u8> to a JS Buffer.
-            FieldType::Char(_) => Some(quote! { Vec<u8> }),
+            FieldType::Bytes(_) => Some(quote! { Vec<u8> }),
 
             // FixedArray — map element type recursively.
             FieldType::FixedArray(inner, _) => {
@@ -385,7 +385,7 @@ impl NapiGenerator {
             FieldType::Json => quote! { __src.#field_name.clone() },
 
             // char(N): [u8; N] → Vec<u8>.
-            FieldType::Char(_) => quote! { __src.#field_name.to_vec() },
+            FieldType::Bytes(_) => quote! { __src.#field_name.to_vec() },
 
             // FixedArray: [T; N] → Vec<napi_type(T)>.
             FieldType::FixedArray(inner, _) => {
@@ -443,7 +443,7 @@ impl NapiGenerator {
                 }
             }
             FieldType::Json => quote! { __src.#field_name.clone() },
-            FieldType::Char(_) => quote! { __src.#field_name.map(|__b| __b.to_vec()) },
+            FieldType::Bytes(_) => quote! { __src.#field_name.map(|__b| __b.to_vec()) },
             FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
                 quote! { __src.#field_name.as_ref().map(|__s| serde_json::to_value(__s).unwrap_or_default()) }
             }
