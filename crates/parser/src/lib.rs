@@ -183,3 +183,8 @@ pub use lexer::{Lexer, Token};
 pub use parser::{ParsedSchema, Parser};
 // The single positioned schema-validation authority (consumed by the CLI + LSP).
 pub use validate::{collect_naming_errors, collect_structure_errors, validate_schema};
+
+/// Diagnostic severity (#237), re-exported so consumers of [`ParsedSchema`] and
+/// [`Parser::warnings`] can partition by it without depending on
+/// `forgedb-validation` directly.
+pub use forgedb_validation::{Position, Severity, ValidationError};

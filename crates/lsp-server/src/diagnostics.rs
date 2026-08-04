@@ -6,8 +6,19 @@
 // source `Position`. This module is the thin adapter that turns those into 0-based LSP
 // `Diagnostic`s, so editor squiggles match `forgedb validate` exactly (#173 parity).
 
-use forgedb_validation::ValidationError;
+use forgedb_validation::{Severity, ValidationError};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+
+/// Map a compiler [`Severity`] onto the LSP one (#237).
+///
+/// Before the severity axis existed this was hardcoded to `ERROR`, which made a
+/// deprecation indistinguishable from a broken schema in the editor.
+pub(crate) fn to_lsp_severity(severity: Severity) -> DiagnosticSeverity {
+    match severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+    }
+}
 
 /// Convert compiler diagnostics (1-based line/column) into LSP diagnostics (0-based).
 ///
@@ -34,7 +45,7 @@ pub fn to_lsp_diagnostics(errors: &[ValidationError], content: &str) -> Vec<Diag
 
             Diagnostic {
                 range,
-                severity: Some(DiagnosticSeverity::ERROR),
+                severity: Some(to_lsp_severity(err.severity)),
                 source: Some("forgedb".to_string()),
                 message,
                 ..Default::default()
@@ -100,6 +111,30 @@ mod tests {
             diags.iter().any(|d| d.message.contains("Suggestion:")),
             "expected a suggestion in: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// A warning-severity diagnostic publishes as `WARNING`, not `ERROR` (#237).
+    /// Before the severity axis existed this site was hardcoded, which would have
+    /// made every deprecation look like a broken schema in the editor.
+    #[test]
+    fn warning_severity_maps_to_lsp_warning() {
+        use forgedb_validation::{Severity, ValidationError};
+
+        let diags = to_lsp_diagnostics(
+            &[
+                ValidationError::warning("char(n) is deprecated"),
+                ValidationError::new("duplicate model 'User'"),
+            ],
+            "User {\n  id: +uuid\n}\n",
+        );
+
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diags[1].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            to_lsp_severity(Severity::Error),
+            DiagnosticSeverity::ERROR,
+            "the default severity must keep mapping to ERROR"
         );
     }
 

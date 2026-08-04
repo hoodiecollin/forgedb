@@ -45,6 +45,18 @@ pub fn warning(msg: &str) {
     }
 }
 
+/// Print a warning to **stderr** (always shown, even under `--quiet`).
+///
+/// The [`warning`] above goes to stdout, which is right for the advisory lints
+/// `validate` prints as part of its report. A *diagnostic* is different: it is the
+/// same class of thing as [`error`] and belongs on the same stream, so that
+/// `forgedb generate > build.log` still puts a deprecation in front of the person
+/// running it instead of burying it in the redirect. Being hard to miss is the
+/// entire point of the channel (#237).
+pub fn warning_diagnostic(msg: &str) {
+    eprintln!("{} {}", "⚠".yellow().bold(), msg);
+}
+
 /// Print an info message (suppressed by `--quiet`).
 pub fn info(msg: &str) {
     if level() >= NORMAL {

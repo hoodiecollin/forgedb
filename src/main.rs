@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod config;
+mod diagnostics;
 mod error;
 mod templates;
 mod ui;

@@ -29,6 +29,26 @@ pub struct Parser {
     recovering: bool,
     /// Syntax diagnostics accumulated during a recovering parse.
     recovery_diagnostics: Vec<ValidationError>,
+    /// Non-fatal diagnostics accumulated during **any** parse (#237).
+    ///
+    /// Deliberately separate from `recovery_diagnostics`, which only fills when
+    /// `recovering` is set. Warnings must reach the fail-fast
+    /// [`Parser::parse`]/[`Parser::parse_unvalidated`] paths too — `forgedb
+    /// generate` is the most-run command and therefore where a deprecation most
+    /// needs to be seen, and it must not be pushed onto `parse_recover` to get
+    /// one (that would change its error semantics from abort-on-first to
+    /// recover-and-continue).
+    ///
+    /// Read with [`Parser::warnings`] / [`Parser::take_warnings`].
+    warnings: Vec<ValidationError>,
+    /// Test-only producer seam (#237). The channel ships with **no** emitters —
+    /// #233 and #235 are the first — so without this there is no way to drive a
+    /// warning through a real parse and the `warnings → ParsedSchema::diagnostics`
+    /// fold (the path the LSP uses) would land unguarded. Emitted immediately
+    /// after each parse entry point clears its buffers, exactly where a real
+    /// producer inside the parse would land.
+    #[cfg(test)]
+    seed_warning: Option<String>,
 }
 
 impl Parser {
@@ -50,7 +70,51 @@ impl Parser {
             use_validation,
             recovering: false,
             recovery_diagnostics: Vec::new(),
+            warnings: Vec::new(),
+            #[cfg(test)]
+            seed_warning: None,
         })
+    }
+
+    /// Emit the test-only seeded warning, if any (#237). No-op in release builds.
+    #[inline]
+    fn emit_seeded_warning(&mut self) {
+        #[cfg(test)]
+        if let Some(message) = self.seed_warning.clone() {
+            self.warn(message, None, None);
+        }
+    }
+
+    /// The non-fatal diagnostics collected by the most recent parse (#237).
+    ///
+    /// Populated by every parse entry point, including the fail-fast ones, so a
+    /// caller that used [`Self::parse`] can still surface deprecations. Empty
+    /// until a producer emits one — this channel ships with no emitters.
+    pub fn warnings(&self) -> &[ValidationError] {
+        &self.warnings
+    }
+
+    /// Take the accumulated warnings, leaving the parser's buffer empty (#237).
+    pub fn take_warnings(&mut self) -> Vec<ValidationError> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// Record a non-fatal diagnostic (#237).
+    ///
+    /// The producer-side entry point for schema-language deprecations. Never
+    /// aborts a parse and never contributes to an exit code; the diagnostic
+    /// travels alongside a successful result.
+    #[allow(dead_code)]
+    pub(crate) fn warn(
+        &mut self,
+        message: impl Into<String>,
+        position: Option<Position>,
+        suggestion: Option<String>,
+    ) {
+        let mut diag = ValidationError::warning(message);
+        diag.position = position;
+        diag.suggestion = suggestion;
+        self.warnings.push(diag);
     }
 
     fn get_current_position(&self) -> Option<Position> {
@@ -1132,6 +1196,10 @@ impl Parser {
     /// positioned diagnostics instead of only the first. (Error recovery for
     /// mid-keystroke buffers is #173.)
     pub fn parse_unvalidated(&mut self) -> Result<Schema, String> {
+        // Warnings belong to one parse run, not to the parser's lifetime (#237).
+        self.warnings.clear();
+        self.emit_seeded_warning();
+
         let mut structs = Vec::new();
         let mut enums = Vec::new();
         let mut models = Vec::new();
@@ -1206,6 +1274,8 @@ impl Parser {
         let prev_recovering = self.recovering;
         self.recovering = true;
         self.recovery_diagnostics.clear();
+        self.warnings.clear();
+        self.emit_seeded_warning();
 
         let mut structs = Vec::new();
         let mut enums = Vec::new();
@@ -1259,6 +1329,12 @@ impl Parser {
 
         let mut diagnostics = std::mem::take(&mut self.recovery_diagnostics);
         diagnostics.extend(crate::validate::validate_schema(&schema));
+        // Fold in any non-fatal diagnostics (#237). `ParsedSchema::diagnostics` is
+        // the single channel this entry point reports through — the LSP and
+        // `forgedb validate` both read it — so warnings travel here rather than in
+        // the `warnings` buffer that the fail-fast paths expose. Consumers MUST
+        // partition by `severity` instead of testing the list for emptiness.
+        diagnostics.extend(self.take_warnings());
         // Present diagnostics in source order (unpositioned ones last).
         diagnostics.sort_by_key(|d| {
             d.position
@@ -1730,5 +1806,118 @@ B
             "both broken declarations reported: {:?}",
             recovered.diagnostics
         );
+    }
+
+    // ---- #237: the deprecation-warning channel -------------------------------
+    //
+    // The channel ships with **no producers** — #233 (`char(n)` → `bytes(n)`) and
+    // #235 (`@length(N)` becoming exact) are the first two. These tests drive
+    // `Parser::warn` directly so the plumbing is guarded before either lands,
+    // rather than being incidentally covered by whichever ships first.
+
+    const VALID: &str = "User {\n  id: +uuid\n  email: string\n}\n";
+
+    /// The channel is invisible until something emits: a schema that parsed
+    /// cleanly before #237 still parses cleanly, with no warnings and no change in
+    /// its `Result`. This is the regression that keeps the field additive.
+    #[test]
+    fn warnings_are_empty_without_a_producer() {
+        let mut p = Parser::new(VALID).unwrap();
+        assert!(p.parse().is_ok(), "valid schema still parses");
+        assert!(p.warnings().is_empty(), "no producer ⇒ no warnings");
+
+        let recovered = Parser::new(VALID).unwrap().parse_recover();
+        assert!(
+            recovered.diagnostics.is_empty(),
+            "valid schema has no diagnostics of any severity: {:?}",
+            recovered.diagnostics
+        );
+    }
+
+    /// A warning emitted during a **fail-fast** parse survives to the caller. This
+    /// is the case `forgedb generate` depends on: it must be able to report a
+    /// deprecation without switching to `parse_recover` and thereby changing its
+    /// error semantics.
+    #[test]
+    fn fail_fast_parse_carries_warnings() {
+        let mut p = Parser::new(VALID).unwrap();
+        p.parse().expect("valid schema parses");
+        p.warn("char(n) is deprecated", Some(Position::new(2, 7)), Some("use bytes(n)".into()));
+
+        assert_eq!(p.warnings().len(), 1);
+        let w = &p.warnings()[0];
+        assert!(w.is_warning(), "severity is Warning, not Error");
+        assert_eq!(w.position, Some(Position::new(2, 7)));
+        assert_eq!(w.suggestion.as_deref(), Some("use bytes(n)"));
+
+        let taken = p.take_warnings();
+        assert_eq!(taken.len(), 1);
+        assert!(p.warnings().is_empty(), "take_warnings drains the buffer");
+    }
+
+    /// Warnings belong to one parse run. Re-parsing with the same `Parser` must not
+    /// replay a previous run's deprecations, which would double-report them.
+    #[test]
+    fn warnings_do_not_accumulate_across_parses() {
+        let mut p = Parser::new(VALID).unwrap();
+        p.parse().unwrap();
+        p.warn("first run", None, None);
+        assert_eq!(p.warnings().len(), 1);
+
+        p.position = 0;
+        p.parse().unwrap();
+        assert!(p.warnings().is_empty(), "a fresh parse clears prior warnings");
+    }
+
+    /// A warning raised *during* a recovering parse reaches `ParsedSchema` on its
+    /// own — this is the path the LSP and `forgedb validate` actually read, so the
+    /// fold has to work without the caller merging anything by hand.
+    #[test]
+    fn recover_folds_warnings_into_diagnostics() {
+        let mut p = Parser::new(VALID).unwrap();
+        p.seed_warning = Some("char(n) is deprecated".into());
+        let parsed = p.parse_recover();
+
+        assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+        assert!(parsed.diagnostics[0].is_warning());
+        assert!(
+            p.warnings().is_empty(),
+            "the fold drains the buffer — one channel per entry point, not two"
+        );
+    }
+
+    /// A warning and a genuine error coexist in one `ParsedSchema` and stay
+    /// separable by severity alone. This is what lets `validate` keep failing on
+    /// real errors while a deprecation exits 0.
+    #[test]
+    fn recover_keeps_warnings_and_errors_distinguishable() {
+        // `posts: [Post]` with no `Post` model is a fatal dangling-relation error.
+        let mut p = Parser::new("User {\n  id: +uuid\n  posts: [Post]\n}\n").unwrap();
+        p.seed_warning = Some("char(n) is deprecated".into());
+        let parsed = p.parse_recover();
+
+        let errors: Vec<_> = parsed.diagnostics.iter().filter(|d| !d.is_warning()).collect();
+        let warnings: Vec<_> = parsed.diagnostics.iter().filter(|d| d.is_warning()).collect();
+
+        assert!(!errors.is_empty(), "the dangling relation is still fatal");
+        assert_eq!(warnings.len(), 1, "the deprecation is present and non-fatal");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.severity == forgedb_validation::Severity::Error),
+            "errors keep the default severity"
+        );
+    }
+
+    /// The same seam through the fail-fast path: a producer firing inside `parse`
+    /// leaves its warning where `forgedb generate` reads it, and the parse still
+    /// succeeds.
+    #[test]
+    fn fail_fast_parse_surfaces_a_producer_warning() {
+        let mut p = Parser::new(VALID).unwrap();
+        p.seed_warning = Some("@length(N) now means exactly N".into());
+        assert!(p.parse().is_ok(), "a warning never fails a parse");
+        assert_eq!(p.warnings().len(), 1);
+        assert!(p.warnings()[0].is_warning());
     }
 }

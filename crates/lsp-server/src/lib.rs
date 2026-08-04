@@ -289,6 +289,11 @@ fn find_definition(schema: &Schema, name: &str) -> Option<Position> {
 
 /// Turn a fatal lexer error string (which embeds "line N, column M") into a
 /// diagnostic anchored at that position, falling back to the document start.
+///
+/// The hardcoded `ERROR` below is correct and must stay: a lexer failure leaves no
+/// token stream to recover from, so it is fatal by construction and can never be a
+/// warning. Severity is only variable on the `parse_recover` path (#237), which
+/// maps it via [`diagnostics::to_lsp_severity`].
 fn lexer_error_diagnostic(message: &str) -> Diagnostic {
     let start = parse_line_column(message)
         .map(|(l, c)| Position {

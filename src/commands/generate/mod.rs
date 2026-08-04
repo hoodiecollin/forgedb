@@ -95,6 +95,20 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         .parse()
         .map_err(|e| CliError::SchemaValidation(format!("Parser error: {}", e)))?;
 
+    // Surface any non-fatal diagnostics the parse collected (#237). `generate` is
+    // the most-run command, so it is where a deprecation most needs to be seen —
+    // and before this it was the one path with nowhere to put a warning at all.
+    //
+    // Note this reads the warnings off the *fail-fast* `parse` above rather than
+    // switching to `parse_recover`: recovering here would change generation's error
+    // semantics from abort-on-first-error to recover-and-continue, which is a far
+    // larger behavioral change than any deprecation needs.
+    //
+    // Warnings never gate generation. The error count is ignored here on purpose —
+    // `parse` already returned `Err` for anything fatal — and only warnings can
+    // reach this point.
+    let _ = crate::diagnostics::report(&parser.take_warnings());
+
     ui::success(&format!(
         "Parsed schema ({} models, {} total fields)",
         schema.models.len(),
