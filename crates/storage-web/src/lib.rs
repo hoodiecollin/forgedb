@@ -126,6 +126,43 @@ mod tests {
         );
     }
 
+    /// #231: the arena `append_tagged` must lay bytes down exactly as the
+    /// concatenation it replaces, or a replica's arenas diverge from the
+    /// server's files it is following. Same corpus the native guard uses.
+    #[test]
+    fn append_tagged_is_byte_identical_to_the_concatenation() {
+        store::clear();
+        let mut new_col = VariableColumn::new(p("t/new_d.bin"), p("t/new_o.bin")).unwrap();
+        let mut old_col = VariableColumn::new(p("t/old_d.bin"), p("t/old_o.bin")).unwrap();
+
+        for value in ["", "a", "hello world", "unicode ✓ é 日本語", "embedded\u{0}nul"] {
+            new_col.append_tagged(1, value).unwrap();
+            new_col.append_tagged(0, "").unwrap();
+
+            let mut encoded = String::with_capacity(value.len() + 1);
+            encoded.push('\u{1}');
+            encoded.push_str(value);
+            old_col.append_string(&encoded).unwrap();
+            old_col.append_string(&String::from('\u{0}')).unwrap();
+        }
+
+        let bytes = |path: &str| {
+            store::with_bytes(&p(path), |b| Ok::<Vec<u8>, std::io::Error>(b.to_vec())).unwrap()
+        };
+        assert_eq!(bytes("t/new_d.bin"), bytes("t/old_d.bin"), "data arena");
+        assert_eq!(bytes("t/new_o.bin"), bytes("t/old_o.bin"), "offsets arena");
+
+        // And it reads back through both readers, including the borrowed one.
+        assert_eq!(new_col.read_string(0).unwrap(), "\u{1}");
+        assert_eq!(new_col.read_string(1).unwrap(), "\u{0}");
+        assert_eq!(new_col.read_string(4).unwrap(), "\u{1}hello world");
+        let indices: Vec<usize> = (0..new_col.len()).collect();
+        let buf = new_col.gather_buffered(&indices).unwrap();
+        for slot in 0..indices.len() {
+            assert_eq!(buf.read_str(slot).unwrap(), buf.read_string(slot).unwrap());
+        }
+    }
+
     #[test]
     fn fixed_column_gather_matches_native_semantics() {
         store::clear();
