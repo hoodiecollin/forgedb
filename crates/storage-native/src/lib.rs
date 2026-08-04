@@ -1041,9 +1041,12 @@ pub struct BufferedVariableColumn {
     /// enough to be worth mapping, an owned copy otherwise (#222).
     data: ColumnExport,
     /// File offset `data` starts at, so the absolute offsets in `slots` can be
-    /// rebased onto it. Zero when the whole region is buffered.
+    /// rebased onto it. Zero when the whole region is buffered, and zero on the
+    /// sparse path (#228), where `data` is packed and `slots` already index into it.
     base: u64,
-    // (absolute offset in the data FILE, byte length) per slot, in selection order.
+    // (offset, byte length) per slot, in selection order. The offset is absolute in
+    // the data FILE on the spanned path and relative to `data` on the packed sparse
+    // path — `base` is what reconciles them, so `read_str` needs no branch.
     slots: Vec<(u64, u64)>,
 }
 
@@ -1110,6 +1113,27 @@ impl BufferedVariableColumn {
 /// the span from being paid for — untouched pages are never faulted in. Conservative
 /// rather than tuned; the shape of the win does not depend on the exact crossover.
 const VAR_MMAP_MIN_BYTES: usize = 64 * 1024;
+
+/// Selection sparsity at which [`VariableColumn::gather_buffered`] reads each
+/// offsets entry on its own instead of the whole spanned slice (#228).
+///
+/// The spanned read is one syscall for `span_rows * 16` bytes; the per-index read
+/// is `n` syscalls of 16 bytes. The former wins while the selection is dense, and
+/// loses badly once it is not: a two-row selection at opposite ends of a 20 000-row
+/// column read 320 KB of offsets per column to use 32 bytes of it.
+///
+/// That shape is not hypothetical — it is what an index-pushdown candidate set
+/// looks like. Since #228 unified the pushdown arm on the buffered scan, a handful
+/// of scattered candidates reach here directly, and before this branch existed the
+/// pushdown measured **5x slower** than the per-row positional decode it replaced.
+///
+/// The crossover is where `n` syscalls cost what the spanned read costs, which on
+/// a warm page cache lands near `span_rows ≈ 190n`. `128` sits just under that:
+/// conservative toward the spanned read (better locality, and it is the path the
+/// dense common case takes), while still catching every sparse case by a wide
+/// margin. The exact value is not load-bearing — the two costs differ by orders of
+/// magnitude on either side of it, not by a few percent.
+const SPARSE_OFFSETS_SPAN_FACTOR: usize = 128;
 
 pub struct VariableColumn {
     data_file: File,
@@ -1282,6 +1306,15 @@ impl VariableColumn {
     /// the live set is. Append-only helps here: an updated row is re-appended at
     /// the tail, so churn tends to concentrate live rows rather than scatter them.
     ///
+    /// # Sparse selections (#228)
+    ///
+    /// Bounding to the span is the wrong trade when the selection is a handful of
+    /// rows scattered across the column — the offsets read is then almost entirely
+    /// rows nobody asked for. Below [`SPARSE_OFFSETS_SPAN_FACTOR`] density the
+    /// offsets are read per index instead. This mirrors what
+    /// [`FixedColumn::gather`] already does via `GATHER_MMAP_MIN_ROWS`; the data
+    /// region still maps by span, which costs address space rather than I/O.
+    ///
     /// # Errors
     ///
     /// `InvalidInput` if any index is `>= self.len()`; other errors come from the
@@ -1307,6 +1340,14 @@ impl VariableColumn {
             }
             lo = lo.min(index);
             hi = hi.max(index);
+        }
+
+        // A few rows scattered across the column: bounding to the span would read
+        // almost entirely rows nobody asked for, and map a data region orders of
+        // magnitude larger than the bytes wanted.  Gather them individually
+        // instead (#228 — see `SPARSE_OFFSETS_SPAN_FACTOR`).
+        if hi + 1 - lo > indices.len().saturating_mul(SPARSE_OFFSETS_SPAN_FACTOR) {
+            return self.gather_sparse(indices);
         }
 
         // Only the spanned slice of the offsets index (16 bytes/row), not all
@@ -1361,6 +1402,50 @@ impl VariableColumn {
         };
 
         Ok(BufferedVariableColumn { data, base: data_lo, slots })
+    }
+
+    /// The sparse-selection arm of [`gather_buffered`](Self::gather_buffered)
+    /// (#228): read each selected row's offsets entry and bytes individually, into
+    /// one **packed** buffer holding only the rows asked for.
+    ///
+    /// The spanned arm is the right shape when the selection covers most of its
+    /// span — one bounded offsets read, and a data region whose dead versions cost
+    /// address space rather than I/O because only addressed pages fault in. It is
+    /// the wrong shape when a handful of rows are scattered across the whole
+    /// column: the offsets read is then almost all rows nobody wants, and the
+    /// mapping's setup and teardown are paid in full to reach a few hundred bytes.
+    ///
+    /// That case is not hypothetical — it is what an index-pushdown candidate set
+    /// looks like, and since #228 those reach here directly instead of being
+    /// decoded per row. Measured on a 20 000-row column, two rows at opposite ends
+    /// cost 5x the per-row positional decode this replaced; packing them brings it
+    /// back to parity, while every denser selection keeps the spanned arm's win.
+    ///
+    /// The packed buffer means `slots` here hold **offsets into `data`**, not
+    /// absolute file offsets, with `base` 0 — the one place that distinction
+    /// exists. `read_str` computes `offset - base` either way, so it needs no
+    /// branch and cannot tell the two apart.
+    fn gather_sparse(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
+        let mut slots = Vec::with_capacity(indices.len());
+        let mut data: Vec<u8> = Vec::new();
+        let mut entry = [0u8; 16];
+        for &index in indices {
+            self.offsets_file
+                .read_exact_at(&mut entry, (index * 16) as u64)?;
+            let offset = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            let length = u64::from_le_bytes(entry[8..].try_into().unwrap());
+            let start = data.len();
+            data.resize(start + length as usize, 0);
+            if length > 0 {
+                self.data_file.read_exact_at(&mut data[start..], offset)?;
+            }
+            slots.push((start as u64, length));
+        }
+        Ok(BufferedVariableColumn {
+            data: ColumnExport::Owned(data),
+            base: 0,
+            slots,
+        })
     }
 
     /// Flush all pending writes to disk (fsync both data and offsets files).

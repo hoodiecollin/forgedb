@@ -179,7 +179,8 @@ The original diagnosis and what changed:
    `top10` because that one is index-served for SQLite; see below.) ForgeDB is now ~5.7× off
    DuckDB on the aggregate (was ~320×).
 2. **The 32 ms was ~80 000 per-row `read_*` syscalls in hashmap order, not a columnar-layout
-   penalty.** `__scan_all` walked `id_to_row.values()` (random order) and read every column
+   penalty.** The narrow scan (then `__scan_all`; today's `__with_scan`) walked
+   `id_to_row.values()` (random order) and read every column
    positionally per row (`pread` each) — neither columnar sequential locality nor row-store
    contiguity, and the files were cache-hot so ordering alone barely helped (a physical-order sort
    measured only −3%). **The column-pruned scan** iterates the live rows in physical order and **bulk-loads each
@@ -507,7 +508,8 @@ cannot inherently cost 96× more to read. That is the signature of a **fast path
 and the code said exactly which one:
 
 - `FixedColumn::export` (`crates/storage-native/src/lib.rs`) takes a zero-copy `mmap` **only when
-  the requested indices are the dense prefix `[0, n)`**. Generated `__scan_all` / `all_hot` build
+  the requested indices are the dense prefix `[0, n)`**. Generated `__scan_all` (today's
+  `__with_scan`) / `all_hot` build
   their index list from the *live* set, so **one superseded row anywhere** makes the list
   non-dense and every fixed column falls off the fast path — permanently, until compaction.
 - The fallback, `FixedColumn::gather`, issues **one `read_exact_at` syscall per index**. The

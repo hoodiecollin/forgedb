@@ -1514,6 +1514,73 @@ fn test_buffered_variable_column_mapped_path_matches_per_row_reads() {
 }
 
 #[test]
+fn test_buffered_variable_column_sparse_offsets_path_matches_spanned() {
+    // #228: below `SPARSE_OFFSETS_SPAN_FACTOR` density, `gather_buffered` reads each
+    // offsets entry on its own rather than the whole spanned slice — a two-row
+    // selection at opposite ends of a large column was reading hundreds of KB of
+    // offsets to use 32 bytes of it, which made the index-pushdown arm SLOWER than
+    // the per-row positional decode it replaced.
+    //
+    // The branch is a pure performance choice, so the guard is that it is invisible:
+    // both paths must produce byte-identical slots for the same selection. The
+    // selections below are chosen to land deliberately on each side of the threshold
+    // and right at it, since a density branch that is wrong at its own boundary is
+    // exactly the bug this could introduce.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_var_sparse");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col =
+        VariableColumn::new(temp_dir.join("v_data.bin"), temp_dir.join("v_offsets.bin")).unwrap();
+
+    let n = 5000usize;
+    for i in 0..n {
+        if i % 41 == 0 {
+            col.append_string("").unwrap();
+        } else {
+            col.append_string(&format!("row-{i}-{}", "z".repeat(180)))
+                .unwrap();
+        }
+    }
+
+    let check = |label: &str, idx: &[usize]| {
+        let buf = col.gather_buffered(idx).unwrap();
+        assert_eq!(buf.len(), idx.len(), "{label}: slot count");
+        for (slot, &i) in idx.iter().enumerate() {
+            assert_eq!(
+                buf.read_str(slot).unwrap(),
+                col.read_string(i).unwrap(),
+                "{label}: slot {slot} (row {i})"
+            );
+        }
+    };
+
+    // Maximally sparse: two rows at opposite ends. This is the case that regressed.
+    check("two rows, full span", &[3, n - 2]);
+    // One row in the middle — span of 1, so it takes the spanned path trivially.
+    check("single row", &[n / 2]);
+    // A scattered pushdown-shaped candidate set.
+    check("20 scattered", &(0..20).map(|i| i * (n / 20)).collect::<Vec<_>>());
+    // Dense enough to stay on the spanned read (span/n well under the factor).
+    check("dense run", &(1000..1400).collect::<Vec<_>>());
+    // Straddling the threshold from both sides: with 8 indices the branch flips at a
+    // span of 8*128 = 1024 rows, so these two differ only in which path they take.
+    check("just dense", &(0..8).map(|i| i * 100).collect::<Vec<_>>());
+    check("just sparse", &(0..8).map(|i| i * 200).collect::<Vec<_>>());
+    // Order is positional on both paths, including reversed and duplicated.
+    check("reversed sparse", &(0..10).rev().map(|i| i * 450).collect::<Vec<_>>());
+    check("duplicates", &[n - 1, 0, n - 1, 0]);
+    // Empty strings inside a sparse selection: a zero-length data span still decodes.
+    check("sparse empties", &(0..n).filter(|i| i % 41 == 0).step_by(30).collect::<Vec<_>>());
+
+    // Bounds are still checked before any read, on either path.
+    assert!(col.gather_buffered(&[0, n]).is_err());
+    assert!(col.gather_buffered(&[n - 1, n + 5]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
 fn test_buffered_variable_read_str_matches_read_string() {
     // #224: `read_str` borrows out of the buffered span instead of allocating a
     // `String` per slot.  It is the decode both paths now share — `read_string` is

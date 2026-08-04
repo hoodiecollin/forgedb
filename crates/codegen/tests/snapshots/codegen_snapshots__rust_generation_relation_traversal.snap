@@ -162,27 +162,11 @@ pub struct User {
     pub name: String,
     pub posts: (),
 }
-///Internal narrow scan record for `User` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
-#[derive(Debug, Clone)]
-pub struct UserScanRow {
-    pub id: Uuid,
-    pub name: String,
-}
-///Borrowed narrow scan record for `User` (#224): the same columns as `UserScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+///Borrowed narrow scan view for `User` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct UserScanRef<'a> {
     pub id: Uuid,
     pub name: &'a str,
-}
-impl<'a> UserScanRef<'a> {
-    /// Materialize the owned scan record.  Called only for rows that
-    /// survive the filter (#224).
-    pub fn to_owned_row(&self) -> UserScanRow {
-        UserScanRow {
-            id: self.id.clone(),
-            name: self.name.to_string(),
-        }
-    }
 }
 ///Storage for User model
 pub struct UserStorage {
@@ -1044,47 +1028,40 @@ impl UserStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
-        };
-        let name_value = self
-            .name_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        Some(UserScanRow {
-            id: id_value,
-            name: name_value,
-        })
-    }
-    /// Narrow scan of every live row, filtered on the BORROWED view
-    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-    /// only the filterable/sortable columns.  Each column is bulk-loaded
-    /// once (`gather_buffered`); each row is then decoded into
-    /// a borrowed view whose `string` fields point straight at that buffer,
-    /// and `keep` runs on it — so a row the filter rejects never allocates.
-    /// Only survivors are materialized as owned rows.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
-    pub fn __scan_all_filtered(
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
         &self,
+        sel: Option<Vec<usize>>,
         keep: impl Fn(&UserScanRef<'_>) -> bool,
-    ) -> Vec<UserScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
+        f: impl FnOnce(&mut Vec<UserScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __UserScanBufs {
@@ -1101,7 +1078,7 @@ impl UserStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<UserScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -1119,15 +1096,10 @@ impl UserStorage {
                 name: name_value,
             };
             if keep(&__row_ref) {
-                rows.push(__row_ref.to_owned_row());
+                __refs.push(__row_ref);
             }
         }
-        rows
-    }
-    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-    /// that keeps everything, so there is exactly one buffered-scan body.
-    pub fn __scan_all(&self) -> Vec<UserScanRow> {
-        self.__scan_all_filtered(|_| true)
+        f(&mut __refs)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
@@ -1238,27 +1210,11 @@ pub struct Post {
     pub editor: Option<Uuid>,
     pub tags: (),
 }
-///Internal narrow scan record for `Post` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
-#[derive(Debug, Clone)]
-pub struct PostScanRow {
-    pub id: Uuid,
-    pub title: String,
-}
-///Borrowed narrow scan record for `Post` (#224): the same columns as `PostScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+///Borrowed narrow scan view for `Post` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct PostScanRef<'a> {
     pub id: Uuid,
     pub title: &'a str,
-}
-impl<'a> PostScanRef<'a> {
-    /// Materialize the owned scan record.  Called only for rows that
-    /// survive the filter (#224).
-    pub fn to_owned_row(&self) -> PostScanRow {
-        PostScanRow {
-            id: self.id.clone(),
-            title: self.title.to_string(),
-        }
-    }
 }
 ///Storage for Post model
 pub struct PostStorage {
@@ -2791,47 +2747,40 @@ impl PostStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.author_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<PostScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
-        };
-        let title_value = self
-            .title_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        Some(PostScanRow {
-            id: id_value,
-            title: title_value,
-        })
-    }
-    /// Narrow scan of every live row, filtered on the BORROWED view
-    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-    /// only the filterable/sortable columns.  Each column is bulk-loaded
-    /// once (`gather_buffered`); each row is then decoded into
-    /// a borrowed view whose `string` fields point straight at that buffer,
-    /// and `keep` runs on it — so a row the filter rejects never allocates.
-    /// Only survivors are materialized as owned rows.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
-    pub fn __scan_all_filtered(
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
         &self,
+        sel: Option<Vec<usize>>,
         keep: impl Fn(&PostScanRef<'_>) -> bool,
-    ) -> Vec<PostScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
+        f: impl FnOnce(&mut Vec<PostScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __PostScanBufs {
@@ -2848,7 +2797,7 @@ impl PostStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<PostScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -2866,15 +2815,10 @@ impl PostStorage {
                 title: title_value,
             };
             if keep(&__row_ref) {
-                rows.push(__row_ref.to_owned_row());
+                __refs.push(__row_ref);
             }
         }
-        rows
-    }
-    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-    /// that keeps everything, so there is exactly one buffered-scan body.
-    pub fn __scan_all(&self) -> Vec<PostScanRow> {
-        self.__scan_all_filtered(|_| true)
+        f(&mut __refs)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
@@ -3099,27 +3043,11 @@ pub struct Tag {
     pub label: String,
     pub posts: (),
 }
-///Internal narrow scan record for `Tag` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
-#[derive(Debug, Clone)]
-pub struct TagScanRow {
-    pub id: Uuid,
-    pub label: String,
-}
-///Borrowed narrow scan record for `Tag` (#224): the same columns as `TagScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+///Borrowed narrow scan view for `Tag` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct TagScanRef<'a> {
     pub id: Uuid,
     pub label: &'a str,
-}
-impl<'a> TagScanRef<'a> {
-    /// Materialize the owned scan record.  Called only for rows that
-    /// survive the filter (#224).
-    pub fn to_owned_row(&self) -> TagScanRow {
-        TagScanRow {
-            id: self.id.clone(),
-            label: self.label.to_string(),
-        }
-    }
 }
 ///Storage for Tag model
 pub struct TagStorage {
@@ -3977,47 +3905,40 @@ impl TagStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<TagScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
-        };
-        let label_value = self
-            .label_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        Some(TagScanRow {
-            id: id_value,
-            label: label_value,
-        })
-    }
-    /// Narrow scan of every live row, filtered on the BORROWED view
-    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-    /// only the filterable/sortable columns.  Each column is bulk-loaded
-    /// once (`gather_buffered`); each row is then decoded into
-    /// a borrowed view whose `string` fields point straight at that buffer,
-    /// and `keep` runs on it — so a row the filter rejects never allocates.
-    /// Only survivors are materialized as owned rows.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
-    pub fn __scan_all_filtered(
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
         &self,
+        sel: Option<Vec<usize>>,
         keep: impl Fn(&TagScanRef<'_>) -> bool,
-    ) -> Vec<TagScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
+        f: impl FnOnce(&mut Vec<TagScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __TagScanBufs {
@@ -4034,7 +3955,7 @@ impl TagStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<TagScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -4052,15 +3973,10 @@ impl TagStorage {
                 label: label_value,
             };
             if keep(&__row_ref) {
-                rows.push(__row_ref.to_owned_row());
+                __refs.push(__row_ref);
             }
         }
-        rows
-    }
-    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-    /// that keeps everything, so there is exactly one buffered-scan body.
-    pub fn __scan_all(&self) -> Vec<TagScanRow> {
-        self.__scan_all_filtered(|_| true)
+        f(&mut __refs)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

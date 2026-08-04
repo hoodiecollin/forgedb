@@ -5441,67 +5441,42 @@ impl RustGenerator {
         out
     }
 
-    /// #160: the internal narrow "scan record" for the REST list path — the id
-    /// field plus every filterable/sortable column (the only columns a `?field=`
-    /// filter or `?sort=` can touch; the sortable set is a subset of the
-    /// filterable set).  The list handler filters + sorts these narrow records and
-    /// full-materializes ONLY the paginated page, instead of decoding every column
-    /// of every row through `all()`.  Reuses the shared `generate_row_read_body`
-    /// decoder (the same body `read_at` uses — no drift) and stays internal: never
-    /// wired to REST `?projection=` / the TS SDK / OpenAPI.  Returns
-    /// `(struct, methods)`; empty for a model with no id field (no `all()`-driven
-    /// list to optimize).
+    /// #160/#224/#228: the internal narrow "scan view" for the REST list path — the
+    /// id field plus every filterable/sortable column (the only columns a `?field=`
+    /// filter or `?sort=` can touch; the sortable set is a subset of the filterable
+    /// set).  The list handler filters, sorts, counts and paginates these narrow
+    /// views and full-materializes ONLY the paginated page, instead of decoding
+    /// every column of every row through `all()`.  Stays internal: never wired to
+    /// REST `?projection=` / the TS SDK / OpenAPI.  Returns `(struct, methods)`;
+    /// empty for a model with no id field (no `all()`-driven list to optimize).
+    ///
+    /// #228 removed the *owned* twin of this view.  It existed only because the scan
+    /// returned its rows to the caller, so the borrowed strings had to be copied out
+    /// of the buffered span before it dropped — and nothing outside the scan ever
+    /// read them: the list handler used the rows for the sort comparator, `.len()`
+    /// and `.id`, then threw them away.  The scan is now a *scope*
+    /// (`__with_scan`) that runs the whole filter/sort/count/page pipeline while the
+    /// buffers are still alive and lets only `(total, ids)` escape, so a `String` is
+    /// never allocated for a scan row at all.
     fn generate_list_scan(
         model: &forgedb_parser::Model,
     ) -> (TokenStream, TokenStream) {
         if Self::identity_field(model).is_none() {
             return (quote! {}, quote! {});
         }
-        let scan_ident = format_ident!("{}ScanRow", model.name);
         let scan_fields = Self::scan_field_set(model);
-        // Minimal struct: plain field decls (no ToSchema/Serialize — never on the
-        // wire), same names + types as the model fields so the reused list
-        // filter/sort (`record.<field>` / `a.<field>`) compile against it.
-        let field_decls = scan_fields.iter().map(|f| {
-            let fname = format_ident!("{}", f.name);
-            let base = Self::map_field_type_ident(&f.field_type);
-            // `map_field_type_ident` returns the inner type for a nullable field —
-            // the `Option<>` wrapper is added here (matching the model struct and
-            // the `field_read_stmt` decode output, which binds `Option<inner>`).
-            let fty = if f.is_nullable() {
-                quote! { Option<#base> }
-            } else {
-                base
-            };
-            quote! { pub #fname: #fty }
-        });
-        let read_body = Self::generate_row_read_body(&scan_ident, &scan_fields);
-        let doc = format!(
-            "Internal narrow scan record for `{}` (#160): id + filterable/sortable \
-             columns, used to filter + sort the list endpoint without decoding \
-             every column of every row.  Not a wire type.",
-            model.name
-        );
-        let struct_tokens = quote! {
-            #[doc = #doc]
-            #[derive(Debug, Clone)]
-            pub struct #scan_ident {
-                #(#field_decls,)*
-            }
-        };
-        // #160 (C): per eligible indexed field, a narrow scan that resolves
-        // candidates through the secondary index instead of scanning every row —
-        // O(matches) not O(rows) when the list filters on an indexed field.
+        // #160 (C): per eligible indexed field, a candidate-row resolver that goes
+        // through the secondary index instead of scanning every row — O(matches)
+        // not O(rows) when the list filters on an indexed field.
         let pushdown: Vec<_> = Self::scan_pushdown_fields(model)
             .into_iter()
-            .map(|f| Self::generate_scan_by_index(f, &scan_ident))
+            .map(Self::generate_rows_by_index)
             .collect();
 
-        // #224: the BORROWED twin of the scan record — identical field-for-field
-        // except that `string` becomes `&'a str`, borrowed straight out of the
-        // buffered span the scan already holds.  The list filter runs on this, so a
-        // row that the filter rejects never allocates a `String` at all; only
-        // survivors are materialized as an owned `#scan_ident`.
+        // #224: the borrowed narrow view — every filterable column, with `string`
+        // borrowed straight out of the buffered span the scan already holds rather
+        // than copied into a `String`.  Since #228 this is the ONLY scan view: there
+        // is no owned form to materialize into.
         //
         // INTERNAL by decision (#224): never derived `Serialize`/`ToSchema`, never
         // reachable from the REST/TS/OpenAPI surface, and never returned — it only
@@ -5513,27 +5488,15 @@ impl RustGenerator {
             let fty = Self::scan_ref_field_type(f);
             quote! { pub #fname: #fty }
         });
-        // `to_owned_row` is where the allocation moved TO: it happens once per
-        // surviving row instead of once per string field of every row.
-        let to_owned_fields = scan_fields.iter().map(|f| {
-            let fname = format_ident!("{}", f.name);
-            if Self::is_string_type(&f.field_type) {
-                if f.is_nullable() {
-                    quote! { #fname: self.#fname.map(str::to_string) }
-                } else {
-                    quote! { #fname: self.#fname.to_string() }
-                }
-            } else {
-                quote! { #fname: self.#fname.clone() }
-            }
-        });
         let ref_doc = format!(
-            "Borrowed narrow scan record for `{}` (#224): the same columns as \
-             `{}ScanRow`, with `string` fields borrowed from the buffered column \
-             span instead of copied into a `String`.  Filter predicates run on this \
-             so only surviving rows allocate.  Internal — not a wire type, never \
-             exported.",
-            model.name, model.name
+            "Borrowed narrow scan view for `{}` (#224/#228): the id field plus every \
+             filterable/sortable column, with `string` fields borrowed from the \
+             buffered column span instead of copied into a `String`.  The list \
+             endpoint's whole filter/sort/paginate pipeline runs on these, inside \
+             the scan scope, so no scan row is ever allocated.  Internal — not a \
+             wire type, never exported, and never returned (it only appears behind \
+             a `&` in a closure argument).",
+            model.name
         );
         let ref_struct_tokens = quote! {
             #[doc = #ref_doc]
@@ -5541,47 +5504,21 @@ impl RustGenerator {
             pub struct #scan_ref_ident<'a> {
                 #(#ref_field_decls,)*
             }
-
-            impl<'a> #scan_ref_ident<'a> {
-                /// Materialize the owned scan record.  Called only for rows that
-                /// survive the filter (#224).
-                pub fn to_owned_row(&self) -> #scan_ident {
-                    #scan_ident {
-                        #(#to_owned_fields,)*
-                    }
-                }
-            }
         };
 
-        // #168/#224: the buffered column scan.  `__scan_all_filtered` decodes each
-        // live row into the borrowed view, applies the caller's predicate, and
-        // materializes only survivors; `__scan_all` is that with a predicate that
-        // keeps everything — one buffered-scan body, not two.  `@projection`'s live
-        // `all_<proj>` keeps using the owned emitter below (it returns rows to the
-        // user, so it has nothing to filter against).
+        // #168/#224/#228: the buffered column scan, as a scope.  `@projection`'s
+        // live `all_<proj>` keeps using the owned emitter below (it returns rows to
+        // the user, so it has nothing to filter against and nothing to keep inside
+        // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
-        let scan_all_method = Self::generate_filtered_scan_method(
-            &scan_ident,
-            &scan_ref_ident,
-            &buf_holder,
-            &scan_fields,
-        );
+        let with_scan_method =
+            Self::generate_scan_scope_method(&scan_ref_ident, &buf_holder, &scan_fields);
 
         let methods = quote! {
-            /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-            /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-            /// candidate rows and reads them individually.
-            fn __scan_row_at(&self, row_index: usize) -> Option<#scan_ident> {
-                #read_body
-            }
-            #scan_all_method
+            #with_scan_method
             #(#pushdown)*
         };
-        let struct_tokens = quote! {
-            #struct_tokens
-            #ref_struct_tokens
-        };
-        (struct_tokens, methods)
+        (ref_struct_tokens, methods)
     }
 
     /// The borrowed scan-view type for one scan field (#224): `string` becomes
@@ -5606,18 +5543,29 @@ impl RustGenerator {
         }
     }
 
-    /// Emit the filtered buffered narrow-scan (#224) plus the unfiltered
-    /// `__scan_all` that delegates to it.
+    /// Emit the narrow-scan **scope** (#228) — the single entry point to the list
+    /// path's column scan.
     ///
     /// Same bulk-load as [`Self::generate_buffered_scan_method`] — one
-    /// `gather_buffered` per column, hoisted out of the row loop — but each slot is
-    /// decoded into the BORROWED view first and only materialized as an owned row
-    /// if the caller's predicate keeps it.  Before this, `__scan_all` decoded every
-    /// live row into owned `String`s and the list handler then `retain`ed most of
-    /// them away; the strings of rejected rows were allocated, copied, and dropped
-    /// without ever being read.
-    fn generate_filtered_scan_method(
-        row_ident: &proc_macro2::Ident,
+    /// `gather_buffered` per column, hoisted out of the row loop — but nothing it
+    /// decodes ever leaves: the caller's `f` runs the whole filter/sort/count/page
+    /// pipeline while the buffers are alive, and only what `f` returns escapes.
+    ///
+    /// The shape is deliberate, and it is a constraint being committed to. #224
+    /// already decoded each slot into the borrowed view and ran the filter on it,
+    /// so a *rejected* row never allocated — but survivors were copied into owned
+    /// rows to hand back, and on an unfiltered `GET /model?limit=50` over 20 000
+    /// rows every row is a survivor.  Those copies were then read for exactly three
+    /// things (the sort comparator, `.len()`, `.id`) and dropped.  Keeping the
+    /// pipeline inside the scope removes the copy entirely; the price is that only
+    /// scalars can cross the boundary, so any future list feature wanting more than
+    /// ids out of a scan has to come inside the callback.
+    ///
+    /// `keep` stays a separate closure rather than folding into `f` for a reason:
+    /// applied during decode, a rejected row is never even pushed, so a selective
+    /// filter allocates a `Vec` of survivors rather than of every live row. That is
+    /// #224's win, preserved.
+    fn generate_scan_scope_method(
         ref_ident: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
@@ -5660,27 +5608,51 @@ impl RustGenerator {
         }
 
         quote! {
-            /// Narrow scan of every live row, filtered on the BORROWED view
-            /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-            /// only the filterable/sortable columns.  Each column is bulk-loaded
-            /// once (`gather_buffered`); each row is then decoded into
-            /// a borrowed view whose `string` fields point straight at that buffer,
-            /// and `keep` runs on it — so a row the filter rejects never allocates.
-            /// Only survivors are materialized as owned rows.  The page is
-            /// full-materialized separately, so only `limit` rows pay a full decode.
-            pub fn __scan_all_filtered(
+            /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+            /// endpoint's and live query's single scan entry point.
+            ///
+            /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+            /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+            /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+            /// into a borrowed view whose `string` fields point straight at that
+            /// buffer, and `keep` runs on it — so a row the filter rejects never
+            /// allocates.  Survivors are collected as borrowed views and handed to
+            /// `f`, which runs while the buffers are still alive.
+            ///
+            /// Only `f`'s return value escapes the scope, and it cannot borrow from
+            /// the scan (the view's lifetime is higher-ranked).  Callers return
+            /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+            /// through `get`, so only `limit` rows ever pay a full decode.
+            pub fn __with_scan<R>(
                 &self,
+                sel: Option<Vec<usize>>,
                 keep: impl Fn(&#ref_ident<'_>) -> bool,
-            ) -> Vec<#row_ident> {
-                // Live rows in ascending physical order — so a churn-free table's
-                // selection is exactly the dense prefix `[0, n)` (zero-copy mmap
-                // bulk load) and column reads march forward.  `id_to_row` repoints
-                // a deleted id at its tombstoned row (delete appends a tombstone,
-                // #66), so filter those out with one bulk tombstone read.
-                let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-                __rows.sort_unstable();
-                let __rows = self.tombstones.live_indices(&__rows)
-                    .expect("Failed to read tombstone liveness");
+                f: impl FnOnce(&mut Vec<#ref_ident<'_>>) -> R,
+            ) -> R {
+                let __rows: Vec<usize> = match sel {
+                    // Index pushdown (#160 C).  No tombstone read: delete removes
+                    // the id from every secondary index, so a candidate resolved
+                    // through one is live by construction.  Sorted anyway —
+                    // `gather_buffered` bounds its reads to `[min, max]`, so
+                    // ascending order is what keeps the spanned read tight and the
+                    // column walk forward.
+                    Some(mut __c) => {
+                        __c.sort_unstable();
+                        __c
+                    }
+                    // Live rows in ascending physical order — so a churn-free
+                    // table's selection is exactly the dense prefix `[0, n)`
+                    // (zero-copy mmap bulk load) and column reads march forward.
+                    // `id_to_row` repoints a deleted id at its tombstoned row
+                    // (delete appends a tombstone, #66), so filter those out with
+                    // one bulk tombstone read.
+                    None => {
+                        let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                        __all.sort_unstable();
+                        self.tombstones.live_indices(&__all)
+                            .expect("Failed to read tombstone liveness")
+                    }
+                };
                 let __n = __rows.len();
 
                 #[allow(non_camel_case_types)]
@@ -5691,28 +5663,23 @@ impl RustGenerator {
                     #(#buf_inits,)*
                 };
 
-                // Reserve for the whole live set even though a selective filter will
-                // not fill it: that is ONE oversized allocation, freed at the end,
-                // against ~log2(n) reallocations each memcpy-ing every row already
-                // accepted.  Measured on a 20 000-row unfiltered scan, dropping the
-                // reserve cost ~5% — the growth copy is not free at this row count.
-                let mut rows = Vec::with_capacity(__n);
+                // Reserve for the whole selection even though a selective filter
+                // will not fill it: that is ONE oversized allocation, freed at the
+                // end, against ~log2(n) reallocations each memcpy-ing every view
+                // already accepted.  Measured on a 20 000-row unfiltered scan,
+                // dropping the reserve cost ~5% — the growth copy is not free at
+                // this row count.
+                let mut __refs: Vec<#ref_ident<'_>> = Vec::with_capacity(__n);
                 for __slot in 0..__n {
                     #(#buf_read_stmts)*
                     let __row_ref = #ref_ident {
                         #(#buf_field_values),*
                     };
                     if keep(&__row_ref) {
-                        rows.push(__row_ref.to_owned_row());
+                        __refs.push(__row_ref);
                     }
                 }
-                rows
-            }
-
-            /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-            /// that keeps everything, so there is exactly one buffered-scan body.
-            pub fn __scan_all(&self) -> Vec<#row_ident> {
-                self.__scan_all_filtered(|_| true)
+                f(&mut __refs)
             }
         }
     }
@@ -5725,9 +5692,10 @@ impl RustGenerator {
     /// (PM constraint 2).  Because only the columns of `fields` are gathered and
     /// decoded, a projected subset skips the unselected columns entirely — no
     /// `gather_buffered`, no per-row heap alloc for them (e.g. a `views,published`
-    /// aggregate scan never touches the `title` `String` column).  Reused by
-    /// `__scan_all` (the full filterable set) and each `@projection`'s live
-    /// `all_<proj>` (#113 + #168 converged).
+    /// aggregate scan never touches the `title` `String` column).  Emits each
+    /// `@projection`'s live `all_<proj>` (#113 + #168 converged); the list path's
+    /// own scan is [`Self::generate_scan_scope_method`], which shares the bulk-load
+    /// but keeps everything it decodes inside the scope (#228).
     fn generate_buffered_scan_method(
         struct_ident: &proc_macro2::Ident,
         method: &proc_macro2::Ident,
@@ -5839,20 +5807,24 @@ impl RustGenerator {
             .collect()
     }
 
-    /// Emit `__scan_by_<field>(&self, value: &str) -> Option<Vec<ScanRow>>` for an
+    /// Emit `__rows_by_<field>(&self, value: &str) -> Option<Vec<usize>>` for an
     /// eligible indexed field (#160 C).  Parses the raw param, derives the SAME
     /// index key as `find_by_<field>` (via `index_key_expr`/`index_value_expr` —
     /// one derivation, so an index hit is self-consistent), probes the field index,
-    /// and narrow-reads the candidate rows.  Returns `None` when the param does not
-    /// parse (the caller falls back to the full scan, so a match is never missed);
-    /// `Some(vec![])` when the value parses but no row holds it.
-    fn generate_scan_by_index(
-        field: &forgedb_parser::Field,
-        scan_ident: &proc_macro2::Ident,
-    ) -> TokenStream {
+    /// and returns the candidates' physical row positions.  Returns `None` when the
+    /// param does not parse (the caller falls back to the full scan, so a match is
+    /// never missed); `Some(vec![])` when the value parses but no row holds it.
+    ///
+    /// #228 reduced this to *row resolution*.  It used to decode the candidates
+    /// itself, one positional read per column per row (`__scan_row_at`), which is
+    /// why it was the one scan path that could not borrow — it held no buffered
+    /// span.  Handing the rows to `__with_scan` instead unifies the two paths on the
+    /// borrowed view and bulk-loads the candidates (one `gather_buffered` per
+    /// column), so the pushdown stops being the odd one out in both senses.
+    fn generate_rows_by_index(field: &forgedb_parser::Field) -> TokenStream {
         use forgedb_parser::{FieldType, RelationType};
         let index_ident = Self::index_field_ident(field);
-        let scan_by = format_ident!("__scan_by_{}", field.name);
+        let rows_by = format_ident!("__rows_by_{}", field.name);
         // Parse the raw `value: &str` into the typed value the index key derives
         // from, binding `__typed`.  String needs no parse (the key derives from the
         // &str directly, matching `find_by`'s `&str` param).
@@ -5891,22 +5863,21 @@ impl RustGenerator {
         };
         let key = Self::index_key_expr(&field.field_type, Self::index_value_expr(&field.field_type, key_value));
         quote! {
-            /// #160 (C): resolve list candidates for this indexed field from the
-            /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-            /// param did not parse; the caller falls back to `__scan_all`.
-            pub fn #scan_by(&self, value: &str) -> Option<Vec<#scan_ident>> {
+            /// #160 (C): resolve list candidate ROWS for this indexed field from the
+            /// secondary index (O(matches)) rather than a full scan.  Feed the result
+            /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+            /// the caller falls back to a full scan, so a match is never missed.
+            pub fn #rows_by(&self, value: &str) -> Option<Vec<usize>> {
                 #parse_stmt
                 let __k: String = { #key };
                 let __ids = match self.#index_ident.get(&__k) {
                     Some(__s) => __s,
                     None => return Some(Vec::new()),
                 };
-                let mut __out = Vec::new();
+                let mut __out = Vec::with_capacity(__ids.len());
                 for &__id in __ids {
                     if let Some(&__row) = self.id_to_row.get(&__id) {
-                        if let Some(__r) = self.__scan_row_at(__row) {
-                            __out.push(__r);
-                        }
+                        __out.push(__row);
                     }
                 }
                 Some(__out)

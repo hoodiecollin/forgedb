@@ -96,28 +96,28 @@ async fn list_user(
             (page, total)
         }
         None => {
-            let mut __scan_rows = if let Some(__v) = params.get("email") {
-                match db.user.__scan_by_email(__v) {
-                    Some(mut __c) => {
-                        __c.retain(|r| __user_scan_matches(r, &params));
-                        __c
-                    }
-                    None => {
-                        db.user
-                            .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
-                    }
-                }
+            let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("email") {
+                db.user.__rows_by_email(__v)
             } else {
-                db.user.__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
+                None
             };
-            __user_scan_sort(&mut __scan_rows, &qp.sort);
-            let total = __scan_rows.len();
-            let __page_ids: Vec<_> = qp
-                .pagination
-                .apply(&__scan_rows)
-                .iter()
-                .map(|r| r.id)
-                .collect();
+            let (total, __page_ids) = db
+                .user
+                .__with_scan(
+                    __sel,
+                    |r| __user_scan_matches(r, &params),
+                    |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                        __user_scan_sort(__scan, &qp.sort);
+                        let __total = __scan.len();
+                        let __ids: Vec<_> = qp
+                            .pagination
+                            .apply(__scan)
+                            .iter()
+                            .map(|r| r.id)
+                            .collect();
+                        (__total, __ids)
+                    },
+                );
             let page: Vec<super::User> = __page_ids
                 .iter()
                 .filter_map(|__id| db.user.get(*__id))
@@ -330,40 +330,11 @@ fn user_apply_sort(
         rows.reverse();
     }
 }
-/// Narrow closed-set filter over the scan record (#160) — same per-field
-/// checks as `_event_matches`, only the operand type is narrower.
+/// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
+/// a row is accepted or rejected before its strings are ever copied out
+/// of the buffered column.  Same per-field checks as `_event_matches`,
+/// only the operand type is narrower.
 fn __user_scan_matches(
-    record: &super::UserScanRow,
-    params: &HashMap<String, String>,
-) -> bool {
-    if params.is_empty() {
-        return true;
-    }
-    if let Some(want) = params.get("id") {
-        let __ok = match want.parse::<Uuid>().ok() {
-            Some(__w) => record.id == __w,
-            None => false,
-        };
-        if !__ok {
-            return false;
-        }
-    }
-    if let Some(want) = params.get("email") {
-        let __ok = match Some(want.clone()) {
-            Some(__w) => record.email == __w,
-            None => false,
-        };
-        if !__ok {
-            return false;
-        }
-    }
-    true
-}
-/// The same filter over the BORROWED scan view (#224), so a row can be
-/// accepted or rejected before its strings are ever copied out of the
-/// buffered column.  Emitted from the identical per-field checks as
-/// the owned filter above — one predicate, two operand views.
-fn __user_scan_matches_ref(
     record: &super::UserScanRef<'_>,
     params: &HashMap<String, String>,
 ) -> bool {
@@ -390,10 +361,12 @@ fn __user_scan_matches_ref(
     }
     true
 }
-/// Narrow list sort over the scan record (#160) — same arms as
-/// `_apply_sort`.
+/// Narrow list sort over the borrowed scan view (#160/#228) — same arms
+/// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
+/// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
+/// comparing them is comparing the buffer's bytes in place.
 fn __user_scan_sort(
-    rows: &mut Vec<super::UserScanRow>,
+    rows: &mut Vec<super::UserScanRef<'_>>,
     sort: &Option<forgedb_query_params::Sort>,
 ) {
     let Some(sort) = sort.as_ref() else {
@@ -501,7 +474,7 @@ async fn handle_user_subscription(
         }
     }
 }
-///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query (narrow `__scan_all` + `__user_scan_matches`, materializing only matches — #160), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
+///Live-query WebSocket subscription for `User` (#62 Direction B). Runs the generated closed-set query (narrow `__with_scan` + `__user_scan_matches`, materializing only matches — #160), streams an initial `UserLiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / `Removed` deltas as the matching set changes.
 async fn subscribe_live_user(
     Query(params): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
@@ -519,11 +492,16 @@ async fn handle_user_live_query(
     {
         let rows: Vec<super::User> = {
             let g = db.read().await;
-            g.user
-                .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
-                .into_iter()
-                .filter_map(|r| g.user.get(r.id))
-                .collect()
+            let __ids = g
+                .user
+                .__with_scan(
+                    None,
+                    |r| __user_scan_matches(r, &params),
+                    |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                        __scan.iter().map(|r| r.id).collect::<Vec<_>>()
+                    },
+                );
+            __ids.into_iter().filter_map(|__id| g.user.get(__id)).collect()
         };
         for r in &rows {
             members.insert(r.id, r.clone());
@@ -543,11 +521,16 @@ async fn handle_user_live_query(
                 }
                 let current: Vec<super::User> = {
                     let g = db.read().await;
-                    g.user
-                        .__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))
-                        .into_iter()
-                        .filter_map(|r| g.user.get(r.id))
-                        .collect()
+                    let __ids = g
+                        .user
+                        .__with_scan(
+                            None,
+                            |r| __user_scan_matches(r, &params),
+                            |__scan: &mut Vec<super::UserScanRef<'_>>| {
+                                __scan.iter().map(|r| r.id).collect::<Vec<_>>()
+                            },
+                        );
+                    __ids.into_iter().filter_map(|__id| g.user.get(__id)).collect()
                 };
                 let mut next: HashMap<Uuid, super::User> = HashMap::new();
                 let mut deltas: Vec<super::UserLiveDelta> = Vec::new();

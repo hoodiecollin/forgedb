@@ -155,30 +155,55 @@ axum router (generated in api.rs)
 Every field-aware step — filtering, sorting, the event matcher, index probes — is *generated
 per model*. The substrate crates on this path (`auth`, `query-params`) interpret no schema.
 
-### The list path is a narrow scan, filtered before it allocates
+### The list path is a scan *scope*, and never materializes a row
 
-A list request does **not** decode every column of every row. Codegen emits a *narrow scan
-record* per model — the identity field plus the filterable/sortable columns — and the handler
-filters and sorts those, then full-materializes only the paginated page. Each scan column is
-bulk-loaded once (one `gather_buffered` per column, hoisted out of the row loop) rather than read
-per row.
+A list request does **not** decode every column of every row. Codegen emits a *narrow scan view*
+per model — `<Model>ScanRef<'a>`, the identity field plus the filterable/sortable columns, with
+`string` as `&'a str` — and each scan column is bulk-loaded once (one `gather_buffered` per
+column, hoisted out of the row loop) rather than read per row.
 
-Filtering happens **during** the scan, against a borrowed view. Alongside the owned scan record,
-codegen emits `<Model>ScanRef<'a>`, identical field-for-field except that `string` becomes
-`&'a str` — borrowed straight from the bulk-loaded span, which already holds those bytes. The
-predicate runs on that view and an owned row is materialized only for survivors, so a rejected row
-never allocates a string at all. Two properties make this safe and non-viral:
+The scan is a **scope**, not a producer:
 
-- The buffered columns live in a local holder inside the generated scan, so a borrowed row cannot
+```rust
+pub fn __with_scan<R>(
+    &self,
+    sel: Option<Vec<usize>>,                       // index-pushdown rows, or every live row
+    keep: impl Fn(&<Model>ScanRef<'_>) -> bool,    // runs during decode
+    f:    impl FnOnce(&mut Vec<<Model>ScanRef<'_>>) -> R,
+) -> R
+```
+
+The handler filters, sorts, counts and paginates *inside* `f`, and returns `(total, Vec<Id>)`; the
+page is then re-read through `get`, so only `limit` rows ever pay a full decode. Nothing borrowed
+crosses the boundary — the view's lifetime is higher-ranked, so `R` cannot name it.
+
+That shape is what removes the copies rather than narrowing who pays them. `keep` running during
+decode means a **rejected** row never allocates a string. Keeping the sort and the page inside the
+scope means a **surviving** one does not either — and on an unfiltered `GET /model?limit=50` every
+row is a survivor, which is exactly the case a filter-only optimization wins nothing on. The
+strings a scan row used to allocate were read for three things (the sort comparator, `.len()`,
+`.id`) and dropped; now the comparator reads the buffer's bytes in place.
+
+The constraint this commits to: **only scalars leave a scan.** A future list feature that wants
+more than ids out of one has to come inside the callback.
+
+Three properties keep it safe and non-viral:
+
+- The buffered columns live in a local holder inside the generated scan, so a borrowed view cannot
   escape it. `ScanRef` is internal — no wire derives, never reachable from REST/TS/OpenAPI, and
   only ever named behind a `&` in a closure argument. **No lifetime appears in any user-facing
   generated signature.**
-- The borrowed and owned filters are emitted from the *same* per-field checks that the change-feed
-  matcher uses, so there is one predicate source and three operand views — never a second parser.
+- The scan filter is emitted from the *same* per-field checks the change-feed matcher uses, so
+  there is one predicate source and two operand views — never a second parser.
+- The index-pushdown arm (`__rows_by_<field>`, O(matches) via the secondary index) resolves
+  candidate *rows* and feeds them to the same scope, so there is one scan body and one decode
+  path. Pushing that arm through `gather_buffered` needed a matching substrate change: bounding a
+  bulk read to the selection's row span is right for a dense scan and wrong for a handful of
+  scattered candidates, so `VariableColumn::gather_buffered` gained a packed sparse path
+  (`SPARSE_OFFSETS_SPAN_FACTOR`) below which offsets and bytes are read per row.
 
-The same shape backs the live-query re-run, which re-evaluates the closed-set query on every
-change to the model. The win is proportional to how much the filter rejects: an unfiltered list
-still materializes every row.
+The same scope backs the live-query re-run, which re-evaluates the closed-set query on every
+change to the model.
 
 ---
 
