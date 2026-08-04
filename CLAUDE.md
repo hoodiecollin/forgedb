@@ -256,7 +256,9 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 
 ## Schema language quick reference
 
-Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case.
+Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case. Every model
+must also have an **identity field** — named `id`, or any `+` auto-generate field — which is
+likewise fatal (#248); convention is `id: +uuid`.
 Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — but only
 `uuid`/`timestamp` are actually synthesized on create; integer `+u32`/`+u64` parse+mark but are
 NOT auto-incremented, RFC #187), `&`

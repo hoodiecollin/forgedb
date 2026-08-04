@@ -29,8 +29,10 @@
 //! arity) remain fatal in the parser's structural pass and never reach here.
 //!
 //! Callers that also need **filesystem** checks (component-file existence) or
-//! **advisory** lints (no id / no timestamp) layer those on top — those are not
-//! pure-schema diagnostics and stay in the CLI.
+//! **advisory** lints (no timestamp) layer those on top — those are not
+//! pure-schema diagnostics and stay in the CLI. (The missing-identity check used
+//! to be one of those advisories; #248 made it a hard rule and moved it here, so
+//! the LSP reports it too.)
 
 use crate::ast::{FieldType, RelationType, Schema};
 use forgedb_validation::{is_pascal_case, validate_field_name, validate_model_name, ValidationError};
@@ -215,6 +217,36 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
             }
         }
 
+        // Identity is mandatory (#248). A model with no identity field generates
+        // code that does not compile — `create_*` reads `record.id`, `id_to_row`
+        // has nothing to key on, and the REST id routes have no path parameter to
+        // parse. Beyond compiling, identity is load-bearing for relations,
+        // secondary indexes, the change feed, and live queries, so there is very
+        // little generated surface left for a model without one.
+        //
+        // The predicate matches what codegen uses to *find* the identity field, so
+        // validation and generation cannot disagree about whether one exists.
+        // (Whether the chosen field's *type* can serve as a key is a separate,
+        // unenforced question — a `string` or `timestamp` identity still generates
+        // code that does not compile. Tracked separately.)
+        if !model
+            .fields
+            .iter()
+            .any(|f| f.name == "id" || f.auto_generate)
+        {
+            errors.push(
+                positioned(
+                    format!(
+                        "Model '{}' has no identity field. Every model needs one: a field named \
+                         'id', or any field marked auto-generate ('+').",
+                        model.name
+                    ),
+                    model.position,
+                )
+                .with_suggestion("id: +uuid"),
+            );
+        }
+
         // Composite indexes reference existing fields.
         for comp_idx in &model.composite_indexes {
             for field_name in &comp_idx.fields {
@@ -346,5 +378,64 @@ mod tests {
         collect_structure_errors(&schema, &mut errors);
         assert_eq!(errors.len(), 1, "only the structural defect: {errors:?}");
         assert!(errors[0].message.contains("undefined model 'Ghost'"));
+    }
+
+    // ---- #248: identity is mandatory ----------------------------------------
+
+    /// A model with no identity field is rejected, positioned at the model, with a
+    /// suggestion an editor quick-fix can apply. Before #248 this was a CLI-only
+    /// advisory that exited 0 and let uncompilable code be generated.
+    #[test]
+    fn model_without_identity_is_rejected() {
+        // 1: Thing {   2:   name: string   3:   count: u32   4: }
+        let schema = ast("Thing {\n  name: string\n  count: u32\n}\n");
+        let errors = validate_schema(&schema);
+        let identity: Vec<_> = errors
+            .iter()
+            .filter(|e| e.message.contains("no identity field"))
+            .collect();
+
+        assert_eq!(identity.len(), 1, "exactly one: {errors:?}");
+        assert_eq!(
+            identity[0].position.map(|p| p.line),
+            Some(1),
+            "anchored at the model declaration"
+        );
+        assert_eq!(identity[0].suggestion.as_deref(), Some("id: +uuid"));
+        assert!(
+            !identity[0].is_warning(),
+            "#248 promoted this from an advisory to a hard error"
+        );
+    }
+
+    /// Both spellings of identity are accepted, and they are the same two the
+    /// generators use to *find* the field — validation and codegen must not
+    /// disagree about whether a model has one.
+    #[test]
+    fn either_spelling_of_identity_satisfies_the_rule() {
+        for src in [
+            "Thing {\n  id: +uuid\n  name: string\n}\n",  // auto-generated `id`
+            "Thing {\n  id: uuid\n  name: string\n}\n",   // named `id`, not auto
+            "Thing {\n  code: +uuid\n  name: string\n}\n", // auto-generated, other name
+        ] {
+            let errors = validate_schema(&ast(src));
+            assert!(
+                !errors.iter().any(|e| e.message.contains("no identity field")),
+                "{src:?} has an identity field: {errors:?}"
+            );
+        }
+    }
+
+    /// The rule is per-model, not per-schema: one good model does not excuse a bad
+    /// sibling, and each is reported at its own position.
+    #[test]
+    fn identity_is_checked_per_model() {
+        let schema = ast("Good {\n  id: +uuid\n}\n\nBad {\n  name: string\n}\n");
+        let identity: Vec<_> = validate_schema(&schema)
+            .into_iter()
+            .filter(|e| e.message.contains("no identity field"))
+            .collect();
+        assert_eq!(identity.len(), 1, "only the bad one: {identity:?}");
+        assert!(identity[0].message.contains("'Bad'"));
     }
 }

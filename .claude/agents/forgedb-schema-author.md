@@ -14,6 +14,7 @@ ForgeDB is an **application database GENERATOR**, not SQL and not a runtime ORM.
 ## Hard grammar rules (the parser enforces these — violations are FATAL parse errors)
 
 Naming (enforced by `validate_field_name`/`validate_model_name`, fatal):
+- **Every model MUST have an identity field** — `id: +uuid` by convention. A model without one is a fatal validation error, not a lint.
 - **Models and structs: PascalCase** (`User`, `BlogPost`, `OrderLineItem`).
 - **Fields: snake_case** — ALWAYS, including component-reference fields (`profile_card`, not `profileCard`). Non-snake_case fields will NOT parse.
 
