@@ -244,6 +244,67 @@ impl Parser {
         }
     }
 
+    /// The token after the cursor.
+    fn peek_token(&self) -> &Token {
+        self.tokens.get(self.position + 1).unwrap_or(&Token::Eof)
+    }
+
+    /// Is the cursor sitting on the contextual `bytes` type keyword (#233)?
+    ///
+    /// `bytes` is deliberately **not** a reserved word. Adding one would be a
+    /// larger break than the rename it serves: `bytes` is an ordinary noun for a
+    /// size, and reserving it turns `bytes: i32?` — a real column in the
+    /// Chinook-derived `music-store` example — into a parse error on a *minor*
+    /// version bump. So it lexes as [`Token::Ident`] and only means the type in
+    /// type position followed by `(`, the same lookahead trick the `tsx://` /
+    /// `jsx://` / `api://` component protocols already use.
+    ///
+    /// (The other type keywords — `string`, `timestamp`, `decimal`, … — *are*
+    /// reserved and cannot be field names. That is pre-existing and tracked
+    /// separately; this rename does not add to the problem.)
+    fn at_bytes_type(&self) -> bool {
+        matches!(self.current_token(), Token::Ident(name) if name == "bytes")
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `bytes ( N )` / `char ( N )` and return [`FieldType::Bytes`].
+    ///
+    /// The cursor must be on the type keyword. Emits the #233 deprecation warning
+    /// when the source spelling was `char`.
+    fn parse_bytes_type(&mut self) -> Result<FieldType, String> {
+        let deprecated = matches!(self.current_token(), Token::TypeCharDeprecated);
+        // Anchor the diagnostic at the keyword, not wherever the size parse ends.
+        let keyword_position = self.get_current_position();
+        let keyword = if deprecated { "char" } else { "bytes" };
+        self.advance();
+        self.expect(Token::LParen)?;
+        let size = match self.current_token() {
+            Token::Number(n) => *n as usize,
+            _ => {
+                return Err(format!(
+                    "Expected size after '{}(', found {:?}",
+                    keyword,
+                    self.current_token()
+                ))
+            }
+        };
+        self.advance();
+        self.expect(Token::RParen)?;
+        if deprecated {
+            self.warn(
+                format!(
+                    "`char({size})` is deprecated and will be removed in the next major version. \
+                     The type stores raw bytes — there is no UTF-8 guarantee and no text \
+                     semantics, unlike SQL's CHAR(N), which is fixed-length text. If this field \
+                     holds text, use `string` instead."
+                ),
+                keyword_position,
+                Some(format!("bytes({size})")),
+            );
+        }
+        Ok(FieldType::Bytes(size))
+    }
+
     fn skip_newlines(&mut self) {
         while matches!(self.current_token(), Token::Newline) {
             self.advance();
@@ -375,6 +436,12 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> Result<FieldType, String> {
+        // `bytes(N)` is contextual and arrives as an identifier, so it has to be
+        // claimed before the `Token::Ident` arm below reads it as a struct name.
+        if self.at_bytes_type() {
+            return self.parse_bytes_type();
+        }
+
         // Check for relation types first
         match self.current_token() {
             // Fixed array or One-to-many: [type; count] or [Post]
@@ -383,6 +450,25 @@ impl Parser {
 
                 // Check if this is a fixed array [type; count] or one-to-many [Model]
                 let first_token = self.current_token().clone();
+
+                // `[bytes(20); 5]` — claim the contextual keyword before the
+                // `Token::Ident` arm treats it as a struct name (#233).
+                if self.at_bytes_type() {
+                    let inner_type = self.parse_bytes_type()?;
+                    self.expect(Token::Semicolon)?;
+                    let count = match self.current_token() {
+                        Token::Number(n) => *n as usize,
+                        _ => {
+                            return Err(format!(
+                                "Expected array count, found {:?}",
+                                self.current_token()
+                            ))
+                        }
+                    };
+                    self.advance();
+                    self.expect(Token::RBracket)?;
+                    return Ok(FieldType::FixedArray(Box::new(inner_type), count));
+                }
 
                 match first_token {
                     Token::Ident(name) => {
@@ -462,6 +548,12 @@ impl Parser {
             // Optional reference or nullable primitive: ?User  or  ?i32
             Token::Question => {
                 self.advance();
+                // `?bytes(3)` — claim the contextual keyword before the
+                // `Token::Ident` arm reads it as an optional model ref (#233).
+                if self.at_bytes_type() {
+                    let inner = self.parse_bytes_type()?;
+                    return Ok(FieldType::Nullable(Box::new(inner)));
+                }
                 match self.current_token().clone() {
                     Token::Ident(name) => {
                         self.advance();
@@ -479,7 +571,7 @@ impl Parser {
                     | Token::TypeTimestamp
                     | Token::TypeJson
                     | Token::TypeDecimal
-                    | Token::TypeChar => {
+                    | Token::TypeCharDeprecated => {
                         let inner = self.parse_primitive_type()?;
                         return Ok(FieldType::Nullable(Box::new(inner)));
                     }
@@ -549,22 +641,10 @@ impl Parser {
             Token::TypeDecimal => FieldType::Decimal,
             Token::TypeUuid => FieldType::Uuid,
             Token::TypeTimestamp => FieldType::Timestamp,
-            Token::TypeChar => {
-                // char(N) - expect (N)
-                self.advance();
-                self.expect(Token::LParen)?;
-                let size = match self.current_token() {
-                    Token::Number(n) => *n as usize,
-                    _ => {
-                        return Err(format!(
-                            "Expected size after 'char(', found {:?}",
-                            self.current_token()
-                        ))
-                    }
-                };
-                self.advance();
-                self.expect(Token::RParen)?;
-                return Ok(FieldType::Char(size));
+            Token::TypeCharDeprecated => return self.parse_bytes_type(),
+            // The contextual `bytes(N)` spelling arrives as an identifier (#233).
+            Token::Ident(name) if name == "bytes" && matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_bytes_type()
             }
             _ => return Err(format!("Expected type, found {:?}", self.current_token())),
         };
@@ -772,7 +852,7 @@ impl Parser {
                 | FieldType::Decimal
                 | FieldType::Uuid
                 | FieldType::Timestamp
-                | FieldType::Char(_)
+                | FieldType::Bytes(_)
                 | FieldType::FixedArray(_, _) => {
                     let inner = field_type.clone();
                     self.advance();
@@ -1919,5 +1999,127 @@ B
         assert!(p.parse().is_ok(), "a warning never fails a parse");
         assert_eq!(p.warnings().len(), 1);
         assert!(p.warnings()[0].is_warning());
+    }
+
+    // ---- #233: `char(n)` → `bytes(n)` ---------------------------------------
+    //
+    // The first real producer on the #237 channel. Both spellings must reach the
+    // *same* `FieldType::Bytes`, in every type position, with a warning on
+    // exactly the deprecated one.
+
+    /// Parse a single-model schema and return `(field_type, warnings)`.
+    fn parse_field(src: &str, field: &str) -> (FieldType, Vec<ValidationError>) {
+        let mut p = Parser::new(src).unwrap();
+        let schema = p.parse().expect("schema parses");
+        let ty = schema
+            .models
+            .iter()
+            .flat_map(|m| &m.fields)
+            .find(|f| f.name == field)
+            .unwrap_or_else(|| panic!("field `{field}` not found"))
+            .field_type
+            .clone();
+        (ty, p.take_warnings())
+    }
+
+    /// The canonical spelling parses clean — no diagnostic of any severity.
+    #[test]
+    fn bytes_parses_without_a_diagnostic() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: bytes(3)\n}\n", "code");
+        assert_eq!(ty, FieldType::Bytes(3));
+        assert!(warnings.is_empty(), "canonical spelling is silent: {warnings:?}");
+    }
+
+    /// The deprecated spelling reaches the identical AST, and warns exactly once
+    /// — positioned at the `char` keyword, and naming the replacement.
+    #[test]
+    fn char_parses_to_bytes_and_warns_once() {
+        // 1: T {   2:   id: +uuid   3:   code: char(3)
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: char(3)\n}\n", "code");
+        assert_eq!(ty, FieldType::Bytes(3), "same AST as `bytes(3)`");
+        assert_eq!(warnings.len(), 1, "exactly one diagnostic: {warnings:?}");
+
+        let w = &warnings[0];
+        assert!(w.is_warning(), "a deprecation is never an error");
+        assert_eq!(
+            w.position.map(|p| (p.line, p.column)),
+            Some((3, 9)),
+            "anchored at the `char` keyword, not the size or the field name"
+        );
+        assert_eq!(
+            w.suggestion.as_deref(),
+            Some("bytes(3)"),
+            "the suggestion carries the size, so a quick-fix can apply it verbatim"
+        );
+    }
+
+    /// The deprecation reaches *inside* the compound type positions, not just a
+    /// bare field type. Each is a separate parse path in `parse_type`.
+    #[test]
+    fn char_warns_in_every_type_position() {
+        for (src_type, expected) in [
+            ("char(2)?", FieldType::Nullable(Box::new(FieldType::Bytes(2)))),
+            ("?char(4)", FieldType::Nullable(Box::new(FieldType::Bytes(4)))),
+            (
+                "[char(8); 2]",
+                FieldType::FixedArray(Box::new(FieldType::Bytes(8)), 2),
+            ),
+            ("^&char(5)", FieldType::Bytes(5)),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert_eq!(warnings.len(), 1, "`{src_type}` warns exactly once");
+        }
+    }
+
+    /// `^` / `&` are parsed before the type, so a deprecation inside a modified
+    /// field must not eat them.
+    #[test]
+    fn char_deprecation_preserves_modifiers() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  key: ^&char(5)\n}\n").unwrap();
+        let schema = p.parse().expect("parses");
+        let f = schema.models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "key")
+            .unwrap();
+        assert!(f.indexed && f.unique, "`^` and `&` survive the warning");
+        assert_eq!(p.warnings().len(), 1);
+    }
+
+    /// `bytes` is **contextual**, not reserved: it stays usable as a field name.
+    /// The Chinook-derived `music-store` example has exactly this column, so
+    /// reserving the word would have turned a valid schema into a parse error on
+    /// a minor version bump.
+    #[test]
+    fn bytes_is_still_a_valid_field_name() {
+        let (ty, warnings) = parse_field(
+            "T {\n  id: +uuid\n  bytes: i32?\n  blob: bytes(4)\n}\n",
+            "bytes",
+        );
+        assert_eq!(ty, FieldType::Nullable(Box::new(FieldType::I32)));
+        assert!(warnings.is_empty());
+
+        let (blob, _) = parse_field(
+            "T {\n  id: +uuid\n  bytes: i32?\n  blob: bytes(4)\n}\n",
+            "blob",
+        );
+        assert_eq!(
+            blob,
+            FieldType::Bytes(4),
+            "the type still resolves in the same schema as the field name"
+        );
+    }
+
+    /// Bare `bytes` with no size is not the type — it falls through to the
+    /// struct-reference path, exactly as any other unknown bare identifier does.
+    /// This is what keeps the contextual keyword from swallowing real names.
+    #[test]
+    fn bare_bytes_without_a_size_is_not_the_type() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes\n}\n").unwrap();
+        // Unresolvable as a struct, so validation rejects it — the point is that
+        // it was never parsed as `FieldType::Bytes`.
+        assert!(p.parse().is_err(), "a sizeless `bytes` is not a type");
     }
 }

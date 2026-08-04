@@ -82,7 +82,13 @@ pub enum FieldType {
     /// stays a `StructType` and is caught by struct-reference validation.
     Enum(String),
     // Fixed-size types (Sprint 8)
-    Char(usize),                       // Fixed-size character array: char(N)
+    /// Fixed-size **byte** array: `bytes(N)` → `[u8; N]`.
+    ///
+    /// There is no UTF-8 guarantee, no length tracking, and no text semantics
+    /// anywhere in the pipeline — on the wire it is an array of integers. The
+    /// deprecated spelling `char(N)` (#233) parses to this same variant and warns;
+    /// `char` was a false friend, since SQL's `CHAR(N)` is fixed-length *text*.
+    Bytes(usize),
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
     StructType(String),                // Reference to a struct by name
     OptionalStructType(String),        // Optional struct reference
@@ -389,7 +395,7 @@ impl FieldType {
             FieldType::Enum(name) => name.clone(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
             FieldType::Timestamp => "i64".to_string(),
-            FieldType::Char(size) => format!("[u8; {}]", size),
+            FieldType::Bytes(size) => format!("[u8; {}]", size),
             FieldType::FixedArray(inner_type, count) => {
                 format!("[{}; {}]", inner_type.to_rust_type(), count)
             }
@@ -440,7 +446,7 @@ impl FieldType {
             | FieldType::Timestamp
             | FieldType::Decimal // exact decimal is a fixed 16-byte column, like Uuid
             | FieldType::Enum(_) // enum is a fixed 1-byte discriminant column
-            | FieldType::Char(_) => true,
+            | FieldType::Bytes(_) => true,
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
@@ -479,7 +485,7 @@ impl FieldType {
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16,
             FieldType::Decimal => 16, // exact decimal is a fixed 16-byte column, like Uuid (#189)
-            FieldType::Char(size) => *size,
+            FieldType::Bytes(size) => *size,
             FieldType::FixedArray(inner, count) => inner.size_in_bytes(schema) * count,
             FieldType::StructType(name) => {
                 if let Some(struct_def) = schema.find_struct(name) {
@@ -510,7 +516,7 @@ impl FieldType {
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16, // UUID is typically 16-byte aligned
-            FieldType::Char(_) => 1,
+            FieldType::Bytes(_) => 1,
             FieldType::FixedArray(inner, _) => inner.alignment(schema),
             FieldType::StructType(name) => {
                 if let Some(struct_def) = schema.find_struct(name) {

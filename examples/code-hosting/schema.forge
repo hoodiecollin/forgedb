@@ -109,6 +109,8 @@ PullRequest {
   base_branch: string
   has_merged: bool @default(false)
   merged_at: timestamp?
+  // A git object id is 20 raw bytes, not text — this is what `bytes(N)` is for.
+  merge_commit_sha: bytes(20)?
   status: string @default(checking)
   created_at: +timestamp
   issue: *Issue
@@ -130,7 +132,8 @@ Comment {
 Label {
   id: +uuid
   name: string @length(1, 50)
-  color: char(7)
+  // hex color, e.g. "#A855F7" — text, so `string` (not `bytes(7)`)
+  color: string @length(7, 7)
   description: string?
   created_at: +timestamp
   repo: *Repository

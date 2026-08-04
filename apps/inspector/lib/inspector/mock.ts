@@ -55,7 +55,7 @@ export const SCHEMA: Record<string, Field[]> = {
     { name: "is_admin", typeLabel: "bool", mods: ["?"], control: "bool", default: "true" },
     { name: "role", typeLabel: "string", mods: [], directive: '@default("member")', control: "string", value: "member" },
     { name: "score", typeLabel: "f64", mods: [], control: "float", value: "87.5" },
-    { name: "login_code", typeLabel: "char(8)", mods: [], control: "char", len: 8, value: "A1B2C3D4" },
+    { name: "login_code", typeLabel: "bytes(8)", mods: [], control: "bytes", len: 8, value: "A1B2C3D4" },
     { name: "created_at", typeLabel: "timestamp", mods: ["+"], control: "ts", msVal: "1730556180000", humanVal: "2024-11-02 14:03" },
     { name: "org", typeLabel: "∗Org", mods: [], control: "fk", fkTarget: "Org", fkCurrent: "acme", fkOptions: [{ v: "acme", label: "Acme Inc" }, { v: "beta", label: "Beta LLC" }, { v: "globex", label: "Globex" }] },
     { name: "address", typeLabel: "struct", mods: ["?"], control: "struct", structFields: [{ name: "street", value: "12 Oak St", ph: "street" }, { name: "city", value: "Austin", ph: "city" }, { name: "zip", value: "78701", ph: "zip" }] },
@@ -76,7 +76,7 @@ export const SCHEMA: Record<string, Field[]> = {
   Tag: [
     { name: "id", typeLabel: "uuid", mods: ["+", "&", "^"], control: "uuid", value: "ta7-…-01" },
     { name: "name", typeLabel: "string", mods: ["&", "^"], control: "string", value: "infra" },
-    { name: "color", typeLabel: "char(6)", mods: [], control: "char", len: 6, value: "A855F7" },
+    { name: "color", typeLabel: "bytes(6)", mods: [], control: "bytes", len: 6, value: "A855F7" },
     { name: "posts", typeLabel: "[Post]", mods: [], control: "m2m", target: "Post", chips: [{ label: "312 linked" }] },
   ],
   Comment: [
@@ -116,7 +116,7 @@ export const GRID: Record<string, GridData> = {
     ],
   },
   Tag: {
-    cols: [{ k: "id", l: "id", mono: true }, { k: "name", l: "name &^" }, { k: "color", l: "color char(6)", mono: true }, { k: "posts", l: "posts ↔", rel: true }],
+    cols: [{ k: "id", l: "id", mono: true }, { k: "name", l: "name &^" }, { k: "color", l: "color bytes(6)", mono: true }, { k: "posts", l: "posts ↔", rel: true }],
     rows: [
       { _id: "t1", id: "ta7…01", name: "infra", color: "A855F7", posts: "312 linked" },
       { _id: "t2", id: "ta8…02", name: "rust", color: "F97316", posts: "208 linked" },

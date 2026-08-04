@@ -97,11 +97,24 @@ status: string? @default("pending")     // nullable string with a default (seman
 | `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
 | `timestamp` | `timestamp`     | `i64`               | Unix timestamp (milliseconds)    |
-| `char(N)` | `char(8)`         | `[u8; 8]`           | Fixed-size byte array |
+| `bytes(N)` | `bytes(20)`      | `[u8; 20]`          | Fixed-size **byte** array (not text — see below) |
 
 **Key points:**
 - No `text` type — use `string`
-- `char(N)` is parsed as `FieldType::Char(usize)` and requires `(...)` syntax (`crates/parser/src/parser/core.rs:354-369`)
+- `bytes(N)` is parsed as `FieldType::Bytes(usize)` and requires `(...)` syntax
+- **`bytes(N)` is not a string type.** It holds exactly N raw bytes with no UTF-8
+  guarantee, no length tracking, and no text semantics, and it serializes as a JSON
+  **array of integers** — `"USD"` in a `bytes(3)` goes on the wire as `[85, 83, 68]`.
+  Use it for genuinely binary fixed-width data (a git object id, a digest, a
+  fixed-width protocol field). For text of any kind — including short fixed-length
+  codes like ISO currency or IATA airport codes — use `string`, with `@length` if you
+  want the length enforced.
+- **`char(N)` is the deprecated spelling of `bytes(N)`** (#233). It still parses and
+  produces identical code, but emits a deprecation warning (`forgedb validate` and
+  `forgedb generate` both report it and still exit 0), and it is removed at the next
+  major version. The name was a false friend: SQL's `CHAR(N)` is fixed-length *text*.
+- **`bytes` is a contextual keyword, not a reserved word** — it only means the type in
+  type position followed by `(`, so `bytes: i32` remains a perfectly valid field.
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 - `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
 
@@ -261,9 +274,13 @@ field: [type; count]
 **Example:**
 ```
 Product {
-  image_urls: [char(255); 5]    // array of 5 strings (max 255 chars each)
+  layer_digests: [bytes(32); 5]  // array of 5 SHA-256 digests (raw bytes)
   scores: [u32; 10]              // array of 10 unsigned ints
 }
+```
+
+Note there is no way to put *text* in a fixed array: `string` is variable-length, and
+`bytes(N)` is not a string type. Model a list of strings as a related model.
 ```
 
 ### Inline Structs
@@ -288,17 +305,23 @@ field: StructName?         // optional struct field
 - Struct references in fields are stored as `FieldType::StructType(name)` or `FieldType::OptionalStructType(name)` (`crates/parser/src/ast.rs:56-57`)
 - Cannot contain variable-length types (string, relations, components) (`crates/parser/src/ast.rs:169-176`)
 
+**This rules out text.** A struct cannot hold a `string`, and `bytes(N)` is not a string
+type — so there is no way to embed an address, a name, or any other free text in a
+struct. Text belongs on the model, or on a related model. Structs are for fixed-width
+numeric/binary groupings.
+
 **Example:**
 ```
-struct Address {
-  street: char(100)
-  city: char(50)
-  zip: char(10)
+struct Dimensions {
+  length_mm: u32
+  width_mm: u32
+  height_mm: u32
 }
 
-User {
+Product {
   id: +uuid
-  address: Address?         // optional embedded Address
+  name: string              // text lives on the model, not in the struct
+  packed: Dimensions?       // optional embedded fixed-size group
 }
 ```
 
@@ -629,7 +652,7 @@ The rules in this reference are grounded in the parser and validator source:
 
 1. **Define models** (PascalCase names) with **snake_case fields**
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
-3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, char(N)
+3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
 5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only), `@length` (string length), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)

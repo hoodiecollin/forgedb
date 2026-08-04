@@ -7,8 +7,8 @@
 
 Airport {
   id: +uuid
-  // IATA 3-letter code, e.g. "SFO" — unique, fixed-size char(3)
-  iata_code: ^&char(3)
+  // IATA 3-letter code, e.g. "SFO" — text, so `string`; unique + indexed
+  iata_code: ^&string @length(3, 3)
   name: string
   city: string
   country: string

@@ -105,13 +105,14 @@ a numeric literal.
 
 ```forge
 Product {
-  scores: [u32; 10]         // exactly 10 ints
-  thumbnails: [char(255); 5] // 5 fixed-size byte arrays
+  scores: [u32; 10]            // exactly 10 ints
+  layer_digests: [bytes(32); 5] // 5 SHA-256 digests
 }
 ```
 
-Because the element must be fixed-size, `[string; N]` is invalid — use `char(N)` for
-fixed-width text inside an array.
+Because the element must be fixed-size, `[string; N]` is invalid — and `bytes(N)` is not a
+substitute, since it stores raw bytes rather than text. There is no way to put text in a
+fixed array; model a list of strings as a related model.
 
 ## Inline structs
 
@@ -119,22 +120,25 @@ A [struct](/docs/schema/overview/) is a reusable embedded value type. It is inli
 the model that references it — not stored as its own table.
 
 ```forge
-struct Address {
-  street: char(100)
-  city: char(50)
-  zip: char(10)
+struct Dimensions {
+  length_mm: u32
+  width_mm: u32
+  height_mm: u32
 }
 
-User {
+Product {
   id: +uuid
-  address: Address?     // optional embedded struct
+  name: string          // text lives on the model, not in the struct
+  packed: Dimensions?   // optional embedded struct
 }
 ```
 
-<Callout type="warning" title="Structs are fixed-size only">
+<Callout type="warning" title="Structs are fixed-size only — which rules out text">
 A struct may contain **only fixed-size** fields. `string`, relations, and nested
-variable-length types are rejected inside a struct — use `char(N)` for text. Reference a
-struct required (`address: Address`) or optional (`address: Address?`).
+variable-length types are rejected inside a struct, and `bytes(N)` is not a workaround —
+it stores raw bytes, not text. So there is no way to embed an address, a name, or any free
+text in a struct; put it on the model, or on a related model. Reference a struct required
+(`packed: Dimensions`) or optional (`packed: Dimensions?`).
 </Callout>
 
 ## Generated traversal

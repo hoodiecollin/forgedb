@@ -62,7 +62,7 @@ ModelName {
 
 ```forge
 Person {
-  code: char(10)              // Fixed-size character array
+  code: bytes(10)             // Fixed-size byte array
   matrix: [i32; 9]            // Fixed-size array
   point: Point                // Struct reference
   optional_data: ?Point       // Optional struct

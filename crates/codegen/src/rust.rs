@@ -1518,7 +1518,7 @@ impl RustGenerator {
             // enum derives `Ord` + `Hash`, so it is filterable / sortable /
             // indexable (index key = the variant name string, via `index_key_expr`).
             | FieldType::Enum(_)
-            | FieldType::Char(_) => true,
+            | FieldType::Bytes(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_scalar(inner),
             _ => false,
         }
@@ -2001,7 +2001,7 @@ impl RustGenerator {
                 }
             },
             // `char(N)` is `[u8; N]`, which serde renders as a JSON array.
-            FieldType::Char(_) => quote! {
+            FieldType::Bytes(_) => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
                 __k.push('[');
@@ -2841,7 +2841,7 @@ impl RustGenerator {
                     // (Decimal::serialize() -> [u8; 16]).
                     forgedb_parser::FieldType::Decimal => 16,
                     forgedb_parser::FieldType::Timestamp => 8,
-                    forgedb_parser::FieldType::Char(n) => *n,
+                    forgedb_parser::FieldType::Bytes(n) => *n,
                     forgedb_parser::FieldType::FixedArray(inner, count) => {
                         // Fall back to map_field_type_ident for array sizing
                         let inner_tokens = Self::map_field_type_ident(inner);
@@ -3109,7 +3109,7 @@ impl RustGenerator {
                 // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
                 let needs_byte_conversion = matches!(
                     &field.field_type,
-                    forgedb_parser::FieldType::Char(_)
+                    forgedb_parser::FieldType::Bytes(_)
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
@@ -3440,7 +3440,7 @@ impl RustGenerator {
             } else if Self::is_fixed_size_type(&field.field_type) {
                 let needs_byte_conversion = matches!(
                     &field.field_type,
-                    forgedb_parser::FieldType::Char(_)
+                    forgedb_parser::FieldType::Bytes(_)
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
@@ -5190,7 +5190,7 @@ impl RustGenerator {
             // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
             let needs_byte_conversion = matches!(
                 &field.field_type,
-                forgedb_parser::FieldType::Char(_)
+                forgedb_parser::FieldType::Bytes(_)
                     | forgedb_parser::FieldType::FixedArray(_, _)
                     | forgedb_parser::FieldType::StructType(_)
                     | forgedb_parser::FieldType::OptionalStructType(_)
@@ -6166,7 +6166,7 @@ impl RustGenerator {
             // BEFORE the generic fixed path everywhere, so this only makes column
             // layout / iteration agree that an enum field HAS a column.
             | forgedb_parser::FieldType::Enum(_)
-            | forgedb_parser::FieldType::Char(_)
+            | forgedb_parser::FieldType::Bytes(_)
             | forgedb_parser::FieldType::FixedArray(_, _)
             | forgedb_parser::FieldType::StructType(_)
             | forgedb_parser::FieldType::OptionalStructType(_) => true,
@@ -6292,7 +6292,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::Decimal => "decimal",
             // enum persists as a raw 1-byte discriminant (append_bytes/read_bytes).
             forgedb_parser::FieldType::Enum(_) => "enum",
-            forgedb_parser::FieldType::Char(_) => "bytes",
+            forgedb_parser::FieldType::Bytes(_) => "bytes",
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
             forgedb_parser::FieldType::OptionalStructType(_) => "bytes",
@@ -9797,7 +9797,7 @@ impl RustGenerator {
                 // Return the inner type; is_nullable() causes the Option<> wrapper to be added
                 Self::map_field_type_ident(inner)
             }
-            forgedb_parser::FieldType::Char(size) => {
+            forgedb_parser::FieldType::Bytes(size) => {
                 quote! { [u8; #size] }
             }
             forgedb_parser::FieldType::FixedArray(inner, count) => {

@@ -26,7 +26,15 @@ pub enum Token {
     TypeTimestamp,
     TypeJson,    // json - variable-length column typed serde_json::Value
     TypeDecimal, // decimal - fixed 16-byte column typed rust_decimal::Decimal
-    TypeChar,    // char(N) - fixed-size character array
+    /// The deprecated spelling of `bytes(N)` (#233).
+    ///
+    /// There is deliberately **no** `TypeBytes` counterpart: `bytes` is a
+    /// *contextual* keyword, lexed as an ordinary [`Token::Ident`] and recognized
+    /// as the type only in type position followed by `(` (see
+    /// `Parser::at_bytes_type`). `char` stays a reserved word because it always
+    /// was one. Both spellings produce `FieldType::Bytes(N)` — identical AST,
+    /// identical generated Rust (`[u8; N]`), identical column layout and wire form.
+    TypeCharDeprecated, // char(N)
 
     // Keywords
     KwStruct, // struct
@@ -326,7 +334,9 @@ impl Lexer {
                     "timestamp" => Token::TypeTimestamp,
                     "json" => Token::TypeJson,
                     "decimal" => Token::TypeDecimal,
-                    "char" => Token::TypeChar,
+                    // NOTE: "bytes" is deliberately absent — it is a contextual
+                    // keyword and lexes as `Token::Ident` (#233).
+                    "char" => Token::TypeCharDeprecated,
                     "struct" => Token::KwStruct,
                     "enum" => Token::KwEnum,
                     _ => Token::Ident(ident),

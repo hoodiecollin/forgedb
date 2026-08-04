@@ -22,7 +22,7 @@ inline structs) see [relations](/docs/schema/relations/); for closed value sets 
 | `decimal` | `rust_decimal::Decimal` | `string` | fixed 16-byte column | ✅ |
 | `uuid` | `uuid::Uuid` | `string` | fixed 16-byte column | ✅ |
 | `timestamp` | `i64` | `number` | fixed 8-byte column | ✅ |
-| `char(N)` | `[u8; N]` | `string` | fixed N-byte column | ✅ |
+| `bytes(N)` | `[u8; N]` | `any` | fixed N-byte column | ✅ |
 
 <Callout type="warning" title="There is no `text` type">
 Older docs mention a `text` type. It does **not** exist — use `string` for all
@@ -44,11 +44,30 @@ Variable-length UTF-8 text, stored on the variable-length column. Indexable, fil
 and sortable. A hash index on a string is **exact-match only** (see
 [indexes](/docs/schema/indexes-and-projections/)).
 
-## `char(N)`
+## `bytes(N)`
 
 A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Being fixed-width, it can
 live inside a [struct](/docs/schema/relations/#inline-structs) — where `string` cannot.
-Requires the parenthesized size: `code: char(8)`.
+Requires the parenthesized size: `digest: bytes(32)`.
+
+<Callout type="warning" title="`bytes(N)` is not a string type">
+It holds raw bytes: no UTF-8 guarantee, no length tracking, no text semantics. On the wire
+it is a JSON **array of integers**, so `"USD"` in a `bytes(3)` arrives as `[85, 83, 68]`.
+Reach for it only for genuinely binary fixed-width data — a git object id, a digest, a
+fixed-width protocol field. For text of any kind, including short fixed-length codes like
+ISO currency or IATA airport codes, use `string` (with `@length` to enforce the length).
+</Callout>
+
+`bytes` is a *contextual* keyword rather than a reserved word: it only means the type in
+type position followed by `(`, so a field may still be named `bytes`.
+
+### `char(N)` is deprecated
+
+`char(N)` is the old spelling of this type. It still parses and produces byte-identical
+code, but emits a deprecation warning — `forgedb validate` and `forgedb generate` both
+report it and still exit `0` — and it is removed at the next major version. The name was a
+false friend: SQL's `CHAR(N)` is fixed-length *text*, while this type has never been
+anything but bytes.
 
 ## `uuid`
 

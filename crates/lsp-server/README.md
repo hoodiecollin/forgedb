@@ -19,7 +19,7 @@ relative to `forgedb validate`.
 
 ### Code Completion
 - Field-type suggestions for the actual scalar set: `string`, `bool`, `u32`, `u64`,
-  `i32`, `i64`, `f64`, `decimal`, `json`, `uuid`, `timestamp`, `char(N)`.
+  `i32`, `i64`, `f64`, `decimal`, `json`, `uuid`, `timestamp`, `bytes(N)`.
 - Field-modifier suggestions: `+` (auto-generate), `&` (unique), `^` (index),
   `*` (required FK), `?` (optional). There is no `~` modifier.
 - Directive suggestions (`@email`, `@min`, `@max`, `@pattern`, `@on_delete`, …).

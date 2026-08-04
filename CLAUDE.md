@@ -261,7 +261,9 @@ Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp o
 `uuid`/`timestamp` are actually synthesized on create; integer `+u32`/`+u64` parse+mark but are
 NOT auto-incremented, RFC #187), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
-FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `char(N)` — **there is no
+FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `bytes(N)` (raw fixed-size bytes,
+NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
+keyword, so it is still usable as a field name) — **there is no
 `text`**. `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
 sortable — no total order); `decimal` (→ `rust_decimal::Decimal`, exact fixed-point on the 16-byte column, string
 serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p,s)` precision/scale deferred). Enums:

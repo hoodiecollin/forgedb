@@ -78,7 +78,7 @@ Tier {
   tier_type: string @default(paid)
   monthly_price: i64?
   yearly_price: i64?
-  currency: char(3)?
+  currency: string? @length(3, 3)
   trial_days: u32 @default(0)
   active: bool @default(true)
   created_at: +timestamp
@@ -92,7 +92,7 @@ Subscription {
   status: string @default(active)
   cadence: string @default(monthly)
   amount: i64
-  currency: char(3)
+  currency: string @length(3, 3)
   current_period_start: timestamp?
   current_period_end: timestamp?
   cancel_at_period_end: bool @default(false)

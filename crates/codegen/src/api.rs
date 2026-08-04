@@ -870,7 +870,7 @@ impl ApiGenerator {
             // enum derives `Ord`, so it is filterable + sortable via `Ord::cmp`
             // (sort orders by declaration order — the variant discriminant).
             | FieldType::Enum(_)
-            | FieldType::Char(_) => true,
+            | FieldType::Bytes(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_field(inner),
             _ => false,
         }
@@ -913,7 +913,7 @@ impl ApiGenerator {
         // char(N) is a fixed `[u8; N]`: compare the param's bytes, zero-padded to
         // N (a param longer than N can never match).  Handled inline because it
         // parses into a buffer rather than a single `T`.
-        if let FieldType::Char(n) = base {
+        if let FieldType::Bytes(n) = base {
             let cmp = if nullable {
                 quote! { record.#fname == Some(__buf) }
             } else {

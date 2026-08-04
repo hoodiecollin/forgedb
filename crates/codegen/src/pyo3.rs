@@ -398,14 +398,14 @@ impl PyO3Generator {
                         let needs_py_lifetime = matches!(
                             f.field_type,
                             forgedb_parser::FieldType::Json
-                            | forgedb_parser::FieldType::Char(_)
+                            | forgedb_parser::FieldType::Bytes(_)
                             | forgedb_parser::FieldType::StructType(_)
                             | forgedb_parser::FieldType::OptionalStructType(_)
                             | forgedb_parser::FieldType::FixedArray(_, _)
                         ) || (matches!(&f.field_type, forgedb_parser::FieldType::Nullable(inner)
                             if matches!(inner.as_ref(),
                                 forgedb_parser::FieldType::Json
-                                | forgedb_parser::FieldType::Char(_)
+                                | forgedb_parser::FieldType::Bytes(_)
                                 | forgedb_parser::FieldType::StructType(_)
                                 | forgedb_parser::FieldType::OptionalStructType(_)
                             )
