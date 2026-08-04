@@ -912,9 +912,22 @@ Place {
     assert!(code.contains("id: u64"), "get must take the u64 PK");
 
     // Gap 1: nullable string field renders as Option<String> and is encoded
-    // with a presence tag (so None and Some(\"\") stay distinct).
+    // with a presence tag (so None and Some(\"\") stay distinct).  The tag goes
+    // down through `append_tagged` (#231) rather than a concatenated String, so
+    // neither arm allocates; the stored bytes are unchanged.
     assert!(code.contains("pub description: Option<String>"), "nullable string field");
-    assert!(code.contains(r"String::from('\u{0}')"), "None must encode to a presence tag");
+    assert!(
+        code.contains("append_tagged(1u8, s)"),
+        "Some must append the 0x01 tag alongside the borrowed value"
+    );
+    assert!(
+        code.contains(r#"append_tagged(0u8, "")"#),
+        "None must encode to a presence tag"
+    );
+    assert!(
+        !code.contains(r"String::from('\u{0}')"),
+        "the None arm must not allocate a tagged String"
+    );
 
     insta::assert_snapshot!(code);
 }
@@ -1634,10 +1647,17 @@ Event {
     );
 
     // Nullable json uses the same 1-byte presence tag scheme as nullable string
-    // (`\u{1}` = Some, `\u{0}` = None) so None vs Some(Value::Null) stay distinct.
+    // (0x01 = Some, 0x00 = None) so None vs Some(Value::Null) stay distinct —
+    // written through `append_tagged` (#231), which lays down the same bytes
+    // without building the concatenation.
     assert!(
-        code.contains("'\\u{1}'") && code.contains("'\\u{0}'"),
+        code.contains("append_tagged(1u8, &s)") && code.contains(r#"append_tagged(0u8, "")"#),
         "nullable json uses the presence-tag scheme"
+    );
+    // The read path still decodes the tag, so both halves stay in sync.
+    assert!(
+        code.contains("'\\u{1}'") || code.contains("as_bytes"),
+        "nullable json read path must still split the presence tag"
     );
 }
 
@@ -3123,7 +3143,7 @@ Widget {
     // Correct per-type defaults: nullable string → None tag, numeric → 0,
     // f64 → 0.0, bool → false.
     assert!(
-        code.contains("append_string(&String::from('\\u{0}'))"),
+        code.contains(r#"append_tagged(0u8, "")"#),
         "nullable string backfills the None presence tag"
     );
     assert!(

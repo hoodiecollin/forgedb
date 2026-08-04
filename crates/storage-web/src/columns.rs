@@ -399,6 +399,28 @@ impl VariableColumn {
         Ok(())
     }
 
+    /// Append a single tag byte followed by `value`'s bytes, as one row (#231).
+    ///
+    /// Arena twin of the native `VariableColumn::append_tagged`. Generated code
+    /// calls this on both targets, so the web backend carries the same name, the
+    /// same argument order, and the same on-arena bytes — the tag byte is pushed
+    /// straight into the data arena ahead of the value, with no intermediate
+    /// `String`. See the native doc for the UTF-8 caveat on tags >= 0x80.
+    pub fn append_tagged(&mut self, tag: u8, value: &str) -> io::Result<()> {
+        let bytes = value.as_bytes();
+        let offset = store::byte_len(&self.data_path) as u64;
+        let length = bytes.len() as u64 + 1;
+        store::with_bytes_mut(&self.data_path, |b| {
+            b.push(tag);
+            b.extend_from_slice(bytes);
+        });
+        store::with_bytes_mut(&self.offsets_path, |b| {
+            b.extend_from_slice(&offset.to_le_bytes());
+            b.extend_from_slice(&length.to_le_bytes());
+        });
+        Ok(())
+    }
+
     pub fn read_string(&self, index: usize) -> io::Result<String> {
         let (offset, length) = read_offset_pair(&self.offsets_path, index)?;
         let data = store::with_bytes(&self.data_path, |b| {
