@@ -178,12 +178,50 @@ impl Position {
     }
 }
 
+/// How serious a diagnostic is (#237).
+///
+/// The toolchain had no way to express a **non-fatal** diagnostic: every path was
+/// error-or-nothing, so a schema-language deprecation could only be silent or
+/// breaking. `Severity` is the missing third option.
+///
+/// [`Severity::Error`] is the [`Default`], which is what makes this additive:
+/// every pre-existing `ValidationError` construction keeps its exact meaning.
+///
+/// **A `Warning` must never change an exit code.** A deprecation that fails a
+/// build is a removal, not a deprecation — and shipping that on a *minor* version
+/// would break every downstream user's CI. Producers rely on that, so consumers
+/// must partition by severity rather than testing a diagnostic list for emptiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Severity {
+    /// Fatal: the schema is not usable as written.
+    #[default]
+    Error,
+    /// Advisory: the schema is valid, but something about it should change —
+    /// a deprecated spelling, a construct whose meaning is scheduled to shift.
+    Warning,
+}
+
+impl Severity {
+    /// The word this severity renders as in CLI output and in [`Display`].
+    ///
+    /// [`Display`]: std::fmt::Display
+    pub fn label(&self) -> &'static str {
+        match self {
+            Severity::Error => "Error",
+            Severity::Warning => "Warning",
+        }
+    }
+}
+
 /// Validation error with position information
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationError {
     pub message: String,
     pub position: Option<Position>,
     pub suggestion: Option<String>,
+    /// How serious this diagnostic is (#237). Defaults to [`Severity::Error`], so
+    /// every construction that predates this field is unchanged.
+    pub severity: Severity,
 }
 
 impl ValidationError {
@@ -192,6 +230,18 @@ impl ValidationError {
             message: message.into(),
             position: None,
             suggestion: None,
+            severity: Severity::Error,
+        }
+    }
+
+    /// Construct a non-fatal diagnostic (#237). The counterpart to [`Self::new`],
+    /// for deprecations and other advisories that must not fail a build.
+    pub fn warning(message: impl Into<String>) -> Self {
+        ValidationError {
+            message: message.into(),
+            position: None,
+            suggestion: None,
+            severity: Severity::Warning,
         }
     }
 
@@ -204,18 +254,29 @@ impl ValidationError {
         self.suggestion = Some(suggestion.into());
         self
     }
+
+    pub fn with_severity(mut self, severity: Severity) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    /// Whether this diagnostic is advisory rather than fatal (#237).
+    pub fn is_warning(&self) -> bool {
+        self.severity == Severity::Warning
+    }
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = self.severity.label();
         if let Some(pos) = self.position {
             write!(
                 f,
-                "Error at line {}, column {}: {}",
-                pos.line, pos.column, self.message
+                "{} at line {}, column {}: {}",
+                label, pos.line, pos.column, self.message
             )?;
         } else {
-            write!(f, "Error: {}", self.message)?;
+            write!(f, "{}: {}", label, self.message)?;
         }
 
         if let Some(ref suggestion) = self.suggestion {
