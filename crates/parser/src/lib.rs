@@ -121,7 +121,9 @@
 //! - **Floating Point**: `f64`
 //! - **Decimal**: `decimal` (exact fixed-point)
 //! - **Boolean**: `bool`
-//! - **String**: `string`, `char(N)` (fixed-size)
+//! - **String**: `string`
+//! - **Bytes**: `bytes(N)` (fixed-size byte array; `char(N)` is the deprecated
+//!   spelling and warns)
 //! - **JSON**: `json`
 //! - **UUID**: `uuid`
 //! - **Timestamp**: `timestamp`
