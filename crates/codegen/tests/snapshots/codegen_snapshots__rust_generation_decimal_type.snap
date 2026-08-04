@@ -166,30 +166,12 @@ pub struct Product {
     #[serde(with = "rust_decimal::serde::str_option")]
     pub discount: Option<rust_decimal::Decimal>,
 }
-///Internal narrow scan record for `Product` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
-#[derive(Debug, Clone)]
-pub struct ProductScanRow {
-    pub id: Uuid,
-    pub price: rust_decimal::Decimal,
-    pub discount: Option<rust_decimal::Decimal>,
-}
-///Borrowed narrow scan record for `Product` (#224): the same columns as `ProductScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+///Borrowed narrow scan view for `Product` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct ProductScanRef<'a> {
     pub id: Uuid,
     pub price: rust_decimal::Decimal,
     pub discount: Option<rust_decimal::Decimal>,
-}
-impl<'a> ProductScanRef<'a> {
-    /// Materialize the owned scan record.  Called only for rows that
-    /// survive the filter (#224).
-    pub fn to_owned_row(&self) -> ProductScanRow {
-        ProductScanRow {
-            id: self.id.clone(),
-            price: self.price.clone(),
-            discount: self.discount.clone(),
-        }
-    }
 }
 ///Storage for Product model
 pub struct ProductStorage {
@@ -1531,62 +1513,40 @@ impl ProductStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<ProductScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
-        };
-        let price_value = {
-            let bytes = self
-                .price_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            rust_decimal::Decimal::deserialize(bytes)
-        };
-        let discount_value: Option<rust_decimal::Decimal> = {
-            let bytes = self
-                .discount_col
-                .read_bytes(row_index)
-                .expect("Failed to read from column");
-            unsafe {
-                std::ptr::read_unaligned(
-                    bytes.as_ptr() as *const Option<rust_decimal::Decimal>,
-                )
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&ProductScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<ProductScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
             }
         };
-        Some(ProductScanRow {
-            id: id_value,
-            price: price_value,
-            discount: discount_value,
-        })
-    }
-    /// Narrow scan of every live row, filtered on the BORROWED view
-    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-    /// only the filterable/sortable columns.  Each column is bulk-loaded
-    /// once (`gather_buffered`); each row is then decoded into
-    /// a borrowed view whose `string` fields point straight at that buffer,
-    /// and `keep` runs on it — so a row the filter rejects never allocates.
-    /// Only survivors are materialized as owned rows.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
-    pub fn __scan_all_filtered(
-        &self,
-        keep: impl Fn(&ProductScanRef<'_>) -> bool,
-    ) -> Vec<ProductScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __ProductScanBufs {
@@ -1608,7 +1568,7 @@ impl ProductStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<ProductScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -1641,20 +1601,16 @@ impl ProductStorage {
                 discount: discount_value,
             };
             if keep(&__row_ref) {
-                rows.push(__row_ref.to_owned_row());
+                __refs.push(__row_ref);
             }
         }
-        rows
+        f(&mut __refs)
     }
-    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-    /// that keeps everything, so there is exactly one buffered-scan body.
-    pub fn __scan_all(&self) -> Vec<ProductScanRow> {
-        self.__scan_all_filtered(|_| true)
-    }
-    /// #160 (C): resolve list candidates for this indexed field from the
-    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-    /// param did not parse; the caller falls back to `__scan_all`.
-    pub fn __scan_by_price(&self, value: &str) -> Option<Vec<ProductScanRow>> {
+    /// #160 (C): resolve list candidate ROWS for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  Feed the result
+    /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+    /// the caller falls back to a full scan, so a match is never missed.
+    pub fn __rows_by_price(&self, value: &str) -> Option<Vec<usize>> {
         let __typed = value.parse::<rust_decimal::Decimal>().ok()?;
         let __k: String = {
             {
@@ -1669,12 +1625,10 @@ impl ProductStorage {
             Some(__s) => __s,
             None => return Some(Vec::new()),
         };
-        let mut __out = Vec::new();
+        let mut __out = Vec::with_capacity(__ids.len());
         for &__id in __ids {
             if let Some(&__row) = self.id_to_row.get(&__id) {
-                if let Some(__r) = self.__scan_row_at(__row) {
-                    __out.push(__r);
-                }
+                __out.push(__row);
             }
         }
         Some(__out)

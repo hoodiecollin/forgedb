@@ -169,30 +169,12 @@ pub struct Place {
     pub description: Option<String>,
     pub location: GeoPoint,
 }
-///Internal narrow scan record for `Place` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
-#[derive(Debug, Clone)]
-pub struct PlaceScanRow {
-    pub id: u64,
-    pub name: String,
-    pub description: Option<String>,
-}
-///Borrowed narrow scan record for `Place` (#224): the same columns as `PlaceScanRow`, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  Filter predicates run on this so only surviving rows allocate.  Internal — not a wire type, never exported.
+///Borrowed narrow scan view for `Place` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct PlaceScanRef<'a> {
     pub id: u64,
     pub name: &'a str,
     pub description: Option<&'a str>,
-}
-impl<'a> PlaceScanRef<'a> {
-    /// Materialize the owned scan record.  Called only for rows that
-    /// survive the filter (#224).
-    pub fn to_owned_row(&self) -> PlaceScanRow {
-        PlaceScanRow {
-            id: self.id.clone(),
-            name: self.name.to_string(),
-            description: self.description.map(str::to_string),
-        }
-    }
 }
 ///Storage for Place model
 pub struct PlaceStorage {
@@ -1194,56 +1176,40 @@ impl PlaceStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<PlaceScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = self
-            .id_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let name_value = self
-            .name_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let description_value = {
-            let raw = self
-                .description_col
-                .read_string(row_index)
-                .expect("Failed to read string");
-            if raw.as_bytes().first() == Some(&1u8) {
-                Some(raw[1..].to_string())
-            } else {
-                None
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&PlaceScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<PlaceScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
             }
         };
-        Some(PlaceScanRow {
-            id: id_value,
-            name: name_value,
-            description: description_value,
-        })
-    }
-    /// Narrow scan of every live row, filtered on the BORROWED view
-    /// (#160/#168/#224): the list endpoint's filter/sort source, decoding
-    /// only the filterable/sortable columns.  Each column is bulk-loaded
-    /// once (`gather_buffered`); each row is then decoded into
-    /// a borrowed view whose `string` fields point straight at that buffer,
-    /// and `keep` runs on it — so a row the filter rejects never allocates.
-    /// Only survivors are materialized as owned rows.  The page is
-    /// full-materialized separately, so only `limit` rows pay a full decode.
-    pub fn __scan_all_filtered(
-        &self,
-        keep: impl Fn(&PlaceScanRef<'_>) -> bool,
-    ) -> Vec<PlaceScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __PlaceScanBufs {
@@ -1265,7 +1231,7 @@ impl PlaceStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<PlaceScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = __bufs
                 .id_col
@@ -1288,15 +1254,10 @@ impl PlaceStorage {
                 description: description_value,
             };
             if keep(&__row_ref) {
-                rows.push(__row_ref.to_owned_row());
+                __refs.push(__row_ref);
             }
         }
-        rows
-    }
-    /// Every live row, unfiltered — `__scan_all_filtered` with a predicate
-    /// that keeps everything, so there is exactly one buffered-scan body.
-    pub fn __scan_all(&self) -> Vec<PlaceScanRow> {
-        self.__scan_all_filtered(|_| true)
+        f(&mut __refs)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent

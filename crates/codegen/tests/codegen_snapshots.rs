@@ -471,85 +471,109 @@ User {
     let db_code = RustGenerator::generate(&schema).unwrap().code;
     let api_code = ApiGenerator::generate(&schema).unwrap().code;
 
-    // database.rs: an internal narrow scan record + reads, NOT a wire type
-    // (no Serialize/ToSchema derive).
-    assert!(db_code.contains("pub struct UserScanRow"), "#160: narrow scan struct emitted");
-    assert!(db_code.contains("fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow>"),
-        "#160: narrow row decoder");
-    assert!(db_code.contains("pub fn __scan_all(&self) -> Vec<UserScanRow>"),
-        "#160: narrow scan of live rows");
-    // The scan record carries filterable columns but NOT the model's derives.
-    let scan_struct = &db_code[db_code.find("pub struct UserScanRow").unwrap()..];
+    // database.rs: an internal narrow scan view + a scope to read it in, NOT a wire
+    // type (no Serialize/ToSchema derive).  #228 deleted the OWNED scan record and
+    // its per-row decoder: nothing the scan decodes leaves the scope any more, so
+    // there is nothing to own.
+    assert!(db_code.contains("pub struct UserScanRef<'a>"), "#160/#224: narrow scan view emitted");
+    assert!(!db_code.contains("UserScanRow"),
+        "#228: the owned scan record is gone — the scope is the only scan surface");
+    assert!(!db_code.contains("fn __scan_row_at("),
+        "#228: the per-row narrow decoder is gone with its only caller");
+    assert!(!db_code.contains("to_owned_row"),
+        "#228: nothing materializes a scan row");
+    // The scan view carries filterable columns but NOT the model's derives.
+    let scan_struct = &db_code[db_code.find("pub struct UserScanRef<'a>").unwrap()..];
     let scan_struct = &scan_struct[..scan_struct.find('}').unwrap()];
     assert!(scan_struct.contains("status") && scan_struct.contains("age"),
-        "#160: scan record carries filterable fields");
+        "#160: scan view carries filterable fields");
 
     // api.rs: narrow filter/sort helpers, and the live list uses them + materializes
     // only the page ids (never `all()` on the live path).
     assert!(api_code.contains("fn __user_scan_matches("), "#160: narrow filter helper");
     assert!(api_code.contains("fn __user_scan_sort("), "#160: narrow sort helper");
-    // #224 moved the filter INTO the scan (`__scan_all_filtered`), so a rejected
-    // row never allocates its strings — the #160 guarantee is unchanged: the live
-    // list still sources from the narrow scan, never `all()`.
+    assert!(!api_code.contains("__user_scan_matches_ref"),
+        "#228: one scan filter, not an owned/borrowed pair — the owned operand is gone");
+    // prettyplease wraps the scan call and its callback across lines; collapse
+    // whitespace so the assertions track the shape, not the formatting.
+    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    // #224 moved the filter INTO the scan, so a rejected row never allocates its
+    // strings; #228 moved the sort/count/page in too, so a SURVIVING row does not
+    // either.  The #160 guarantee is unchanged: the live list still sources from the
+    // narrow scan, never `all()`.
     assert!(
-        api_code.contains("db.user.__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
-        "#160/#224: live list scans narrowly, filtering during the scan"
+        api_flat.contains("db .user .__with_scan("),
+        "#160/#224/#228: live list scans narrowly, inside the scan scope.\nGot: {api_flat}"
     );
-    assert!(api_code.contains("__user_scan_matches_ref(r, &params)"), "#160: live list filters narrow");
+    assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
     assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
         "#160: only the paginated page is full-materialized");
     // The as_of branch keeps the full-record path (unchanged correctness).
     assert!(api_code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"),
         "#160: as_of retains the full snapshot read");
-
-    // #160 (C): index pushdown — an eligible indexed field's list filter resolves
-    // candidates from that field's index instead of scanning every row.
-    assert!(db_code.contains("pub fn __scan_by_status(&self, value: &str) -> Option<Vec<UserScanRow>>"),
-        "#160 C: indexed field gets a pushdown scan");
-    assert!(db_code.contains("pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>>"),
-        "#160 C: unique-indexed field gets a pushdown scan");
-    assert!(api_code.contains("db.user.__scan_by_status(__v)"),
-        "#160 C: live list tries index pushdown");
-    // prettyplease wraps the fallback arm across lines; collapse whitespace so the
-    // assertion tracks the shape, not the formatting.
-    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    // #228: sort, count and pagination all happen INSIDE the callback, and only
+    // `(total, ids)` comes back out.  This is the constraint the issue commits to —
+    // if a future list feature needs more than ids from a scan, it comes inside.
     assert!(
         api_flat.contains(
-            "None => { db.user .__scan_all_filtered(|r| __user_scan_matches_ref("
+            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); \
+             let __total = __scan.len(); let __ids: Vec<_> = qp .pagination .apply(__scan) \
+             .iter() .map(|r| r.id) .collect(); (__total, __ids) }"
         ),
+        "#228: filter/sort/count/page run inside the scope; only (total, ids) escape.\nGot: {api_flat}"
+    );
+
+    // #160 (C): index pushdown — an eligible indexed field's list filter resolves
+    // candidate ROWS from that field's index instead of scanning every row.  #228
+    // reduced this to row resolution: the decode is the scan scope's, so the
+    // pushdown arm now gets the borrowed view it could never have while it read its
+    // candidates positionally.
+    assert!(db_code.contains("pub fn __rows_by_status(&self, value: &str) -> Option<Vec<usize>>"),
+        "#160 C/#228: indexed field resolves candidate rows");
+    assert!(db_code.contains("pub fn __rows_by_email(&self, value: &str) -> Option<Vec<usize>>"),
+        "#160 C/#228: unique-indexed field resolves candidate rows");
+    assert!(api_code.contains("db.user.__rows_by_status(__v)"),
+        "#160 C: live list tries index pushdown");
+    assert!(
+        api_flat.contains("} else { None }; let (total, __page_ids) = db .user .__with_scan( __sel,"),
         "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
     // pushdown field — it falls through to the narrow scan.
-    assert!(!db_code.contains("fn __scan_by_region("),
+    assert!(!db_code.contains("fn __rows_by_region("),
         "#160 C: a composite-only field is not a single-field pushdown");
 
-    // #168: `__scan_all` bulk-loads each scan column once and decodes from memory
+    // #168: the scan bulk-loads each scan column once and decodes from memory
     // (physical row order + `gather_buffered`) instead of a per-row read syscall
     // storm.  A churn-free selection is the dense prefix, so `export` aliases the
     // column via mmap; deleted rows are excluded by one bulk tombstone read.
-    // #224: `__scan_all` is now the unfiltered alias; the buffered body lives in
-    // `__scan_all_filtered`, which is what these #168 guarantees describe.
-    let scan_all = &db_code[db_code.find("pub fn __scan_all_filtered").unwrap()..];
-    let scan_all = &scan_all[..scan_all.find("fn __scan_by_").unwrap_or(scan_all.len())];
-    assert!(scan_all.contains("struct __UserScanBufs"),
+    let scan = &db_code[db_code.find("pub fn __with_scan<R>").unwrap()..];
+    let scan = &scan[..scan.find("fn __rows_by_").unwrap_or(scan.len())];
+    let scan_flat: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(scan.contains("struct __UserScanBufs"),
         "#168: local buffered-column holder emitted");
-    assert!(scan_all.contains(".gather_buffered(&__rows)"),
+    assert!(scan.contains(".gather_buffered(&__rows)"),
         "#168: each scan column is bulk-loaded once");
-    assert!(scan_all.contains("forgedb_storage::BufferedFixedColumn"),
+    assert!(scan.contains("forgedb_storage::BufferedFixedColumn"),
         "#168: fixed scan columns use the buffered fixed reader");
-    assert!(scan_all.contains("forgedb_storage::BufferedVariableColumn"),
+    assert!(scan.contains("forgedb_storage::BufferedVariableColumn"),
         "#168: string scan columns use the buffered variable reader");
-    assert!(scan_all.contains("tombstones") && scan_all.contains(".live_indices(&__rows)"),
-        "#168: deleted rows excluded by one bulk tombstone read");
-    assert!(scan_all.contains("__rows.sort_unstable()"),
+    assert!(scan_flat.contains("self.tombstones .live_indices(&__all)"),
+        "#168: deleted rows excluded by one bulk tombstone read.\nGot: {scan_flat}");
+    assert!(scan.contains("__all.sort_unstable()"),
         "#168: live rows iterated in physical (ascending) order");
+    // #228: an index-pushdown selection is sorted too — `gather_buffered` bounds its
+    // reads to [min, max], so ascending order keeps the spanned read tight.  It is
+    // NOT tombstone-filtered: delete removes the id from every secondary index, so a
+    // candidate resolved through one is live by construction.
+    assert!(scan_flat.contains("Some(mut __c) => { __c.sort_unstable(); __c }"),
+        "#228: a pushdown selection is sorted for span locality.\nGot: {scan_flat}");
     // The buffered loop decodes by SLOT via the reused field_read_stmt bodies —
     // never a per-row positional read against `self.<col>` inside the scan loop.
-    assert!(scan_all.contains("for __slot in 0..__n"),
+    assert!(scan.contains("for __slot in 0..__n"),
         "#168: buffered decode iterates slots");
-    assert!(!scan_all.contains("self.__scan_row_at"),
-        "#168: __scan_all no longer calls the per-row decoder in its loop");
+    assert!(scan.contains("f(&mut __refs)"),
+        "#228: the scope hands the borrowed views to the caller's callback");
 }
 
 #[test]
@@ -3187,7 +3211,7 @@ User {
     // #224: that matcher now runs on the BORROWED scan view, during the scan — the
     // "one predicate source" guarantee is unchanged; only the operand view is.
     assert!(
-        code.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
+        code.contains("|r| __user_scan_matches(r, &params)"),
         "list filters the narrow scan via the generated closed-set matcher (no second parser)"
     );
     // The `?as_of` snapshot path keeps the full-record read + the same closed-set
@@ -6780,10 +6804,16 @@ fn test_python_sdk_generation_snapshot() {
 
 #[test]
 fn test_rust_generation_borrowed_scan_view() {
-    // #224: the narrow scan decodes each live row into a BORROWED view first and
-    // materializes an owned row only for the ones a predicate keeps.  Before this,
-    // every live row's strings were allocated and copied out of the buffered span,
-    // then most of them were thrown away by the list handler's `retain`.
+    // #224: the narrow scan decodes each live row into a BORROWED view whose strings
+    // point straight at the buffered span.  Before this, every live row's strings
+    // were allocated and copied out of that span, then most of them were thrown away
+    // by the list handler's `retain`.
+    //
+    // #228: and the borrowed view is now the ONLY scan view.  The owned twin existed
+    // solely because the scan handed its rows back to the caller, so the borrows had
+    // to be broken before the buffers dropped — and on an unfiltered list every row
+    // was a survivor, so every row still paid the copy.  Making the scan a scope
+    // removes the reason for the copy rather than narrowing who pays it.
     let src = r#"
 User {
   id: +uuid
@@ -6827,30 +6857,35 @@ User {
         "nullable string borrows past the presence tag instead of copying"
     );
 
-    // The owned per-row decode (`read_at`, the index-pushdown `__scan_row_at`) is
-    // untouched — it still allocates, because its callers need owned records.
+    // The full-record positional decode (`read_at`, which the page materialization
+    // goes through) is untouched — it still allocates, because its callers need
+    // owned records.  Only `limit` rows reach it.
     assert!(
         flat.contains(".email_col .read_string(row_index)"),
         "the positional read path keeps the owned decode"
     );
 
-    // Filtered scan + the unfiltered alias that delegates to it: one buffered-scan
-    // body, not two.
+    // #228: one scan entry point, and it is a SCOPE.  `keep` runs during decode so a
+    // rejected row is never pushed (that is #224's win, preserved); `f` runs while
+    // the buffers are alive, and only what it returns escapes.
     assert!(
         flat.contains(
-            "pub fn __scan_all_filtered( &self, keep: impl Fn(&UserScanRef<'_>) -> bool, ) \
-             -> Vec<UserScanRow>"
+            "pub fn __with_scan<R>( &self, sel: Option<Vec<usize>>, \
+             keep: impl Fn(&UserScanRef<'_>) -> bool, \
+             f: impl FnOnce(&mut Vec<UserScanRef<'_>>) -> R, ) -> R"
         ),
-        "__scan_all_filtered takes a predicate over the borrowed view.\nGot: {flat}"
+        "__with_scan is the scan scope: a selection, a predicate, and a callback.\nGot: {flat}"
     );
+    // Survivors are collected as BORROWED views — no owned row, no `to_owned_row`.
     assert!(
-        flat.contains("pub fn __scan_all(&self) -> Vec<UserScanRow> { self.__scan_all_filtered(|_| true) }"),
-        "__scan_all delegates to the filtered scan.\nGot: {flat}"
+        flat.contains("if keep(&__row_ref) { __refs.push(__row_ref); }"),
+        "survivors stay borrowed inside the scope.\nGot: {flat}"
     );
-    // Materialization happens once per SURVIVOR, inside the keep branch.
+    // The scope's return is the callback's return, so nothing borrowed can leak: the
+    // view's lifetime is higher-ranked, which is what makes `R` unable to name it.
     assert!(
-        flat.contains("if keep(&__row_ref) { rows.push(__row_ref.to_owned_row()); }"),
-        "only rows the predicate keeps are materialized.\nGot: {flat}"
+        flat.contains("f(&mut __refs) }"),
+        "the scope returns only what the callback returns.\nGot: {flat}"
     );
 }
 
@@ -6871,54 +6906,52 @@ User {
     let code = ApiGenerator::generate(&schema).unwrap().code;
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // Both filters exist and are emitted from the same per-field checks.
-    assert!(code.contains("fn __user_scan_matches("), "owned scan filter still emitted");
-    assert!(code.contains("fn __user_scan_matches_ref("), "borrowed scan filter emitted");
+    // #228: exactly ONE scan filter, over the borrowed view.  #224 had emitted a
+    // second, owned-operand copy for the index-pushdown arm, which was the only
+    // caller that held no buffered span; unifying that arm on the scan scope left it
+    // with none.
+    assert!(code.contains("fn __user_scan_matches("), "scan filter emitted");
+    assert!(!code.contains("__user_scan_matches_ref"), "the owned-operand twin is gone");
+    assert!(
+        flat.contains(
+            "fn __user_scan_matches( record: &super::UserScanRef<'_>, \
+             params: &HashMap<String, String>, ) -> bool"
+        ),
+        "the one scan filter takes the borrowed view.\nGot: {flat}"
+    );
 
     // The REST list source and BOTH live-query scans filter during the scan
     // instead of decoding everything and `retain`ing afterwards.
     assert!(
-        flat.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
-        "scan source filters on the borrowed view.\nGot: {flat}"
+        flat.contains("__with_scan( None, |r| __user_scan_matches(r, &params),"),
+        "the live-query scans filter on the borrowed view inside the scope.\nGot: {flat}"
     );
-    // At least the three call sites: the REST list source, the live-query initial
-    // scan, and the live-query re-run.  (An indexed model emits one more per
-    // pushdown branch — the fallback when the param does not parse — so this is a
-    // floor, not an exact count.)
+    // All three call sites: the REST list source, the live-query initial scan, and
+    // the live-query re-run.  Since #228 the pushdown fallback is no longer a fourth
+    // *scan* — it is a `None` selection into the same one — so this is exact.
     assert!(
-        flat.matches("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))").count() >= 3,
-        "REST list + live-query init + live-query re-run all filter during the scan.\nGot: {flat}"
+        flat.matches("|r| __user_scan_matches(r, &params)").count() == 3,
+        "REST list + live-query init + live-query re-run, one scan each.\nGot: {flat}"
     );
     assert!(
-        !flat.contains("__scan_rows.retain(|r| __user_scan_matches(r, &params));"),
-        "the post-scan retain over every decoded row is gone"
-    );
-    // The index-pushdown arm still filters OWNED rows: it resolves O(matches)
-    // candidates through the secondary index and reads them individually, so there
-    // is no buffered span to borrow from.
-    assert!(
-        flat.contains("__c.retain(|r| __user_scan_matches(r, &params));"),
-        "the pushdown candidate set keeps the owned filter.\nGot: {flat}"
+        !flat.contains(".retain(|r| __user_scan_matches(r, &params))"),
+        "no post-scan retain over decoded rows remains"
     );
 
-    // The ONE comparison that has to differ: `Option`'s PartialEq is homogeneous,
-    // so a nullable string on the borrowed view must borrow the parsed param too.
-    // Every other check is byte-identical between the two filters.
-    let owned = &code[code.find("fn __user_scan_matches(").unwrap()
-        ..code.find("fn __user_scan_matches_ref(").unwrap()];
-    let borrowed = &code[code.find("fn __user_scan_matches_ref(").unwrap()..];
+    // The comparison that made the borrowed view non-trivial: `Option`'s PartialEq is
+    // homogeneous, so there is no `Option<&str> == Option<String>` and a nullable
+    // string has to compare against a BORROWED param.  Non-nullable strings need no
+    // adjustment — std has `&str: PartialEq<String>`.  That asymmetry is not obvious
+    // from either type, so it stays pinned even though the owned twin it used to be
+    // contrasted against is gone.
+    let matcher = &code[code.find("fn __user_scan_matches(").unwrap()..];
     assert!(
-        owned.contains("record.bio == Some(__w)"),
-        "owned filter compares Option<String> directly"
+        matcher.contains("record.bio == Some(__w.as_str())"),
+        "nullable string compares Option<&str> against a borrowed param.\nGot: {matcher}"
     );
     assert!(
-        borrowed.contains("record.bio == Some(__w.as_str())"),
-        "borrowed filter compares Option<&str> against a borrowed param"
-    );
-    // Non-nullable strings need no adjustment — std has `&str: PartialEq<String>`.
-    assert!(
-        owned.contains("record.email == __w") && borrowed.contains("record.email == __w"),
-        "non-nullable string comparison is identical in both views"
+        matcher.contains("record.email == __w"),
+        "non-nullable string compares &str against the owned param directly"
     );
 }
 

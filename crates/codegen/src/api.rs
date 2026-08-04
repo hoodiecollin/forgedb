@@ -348,64 +348,59 @@ impl ApiGenerator {
         let has_id = crate::rust::RustGenerator::identity_field(model).is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
-        let scan_matches_ref_fn =
-            format_ident!("__{}_scan_matches_ref", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         // The live list source+filter+sort+page-materialize.  For an id-bearing
-        // model this is the #160 narrow path: filter/sort a scan record (only the
-        // filterable/sortable columns), then full-materialize ONLY the page.  A
+        // model this is the #160 narrow path: filter/sort a narrow scan view (only
+        // the filterable/sortable columns), then full-materialize ONLY the page.  A
         // model with no id keeps the original full `all()` scan (it has no
         // `id_to_row`-driven narrow scan and cannot be mutated anyway).
-        // #160 (C): index pushdown — if the filter names an eligible indexed field,
-        // resolve candidates from that field's index (O(matches)) instead of
-        // scanning every row; else scan all narrow rows.  A parse failure falls
-        // back to the full scan (`unwrap_or_else`), so a match is never missed.
         //
-        // #224: the full-scan arms filter on the BORROWED scan view
-        // (`__scan_all_filtered`), so a row the filter rejects never allocates its
-        // strings — previously every live row was decoded into owned `String`s and
-        // then `retain`ed away.  The pushdown arm still filters owned rows: it
-        // resolves O(matches) candidates through the index and reads them
-        // individually (`__scan_row_at`), so there is no buffered span to borrow
-        // from and nothing to save.
+        // #160 (C): index pushdown — if the filter names an eligible indexed field,
+        // resolve candidate rows from that field's index (O(matches)) instead of
+        // scanning every row.  `__rows_by_*` returns `None` when the value does not
+        // parse, which falls through to the full scan, so a match is never missed.
+        //
+        // #228: the pushdown now selects *rows*, not rows-and-decode, so both paths
+        // go through the one scan scope and the pushdown arm gets the borrowed view
+        // (#224) it previously could not have — it read its candidates positionally
+        // and so held no buffered span to borrow from.
         let pushdown_fields = crate::rust::RustGenerator::scan_pushdown_fields(model);
-        let scan_source = if pushdown_fields.is_empty() {
-            quote! {
-                db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-            }
+        let row_selection = if pushdown_fields.is_empty() {
+            quote! { None }
         } else {
             let branches = pushdown_fields.iter().map(|f| {
                 let fname = &f.name;
-                let scan_by = format_ident!("__scan_by_{}", f.name);
+                let rows_by = format_ident!("__rows_by_{}", f.name);
                 quote! {
                     if let Some(__v) = params.get(#fname) {
-                        match db.#storage_field.#scan_by(__v) {
-                            Some(mut __c) => {
-                                __c.retain(|r| #scan_matches_fn(r, &params));
-                                __c
-                            }
-                            None => db.#storage_field
-                                .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params)),
-                        }
+                        db.#storage_field.#rows_by(__v)
                     }
                 }
             });
-            quote! {
-                #(#branches else)* {
-                    db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                }
-            }
+            quote! { #(#branches else)* { None } }
         };
         let live_list_block = if has_id {
             quote! {
-                let mut __scan_rows = #scan_source;
-                #scan_sort_fn(&mut __scan_rows, &qp.sort);
-                let total = __scan_rows.len();
-                let __page_ids: Vec<_> = qp.pagination
-                    .apply(&__scan_rows)
-                    .iter()
-                    .map(|r| r.#id_field)
-                    .collect();
+                let __sel: Option<Vec<usize>> = #row_selection;
+                // #228: filter, sort, count and page all run INSIDE the scan scope,
+                // on the borrowed view.  Only `(total, ids)` crosses the boundary —
+                // no scan row is ever materialized, so the strings of the rows that
+                // the page does not contain are never copied out of the buffer.
+                let (total, __page_ids) = db.#storage_field.__with_scan(
+                    __sel,
+                    |r| #scan_matches_fn(r, &params),
+                    |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                        #scan_sort_fn(__scan, &qp.sort);
+                        let __total = __scan.len();
+                        let __ids: Vec<_> = qp.pagination
+                            .apply(__scan)
+                            .iter()
+                            .map(|r| r.#id_field)
+                            .collect();
+                        (__total, __ids)
+                    },
+                );
                 // Full-materialize only the paginated page (or 404-skip a row that
                 // was deleted between the scan and here — the read lock makes that
                 // impossible, but `filter_map` is the honest primitive).
@@ -772,34 +767,33 @@ impl ApiGenerator {
     }
 
     /// #160: the narrow list helpers — `__<model>_scan_matches` and
-    /// `__<model>_scan_sort` over the internal `<Model>ScanRow` (id +
+    /// `__<model>_scan_sort` over the internal borrowed `<Model>ScanRef` (id +
     /// filterable/sortable columns).  Emitted from the SAME `generate_filter_check`
     /// per-field checks and `list_sort_arms` as the full-record `_event_matches` /
     /// `_apply_sort`, so filtering + ordering are byte-identical — only the operand
     /// type is narrower.  Lets the list endpoint filter/sort without decoding every
     /// column, then full-materialize only the paginated page.  Empty for a model
     /// with no id field (no list to optimize).
+    ///
+    /// #228 deleted the owned twin of both.  #224 had introduced a second,
+    /// borrowed-operand filter alongside the owned one because the index-pushdown
+    /// arm still worked on owned rows; unifying that arm on the scan scope left the
+    /// owned filter with no caller, and the sort's operand became the borrowed view.
+    /// Neither is a semantic change — `&str` and `Option<&str>` are both `Ord`, so
+    /// the emitted arms are unchanged.
     fn generate_list_scan_helpers(model: &forgedb_parser::Model) -> TokenStream {
         if crate::rust::RustGenerator::identity_field(model).is_none() {
             return quote! {};
         }
-        let scan_ident = format_ident!("{}ScanRow", model.name);
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let snake = Self::to_snake_case(&model.name);
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
-        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
         let scan_sort_fn = format_ident!("__{}_scan_sort", snake);
+        // #224: the borrowed-view filter comes from the SAME emitter as
+        // `_event_matches`, not a second predicate — same param keys, same parse,
+        // same semantics.  Only the nullable-string comparison differs, because
+        // `Option`'s `PartialEq` is homogeneous (see `generate_filter_check`).
         let field_checks: Vec<_> = model
-            .fields
-            .iter()
-            .filter(|f| Self::is_filterable_field(&f.field_type))
-            .map(|f| Self::generate_filter_check(f, false))
-            .collect();
-        // #224: the borrowed-view filter comes from the SAME emitter, not a second
-        // predicate — same param keys, same parse, same semantics.  Only the
-        // nullable-string comparison differs, because `Option`'s `PartialEq` is
-        // homogeneous (see `generate_filter_check`).
-        let field_checks_ref: Vec<_> = model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
@@ -807,9 +801,14 @@ impl ApiGenerator {
             .collect();
         let arms = Self::list_sort_arms(model);
         quote! {
-            /// Narrow closed-set filter over the scan record (#160) — same per-field
-            /// checks as `_event_matches`, only the operand type is narrower.
-            fn #scan_matches_fn(record: &super::#scan_ident, params: &HashMap<String, String>) -> bool {
+            /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
+            /// a row is accepted or rejected before its strings are ever copied out
+            /// of the buffered column.  Same per-field checks as `_event_matches`,
+            /// only the operand type is narrower.
+            fn #scan_matches_fn(
+                record: &super::#scan_ref_ident<'_>,
+                params: &HashMap<String, String>,
+            ) -> bool {
                 if params.is_empty() {
                     return true;
                 }
@@ -817,25 +816,12 @@ impl ApiGenerator {
                 true
             }
 
-            /// The same filter over the BORROWED scan view (#224), so a row can be
-            /// accepted or rejected before its strings are ever copied out of the
-            /// buffered column.  Emitted from the identical per-field checks as
-            /// the owned filter above — one predicate, two operand views.
-            fn #scan_matches_ref_fn(
-                record: &super::#scan_ref_ident<'_>,
-                params: &HashMap<String, String>,
-            ) -> bool {
-                if params.is_empty() {
-                    return true;
-                }
-                #(#field_checks_ref)*
-                true
-            }
-
-            /// Narrow list sort over the scan record (#160) — same arms as
-            /// `_apply_sort`.
+            /// Narrow list sort over the borrowed scan view (#160/#228) — same arms
+            /// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
+            /// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
+            /// comparing them is comparing the buffer's bytes in place.
             fn #scan_sort_fn(
-                rows: &mut Vec<super::#scan_ident>,
+                rows: &mut Vec<super::#scan_ref_ident<'_>>,
                 sort: &Option<forgedb_query_params::Sort>,
             ) {
                 let Some(sort) = sort.as_ref() else { return; };
@@ -1281,7 +1267,7 @@ impl ApiGenerator {
     /// Generate the live-query WebSocket handler for a model (#62 Direction B).
     ///
     /// A stateful, removal-aware result-set subscription.  On connect it runs a
-    /// **generated closed-set query** — the narrow `db.<model>.__scan_all()`
+    /// **generated closed-set query** — the narrow `db.<model>.__with_scan(..)`
     /// filtered by the generated per-model `__<model>_scan_matches` closed-set
     /// filter (the SAME per-field checks as `<model>_event_matches` / the REST
     /// `list` endpoint, only the operand is the narrow scan row — NO second
@@ -1314,21 +1300,24 @@ impl ApiGenerator {
         // `generate_subscription` — reused here so there is one change-detection
         // body per model, never a second (stringify) path.
         let changed_fn = format_ident!("{}_record_changed", snake);
-        // #160: the narrow closed-set filter over `<Model>ScanRow` (id +
-        // filterable columns), co-emitted with the list path. The live-query
+        // #160: the narrow closed-set filter over the borrowed `<Model>ScanRef` (id
+        // + filterable columns), co-emitted with the list path. The live-query
         // re-evaluation filters the CHEAP narrow scan and full-materializes only
         // the matching rows, instead of full-decoding every column of every row.
         // #224: it filters the BORROWED scan view, so a re-run rejects non-matching
         // rows before their strings are copied — the re-run happens on every change
         // to the model, so this is the hottest of the three call sites.
-        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
+        // #228: and a *matching* row no longer materializes either — the scope hands
+        // back only ids, which are then read through `get`.
+        let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(model);
         let model_name_str = &model.name;
 
         let subscribe_doc = format!(
             "Live-query WebSocket subscription for `{}` (#62 Direction B). Runs the \
-             generated closed-set query (narrow `__scan_all` + `__{}_scan_matches`, \
+             generated closed-set query (narrow `__with_scan` + `__{}_scan_matches`, \
              materializing only matches — #160), streams an initial \
              `{}LiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / \
              `Removed` deltas as the matching set changes.",
@@ -1363,10 +1352,15 @@ impl ApiGenerator {
                 {
                     let rows: Vec<super::#model_name> = {
                         let g = db.read().await;
-                        g.#storage_field
-                            .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                            .into_iter()
-                            .filter_map(|r| g.#storage_field.get(r.#id_field))
+                        let __ids = g.#storage_field.__with_scan(
+                            None,
+                            |r| #scan_matches_fn(r, &params),
+                            |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                                __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
+                            },
+                        );
+                        __ids.into_iter()
+                            .filter_map(|__id| g.#storage_field.get(__id))
                             .collect()
                     };
                     for r in &rows {
@@ -1393,10 +1387,15 @@ impl ApiGenerator {
                             // narrow scan + filter, full-materialize only matches).
                             let current: Vec<super::#model_name> = {
                                 let g = db.read().await;
-                                g.#storage_field
-                                    .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                                    .into_iter()
-                                    .filter_map(|r| g.#storage_field.get(r.#id_field))
+                                let __ids = g.#storage_field.__with_scan(
+                                    None,
+                                    |r| #scan_matches_fn(r, &params),
+                                    |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                                        __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
+                                    },
+                                );
+                                __ids.into_iter()
+                                    .filter_map(|__id| g.#storage_field.get(__id))
                                     .collect()
                             };
 
