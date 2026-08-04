@@ -11,7 +11,7 @@ via composite index.
 
 | Model | Role |
 |---|---|
-| `Airport` | Airport with a unique IATA `char(3)` code |
+| `Airport` | Airport with a unique IATA code (`string`, exactly 3 chars) |
 | `Aircraft` | Airframe with capacity; owns `[Seat]` and `[Flight]` |
 | `Flight` | Scheduled service with two `*Airport` FKs (origin + destination) and an `*Aircraft` FK |
 | `Seat` | Physical seat on an aircraft; composite index prevents duplicate seat numbers per aircraft |
@@ -27,7 +27,7 @@ Key relationships:
 
 ## Grammar features showcased
 
-- `^&char(3)` on `Airport.iata_code` — indexed unique fixed-size byte field (IATA codes are exactly 3 bytes)
+- `^&string @length(3, 3)` on `Airport.iata_code` — indexed unique text field with an exact length (IATA codes are text, not bytes)
 - Dual FK to the same model (`Flight.origin_airport: *Airport`, `Flight.destination_airport: *Airport`)
 - Composite `@index(aircraft, seat_number)` on `Seat` — unique seat per airframe
 - Composite `@index(flight, seat)` on `Booking` — the discrete seat-lock reservation constraint

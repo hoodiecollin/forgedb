@@ -10,7 +10,7 @@ Federated microblogging server with accounts, status posts, follow/block graphs,
 | Model | Key fields | Relationships |
 |---|---|---|
 | `Account` | username (indexed), domain (nullable=local), uri, is_local, follower/following/status counts | O2M Status, MediaAttachment, Favourite |
-| `Status` | content (@fulltext), visibility, sensitive, language (char(2)?), in_reply_to | `account: *Account`; `in_reply_to: ?Status` (self-ref); O2M MediaAttachment, Favourite; @soft_delete |
+| `Status` | content (@fulltext), visibility, sensitive, language (`string?`, exactly 2 chars), in_reply_to | `account: *Account`; `in_reply_to: ?Status` (self-ref); O2M MediaAttachment, Favourite; @soft_delete |
 | `Follow` | show_reblogs, notify | `follower: *Account`, `followed: *Account` (two FKs to same model); @index(follower, followed) |
 | `Block` | — | `blocker: *Account`, `blocked: *Account`; @index(blocker, blocked) |
 | `Favourite` | — | `account: *Account`, `status: *Status`; @index(account, status) |
@@ -32,7 +32,7 @@ Federated microblogging server with accounts, status posts, follow/block graphs,
 - Two FKs to the same model in explicit join models (`Follow`, `Block`, `Notification`)
 - `@soft_delete` on `Status` (federated deletions propagate asynchronously)
 - `@fulltext` on `Status.content`
-- `char(2)?` nullable fixed-size language code field
+- `string? @length(2, 2)` nullable language-code field — a BCP 47 subtag is text
 - `@index` on both FK fields of join models for bidirectional graph traversal
 - `@index(account, read)` for unread-notification queries
 - `@index(status, created_at)` for chronological media attachment lookups

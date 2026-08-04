@@ -34,14 +34,14 @@ is skipped by design — see the root CLAUDE.md).
 | `wholesale-orders` | Adapted — Northwind (MIT port) | 8 | `OrderDetail` join w/ discount, self-ref employees, multi-FK orders, composite indexes |
 | `dvd-rental` | Adapted — Sakila/Pagila (BSD) | 13 | Two M2M on one model, dual FK to same model, store↔staff mutual cycle, geo chain (most complex) |
 | `code-hosting` | Adapted — Gitea (MIT) | 11 | Fork lineage self-ref, PR head/base dual FK, org/team RBAC joins, issue↔label M2M |
-| `publishing-membership` | Adapted — Ghost (MIT) | 7 | `@fulltext`, three M2M pairs, subscription billing join, ISO currency `char(3)` |
+| `publishing-membership` | Adapted — Ghost (MIT) | 7 | `@fulltext`, three M2M pairs, subscription billing join, ISO currency as `string @length(3, 3)` |
 | `social-graph` | Inspired — Mastodon (AGPL) | 7 | Reply-thread self-ref, follow/block join models (dual FK to `Account`), notifications |
 | `student-information-system` | Synthetic (teaching SIS) | 7 | Textbook M2M-with-payload (`Enrollment` grade), section/term/course FKs, GPA constraints |
 | `healthcare` | Synthetic | 6 | Appointments, role-as-string providers, prescriptions/diagnoses, composite scheduling index |
 | `hotel-reservations` | Synthetic | 6 | RoomType template vs Room inventory, date-range availability, `i64` money |
 | `food-delivery` | Synthetic | 8 | `struct GeoPoint` (required + optional), `OrderItem` join, timestamped status-event audit log |
-| `banking-ledger` | Synthetic | 6 | Double-entry transactions, `Transfer` dual FK to `Account`, joint-account M2M, `char(3)` currency |
-| `airline-reservations` | Synthetic | 7 | Flight dual FK to `Airport`, unique-seat composite index (seat lock), IATA `char(3)` |
+| `banking-ledger` | Synthetic | 6 | Double-entry transactions, `Transfer` dual FK to `Account`, joint-account M2M, `string` currency codes |
+| `airline-reservations` | Synthetic | 7 | Flight dual FK to `Airport`, unique-seat composite index (seat lock), IATA codes as `string` |
 | `blog-cms` | Synthetic | 5 | **Correct snake_case component refs** (`tsx://`/`jsx://`/`api://`), self-ref comments/categories, `@fulltext`, `@soft_delete` |
 | `project-management` | Synthetic | 8 | Org→Team→Project→Issue hierarchy, sub-issue self-ref, label M2M, dual composite indexes |
 | `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log |
