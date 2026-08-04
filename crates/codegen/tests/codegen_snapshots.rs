@@ -3214,6 +3214,98 @@ User {
 }
 
 #[test]
+fn test_api_generation_list_envelope() {
+    // #229: the list envelope and the point reads serialize from their own types
+    // instead of being routed through a `serde_json::Value` tree, which cloned
+    // every string in the response before axum serialized it again.
+    //
+    // This is link 1 of the guard — it pins WHAT IS EMITTED. Link 2 is
+    // `tests/api_wire_test.rs`, which compiles this output, boots the router, and
+    // pins the bytes that emission puts on the socket. Both must move together.
+    let src = r#"
+enum Status { Draft, Published }
+
+Post {
+  @projection(card: title, status)
+  id: +uuid
+  title: string
+  body: string
+  status: Status
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The envelope is emitted ONCE per file (schema-blind — it names no model and
+    // no field), generic over the row type because the `?projection=` arms each
+    // carry a different one. `__`-prefixed: this file does `use super::*`, so an
+    // unprefixed name would be one PascalCase model away from a collision.
+    assert!(
+        flat.contains("struct __ListEnvelope<'a, T: serde::Serialize> { data: &'a [T], total: usize, limit: usize, offset: usize, }"),
+        "the envelope is a generic struct borrowing the page, fields in wire order"
+    );
+    assert_eq!(
+        code.matches("struct __ListEnvelope").count(),
+        1,
+        "emitted once for the whole file, not per model"
+    );
+
+    // The list body borrows the page straight into it — no intermediate `Value`.
+    assert!(
+        flat.contains("Json(__ListEnvelope { data: &page, total, limit: qp.pagination.limit, offset: qp.pagination.offset, })"),
+        "the list handler borrows the page into the envelope"
+    );
+    // The projection arm builds a TYPED page and borrows that into the same
+    // envelope — it used to `serde_json::to_value` each row into a `Vec<Value>`.
+    assert!(
+        flat.contains("let __data: Vec<super::PostCard> = page .iter() .map(|r| super::PostCard {"),
+        "the projection list arm collects a typed page"
+    );
+    assert!(
+        flat.contains("Json(__ListEnvelope { data: &__data,"),
+        "the projection list arm borrows its typed page into the same envelope"
+    );
+
+    // Both handlers now return `Response` — success and error bodies have
+    // different types, and the projection arms differ from each other again.
+    assert!(
+        flat.contains("async fn list_post( Query(params): Query<HashMap<String, String>>, State(db): State<Arc<RwLock<super::Database>>>, ) -> Response"),
+        "the list handler returns Response"
+    );
+    assert!(
+        flat.contains("async fn get_post( Path(id): Path<String>, Query(params): Query<HashMap<String, String>>, State(db): State<Arc<RwLock<super::Database>>>, ) -> Response"),
+        "the get handler returns Response"
+    );
+
+    // Point reads serialize the record itself.
+    assert!(
+        flat.contains("Some(record) => (StatusCode::OK, Json(record)).into_response()"),
+        "the point read serializes the record directly"
+    );
+    assert!(
+        flat.contains("Some(r) => (StatusCode::OK, Json(r)).into_response()"),
+        "the projected point read serializes the projection struct directly"
+    );
+
+    // Negative: nothing on a read path builds a `Value` tree any more. The error
+    // bodies deliberately stay `json!` objects (single small objects, #229 non-goal).
+    assert!(
+        !code.contains("serde_json::to_value"),
+        "no read path routes a record through serde_json::Value"
+    );
+    assert!(
+        !flat.contains(r#"json!({ "data""#),
+        "the envelope is no longer built by the json! macro"
+    );
+    assert!(
+        flat.contains(r#"json!({ "error" : "not found" })"#),
+        "error bodies are unchanged"
+    );
+}
+
+#[test]
 fn test_rust_generation_changefeed_emits() {
     // Change notifications (#62 Direction A): generated insert()/link_* emit a
     // FIELD-BLIND (model, row_index) signal into a shared substrate ChangeFeed;
