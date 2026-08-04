@@ -335,7 +335,19 @@ reading *pending release* until the tag exists.
 
 **Label invariants (§3.2) — enforce on every issue; violations are the #1 drift smell:**
 `plan-next` ⊕ milestone · `idea` ⊕ `plan-next` · `idea` ⊕ milestone (scheduled implies committed) ·
-`experiment` ⊕ {`idea`, `plan-next`, milestone}.
+`experiment` ⊕ {`idea`, `plan-next`, milestone} · `release-gate` ⇒ milestone, and
+`release-gate` ⊕ {`idea`, `plan-next`, `experiment`}.
+
+**`release-gate` = blocks the tag (§5.2).** The rung between *closed-into-milestone* and
+*released*. An open `release-gate` issue on a milestone means **that milestone cannot be tagged**,
+even if every feature on it is closed — it is a release obligation (publish the substrate,
+reconcile a version line, rotate a credential), not deferrable work. File one the moment you
+*knowingly* defer such an obligation; the deferral is exactly when it gets forgotten, because
+everything still builds locally. The complete "can we tag?" query:
+
+```bash
+gh issue list --label release-gate --state open      # any row ⇒ blocked
+```
 
 **Surfaces (§6.1).** A `surface:*` label marks a separately shippable product face. This repo uses
 `surface:website` and `surface:ide-extension`; **core is the implicit default and carries no label.**
@@ -386,6 +398,44 @@ of truth.
    `cargo build` passing does **not** prove an installed user can build — only the outside-repo
    reclose does. Additive substrate changes (no on-disk format break) keep the scaffold pin
    (`= "0.2"`) resolving; a format break bumps the major and needs a migration path.
+
+   **Where the gap is allowed to live — the branch model (playbook §5.2).** ForgeDB batches the
+   substrate publish at the release rather than publishing per-issue, so a publish gap *does* open
+   mid-cycle. It is held off the default branch:
+
+   | Branch | Holds | Invariant |
+   |---|---|---|
+   | `main` | released state | **Always releasable.** An outside-repo `init → generate → cargo build` resolves entirely from crates.io. |
+   | `develop` | the current core release cycle | May knowingly carry a publish gap. That is its job. |
+
+   - **Core work branches off `develop` and merges back to `develop`** (keep branch-per-scope +
+     auto-merge; only the base changes). Nothing core lands on `main` except a release merge.
+   - **The release sequence is ordered, and the order is the whole point:** publish the substrate
+     → **then** merge `develop` → `main` → **then** tag. Publishing after the merge reopens the
+     window the branch exists to close.
+   - **The outside-repo reclose is a check on `main`, not on `develop`** — required on the
+     integration branch it would sit red for an entire cycle and stop being read.
+     `.github/workflows/substrate-reclose.yml`.
+
+   **Which branch a docs / website / extension change targets is a *coupling* question, not a
+   surface one.** The surface-exclusion rule above governs *milestones and changelogs*; this
+   governs *when the change becomes visible*:
+
+   - **Independent of unreleased core → straight to `main`.** Typo and link fixes, styling, SEO,
+     analytics, dep bumps, corrections to already-shipped docs. These deploy continuously and must
+     not wait on a release they have nothing to do with.
+   - **Documents, depends on, or demonstrates unreleased core → `develop`, in the same change as
+     the feature.** Docs for an unshipped feature, examples using an unreleased API, a schema
+     reference for syntax that does not parse yet.
+
+   Getting this backwards publishes documentation for an API nobody can call — worse than no page,
+   because it makes the docs a liar in the exact moment someone is trusting them. Pair feature docs
+   with the feature.
+
+   **Transition note (delete once v0.4.0 is tagged):** `main` currently carries the v0.4.0 gap —
+   `develop` was created from it mid-cycle rather than rewinding pushed history. So the reclose is
+   expected RED on `main` until #241 closes, and the model is fully in force from v0.5.0. Do not
+   "fix" this by force-pushing `main`.
 
 3. **Codegen is compile-tested, not just snapshot-tested.** The `insta` snapshots compare
    generated code as *strings* — a snapshot pass does **not** mean the output compiles. When you

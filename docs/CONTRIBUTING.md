@@ -376,11 +376,58 @@ crate-name/
 
 ## Pull Request Process
 
+### Which branch does your PR target?
+
+ForgeDB keeps two long-lived branches, because generated code links the
+`forgedb-*` substrate crates **from crates.io** and those are published once per
+release rather than per change. Between the change and the publish there is a
+window where the repo builds fine in-tree but an installed user cannot build at
+all. That window is held off the default branch.
+
+| Branch | What it holds | Guarantee |
+|---|---|---|
+| `main` | released state | Always releasable — an outside-repo `forgedb init → generate → cargo build` resolves entirely from crates.io. |
+| `develop` | the current release cycle | May carry unpublished substrate APIs. |
+
+**Core changes** — anything under `crates/`, `src/`, `tests/`, `examples/` —
+branch from `develop` and target `develop`:
+
+```bash
+git checkout develop && git pull
+git checkout -b feature/my-new-feature   # or fix/… , perf/… , refactor/…
+```
+
+> `main` remains the repository's default branch, so that cloning gives you a tree
+> that actually builds and installs. That means **GitHub will pre-fill `main` as
+> your PR's base** — change it to `develop` for core work. A core PR merged into
+> `main` puts an unpublished substrate API on the branch that is supposed to be
+> releasable, which is precisely what this split exists to prevent.
+
+**Docs, website, and extension changes** are decided by *coupling*, not by which
+directory they live in. Ask: **does this change describe, depend on, or
+demonstrate behavior that is not released yet?**
+
+- **No → target `main`.** Typo and link fixes, styling, SEO, analytics, dependency
+  bumps, corrections to already-shipped documentation. These deploy continuously
+  and should not wait on a release they have nothing to do with.
+- **Yes → target `develop`, in the same PR as the feature.** Documentation for an
+  unreleased feature, examples calling an unreleased API, a schema reference for
+  syntax that does not parse yet.
+
+Documentation that lands ahead of the feature it documents is worse than no
+documentation: it describes an API nobody can call, and it makes the docs
+untrustworthy exactly when someone is relying on them. Pair feature docs with the
+feature.
+
+Releases go **publish the substrate → merge `develop` into `main` → tag**, in that
+order. The `Substrate reclose` workflow runs on `main` and proves the first step
+actually happened.
+
 ### Before Submitting
 
 **1. Create an issue** (if one doesn't exist) describing the change.
 
-**2. Fork and create a branch:**
+**2. Fork and create a branch** from the base chosen above:
 ```bash
 git checkout -b feature/my-new-feature
 # or

@@ -1,0 +1,128 @@
+# Substrate outside-repo reclose — the "is `main` actually releasable?" check.
+#
+# ForgeDB's generated code links the substrate crates by their scaffold-pinned
+# versions, resolved from crates.io. That creates a failure mode with no in-repo
+# symptom: work lands that makes generated code call a substrate API which has not
+# been published yet, an in-tree `cargo build` resolves it by workspace path and
+# passes, and an installed user resolving from the registry cannot build at all.
+# CI is green and the branch is unshippable. See CLAUDE.md → publish-gap rule, and
+# ai-pm-playbook PLAYBOOK.md §5.2.
+#
+# No test suite can catch that, because what is broken is the relationship between
+# this repo and crates.io, and the repo cannot observe it. The only proof is this:
+# scaffold a project OUTSIDE the checkout, generate into it, and build it with
+# every `forgedb-*` dependency resolved from the registry. If a needed API is
+# unpublished, the build fails here and nowhere else.
+#
+# WHY THIS RUNS ON `main` AND NOT ON `develop`
+#
+# `develop` is where the current release cycle integrates and is *allowed* to carry
+# a publish gap — that is the whole point of holding the gap off the default branch.
+# Requiring this check there would leave it red for an entire cycle, and a check
+# that is always red is a check nobody reads. `main` is the branch that must stay
+# releasable, so this is where the gate belongs. The release order it enforces:
+# publish the substrate -> merge develop -> main -> tag.
+#
+# TRANSITION (v0.4.0 only): `develop` was cut from `main` mid-cycle rather than
+# rewinding pushed history, so `main` currently carries the v0.4.0 gap and this
+# workflow is EXPECTED TO FAIL there until #241 closes. Do not mark it a required
+# check, and do not "fix" it by force-pushing `main` — it goes required once
+# v0.4.0 is published and tagged.
+#
+# Deliberately generates `all` (not just `rust`): api.rs pulls in query-params and
+# auth, so a gap in any of the substrate crates the scaffold pins surfaces here.
+name: Substrate reclose
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Run before cutting a tag, and any time you want to know whether the gap is
+  # currently open without waiting for a merge.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  reclose:
+    name: outside-repo init -> generate -> build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Toolchain comes from rust-toolchain.toml (channel 1.96).
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the forgedb CLI
+        run: cargo build --release --bin forgedb
+
+      - name: Reclose — scaffold, generate, and build against crates.io
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          # OUTSIDE the checkout: no workspace inheritance, no path overrides, so
+          # every forgedb-* dep must resolve from the registry.
+          WORK="$(mktemp -d "${RUNNER_TEMP}/substrate-reclose.XXXXXX")"
+          cd "$WORK"
+
+          "$FORGEDB" init app
+          cd app
+
+          # A schema wide enough that the generated code touches the substrate
+          # surface the scaffold pins — relations, an enum, an index, a
+          # projection, json/decimal/optional columns.
+          cat > schema.forge <<'SCHEMA'
+          enum Status { Draft, Published, Archived }
+
+          Author {
+            id: +uuid
+            email: &string
+            name: ^string
+            posts: [Post]
+          }
+
+          Post {
+            @projection(card: title, status)
+            id: +uuid
+            title: ^string
+            body: string
+            summary: string?
+            views: u32
+            price: decimal
+            status: ^Status
+            meta: json
+            author: *Author
+            editor: ?Author
+          }
+          SCHEMA
+
+          "$FORGEDB" validate
+          "$FORGEDB" generate all
+
+          # The moment of truth. A gap shows up as an unresolved name or a
+          # missing method on a registry-resolved substrate crate.
+          cargo build
+
+      - name: Report open release gates
+        # Informational: names anything still blocking the next tag. Never fails
+        # the job — the reclose above is the mechanical gate; this is the human
+        # one, and its rows may legitimately be open mid-cycle.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gates="$(gh issue list --label release-gate --state open \
+                     --json number,title,milestone \
+                     --jq '.[] | "  #\(.number) [\(.milestone.title // "no milestone")] \(.title)"')"
+          if [ -n "$gates" ]; then
+            echo "Open release gates — these block the tag:"
+            echo "$gates"
+          else
+            echo "No open release gates."
+          fi
