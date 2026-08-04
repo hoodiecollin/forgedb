@@ -30,6 +30,10 @@ key type.
 
 `total` counts matches before pagination.
 
+Records serialize their fields in **schema declaration order** — on the list page, on the
+point read, and in the WebSocket event payloads alike. JSON object key order is not
+significant and no client should depend on it, but it is stable rather than incidental.
+
 ## Query parameters (list + read)
 
 The list handler filters, sorts, and paginates. Filtering and sorting are **generated

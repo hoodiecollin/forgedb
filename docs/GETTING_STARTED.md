@@ -152,7 +152,7 @@ curl -X POST localhost:3000/api/user -H 'content-type: application/json' -d '{
 
 # List — paginated envelope
 curl localhost:3000/api/user
-# → {"data":[{...}],"limit":50,"offset":0,"total":1}
+# → {"data":[{...}],"total":1,"limit":50,"offset":0}
 ```
 
 Field validation is enforced at write and mapped to HTTP:
