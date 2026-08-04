@@ -9,7 +9,7 @@ use super::*;
 use axum::{
     extract::{Path, Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    http::StatusCode, response::{Json, Response},
+    http::StatusCode, response::{IntoResponse, Json, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -23,6 +23,13 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 const PAGE_DEFAULT_LIMIT: usize = 50;
 const PAGE_MAX_LIMIT: usize = 1000;
+#[derive(serde::Serialize)]
+struct __ListEnvelope<'a, T: serde::Serialize> {
+    data: &'a [T],
+    total: usize,
+    limit: usize,
+    offset: usize,
+}
 #[utoipa::path(
     get,
     path = "",
@@ -47,7 +54,7 @@ const PAGE_MAX_LIMIT: usize = 1000;
 async fn list_user(
     Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let mut qp = forgedb_query_params::QueryParams::from_map(params.clone());
     qp.pagination.limit = params
         .get("limit")
@@ -67,7 +74,8 @@ async fn list_user(
                                 }
                             ),
                         ),
-                    );
+                    )
+                        .into_response();
                 }
             }
         }
@@ -117,11 +125,16 @@ async fn list_user(
             (page, total)
         }
     };
-    let body = json!(
-        { "data" : page, "total" : total, "limit" : qp.pagination.limit, "offset" : qp
-        .pagination.offset, }
-    );
-    (StatusCode::OK, Json(body))
+    (
+        StatusCode::OK,
+        Json(__ListEnvelope {
+            data: &page,
+            total,
+            limit: qp.pagination.limit,
+            offset: qp.pagination.offset,
+        }),
+    )
+        .into_response()
 }
 #[utoipa::path(
     get,
@@ -144,11 +157,12 @@ async fn get_user(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     State(db): State<Arc<RwLock<super::Database>>>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
     let key = match id.parse::<Uuid>() {
         Ok(key) => key,
         Err(_) => {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })));
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error" : "invalid id" })))
+                .into_response();
         }
     };
     let __as_of: Option<usize> = match params.get("as_of") {
@@ -164,7 +178,8 @@ async fn get_user(
                                 }
                             ),
                         ),
-                    );
+                    )
+                        .into_response();
                 }
             }
         }
@@ -176,11 +191,11 @@ async fn get_user(
         None => db.user.get(key),
     };
     match __found {
-        Some(record) => {
-            let data = serde_json::to_value(&record).unwrap_or(json!(null));
-            (StatusCode::OK, Json(data))
+        Some(record) => (StatusCode::OK, Json(record)).into_response(),
+        None => {
+            (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" })))
+                .into_response()
         }
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error" : "not found" }))),
     }
 }
 #[utoipa::path(
