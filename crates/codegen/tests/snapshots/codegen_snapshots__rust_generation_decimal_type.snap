@@ -307,19 +307,12 @@ impl ProductStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&((price_value).normalize())) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &((price_value).normalize());
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{1}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.price_index)
@@ -502,19 +495,12 @@ impl ProductStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&((record.price).normalize())) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &((record.price).normalize());
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{1}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.price_index)
@@ -608,19 +594,12 @@ impl ProductStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&((__old_rec.price).normalize())) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &((__old_rec.price).normalize());
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{1}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -648,19 +627,12 @@ impl ProductStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&((record.price).normalize())) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &((record.price).normalize());
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{1}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.price_index)
@@ -760,19 +732,12 @@ impl ProductStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&((record.price).normalize())) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &((record.price).normalize());
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{1}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -1080,19 +1045,12 @@ impl ProductStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&((price_value).normalize())) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &((price_value).normalize());
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{1}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.price_index)
@@ -1126,19 +1084,12 @@ impl ProductStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&((__old_rec.price).normalize())) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &((__old_rec.price).normalize());
+                            use std::fmt::Write as _;
+                            let mut __k = String::from('\u{1}');
+                            let _ = write!(__k, "{}", __v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -1174,21 +1125,12 @@ impl ProductStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(
-                                &((__new_rec.price).normalize()),
-                            ) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &((__new_rec.price).normalize());
+                                use std::fmt::Write as _;
+                                let mut __k = String::from('\u{1}');
+                                let _ = write!(__k, "{}", __v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.price_index)
@@ -1457,19 +1399,12 @@ impl ProductStorage {
     ///Index probe for `Product`.`price` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_price(&self, value: rust_decimal::Decimal) -> Vec<Product> {
         let __k: String = {
-            match serde_json::to_value(&((value).normalize())) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &((value).normalize());
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{1}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.price_index.get(&__k) {
@@ -1485,19 +1420,12 @@ impl ProductStorage {
         value: rust_decimal::Decimal,
     ) -> Vec<Product> {
         let __k: String = {
-            match serde_json::to_value(&((value).normalize())) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &((value).normalize());
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{1}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.price_index.get(&__k) {
@@ -1508,19 +1436,12 @@ impl ProductStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&((__rec.price).normalize())) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &((__rec.price).normalize());
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{1}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1736,19 +1657,12 @@ impl ProductStorage {
     pub fn __scan_by_price(&self, value: &str) -> Option<Vec<ProductScanRow>> {
         let __typed = value.parse::<rust_decimal::Decimal>().ok()?;
         let __k: String = {
-            match serde_json::to_value(&((__typed).normalize())) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &((__typed).normalize());
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{1}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.price_index.get(&__k) {
@@ -1886,19 +1800,12 @@ impl ProductStorageReader {
         value: rust_decimal::Decimal,
     ) -> Vec<Product> {
         let __k: String = {
-            match serde_json::to_value(&((value).normalize())) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &((value).normalize());
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{1}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.price_index.get(&__k) {
@@ -1909,19 +1816,12 @@ impl ProductStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&((__rec.price).normalize())) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &((__rec.price).normalize());
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{1}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {

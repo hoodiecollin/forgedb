@@ -6829,3 +6829,128 @@ User {
         "non-nullable string comparison is identical in both views"
     );
 }
+
+/// #230: index keys are emitted **monomorphically per field type**, not by matching
+/// on a `serde_json::Value` at runtime.
+///
+/// This is link 1 of the parity guard chain — it pins *what the generator emits*.
+/// Link 2 (`tests/index_key_parity_test.rs`) compiles a generated crate and asserts
+/// those forms are byte-identical to the `Value` match they replaced. Changing
+/// `RustGenerator::index_key_body` means moving both.
+#[test]
+fn test_rust_generation_monomorphic_index_keys() {
+    let src = r#"
+enum Status { Draft, Published }
+
+Kitchen {
+  id: +uuid
+  s_name: &string
+  s_code: ^char(8)
+  n_u32: ^u32
+  n_f64: ^f64
+  b_flag: ^bool
+  d_price: ^decimal
+  u_ref: ^uuid
+  t_at: ^timestamp
+  e_status: ^Status
+  o_name: ^string?
+  owner: *Owner
+  editor: ?Owner
+}
+
+Owner {
+  id: +uuid
+  email: &string
+  kitchens: [Kitchen]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // The whole point: no index key is built by dispatching on a `Value` variant.
+    // `is_filterable_scalar` + the two FK relations are fully covered by
+    // `index_key_body`, so the generic fallback must never be reached.
+    assert!(
+        !flat.contains("matchserde_json::to_value"),
+        "no index key may route through a serde_json::Value match (#230).\nGot: {code}"
+    );
+    // The dead `Err` arm goes with it — `to_value` cannot fail for any indexable
+    // type (non-finite floats become `Value::Null`, they do not error), so the
+    // `\\u{3}` tag was unreachable and is no longer emitted anywhere.
+    assert!(
+        !flat.contains(r"String::from('\u{3}')"),
+        "the unreachable serialization-error tag must no longer be emitted (#230)"
+    );
+
+    // --- JSON string class (tag \u{1}) ------------------------------------
+    assert!(
+        flat.contains(r"__k.push('\u{1}');__k.push_str(__v);"),
+        "string keys copy the value straight in, with no intermediate allocation"
+    );
+    assert!(
+        flat.contains("__v.hyphenated().encode_lower(&mut__buf)"),
+        "uuid / FK keys render hyphenated-lowercase into a stack buffer"
+    );
+    assert!(
+        flat.contains("__v.__as_str()"),
+        "enum keys use the generated variant-name accessor, matching the serde derive"
+    );
+    assert!(
+        flat.contains(r#"letmut__k=String::from('\u{1}');let_=write!(__k,"{}",__v);"#),
+        "decimal keys write the Display form (== its serde string form) in place"
+    );
+
+    // --- JSON non-string scalar class (tag \u{2}) -------------------------
+    assert!(
+        flat.contains(r#"letmut__k=String::from('\u{2}');let_=write!(__k,"{}",__v);"#),
+        "integer keys write digits straight in"
+    );
+    assert!(
+        flat.contains(r#"write!(__k,"{}",__v.as_seconds())"#),
+        "timestamp is #[serde(transparent)] over i64 — its key is the bare number"
+    );
+    assert!(
+        flat.contains(r#"__k.push_str(if*__v{"true"}else{"false"});"#),
+        "bool keys are a literal, not a formatted value"
+    );
+    // Floats KEEP the JSON number formatter: Display renders 1.0 as "1" and 1e300
+    // as "1e300", where JSON gives "1.0" and "1e+300".
+    assert!(
+        flat.contains("matchserde_json::Number::from_f64(*__v)"),
+        "f64 keys must use the JSON float formatter, not Display (#230)"
+    );
+    // `from_f64` returning None is exactly the NaN/Inf case that used to arrive as
+    // `Value::Null`; it must still land in the null bucket.
+    assert!(
+        flat.contains(r"None=>String::from('\u{0}'),"),
+        "non-finite floats keep keying into the null bucket"
+    );
+    // char(N) is [u8; N] — serde renders it as a JSON array, so the key is
+    // `\u{2}[104,101,...]`, the non-string arm.
+    assert!(
+        flat.contains(r#"__k.push('[');for(__i,__b)in__v.iter().enumerate()"#),
+        "char(N) keys render the JSON array form"
+    );
+
+    // --- nullable ---------------------------------------------------------
+    // A nullable field matches on the `Option`, never on a `Value`. Matching a
+    // reference is what lets one emitted form serve the owning record side and the
+    // borrowing probe side (`Option<String>` vs `Option<&str>`).
+    assert!(
+        flat.contains(r"Some(__v)=>{letmut__k=String::with_capacity(1+__v.len());"),
+        "nullable string keys match the Option and reuse the non-nullable body"
+    );
+    assert!(
+        flat.contains(r"None=>String::from('\u{0}'),"),
+        "the None arm keys into the null bucket"
+    );
+    // An optional FK (`?Owner`) is `Option<Uuid>` in Rust but carries its
+    // optionality in the RelationType, NOT a `Nullable` wrapper. Missing that is a
+    // silent mis-key, so assert the unlinked case is handled as an Option.
+    assert!(
+        flat.contains(r"match&(record.editor){Some(__v)=>{letmut__buf=[0u8;36];"),
+        "an optional FK keys through the Option arm, not as a bare Uuid (#230)"
+    );
+}

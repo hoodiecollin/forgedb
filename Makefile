@@ -214,3 +214,12 @@ extension-package:
 ## suite because it compiles a generated crate — run it explicitly here.
 crash-test:
 	cargo test --test crash_recovery_test -- --ignored --nocapture
+
+.PHONY: index-key-parity
+
+## Index-key parity proof (#230): generate a model carrying every indexable type,
+## compile it, and assert the monomorphic key emission is byte-identical to the
+## `serde_json::Value` form it replaced — plus a round-trip through the real
+## generated `find_by_*`. Also #[ignore]d out of the fast suite (compiles a crate).
+index-key-parity:
+	cargo test --test index_key_parity_test -- --ignored --nocapture

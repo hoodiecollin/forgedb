@@ -181,6 +181,16 @@ impl OrderStatus {
             OrderStatus::Shipped => 2u8,
         }
     }
+    /// This variant's NAME — identical to what the serde derive
+    /// serializes it as, so the index key (#230) and the REST / TS /
+    /// JSON representations cannot drift apart.
+    fn __as_str(&self) -> &'static str {
+        match self {
+            OrderStatus::Pending => "Pending",
+            OrderStatus::Paid => "Paid",
+            OrderStatus::Shipped => "Shipped",
+        }
+    }
     /// Decode a stored discriminant back to a variant.  Panics on an
     /// out-of-range byte (a corrupt column or server/replica schema skew).
     fn __from_u8(__b: u8) -> OrderStatus {
@@ -347,19 +357,13 @@ impl OrderStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(status_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(status_value);
+                        let __s = __v.__as_str();
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.status_index)
@@ -540,19 +544,13 @@ impl OrderStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.status)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.status);
+                    let __s = __v.__as_str();
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.status_index)
@@ -637,19 +635,13 @@ impl OrderStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.status)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.status);
+                        let __s = __v.__as_str();
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -665,19 +657,13 @@ impl OrderStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.status)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.status);
+                    let __s = __v.__as_str();
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.status_index)
@@ -772,19 +758,13 @@ impl OrderStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.status)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.status);
+                    let __s = __v.__as_str();
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -1085,19 +1065,13 @@ impl OrderStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(status_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(status_value);
+                        let __s = __v.__as_str();
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.status_index)
@@ -1125,19 +1099,13 @@ impl OrderStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.status)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.status);
+                            let __s = __v.__as_str();
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -1161,19 +1129,13 @@ impl OrderStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.status)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.status);
+                                let __s = __v.__as_str();
+                                let mut __k = String::with_capacity(1 + __s.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__s);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.status_index)
@@ -1443,19 +1405,13 @@ impl OrderStorage {
     ///Index probe for `Order`.`status` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_status(&self, value: OrderStatus) -> Vec<Order> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let __s = __v.__as_str();
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.status_index.get(&__k) {
@@ -1471,19 +1427,13 @@ impl OrderStorage {
         value: OrderStatus,
     ) -> Vec<Order> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let __s = __v.__as_str();
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.status_index.get(&__k) {
@@ -1494,19 +1444,13 @@ impl OrderStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.status)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.status);
+                        let __s = __v.__as_str();
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1693,19 +1637,13 @@ impl OrderStorage {
         >(serde_json::Value::String(value.to_string()))
             .ok()?;
         let __k: String = {
-            match serde_json::to_value(&(__typed)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(__typed);
+                let __s = __v.__as_str();
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.status_index.get(&__k) {
@@ -1850,19 +1788,13 @@ impl OrderStorageReader {
         value: OrderStatus,
     ) -> Vec<Order> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let __s = __v.__as_str();
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.status_index.get(&__k) {
@@ -1873,19 +1805,13 @@ impl OrderStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.status)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.status);
+                        let __s = __v.__as_str();
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {

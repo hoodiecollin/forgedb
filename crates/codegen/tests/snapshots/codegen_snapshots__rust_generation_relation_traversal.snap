@@ -1385,19 +1385,14 @@ impl PostStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(author_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(author_value);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.author_index)
@@ -1407,19 +1402,16 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(editor_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
+                    match &(editor_value) {
+                        Some(__v) => {
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
                             __k
                         }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                        None => String::from('\u{0}'),
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.editor_index)
@@ -1602,19 +1594,14 @@ impl PostStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.author_index)
@@ -1624,19 +1611,16 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.editor)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
+                match &(record.editor) {
+                    Some(__v) => {
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
                         __k
                     }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                    None => String::from('\u{0}'),
                 }
             };
             std::sync::Arc::make_mut(&mut self.editor_index)
@@ -1721,19 +1705,14 @@ impl PostStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -1748,19 +1727,16 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.editor)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
+                    match &(__old_rec.editor) {
+                        Some(__v) => {
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
                             __k
                         }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                        None => String::from('\u{0}'),
                     }
                 };
                 let mut __empty = false;
@@ -1776,19 +1752,14 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.author_index)
@@ -1798,19 +1769,16 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.editor)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
+                match &(record.editor) {
+                    Some(__v) => {
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
                         __k
                     }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                    None => String::from('\u{0}'),
                 }
             };
             std::sync::Arc::make_mut(&mut self.editor_index)
@@ -1905,19 +1873,14 @@ impl PostStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -1932,19 +1895,16 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.editor)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
+                match &(record.editor) {
+                    Some(__v) => {
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
                         __k
                     }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                    None => String::from('\u{0}'),
                 }
             };
             let mut __empty = false;
@@ -2257,19 +2217,14 @@ impl PostStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(author_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(author_value);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.author_index)
@@ -2279,19 +2234,16 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(editor_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
+                    match &(editor_value) {
+                        Some(__v) => {
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
                             __k
                         }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                        None => String::from('\u{0}'),
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.editor_index)
@@ -2319,19 +2271,14 @@ impl PostStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.author)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.author);
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -2346,19 +2293,16 @@ impl PostStorage {
                 }
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.editor)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
+                        match &(__old_rec.editor) {
+                            Some(__v) => {
+                                let mut __buf = [0u8; 36];
+                                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                                let mut __k = String::with_capacity(1 + __s.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__s);
                                 __k
                             }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                            None => String::from('\u{0}'),
                         }
                     };
                     let mut __empty = false;
@@ -2382,19 +2326,14 @@ impl PostStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.author)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.author);
+                                let mut __buf = [0u8; 36];
+                                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                                let mut __k = String::with_capacity(1 + __s.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__s);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.author_index)
@@ -2404,19 +2343,16 @@ impl PostStorage {
                     }
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.editor)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
+                            match &(__new_rec.editor) {
+                                Some(__v) => {
+                                    let mut __buf = [0u8; 36];
+                                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                                    let mut __k = String::with_capacity(1 + __s.len());
+                                    __k.push('\u{1}');
+                                    __k.push_str(__s);
                                     __k
                                 }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                                None => String::from('\u{0}'),
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.editor_index)
@@ -2683,19 +2619,14 @@ impl PostStorage {
     ///Index probe for `Post`.`author` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_author(&self, value: Uuid) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -2711,19 +2642,14 @@ impl PostStorage {
         value: Uuid,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -2734,19 +2660,14 @@ impl PostStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -2759,19 +2680,16 @@ impl PostStorage {
     ///Index probe for `Post`.`editor` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_editor(&self, value: Option<Uuid>) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
+            match &(value) {
+                Some(__v) => {
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
                     __k
                 }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+                None => String::from('\u{0}'),
             }
         };
         let __ids = match self.editor_index.get(&__k) {
@@ -2787,19 +2705,16 @@ impl PostStorage {
         value: Option<Uuid>,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
+            match &(value) {
+                Some(__v) => {
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
                     __k
                 }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+                None => String::from('\u{0}'),
             }
         };
         let __ids = match self.editor_index.get(&__k) {
@@ -2810,19 +2725,16 @@ impl PostStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.editor)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
+                    match &(__rec.editor) {
+                        Some(__v) => {
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
                             __k
                         }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                        None => String::from('\u{0}'),
                     }
                 };
                 if __rk == __k {
@@ -3090,19 +3002,14 @@ impl PostStorageReader {
         value: Uuid,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -3113,19 +3020,14 @@ impl PostStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -3142,19 +3044,16 @@ impl PostStorageReader {
         value: Option<Uuid>,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
+            match &(value) {
+                Some(__v) => {
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
                     __k
                 }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+                None => String::from('\u{0}'),
             }
         };
         let __ids = match self.editor_index.get(&__k) {
@@ -3165,19 +3064,16 @@ impl PostStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.editor)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
+                    match &(__rec.editor) {
+                        Some(__v) => {
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
                             __k
                         }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                        None => String::from('\u{0}'),
                     }
                 };
                 if __rk == __k {

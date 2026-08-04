@@ -290,19 +290,12 @@ impl UserStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(email_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(email_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.email_index)
@@ -442,19 +435,12 @@ impl UserStorage {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
@@ -498,19 +484,12 @@ impl UserStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.email_index)
@@ -558,19 +537,12 @@ impl UserStorage {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.email_index.get(&__uk) {
@@ -617,19 +589,12 @@ impl UserStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -645,19 +610,12 @@ impl UserStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.email_index)
@@ -749,19 +707,12 @@ impl UserStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -1046,19 +997,12 @@ impl UserStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(email_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(email_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.email_index)
@@ -1086,19 +1030,12 @@ impl UserStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.email)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.email);
+                            let mut __k = String::with_capacity(1 + __v.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -1122,19 +1059,12 @@ impl UserStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.email)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.email);
+                                let mut __k = String::with_capacity(1 + __v.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.email_index)
@@ -1384,19 +1314,12 @@ impl UserStorage {
     ///Index probe for `User`.`email` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_email(&self, value: &str) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1412,19 +1335,12 @@ impl UserStorage {
         value: &str,
     ) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1435,19 +1351,12 @@ impl UserStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1460,19 +1369,12 @@ impl UserStorage {
     ///Unique index probe for `User`.`email` (#90): the at-most-one live match.
     pub fn get_by_email(&self, value: &str) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = self.email_index.get(&__k)?;
@@ -1485,19 +1387,12 @@ impl UserStorage {
         value: &str,
     ) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1507,19 +1402,12 @@ impl UserStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1652,19 +1540,12 @@ impl UserStorage {
     /// param did not parse; the caller falls back to `__scan_all`.
     pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1792,19 +1673,12 @@ impl UserStorageReader {
         value: &str,
     ) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1815,19 +1689,12 @@ impl UserStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1844,19 +1711,12 @@ impl UserStorageReader {
         value: &str,
     ) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1866,19 +1726,12 @@ impl UserStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -2400,19 +2253,12 @@ impl<'db> TxHandle<'db> {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.db.user.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty())
@@ -2455,19 +2301,12 @@ impl<'db> TxHandle<'db> {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.db.user.email_index.get(&__uk) {
@@ -2901,19 +2740,12 @@ impl ConcurrentTxHandle {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.staged_unique_keys.contains(&("email", __uk.clone())) {
@@ -2968,19 +2800,12 @@ impl ConcurrentTxHandle {
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             {

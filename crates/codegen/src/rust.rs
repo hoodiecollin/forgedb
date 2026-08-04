@@ -1400,6 +1400,16 @@ impl RustGenerator {
             })
             .collect();
 
+        // `__as_str`: variant -> its NAME, the same string the serde derive
+        // produces.  The monomorphic index key (#230) needs the name as a
+        // `&'static str` without routing the value through `serde_json::Value`
+        // to get it back out of a `Value::String`.
+        let name_arms: Vec<_> = variant_idents
+            .iter()
+            .zip(enum_def.variants.iter())
+            .map(|(ident, name)| quote! { #enum_name::#ident => #name })
+            .collect();
+
         let name_str = &enum_def.name;
 
         Ok(quote! {
@@ -1414,6 +1424,15 @@ impl RustGenerator {
                 fn __to_u8(&self) -> u8 {
                     match self {
                         #(#to_arms),*
+                    }
+                }
+
+                /// This variant's NAME — identical to what the serde derive
+                /// serializes it as, so the index key (#230) and the REST / TS /
+                /// JSON representations cannot drift apart.
+                fn __as_str(&self) -> &'static str {
+                    match self {
+                        #(#name_arms),*
                     }
                 }
 
@@ -1733,8 +1752,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(Self::index_value_expr(
-                    &f.field_type,
+                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 if exclude_self {
@@ -1775,8 +1793,8 @@ impl RustGenerator {
     ///   * `?Target` FK           → `Option<Uuid>` (#100 — `None` probes unlinked rows)
     ///   * other scalar           → the (Copy) mapped type by value
     ///
-    /// The arg-side key (`index_key_expr(value)`) and record-side key
-    /// (`index_key_expr(record.field)`) must serialize identically; the `Option<_>`
+    /// The arg-side key (`index_key_expr(.., value)`) and record-side key
+    /// (`index_key_expr(.., record.field)`) must serialize identically; the `Option<_>`
     /// param types above are exactly the record field types, so both agree.
     fn index_param_type(field: &forgedb_parser::Field) -> TokenStream {
         use forgedb_parser::{FieldType, RelationType};
@@ -1796,19 +1814,6 @@ impl RustGenerator {
         }
     }
 
-    /// Canonical, **null-distinct** string key for a value expression.  A leading
-    /// tag byte encodes the JSON type class so values that stringify alike can
-    /// never collide across classes — critically `None`/`Value::Null` (`\u{0}`)
-    /// vs the literal string `"null"` (`\u{1}null`), the collision that made #90
-    /// gate nullable/optional-FK fields out (#102).  The tags:
-    ///   `\u{0}`        → JSON null (a `None` / unset optional / unlinked FK)
-    ///   `\u{1}` + raw  → JSON string (raw contents, incl. uuid hyphenated form)
-    ///   `\u{2}` + text → any other scalar (number / bool) via JSON `to_string`
-    ///   `\u{3}`        → serialization error (unreachable for scalar fields)
-    /// The key is internal to the index probes — it is NOT the value the REST
-    /// filter (`<model>_event_matches`) compares by — so tagging is free of any
-    /// cross-path constraint.  Computing it identically for the stored field value
-    /// and the probe argument is what keeps an index hit self-consistent.
     /// Pre-transform a field value expression before it is fed to `index_key_expr`,
     /// so the resulting index key is **scale-invariant** for `decimal` fields.
     ///
@@ -1829,22 +1834,207 @@ impl RustGenerator {
         }
     }
 
-    fn index_key_expr(value_expr: TokenStream) -> TokenStream {
+    /// Canonical, **null-distinct** string key for a field value expression.  A
+    /// leading tag byte encodes the JSON type class so values that stringify alike
+    /// can never collide across classes — critically `None` (`\u{0}`) vs the
+    /// literal string `"null"` (`\u{1}null`), the collision that made #90 gate
+    /// nullable/optional-FK fields out (#102).  The tags:
+    ///   `\u{0}`        → JSON null (a `None` / unset optional / unlinked FK)
+    ///   `\u{1}` + raw  → JSON string (raw contents, incl. uuid hyphenated form)
+    ///   `\u{2}` + text → any other scalar (number / bool / byte array) as JSON
+    ///
+    /// The key is internal to the index probes — it is NOT the value the REST
+    /// filter (`<model>_event_matches`) compares by — so tagging is free of any
+    /// cross-path constraint.  Computing it identically for the stored field value
+    /// and the probe argument is what keeps an index hit self-consistent.
+    ///
+    /// # Monomorphic per field type (#230)
+    ///
+    /// This used to emit one type-blind expression for every field: run the value
+    /// through `serde_json::to_value` and `match` the resulting `Value` variant.
+    /// For a `string` field that was three allocations plus a serde dispatch to
+    /// produce a key whose tag was decided at generate time — a runtime match over
+    /// `Value` variants inside *generated* code, which is the shape this project
+    /// exists to avoid.  The emission is now chosen per field type; the key bytes
+    /// are unchanged (guarded by `tests/index_key_parity_test.rs`).
+    ///
+    /// Two arms of the old match were not what they looked like:
+    ///
+    /// * `Err(_) => '\u{3}'` was **dead**.  `to_value` does not fail on a
+    ///   non-finite float — it maps NaN and ±Inf to `Value::Null`, so they took the
+    ///   `\u{0}` arm.  Preserved exactly: a NaN-valued `^f64` keys into the same
+    ///   bucket as `None`.  That is a pre-existing quirk, not one introduced here.
+    /// * `char(N)` is `[u8; N]`, which serde renders as a JSON **array**, so its
+    ///   key is `\u{2}[104,101,...]` — the `other` arm, not a string.  (It also
+    ///   could not compile at all past N = 32, since serde has no `Serialize` for
+    ///   longer arrays.  Nothing here needs `Serialize`, so that limit is gone.)
+    ///
+    /// The `value_expr` is used for BOTH the record side (`record.f`, owning) and
+    /// the probe side (the `index_param_type` argument, borrowing) — `String` vs
+    /// `&str`, `Option<String>` vs `Option<&str>`.  Binding through `&(...)` lets
+    /// deref coercion resolve both, which is why one emitted form serves each side
+    /// and no generic bound or helper function is needed.
+    fn index_key_expr(
+        field_type: &forgedb_parser::FieldType,
+        value_expr: TokenStream,
+    ) -> TokenStream {
+        use forgedb_parser::{FieldType, RelationType};
+
+        // Two distinct schema shapes both land in Rust as `Option<_>`: an explicit
+        // `T?` (`Nullable`), and an optional FK `?Target` — whose optionality lives
+        // in the RelationType, not a `Nullable` wrapper, but which `index_param_type`
+        // still types as `Option<Uuid>`.  Missing the second is a silent mis-key,
+        // so both are resolved here rather than only matching `Nullable`.
+        let optional_inner: Option<FieldType> = match field_type {
+            FieldType::Nullable(inner) => Some((**inner).clone()),
+            FieldType::Relation(RelationType::OptionalReference(_)) => Some(FieldType::Uuid),
+            _ => None,
+        };
+
+        if let Some(inner) = optional_inner {
+            // Match on `&Option<_>`, so the bound value is a reference and the
+            // inner emission is identical to the non-nullable one.
+            let some_arm = Self::index_key_body(&inner);
+            return quote! {
+                match &(#value_expr) {
+                    Some(__v) => { #some_arm }
+                    None => String::from('\u{0}'),
+                }
+            };
+        }
+
+        let body = Self::index_key_body(field_type);
         quote! {
-            match serde_json::to_value(&(#value_expr)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(#value_expr);
+                #body
             }
+        }
+    }
+
+    /// The tagged-key body for a **non-nullable** field type, with `__v` already
+    /// bound to a reference to the value.  Split out of [`index_key_expr`] so the
+    /// nullable path reuses it verbatim for its `Some` arm.
+    ///
+    /// Each arm reproduces byte-for-byte what `serde_json` produced for that type
+    /// through the pre-#230 expression; `tests/index_key_parity_test.rs` holds the
+    /// frozen legacy implementation and asserts the equality, and the shape
+    /// assertions in `codegen_snapshots.rs` pin what is emitted here.  Change one
+    /// and both must move.
+    fn index_key_body(field_type: &forgedb_parser::FieldType) -> TokenStream {
+        use forgedb_parser::{FieldType, RelationType};
+
+        match field_type {
+            // --- JSON string class (tag \u{1}) --------------------------------
+            FieldType::String => quote! {
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
+            },
+            // A uuid renders hyphenated lowercase.  `encode_lower` writes into a
+            // stack buffer, so the key costs one allocation rather than two.
+            FieldType::Uuid
+            | FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => quote! {
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
+            },
+            // `rust_decimal` serializes as a string whose contents are its
+            // `Display` form (scale-preserving — normalized upstream by
+            // `index_value_expr`), so write it straight in.
+            FieldType::Decimal => quote! {
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{1}');
+                let _ = write!(__k, "{}", __v);
+                __k
+            },
+            // The serde derive serializes an enum as its variant NAME; `__as_str`
+            // is that same name, so the two cannot drift.
+            FieldType::Enum(_) => quote! {
+                let __s = __v.__as_str();
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
+            },
+
+            // --- JSON non-string scalar class (tag \u{2}) ---------------------
+            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => quote! {
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
+            },
+            // `Timestamp` is `#[serde(transparent)]` over an i64, so its JSON form
+            // is the bare number — NOT a formatted date.
+            FieldType::Timestamp => quote! {
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v.as_seconds());
+                __k
+            },
+            FieldType::Bool => quote! {
+                let mut __k = String::with_capacity(6);
+                __k.push('\u{2}');
+                __k.push_str(if *__v { "true" } else { "false" });
+                __k
+            },
+            // Floats keep the JSON number formatter: `Display` would render 1.0 as
+            // "1" and 1e300 as "1e300", where JSON gives "1.0" and "1e+300".
+            // `from_f64` returning `None` is exactly the NaN/±Inf case that used to
+            // arrive as `Value::Null` — same `\u{0}` bucket, preserved.
+            FieldType::F64 => quote! {
+                use std::fmt::Write as _;
+                match serde_json::Number::from_f64(*__v) {
+                    Some(__n) => {
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __n);
+                        __k
+                    }
+                    None => String::from('\u{0}'),
+                }
+            },
+            // `char(N)` is `[u8; N]`, which serde renders as a JSON array.
+            FieldType::Char(_) => quote! {
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                __k.push('[');
+                for (__i, __b) in __v.iter().enumerate() {
+                    if __i > 0 {
+                        __k.push(',');
+                    }
+                    let _ = write!(__k, "{}", __b);
+                }
+                __k.push(']');
+                __k
+            },
+
+            // Not reachable for anything `indexed_fields` admits (it filters on
+            // `is_filterable_scalar` plus the two FK relations, all covered above).
+            // Falling back to the pre-#230 generic form rather than guessing keeps
+            // an unforeseen type correct-but-slow instead of silently mis-keyed.
+            _ => quote! {
+                match serde_json::to_value(__v) {
+                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
+                    Ok(serde_json::Value::String(__s)) => {
+                        let mut __k = String::from('\u{1}');
+                        __k.push_str(&__s);
+                        __k
+                    }
+                    Ok(__other) => {
+                        let mut __k = String::from('\u{2}');
+                        __k.push_str(&__other.to_string());
+                        __k
+                    }
+                    Err(_) => String::from('\u{3}'),
+                }
+            },
         }
     }
 
@@ -1865,7 +2055,7 @@ impl RustGenerator {
         } else {
             let fname = format_ident!("{}", field.name);
             let val = Self::index_value_expr(&field.field_type, quote! { #record_expr.#fname });
-            Self::index_key_expr(val)
+            Self::index_key_expr(&field.field_type, val)
         }
     }
 
@@ -1907,7 +2097,7 @@ impl RustGenerator {
             let ident = format_ident!("__ik_{}_{}", prefix, f.name);
             let fname = format_ident!("{}", f.name);
             let val = Self::index_value_expr(&f.field_type, quote! { #record_expr.#fname });
-            let key = Self::index_key_expr(val);
+            let key = Self::index_key_expr(&f.field_type, val);
             binds.push(quote! { let #ident: String = { #key }; });
             map.insert(f.name.clone(), ident);
         }
@@ -4663,9 +4853,8 @@ impl RustGenerator {
             let find_at_fn = format_ident!("find_by_{}_at", f.name);
             let params = quote! { value: #param_ty };
             let key_from_arg =
-                Self::index_key_expr(Self::index_value_expr(&f.field_type, quote! { value }));
-            let key_from_rec = Self::index_key_expr(Self::index_value_expr(
-                &f.field_type,
+                Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type, quote! { value }));
+            let key_from_rec = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                 quote! { __rec.#fname },
             ));
             let subject = format!("`{}`.`{}`", model.name, f.name);
@@ -4708,15 +4897,14 @@ impl RustGenerator {
                 .iter()
                 .map(|c| {
                     let pn = format_ident!("{}", c.name);
-                    Self::index_key_expr(Self::index_value_expr(&c.field_type, quote! { #pn }))
+                    Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type, quote! { #pn }))
                 })
                 .collect();
             let rec_keys: Vec<_> = comps
                 .iter()
                 .map(|c| {
                     let cf = format_ident!("{}", c.name);
-                    Self::index_key_expr(Self::index_value_expr(
-                        &c.field_type,
+                    Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type,
                         quote! { __rec.#cf },
                     ))
                 })
@@ -5701,7 +5889,7 @@ impl RustGenerator {
             // scan_pushdown_fields guarantees eligibility; other types are excluded.
             _ => return quote! {},
         };
-        let key = Self::index_key_expr(Self::index_value_expr(&field.field_type, key_value));
+        let key = Self::index_key_expr(&field.field_type, Self::index_value_expr(&field.field_type, key_value));
         quote! {
             /// #160 (C): resolve list candidates for this indexed field from the
             /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
@@ -6260,8 +6448,7 @@ impl RustGenerator {
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
-                        let key = Self::index_key_expr(
-                            Self::index_value_expr(&f.field_type, quote! { #val }),
+                        let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type, quote! { #val }),
                         );
                         Self::index_add_block(recv, &ident, key, &id_tok)
                     })
@@ -6280,8 +6467,7 @@ impl RustGenerator {
                         .iter()
                         .map(|c| {
                             let val = format_ident!("{}_value", c.name);
-                            Self::index_key_expr(
-                                Self::index_value_expr(&c.field_type, quote! { #val }),
+                            Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type, quote! { #val }),
                             )
                         })
                         .collect();
@@ -7998,8 +8184,7 @@ impl RustGenerator {
                     let ident = Self::index_field_ident(f);
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
-                    let key = Self::index_key_expr(Self::index_value_expr(
-                        &f.field_type,
+                    let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -8028,8 +8213,7 @@ impl RustGenerator {
                     let ident = Self::index_field_ident(f);
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
-                    let key = Self::index_key_expr(Self::index_value_expr(
-                        &f.field_type,
+                    let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -8450,8 +8634,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(Self::index_value_expr(
-                    &f.field_type,
+                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
@@ -8478,8 +8661,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(Self::index_value_expr(
-                    &f.field_type,
+                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
