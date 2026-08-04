@@ -156,7 +156,7 @@ export async function deleteRow(base: string, model: string, id: string): Promis
  * Build the JSON body for a create/replace, overlaying the editor's per-field
  * values onto a `base` row. `base` is the existing live row (for a replace, so
  * every generated struct field is present) or `{}` (for a create). Coercion is
- * by control: numbers for int/float/ts, strings for bigint/uuid/char/string,
+ * by control: numbers for int/float/ts, strings for bigint/uuid/bytes/string,
  * tri-state bool, explicit `null` for nulled scalars. Relation fields
  * (hasmany/m2m/struct) that the generated struct carries as `()`/optional are
  * passed through from `base` (or null) untouched — the inspector doesn't author
@@ -197,7 +197,7 @@ export function buildRecordBody(
       const n = Number(raw);
       out[f.name] = Number.isFinite(n) ? n : raw;
     } else {
-      // bigint/uuid/char/string/text/fk — string on the wire
+      // bigint/uuid/bytes/string/text/fk — string on the wire
       out[f.name] = raw;
     }
   }
@@ -287,7 +287,7 @@ export function liveColumns(
     .map((f) => ({
       k: f.name,
       l: f.name,
-      mono: ["uuid", "int", "bigint", "float", "ts", "char"].includes(f.control),
+      mono: ["uuid", "int", "bigint", "float", "ts", "bytes"].includes(f.control),
       rel: f.control === "fk",
     }));
 }

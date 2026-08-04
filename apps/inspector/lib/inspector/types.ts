@@ -25,7 +25,7 @@ export type FieldControl =
   | "float"
   | "bool"
   | "ts"
-  | "char"
+  | "bytes"
   | "fk"
   | "struct"
   | "hasmany"
@@ -50,7 +50,7 @@ export interface StructSubField {
 /** One field of a model, with everything a type-aware control needs. */
 export interface Field {
   name: string;
-  /** e.g. "uuid", "string", "u32", "char(8)", "*Org", "[Post]" */
+  /** e.g. "uuid", "string", "u32", "bytes(8)", "*Org", "[Post]" */
   typeLabel: string;
   mods: Mod[];
   /** semantic-only directive marker(s), e.g. "@email", "@min(0) @max(120)" */
@@ -61,7 +61,7 @@ export interface Field {
   /** int bounds from @min/@max */
   min?: number;
   max?: number;
-  /** char(N) length */
+  /** bytes(N) length */
   len?: number;
   /** timestamp (Unix ms) */
   msVal?: string;
