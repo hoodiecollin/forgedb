@@ -1,0 +1,13 @@
+{
+  "name": "forgedb-scripts",
+  "private": true,
+  "type": "module",
+  "description": "Root-level repo tooling for the ForgeDB Rust workspace (CI gates, maintenance tasks). Lives in scripts/ rather than the repo root because a root package.json is gitignored as a design-sync artifact. Deps are types only — the scripts run under bun with no install step.",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  }
+}
