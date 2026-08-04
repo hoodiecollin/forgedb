@@ -223,3 +223,13 @@ crash-test:
 ## generated `find_by_*`. Also #[ignore]d out of the fast suite (compiles a crate).
 index-key-parity:
 	cargo test --test index_key_parity_test -- --ignored --nocapture
+
+.PHONY: api-wire-test
+
+## REST wire-format proof (#229): generate + compile a real API, boot the generated
+## router in-process, and assert the exact response bytes of every read path —
+## envelope key order, record key order, projections, and the error bodies. Guards
+## the list path against silent wire changes from #226/#228. Also #[ignore]d out of
+## the fast suite (compiles a crate).
+api-wire-test:
+	cargo test --test api_wire_test -- --ignored --nocapture
