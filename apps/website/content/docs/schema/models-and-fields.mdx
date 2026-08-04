@@ -21,6 +21,15 @@ ModelName {
   fail to parse.
 - A model must contain **at least one field**. An empty `User { }` is rejected.
 - Model names must be **unique** within the schema.
+- A model must have an **identity field** — one named `id`, or any field with the
+  `+` auto-generate modifier. The convention is `id: +uuid`.
+
+<Callout type="warning" title="Identity is mandatory">
+A model without an identity field is rejected by `forgedb validate` and
+`forgedb generate`. Identity is what `create_*` writes, what the row index is
+keyed on, what relations point at, and what the record-level REST routes take as
+their path parameter — there is almost no generated surface left without it.
+</Callout>
 
 ```forge
 User {

@@ -26,6 +26,12 @@ ModelName {
 **Rules:**
 - Model name must be **PascalCase** (validated in `crates/parser/src/parser/core.rs:691-696` via `validate_model_name`)
 - Models must contain at least one field (`crates/parser/src/parser/core.rs:768`)
+- **Every model must have an identity field** — a field named `id`, or any field
+  carrying the `+` auto-generate modifier. This is fatal, not advisory (#248):
+  identity is what `create_*` writes, what the row index is keyed on, what
+  relations point at, and what three of the five REST routes take as a path
+  parameter, so there is almost no generated surface left without one. Convention
+  is `id: +uuid`
 - Field names must be **snake_case** (validated in `crates/parser/src/parser/core.rs:462-466` via `validate_field_name`)
 - Model names must be unique within schema (`crates/parser/src/parser/core.rs:814-818`)
 
