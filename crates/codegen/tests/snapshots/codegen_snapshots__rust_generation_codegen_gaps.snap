@@ -436,17 +436,10 @@ impl PlaceStorage {
         self.id_col.append_u64(record.id).expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         {
-            let encoded = match &record.description {
-                Some(s) => {
-                    let mut e = String::with_capacity(s.len() + 1);
-                    e.push('\u{1}');
-                    e.push_str(s);
-                    e
-                }
-                None => String::from('\u{0}'),
-            };
-            self.description_col
-                .append_string(&encoded)
+            match &record.description {
+                Some(s) => self.description_col.append_tagged(1u8, s),
+                None => self.description_col.append_tagged(0u8, ""),
+            }
                 .expect("Failed to append string");
         }
         {
@@ -518,17 +511,10 @@ impl PlaceStorage {
         self.id_col.append_u64(record.id).expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         {
-            let encoded = match &record.description {
-                Some(s) => {
-                    let mut e = String::with_capacity(s.len() + 1);
-                    e.push('\u{1}');
-                    e.push_str(s);
-                    e
-                }
-                None => String::from('\u{0}'),
-            };
-            self.description_col
-                .append_string(&encoded)
+            match &record.description {
+                Some(s) => self.description_col.append_tagged(1u8, s),
+                None => self.description_col.append_tagged(0u8, ""),
+            }
                 .expect("Failed to append string");
         }
         {
@@ -612,17 +598,10 @@ impl PlaceStorage {
         self.id_col.append_u64(record.id).expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         {
-            let encoded = match &record.description {
-                Some(s) => {
-                    let mut e = String::with_capacity(s.len() + 1);
-                    e.push('\u{1}');
-                    e.push_str(s);
-                    e
-                }
-                None => String::from('\u{0}'),
-            };
-            self.description_col
-                .append_string(&encoded)
+            match &record.description {
+                Some(s) => self.description_col.append_tagged(1u8, s),
+                None => self.description_col.append_tagged(0u8, ""),
+            }
                 .expect("Failed to append string");
         }
         {
@@ -733,7 +712,7 @@ impl PlaceStorage {
         }
         while self.description_col.len() < __anchor {
             self.description_col
-                .append_string(&String::from('\u{0}'))
+                .append_tagged(0u8, "")
                 .expect("Failed to backfill string column");
         }
         while self.location_col.len() < __anchor {
@@ -779,17 +758,10 @@ impl PlaceStorage {
                     .append_string(&record.name)
                     .expect("Failed to append string");
                 {
-                    let encoded = match &record.description {
-                        Some(s) => {
-                            let mut e = String::with_capacity(s.len() + 1);
-                            e.push('\u{1}');
-                            e.push_str(s);
-                            e
-                        }
-                        None => String::from('\u{0}'),
-                    };
-                    self.description_col
-                        .append_string(&encoded)
+                    match &record.description {
+                        Some(s) => self.description_col.append_tagged(1u8, s),
+                        None => self.description_col.append_tagged(0u8, ""),
+                    }
                         .expect("Failed to append string");
                 }
                 {
@@ -1045,17 +1017,10 @@ impl PlaceStorage {
         self.id_col.append_u64(record.id).expect("Failed to append to column");
         self.name_col.append_string(&record.name).expect("Failed to append string");
         {
-            let encoded = match &record.description {
-                Some(s) => {
-                    let mut e = String::with_capacity(s.len() + 1);
-                    e.push('\u{1}');
-                    e.push_str(s);
-                    e
-                }
-                None => String::from('\u{0}'),
-            };
-            self.description_col
-                .append_string(&encoded)
+            match &record.description {
+                Some(s) => self.description_col.append_tagged(1u8, s),
+                None => self.description_col.append_tagged(0u8, ""),
+            }
                 .expect("Failed to append string");
         }
         {

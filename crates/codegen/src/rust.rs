@@ -2838,21 +2838,23 @@ impl RustGenerator {
                     // round-trip distinctly (0x00 = None, 0x01 = Some), then store
                     // the serialized JSON (always valid UTF-8) as a variable-length
                     // string — the same column machinery `string` uses.
+                    //
+                    // `append_tagged` writes the tag byte and the value from their
+                    // own slices (#231), so neither arm allocates a tagged copy —
+                    // the `None` arm writes one known byte and nothing else.  The
+                    // stored bytes are identical to the concatenation this used to
+                    // build.
                     append_statements.push(quote! {
                         {
-                            let encoded = match &record.#field_name {
+                            match &record.#field_name {
                                 Some(v) => {
                                     let s = serde_json::to_string(v)
                                         .expect("Failed to serialize json");
-                                    let mut e = String::with_capacity(s.len() + 1);
-                                    e.push('\u{1}');
-                                    e.push_str(&s);
-                                    e
+                                    self.#field_col_name.append_tagged(1u8, &s)
                                 }
-                                None => String::from('\u{0}'),
-                            };
-                            self.#field_col_name.append_string(&encoded)
-                                .expect("Failed to append string");
+                                None => self.#field_col_name.append_tagged(0u8, ""),
+                            }
+                            .expect("Failed to append string");
                         }
                     });
                 } else {
@@ -2871,19 +2873,18 @@ impl RustGenerator {
                     // 1-byte presence tag so `None` and `Some("")` round-trip
                     // distinctly (0x00 = None, 0x01 = Some), then store as an
                     // ordinary variable-length string.
+                    //
+                    // `append_tagged` writes the tag byte and the value from their
+                    // own slices (#231), so the `Some` arm no longer allocates and
+                    // copies the whole string just to prepend a byte, and the
+                    // `None` arm allocates nothing at all.  Stored bytes unchanged.
                     append_statements.push(quote! {
                         {
-                            let encoded = match &record.#field_name {
-                                Some(s) => {
-                                    let mut e = String::with_capacity(s.len() + 1);
-                                    e.push('\u{1}');
-                                    e.push_str(s);
-                                    e
-                                }
-                                None => String::from('\u{0}'),
-                            };
-                            self.#field_col_name.append_string(&encoded)
-                                .expect("Failed to append string");
+                            match &record.#field_name {
+                                Some(s) => self.#field_col_name.append_tagged(1u8, s),
+                                None => self.#field_col_name.append_tagged(0u8, ""),
+                            }
+                            .expect("Failed to append string");
                         }
                     });
                 } else {
@@ -3200,9 +3201,10 @@ impl RustGenerator {
             let col = format_ident!("{}_col", field.name);
             if Self::is_json_type(&field.field_type) {
                 let one = if field.is_nullable() {
-                    // Nullable json: the 1-byte presence tag `\u{0}` = None.
+                    // Nullable json: the 1-byte presence tag `0x00` = None (#231 —
+                    // one known byte, no allocation).
                     quote! {
-                        self.#col.append_string(&String::from('\u{0}'))
+                        self.#col.append_tagged(0u8, "")
                             .expect("Failed to backfill json column");
                     }
                 } else {
@@ -3232,9 +3234,10 @@ impl RustGenerator {
                 out.push((col, one));
             } else if Self::is_string_type(&field.field_type) {
                 let one = if field.is_nullable() {
-                    // Nullable string: the 1-byte presence tag `\u{0}` = None.
+                    // Nullable string: the 1-byte presence tag `0x00` = None (#231 —
+                    // one known byte, no allocation).
                     quote! {
-                        self.#col.append_string(&String::from('\u{0}'))
+                        self.#col.append_tagged(0u8, "")
                             .expect("Failed to backfill string column");
                     }
                 } else {
