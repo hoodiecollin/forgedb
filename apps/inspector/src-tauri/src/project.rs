@@ -314,16 +314,24 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
     }
 }
 
+/// Render one directive argument for display, in the spelling it was written in —
+/// a named argument reads `min: 3`, not a bare `3` (#235), so the inspector shows
+/// the same thing the schema says.
+fn render_param(p: &ConstraintParam) -> String {
+    match p {
+        ConstraintParam::Number(n) => n.to_string(),
+        ConstraintParam::String(s) => s.clone(),
+        ConstraintParam::Named { name, value } => format!("{name}: {}", render_param(value)),
+    }
+}
+
 fn directive_dto(c: &Constraint) -> DirectiveDto {
     DirectiveDto {
         name: c.name.clone(),
         params: c
             .params
             .iter()
-            .map(|p| match p {
-                ConstraintParam::Number(n) => n.to_string(),
-                ConstraintParam::String(s) => s.clone(),
-            })
+            .map(|p| render_param(p))
             .collect(),
     }
 }

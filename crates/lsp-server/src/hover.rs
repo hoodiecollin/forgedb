@@ -133,7 +133,7 @@ fn get_directive_info(directive_name: &str) -> Option<String> {
         "min" => "**@min(value)** — Minimum value or length\n\n```\nage: u32 @min(0)\n```",
         "max" => "**@max(value)** — Maximum value or length\n\n```\nage: u32 @max(150)\n```",
         "pattern" | "regex" => "**@pattern(\"…\")** — Regex validation (ENFORCED)\n\nRejects non-matching values at runtime (422). `@regex` is an alias.\n\n```\nphone: string @pattern(\"^\\\\+?[1-9]\\\\d{1,14}$\")\n```",
-        "length" => "**@length(n)** — String length\n\n```\nzipcode: string @length(5)\n```",
+        "length" => "**@length(…)** — String length in characters (ENFORCED)\n\nRejects out-of-range values at runtime (422).\n\n- `@length(min: n)` — at least n\n- `@length(max: n)` — at most n\n- `@length(min: a, max: b)` / `@length(a, b)` — between a and b\n- `@length(n)` — **exactly** n\n\n```\nslug: string @length(min: 3, max: 64)\nzipcode: string @length(5)\n```",
         "index" => "**@index(a, b, …)** — Composite index (model level)\n\n```\n@index(user, created_at)\n```",
         "on_delete" => "**@on_delete(action)** — Foreign-key on-delete behavior (ENFORCED)\n\n- `restrict` (default) — refuse deleting a referenced parent (409)\n- `cascade` — recursively delete children\n- `set_null` — null the FK (optional FKs only)\n\n```\nauthor: *User @on_delete(cascade)\n```",
         "fulltext" => "**@fulltext** — Full-text marker (semantic-only)\n\nRecorded on the field; no full-text engine is generated today.",
