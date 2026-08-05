@@ -219,7 +219,7 @@ Order {
 |------------------------|-----------------|---------------------|------------------------------------------|------------------------------|
 | `@min`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Minimum value — **ENFORCED** (violation → 422)     | `age: u32 @min(13)` |
 | `@max`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Maximum value — **ENFORCED** (violation → 422). *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)` |
-| `@length`              | `(min, max)` or `(count)` | `string`  | String length — **ENFORCED** (violation → 422)     | `name: string @length(1, 100)` |
+| `@length`              | `(min: n)`, `(max: n)`, `(min: a, max: b)`, `(a, b)`, or `(n)` | `string` | String length in **characters** — **ENFORCED** (violation → 422). See the table below — single-arg `@length(n)` means **exactly** n. | `name: string @length(min: 1, max: 100)` |
 | `@email`               | (none)          | `string`            | Email format — **ENFORCED** (violation → 422)      | `email: string @email` |
 | `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
 | `@pattern`             | `(regex_string)` | `string`           | Regex match — **ENFORCED** via `LazyLock<Regex>` (non-match → 422) | `phone: string @pattern("^[0-9]+$")` |
@@ -238,6 +238,26 @@ Order {
 |------------------------|-----------------|--------------------------------------------------|------------------------------|
 | `@soft_delete`         | (none)          | Enable soft delete                   | `@soft_delete` in model block |
 | `@index`               | `(field1, field2, ...)` | Composite index on multiple fields | `@index(user_id, created_at)` |
+
+> **`@length` spellings.** The bound is in **characters** (`chars().count()`), not bytes.
+> `min`/`max` may be given in either order, and either alone.
+>
+> | written | means |
+> |---|---|
+> | `@length(min: 3)` | at least 3 — a floor with no ceiling |
+> | `@length(max: 20)` | at most 20 |
+> | `@length(min: 3, max: 64)` | between 3 and 64 |
+> | `@length(3, 5)` | between 3 and 5 — the positional pair, unchanged |
+> | `@length(5)` | **exactly** 5 |
+>
+> Mixing positional and named arguments, repeating a name, using a name other than
+> `min`/`max`, or writing a `min` above the `max` are all parse errors.
+>
+> **Single-arg `@length(n)` changed meaning.** It previously meant *at most* n; it now
+> means *exactly* n, and the parser emits a warning saying so. Write `@length(max: n)`
+> to keep the old behavior. This is a 0.x breaking change: the old spelling still
+> parses and still compiles, so a field that accepted shorter values starts returning
+> 422 — the warning is the only signal.
 
 > **Quoted string literals.** Directive arguments accept **quoted string literals** in addition
 > to numbers and bare identifiers. `@pattern("^[0-9]+$")`, `@regex("...")`, and `@default("text")`
@@ -660,7 +680,7 @@ The rules in this reference are grounded in the parser and validator source:
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
 3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
-5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only), `@length` (string length), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
+5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable
