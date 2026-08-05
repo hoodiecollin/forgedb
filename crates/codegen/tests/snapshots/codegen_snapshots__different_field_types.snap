@@ -173,6 +173,9 @@ pub struct ComplexModelScanRef<'a> {
     pub price: f64,
     pub active: bool,
     pub created_at: Timestamp,
+    /// #250: anchors `'a` for a view whose every field is fixed-size.
+    /// Zero-sized — the struct's layout is unchanged.
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
 ///Storage for ComplexModel model
 pub struct ComplexModelStorage {
@@ -1340,6 +1343,7 @@ impl ComplexModelStorage {
                 price: price_value,
                 active: active_value,
                 created_at: created_at_value,
+                __borrow: ::std::marker::PhantomData,
             };
             if keep(&__row_ref) {
                 __refs.push(__row_ref);

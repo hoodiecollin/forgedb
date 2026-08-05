@@ -5498,11 +5498,32 @@ impl RustGenerator {
              a `&` in a closure argument).",
             model.name
         );
+        // #250: `'a` exists so `string` fields can borrow out of the buffered span.
+        // A model whose every scan field is fixed-size — any pure join/link row:
+        // identity, timestamps, foreign keys, no string — leaves it with nothing to
+        // attach to, and `error[E0392]: lifetime parameter 'a is never used` makes
+        // the generated crate fail to build.  A zero-sized `PhantomData` anchors it.
+        //
+        // Anchoring rather than emitting the lifetime conditionally is deliberate:
+        // every use site (here and in `api.rs`) names the view as `#ident<'_>`, so
+        // dropping the parameter would break all of them and force this predicate
+        // across the module boundary.  `PhantomData<&'a ()>` — the shared-reference
+        // form, so the view stays covariant over `'a` exactly as the real borrows
+        // are; `&'a mut ()` would make it invariant and reject sound callers.
+        let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields) {
+            None => quote! {},
+            Some(anchor) => quote! {
+                /// #250: anchors `'a` for a view whose every field is fixed-size.
+                /// Zero-sized — the struct's layout is unchanged.
+                pub #anchor: ::std::marker::PhantomData<&'a ()>,
+            },
+        };
         let ref_struct_tokens = quote! {
             #[doc = #ref_doc]
             #[derive(Debug, Clone)]
             pub struct #scan_ref_ident<'a> {
                 #(#ref_field_decls,)*
+                #ref_borrow_anchor
             }
         };
 
@@ -5519,6 +5540,31 @@ impl RustGenerator {
             #(#pushdown)*
         };
         (ref_struct_tokens, methods)
+    }
+
+    /// The name of the #250 lifetime anchor for a scan view, or `None` when the
+    /// view already borrows and needs no anchor.
+    ///
+    /// Whether an anchor is needed mirrors [`Self::scan_ref_field_type`] exactly:
+    /// `string` is the only scan type that borrows (`&'a str` / `Option<&'a str>`);
+    /// every other filterable type is owned and fixed-size.  A view with no
+    /// borrowing field has nothing to attach `'a` to and will not compile without
+    /// the anchor.
+    ///
+    /// The name is *derived* rather than fixed because `.forge` field names are
+    /// only required to be snake_case — `__borrow: u32` is a legal field, and on a
+    /// string-free model a hardcoded anchor would collide with it and emit the
+    /// field twice.  Underscores are appended until the name is free, so the two
+    /// emission sites agree by construction.
+    fn scan_ref_anchor(fields: &[&forgedb_parser::Field]) -> Option<proc_macro2::Ident> {
+        if fields.iter().any(|f| Self::is_string_type(&f.field_type)) {
+            return None;
+        }
+        let mut name = String::from("__borrow");
+        while fields.iter().any(|f| f.name == name) {
+            name.push('_');
+        }
+        Some(format_ident!("{}", name))
     }
 
     /// The borrowed scan-view type for one scan field (#224): `string` becomes
@@ -5607,6 +5653,13 @@ impl RustGenerator {
             }
         }
 
+        // #250: initialize the lifetime anchor iff the struct declares one.  Same
+        // derivation as the emission site, so the name cannot drift apart from it.
+        let ref_borrow_init = match Self::scan_ref_anchor(fields) {
+            None => quote! {},
+            Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
+        };
+
         quote! {
             /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
             /// endpoint's and live query's single scan entry point.
@@ -5673,7 +5726,8 @@ impl RustGenerator {
                 for __slot in 0..__n {
                     #(#buf_read_stmts)*
                     let __row_ref = #ref_ident {
-                        #(#buf_field_values),*
+                        #(#buf_field_values,)*
+                        #ref_borrow_init
                     };
                     if keep(&__row_ref) {
                         __refs.push(__row_ref);
