@@ -73,7 +73,7 @@ default = []
 lsp = ["dep:forgedb-lsp-server"]
 
 [dependencies]
-forgedb-parser = { path = "crates/parser", version = "0.3.0" }
+forgedb-parser = { path = "crates/parser", version = "0.4.0" }
 forgedb-codegen = { path = "crates/codegen", version = "0.3.0" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.1" }
 forgedb-migrations = { path = "crates/migrations", version = "0.2.0" }
@@ -93,7 +93,7 @@ toml = "0.8"
 ctrlc = "3.4"
 
 [dev-dependencies]
-forgedb-parser = { path = "crates/parser", version = "0.3.0" }
+forgedb-parser = { path = "crates/parser", version = "0.4.0" }
 forgedb-validation = { path = "crates/validation", version = "0.3.0" }
 forgedb-lsp-server = { path = "crates/lsp-server", version = "0.1.1" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.1" }
