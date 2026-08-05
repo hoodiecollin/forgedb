@@ -274,7 +274,9 @@ serialized as the variant-name string, filterable/sortable (declaration order)/i
 one-to-many, `*Model` required FK, `?Model` optional FK, bidirectional `[..]`/`[..]` = many-to-many; `[type; N]`
 fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives — **the validating
 ones are `@min @max @length @email @url @pattern`/`@regex`, all ENFORCED** (violation → 422; `@length` counts
-**chars**, not bytes; `@pattern` is a per-field `LazyLock<Regex>`, #104). **Semantic-only markers** (parsed, carried,
+**chars**, not bytes, and takes named args — `@length(min: a, max: b)`, either alone, or positional `(a, b)`;
+single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
+#104). **Semantic-only markers** (parsed, carried,
 never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
 modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
