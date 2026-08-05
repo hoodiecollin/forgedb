@@ -7080,6 +7080,82 @@ Owner {
     );
 }
 
+/// #235: `@length` takes named `min:`/`max:` arguments, and single-arg `@length(N)`
+/// now means an EXACT length.
+///
+/// Five spellings, five distinct emitted checks. The single-arg change is the one
+/// that matters most here: it used to emit `> N` and now emits `!= N`, a narrowing
+/// that no other layer would catch — the schema still parses and the crate still
+/// compiles, so this assertion and the parser's warning are the whole safety net.
+#[test]
+fn test_rust_generation_length_named_args() {
+    let src = r#"
+Doc {
+  id: +uuid
+  floor: string @length(min: 3)
+  ceiling: string @length(max: 20)
+  both: string @length(min: 3, max: 64)
+  positional: string @length(3, 5)
+  exact: string @length(7)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // min only — a floor with no ceiling, which was inexpressible before #235.
+    assert!(
+        flat.contains("if__v.chars().count()<3i64asusize"),
+        "`@length(min: 3)` emits a floor check.\nGot: {code}"
+    );
+    assert!(
+        !flat.contains(r#""floor",message:"lengthmustbe<=3""#),
+        "`@length(min: 3)` must NOT be read as a maximum"
+    );
+
+    // max only — the new spelling for what `@length(20)` used to mean.
+    assert!(
+        flat.contains("if__v.chars().count()>20i64asusize"),
+        "`@length(max: 20)` emits a ceiling check"
+    );
+
+    // Both, named and positional, emit the same range check.
+    assert!(
+        flat.contains("__len<3i64asusize||__len>64i64asusize"),
+        "`@length(min: 3, max: 64)` emits a range check"
+    );
+    assert!(
+        flat.contains("__len<3i64asusize||__len>5i64asusize"),
+        "`@length(3, 5)` is unchanged — still min, max"
+    );
+
+    // The breaking one: exactly N, not at most N.
+    assert!(
+        flat.contains("if__v.chars().count()!=7i64asusize"),
+        "`@length(7)` now emits an EQUALITY check (#235)"
+    );
+    assert!(
+        !flat.contains("if__v.chars().count()>7i64asusize"),
+        "`@length(7)` must no longer emit the old `> 7` maximum check"
+    );
+
+    // The messages are what a 422 body shows, so they have to say which rule
+    // rejected the value rather than all reading "length must be ...".
+    for msg in [
+        "lengthmustbe>=3",
+        "lengthmustbe<=20",
+        "lengthmustbebetween3and64",
+        "lengthmustbebetween3and5",
+        "lengthmustbeexactly7",
+    ] {
+        assert!(
+            flat.contains(msg),
+            "each spelling reports its own rule — missing {msg}"
+        );
+    }
+}
+
 /// #243: an array past serde's `[T; N]` ceiling (N = 32) must still generate code
 /// that compiles.
 ///

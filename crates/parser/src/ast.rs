@@ -7,6 +7,15 @@ use forgedb_validation::Position;
 pub enum ConstraintParam {
     Number(i64),
     String(String),
+    /// A named argument, `name: value` (#235) — as in `@length(min: 3, max: 64)`.
+    ///
+    /// The value is boxed rather than fixed to `i64` so a future value kind (a
+    /// float, for the fractional numeric bounds of #239) composes here without a
+    /// second grammar pass over the parameter loop.
+    Named {
+        name: String,
+        value: Box<ConstraintParam>,
+    },
 }
 
 /// Constraint directive (e.g., @min(10), @email)

@@ -1880,6 +1880,19 @@ impl RustGenerator {
             .collect()
     }
 
+    /// The value of a named numeric param, `@d(name: 3)` (#235).
+    fn constraint_named_number(c: &forgedb_parser::ast::Constraint, want: &str) -> Option<i64> {
+        c.params.iter().find_map(|p| match p {
+            forgedb_parser::ast::ConstraintParam::Named { name, value } if name == want => {
+                match value.as_ref() {
+                    forgedb_parser::ast::ConstraintParam::Number(n) => Some(*n),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
     /// The first string param of a constraint (`@pattern("...")`/`@default("...")`).
     fn constraint_first_string(c: &forgedb_parser::ast::Constraint) -> Option<&str> {
         c.params.iter().find_map(|p| match p {
@@ -1942,31 +1955,83 @@ impl RustGenerator {
                                 });
                             }
                         }
+                        // `@length` (#235).  Five spellings, and the bound's unit is
+                        // characters (`chars().count()`, not bytes) for `string`.
+                        //
+                        //   @length(min: n)        -> at least n
+                        //   @length(max: n)        -> at most n
+                        //   @length(min: a, max: b)-> between a and b
+                        //   @length(a, b)          -> between a and b  (unchanged)
+                        //   @length(n)             -> EXACTLY n        (was: at most n)
+                        //
+                        // The single-arg meaning change is invisible everywhere else —
+                        // it parses and compiles either way — so the parser emits a
+                        // one-release warning naming both replacement spellings.
+                        // Argument names are validated in the parser, so anything
+                        // reaching here is well-formed.
                         "length" if is_string => {
+                            let named_min = Self::constraint_named_number(c, "min");
+                            let named_max = Self::constraint_named_number(c, "max");
                             let nums = Self::constraint_numbers(c);
-                            if nums.len() == 1 {
-                                let max = nums[0];
-                                let msg = format!("length must be <= {max}");
-                                checks.push(quote! {
-                                    if __v.chars().count() > #max as usize {
-                                        return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "length",
-                                            message: #msg.to_string(),
-                                        });
-                                    }
-                                });
+
+                            let (min, max, exact) = if named_min.is_some() || named_max.is_some() {
+                                (named_min, named_max, None)
+                            } else if nums.len() == 1 {
+                                (None, None, Some(nums[0]))
                             } else if nums.len() >= 2 {
-                                let (min, max) = (nums[0], nums[1]);
-                                let msg = format!("length must be between {min} and {max}");
-                                checks.push(quote! {
-                                    let __len = __v.chars().count();
-                                    if __len < #min as usize || __len > #max as usize {
-                                        return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "length",
-                                            message: #msg.to_string(),
-                                        });
-                                    }
-                                });
+                                (Some(nums[0]), Some(nums[1]), None)
+                            } else {
+                                (None, None, None)
+                            };
+
+                            match (min, max, exact) {
+                                (_, _, Some(n)) => {
+                                    let msg = format!("length must be exactly {n}");
+                                    checks.push(quote! {
+                                        if __v.chars().count() != #n as usize {
+                                            return Err(ValidationError::Constraint {
+                                                field: #fname_str, rule: "length",
+                                                message: #msg.to_string(),
+                                            });
+                                        }
+                                    });
+                                }
+                                (Some(min), Some(max), None) => {
+                                    let msg =
+                                        format!("length must be between {min} and {max}");
+                                    checks.push(quote! {
+                                        let __len = __v.chars().count();
+                                        if __len < #min as usize || __len > #max as usize {
+                                            return Err(ValidationError::Constraint {
+                                                field: #fname_str, rule: "length",
+                                                message: #msg.to_string(),
+                                            });
+                                        }
+                                    });
+                                }
+                                (Some(min), None, None) => {
+                                    let msg = format!("length must be >= {min}");
+                                    checks.push(quote! {
+                                        if __v.chars().count() < #min as usize {
+                                            return Err(ValidationError::Constraint {
+                                                field: #fname_str, rule: "length",
+                                                message: #msg.to_string(),
+                                            });
+                                        }
+                                    });
+                                }
+                                (None, Some(max), None) => {
+                                    let msg = format!("length must be <= {max}");
+                                    checks.push(quote! {
+                                        if __v.chars().count() > #max as usize {
+                                            return Err(ValidationError::Constraint {
+                                                field: #fname_str, rule: "length",
+                                                message: #msg.to_string(),
+                                            });
+                                        }
+                                    });
+                                }
+                                (None, None, None) => {}
                             }
                         }
                         "email" if is_string => {

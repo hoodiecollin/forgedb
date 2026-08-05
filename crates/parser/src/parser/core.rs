@@ -365,7 +365,9 @@ impl Parser {
         // Expect @
         self.expect(Token::At)?;
 
-        // Parse constraint name
+        // Parse constraint name.  Anchor any diagnostic at the directive name, not
+        // wherever the parameter list happens to end (#235).
+        let constraint_position = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => {
@@ -391,8 +393,35 @@ impl Parser {
                         self.advance();
                     }
                     Token::Ident(s) => {
-                        constraint = constraint.with_param(ConstraintParam::String(s.clone()));
+                        let ident = s.clone();
                         self.advance();
+                        // `name: value` (#235).  The colon-in-directive grammar
+                        // already exists for `@projection(name: a, b)`, but that is
+                        // parsed by a bespoke routine; this generalizes it to the
+                        // shared parameter loop so any directive can take named args.
+                        // Whether a given directive *accepts* them is a per-directive
+                        // question, checked after the loop.
+                        if matches!(self.current_token(), Token::Colon) {
+                            self.advance();
+                            let value = match self.current_token() {
+                                Token::Number(n) => ConstraintParam::Number(*n),
+                                Token::Str(s) => ConstraintParam::String(s.clone()),
+                                Token::Ident(s) => ConstraintParam::String(s.clone()),
+                                other => {
+                                    return Err(format!(
+                                        "Expected a value after '{ident}:' in constraint \
+                                         parameters, found {other:?}"
+                                    ))
+                                }
+                            };
+                            self.advance();
+                            constraint = constraint.with_param(ConstraintParam::Named {
+                                name: ident,
+                                value: Box::new(value),
+                            });
+                        } else {
+                            constraint = constraint.with_param(ConstraintParam::String(ident));
+                        }
                     }
                     Token::Str(s) => {
                         constraint = constraint.with_param(ConstraintParam::String(s.clone()));
@@ -432,7 +461,107 @@ impl Parser {
             }
         }
 
+        if constraint.name == "length" {
+            self.check_length_constraint(&constraint, constraint_position)?;
+        }
+
         Ok(constraint)
+    }
+
+    /// Validate `@length`'s arguments and warn on the single-arg meaning change
+    /// (#235).
+    ///
+    /// This lives in the parser because it is where the argument *names* are known.
+    /// The codegen side filters parameters it does not recognize, so an unchecked
+    /// `@length(foo: 3)` would silently produce a field with no bound at all — a
+    /// constraint the schema declares and the database does not enforce. Rejecting
+    /// it here is the difference between a typo being caught and being ignored.
+    ///
+    /// The accepted surface:
+    ///
+    /// | spelling | meaning |
+    /// |---|---|
+    /// | `@length(min: n)` | at least n |
+    /// | `@length(max: n)` | at most n |
+    /// | `@length(min: a, max: b)` | between a and b |
+    /// | `@length(a, b)` | between a and b — unchanged |
+    /// | `@length(n)` | **exactly** n — changed from "at most n" |
+    fn check_length_constraint(
+        &mut self,
+        constraint: &Constraint,
+        position: Option<Position>,
+    ) -> Result<(), String> {
+        let named: Vec<(&str, &ConstraintParam)> = constraint
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                ConstraintParam::Named { name, value } => Some((name.as_str(), value.as_ref())),
+                _ => None,
+            })
+            .collect();
+
+        if named.is_empty() {
+            // Positional.  Only the single-arg form changed meaning; the pair is
+            // kept first-class and says nothing.
+            if constraint.params.len() == 1
+                && matches!(constraint.params[0], ConstraintParam::Number(_))
+            {
+                let ConstraintParam::Number(n) = constraint.params[0] else {
+                    unreachable!("guarded by the matches! above")
+                };
+                self.warn(
+                    format!(
+                        "`@length({n})` now means an EXACT length of {n}; it previously meant a \
+                         maximum of {n}. Write `@length(max: {n})` to keep the old meaning, or \
+                         `@length({n})` deliberately to require exactly {n}."
+                    ),
+                    position,
+                    Some(format!("@length(max: {n})")),
+                );
+            }
+            return Ok(());
+        }
+
+        if named.len() != constraint.params.len() {
+            return Err(
+                "@length takes either positional numbers or named arguments, not both — \
+                 write `@length(min: a, max: b)`"
+                    .to_string(),
+            );
+        }
+
+        let (mut min, mut max) = (None, None);
+        for (name, value) in named {
+            let slot = match name {
+                "min" => &mut min,
+                "max" => &mut max,
+                other => {
+                    return Err(format!(
+                        "Unknown @length argument `{other}` — the accepted names are `min` and \
+                         `max`, as in `@length(min: 3, max: 64)`"
+                    ))
+                }
+            };
+            let ConstraintParam::Number(n) = value else {
+                return Err(format!(
+                    "@length argument `{name}` must be a number, as in `@length({name}: 20)`"
+                ));
+            };
+            if slot.is_some() {
+                return Err(format!("duplicate @length argument `{name}`"));
+            }
+            *slot = Some(*n);
+        }
+
+        if let (Some(lo), Some(hi)) = (min, max)
+            && lo > hi
+        {
+            return Err(format!(
+                "@length min ({lo}) is greater than max ({hi}) — no value can satisfy it"
+            ));
+        }
+
+        Ok(())
     }
 
     fn parse_type(&mut self) -> Result<FieldType, String> {
@@ -1663,6 +1792,195 @@ mod tests {
             cons[1].params,
             vec![ConstraintParam::Number(3), ConstraintParam::Number(3)]
         );
+    }
+
+    // ---- #235: named `@length` arguments -------------------------------------
+    //
+    // The accepted surface (decided on the issue 2026-08-03):
+    //
+    //   @length(min: 1)          min only  — inexpressible before this
+    //   @length(max: 20)         max only  — the new spelling for the old @length(20)
+    //   @length(min: 3, max: 5)  both
+    //   @length(3, 5)            min 3, max 5 — UNCHANGED, kept first-class
+    //   @length(3)               EXACT (min = max = 3) — a BREAKING meaning change
+    //
+    // The single-arg change is silent at every other layer — it still parses, still
+    // compiles, and only shows up as a 422 at write time — so the warning is the
+    // only signal a reader gets. That is why it is asserted here, not just the shape.
+
+    /// The named form reaches the AST as `Named`, in each combination.
+    #[test]
+    fn length_accepts_named_arguments() {
+        for (src_args, expected) in [
+            (
+                "min: 1",
+                vec![ConstraintParam::Named {
+                    name: "min".to_string(),
+                    value: Box::new(ConstraintParam::Number(1)),
+                }],
+            ),
+            (
+                "max: 20",
+                vec![ConstraintParam::Named {
+                    name: "max".to_string(),
+                    value: Box::new(ConstraintParam::Number(20)),
+                }],
+            ),
+            (
+                "min: 3, max: 64",
+                vec![
+                    ConstraintParam::Named {
+                        name: "min".to_string(),
+                        value: Box::new(ConstraintParam::Number(3)),
+                    },
+                    ConstraintParam::Named {
+                        name: "max".to_string(),
+                        value: Box::new(ConstraintParam::Number(64)),
+                    },
+                ],
+            ),
+            // Order is preserved but not required — `max:` first is equally valid.
+            (
+                "max: 64, min: 3",
+                vec![
+                    ConstraintParam::Named {
+                        name: "max".to_string(),
+                        value: Box::new(ConstraintParam::Number(64)),
+                    },
+                    ConstraintParam::Named {
+                        name: "min".to_string(),
+                        value: Box::new(ConstraintParam::Number(3)),
+                    },
+                ],
+            ),
+        ] {
+            let src = format!(
+                "Thing {{\n  id: +uuid\n  name: string @length({src_args})\n}}\n"
+            );
+            let mut parser = Parser::new(&src).unwrap();
+            let schema = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("`@length({src_args})` must parse: {e}"));
+            let cons = field_constraints(&schema, "Thing", "name");
+            assert_eq!(cons[0].params, expected, "for `@length({src_args})`");
+            assert!(
+                parser.warnings().is_empty(),
+                "the named form is the recommended spelling and must be silent: {:?}",
+                parser.warnings()
+            );
+        }
+    }
+
+    /// Two-arg positional is kept first-class, not deprecated: same AST as before,
+    /// and no warning.
+    #[test]
+    fn length_positional_pair_is_unchanged_and_silent() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(3, 5)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        let cons = field_constraints(&schema, "Thing", "name");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::Number(3), ConstraintParam::Number(5)]
+        );
+        assert!(
+            parser.warnings().is_empty(),
+            "the positional pair keeps working with no diagnostic: {:?}",
+            parser.warnings()
+        );
+    }
+
+    /// Single-arg `@length(N)` changed meaning from `max: N` to exact `N`. It still
+    /// parses, so the warning is the only thing that tells a reader their field's
+    /// validation just narrowed.
+    #[test]
+    fn length_single_arg_warns_that_it_now_means_exact() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(20)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let schema = parser.parse().expect("it must still parse");
+        let cons = field_constraints(&schema, "Thing", "name");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::Number(20)],
+            "the AST is unchanged — the meaning moved, not the shape"
+        );
+
+        let warnings = parser.take_warnings();
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        let w = &warnings[0];
+        assert!(w.is_warning(), "a meaning change is not a parse error");
+        // Both replacement spellings must be named: one to keep the old behavior,
+        // one to adopt the new. A warning that only says "this changed" leaves the
+        // reader to guess which way to go.
+        assert!(
+            w.message.contains("max: 20"),
+            "the warning must name the spelling that preserves the old meaning: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("exact"),
+            "the warning must say what it means now: {}",
+            w.message
+        );
+        assert!(w.position.is_some(), "the diagnostic is anchored in the source");
+    }
+
+    /// The named form is validated at parse time, where the argument names are
+    /// known. Each of these would otherwise be silently dropped by the codegen
+    /// filter and produce a field with no bound at all.
+    #[test]
+    fn length_rejects_malformed_named_arguments() {
+        for (args, expected_fragment) in [
+            ("foo: 3", "min"),
+            ("min: 1, min: 2", "duplicate"),
+            ("min: 5, max: 3", "min"),
+            ("1, max: 2", "positional"),
+            ("min: \"x\"", "number"),
+        ] {
+            let src = format!(
+                "Thing {{\n  id: +uuid\n  name: string @length({args})\n}}\n"
+            );
+            let err = Parser::new(&src)
+                .unwrap()
+                .parse()
+                .expect_err(&format!("`@length({args})` must be rejected"));
+            assert!(
+                err.to_lowercase().contains(expected_fragment),
+                "`@length({args})` error should mention {expected_fragment:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The colon grammar must also work on the recovering path the LSP uses — that
+    /// path re-enters the same parameter loop, so a form that parses in one and not
+    /// the other would show as a phantom editor diagnostic on valid source.
+    #[test]
+    fn length_named_arguments_survive_parse_recover() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(min: 3, max: 64)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let parsed = parser.parse_recover();
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.is_warning()),
+            "valid source must produce no errors on the recovering path: {:?}",
+            parsed.diagnostics
+        );
+        let cons = field_constraints(&parsed.schema, "Thing", "name");
+        assert_eq!(cons[0].params.len(), 2, "both named args survive recovery");
     }
 
     #[test]
