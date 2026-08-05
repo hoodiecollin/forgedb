@@ -115,11 +115,13 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 ### Query capability
 - Scalar / foreign-key / composite (`@index(a, b)`) indexes are **hash
   exact-match** — they answer `field = value` and `a = ? AND b = ?`, not prefix
-  matches. Ordered-eligible fields (`u32`/`u64`/`i32`/`i64`/`timestamp`/`decimal`)
-  *additionally* get a parallel ordered (BTreeMap) index, so they answer range and
-  top-N queries via `find_by_<field>_range(min, max, descending, limit)`. Still
-  deferred: prefix search, `f64`/nullable ordered indexes, and the snapshot (`_at`)
-  ordered form. Many-to-many junction lookups are still linear scans (and
+  matches. Ordered-eligible fields
+  (`u32`/`u64`/`i32`/`i64`/`f64`/`timestamp`/`decimal`) *additionally* get a
+  parallel ordered (BTreeMap) index, so they answer range and top-N queries via
+  `find_by_<field>_range(min, max, descending, limit)`. `f64` is keyed by its IEEE
+  754 total-order encoding, which orders `-Inf < finite < +Inf < NaN` and folds
+  `-0.0` into `0.0`. Still deferred: prefix search, nullable ordered indexes, and
+  the snapshot (`_at`) ordered form. Many-to-many junction lookups are still linear scans (and
   `unlink_<a>_<b>` / `unlink_all_*` is likewise a linear junction scan).
 
 ### Operations

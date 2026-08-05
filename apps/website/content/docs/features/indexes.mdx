@@ -109,8 +109,8 @@ string `"null"`.
 
 Hash indexes are exact-match only. For **ordered range and top-N** queries, an
 ordered-eligible non-nullable indexed field also gets a parallel ordered (B-tree) index keyed
-by the typed value. Eligible types are the `Ord` keys: `u32`, `u64`, `i32`, `i64`,
-`timestamp`, and `decimal`.
+by the typed value. Eligible types: `u32`, `u64`, `i32`, `i64`, `f64`, `timestamp`, and
+`decimal`.
 
 ```forge
 Post {
@@ -127,8 +127,10 @@ let top = db.post.find_by_views_range(Some(100), None, /* descending */ true, /*
 ```
 
 <Callout type="note" title="Ordered-index exclusions">
-`f64` is excluded (no clean total order). **Nullable** ordered indexes are deferred. Decimal
-keys are normalized (scale-invariant), so `1.0` and `1.00` share a bucket.
+**Nullable** ordered indexes are deferred. Decimal keys are normalized (scale-invariant), so
+`1.0` and `1.00` share a bucket. `f64` keys by its IEEE 754 total-order encoding, so ranges
+work despite `f64` having no `Ord`: the order is `-Inf < finite < +Inf < NaN`, `-0.0` shares a
+bucket with `0.0`, and `NaN` sorts above every number — so it never falls inside a finite range.
 </Callout>
 
 <DiveDeeper summary="why the ordered index is separate from the hash index">
