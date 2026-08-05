@@ -1369,7 +1369,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-codegen"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "forgedb-parser",
@@ -1429,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-lsp-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "forgedb-parser",
  "forgedb-validation",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-parser"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "forgedb-validation",
 ]
@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "forgedb-storage-native",
  "forgedb-storage-web",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-native"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "forgedb-wal",
  "fs2",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-web"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "forgedb-wal",
  "js-sys",
@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-validation"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "forgedb-wal"
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-watcher"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "forgedb-codegen",
