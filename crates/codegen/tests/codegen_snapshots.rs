@@ -7080,6 +7080,146 @@ Owner {
     );
 }
 
+/// #243: an array past serde's `[T; N]` ceiling (N = 32) must still generate code
+/// that compiles.
+///
+/// serde implements `Serialize`/`Deserialize` for arrays only up to N = 32, so a
+/// `bytes(64)` or `[u32; 40]` field made the `#[derive(Serialize, Deserialize)]` on
+/// the generated type fail to resolve — an entire crate that did not compile. It was
+/// never only an *index* problem: a plain, unindexed field broke it just the same,
+/// because the derive is on the struct.
+///
+/// Three shapes reach it and nothing else can, because nested fixed arrays do not
+/// parse. Each gets its own helper, and an inline `struct` is a second emission site
+/// that broke independently of the model one.
+///
+/// This test pins the two halves that could silently regress: that oversized fields
+/// get the attribute, and that fields serde can already handle do **not** — crossing
+/// the boundary must not rewrite output for every existing schema.
+///
+/// That the result *compiles* is proven by `tests/oversized_array_test.rs`, which
+/// builds a generated crate carrying every shape; a string assertion cannot.
+#[test]
+fn test_rust_generation_oversized_bytes_serde() {
+    let src = r#"
+struct Fp {
+  digest: bytes(64)
+  small: bytes(8)
+  wide: [u32; 40]
+}
+
+Doc {
+  id: +uuid
+  plain: bytes(64)
+  fingerprint: ^bytes(64)
+  opt_hash: bytes(48)?
+  boundary: bytes(32)
+  past: bytes(33)
+  small: ^bytes(8)
+  fp: Fp
+  arr_big: [bytes(64); 2]
+  arr_small: [bytes(8); 2]
+  many: [u32; 40]
+  few: [u32; 4]
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    for module in ["mod__forgedb_big_bytes", "mod__forgedb_big_array"] {
+        assert!(
+            flat.contains(module),
+            "`{module}` must be emitted when a field needs it.\nGot: {code}"
+        );
+    }
+
+    // Past the ceiling: each shape points at its own helper.
+    for (field, path) in [
+        ("plain", "__forgedb_big_bytes"),
+        ("fingerprint", "__forgedb_big_bytes"),
+        ("past", "__forgedb_big_bytes"),
+        ("opt_hash", "__forgedb_big_bytes::option"),
+        ("arr_big", "__forgedb_big_bytes::array"),
+        ("many", "__forgedb_big_array"),
+        // The inline struct: a second field-emission site (`generate_struct`), which
+        // carries the same derive and so broke the same way.
+        ("digest", "__forgedb_big_bytes"),
+        ("wide", "__forgedb_big_array"),
+    ] {
+        let decl = format!(r#"#[serde(with="{path}")]pub{field}:"#);
+        assert!(
+            flat.contains(&decl),
+            "`{field}` is past serde's array ceiling and must use `{path}`"
+        );
+    }
+    // utoipa stops at 32 for the same reason serde does, so the schema type is
+    // declared rather than derived.
+    for schema_ty in [
+        "#[schema(value_type=Vec<u8>)]",
+        "#[schema(value_type=Vec<Vec<u8>>)]",
+        "#[schema(value_type=Option<Vec<u8>>)]",
+    ] {
+        assert!(
+            flat.contains(schema_ty),
+            "utoipa cannot describe the oversized array either — expected {schema_ty}"
+        );
+    }
+
+    // At or under the ceiling: serde's own impl applies and nothing changes. This is
+    // the half that keeps the fix from churning every existing schema's output.
+    // Asserted as "no attribute at all", by pinning the field to the end of the
+    // preceding one — a window-of-N-chars search would just find the *previous*
+    // field's attribute.
+    for field in ["boundary", "small", "few", "arr_small"] {
+        let decl = format!("pub{field}:[");
+        let at = flat
+            .find(&decl)
+            .unwrap_or_else(|| panic!("`{field}` must exist"));
+        let preceding = flat[..at].chars().next_back().unwrap();
+        assert!(
+            matches!(preceding, ',' | '{'),
+            "`{field}` is within serde's array ceiling and must carry no attribute, \
+             but is preceded by {preceding:?}"
+        );
+    }
+}
+
+/// #243: the helper modules are emitted ONLY when a field needs them.
+///
+/// Generated code is tailored to the schema — a schema that never crosses the
+/// ceiling must not carry the machinery, and its output must stay byte-identical to
+/// what it produced before the fix. This is what kept every existing snapshot from
+/// being rewritten.
+#[test]
+fn test_rust_generation_no_big_array_serde_when_unneeded() {
+    let src = r#"
+struct Fp {
+  small: bytes(8)
+}
+
+Doc {
+  id: +uuid
+  code: ^bytes(32)
+  arr: [bytes(32); 32]
+  nums: [u32; 32]
+  fp: Fp
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Exactly at the ceiling in every position — serde covers all of it.
+    assert!(
+        !code.contains("__forgedb_big_bytes") && !code.contains("__forgedb_big_array"),
+        "a schema that stays within serde's array ceiling must carry no helper.\nGot: {code}"
+    );
+}
+
 /// #233: `char(N)` is a *spelling*, not a distinct type — the deprecated form must
 /// emit byte-identical code across every generator, in every type position.
 ///
