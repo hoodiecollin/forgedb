@@ -376,6 +376,20 @@ drift-prone) and *not* a labels/fields convention. An epic is a top-level contai
 releases; each child carries its own milestone. The website `/roadmap` reads exactly this shape
 (epics collapsible, standalone issues alongside) — see [`apps/website/lib/roadmap-transform.ts`].
 
+**Parenting is for work on the commitment ladder — never parent an `idea` or an `experiment`.**
+Both are barred from carrying a milestone by the invariants above, so neither can ever close
+into a release, and making one a sub-issue does two bad things: it pins the epic's `done/total`
+below 100% permanently (the transform counts every child indiscriminately), and it removes the
+child from the standalone list — the *only* path by which an `idea` reaches the roadmap's
+**Ideas** section and an `experiment`/`rfc` reaches **Labs** (`claimedChildren`). Parenting an
+idea to an epic therefore **hides** it. Link them instead with a plain `#number` reference under
+a *Related, deliberately unparented* heading in the epic body: GitHub records a cross-reference
+event on the child, so the link is bidirectional and machine-visible with nothing to
+hand-maintain, and unlike a checkbox it carries no status to drift. When an experiment's
+measured conclusion commits real work, *that* work is a new issue — and it parents normally.
+(The one coherent exception is an epic that is *itself* labeled `experiment`, e.g. #167: it
+rides no release spine, so its children completing is a meaningful signal.)
+
 **Retired — do NOT reintroduce:** the "workstream" decomposition (`WS1`/`WS2`/`Workstream 2` sub-
 tasking of an epic) and the flat 5-bucket roadmap are **dead patterns**. Break an epic into real
 child issues linked as native sub-issues; never invent `WSn` sub-labels or a parallel Project
