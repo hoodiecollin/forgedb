@@ -172,6 +172,9 @@ pub struct ProductScanRef<'a> {
     pub id: Uuid,
     pub price: rust_decimal::Decimal,
     pub discount: Option<rust_decimal::Decimal>,
+    /// #250: anchors `'a` for a view whose every field is fixed-size.
+    /// Zero-sized — the struct's layout is unchanged.
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
 ///Storage for Product model
 pub struct ProductStorage {
@@ -1599,6 +1602,7 @@ impl ProductStorage {
                 id: id_value,
                 price: price_value,
                 discount: discount_value,
+                __borrow: ::std::marker::PhantomData,
             };
             if keep(&__row_ref) {
                 __refs.push(__row_ref);

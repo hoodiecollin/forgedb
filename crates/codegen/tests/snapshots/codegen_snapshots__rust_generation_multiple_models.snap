@@ -164,6 +164,9 @@ pub struct User {
 #[derive(Debug, Clone)]
 pub struct UserScanRef<'a> {
     pub id: Uuid,
+    /// #250: anchors `'a` for a view whose every field is fixed-size.
+    /// Zero-sized — the struct's layout is unchanged.
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
 ///Storage for User model
 pub struct UserStorage {
@@ -1034,7 +1037,10 @@ impl UserStorage {
                     .expect("Failed to read from column");
                 Uuid::from_bytes(bytes)
             };
-            let __row_ref = UserScanRef { id: id_value };
+            let __row_ref = UserScanRef {
+                id: id_value,
+                __borrow: ::std::marker::PhantomData,
+            };
             if keep(&__row_ref) {
                 __refs.push(__row_ref);
             }
