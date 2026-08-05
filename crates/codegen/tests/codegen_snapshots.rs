@@ -7141,3 +7141,102 @@ Thing {
         "types.ts"
     );
 }
+
+/// #250: every `<Model>ScanRef<'a>` must actually use its lifetime, or the emitted
+/// crate does not compile (`error[E0392]: lifetime parameter 'a is never used`).
+///
+/// The lifetime exists so `string` scan fields can borrow out of the buffered
+/// column span. A model whose every scannable field is fixed-size has nothing to
+/// attach it to — and that is not an exotic shape: it is the ordinary pure
+/// join/link row (identity, timestamps, foreign keys, no string), which is what
+/// `Star` is in `examples/code-hosting`.
+///
+/// The defect shipped from #160/#224 because the snapshot tests compare generated
+/// code as *strings* and never compile it, and every schema used in a manual
+/// compile-check happened to give each model a string field. So the durable guard
+/// is not "assert the struct looks right" — it is **a fixture that carries a
+/// string-free model at all**, which is what `Link` is below.
+#[test]
+fn test_rust_generation_scan_ref_lifetime_is_always_anchored() {
+    let schema_src = r#"
+Owner {
+  id: +uuid
+  name: string
+}
+
+Link {
+  id: +uuid
+  created_at: +timestamp
+  owner: *Owner
+  weight: u32
+}
+"#;
+    let schema = forgedb_parser::Parser::new(schema_src)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `Link` has no `string`, so nothing in its view borrows: the anchor carries
+    // the lifetime.
+    let link = extract_struct(&code, "pub struct LinkScanRef<'a>");
+    assert!(
+        link.contains("PhantomData<&'a ()>"),
+        "a scan view with no borrowing field must anchor 'a, else E0392:\n{link}"
+    );
+
+    // `Owner.name` borrows, so the anchor would be redundant — and emitting it
+    // unconditionally would churn every existing snapshot. Pin that it does not.
+    let owner = extract_struct(&code, "pub struct OwnerScanRef<'a>");
+    assert!(
+        owner.contains("&'a str"),
+        "expected the borrowed string field:\n{owner}"
+    );
+    assert!(
+        !owner.contains("PhantomData"),
+        "a view that already borrows needs no anchor:\n{owner}"
+    );
+}
+
+/// Slice out a struct body by its declaration line, for the assertions above.
+fn extract_struct<'a>(code: &'a str, decl: &str) -> &'a str {
+    let start = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` not found in generated code"));
+    let rest = &code[start..];
+    let end = rest.find('}').expect("unterminated struct") + 1;
+    &rest[..end]
+}
+
+/// #250: the anchor's name is derived, not fixed, because `.forge` field names are
+/// only required to be snake_case — `__borrow: u32` parses and validates today.
+/// On a string-free model a hardcoded anchor would land beside it and emit the
+/// field twice (`error[E0124]: field `__borrow` is already declared`).
+#[test]
+fn test_rust_generation_scan_ref_anchor_avoids_a_field_name_collision() {
+    let schema = forgedb_parser::Parser::new(
+        r#"
+Collide {
+  id: +uuid
+  __borrow: u32
+  __borrow_: u32
+}
+"#,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let view = extract_struct(&code, "pub struct CollideScanRef<'a>");
+
+    // Both obvious names are taken, so the anchor steps past them.
+    assert!(
+        view.contains("pub __borrow__: ::std::marker::PhantomData<&'a ()>"),
+        "anchor should skip every taken name:\n{view}"
+    );
+    assert_eq!(
+        view.matches("__borrow:").count(),
+        1,
+        "the user's own field must appear exactly once:\n{view}"
+    );
+}
