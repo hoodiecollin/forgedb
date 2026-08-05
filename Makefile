@@ -224,6 +224,16 @@ crash-test:
 index-key-parity:
 	cargo test --test index_key_parity_test -- --ignored --nocapture
 
+.PHONY: oversized-array-test
+
+## Oversized-array proof (#243): serde implements `[T; N]` only to N = 32, so a
+## `bytes(64)` or `[u32; 40]` field made the derive on the generated struct fail to
+## resolve and the whole crate failed to compile. Generates every shape past the
+## ceiling (plus an under-ceiling twin for each), compiles it, and round-trips the
+## wire form. Also #[ignore]d out of the fast suite (compiles a crate).
+oversized-array-test:
+	cargo test --test oversized_array_test -- --ignored --nocapture
+
 .PHONY: api-wire-test
 
 ## REST wire-format proof (#229): generate + compile a real API, boot the generated

@@ -334,6 +334,332 @@ impl RustGenerator {
             }
         });
 
+        // serde for generated arrays past serde's built-in ceiling (#243).  serde
+        // implements `Serialize`/`Deserialize` for `[T; N]` only up to N = 32, so an
+        // oversized array made the derive on the model/struct fail to resolve —
+        // generated code that did not compile.  It was never only an *index*
+        // problem: a plain, unindexed field broke it just the same, because the
+        // derive is on the struct.
+        //
+        // Three shapes reach it, and nothing else can: nested fixed arrays do not
+        // parse (`[[u32; 4]; 3]` is rejected at the type position), so a fixed
+        // array's element is always a scalar, a `bytes(N)`, or a struct.
+        //
+        //   `bytes(N)`, N > 32   -> `[u8; N]`        -> `__forgedb_big_bytes`
+        //   `[T; M]`,   M > 32   -> `[T; M]`         -> `__forgedb_big_array`
+        //   `[bytes(N); M]`, N>32 -> `[[u8; N]; M]`  -> `__forgedb_big_bytes::array`
+        //
+        // Every wire form is byte-identical to serde's own array impl (a JSON array,
+        // via `serialize_tuple`), so a field's representation does not change at the
+        // N = 32 boundary — only which impl produces it.
+        //
+        // Emitted ONLY when some field needs it.  `#![allow(dead_code)]` would let it
+        // ride along unused, but a schema should not carry this machinery for a width
+        // it never declares — generated code is tailored to the schema, and this
+        // keeps output byte-identical for every schema that stays under 32.
+        if Self::schema_needs_big_array_serde(schema) {
+            tokens.extend(quote! {
+                /// serde for arrays past serde's built-in ceiling of N = 32 (#243).
+                /// Wire form matches serde's own array impl exactly; these exist only
+                /// because that impl stops at 32.
+                mod __forgedb_big_array {
+                    use serde::de::{Error as _, SeqAccess, Visitor};
+                    use serde::ser::SerializeTuple;
+                    use serde::{Deserialize, Deserializer, Serializer};
+
+                    pub fn serialize<S, T, const N: usize>(
+                        value: &[T; N],
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error>
+                    where
+                        S: Serializer,
+                        T: serde::Serialize,
+                    {
+                        let mut tup = serializer.serialize_tuple(N)?;
+                        for item in value.iter() {
+                            tup.serialize_element(item)?;
+                        }
+                        tup.end()
+                    }
+
+                    struct ArrayVisitor<T, const N: usize>(std::marker::PhantomData<T>);
+
+                    impl<'de, T, const N: usize> Visitor<'de> for ArrayVisitor<T, N>
+                    where
+                        T: Deserialize<'de>,
+                    {
+                        type Value = [T; N];
+
+                        fn expecting(
+                            &self,
+                            f: &mut std::fmt::Formatter<'_>,
+                        ) -> std::fmt::Result {
+                            write!(f, "an array of {N} elements")
+                        }
+
+                        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                        where
+                            A: SeqAccess<'de>,
+                        {
+                            // Collected then converted rather than built in place:
+                            // `[T; N]` has no `Default` past N = 32 either, and the
+                            // alternative is `MaybeUninit`.  This is the JSON wire
+                            // boundary, not a storage path, so the temporary is fine.
+                            let mut items = Vec::with_capacity(N);
+                            while let Some(item) = seq.next_element::<T>()? {
+                                if items.len() == N {
+                                    return Err(A::Error::invalid_length(N + 1, &self));
+                                }
+                                items.push(item);
+                            }
+                            let got = items.len();
+                            <[T; N]>::try_from(items)
+                                .map_err(|_| A::Error::invalid_length(got, &self))
+                        }
+                    }
+
+                    pub fn deserialize<'de, D, T, const N: usize>(
+                        deserializer: D,
+                    ) -> Result<[T; N], D::Error>
+                    where
+                        D: Deserializer<'de>,
+                        T: Deserialize<'de>,
+                    {
+                        deserializer.deserialize_tuple(
+                            N,
+                            ArrayVisitor::<T, N>(std::marker::PhantomData),
+                        )
+                    }
+
+                    /// `#[serde(with = "__forgedb_big_array::option")]` for a
+                    /// nullable oversized array.
+                    pub mod option {
+                        use serde::{Deserialize, Deserializer, Serializer};
+
+                        /// Carrier so the nullable form defers to serde's own
+                        /// `Option` handling, which is what keeps `null` round-
+                        /// tripping as `None`.
+                        struct Wrap<T, const N: usize>([T; N]);
+
+                        impl<T: serde::Serialize, const N: usize> serde::Serialize
+                            for Wrap<T, N>
+                        {
+                            fn serialize<S: Serializer>(
+                                &self,
+                                s: S,
+                            ) -> Result<S::Ok, S::Error> {
+                                super::serialize(&self.0, s)
+                            }
+                        }
+
+                        impl<'de, T: Deserialize<'de>, const N: usize> Deserialize<'de>
+                            for Wrap<T, N>
+                        {
+                            fn deserialize<D: Deserializer<'de>>(
+                                d: D,
+                            ) -> Result<Self, D::Error> {
+                                super::deserialize(d).map(Wrap)
+                            }
+                        }
+
+                        pub fn serialize<S, T, const N: usize>(
+                            value: &Option<[T; N]>,
+                            serializer: S,
+                        ) -> Result<S::Ok, S::Error>
+                        where
+                            S: Serializer,
+                            T: serde::Serialize + Copy,
+                        {
+                            match value {
+                                Some(inner) => serializer.serialize_some(&Wrap(*inner)),
+                                None => serializer.serialize_none(),
+                            }
+                        }
+
+                        pub fn deserialize<'de, D, T, const N: usize>(
+                            deserializer: D,
+                        ) -> Result<Option<[T; N]>, D::Error>
+                        where
+                            D: Deserializer<'de>,
+                            T: Deserialize<'de>,
+                        {
+                            Ok(Option::<Wrap<T, N>>::deserialize(deserializer)?
+                                .map(|w| w.0))
+                        }
+                    }
+                }
+
+                /// serde for `bytes(N)` where N > 32, and for a fixed array of them
+                /// (#243).  Separate from `__forgedb_big_array` because `[u8; N]` has
+                /// no `Serialize` at that width, so it cannot be that module's `T`.
+                mod __forgedb_big_bytes {
+                    use serde::de::{Error as _, SeqAccess, Visitor};
+                    use serde::ser::SerializeTuple;
+                    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+                    pub fn serialize<S, const N: usize>(
+                        value: &[u8; N],
+                        serializer: S,
+                    ) -> Result<S::Ok, S::Error>
+                    where
+                        S: Serializer,
+                    {
+                        let mut tup = serializer.serialize_tuple(N)?;
+                        for byte in value.iter() {
+                            tup.serialize_element(byte)?;
+                        }
+                        tup.end()
+                    }
+
+                    struct BytesVisitor<const N: usize>;
+
+                    impl<'de, const N: usize> Visitor<'de> for BytesVisitor<N> {
+                        type Value = [u8; N];
+
+                        fn expecting(
+                            &self,
+                            f: &mut std::fmt::Formatter<'_>,
+                        ) -> std::fmt::Result {
+                            write!(f, "an array of {N} bytes")
+                        }
+
+                        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                        where
+                            A: SeqAccess<'de>,
+                        {
+                            let mut out = [0u8; N];
+                            for (i, slot) in out.iter_mut().enumerate() {
+                                *slot = seq
+                                    .next_element()?
+                                    .ok_or_else(|| A::Error::invalid_length(i, &self))?;
+                            }
+                            if seq.next_element::<u8>()?.is_some() {
+                                return Err(A::Error::invalid_length(N + 1, &self));
+                            }
+                            Ok(out)
+                        }
+                    }
+
+                    pub fn deserialize<'de, D, const N: usize>(
+                        deserializer: D,
+                    ) -> Result<[u8; N], D::Error>
+                    where
+                        D: Deserializer<'de>,
+                    {
+                        deserializer.deserialize_tuple(N, BytesVisitor::<N>)
+                    }
+
+                    /// Carrier giving `[u8; N]` the serde impls it lacks, so the
+                    /// nullable and array forms can compose over it.
+                    struct Wrap<const N: usize>([u8; N]);
+
+                    impl<const N: usize> Serialize for Wrap<N> {
+                        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                            serialize(&self.0, s)
+                        }
+                    }
+
+                    impl<'de, const N: usize> Deserialize<'de> for Wrap<N> {
+                        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                            deserialize(d).map(Wrap)
+                        }
+                    }
+
+                    /// `#[serde(with = "__forgedb_big_bytes::option")]` for `bytes(N)?`.
+                    pub mod option {
+                        use serde::{Deserialize, Deserializer, Serializer};
+
+                        pub fn serialize<S, const N: usize>(
+                            value: &Option<[u8; N]>,
+                            serializer: S,
+                        ) -> Result<S::Ok, S::Error>
+                        where
+                            S: Serializer,
+                        {
+                            match value {
+                                Some(bytes) => serializer.serialize_some(&super::Wrap(*bytes)),
+                                None => serializer.serialize_none(),
+                            }
+                        }
+
+                        pub fn deserialize<'de, D, const N: usize>(
+                            deserializer: D,
+                        ) -> Result<Option<[u8; N]>, D::Error>
+                        where
+                            D: Deserializer<'de>,
+                        {
+                            Ok(Option::<super::Wrap<N>>::deserialize(deserializer)?
+                                .map(|w| w.0))
+                        }
+                    }
+
+                    /// `#[serde(with = "__forgedb_big_bytes::array")]` for
+                    /// `[bytes(N); M]` with N > 32 — the outer array is fine at any M,
+                    /// but its element is what serde cannot describe.
+                    pub mod array {
+                        use serde::de::{Error as _, SeqAccess, Visitor};
+                        use serde::ser::SerializeTuple;
+                        use serde::{Deserializer, Serializer};
+
+                        pub fn serialize<S, const N: usize, const M: usize>(
+                            value: &[[u8; N]; M],
+                            serializer: S,
+                        ) -> Result<S::Ok, S::Error>
+                        where
+                            S: Serializer,
+                        {
+                            let mut tup = serializer.serialize_tuple(M)?;
+                            for inner in value.iter() {
+                                tup.serialize_element(&super::Wrap(*inner))?;
+                            }
+                            tup.end()
+                        }
+
+                        struct OuterVisitor<const N: usize, const M: usize>;
+
+                        impl<'de, const N: usize, const M: usize> Visitor<'de>
+                            for OuterVisitor<N, M>
+                        {
+                            type Value = [[u8; N]; M];
+
+                            fn expecting(
+                                &self,
+                                f: &mut std::fmt::Formatter<'_>,
+                            ) -> std::fmt::Result {
+                                write!(f, "an array of {M} arrays of {N} bytes")
+                            }
+
+                            fn visit_seq<A>(
+                                self,
+                                mut seq: A,
+                            ) -> Result<Self::Value, A::Error>
+                            where
+                                A: SeqAccess<'de>,
+                            {
+                                let mut out = [[0u8; N]; M];
+                                for (i, slot) in out.iter_mut().enumerate() {
+                                    let wrapped: super::Wrap<N> = seq
+                                        .next_element()?
+                                        .ok_or_else(|| A::Error::invalid_length(i, &self))?;
+                                    *slot = wrapped.0;
+                                }
+                                Ok(out)
+                            }
+                        }
+
+                        pub fn deserialize<'de, D, const N: usize, const M: usize>(
+                            deserializer: D,
+                        ) -> Result<[[u8; N]; M], D::Error>
+                        where
+                            D: Deserializer<'de>,
+                        {
+                            deserializer.deserialize_tuple(M, OuterVisitor::<N, M>)
+                        }
+                    }
+                }
+            });
+        }
+
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
         // generic *shape* (three integrity classes) but every field name, rule,
         // and message is filled in by generated per-field checks — there is no
@@ -1318,20 +1644,25 @@ impl RustGenerator {
                 let field_name = format_ident!("{}", field.name);
                 let field_type = Self::map_field_type_ident(&field.field_type);
 
-                let schema_attr = if Self::is_timestamp_type(&field.field_type) {
+                // An inline struct carries the same `#[derive(Serialize,
+                // Deserialize)]` as a model, so an oversized array breaks it exactly
+                // the same way (#243) and takes exactly the same attributes.
+                let (schema_attr, serde_attr) = if Self::is_timestamp_type(&field.field_type) {
                     if field.is_nullable() {
-                        quote! { #[schema(value_type = Option<i64>)] }
+                        (quote! { #[schema(value_type = Option<i64>)] }, quote! {})
                     } else {
-                        quote! { #[schema(value_type = i64)] }
+                        (quote! { #[schema(value_type = i64)] }, quote! {})
                     }
+                } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
+                    attrs
                 } else {
-                    quote! {}
+                    (quote! {}, quote! {})
                 };
 
                 if field.is_nullable() {
-                    quote! { #schema_attr pub #field_name: Option<#field_type> }
+                    quote! { #schema_attr #serde_attr pub #field_name: Option<#field_type> }
                 } else {
-                    quote! { #schema_attr pub #field_name: #field_type }
+                    quote! { #schema_attr #serde_attr pub #field_name: #field_type }
                 }
             })
             .collect();
@@ -5307,6 +5638,12 @@ impl RustGenerator {
                     quote! { #[serde(with = "rust_decimal::serde::str")] },
                 )
             }
+        } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
+            // An array past serde's N = 32 ceiling (#243).  Without this the derive
+            // on the struct does not resolve and the generated crate does not
+            // compile — for an indexed *or* a plain field.  Points at the emitted
+            // helper, whose wire form is identical to serde's own.
+            attrs
         } else {
             (quote! {}, quote! {})
         };
@@ -6236,6 +6573,81 @@ impl RustGenerator {
             ) => true,
             _ => false,
         }
+    }
+
+    /// serde's built-in `[T; N]` impls stop here; past it a generated array field
+    /// needs one of the emitted helpers (#243).  utoipa's array impls stop at the
+    /// same place, which is why crossing it changes the `#[schema]` attribute too.
+    const SERDE_ARRAY_CEILING: usize = 32;
+
+    /// Which emitted serde helper a field needs, if any (#243).
+    ///
+    /// Deliberately a *width* question, not a type question: `bytes(8)` and
+    /// `bytes(64)` are the same type and the same column, and they serialize to the
+    /// same JSON array — they differ only in which impl serde can find.
+    fn big_array_serde_path(field_type: &forgedb_parser::FieldType) -> Option<&'static str> {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::Bytes(n) if *n > Self::SERDE_ARRAY_CEILING => Some("__forgedb_big_bytes"),
+            // A fixed array of oversized `bytes(N)`: the OUTER length is irrelevant,
+            // the element is what serde cannot describe.
+            FieldType::FixedArray(inner, _) if matches!(**inner, FieldType::Bytes(n) if n > Self::SERDE_ARRAY_CEILING) => {
+                Some("__forgedb_big_bytes::array")
+            }
+            // Any other fixed array, oversized in its own length.  Nested fixed
+            // arrays do not parse, so the element here always has its own serde.
+            FieldType::FixedArray(_, m) if *m > Self::SERDE_ARRAY_CEILING => {
+                Some("__forgedb_big_array")
+            }
+            FieldType::Nullable(inner) => match Self::big_array_serde_path(inner)? {
+                "__forgedb_big_bytes" => Some("__forgedb_big_bytes::option"),
+                "__forgedb_big_array" => Some("__forgedb_big_array::option"),
+                // `[bytes(N); M]?` would need a fourth carrier; nothing generates it
+                // today (an optional fixed array is not a parseable field shape), so
+                // it is left unhandled rather than emitted unused and untested.
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether any model or inline-struct field in the schema needs the emitted
+    /// oversized-array serde helpers (#243).  Inline structs are included because
+    /// they carry the same `#[derive(Serialize, Deserialize)]` and so break the same
+    /// way — `generate_struct` is a second field-emission site, not a variant of the
+    /// first.
+    fn schema_needs_big_array_serde(schema: &Schema) -> bool {
+        let model_fields = schema.models.iter().flat_map(|m| m.fields.iter());
+        let struct_fields = schema.structs.iter().flat_map(|s| s.fields.iter());
+        model_fields
+            .chain(struct_fields)
+            .any(|f| Self::big_array_serde_path(&f.field_type).is_some())
+    }
+
+    /// The `#[schema(...)]`/`#[serde(...)]` attribute pair an oversized array field
+    /// needs (#243), or `None` when serde's own impls already cover it.
+    ///
+    /// utoipa stops at 32 for the same reason serde does, so the schema type is
+    /// declared explicitly as the JSON array this serializes to.
+    fn big_array_attrs(
+        field_type: &forgedb_parser::FieldType,
+    ) -> Option<(TokenStream, TokenStream)> {
+        let path = Self::big_array_serde_path(field_type)?;
+        let nullable = matches!(field_type, forgedb_parser::FieldType::Nullable(_));
+        let element_is_bytes = path.starts_with("__forgedb_big_bytes");
+        let inner_schema = if element_is_bytes && path.ends_with("::array") {
+            quote! { Vec<Vec<u8>> }
+        } else if element_is_bytes {
+            quote! { Vec<u8> }
+        } else {
+            quote! { Vec<serde_json::Value> }
+        };
+        let schema_attr = if nullable {
+            quote! { #[schema(value_type = Option<#inner_schema>)] }
+        } else {
+            quote! { #[schema(value_type = #inner_schema)] }
+        };
+        Some((schema_attr, quote! { #[serde(with = #path)] }))
     }
 
     /// Check if a field type is a string (variable-length).

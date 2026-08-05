@@ -22,6 +22,20 @@
 //! Link 2's mirror could drift from what is actually emitted; link 1 is what stops
 //! that. If you change `RustGenerator::index_key_body`, both must move together.
 //!
+//! # The `bytes(64)` fields (#243)
+//!
+//! `s_hash` / `o_hash` are here to be *compiled*, not just keyed. serde implements
+//! `Serialize`/`Deserialize` for `[T; N]` only up to N = 32, so before #243 a
+//! `bytes(64)` field made the derive on the model struct fail to resolve and the
+//! whole generated crate failed to build — indexed or not. This test compiles the
+//! generated crate, so carrying an oversized field is what proves the ceiling is
+//! gone; a string-level snapshot cannot.
+//!
+//! Their keys cannot be compared against `legacy` — that function *is* `to_value`,
+//! and it does not accept `[u8; 64]`. That absence is the bug, not a gap in the
+//! test. Instead the emitted form is anchored at N = 32, the last width serde can
+//! serialize, and the widths past it are asserted to continue the same rendering.
+//!
 //! Plus an end-to-end pass: every indexed field is round-tripped through the **real**
 //! generated `find_by_*`, which is the observable contract regardless of key bytes.
 //!
@@ -70,6 +84,7 @@ Kitchen {
   id: +uuid
   s_name: &string
   s_code: ^bytes(8)
+  s_hash: ^bytes(64)
   n_u32: ^u32
   n_u64: ^u64
   n_i32: ^i32
@@ -83,6 +98,7 @@ Kitchen {
 
   o_name: ^string?
   o_code: ^bytes(8)?
+  o_hash: ^bytes(64)?
   o_u32: ^u32?
   o_f64: ^f64?
   o_flag: ^bool?
@@ -351,6 +367,22 @@ fn parity() {
     check("bytes8", m_bytes(&code), legacy(&code));
     check("bytes8-zero", m_bytes(&[0u8; 8]), legacy(&[0u8; 8]));
 
+    // --- past serde's array ceiling (#243) --------------------------------
+    // N = 32 is the last width `legacy` can even be called at, so it is the anchor:
+    // the emitted form agrees with the legacy form exactly there...
+    let at32: [u8; 32] = [171; 32];
+    check("bytes32-anchor", m_bytes(&at32), legacy(&at32));
+    // ...and every width past it continues the same rendering, element by element.
+    // This is what makes the generated `__forgedb_big_bytes` wire-continuous with
+    // serde's own impl instead of merely plausible.
+    let at33: [u8; 33] = [171; 33];
+    let grown = format!("{},171]", m_bytes(&at32).trim_end_matches(']'));
+    check("bytes33-continues-32", m_bytes(&at33), grown);
+    let at64: [u8; 64] = [171; 64];
+    check("bytes64-elements", format!("{}", m_bytes(&at64).matches(',').count()), "63".to_string());
+    check("opt-bytes64", m_opt(&Some(at64), m_bytes), m_bytes(&at64));
+    check("opt-bytes64-none", m_opt(&None::<[u8; 64]>, m_bytes), "\u{0}".to_string());
+
     // --- nullable ---------------------------------------------------------
     check("opt-none", m_opt(&Option::<String>::None, |s: &String| m_string(s)), legacy(&Option::<String>::None));
     // The #102 collision: None must not key like the literal string "null".
@@ -392,6 +424,7 @@ fn roundtrip(dir: std::path::PathBuf) {
         id: Uuid::nil(),
         s_name: name.to_string(),
         s_code: *b"hello\0\0\0",
+        s_hash: [171u8; 64],
         n_u32: 7,
         n_u64: u64::MAX,
         n_i32: -5,
@@ -404,6 +437,7 @@ fn roundtrip(dir: std::path::PathBuf) {
         e_status: Status::Published,
         o_name: None,
         o_code: None,
+        o_hash: None,
         o_u32: None,
         o_f64: None,
         o_flag: None,
@@ -438,6 +472,10 @@ fn roundtrip(dir: std::path::PathBuf) {
     };
     hit("s_name", db.kitchen.find_by_s_name("unset"), id_unset);
     hit("s_code", db.kitchen.find_by_s_code(*b"hello\0\0\0"), id_unset);
+    // #243: the same path at a width serde cannot derive for. Reaching this line at
+    // all means the generated crate compiled with an oversized `bytes(N)` field.
+    hit("s_hash", db.kitchen.find_by_s_hash([171u8; 64]), id_unset);
+    hit("o_hash(None)", db.kitchen.find_by_o_hash(None), id_unset);
     hit("n_u32", db.kitchen.find_by_n_u32(7), id_unset);
     hit("n_u64", db.kitchen.find_by_n_u64(u64::MAX), id_unset);
     hit("n_i32", db.kitchen.find_by_n_i32(-5), id_unset);
