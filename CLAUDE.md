@@ -222,15 +222,15 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
   `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
   `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
   schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
-  links against, like `changefeed`/`auth`. Generated code requires it; **published 0.1.0 (2026-07-10)**.
+  links against, like `changefeed`/`auth`. Generated code requires it, and it is published.
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
   `changefeed` (#62 Direction A) is a **class-1 substrate** the *generated code links against*
   (like `storage`/`wal`, not like the internal-only crates above): a field-blind
-  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. **Published
-  0.1.0 (2026-07-07)**; the scaffold pins `forgedb-changefeed = "0.1"`. It never decodes a field;
-  generated code routes by model name and materializes typed events.
+  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. Published; the
+  scaffold pins it by major (derive both numbers — see the *Workspace layout* note). It never decodes
+  a field; generated code routes by model name and materializes typed events.
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).

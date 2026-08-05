@@ -37,22 +37,35 @@ shipped.
 ## The published substrate
 
 Each crate is versioned on an **independent** line — the pins are intentionally *not*
-normalized. Versions below are current as of this writing; treat the crate manifests and
-crates.io as authoritative.
+normalized.
 
-| Crate | Version | Role |
-|---|---|---|
-| `forgedb-types` | 0.2.1 | Core type system (uuid, timestamp, primitives). A `cfg(wasm32)` uuid/getrandom feature for the browser build. |
-| `forgedb-storage` | 0.2.3 | Columnar storage **facade** — a thin `cfg` re-export selecting a backend by target. Generated code uses only this crate. |
-| `forgedb-storage-native` | 0.1.4 | Native positional-file columnar backend (host targets). Selected by the facade on non-wasm. |
-| `forgedb-storage-web` | 0.1.4 | In-memory-arena columnar backend for the browser read-replica (wasm32); async only at the IndexedDB/OPFS hydrate/commit boundary. Byte-identical positional semantics to native. |
-| `forgedb-wal` | 0.2.3 | Write-ahead log. Generated code links the **opaque `Raw`** record path (bytes + CRC framing + fsync policy + torn-tail recovery). File impl on host, in-memory impl on wasm32. |
-| `forgedb-changefeed` | 0.2.0 | Field-blind change-feed broadcast **+ durable replication broker** (`durable` module: CRC-framed append-only log at a monotonic global offset; resumable subscription). |
-| `forgedb-auth` | 0.2.0 | Verify-only JWT + tenant cross-check axum extractor/middleware (static PEM, or opt-in `jwks-http` fetch + background rotation; algorithm-pinned). Injects an opaque `Principal`; knows no model/row. |
-| `forgedb-query-params` | 0.1.0 | REST query-string parser (URL → generic `Filter`/`Sort`/`Pagination`, limit clamped). All field-aware filtering/sorting is generated per-model; this parses only the string. |
-| `forgedb-compaction` | 0.1.0 | In-process dead-row reclaim keyed by model *directory name*. `compact_model_keeping(model, live_rows)` keeps caller-supplied opaque row indices (the generated code computes the live set). |
-| `forgedb-txn` | 0.1.0 | MVCC Tier 2 commit sequencer: monotonic LSN + first-committer-wins conflict detection over an in-memory `id → last-committer` map (rebuilt empty on open; never persisted). |
-| `forgedb-coordinator` | 0.2.1 | MVCC Tier 3 multi-process write control plane. A `forgedb coordinate <root>` process holds the `DirLock`, serializes the commit turn, sequences the LSN (configurable `--turn-timeout`/`--max-frame-mib`). **No `forgedb-storage*` dep** — it never writes columns. |
+**This table deliberately carries no version column.** It used to, and every row of it was
+wrong within a release or two — the column was stale in five of eleven rows when the v0.4.0
+publish gap was reconciled, while the prose beside it still claimed to be current. A version
+written in prose is a claim about the registry, and the registry is the only thing that can
+answer it. Derive the numbers instead:
+
+```bash
+cargo search forgedb-<crate>                 # what is actually published
+grep -H '^version' crates/*/Cargo.toml       # what this working copy would publish
+```
+
+A mismatch between those two is not cosmetic — it is an open publish gap. See
+[PUBLISHING.md](./PUBLISHING.md) and the publish-gap rule in [`CLAUDE.md`](../CLAUDE.md).
+
+| Crate | Role |
+|---|---|
+| `forgedb-types` | Core type system (uuid, timestamp, primitives). A `cfg(wasm32)` uuid/getrandom feature for the browser build. |
+| `forgedb-storage` | Columnar storage **facade** — a thin `cfg` re-export selecting a backend by target. Generated code uses only this crate. |
+| `forgedb-storage-native` | Native positional-file columnar backend (host targets). Selected by the facade on non-wasm. |
+| `forgedb-storage-web` | In-memory-arena columnar backend for the browser read-replica (wasm32); async only at the IndexedDB/OPFS hydrate/commit boundary. Byte-identical positional semantics to native. |
+| `forgedb-wal` | Write-ahead log. Generated code links the **opaque `Raw`** record path (bytes + CRC framing + fsync policy + torn-tail recovery). File impl on host, in-memory impl on wasm32. |
+| `forgedb-changefeed` | Field-blind change-feed broadcast **+ durable replication broker** (`durable` module: CRC-framed append-only log at a monotonic global offset; resumable subscription). |
+| `forgedb-auth` | Verify-only JWT + tenant cross-check axum extractor/middleware (static PEM, or opt-in `jwks-http` fetch + background rotation; algorithm-pinned). Injects an opaque `Principal`; knows no model/row. |
+| `forgedb-query-params` | REST query-string parser (URL → generic `Filter`/`Sort`/`Pagination`, limit clamped). All field-aware filtering/sorting is generated per-model; this parses only the string. |
+| `forgedb-compaction` | In-process dead-row reclaim keyed by model *directory name*. `compact_model_keeping(model, live_rows)` keeps caller-supplied opaque row indices (the generated code computes the live set). |
+| `forgedb-txn` | MVCC Tier 2 commit sequencer: monotonic LSN + first-committer-wins conflict detection over an in-memory `id → last-committer` map (rebuilt empty on open; never persisted). |
+| `forgedb-coordinator` | MVCC Tier 3 multi-process write control plane. A `forgedb coordinate <root>` process holds the `DirLock`, serializes the commit turn, sequences the LSN (configurable `--turn-timeout`/`--max-frame-mib`). **No `forgedb-storage*` dep** — it never writes columns. |
 
 ### Not substrate
 
