@@ -81,8 +81,8 @@ The CLI installs from a shell one-liner, Homebrew, npm/bun, PyPI/uv, Docker, Nix
 
 ### Query capability
 
-- Scalar, foreign-key, and composite (`@index(a,b)`) indexes are **hash exact-match** — they answer `field = value` and `a = ? AND b = ?` in O(1). Ordered-eligible scalar types (`u32`/`u64`/`i32`/`i64`/`timestamp`/`decimal`) additionally get a parallel ordered (BTreeMap) index that backs `find_by_<field>_range(min, max, descending, limit)` for range scans and top-N. The two coexist: the hash index answers equality, the ordered index answers ranges without a full scan.
-- What is deferred follows from that split: `f64` and nullable fields have no ordered index yet, prefix search would need a different structure again, the snapshot (`_at`) ordered form is absent, and many-to-many junction lookups stay linear (`unlink_<a>_<b>` and `unlink_all_*` walk the junction).
+- Scalar, foreign-key, and composite (`@index(a,b)`) indexes are **hash exact-match** — they answer `field = value` and `a = ? AND b = ?` in O(1). Ordered-eligible scalar types (`u32`/`u64`/`i32`/`i64`/`f64`/`timestamp`/`decimal`) additionally get a parallel ordered (BTreeMap) index that backs `find_by_<field>_range(min, max, descending, limit)` for range scans and top-N. The two coexist: the hash index answers equality, the ordered index answers ranges without a full scan. `f64` has no `Ord`, so it is keyed by its IEEE 754 total-order encoding — `-Inf < finite < +Inf < NaN`, with `-0.0` folded into `0.0`.
+- What is deferred follows from that split: nullable fields have no ordered index yet, prefix search would need a different structure again, the snapshot (`_at`) ordered form is absent, and many-to-many junction lookups stay linear (`unlink_<a>_<b>` and `unlink_all_*` walk the junction).
 
 ### Operations
 

@@ -114,7 +114,7 @@ fn get_type_info(type_name: &str) -> Option<String> {
         "u64" => "**u64** — Unsigned 64-bit integer\n\nRange: 0 to 18,446,744,073,709,551,615. Auto-incrementable with `+`.",
         "i32" => "**i32** — Signed 32-bit integer\n\nRange: -2,147,483,648 to 2,147,483,647.",
         "i64" => "**i64** — Signed 64-bit integer\n\nRange: -9.2e18 to 9.2e18.",
-        "f64" => "**f64** — 64-bit floating point\n\nDouble-precision IEEE 754. Not indexable.",
+        "f64" => "**f64** — 64-bit floating point\n\nDouble-precision IEEE 754. Indexable/filterable/sortable: the index key is a total-order encoding, so `-Inf`, `+Inf` and `NaN` are each distinct (and `NaN` sorts last), and `-0.0` shares a bucket with `0.0`. For exact money/quantity use `decimal` — binary floats do not represent `0.1`.",
         "decimal" => "**decimal** — Exact fixed-point decimal\n\n`rust_decimal::Decimal` in a fixed 16-byte column, serialized as a string. Indexable/sortable (scale-invariant key). Money/quantity.",
         "json" => "**json** — Arbitrary JSON value\n\n`serde_json::Value`, stored in a variable-length column. NOT indexable/filterable/sortable (no total order).",
         "uuid" => "**uuid** — UUID v4\n\n128-bit identifier (16-byte column). Auto-generatable with `+`.",

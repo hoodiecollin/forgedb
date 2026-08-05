@@ -546,7 +546,24 @@ impl FieldType {
         }
     }
 
-    /// Determine if this type supports range queries (ordered)
+    /// Whether an indexed field of this type also gets an **ordered** index
+    /// (#169) — i.e. a `find_by_<field>_range` method — rather than exact-match
+    /// lookup only.
+    ///
+    /// This is not a free-standing opinion about the type: it must agree with
+    /// `RustGenerator::ordered_key_type`, which is what actually decides whether
+    /// the ordered `BTreeMap` is emitted. The answer here reaches users as
+    /// migration prose ("Add BTree index on 'Product.price'") via
+    /// `Field::index_type`, so a disagreement is a visible lie about what was
+    /// generated. `f64` was listed here while codegen excluded it, and `decimal`
+    /// was omitted while codegen included it — both directions wrong (#242).
+    /// The two are now pinned together by a drift guard in the codegen crate.
+    ///
+    /// `f64` is included: it has no `Ord`, but the ordered index keys it by its
+    /// total-order `u64` encoding (#242), so it does answer range queries.
+    ///
+    /// `Nullable` falls through to `false` on purpose: `ordered_key_type` returns
+    /// `None` for any nullable field regardless of its inner type.
     pub fn supports_range_queries(&self) -> bool {
         matches!(
             self,
@@ -556,6 +573,7 @@ impl FieldType {
                 | FieldType::I64
                 | FieldType::F64
                 | FieldType::Timestamp
+                | FieldType::Decimal
         )
     }
 

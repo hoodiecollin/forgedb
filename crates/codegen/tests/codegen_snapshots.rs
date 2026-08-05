@@ -616,13 +616,27 @@ Metric {
     assert!(db_code.contains("views_index"), "#169: hash index kept alongside (parallel, not replace)");
     assert!(db_code.contains("pub fn find_by_views"), "#169: exact-match probe still emitted");
 
-    // Ineligible: string / nullable-i64 / f64 get NO ordered index or range method.
+    // f64 IS ordered (#242), but uniquely: the map is keyed by the encoded u64
+    // while the caller still passes an f64. Both halves are asserted, because
+    // getting only the first right would compile and be unusable.
+    assert!(db_code.contains("ratio_ordered"), "#242: f64 gets an ordered index");
+    assert!(db_code.contains("pub fn find_by_ratio_range"), "#242: f64 range method");
+    let ratio_range = &db_code[db_code.find("fn find_by_ratio_range").unwrap()..];
+    let ratio_range = &ratio_range[..ratio_range.find("__out\n").unwrap_or(ratio_range.len().min(1200))];
+    assert!(
+        ratio_range.contains("min : Option < f64 >") || ratio_range.contains("min: Option<f64>"),
+        "#242: the caller passes an f64 bound, never the encoded u64: {ratio_range}"
+    );
+    assert!(
+        ratio_range.contains("__forgedb_f64_key"),
+        "#242: the bound is encoded on the way in, so it is comparable to the stored key"
+    );
+
+    // Ineligible: string / nullable-i64 get NO ordered index or range method.
     assert!(!db_code.contains("name_ordered"), "#169: string is exact-match only");
     assert!(!db_code.contains("find_by_name_range"), "#169: no range on a string index");
     assert!(!db_code.contains("score_ordered"), "#169: nullable ordered field deferred");
     assert!(!db_code.contains("find_by_score_range"), "#169: no range on a nullable field");
-    assert!(!db_code.contains("ratio_ordered"), "#169: f64 excluded (no clean total order)");
-    assert!(!db_code.contains("find_by_ratio_range"), "#169: no range on f64");
 }
 
 #[test]
@@ -7040,17 +7054,33 @@ Owner {
         flat.contains(r#"__k.push_str(if*__v{"true"}else{"false"});"#),
         "bool keys are a literal, not a formatted value"
     );
-    // Floats KEEP the JSON number formatter: Display renders 1.0 as "1" and 1e300
-    // as "1e300", where JSON gives "1.0" and "1e+300".
+    // Floats key off their total-order u64 encoding (#242), NOT any float
+    // rendering. JSON has no form for a non-finite, which is why the old
+    // `serde_json::Number::from_f64` path returned None for NaN/±Inf and dropped
+    // them into the null bucket.
     assert!(
-        flat.contains("matchserde_json::Number::from_f64(*__v)"),
-        "f64 keys must use the JSON float formatter, not Display (#230)"
+        flat.contains(r#"write!(__k,"{}",__forgedb_f64_key(*__v))"#),
+        "f64 keys must be the total-order encoding (#242)"
     );
-    // `from_f64` returning None is exactly the NaN/Inf case that used to arrive as
-    // `Value::Null`; it must still land in the null bucket.
     assert!(
-        flat.contains(r"None=>String::from('\u{0}'),"),
-        "non-finite floats keep keying into the null bucket"
+        !flat.contains("serde_json::Number::from_f64"),
+        "the from_f64 path is the #242 defect — it must be gone entirely"
+    );
+    // The helper the arm calls, with both canonicalizations — without them the
+    // encoding is a faithful bijection over bit patterns, which is wrong for the
+    // two cases where distinct patterns are equal values: -0.0 == 0.0, and every
+    // NaN payload.
+    assert!(
+        flat.contains("fn__forgedb_f64_key(__v:f64)->u64"),
+        "the total-order key helper must be emitted"
+    );
+    assert!(
+        flat.contains("let__v=if__v==0.0{0.0}elseif__v.is_nan(){f64::NAN}else{__v};"),
+        "-0.0 and NaN payloads must be canonicalized before encoding"
+    );
+    assert!(
+        flat.contains("let__mask=((__bitsasi64>>63)asu64)|0x8000_0000_0000_0000;"),
+        "the sign-extended mask is what makes the encoding order-preserving"
     );
     // bytes(N) is [u8; N] — serde renders it as a JSON array, so the key is
     // `\u{2}[104,101,...]`, the non-string arm.
@@ -7293,6 +7323,61 @@ Doc {
     assert!(
         !code.contains("__forgedb_big_bytes") && !code.contains("__forgedb_big_array"),
         "a schema that stays within serde's array ceiling must carry no helper.\nGot: {code}"
+    );
+}
+
+/// #242: the f64 total-order key helper is emitted on demand, like the oversized
+/// array serde above. Generated code is tailored to its schema — a schema that
+/// indexes no `f64` must not carry the machinery, and its output must be
+/// byte-identical to what it produced before #242.
+#[test]
+fn test_rust_generation_no_f64_key_when_unneeded() {
+    let src = r#"
+Reading {
+  id: +uuid
+  label: ^string
+  raw: f64
+  pair: f64?
+  count: ^u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `raw` and `pair` are f64 but UNINDEXED, so no key is ever derived for them.
+    // Gating on "the schema mentions f64" rather than "the schema indexes f64"
+    // would emit a dead helper here.
+    assert!(
+        !code.contains("__forgedb_f64_key"),
+        "an unindexed f64 needs no key helper.\nGot: {code}"
+    );
+}
+
+/// #242: the gate must count composite components too. A composite key is built
+/// from each component's `index_key_expr`, so an f64 component reaches the same
+/// encoding — missing it would emit a call to a function that was never generated,
+/// and the generated crate would not compile.
+#[test]
+fn test_rust_generation_f64_key_emitted_for_a_composite_component_only() {
+    let src = r#"
+Sample {
+  id: +uuid
+  bucket: ^string
+  score: f64
+
+  @index(bucket, score)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `score` carries no `^` of its own — its only index membership is the
+    // composite.
+    assert!(
+        code.contains("fn __forgedb_f64_key"),
+        "an f64 reachable only as a composite component still needs the helper.\nGot: {code}"
     );
 }
 

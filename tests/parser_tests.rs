@@ -952,14 +952,20 @@ User {
     assert!(field.constraints.iter().any(|c| c.name == "max"));
 }
 
+/// `index_type` must report BTree for exactly the types codegen gives an ordered
+/// index to (`RustGenerator::ordered_key_type`) — it is stringified into the
+/// migration plan a user reads, so a mismatch claims an index that was never
+/// generated. `decimal` is included (scale-invariant normalized key) and so is
+/// `f64`, which has no `Ord` but is keyed by its total-order encoding (#242).
 #[test]
 fn test_parse_btree_index_type_for_ordered_types() {
     let input = r#"
 Product {
   id: +uuid
-  price: ^f64
   stock: ^u32
   created_at: ^timestamp
+  cost: ^decimal
+  score: ^f64
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -967,11 +973,14 @@ Product {
 
     let model = &schema.models[0];
     // Check that ordered types get BTree index type
-    assert_eq!(model.fields[1].index_type, IndexType::BTree); // price: f64
-    assert_eq!(model.fields[2].index_type, IndexType::BTree); // stock: u32
-    assert_eq!(model.fields[3].index_type, IndexType::BTree); // created_at: timestamp
+    assert_eq!(model.fields[1].index_type, IndexType::BTree); // stock: u32
+    assert_eq!(model.fields[2].index_type, IndexType::BTree); // created_at: timestamp
+    assert_eq!(model.fields[3].index_type, IndexType::BTree); // cost: decimal
+    assert_eq!(model.fields[4].index_type, IndexType::BTree); // score: f64
 }
 
+/// The counterpart: types with no total order report Hash — they are exact-match
+/// only, with no `find_by_*_range`.
 #[test]
 fn test_parse_hash_index_type_for_unordered_types() {
     let input = r#"
@@ -979,6 +988,7 @@ User {
   id: +uuid
   email: ^string
   active: ^bool
+  avatar: ^uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -988,6 +998,23 @@ User {
     // Check that unordered types get Hash index type
     assert_eq!(model.fields[1].index_type, IndexType::Hash); // email: string
     assert_eq!(model.fields[2].index_type, IndexType::Hash); // active: bool
+    assert_eq!(model.fields[3].index_type, IndexType::Hash); // avatar: uuid
+}
+
+/// A nullable ordered-eligible field is Hash, not BTree: `ordered_key_type`
+/// returns `None` for any nullable field, so no ordered index is generated.
+#[test]
+fn test_parse_hash_index_type_for_nullable_ordered_type() {
+    let input = r#"
+Reading {
+  id: +uuid
+  taken_at: ^timestamp?
+}
+"#;
+    let mut parser = Parser::new(input).unwrap();
+    let schema = parser.parse().unwrap();
+
+    assert_eq!(schema.models[0].fields[1].index_type, IndexType::Hash);
 }
 
 #[test]

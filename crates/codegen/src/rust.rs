@@ -660,6 +660,60 @@ impl RustGenerator {
             });
         }
 
+        // Total-order index key for `f64` (#242).  `f64` has no `Ord`, and its
+        // JSON rendering has no form at all for the non-finites — the key used to
+        // run through `serde_json::Number::from_f64`, whose `None` (exactly the
+        // NaN/±Inf case) fell through to the null tag `\u{0}`.  So NaN and both
+        // infinities were not merely lumped together, they were indistinguishable
+        // from an *unset* optional or an unlinked FK.  The ordered index (#169)
+        // meanwhile excluded `f64` outright, since `f64: !Ord` cannot key a
+        // `BTreeMap`, so `^f64` silently had no range method.
+        //
+        // Both are one problem — no total order over `f64` — so one encoding fixes
+        // both.  Flipping the sign bit of a non-negative float lifts it into the
+        // upper half of `u64`; inverting every bit of a negative one both reverses
+        // the ordering within the negatives (correct: IEEE magnitude runs backwards
+        // there) and drops them into the lower half.  The result orders
+        // `-Inf < negatives < ±0 < positives < +Inf < NaN` under plain `u64: Ord`,
+        // and being a bijection on bit patterns it hands each non-finite its own
+        // key for free.
+        //
+        // Two values must be canonicalized first, or the bijection is *too* faithful:
+        //
+        //   * `0.0 == -0.0` is true, so they must key alike — their bit patterns
+        //     differ, so without this a probe of `0.0` misses a row stored as `-0.0`.
+        //   * NaN has 2^53-ish bit patterns that all compare equal (to nothing,
+        //     including themselves).  Folding them to one keeps a NaN row findable
+        //     by any NaN.
+        //
+        // Both live here rather than in the `index_value_expr` pre-transform,
+        // because the ordered path does not go through it — `ordered_key_expr` is
+        // applied standalone at the maintenance and rehydrate sites.
+        //
+        // Emitted only when the schema indexes an `f64`, so output stays
+        // byte-identical for every schema that does not (same discipline as the
+        // oversized-array serde above).
+        if Self::schema_needs_f64_key(schema) {
+            tokens.extend(quote! {
+                /// Total-order `u64` key for an `f64` index value (#242): orders
+                /// `-Inf < negatives < ±0 < positives < +Inf < NaN`, and gives each
+                /// non-finite a distinct key.  `-0.0` folds to `0.0` and every NaN
+                /// folds to one bit pattern, so equal values key equal.
+                fn __forgedb_f64_key(__v: f64) -> u64 {
+                    let __v = if __v == 0.0 {
+                        0.0
+                    } else if __v.is_nan() {
+                        f64::NAN
+                    } else {
+                        __v
+                    };
+                    let __bits = __v.to_bits();
+                    let __mask = ((__bits as i64 >> 63) as u64) | 0x8000_0000_0000_0000;
+                    __bits ^ __mask
+                }
+            });
+        }
+
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
         // generic *shape* (three integrity classes) but every field name, rule,
         // and message is filled in by generated per-field checks — there is no
@@ -2381,20 +2435,18 @@ impl RustGenerator {
                 __k.push_str(if *__v { "true" } else { "false" });
                 __k
             },
-            // Floats keep the JSON number formatter: `Display` would render 1.0 as
-            // "1" and 1e300 as "1e300", where JSON gives "1.0" and "1e+300".
-            // `from_f64` returning `None` is exactly the NaN/±Inf case that used to
-            // arrive as `Value::Null` — same `\u{0}` bucket, preserved.
+            // Floats key off their total-order `u64` encoding (#242), NOT their
+            // JSON rendering.  JSON has no form for a non-finite, so the old
+            // `serde_json::Number::from_f64` path returned `None` for NaN/±Inf and
+            // fell through to the null tag — putting them in the same bucket as an
+            // unset optional.  The encoding is total, so there is no fall-through
+            // arm here at all; and it makes `-0.0`/`0.0` and every NaN payload key
+            // alike, which the JSON form did not.
             FieldType::F64 => quote! {
                 use std::fmt::Write as _;
-                match serde_json::Number::from_f64(*__v) {
-                    Some(__n) => {
-                        let mut __k = String::from('\u{2}');
-                        let _ = write!(__k, "{}", __n);
-                        __k
-                    }
-                    None => String::from('\u{0}'),
-                }
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __forgedb_f64_key(*__v));
+                __k
             },
             // `char(N)` is `[u8; N]`, which serde renders as a JSON array.
             FieldType::Bytes(_) => quote! {
@@ -2556,11 +2608,19 @@ impl RustGenerator {
     // (load-bearing for `&unique` / FK / reverse-FK / scan-pushdown), and the
     // extra per-write `BTreeMap` insert is negligible against the fsync barrier.
 
-    /// The Rust key type an ordered index uses for `field` — the field's natural
-    /// `Ord` value type — or `None` if the field is not ordered-eligible.
-    /// Eligible: non-nullable `u32/u64/i32/i64/timestamp/decimal`. Excluded:
-    /// `f64` (no clean total order — NaN), nullable (deferred), strings/uuid/enum/
-    /// bool/json/FK (either unordered or exact-match by nature).
+    /// The Rust type an ordered index's `BTreeMap` is **keyed by** for `field`, or
+    /// `None` if the field is not ordered-eligible. Eligible: non-nullable
+    /// `u32/u64/i32/i64/timestamp/decimal/f64`. Excluded: nullable (deferred),
+    /// strings/uuid/enum/bool/json/FK (either unordered or exact-match by nature).
+    ///
+    /// For every type but `f64` this is the field's own value type. `f64` has no
+    /// `Ord`, so it is keyed by its total-order `u64` encoding (#242) — which is
+    /// why this is *not* also the range methods' parameter type; see
+    /// [`ordered_param_type`](Self::ordered_param_type).
+    ///
+    /// Must agree with `FieldType::supports_range_queries` in `forgedb-parser`,
+    /// which reports the same answer to users as migration prose. The drift guard
+    /// `ordered_key_type_agrees_with_parser_range_support` pins them together.
     fn ordered_key_type(field: &forgedb_parser::Field) -> Option<TokenStream> {
         use forgedb_parser::FieldType;
         if field.is_nullable() {
@@ -2573,7 +2633,24 @@ impl RustGenerator {
             FieldType::I64 => Some(quote! { i64 }),
             FieldType::Timestamp => Some(quote! { Timestamp }),
             FieldType::Decimal => Some(quote! { rust_decimal::Decimal }),
+            // Keyed by `__forgedb_f64_key(v)`, not by the float itself.
+            FieldType::F64 => Some(quote! { u64 }),
             _ => None,
+        }
+    }
+
+    /// The type an ordered-index range method takes its `min`/`max` bounds in —
+    /// what the *caller* passes, as opposed to what the map is keyed by.
+    ///
+    /// These are the same for every type except `f64`, whose key is an encoded
+    /// `u64` (#242): a range method taking `Option<u64>` bit patterns would be
+    /// unusable, so the bound stays an `f64` and is encoded on the way in. That is
+    /// sound because the encoding is monotonic — a bound comparison over encoded
+    /// keys answers the same question as one over the floats.
+    fn ordered_param_type(field: &forgedb_parser::Field) -> Option<TokenStream> {
+        match &field.field_type {
+            forgedb_parser::FieldType::F64 if !field.is_nullable() => Some(quote! { f64 }),
+            _ => Self::ordered_key_type(field),
         }
     }
 
@@ -2593,10 +2670,15 @@ impl RustGenerator {
 
     /// The typed ordered-index key for a field value expression — the value
     /// itself, `decimal` normalized (scale-invariant, matching the hash index's
-    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound.
+    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound, and `f64`
+    /// run through its total-order encoding (#242) since it has no `Ord`.
+    ///
+    /// This is applied to the stored value AND to each range bound, which is what
+    /// keeps a bound comparable to what it is bounding.
     fn ordered_key_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
+            forgedb_parser::FieldType::F64 => quote! { __forgedb_f64_key(#value_expr) },
             _ => value_expr,
         }
     }
@@ -5160,10 +5242,16 @@ impl RustGenerator {
             .map(|f| {
                 let ident = Self::ordered_index_ident(f);
                 let kty = Self::ordered_key_type(f).expect("ordered_index_fields filtered");
+                // What the CALLER passes, which is the key type for every field
+                // but `f64` — whose key is an encoded `u64` the caller must never
+                // have to construct (#242).
+                let pty = Self::ordered_param_type(f).expect("ordered_index_fields filtered");
                 let id_type = Self::id_type_tokens(model);
                 let range_fn = format_ident!("find_by_{}_range", f.name);
-                // Normalize each bound identically to the stored key (decimal
-                // scale-invariant) so `1.0` and `1.00` bound the same bucket.
+                // Map each bound through the same transform as the stored key —
+                // decimal scale-invariant, f64 total-order encoded — so a bound is
+                // comparable to what it bounds.  Both are order-preserving, so the
+                // bound still selects the same values it names.
                 let lo_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
                 let hi_norm = Self::ordered_key_expr(&f.field_type, quote! { __v });
                 let doc = format!(
@@ -5177,8 +5265,8 @@ impl RustGenerator {
                     #[doc = #doc]
                     pub fn #range_fn(
                         &self,
-                        min: Option<#kty>,
-                        max: Option<#kty>,
+                        min: Option<#pty>,
+                        max: Option<#pty>,
                         descending: bool,
                         limit: Option<usize>,
                     ) -> Vec<#model_name> {
@@ -6687,6 +6775,36 @@ impl RustGenerator {
         model_fields
             .chain(struct_fields)
             .any(|f| Self::big_array_serde_path(&f.field_type).is_some())
+    }
+
+    /// Whether `__forgedb_f64_key` must be emitted (#242) — true when any model
+    /// indexes an `f64` in any position.
+    ///
+    /// Composite components are included, not just single-field indexes: a
+    /// composite key is built from each component's `index_key_expr`, so an f64
+    /// component reaches the same encoding. Missing them would emit a call to a
+    /// function that was never generated.
+    fn schema_needs_f64_key(schema: &Schema) -> bool {
+        schema.models.iter().any(|m| {
+            let singles = Self::indexed_fields(m).into_iter();
+            let composites = Self::composite_indexes(m)
+                .into_iter()
+                .flat_map(|(_ident, comps)| comps.into_iter());
+            singles
+                .chain(composites)
+                .any(|f| Self::is_f64_type(&f.field_type))
+        })
+    }
+
+    /// `f64`, plain or nullable — the types whose index key routes through
+    /// `__forgedb_f64_key`.
+    fn is_f64_type(field_type: &forgedb_parser::FieldType) -> bool {
+        use forgedb_parser::FieldType;
+        match field_type {
+            FieldType::F64 => true,
+            FieldType::Nullable(inner) => Self::is_f64_type(inner),
+            _ => false,
+        }
     }
 
     /// The `#[schema(...)]`/`#[serde(...)]` attribute pair an oversized array field
@@ -10738,6 +10856,99 @@ mod tests {
     use super::*;
     use forgedb_parser::ast::IndexType;
     use forgedb_parser::{Field, FieldType, Model, Schema};
+
+    /// A bare indexed field of `field_type`, for the predicate tests below.
+    fn probe_field(field_type: FieldType) -> Field {
+        Field {
+            position: None,
+            name: "probe".to_string(),
+            field_type,
+            auto_generate: false,
+            unique: false,
+            indexed: true,
+            constraints: vec![],
+            index_type: IndexType::Hash,
+            is_computed: false,
+            fulltext_indexed: false,
+            is_materialized: false,
+        }
+    }
+
+    /// Two lists describe ordered-index eligibility and must never disagree:
+    /// `ordered_key_type` here decides whether the `BTreeMap` is actually emitted,
+    /// while `FieldType::supports_range_queries` in `forgedb-parser` sets
+    /// `Field::index_type`, which `forgedb migrate` stringifies into user-facing
+    /// prose ("Add BTree index on 'Product.price'").
+    ///
+    /// They had drifted in BOTH directions (#242): `f64` was claimed and not
+    /// generated, `decimal` was generated and not claimed — so the migration plan
+    /// promised an index that did not exist and hid one that did. Editing the lists
+    /// fixed that instance; this is what stops the next one.
+    #[test]
+    fn ordered_key_type_agrees_with_parser_range_support() {
+        let types = [
+            FieldType::U32,
+            FieldType::U64,
+            FieldType::I32,
+            FieldType::I64,
+            FieldType::F64,
+            FieldType::Timestamp,
+            FieldType::Decimal,
+            FieldType::String,
+            FieldType::Bool,
+            FieldType::Uuid,
+            FieldType::Json,
+            FieldType::Bytes(8),
+            FieldType::Enum("Status".to_string()),
+        ];
+        for ty in types {
+            let generated = RustGenerator::ordered_key_type(&probe_field(ty.clone())).is_some();
+            let claimed = ty.supports_range_queries();
+            assert_eq!(
+                generated, claimed,
+                "{ty:?}: codegen emits an ordered index = {generated}, but \
+                 supports_range_queries() claims {claimed}"
+            );
+        }
+    }
+
+    /// Nullability is decided by `ordered_key_type` alone — `supports_range_queries`
+    /// is a `FieldType` predicate and never sees the field. A nullable
+    /// ordered-eligible type must still get no ordered index.
+    #[test]
+    fn nullable_fields_are_never_ordered_eligible() {
+        for inner in [FieldType::U32, FieldType::F64, FieldType::Decimal] {
+            let field = probe_field(FieldType::Nullable(Box::new(inner.clone())));
+            assert!(
+                RustGenerator::ordered_key_type(&field).is_none(),
+                "nullable {inner:?} must not get an ordered index"
+            );
+        }
+    }
+
+    /// `f64` is the one type whose ordered key and range-bound parameter differ:
+    /// the map is keyed by the encoded `u64`, but a caller passes an `f64` (#242).
+    /// Every other type keeps them identical.
+    #[test]
+    fn f64_ordered_param_type_stays_f64_while_its_key_is_u64() {
+        let f = probe_field(FieldType::F64);
+        assert_eq!(
+            RustGenerator::ordered_key_type(&f).unwrap().to_string(),
+            "u64"
+        );
+        assert_eq!(
+            RustGenerator::ordered_param_type(&f).unwrap().to_string(),
+            "f64"
+        );
+        for ty in [FieldType::U32, FieldType::I64, FieldType::Decimal] {
+            let f = probe_field(ty.clone());
+            assert_eq!(
+                RustGenerator::ordered_key_type(&f).unwrap().to_string(),
+                RustGenerator::ordered_param_type(&f).unwrap().to_string(),
+                "{ty:?}: key and param types must coincide"
+            );
+        }
+    }
 
     #[test]
     fn test_rust_generation_with_quote() {

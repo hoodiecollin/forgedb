@@ -84,7 +84,7 @@ DuckDB is built to win these; showing that is honest. ForgeDB closed most of the
 | `scan_aggregate` | 32.4 ms | **568 µs** (186 µs w/ `@projection`) | 352 µs | 632 µs | **92 µs** |
 | `scan_sort_top10` | 32.6 ms | **37 µs** (index) | 4.35 µs | 809 µs | 491 µs |
 
-The old 32 ms was per-row syscalls in hashmap order, not a columnar-layout penalty. A plain aggregate now lands at 568 µs — ahead of redb, behind SQLite. A `@projection` that reads only the aggregated column drops it to 186 µs, which beats both. DuckDB's vectorized fold still leads. On the sorted top-N, ForgeDB's ordered index (37 µs) beats DuckDB's full scan. The ordered index covers non-nullable integer, timestamp, and decimal columns; `f64` and nullable are deferred, and hash indexes are exact-match only.
+The old 32 ms was per-row syscalls in hashmap order, not a columnar-layout penalty. A plain aggregate now lands at 568 µs — ahead of redb, behind SQLite. A `@projection` that reads only the aggregated column drops it to 186 µs, which beats both. DuckDB's vectorized fold still leads. On the sorted top-N, ForgeDB's ordered index (37 µs) beats DuckDB's full scan. The ordered index covers non-nullable integer, `f64`, timestamp, and decimal columns; nullable is deferred, and hash indexes are exact-match only.
 
 ## Footprint
 
