@@ -220,7 +220,9 @@ crash-test:
 ## Index-key parity proof (#230): generate a model carrying every indexable type,
 ## compile it, and assert the monomorphic key emission is byte-identical to the
 ## `serde_json::Value` form it replaced — plus a round-trip through the real
-## generated `find_by_*`. Also #[ignore]d out of the fast suite (compiles a crate).
+## generated `find_by_*`. `f64` is the one exception: its legacy key was broken and
+## was replaced (#242), so it is asserted against its own contract, not against
+## legacy. Also #[ignore]d out of the fast suite (compiles a crate).
 index-key-parity:
 	cargo test --test index_key_parity_test -- --ignored --nocapture
 
@@ -233,6 +235,17 @@ index-key-parity:
 ## wire form. Also #[ignore]d out of the fast suite (compiles a crate).
 oversized-array-test:
 	cargo test --test oversized_array_test -- --ignored --nocapture
+
+.PHONY: f64-index-key
+
+## f64 total-order key proof (#242): a non-finite `f64` keyed into the NULL bucket
+## (`serde_json::Number::from_f64` returns `None`), so NaN/±Inf were indistinguishable
+## from an unset optional — and `^f64` got no ordered index at all, since `f64: !Ord`.
+## Generates every f64 index shape (hash, nullable, unique, composite component),
+## compiles it, and asserts the IEEE 754 total-order encoding both separates the
+## non-finites and orders them. Also #[ignore]d out of the fast suite (compiles a crate).
+f64-index-key:
+	cargo test --test f64_index_key_test -- --ignored --nocapture
 
 .PHONY: api-wire-test
 
