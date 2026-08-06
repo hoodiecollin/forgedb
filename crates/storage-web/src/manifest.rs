@@ -32,8 +32,17 @@ pub struct Manifest {
     pub format_version: u32,
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
-    /// Per-field allocation high-water marks (#187) — opaque `name -> value`.
-    /// See the native crate's `Manifest::auto_sequences` for the full contract.
+    /// Per-field allocation high-water marks (#187) — opaque `name -> highest
+    /// value handed out`.
+    ///
+    /// **This backend neither parses these keys nor branches on them**, and must
+    /// not start: it stores and returns strings and integers. Which fields
+    /// appear, what the numbers mean, and every read and write of them belong to
+    /// generated code. The invariant is restated here rather than delegated
+    /// because `forgedb-storage-web` is separately published and separately
+    /// edited — the rule has to be in front of whoever changes *this* file. The
+    /// native crate's `Manifest::auto_sequences` carries the full rationale.
+    ///
     /// The browser replica is read-only today and never allocates, but the field
     /// must exist so a follower round-trips a writer's manifest without dropping
     /// it (and so `forgedb_storage::Manifest` stays one shape across targets).
