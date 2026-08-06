@@ -304,9 +304,11 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // class would make the bare shape conflict-visible with no substrate change.
         // Refused anyway, because (a) a `.forge` schema must not be
         // deployment-conditional — validity cannot hinge on whether the user later
-        // runs `forgedb coordinate`; (b) `&unique` is enforced durably against
-        // already-committed rows, where a claim key would catch only concurrent
-        // collisions; and (c) the escape is one character, `&`.
+        // runs `forgedb coordinate`; (b) `&unique` is enforced by a **durable**
+        // index that outlives every process, whereas a claim key is only as old as
+        // the coordinator's in-memory conflict map — which does retain committed
+        // keys (it is deliberately never `gc()`d), but is rebuilt empty on
+        // restart; and (c) the escape is one character, `&`.
         let identity_name = model
             .fields
             .iter()

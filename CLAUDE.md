@@ -259,9 +259,13 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case. Every model
 must also have an **identity field** — named `id`, or any `+` auto-generate field — which is
 likewise fatal (#248); convention is `id: +uuid`.
-Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — but only
-`uuid`/`timestamp` are actually synthesized on create; integer `+u32`/`+u64` parse+mark but are
-NOT auto-incremented, RFC #187), `&`
+Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — all four
+are synthesized on create; integer `+u32`/`+u64` allocate from a per-field counter seeded by an
+ungated reopen scan and floored by `Manifest.auto_sequences`, #187. An integer auto must be the
+model's **identity** or carry `&unique` — a bare non-unique one is **fatal at parse**, because
+only those two shapes enter the opaque write-set and make a cross-process double-allocation a
+detected conflict; lifting that is #260. `0` is the allocate sentinel, so it cannot be inserted
+explicitly), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
 FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `bytes(N)` (raw fixed-size bytes,
 NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
