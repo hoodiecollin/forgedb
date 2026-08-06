@@ -268,6 +268,21 @@ api-wire-test:
 list-scan-test:
 	cargo test --test list_scan_test -- --ignored --nocapture
 
+.PHONY: auto-increment-test
+
+## Integer auto-increment proof (#187): the `+u32`/`+u64` counter is a value handed
+## out over time — across a compaction, a reopen, a rollback, threads, and separate
+## processes — so every property it promises is a property of what generated code
+## DOES, which a snapshot cannot see. Covers monotonicity, the `0` sentinel, the
+## deliberate gap on rollback, restart safety, the compaction high-water mark (the
+## one that fails silently), overflow refusal, Tier-2 concurrency, and the Tier-3
+## multi-process case that makes RFC #187's identity-or-`&unique` rule meaningful.
+## Also #[ignore]d out of the fast suite (compiles a crate; the second spawns
+## `forgedb coordinate` plus two writer processes).
+auto-increment-test:
+	cargo test --test auto_increment_test -- --ignored --nocapture
+	cargo test --test auto_increment_coordinated_test -- --ignored --nocapture
+
 .PHONY: scripts-typecheck
 
 ## Typecheck the root-level repo tooling in scripts/. The scripts run under bun with no

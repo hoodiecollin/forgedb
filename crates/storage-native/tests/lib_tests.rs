@@ -191,6 +191,7 @@ fn test_manifest_roundtrip() {
         compaction_epoch: 0,
         format_version: 1,
         row_anchor: None,
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&path).unwrap();
 

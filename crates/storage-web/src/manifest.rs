@@ -32,6 +32,13 @@ pub struct Manifest {
     pub format_version: u32,
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
+    /// Per-field allocation high-water marks (#187) — opaque `name -> value`.
+    /// See the native crate's `Manifest::auto_sequences` for the full contract.
+    /// The browser replica is read-only today and never allocates, but the field
+    /// must exist so a follower round-trips a writer's manifest without dropping
+    /// it (and so `forgedb_storage::Manifest` stays one shape across targets).
+    #[serde(default)]
+    pub auto_sequences: std::collections::BTreeMap<String, u64>,
 }
 
 impl Manifest {

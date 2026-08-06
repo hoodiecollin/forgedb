@@ -7903,3 +7903,255 @@ Collide {
         "the user's own field must appear exactly once:\n{view}"
     );
 }
+
+// ---- #187: `+u32` / `+u64` auto-increment ---------------------------------
+//
+// The design (RFC #187, Gates 1+2 accepted): one monotonic in-memory counter per
+// auto-integer field, seeded by the scans that already run, floored by a
+// high-water mark persisted in `Manifest.auto_sequences`. `0` is the allocate
+// sentinel; an explicitly supplied value advances the counter via `fetch_max`;
+// a rolled-back transaction burns its number (monotonic and unique, not
+// contiguous).
+//
+// Assertions here are identifier-precise (`mentions_ident`) per the #258 lesson:
+// a bare `contains` cannot tell `__autoseq_id` from `__autoseq_ident`.
+//
+// The counter is `__autoseq_<field>`, NOT `__seq_<field>`: the generated Tier-2 /
+// Tier-3 commit path already binds locals named `__seq`, `__seq_arc` and
+// `__seq_start`, so a model with a field named `arc` or `start` would emit a
+// counter whose name reads as one of those. Nothing would fail to compile — it
+// would just be indistinguishable in the emitted source, including to the
+// "emits no counter" guard below.
+
+/// The counter must be allocated from at **all three** create surfaces —
+/// `Database::create_*`, `TxHandle::create_*`, and `ConcurrentTxHandle::create_*`.
+/// The third is the one that would be missed: it is generated in a separate
+/// function from the other two, and its prepare closure runs with no write lock,
+/// which is exactly the path where a missing allocation silently yields `0`.
+#[test]
+fn test_rust_generation_integer_auto_allocates_at_every_create_surface() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "__autoseq_id"),
+        "an integer auto gets a counter field on the storage struct (#187)"
+    );
+    assert_eq!(
+        code.matches("__alloc_id()").count(),
+        3,
+        "all three create surfaces allocate — Database, TxHandle, and \
+         ConcurrentTxHandle (#187)"
+    );
+}
+
+/// A *non-identity* integer auto is the shape the conflict-visible rule forces to
+/// carry `&`, so allocation and the #258 uniqueness enforcement must coexist on
+/// the same field. Guarded together because the two features touch adjacent
+/// generated code and either could plausibly be written to replace the other.
+#[test]
+fn test_rust_generation_non_identity_integer_auto_allocates_and_stays_unique() {
+    let src = r#"
+Invoice {
+  id: +uuid
+  number: &+u64
+  total: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "__autoseq_number"),
+        "a non-identity integer auto gets its own counter (#187)"
+    );
+    assert_eq!(
+        code.matches("__alloc_number()").count(),
+        3,
+        "allocated at every create surface, identity or not (#187)"
+    );
+    // #258: `&` on a non-identity auto still builds the index and enforces it.
+    assert!(
+        mentions_ident(&code, "number_index"),
+        "`&` still builds its index (#258 must not regress under #187)"
+    );
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::Unique{model:\"Invoice\",field:\"number\""),
+        "`&` still enforces uniqueness (#258 must not regress under #187)"
+    );
+    // The identity is a uuid here, so it must NOT have grown a counter.
+    assert!(
+        !mentions_ident(&code, "__autoseq_id"),
+        "a `+uuid` identity allocates from randomness, not a counter (#187)"
+    );
+}
+
+/// The counter is writer state. A `*StorageReader` is a read-only snapshot handle
+/// (#56-B) and must not carry one — a reader holding a counter would read as a
+/// second allocator and invites a future change to allocate through it.
+#[test]
+fn test_rust_generation_reader_carries_no_sequence_counter() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: ^string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let reader = extract_struct(&code, "pub struct TicketStorageReader");
+    assert!(
+        !reader.contains("__autoseq_"),
+        "a read-only reader must carry no allocator state (#187):\n{reader}"
+    );
+    // Control: the writer does carry it, so the assertion above is not vacuous.
+    let storage = extract_struct(&code, "pub struct TicketStorage");
+    assert!(
+        storage.contains("__autoseq_id"),
+        "the writer is where the counter lives (#187):\n{storage}"
+    );
+}
+
+/// The no-regression guard for the whole existing corpus: a model whose only autos
+/// are `+uuid` / `+timestamp` must emit **no** counter machinery at all. Every
+/// schema in `examples/` except `iot-sensors` is this shape, so a leak here would
+/// change output repo-wide.
+#[test]
+fn test_rust_generation_non_integer_autos_emit_no_counter() {
+    let src = r#"
+Event {
+  id: +uuid
+  created_at: +timestamp
+  ref_id: &+uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !code.contains("__autoseq_"),
+        "no counter field for a model with no integer auto (#187)"
+    );
+    assert!(
+        !code.contains("__alloc_"),
+        "no allocation call for a model with no integer auto (#187)"
+    );
+    // NOT asserted: the absence of `SequenceExhausted`. `ValidationError` is a
+    // fixed-shape enum emitted once per schema — every variant is always present,
+    // whether or not any field can produce it. What must be absent is the
+    // machinery above that would *raise* it.
+}
+
+/// The M2M junction writes its own `Manifest` literal, separate from the model
+/// one, and it is compile-forced by `Manifest` having no `Default` — so it must be
+/// updated in the same pass. Pinned because "it compiles" is the only feedback that
+/// site otherwise gives.
+///
+/// The fixture needs a third model to say anything: a junction is only generated
+/// between two **uuid-PK** models (`valid_m2m` → `is_uuid_pk`), so the M2M pair can
+/// never itself carry an integer auto. `Ticket` supplies one alongside, which is
+/// what makes the junction's empty map a real assertion rather than a description
+/// of a schema where nothing allocates anywhere.
+#[test]
+fn test_rust_generation_junction_manifest_carries_empty_sequence_map() {
+    let src = r#"
+Student {
+  id: +uuid
+  courses: [Course]
+}
+
+Course {
+  id: +uuid
+  students: [Student]
+}
+
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("auto_sequences:Default::default()")
+            || flat.contains("auto_sequences:std::collections::BTreeMap::new()"),
+        "the junction manifest takes an empty sequence map — a junction has no \
+         fields, so it can have no auto-integer field (#187)"
+    );
+    // `Ticket` DOES carry a real map, so the emptiness above is specific to the
+    // junction rather than the feature quietly emitting nothing anywhere.
+    assert!(
+        mentions_ident(&code, "__autoseq_id"),
+        "a model with an integer auto still allocates alongside the junction (#187)"
+    );
+}
+
+/// The create contract widens: an integer auto becomes server-synthesized, so it
+/// gains `#[serde(default)]` and drops out of the create input — the same
+/// treatment `+uuid` already gets. This is what stops a REST create that omits an
+/// integer id from 422-ing.
+///
+/// Note this fixes the #188 *class* only for the generators that ask
+/// `is_server_synthesized`. The TS SDK and the OpenAPI `required` list compute the
+/// create shape by guessing and stay wrong until #259 — deliberately out of scope
+/// here, and asserted nowhere in this test.
+#[test]
+fn test_rust_generation_integer_auto_is_server_synthesized() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let model = extract_struct(&code, "pub struct Ticket");
+    assert!(
+        model.contains("#[serde(default)]"),
+        "an integer auto may be omitted from a create body, so it needs a serde \
+         default exactly as `+uuid` does (#187/#188):\n{model}"
+    );
+}
+
+/// Overflow is an error, never a wrap. A `+u32` that wraps past `u32::MAX` would
+/// re-issue `0` — which is also the allocate sentinel — and then collide with
+/// every id already handed out.
+#[test]
+fn test_rust_generation_integer_auto_guards_overflow() {
+    let src = r#"
+Small {
+  id: +u32
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "SequenceExhausted"),
+        "a `+u32` counter must refuse to wrap (#187)"
+    );
+    assert!(
+        code.contains("u32::MAX"),
+        "the guard is against the field's own width, not u64's (#187)"
+    );
+}

@@ -84,6 +84,7 @@ fn build_model_dir(root: &Path, committed: usize, uncommitted_extra: usize) {
             relative_path: "tombstones.bin".into(),
             bytes_per_row: 1,
         }),
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&dir.join("manifest.json")).unwrap();
 }
@@ -192,6 +193,7 @@ fn grow_model_dir(root: &Path, committed: usize, epoch: u64) {
             relative_path: "tombstones.bin".into(),
             bytes_per_row: 1,
         }),
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&dir.join("manifest.json")).unwrap();
 }

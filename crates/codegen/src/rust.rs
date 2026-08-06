@@ -807,6 +807,14 @@ impl RustGenerator {
                     rule: &'static str,
                     message: String,
                 },
+                /// A `+u32`/`+u64` auto-increment field ran out of values (#187) →
+                /// 500.  Refused rather than wrapped: wrapping would re-issue `0`,
+                /// which is also the "allocate one for me" sentinel, and then
+                /// collide with every value already handed out.
+                ///
+                /// A server-side exhaustion, not a bad request — which is why it is
+                /// the one `ValidationError` class that maps to 5xx.
+                SequenceExhausted { model: &'static str, field: &'static str },
             }
 
             impl ValidationError {
@@ -819,6 +827,9 @@ impl RustGenerator {
                         | ValidationError::DanglingReference { .. }
                         | ValidationError::ReferencedByChildren { .. } => 409,
                         ValidationError::Constraint { .. } => 422,
+                        // Not the caller's fault and not retryable by changing the
+                        // request: the id space itself is spent (#187).
+                        ValidationError::SequenceExhausted { .. } => 500,
                     }
                 }
             }
@@ -845,6 +856,13 @@ impl RustGenerator {
                         }
                         ValidationError::Constraint { model, field, rule, message } => {
                             write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
+                        }
+                        ValidationError::SequenceExhausted { model, field } => {
+                            write!(
+                                f,
+                                "auto-increment sequence for `{}.{}` is exhausted",
+                                model, field
+                            )
                         }
                     }
                 }
@@ -1204,6 +1222,41 @@ impl RustGenerator {
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
         let write_manifest = Self::generate_write_manifest(model);
+        let autoseq_methods = Self::generate_autoseq_methods(model);
+
+        // #187: apply the persisted high-water marks as a FLOOR after the reopen
+        // scan has run. `max(persisted, scanned)` — the scan is authoritative for
+        // everything still on disk, and the manifest covers only what compaction
+        // physically removed. That ordering is what makes a lost tip safe: a crash
+        // before the manifest write falls back to the scan, which never
+        // over-issues, only under-issues into a range compaction already freed.
+        let autoseq_floor = {
+            let loads: Vec<TokenStream> = Self::integer_auto_fields(model)
+                .iter()
+                .map(|f| {
+                    let seq = Self::autoseq_field_ident(f);
+                    let key = &f.name;
+                    quote! {
+                        if let Some(&__floor) = __persisted.get(#key) {
+                            db.#seq.fetch_max(__floor, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                })
+                .collect();
+            if loads.is_empty() {
+                quote! {}
+            } else {
+                let manifest_rel = format!("{}/manifest.json", Self::to_snake_case(&model.name));
+                quote! {
+                    {
+                        let __persisted = forgedb_storage::Manifest::load_from(&root.join(#manifest_rel))
+                            .map(|m| m.auto_sequences)
+                            .unwrap_or_default();
+                        #(#loads)*
+                    }
+                }
+            }
+        };
 
         // Read-only reader handle (#56 Direction B): a per-model bundle of
         // read-only column views sharing the writer's file descriptors, so many
@@ -1268,6 +1321,7 @@ impl RustGenerator {
                     // and `id_to_row` below reflect the recovered committed rows.
                     db.recover_from_wal();
                     #rehydrate_logic
+                    #autoseq_floor
                     // Refresh the physical-layout manifest on open (#57): cheap,
                     // off the insert hot path, gives schema-blind backup/inspector
                     // a current column map + row-count anchor.
@@ -1295,6 +1349,8 @@ impl RustGenerator {
                 }
 
                 #write_manifest
+
+                #autoseq_methods
 
                 /// Attach a shared change feed (#62 Direction A).  Called by
                 /// `Database::new()`; afterwards each `insert` emits a field-blind
@@ -1948,6 +2004,42 @@ impl RustGenerator {
     /// — silently, with no warning, on `+uuid`/`+timestamp` fields that synthesize
     /// today.  Composite indexes never applied the exclusion, so the same field was
     /// indexable via `@index(a, b)` but not via `^`.
+    /// The model's `+u32` / `+u64` fields — the ones that allocate from a counter
+    /// (#187).  `+uuid` draws from a random space and `+timestamp` from the clock;
+    /// neither needs one, so neither appears here.
+    ///
+    /// Empty for every schema in the corpus but `iot-sensors`, which is what makes
+    /// this the switch that keeps #187 from changing any other model's output.
+    fn integer_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        model
+            .fields
+            .iter()
+            .filter(|f| {
+                f.auto_generate
+                    && matches!(
+                        f.field_type,
+                        forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::U64
+                    )
+            })
+            .collect()
+    }
+
+    /// The storage-struct field holding one auto-integer field's counter.
+    ///
+    /// `__autoseq_`, deliberately NOT `__seq_`: the generated Tier-2 / Tier-3
+    /// commit path already binds locals named `__seq`, `__seq_arc` and
+    /// `__seq_start`, so a model with a field named `arc` or `start` would emit a
+    /// counter indistinguishable from one of them in the generated source.
+    fn autoseq_field_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
+        format_ident!("__autoseq_{}", field.name)
+    }
+
+    /// The allocator method for one auto-integer field: `fetch_add(1)` plus the
+    /// width guard that makes overflow an error instead of a wrap back to `0`.
+    fn autoseq_alloc_ident(field: &forgedb_parser::Field) -> proc_macro2::Ident {
+        format_ident!("__alloc_{}", field.name)
+    }
+
     fn indexed_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         // A model with no identity cannot be inserted, so there is nothing to
         // index.  (Same predicate codegen uses to *find* the identity, so this
@@ -3167,6 +3259,20 @@ impl RustGenerator {
             quote! {}
         };
 
+        // #187: one monotonic counter per `+u32`/`+u64` field.  `Arc<AtomicU64>`
+        // for the same reason the index maps are `Arc`ed — `compact()` does
+        // `*self = Self::new_at_no_rehydrate(..)`, and the counter has to be
+        // carried across that reset rather than silently rebuilt at zero.
+        // Always `u64` regardless of the field's width; the width only decides
+        // where `__alloc_*` refuses to go further.
+        let autoseq_fields: Vec<_> = Self::integer_auto_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::autoseq_field_ident(f);
+                quote! { #ident: std::sync::Arc<std::sync::atomic::AtomicU64> }
+            })
+            .collect();
+
         quote! {
             id_to_row: std::sync::Arc<HashMap<#id_type, usize>>,
             #id_versions_field
@@ -3175,6 +3281,7 @@ impl RustGenerator {
             #(#index_fields,)*
             #(#composite_fields,)*
             #(#ordered_fields,)*
+            #(#autoseq_fields,)*
             tombstones: forgedb_storage::Tombstones,
             // Write-ahead log (#89 durable write path): every mutation records an
             // opaque row blob here + fsync BEFORE touching columns, so a crash
@@ -3316,6 +3423,18 @@ impl RustGenerator {
             quote! {}
         };
 
+        // #187: counters start at 0 (nothing allocated).  `new_at` seeds them from
+        // `max(manifest floor, scanned max)` in `#rehydrate_logic`; the
+        // no-rehydrate constructor leaves them here at 0 and `compact()` reinstalls
+        // the live values across its `*self =` reset.
+        let autoseq_inits: Vec<_> = Self::integer_auto_fields(model)
+            .iter()
+            .map(|f| {
+                let ident = Self::autoseq_field_ident(f);
+                quote! { #ident: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) }
+            })
+            .collect();
+
         quote! {
             id_to_row: std::sync::Arc::new(HashMap::new()),
             #id_versions_init
@@ -3324,6 +3443,7 @@ impl RustGenerator {
             #(#index_inits,)*
             #(#composite_inits,)*
             #(#ordered_inits,)*
+            #(#autoseq_inits,)*
             tombstones: forgedb_storage::Tombstones::new(
                 root.join(#tombstones_path)
             ).expect("Failed to create tombstones"),
@@ -3580,6 +3700,62 @@ impl RustGenerator {
     /// back to 0 on the next open and silently corrupt a chain); instead it
     /// *loads any existing manifest and preserves* its `compaction_epoch`,
     /// stamping the baseline `0` only for a fresh directory.
+    /// Per-field allocators for `+u32`/`+u64` fields (#187).
+    ///
+    /// A compare-exchange loop rather than `fetch_add`, because `fetch_add`
+    /// **wraps**: at `u64::MAX` it would silently roll to `0` — which is also the
+    /// allocate sentinel — and start colliding with every value ever issued. The
+    /// loop refuses at the field's own width instead, so a `+u32` stops at
+    /// `u32::MAX` rather than at the counter's.
+    ///
+    /// Lock-free by necessity, not preference: Tier 2's `transaction_concurrent`
+    /// runs its prepare closure with **no write lock held**, so two threads are
+    /// genuinely inside this at once.
+    fn generate_autoseq_methods(model: &forgedb_parser::Model) -> TokenStream {
+        let model_name = &model.name;
+        let methods: Vec<TokenStream> = Self::integer_auto_fields(model)
+            .iter()
+            .map(|f| {
+                let alloc = Self::autoseq_alloc_ident(f);
+                let seq = Self::autoseq_field_ident(f);
+                let field_name = &f.name;
+                let ty = Self::map_field_type_ident(&f.field_type);
+                let doc = format!(
+                    "Allocate the next `{}.{}` value (#187). Monotonic and unique, \
+                     never contiguous — a rolled-back or `Nack`ed attempt burns its \
+                     number, the same contract Postgres and MySQL offer.",
+                    model.name, f.name
+                );
+                quote! {
+                    #[doc = #doc]
+                    fn #alloc(&self) -> Result<#ty, ValidationError> {
+                        use std::sync::atomic::Ordering;
+                        const __LIMIT: u64 = #ty::MAX as u64;
+                        let mut __cur = self.#seq.load(Ordering::SeqCst);
+                        loop {
+                            if __cur >= __LIMIT {
+                                return Err(ValidationError::SequenceExhausted {
+                                    model: #model_name,
+                                    field: #field_name,
+                                });
+                            }
+                            match self.#seq.compare_exchange_weak(
+                                __cur,
+                                __cur + 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => return Ok((__cur + 1) as #ty),
+                                Err(__actual) => __cur = __actual,
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+        quote! { #(#methods)* }
+    }
+
     fn generate_write_manifest(model: &forgedb_parser::Model) -> TokenStream {
         let model_snake = Self::to_snake_case(&model.name);
         let manifest_path = format!("{}/manifest.json", model_snake);
@@ -3625,6 +3801,25 @@ impl RustGenerator {
             }
         }
 
+        // One max-merge per auto-integer field (#187).  Empty for every model
+        // with no `+u32`/`+u64` field, which is why this changes no other output.
+        let autoseq_merges: Vec<TokenStream> = Self::integer_auto_fields(model)
+            .iter()
+            .map(|f| {
+                let seq = Self::autoseq_field_ident(f);
+                let key = &f.name;
+                quote! {
+                    {
+                        let __live = self.#seq.load(std::sync::atomic::Ordering::SeqCst);
+                        let __slot = __auto_sequences.entry(#key.to_string()).or_insert(0);
+                        if __live > *__slot {
+                            *__slot = __live;
+                        }
+                    }
+                }
+            })
+            .collect();
+
         quote! {
             /// Write the physical-layout manifest for this model (#57).  Layout
             /// metadata only — schema-blind backup/inspector read it; it carries
@@ -3648,6 +3843,24 @@ impl RustGenerator {
                 let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
                     .map(|m| m.format_version)
                     .unwrap_or(EXPECTED_FORMAT_VERSION);
+                // Auto-increment high-water marks (#187).  This is a **max-merge**,
+                // NOT the carry-forward the two fields above do — and the
+                // difference is load-bearing.
+                //
+                // `compact()` does `*self = Self::new_at_no_rehydrate(&root)`, and
+                // that constructor calls this method while every counter is still
+                // freshly zeroed.  A carry-forward would be fine there but would
+                // lose a live tip elsewhere; a plain write of `self` would clobber
+                // the persisted value with `0` and re-issue every id after the next
+                // restart.  Taking the max makes the stored number a hint that only
+                // ever moves up, so the zeroed intermediate write is harmless and
+                // no ordering discipline is required of the caller.
+                let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                    .map(|m| m.auto_sequences)
+                    .unwrap_or_default();
+                #[allow(unused_mut)]
+                let mut __auto_sequences = __persisted_seqs;
+                #(#autoseq_merges)*
                 let manifest = forgedb_storage::Manifest {
                     schema_version: 1,
                     row_count: self.row_count,
@@ -3663,6 +3876,7 @@ impl RustGenerator {
                         relative_path: "tombstones.bin".to_string(),
                         bytes_per_row: 1usize,
                     }),
+                    auto_sequences: __auto_sequences,
                 };
                 // Best-effort: a failed manifest write must not abort the app;
                 // reopen/compaction anchor on the tombstone file, not this file.
@@ -4489,6 +4703,48 @@ impl RustGenerator {
             })
             .collect();
 
+        // #187 — the auto-increment counters get the SAME save/reinstall treatment
+        // as the index `Arc`s above, and for a sharper reason.
+        //
+        // Compaction is the one operation a pure rescan cannot survive: it
+        // physically drops dead rows, so a later reopen derives a *lower* maximum
+        // than was actually issued and hands the same value out a second time.
+        // `*self = Self::new_at_no_rehydrate(..)` below would reset the live
+        // counter to 0, and `write_manifest` (called from inside that constructor)
+        // max-merges — so the on-disk floor survives, but the in-memory tip
+        // accumulated since open would be lost without this.
+        //
+        // Both halves are required. With only the max-merge, the process keeps
+        // allocating from 0 until it passes the floor and re-issues live ids; with
+        // only the save/reinstall, the floor is never written. Miss either and it
+        // reads as working until the second run after a compaction.
+        let autoseq_idents: Vec<_> = Self::integer_auto_fields(model)
+            .iter()
+            .map(|f| Self::autoseq_field_ident(f))
+            .collect();
+        let save_autoseqs: Vec<_> = autoseq_idents
+            .iter()
+            .map(|ident| {
+                let saved = format_ident!("__saved_{}", ident);
+                quote! { let #saved = std::sync::Arc::clone(&self.#ident); }
+            })
+            .collect();
+        let reinstall_autoseqs: Vec<_> = autoseq_idents
+            .iter()
+            .map(|ident| {
+                let saved = format_ident!("__saved_{}", ident);
+                quote! { self.#ident = #saved; }
+            })
+            .collect();
+        // Re-persist AFTER reinstalling: the constructor's own `write_manifest`
+        // ran while the counters were zeroed, so the floor it merged is only as
+        // high as the previous write. This one carries the live tip.
+        let repersist_autoseqs = if autoseq_idents.is_empty() {
+            quote! {}
+        } else {
+            quote! { self.write_manifest(&__root); }
+        };
+
         // #162-C: `id_versions` (#159) references physical rows, so rebuild it to a
         // single-element `[new_row]` per surviving id (compaction collapses every id
         // to its one kept version).  Omitted for an id-less model (no such field).
@@ -4562,6 +4818,7 @@ impl RustGenerator {
                     // save + reinstall them verbatim; `id_to_row` is remapped below.
                     let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
                     #(#save_indexes)*
+                    #(#save_autoseqs)*
                     let __root = self.root.clone();
                     let __feed = self.changefeed.take();
                     let __broker = self.broker.take();
@@ -4571,6 +4828,8 @@ impl RustGenerator {
                     self.changefeed = __feed;
                     self.broker = __broker;
                     #(#reinstall_indexes)*
+                    #(#reinstall_autoseqs)*
+                    #repersist_autoseqs
                     // Remap `id_to_row` (and rebuild the single-version
                     // `id_versions`) from the dense keep-set positions.  An id whose
                     // newest row was tombstoned is absent from `__keep` and so is
@@ -4926,6 +5185,45 @@ impl RustGenerator {
         let versions_push =
             Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { __r });
 
+        // #187 — this is how a Tier-3 peer's allocations become visible.
+        //
+        // Coordinated clients open lock-free and each derive their own counter, so
+        // a peer's commits are invisible until refresh. `__peer_refresh` already
+        // runs before each coordinated prepare whenever the coordinator's LSN
+        // advanced, and routes through here — so folding the max into this delta
+        // closes peer staleness with no new mechanism, and a `Nack`ed writer
+        // re-derives past the winner's value before it retries.
+        //
+        // Ungated by tombstones, for the same reason the reopen scan is: a peer's
+        // deleted row still spent its number.
+        let autoseq_delta = {
+            let identity = Self::identity_field(model).map(|f| f.name.as_str());
+            let folds: Vec<TokenStream> = Self::integer_auto_fields(model)
+                .iter()
+                .map(|f| {
+                    let seq = Self::autoseq_field_ident(f);
+                    if Some(f.name.as_str()) == identity {
+                        // `id` is already decoded at the top of the loop body.
+                        quote! {
+                            self.#seq.fetch_max(id as u64, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    } else {
+                        let col = format_ident!("{}_col", f.name);
+                        let read_method = Self::get_read_method(&f.field_type);
+                        quote! {
+                            if let Ok(__v) = self.#col.#read_method(__r) {
+                                self.#seq.fetch_max(
+                                    __v as u64,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
+                        }
+                    }
+                })
+                .collect();
+            quote! { #(#folds)* }
+        };
+
         quote! {
             /// Fold only the rows in `[from..row_count)` into the in-memory maps
             /// (#161-B).  Reuses the live update/delete index maintenance per row,
@@ -4943,6 +5241,7 @@ impl RustGenerator {
                     // exactly as the live update/delete path does).
                     std::sync::Arc::make_mut(&mut self.id_to_row).insert(id, __r);
                     #versions_push
+                    #autoseq_delta
                     // A live row adds its keys; a tombstoned row adds none (its keys
                     // were removed above and stay absent — a delete).
                     if !__deleted {
@@ -6006,12 +6305,17 @@ impl RustGenerator {
         // server synthesizes them (`create_*`) — so they deserialize with a serde
         // default.  `Uuid` defaults to nil (its `Default`); `Timestamp` cannot
         // derive `Default` in generated code, so its default points at the emitted
-        // `__forgedb_default_ts`.  Integer `+u32`/`+u64` autos are NOT yet
-        // synthesized (#187), so they stay required (no default) to avoid a silent
-        // `id = 0`.
+        // `__forgedb_default_ts`; an integer auto defaults to `0`, which is exactly
+        // the allocate sentinel `generate_auto_synthesis` looks for.
+        //
+        // The three defaults are the same value each type's synthesis treats as
+        // "unset" — that correspondence is the contract, and breaking it silently
+        // turns an omitted field into a committed zero.
         let serde_default = if auto_default && field.auto_generate {
             match &field.field_type {
-                forgedb_parser::FieldType::Uuid => quote! { #[serde(default)] },
+                forgedb_parser::FieldType::Uuid
+                | forgedb_parser::FieldType::U32
+                | forgedb_parser::FieldType::U64 => quote! { #[serde(default)] },
                 forgedb_parser::FieldType::Timestamp => {
                     quote! { #[serde(default = "__forgedb_default_ts")] }
                 }
@@ -6029,13 +6333,23 @@ impl RustGenerator {
     }
 
     /// Emit the `+` auto-generate value synthesis for a model's create path
-    /// (#187): for each `+uuid`/`+timestamp` field, fill it in when the caller
-    /// left it unset (a nil UUID / a zero timestamp), so `create_<model>` (Rust,
-    /// and REST through it) generates ids/timestamps rather than requiring them in
-    /// the body.  Integer `+u32`/`+u64` auto-increment is not yet synthesized
-    /// (#187) — a monotonic, restart-safe, reuse-free counter is a separate
-    /// change — so those must still be supplied.  Operates on a `mut record`.
-    fn generate_auto_synthesis(model: &forgedb_parser::Model) -> TokenStream {
+    /// (#187): for each `+` field, fill it in when the caller left it unset, so
+    /// `create_<model>` (Rust, and REST through it) generates the value rather
+    /// than requiring it in the body.  Operates on a `mut record`.
+    ///
+    /// Each type has its own "unset" sentinel: a nil UUID, a zero timestamp, and —
+    /// for `+u32`/`+u64` — **`0`**.  The integer case therefore carries a
+    /// user-visible consequence the others do not: `0` cannot be *inserted*
+    /// explicitly into an auto-integer field, because supplying it means "allocate
+    /// one for me".  Documented in `docs/SCHEMA.md` and the website modifiers page,
+    /// not only here.
+    ///
+    /// `recv` is the storage receiver, because unlike uuid/timestamp synthesis —
+    /// which is pure — integer allocation reads and advances per-model state. The
+    /// three create surfaces reach their storage differently (`Database` owns it,
+    /// `TxHandle` borrows the db, `ConcurrentTxHandle` holds an `Arc<RwLock<_>>`),
+    /// so the receiver is threaded in rather than assumed.
+    fn generate_auto_synthesis(model: &forgedb_parser::Model, recv: &TokenStream) -> TokenStream {
         let stmts: Vec<TokenStream> = model
             .fields
             .iter()
@@ -6053,6 +6367,25 @@ impl RustGenerator {
                             record.#name = Timestamp::now();
                         }
                     }),
+                    forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::U64 => {
+                        let alloc = Self::autoseq_alloc_ident(f);
+                        let seq = Self::autoseq_field_ident(f);
+                        Some(quote! {
+                            if record.#name == 0 {
+                                record.#name = #recv.#alloc()?;
+                            } else {
+                                // An explicitly supplied value advances the counter
+                                // past itself (#187 decision 5).  Required whether or
+                                // not compaction is in play: it is what stops a
+                                // restored backup or an imported dataset from
+                                // colliding with live rows on its very next insert.
+                                #recv.#seq.fetch_max(
+                                    record.#name as u64,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
+                        })
+                    }
                     _ => None,
                 }
             })
@@ -6071,17 +6404,23 @@ impl RustGenerator {
 
     /// Whether the server synthesizes this field's value on create, so it may be
     /// omitted from a create body.  Mirrors `generate_auto_synthesis` +
-    /// `model_struct_field`'s `#[serde(default)]`: only `+uuid` / `+timestamp`
-    /// autos are filled in server-side today.  `+u32`/`+u64` autos are NOT yet
-    /// synthesized (#187), so they stay required — as does any non-auto id.  The
-    /// REST-SDK generators use this to compute a `<Model>Create` input that
-    /// actually round-trips (avoiding the #188 class of "omit id → 422" bug that
-    /// the TS SDK's blanket `Omit<Model,'id'>` hits on non-uuid identities).
+    /// `model_struct_field`'s `#[serde(default)]`: **every** `+` auto is filled in
+    /// server-side — `uuid`, `timestamp`, and (since #187) `u32`/`u64`.  A non-auto
+    /// `id` is not: nothing generates it, so it stays required.
+    ///
+    /// The REST-SDK generators use this to compute a `<Model>Create` input that
+    /// actually round-trips.  Note the generators that do NOT ask: the TS SDK
+    /// hard-codes `Omit<Model, 'id'>` and the OpenAPI `required` list derives from
+    /// non-`Option`ness, so both still misreport the create shape — that is #259,
+    /// a separate root cause this predicate cannot reach.
     pub(crate) fn is_server_synthesized(field: &forgedb_parser::Field) -> bool {
         field.auto_generate
             && matches!(
                 field.field_type,
-                forgedb_parser::FieldType::Uuid | forgedb_parser::FieldType::Timestamp
+                forgedb_parser::FieldType::Uuid
+                    | forgedb_parser::FieldType::Timestamp
+                    | forgedb_parser::FieldType::U32
+                    | forgedb_parser::FieldType::U64
             )
     }
 
@@ -7314,11 +7653,69 @@ impl RustGenerator {
             }
         };
 
+        // #187: fold each auto-integer field's maximum out of the SAME reopen
+        // traversal. A maximum is a running maximum, so for the *identity* this
+        // rides the `id_scan` above for free — that pass already decodes the
+        // identity column at every physical row.
+        //
+        // Two properties of that scan are load-bearing:
+        //
+        // 1. It is **ungated by tombstones**, so a deleted row still bounds the
+        //    counter. Without that, deleting the newest row and restarting would
+        //    hand its number to a different row — visible in the replication log,
+        //    in backups, and in any URL that still holds it. (The *index* rebuild
+        //    below is tombstone-gated by design; the max must not come from it.)
+        // 2. It walks every physical row, including superseded versions (#66).
+        //
+        // A **non-identity** auto is not free: the ungated pass decodes only the
+        // identity column, so its counter needs its own read per physical row.
+        // That cost is why the design does not encourage the shape.
+        let autoseq_seed = {
+            let identity = Self::identity_field(model).map(|f| f.name.as_str());
+            let folds: Vec<TokenStream> = Self::integer_auto_fields(model)
+                .iter()
+                .map(|f| {
+                    let seq = Self::autoseq_field_ident(f);
+                    if Some(f.name.as_str()) == identity {
+                        // Rides the id scan: `id_to_row`'s keys ARE this column.
+                        quote! {
+                            {
+                                let mut __max: u64 = 0;
+                                for (&__k, _) in #recv.id_to_row.iter() {
+                                    if (__k as u64) > __max { __max = __k as u64; }
+                                }
+                                #recv.#seq.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    } else {
+                        // Its own column read per physical row — the cost the
+                        // identity case avoids. Ungated by tombstones for the same
+                        // reason: a deleted row's number must stay spent.
+                        let col = format_ident!("{}_col", f.name);
+                        let read_method = Self::get_read_method(&f.field_type);
+                        quote! {
+                            {
+                                let mut __max: u64 = 0;
+                                for __r in 0..n {
+                                    if let Ok(__v) = #recv.#col.#read_method(__r) {
+                                        if (__v as u64) > __max { __max = __v as u64; }
+                                    }
+                                }
+                                #recv.#seq.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                    }
+                })
+                .collect();
+            quote! { #(#folds)* }
+        };
+
         quote! {
             let n = #recv.tombstones.len();
             #recv.row_count = n;
             #id_scan
             #index_rebuild
+            #autoseq_seed
         }
     }
 
@@ -8165,7 +8562,8 @@ impl RustGenerator {
                  `Ok(false)` if the id is absent.",
                 model.name
             );
-            let auto_synth = Self::generate_auto_synthesis(model);
+            let auto_synth =
+                Self::generate_auto_synthesis(model, &quote! { self.#storage_field });
             methods.push(quote! {
                 #[doc = #create_doc]
                 pub fn #create_fn(&mut self, mut record: #model_ident) -> Result<#id_type, ValidationError> {
@@ -9013,7 +9411,13 @@ impl RustGenerator {
             let get_fn = format_ident!("get_{}", snake);
             let all_fn = format_ident!("all_{}", snake);
             let snap_field = format_ident!("{}", snake);
-            let auto_synth = Self::generate_auto_synthesis(model);
+            // The prepare closure runs with NO write lock (Tier 2), so allocation
+            // takes a brief READ lock, which is all it needs: the counter is an
+            // atomic, and `__alloc_*` is a lock-free compare-exchange loop.
+            let auto_synth = Self::generate_auto_synthesis(
+                model,
+                &quote! { self.inner.read().unwrap().#snap_field },
+            );
 
             // Unique checks (insert) for ConcurrentTxHandle.
             let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
@@ -9467,7 +9871,7 @@ impl RustGenerator {
         let get_fn = format_ident!("get_{}", snake);
         let all_fn = format_ident!("all_{}", snake);
         let validate_fn = format_ident!("validate_{}", snake);
-        let auto_synth = Self::generate_auto_synthesis(model);
+        let auto_synth = Self::generate_auto_synthesis(model, &quote! { self.db.#field });
 
         // `&unique` checks: (1) against the committed index (same as the non-txn
         // path) and (2) against the staged-unique buffer (`staged_unique_keys`) so
@@ -9948,6 +10352,10 @@ impl RustGenerator {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: 16usize,
                             }),
+                            // A junction has no fields of its own — only the two
+                            // uuid endpoints — so it can never carry a `+u32`/`+u64`
+                            // auto and its sequence map is always empty (#187).
+                            auto_sequences: Default::default(),
                         };
                         let _ = manifest.save_to(&__manifest_abs);
                     }

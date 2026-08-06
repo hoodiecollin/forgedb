@@ -58,6 +58,14 @@ pub enum ValidationError {
         rule: &'static str,
         message: String,
     },
+    /// A `+u32`/`+u64` auto-increment field ran out of values (#187) →
+    /// 500.  Refused rather than wrapped: wrapping would re-issue `0`,
+    /// which is also the "allocate one for me" sentinel, and then
+    /// collide with every value already handed out.
+    ///
+    /// A server-side exhaustion, not a bad request — which is why it is
+    /// the one `ValidationError` class that maps to 5xx.
+    SequenceExhausted { model: &'static str, field: &'static str },
 }
 impl ValidationError {
     /// The HTTP status the generated API boundary returns for this class:
@@ -69,6 +77,7 @@ impl ValidationError {
             | ValidationError::DanglingReference { .. }
             | ValidationError::ReferencedByChildren { .. } => 409,
             ValidationError::Constraint { .. } => 422,
+            ValidationError::SequenceExhausted { .. } => 500,
         }
     }
 }
@@ -92,6 +101,11 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::Constraint { model, field, rule, message } => {
                 write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
+            }
+            ValidationError::SequenceExhausted { model, field } => {
+                write!(
+                    f, "auto-increment sequence for `{}.{}` is exhausted", model, field
+                )
             }
         }
     }
@@ -191,6 +205,7 @@ pub struct GeoPoint {
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Place {
+    #[serde(default)]
     pub id: u64,
     pub name: String,
     pub description: Option<String>,
@@ -212,6 +227,7 @@ pub struct PlaceStorage {
     name_col: VariableColumn,
     description_col: VariableColumn,
     location_col: FixedColumn,
+    __autoseq_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tombstones: forgedb_storage::Tombstones,
     wal: forgedb_wal::WalManager,
     writes_since_checkpoint: u64,
@@ -266,6 +282,7 @@ impl PlaceStorage {
                     std::mem::size_of::<GeoPoint>(),
                 )
                 .expect("Failed to create fixed column"),
+            __autoseq_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("place/tombstones.bin"),
                 )
@@ -292,6 +309,25 @@ impl PlaceStorage {
             let id = db.id_col.read_u64(i).expect("Failed to read id column");
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
             std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
+        }
+        {
+            let mut __max: u64 = 0;
+            for (&__k, _) in db.id_to_row.iter() {
+                if (__k as u64) > __max {
+                    __max = __k as u64;
+                }
+            }
+            db.__autoseq_id.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
+        }
+        {
+            let __persisted = forgedb_storage::Manifest::load_from(
+                    &root.join("place/manifest.json"),
+                )
+                .map(|m| m.auto_sequences)
+                .unwrap_or_default();
+            if let Some(&__floor) = __persisted.get("id") {
+                db.__autoseq_id.fetch_max(__floor, std::sync::atomic::Ordering::SeqCst);
+            }
         }
         db.write_manifest(root);
         db
@@ -325,6 +361,7 @@ impl PlaceStorage {
                     std::mem::size_of::<GeoPoint>(),
                 )
                 .expect("Failed to create fixed column"),
+            __autoseq_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tombstones: forgedb_storage::Tombstones::new(
                     root.join("place/tombstones.bin"),
                 )
@@ -377,6 +414,18 @@ impl PlaceStorage {
         let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.format_version)
             .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
+        {
+            let __live = self.__autoseq_id.load(std::sync::atomic::Ordering::SeqCst);
+            let __slot = __auto_sequences.entry("id".to_string()).or_insert(0);
+            if __live > *__slot {
+                *__slot = __live;
+            }
+        }
         let manifest = forgedb_storage::Manifest {
             schema_version: 1,
             row_count: self.row_count,
@@ -389,6 +438,7 @@ impl PlaceStorage {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
         let _ = manifest.save_to(&__manifest_abs);
     }
@@ -402,6 +452,32 @@ impl PlaceStorage {
         if let Ok(mut __m) = forgedb_storage::Manifest::load_from(&__manifest_abs) {
             __m.compaction_epoch = __m.compaction_epoch.saturating_add(1);
             let _ = __m.save_to(&__manifest_abs);
+        }
+    }
+    ///Allocate the next `Place.id` value (#187). Monotonic and unique, never contiguous — a rolled-back or `Nack`ed attempt burns its number, the same contract Postgres and MySQL offer.
+    fn __alloc_id(&self) -> Result<u64, ValidationError> {
+        use std::sync::atomic::Ordering;
+        const __LIMIT: u64 = u64::MAX as u64;
+        let mut __cur = self.__autoseq_id.load(Ordering::SeqCst);
+        loop {
+            if __cur >= __LIMIT {
+                return Err(ValidationError::SequenceExhausted {
+                    model: "Place",
+                    field: "id",
+                });
+            }
+            match self
+                .__autoseq_id
+                .compare_exchange_weak(
+                    __cur,
+                    __cur + 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+            {
+                Ok(_) => return Ok((__cur + 1) as u64),
+                Err(__actual) => __cur = __actual,
+            }
         }
     }
     /// Attach a shared change feed (#62 Direction A).  Called by
@@ -836,12 +912,15 @@ impl PlaceStorage {
             let mut __keep_sorted = __keep;
             __keep_sorted.sort_unstable();
             let __old_id_to_row = std::sync::Arc::clone(&self.id_to_row);
+            let __saved___autoseq_id = std::sync::Arc::clone(&self.__autoseq_id);
             let __root = self.root.clone();
             let __feed = self.changefeed.take();
             let __broker = self.broker.take();
             *self = Self::new_at_no_rehydrate(&__root);
             self.changefeed = __feed;
             self.broker = __broker;
+            self.__autoseq_id = __saved___autoseq_id;
+            self.write_manifest(&__root);
             let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
                 __old_id_to_row.len(),
             );
@@ -897,6 +976,15 @@ impl PlaceStorage {
                 .or_default()
                 .push(i);
         }
+        {
+            let mut __max: u64 = 0;
+            for (&__k, _) in self.id_to_row.iter() {
+                if (__k as u64) > __max {
+                    __max = __k as u64;
+                }
+            }
+            self.__autoseq_id.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
+        }
     }
     /// Fold only the rows in `[from..row_count)` into the in-memory maps
     /// (#161-B).  Reuses the live update/delete index maintenance per row,
@@ -913,6 +1001,7 @@ impl PlaceStorage {
                 .entry(id)
                 .or_default()
                 .push(__r);
+            self.__autoseq_id.fetch_max(id as u64, std::sync::atomic::Ordering::SeqCst);
             if !__deleted {}
         }
     }
@@ -1813,6 +1902,13 @@ const MAX_CASCADE_DEPTH: u32 = 64;
 impl Database {
     ///Create a Place with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `insert`.
     pub fn create_place(&mut self, mut record: Place) -> Result<u64, ValidationError> {
+        if record.id == 0 {
+            record.id = self.place.__alloc_id()?;
+        } else {
+            self.place
+                .__autoseq_id
+                .fetch_max(record.id as u64, std::sync::atomic::Ordering::SeqCst);
+        }
         self.place.insert(record)
     }
     ///Update a Place with full integrity (#91): foreign keys must resolve, then field constraints + `&unique` are enforced by `update`. `Ok(false)` if the id is absent.
@@ -1897,6 +1993,14 @@ impl<'db> TxHandle<'db> {
     ///Stage the creation of a Place in this transaction (#83).  Validates field constraints + `&unique` (committed index) + FK existence (txn-visible targets), then stages the row; visible only after `commit`.
     pub fn create_place(&mut self, mut record: Place) -> Result<u64, TxError> {
         self.__mark_place();
+        if record.id == 0 {
+            record.id = self.db.place.__alloc_id()?;
+        } else {
+            self.db
+                .place
+                .__autoseq_id
+                .fetch_max(record.id as u64, std::sync::atomic::Ordering::SeqCst);
+        }
         validate_place(&record)?;
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -2330,6 +2434,16 @@ pub struct ConcurrentTxHandle {
 impl ConcurrentTxHandle {
     /// Stage the creation of a #model_name in a concurrent transaction.
     pub fn create_place(&mut self, mut record: Place) -> Result<u64, TxError> {
+        if record.id == 0 {
+            record.id = self.inner.read().unwrap().place.__alloc_id()?;
+        } else {
+            self.inner
+                .read()
+                .unwrap()
+                .place
+                .__autoseq_id
+                .fetch_max(record.id as u64, std::sync::atomic::Ordering::SeqCst);
+        }
         validate_place(&record)?;
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
