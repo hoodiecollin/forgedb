@@ -2030,6 +2030,186 @@ impl RustGenerator {
             .collect()
     }
 
+    /// Integer autos that are **neither the identity nor `&unique`** (#260).
+    ///
+    /// These are the only fields that need a sequence claim key: an identity
+    /// already contributes a row key (`b"r"`) to the opaque write-set and a
+    /// `&unique` field a unique-claim key (`b"u"`), so a third claim would be
+    /// redundant work on every insert. Empty for every schema that was legal
+    /// before #260, which is what keeps the generated output byte-identical.
+    fn bare_integer_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        let identity = Self::identity_field(model).map(|f| f.name.as_str());
+        Self::integer_auto_fields(model)
+            .into_iter()
+            .filter(|f| !f.unique && Some(f.name.as_str()) != identity)
+            .collect()
+    }
+
+    /// Whether any model needs sequence-claim staging.
+    ///
+    /// Gates the `staged_sequence_keys` field, which lives on the **schema-level**
+    /// `TxHandle` / `ConcurrentTxHandle` rather than per model. Emitting it
+    /// unconditionally would add a field to every generated crate — and diff every
+    /// snapshot — for a feature the schema does not use.
+    fn schema_has_bare_integer_auto(schema: &Schema) -> bool {
+        schema.models.iter().any(|m| !Self::bare_integer_auto_fields(m).is_empty())
+    }
+
+    /// Stage a sequence claim for each bare integer auto on `record`.
+    ///
+    /// Keyed off the record's **final** value, so an explicitly-supplied one is
+    /// claimed too: #187 decision 5 lets a non-zero value through (it advances the
+    /// counter via `fetch_max` instead of allocating), and an explicit `7` racing an
+    /// allocated `7` is the same collision. Claim-only — unlike the `&unique` path
+    /// there is no index to validate against, so there is nothing to check here.
+    fn generate_sequence_claim_staging(model: &forgedb_parser::Model) -> TokenStream {
+        let mtag = model.name.as_str();
+        let stmts: Vec<TokenStream> = Self::bare_integer_auto_fields(model)
+            .iter()
+            .map(|f| {
+                let fident = format_ident!("{}", f.name);
+                let fname = f.name.as_str();
+                quote! {
+                    self.staged_sequence_keys.insert((
+                        #mtag,
+                        #fname,
+                        record.#fident as u64,
+                    ));
+                }
+            })
+            .collect();
+        quote! { #(#stmts)* }
+    }
+
+    /// Re-derive the counter when a sequence claim loses a turn (#260).
+    ///
+    /// Without this a retry merely re-runs the prepare closure, which allocates the
+    /// *next* value — so a writer N values behind a peer needs N attempts and a
+    /// bounded retry budget is exhausted long before it converges.
+    ///
+    /// It cannot lean on step 0's peer refresh: `CoordinatorClient::last_known_lsn`
+    /// advances only on this client's own `Ack`, so a `Nack` never trips that gate.
+    ///
+    /// **Why a refresh rather than reading the value out of the key.** The
+    /// coordinator returns the key that *collided*, which is the key **we** sent —
+    /// so it carries the value we proposed, not the one the winner holds.
+    /// `fetch_max` against our own proposal is a no-op and the writer still walks.
+    /// What the `Nack` really proves is that a peer committed rows we have not
+    /// folded in, and `__peer_refresh` is exactly the routine that folds them —
+    /// re-reading the shared columns and `fetch_max`ing the counter to the true
+    /// committed maximum, so the next attempt starts past every value in play.
+    ///
+    /// The decode is still used, as a **predicate**: only a lost sequence claim
+    /// warrants the column re-read, so a `&unique` or row-key conflict does not pay
+    /// for it. That is generated code reading a format generated code produced —
+    /// the substrate never looks inside a write-set key. `__forgedb_ws_key` is
+    /// length-prefixed, so parts are walked by length rather than scanned for a tag
+    /// (a value's bytes can contain anything, including `b"s"`).
+    fn generate_sequence_fastforward(schema: &Schema) -> TokenStream {
+        if !Self::schema_has_bare_integer_auto(schema) {
+            return quote! {};
+        }
+        quote! {
+            {
+                /// Split a length-prefixed write-set key back into its parts.
+                /// Mirrors `__forgedb_ws_key`; malformed input yields no parts
+                /// rather than panicking, since this only gates an optimization.
+                fn __forgedb_ws_parts(key: &[u8]) -> Vec<&[u8]> {
+                    let mut parts: Vec<&[u8]> = Vec::new();
+                    let mut i = 0usize;
+                    while i + 4 <= key.len() {
+                        let n = u32::from_le_bytes([
+                            key[i], key[i + 1], key[i + 2], key[i + 3],
+                        ]) as usize;
+                        i += 4;
+                        if i + n > key.len() {
+                            return Vec::new();
+                        }
+                        parts.push(&key[i..i + n]);
+                        i += n;
+                    }
+                    parts
+                }
+
+                if let forgedb_txn::CommitOutcome::Conflict { key: __ckey } = &__outcome {
+                    let __parts = __forgedb_ws_parts(__ckey);
+                    if __parts.len() == 4 && __parts[0] == b"s" {
+                        // A sequence claim lost, so a peer holds committed values we
+                        // have not seen.  Fold them in before reallocating.
+                        let mut __db = __inner.write().unwrap();
+                        __db.__peer_refresh();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gated pieces of sequence-claim plumbing (#260), as
+    /// `(struct field, initializer, write-set loop)`.
+    ///
+    /// All three are empty when no model has a bare integer auto, which is what
+    /// keeps every pre-#260 schema's output byte-identical.
+    ///
+    /// `recv` is the handle the loop reads from (`self` or `__tx`), `sink` the
+    /// key vector, and `boxed` selects `OpaqueKey` (Tier 1/2, a boxed slice) versus
+    /// the coordinator's plain `Vec<u8>`.
+    fn sequence_claim_plumbing(
+        schema: &Schema,
+        recv: &TokenStream,
+        sink: &TokenStream,
+        boxed: bool,
+    ) -> (TokenStream, TokenStream, TokenStream) {
+        if !Self::schema_has_bare_integer_auto(schema) {
+            return (quote! {}, quote! {}, quote! {});
+        }
+        let field = quote! {
+            /// Sequence claims staged by this transaction (#260):
+            /// `(model, field, allocated value)`.
+            ///
+            /// An integer auto that is neither the identity nor `&unique` enters
+            /// the opaque write-set through this set and nothing else — without it
+            /// two coordinated writers deriving the same value both commit and
+            /// neither notices.
+            staged_sequence_keys:
+                std::collections::BTreeSet<(&'static str, &'static str, u64)>,
+        };
+        let init = quote! {
+            staged_sequence_keys: std::collections::BTreeSet::new(),
+        };
+        let push = if boxed {
+            quote! {
+                #sink.push(
+                    __forgedb_ws_key(&[
+                        b"s",
+                        __mtag.as_bytes(),
+                        __fname.as_bytes(),
+                        &__val.to_le_bytes(),
+                    ])
+                    .into_boxed_slice(),
+                );
+            }
+        } else {
+            quote! {
+                #sink.push(__forgedb_ws_key(&[
+                    b"s",
+                    __mtag.as_bytes(),
+                    __fname.as_bytes(),
+                    &__val.to_le_bytes(),
+                ]));
+            }
+        };
+        let ws = quote! {
+            // Sequence-claim keys (#260): the third class, for integer autos that
+            // are neither the identity nor unique.  `u32` values are widened to
+            // `u64` so one encoding (and one decoder, on `Nack`) covers both.
+            for (__mtag, __fname, __val) in &#recv.staged_sequence_keys {
+                let __val: u64 = *__val;
+                #push
+            }
+        };
+        (field, init, ws)
+    }
+
     /// The storage-struct field holding one auto-integer field's counter.
     ///
     /// `__autoseq_`, deliberately NOT `__seq_`: the generated Tier-2 / Tier-3
@@ -8919,6 +9099,14 @@ impl RustGenerator {
         let __txn_max_retries =
             proc_macro2::Literal::u32_unsuffixed(Self::active_cfg().txn_max_retries);
 
+        // #260 sequence-claim plumbing for `TxHandle` (empty pre-#260 schemas).
+        let (seq_field, seq_init, seq_ws_self) = Self::sequence_claim_plumbing(
+            schema,
+            &quote! { self },
+            &quote! { keys },
+            true,
+        );
+
         // Rollback arms: truncate every touched collection's columns + WAL tail
         // back to its recorded pre-txn mark, and clear its txn guard.
         let rollback_arms: Vec<_> = tx_models
@@ -9054,6 +9242,7 @@ impl RustGenerator {
                 /// a duplicate.  The key must match what it is a pre-image of.
                 staged_unique_keys:
                     std::collections::BTreeSet<(&'static str, &'static str, String)>,
+                #seq_field
                 /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
                 committed: bool,
             }
@@ -9066,6 +9255,7 @@ impl RustGenerator {
                         wal_marks: std::collections::BTreeMap::new(),
                         pending_events: Vec::new(),
                         staged_unique_keys: std::collections::BTreeSet::new(),
+                        #seq_init
                         committed: false,
                     }
                 }
@@ -9193,6 +9383,7 @@ impl RustGenerator {
                             .into_boxed_slice(),
                         );
                     }
+                    #seq_ws_self
                     forgedb_txn::WriteSet { keys, snapshot_lsn }
                 }
             }
@@ -9353,6 +9544,13 @@ impl RustGenerator {
     /// keys; model-tag dispatch only appears in the apply path (after conflict
     /// resolution passes) — the same pattern as `apply_frame` for the follower.
     fn generate_shared_database_impl(schema: &Schema) -> TokenStream {
+        // #260 sequence-claim plumbing for `ConcurrentTxHandle` (Tier 2).
+        let (seq_field, seq_init, seq_ws_tx) = Self::sequence_claim_plumbing(
+            schema,
+            &quote! { __tx },
+            &quote! { __ws_keys },
+            true,
+        );
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
@@ -9479,6 +9677,8 @@ impl RustGenerator {
             );
 
             // Unique checks (insert) for ConcurrentTxHandle.
+            // #260: sequence claims for bare integer autos (empty otherwise).
+            let seq_claim = Self::generate_sequence_claim_staging(model);
             let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
                 .iter()
                 .filter(|f| f.unique)
@@ -9596,6 +9796,9 @@ impl RustGenerator {
                     #auto_synth
                     #validate_fn(&record)?;
                     #(#unique_checks_insert)*
+                    // #260: claim the allocated value so a peer's identical
+                    // allocation is a detected conflict, not a silent duplicate.
+                    #seq_claim
                     #(#fk_checks)*
                     let id = record.#id_field;
                     let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -9720,6 +9923,7 @@ impl RustGenerator {
                             snap: __snap,
                             buffer: Vec::new(),
                             staged_unique_keys: std::collections::BTreeSet::new(),
+                            #seq_init
                             pending_events: Vec::new(),
                         };
                         let __out = f(&mut __tx);
@@ -9751,6 +9955,7 @@ impl RustGenerator {
                                 .into_boxed_slice(),
                             );
                         }
+                        #seq_ws_tx
                         let __ws = forgedb_txn::WriteSet { keys: __ws_keys, snapshot_lsn: __snap_lsn };
                         // Step 5: serialized conflict check (sequencer mutex only, no RwLock).
                         let __outcome = {
@@ -9796,6 +10001,7 @@ impl RustGenerator {
                 /// Claimed unique keys (field_name, encoded_key).
                 staged_unique_keys:
                     std::collections::BTreeSet<(&'static str, &'static str, String)>,
+                #seq_field
                 /// Pending events: (model_tag, kind, id_bytes, record_bytes).
                 pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
             }
@@ -9938,6 +10144,8 @@ impl RustGenerator {
         // both fail — the committed index only reflects pre-txn rows.
         // On success, insert the key into `staged_unique_keys` so subsequent staged
         // writes can see it.  Rollback discards the set (it never touches real maps).
+        // #260: sequence claims for bare integer autos (empty otherwise).
+        let seq_claim = Self::generate_sequence_claim_staging(model);
         let unique_checks_insert: Vec<_> = Self::indexed_fields(model)
             .iter()
             .filter(|f| f.unique)
@@ -10098,6 +10306,9 @@ impl RustGenerator {
                 #validate_fn(&record)?;
                 // #91 `&unique` (committed index; within-txn duplicate = honest limit).
                 #(#unique_checks_insert)*
+                // #260: claim the allocated value so a peer's identical allocation
+                // is a detected conflict, not a silent duplicate.
+                #seq_claim
                 // #91 FK existence, txn-visible.
                 #(#fk_checks)*
                 let id = record.#id_field;
@@ -11213,6 +11424,22 @@ impl RustGenerator {
     /// for the data-plane write — no second apply path, no drift.  The
     /// coordinator itself never receives a decoded field.
     fn generate_coordinated_client(schema: &Schema) -> TokenStream {
+        // #260 sequence-claim plumbing for the Tier-3 coordinated path.  The
+        // coordinator's write-set is a plain `Vec<Vec<u8>>`, not `OpaqueKey`.
+        let (_, seq_init_coord, seq_ws_coord) = Self::sequence_claim_plumbing(
+            schema,
+            &quote! { __tx },
+            &quote! { __ws_keys },
+            false,
+        );
+        let seq_fastforward = Self::generate_sequence_fastforward(schema);
+        // Bind the conflict outcome ONLY when the fast-forward needs it — renaming
+        // the discard would otherwise diff every pre-#260 schema's output.
+        let seq_outcome_binding = if Self::schema_has_bare_integer_auto(schema) {
+            quote! { __outcome }
+        } else {
+            quote! { _ }
+        };
         // Only generate if there are transactable models.
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
@@ -11354,6 +11581,7 @@ impl RustGenerator {
                             snap: __snap,
                             buffer: Vec::new(),
                             staged_unique_keys: std::collections::BTreeSet::new(),
+                            #seq_init_coord
                             pending_events: Vec::new(),
                         };
                         let __out = f(&mut __tx);
@@ -11383,6 +11611,7 @@ impl RustGenerator {
                                 __ekey.as_bytes(),
                             ]));
                         }
+                        #seq_ws_coord
 
                         // Step 5 – RequestTurn: coordinator conflict-check + LSN assignment.
                         let __turn = {
@@ -11414,8 +11643,9 @@ impl RustGenerator {
                         };
 
                         match __turn {
-                            Err(_) => {
+                            Err(#seq_outcome_binding) => {
                                 // Conflict or busy exhaustion — retry.
+                                #seq_fastforward
                                 let mut __seq = __seq_arc.lock().unwrap();
                                 __seq.release_snapshot(__snap_lsn);
                                 __last_lsn = __coord.last_known_lsn();
