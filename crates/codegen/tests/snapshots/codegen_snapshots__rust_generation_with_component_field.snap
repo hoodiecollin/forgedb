@@ -291,7 +291,7 @@ impl ProductStorage {
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
             std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -333,13 +333,19 @@ impl ProductStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -376,7 +382,7 @@ impl ProductStorage {
             }),
             auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups

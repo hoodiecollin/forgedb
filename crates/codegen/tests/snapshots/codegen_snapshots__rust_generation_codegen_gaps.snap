@@ -329,7 +329,7 @@ impl PlaceStorage {
                 db.__autoseq_id.fetch_max(__floor, std::sync::atomic::Ordering::SeqCst);
             }
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -382,13 +382,19 @@ impl PlaceStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::U64, column_index : 0usize, value_size : 8usize,
@@ -440,7 +446,7 @@ impl PlaceStorage {
             }),
             auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -906,6 +912,17 @@ impl PlaceStorage {
                 __keep.push(__row);
             }
         }
+        let __root_pre = self.root.clone();
+        if let Err(__e) = self.write_manifest(&__root_pre) {
+            eprintln!(
+                "forgedb: refusing to compact '{}' — the auto-increment floor \
+                         could not be persisted first ({__e}). Compaction would drop \
+                         the rows that are the only other record of the values \
+                         already issued, so a crash could re-issue them.",
+                "place"
+            );
+            return;
+        }
         let __config = forgedb_compaction::CompactionConfig::default();
         let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
         if __compactor.compact_model_keeping("place", &__keep).is_ok() {
@@ -920,7 +937,14 @@ impl PlaceStorage {
             self.changefeed = __feed;
             self.broker = __broker;
             self.__autoseq_id = __saved___autoseq_id;
-            self.write_manifest(&__root);
+            if let Err(__e) = self.write_manifest(&__root) {
+                eprintln!(
+                    "forgedb: could not re-persist the auto-increment floor for \
+                         '{}' after compaction ({__e}); the pre-compaction floor \
+                         still covers every value issued before this call.",
+                    "place"
+                );
+            }
             let mut __new_id_to_row: std::collections::HashMap<_, usize> = std::collections::HashMap::with_capacity(
                 __old_id_to_row.len(),
             );

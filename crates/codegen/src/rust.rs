@@ -1324,8 +1324,10 @@ impl RustGenerator {
                     #autoseq_floor
                     // Refresh the physical-layout manifest on open (#57): cheap,
                     // off the insert hot path, gives schema-blind backup/inspector
-                    // a current column map + row-count anchor.
-                    db.write_manifest(root);
+                    // a current column map + row-count anchor.  Advisory here — the
+                    // counter this run allocates from is already correct in memory,
+                    // and the floor is re-persisted before anything destructive.
+                    let _ = db.write_manifest(root);
                     db
                 }
 
@@ -1344,7 +1346,11 @@ impl RustGenerator {
                     // the tombstone length; the WAL was truncated by the pre-compact
                     // checkpoint, so the replay is a no-op) — but no `#rehydrate_logic`.
                     db.recover_from_wal();
-                    db.write_manifest(root);
+                    // Advisory, and deliberately so: this runs from `compact()` with
+                    // every counter freshly zeroed.  The max-merge in `write_manifest`
+                    // makes that harmless, and the live tip is re-persisted by the
+                    // caller once the saved counters are reinstalled.
+                    let _ = db.write_manifest(root);
                     db
                 }
 
@@ -3824,7 +3830,13 @@ impl RustGenerator {
             /// Write the physical-layout manifest for this model (#57).  Layout
             /// metadata only — schema-blind backup/inspector read it; it carries
             /// no `.forge` semantics.  Written at open, off the insert hot path.
-            fn write_manifest(&self, root: &std::path::Path) {
+            ///
+            /// Returns the write result rather than swallowing it (#187): for a
+            /// model with an integer auto this file is no longer advisory — it
+            /// carries the allocation floor, and the pre-compaction caller must be
+            /// able to refuse the destructive rewrite when it cannot be persisted.
+            /// Callers for whom it *is* advisory discard the result explicitly.
+            fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
                 let columns = vec![ #(#col_entries),* ];
                 let __manifest_abs = root.join(#manifest_path);
                 // Preserve the incremental-backup chain token (#76): load any
@@ -3878,9 +3890,7 @@ impl RustGenerator {
                     }),
                     auto_sequences: __auto_sequences,
                 };
-                // Best-effort: a failed manifest write must not abort the app;
-                // reopen/compaction anchor on the tombstone file, not this file.
-                let _ = manifest.save_to(&__manifest_abs);
+                manifest.save_to(&__manifest_abs)
             }
 
             /// Bump this model's `compaction_epoch` (#76): compaction renumbers
@@ -4742,7 +4752,53 @@ impl RustGenerator {
         let repersist_autoseqs = if autoseq_idents.is_empty() {
             quote! {}
         } else {
-            quote! { self.write_manifest(&__root); }
+            quote! {
+                if let Err(__e) = self.write_manifest(&__root) {
+                    eprintln!(
+                        "forgedb: could not re-persist the auto-increment floor for \
+                         '{}' after compaction ({__e}); the pre-compaction floor \
+                         still covers every value issued before this call.",
+                        #model_snake
+                    );
+                }
+            }
+        };
+
+        // ...and persist it BEFORE the destructive rewrite too.
+        //
+        // The floor on disk is only ever written at open and here, so between them
+        // it holds the counter as of *process open*. `compact_model_keeping`
+        // physically drops the dead rows — which, for every value allocated since
+        // open, are the only remaining record that the value was ever issued. A
+        // crash between that rewrite and the re-persist above therefore leaves a
+        // reopen deriving a LOWER maximum than was actually handed out, and it
+        // re-issues the difference. That is precisely the case the floor exists to
+        // prevent, so "the scan is always a safe fallback" holds only while
+        // compaction has not run.
+        //
+        // Writing early is unconditionally safe: the floor is a hint that only
+        // moves up, and over-reserving costs nothing because gaps are the contract.
+        //
+        // If it cannot be written, ABORT rather than proceed. Compaction is a
+        // reclaim optimization and is always safe to retry later; re-issuing an id
+        // is not recoverable, and it escapes the database through the replication
+        // log, backups, and any URL holding the value.
+        let prepersist_autoseqs = if autoseq_idents.is_empty() {
+            quote! {}
+        } else {
+            quote! {
+                let __root_pre = self.root.clone();
+                if let Err(__e) = self.write_manifest(&__root_pre) {
+                    eprintln!(
+                        "forgedb: refusing to compact '{}' — the auto-increment floor \
+                         could not be persisted first ({__e}). Compaction would drop \
+                         the rows that are the only other record of the values \
+                         already issued, so a crash could re-issue them.",
+                        #model_snake
+                    );
+                    return;
+                }
+            }
         };
 
         // #162-C: `id_versions` (#159) references physical rows, so rebuild it to a
@@ -4802,6 +4858,9 @@ impl RustGenerator {
                         __keep.push(__row);
                     }
                 }
+                // 2b. Persist the auto-increment floor (#187) BEFORE step 3 destroys
+                //     the rows that are the only other evidence of what was issued.
+                #prepersist_autoseqs
                 // 3. Hand the opaque live-row set to the schema-blind byte GC.
                 let __config = forgedb_compaction::CompactionConfig::default();
                 let __compactor = forgedb_compaction::Compactor::new(&self.root, __config);
