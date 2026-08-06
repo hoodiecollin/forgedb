@@ -6,6 +6,16 @@ use forgedb_validation::Position;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstraintParam {
     Number(i64),
+    /// A fractional numeric literal, carried as its **verbatim source lexeme**
+    /// (e.g. `"0.01"`, `"-273.15"`) — #239.
+    ///
+    /// Not an `f64`. Rounding into binary float here would happen before the
+    /// target field type is known, which is inherent for an `f64` field but
+    /// defeats the entire point of `decimal` — the type that exists precisely
+    /// because `0.01` has no exact binary representation. Consumers convert
+    /// against the known type: exact `Decimal` for a `decimal` field, correctly
+    /// rounded `f64` for an `f64` field, and an error on an integer field.
+    Fractional(String),
     String(String),
     /// A named argument, `name: value` (#235) — as in `@length(min: 3, max: 64)`.
     ///
@@ -14,6 +24,21 @@ pub enum ConstraintParam {
     /// second grammar pass over the parameter loop.
     Named {
         name: String,
+        value: Box<ConstraintParam>,
+    },
+    /// An exclusive bound written with a comparison operator — `@min(>0)` /
+    /// `@max(<1)` (#239).
+    ///
+    /// Only meaningful on a continuous domain: on integers `>0` and `>=1` denote
+    /// the same set, so validation rejects the operator form there rather than
+    /// admitting a second spelling that buys no expressiveness.
+    ///
+    /// The operator is recorded rather than collapsed to "exclusive" so a
+    /// nonsensical pairing (`@min(<5)`) is rejected instead of being silently
+    /// read as an exclusive minimum.
+    Exclusive {
+        /// `true` for `>`, `false` for `<`.
+        greater: bool,
         value: Box<ConstraintParam>,
     },
 }

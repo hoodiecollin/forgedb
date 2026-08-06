@@ -392,6 +392,34 @@ impl Parser {
                         constraint = constraint.with_param(ConstraintParam::Number(*n));
                         self.advance();
                     }
+                    Token::Fractional(s) => {
+                        constraint =
+                            constraint.with_param(ConstraintParam::Fractional(s.clone()));
+                        self.advance();
+                    }
+                    // `>n` / `<n` — an exclusive bound (#239).  The operator is
+                    // structural here; whether this directive and this field type
+                    // may carry one is a semantic question, checked in `validate`.
+                    Token::Gt | Token::Lt => {
+                        let greater = matches!(self.current_token(), Token::Gt);
+                        let op = if greater { '>' } else { '<' };
+                        self.advance();
+                        let value = match self.current_token() {
+                            Token::Number(n) => ConstraintParam::Number(*n),
+                            Token::Fractional(s) => ConstraintParam::Fractional(s.clone()),
+                            other => {
+                                return Err(format!(
+                                    "Expected a number after '{op}' in constraint \
+                                     parameters, found {other:?}"
+                                ))
+                            }
+                        };
+                        self.advance();
+                        constraint = constraint.with_param(ConstraintParam::Exclusive {
+                            greater,
+                            value: Box::new(value),
+                        });
+                    }
                     Token::Ident(s) => {
                         let ident = s.clone();
                         self.advance();
@@ -405,6 +433,7 @@ impl Parser {
                             self.advance();
                             let value = match self.current_token() {
                                 Token::Number(n) => ConstraintParam::Number(*n),
+                                Token::Fractional(s) => ConstraintParam::Fractional(s.clone()),
                                 Token::Str(s) => ConstraintParam::String(s.clone()),
                                 Token::Ident(s) => ConstraintParam::String(s.clone()),
                                 other => {
