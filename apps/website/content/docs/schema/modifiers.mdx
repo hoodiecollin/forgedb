@@ -8,7 +8,7 @@ Modifiers are sigils on a field's type. Three are **prefix** modifiers (`+`, `&`
 
 | Symbol | Name | Position | Meaning | Valid on |
 |--------|------|----------|---------|----------|
-| `+` | auto-generate | prefix | Fill on create (`uuid`/`timestamp` today; integer is a marker) | `u32`, `u64`, `uuid`, `timestamp` only |
+| `+` | auto-generate | prefix | Fill on create when omitted (all four types) | `u32`, `u64`, `uuid`, `timestamp` only |
 | `&` | unique | prefix | Value must be unique (enforced) | any type |
 | `^` | indexed | prefix | Build an index for fast lookups | any type |
 | `?` | nullable | postfix (or prefix) | Value may be absent | any type |
@@ -16,30 +16,55 @@ Modifiers are sigils on a field's type. Three are **prefix** modifiers (`+`, `&`
 ## `+` — auto-generate
 
 `+` marks a field ForgeDB fills for you. On **create** (`db.create_<model>`, and the REST
-`POST /api/<model>` that routes through it), an omitted or nil `+uuid` gets a fresh
-`Uuid::new_v4()` and an omitted or zero `+timestamp` gets the current time, so callers
-never supply them. Valid **only on** `u32`, `u64`, `uuid`, and `timestamp`:
+`POST /api/<model>` that routes through it), a field left unset gets a generated value, so
+callers never supply it. Valid **only on** `u32`, `u64`, `uuid`, and `timestamp`:
 
 ```forge
-id: +uuid            // fresh UUID on create when omitted/nil
-seq: +u64            // primary-key marker — NOT yet auto-incremented (see below)
+id: +u64                 // next number in the sequence when omitted/0
+ref_id: +uuid            // fresh UUID on create when omitted/nil
 created_at: +timestamp   // current time on create when omitted/zero
 ```
+
+Each type has its own "unset" sentinel: a **nil UUID**, a **zero timestamp**, and — for
+integers — **`0`**.
 
 <Callout type="warning" title="`+` is type-restricted">
 `+` on any other type — e.g. `name: +string` — is a fatal parse error. Only the four
 generatable types above are allowed.
 </Callout>
 
-<Callout type="warning" title="Integer `+` is a marker, not yet auto-incremented">
-`+u32`/`+u64` currently only *mark* the primary-key / auto field — the generator does not
-synthesize a value for them, so a create must still supply the integer id. A correct
-integer auto-increment (a monotonic, restart-safe, reuse-free counter that also holds across
-transactions and the multi-process coordinator) is a design problem, not a quick patch, and
-is being worked through as an RFC — it is deliberately not shipped as a subtly-wrong version
-that could return `id = 0` or reuse a deleted id. `+uuid` and `+timestamp` are fully
-synthesized today; if you need an auto-assigned key now, use `+uuid`. See
-[RFC #187](https://github.com/hoodiecollin/forgedb/issues/187).
+<Callout type="warning" title="`0` is the allocate sentinel">
+You cannot insert `0` explicitly into a `+u32`/`+u64` field — supplying it means "allocate one
+for me". Any other value is honoured verbatim **and** advances the counter past it, so
+restoring a backup or importing existing rows does not collide on the next insert.
+</Callout>
+
+<Callout type="info" title="Integer sequences are monotonic, not gapless">
+A rolled-back transaction — or an attempt the multi-process commit coordinator rejects — burns
+its number. `+u32`/`+u64` guarantee values that are **unique and increasing**, not contiguous.
+This is the same contract Postgres and MySQL offer; do not use the id as a count.
+
+The sequence also refuses to wrap: a `+u32` that reaches `u32::MAX` fails the create rather
+than rolling back to `0` and colliding with every id already issued.
+</Callout>
+
+<Callout type="warning" title="An integer auto must be the identity or `&unique`">
+A bare non-unique `seq: +u64` is a **fatal** validation error. Mark it `&`, or make it the
+model's identity.
+
+The counter lives in each writer process, so two processes coordinated through
+`forgedb coordinate` can allocate the same number. What makes that *detected* instead of
+silent is the write-set the coordinator compares — and only the identity field and a
+`&unique` field put a claim there. `^` alone is not enough: an index makes a value fast to
+find, but claims nothing at commit time, so both writers would commit and neither would
+notice.
+
+```forge
+Invoice {
+  id: +uuid
+  number: &+u64   // non-identity integer auto — the `&` is required
+}
+```
 </Callout>
 
 ## `&` — unique

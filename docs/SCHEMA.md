@@ -154,7 +154,7 @@ Order {
 
 | Symbol | Name          | Position | Meaning                                              | Valid On         | Example           |
 |--------|---------------|----------|------------------------------------------------------|------------------|-------------------|
-| `+`    | Auto-generate | Prefix   | Fill value on insert (`uuid`/`timestamp` only; integer is a marker — see below) | u32, u64, uuid, timestamp | `id: +uuid` |
+| `+`    | Auto-generate | Prefix   | Fill value on insert when omitted (all four types)   | u32, u64, uuid, timestamp | `id: +uuid` |
 | `&`    | Unique        | Prefix   | Field value must be unique (enforced)                | Any type         | `email: &string` |
 | `^`    | Indexed       | Prefix   | Create index on this field for faster queries        | Any type         | `slug: ^string`   |
 | `?`    | Nullable      | Postfix OR Prefix | Field is optional (NULL allowed)         | Any type         | `age: i32?` or `?i32` |
@@ -167,10 +167,21 @@ Order {
 
 **Validation:**
 - `+` (auto-generate) only valid on auto-generatable types: u32, u64, uuid, timestamp (`crates/parser/src/parser/core.rs:526-531`)
-  - **But only `uuid`/`timestamp` are actually synthesized on create today.** `+u32`/`+u64` parse
-    and mark the field, but the generator does not fill an integer value — a create must supply
-    the integer id. Correct integer auto-increment is RFC #187 (blocked on transaction/coordinator
-    sequence-allocation design), deliberately unshipped rather than shipped subtly wrong.
+  - **All four synthesize on create** (#187). Each type has an "unset" sentinel the create path
+    looks for: a nil UUID, a zero timestamp, and — for `+u32`/`+u64` — **`0`**.
+  - **`0` cannot be inserted explicitly** into an auto-integer field. Supplying it means
+    "allocate one for me". Supplying any other value is honoured verbatim *and* advances the
+    counter past it, so restoring a backup or importing a dataset does not collide on the next
+    insert.
+  - **Integer autos are monotonic and unique, not contiguous.** A rolled-back transaction, or an
+    attempt the commit coordinator rejects, burns its number — the same contract Postgres and
+    MySQL offer. Do not rely on the sequence being gapless.
+  - **An integer auto must be the model's identity or carry `&`** — a bare non-unique `seq: +u64`
+    is a **fatal** validation error. The counter is per-process, so two writers coordinated
+    through `forgedb coordinate` can allocate the same number; what makes that *detected* rather
+    than silent is the write-set the coordinator compares, and only the identity and `&unique`
+    put a field there. `^` is not sufficient — an index makes a value fast to find but claims
+    nothing at commit time.
 - `&` (unique) can be applied to any field (no type restriction in parser)
 - **`&`/`^` on the model's identity field warns** (#258). The identity is already
   unique — the generated `id_to_row` is a map keyed by it — so the modifier has no
@@ -199,8 +210,8 @@ Order {
 **NOT implemented:**
 - `~` (auto-update) does not exist — the AST `Field` carries only `auto_generate: bool` (the `+`
   modifier). There is no auto-update-on-write modifier.
-- **Integer auto-increment** — `+u32`/`+u64` are parsed and marked but *not synthesized*; only
-  `+uuid`/`+timestamp` fill on create. See RFC #187.
+- **Gapless / contiguous sequences.** `+u32`/`+u64` are monotonic and unique only; see the
+  `+` notes above.
 
 ---
 
