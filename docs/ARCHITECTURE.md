@@ -234,6 +234,38 @@ at Tier 3: the coordinated writer is still the *same generated code*, and the co
 every substrate crate — knows nothing about any schema. It is the symmetric inverse of the durable
 replication broker (control over the write turn, vs. an ordered feed of committed changes).
 
+### Integer auto-increment allocates per process, and is made conflict-*visible*
+
+`+u32`/`+u64` fields allocate from an in-memory counter held per field, per process — there is
+no shared allocator and no coordinator-side sequence. A counter is seeded at open to
+`max(persisted floor, scanned max)`:
+
+- **The scan is ungated by tombstones** and walks every *physical* row, including superseded
+  versions. A deleted row still spent its number: rehydrating from live rows alone would hand a
+  retired value to a different row, and that value is visible in the replication log, in backups,
+  and in any URL that still holds it. (The secondary-index rebuild beside it *is* tombstone-gated
+  — the max must not come from it.)
+- **The persisted floor** is `Manifest.auto_sequences`, an opaque `field name -> highest value
+  issued` map. It exists because compaction physically drops the rows the scan reads, so after a
+  compaction the scan alone would regress. The floor only ever moves up; gaps are allowed.
+  Generated `compact()` **writes the floor before** handing the live set to the byte GC, and
+  refuses the compaction if that write fails — the reverse order leaves a crash window in which
+  the rows and the floor are both gone.
+
+Across processes the design does **not** prevent two coordinated writers deriving the same next
+value; it relies on the collision being *detected*. Detection runs entirely off the opaque
+write-set the coordinator equality-compares, and exactly two shapes put a field in it: being the
+model's identity (a row key) or carrying `&unique` (a unique-claim key). Either turns a duplicate
+into a `Nack`, and the retry re-derives past the winner. `^` makes a value fast to *find* but
+claims nothing at commit time — so an integer auto that is neither the identity nor unique is a
+**fatal schema error**, refused at parse rather than warned about, because the failure it prevents
+is a silent duplicate in committed data.
+
+Identity-wise, `Manifest.auto_sequences` is **inert substrate**: the two `Manifest` backends store
+and return the map and never parse a key or branch on a value. Which fields appear, what the
+numbers mean, and every read and write of them belong to generated code — the rule is enforced by
+a guard test, not only by a doc comment.
+
 ---
 
 ## Design decisions (and their trade-offs)
@@ -248,6 +280,10 @@ replication broker (control over the write turn, vs. an ordered feed of committe
   that a compaction renumbers rows within an epoch, so pinned watermarks are epoch-scoped.
 - **Storage facade over a target branch in codegen.** The generated `database.rs` compiles to
   both native and wasm32 with zero codegen branches; the facade absorbs the difference.
+- **Per-process auto-increment counters made conflict-visible, over a shared allocator.** A
+  coordinator-side sequence would put a schema-shaped concern inside schema-agnostic substrate;
+  instead each process allocates locally and the *collision* is detected through the opaque
+  write-set. The cost is that only conflict-visible shapes (identity or `&unique`) are allowed.
 - **Substrate / compiler-internals split.** Generated code links only schema-agnostic crates;
   the compiler crates stay off the runtime path, which is what makes the generator identity
   verifiable.
