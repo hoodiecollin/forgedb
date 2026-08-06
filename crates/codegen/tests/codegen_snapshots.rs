@@ -2549,8 +2549,15 @@ Post {
 
     // ValidationError type with the three integrity classes + status mapping.
     assert!(code.contains("pub enum ValidationError"), "ValidationError type emitted");
-    assert!(code.contains("Unique { field") && code.contains("DanglingReference { field")
-        && code.contains("Constraint { field"), "three integrity variants");
+    // Every variant names its model as well as its field (#257): a field is only
+    // identified by the pair, since two models may declare the same field name.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Unique{model:&'staticstr,field:&'staticstr")
+            && flat.contains("DanglingReference{model:&'staticstr,field:&'staticstr,target:&'staticstr")
+            && flat.contains("Constraint{model:&'staticstr,field:&'staticstr,rule:&'staticstr,message:String"),
+        "three integrity variants, each carrying (model, field)"
+    );
     assert!(code.contains("pub fn status_code(&self) -> u16"), "status_code maps to HTTP");
 
     // Per-model field validator with the declared directives.

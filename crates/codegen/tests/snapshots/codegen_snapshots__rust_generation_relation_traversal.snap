@@ -43,16 +43,21 @@ fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     /// A `&unique` field already holds this value on another row → 409.
-    Unique { field: &'static str },
+    Unique { model: &'static str, field: &'static str },
     /// A required/optional foreign key points at a non-existent row → 409.
-    DanglingReference { field: &'static str, target: &'static str },
+    DanglingReference { model: &'static str, field: &'static str, target: &'static str },
     /// A `delete` was refused because live child rows still reference
     /// this parent under an `@on_delete(restrict)` FK (the default
     /// on-delete policy) → 409.
     ReferencedByChildren { model: &'static str, field: &'static str },
     /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
     /// was violated → 422.
-    Constraint { field: &'static str, rule: &'static str, message: String },
+    Constraint {
+        model: &'static str,
+        field: &'static str,
+        rule: &'static str,
+        message: String,
+    },
 }
 impl ValidationError {
     /// The HTTP status the generated API boundary returns for this class:
@@ -70,11 +75,13 @@ impl ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::Unique { field } => {
-                write!(f, "unique constraint violated on field `{}`", field)
+            ValidationError::Unique { model, field } => {
+                write!(f, "unique constraint violated on field `{}.{}`", model, field)
             }
-            ValidationError::DanglingReference { field, target } => {
-                write!(f, "field `{}` references a non-existent {}", field, target)
+            ValidationError::DanglingReference { model, field, target } => {
+                write!(
+                    f, "field `{}.{}` references a non-existent {}", model, field, target
+                )
             }
             ValidationError::ReferencedByChildren { model, field } => {
                 write!(
@@ -83,8 +90,8 @@ impl std::fmt::Display for ValidationError {
                     model, field
                 )
             }
-            ValidationError::Constraint { field, rule, message } => {
-                write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+            ValidationError::Constraint { model, field, rule, message } => {
+                write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
             }
         }
     }
@@ -5212,6 +5219,7 @@ impl Database {
         }
         if self.user.get(record.author).is_none() {
             return Err(ValidationError::DanglingReference {
+                model: "Post",
                 field: "author",
                 target: "User",
             });
@@ -5219,6 +5227,7 @@ impl Database {
         if let Some(__fk) = record.editor {
             if self.user.get(__fk).is_none() {
                 return Err(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "editor",
                     target: "User",
                 });
@@ -5234,6 +5243,7 @@ impl Database {
     ) -> Result<bool, ValidationError> {
         if self.user.get(record.author).is_none() {
             return Err(ValidationError::DanglingReference {
+                model: "Post",
                 field: "author",
                 target: "User",
             });
@@ -5241,6 +5251,7 @@ impl Database {
         if let Some(__fk) = record.editor {
             if self.user.get(__fk).is_none() {
                 return Err(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "editor",
                     target: "User",
                 });
@@ -5519,6 +5530,7 @@ impl<'db> TxHandle<'db> {
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -5528,6 +5540,7 @@ impl<'db> TxHandle<'db> {
             if self.get_user(__fk).is_none() {
                 return Err(
                     TxError::Validation(ValidationError::DanglingReference {
+                        model: "Post",
                         field: "editor",
                         target: "User",
                     }),
@@ -5558,6 +5571,7 @@ impl<'db> TxHandle<'db> {
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -5567,6 +5581,7 @@ impl<'db> TxHandle<'db> {
             if self.get_user(__fk).is_none() {
                 return Err(
                     TxError::Validation(ValidationError::DanglingReference {
+                        model: "Post",
                         field: "editor",
                         target: "User",
                     }),
@@ -6215,6 +6230,7 @@ impl ConcurrentTxHandle {
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -6224,6 +6240,7 @@ impl ConcurrentTxHandle {
             if self.get_user(__fk).is_none() {
                 return Err(
                     TxError::Validation(ValidationError::DanglingReference {
+                        model: "Post",
                         field: "editor",
                         target: "User",
                     }),
@@ -6259,6 +6276,7 @@ impl ConcurrentTxHandle {
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -6268,6 +6286,7 @@ impl ConcurrentTxHandle {
             if self.get_user(__fk).is_none() {
                 return Err(
                     TxError::Validation(ValidationError::DanglingReference {
+                        model: "Post",
                         field: "editor",
                         target: "User",
                     }),
