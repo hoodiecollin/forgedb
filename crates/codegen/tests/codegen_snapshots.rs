@@ -6062,6 +6062,132 @@ Gadget {
     );
 }
 
+/// Whether `code` mentions `ident` as a whole identifier rather than as a
+/// substring of a longer one. `"ref_id_index".contains("id_index")` is true, so a
+/// plain `contains` cannot assert that `id_index` was *not* generated.
+fn mentions_ident(code: &str, ident: &str) -> bool {
+    let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    code.match_indices(ident).any(|(i, _)| {
+        boundary(code[..i].chars().next_back())
+            && boundary(code[i + ident.len()..].chars().next())
+    })
+}
+
+#[test]
+fn test_rust_generation_modifiers_on_non_identity_auto_fields() {
+    // #258: `&` / `^` on a NON-identity auto (`+`) field used to be silently
+    // dropped — `indexed_fields` excluded every `auto_generate` field, so no index
+    // was built and, for `&`, no uniqueness was enforced at all.  This affected
+    // `+uuid` / `+timestamp`, which synthesize today, so it was a live bug rather
+    // than one gated on #187.
+    let src = r#"
+Event {
+  id: +uuid
+  created_at: ^+timestamp
+  ref_id: &+uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `^` builds the index it asked for.
+    assert!(
+        mentions_ident(&code, "created_at_index"),
+        "`^` on a non-identity auto field must build an index (#258)"
+    );
+    // `&` builds the index AND the uniqueness check that rejects a duplicate.
+    assert!(
+        mentions_ident(&code, "ref_id_index"),
+        "`&` on a non-identity auto field must build an index (#258)"
+    );
+    // Flattened: prettyplease wraps the multi-field variant across lines and adds
+    // a trailing comma, so match the field list rather than a formatted literal.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::Unique{model:\"Event\",field:\"ref_id\""),
+        "`&` on a non-identity auto field must enforce uniqueness (#258)"
+    );
+
+    // The identity field keeps its exclusion: `id_to_row` already enforces it, so
+    // a second index would be redundant.  This half of the old behavior is
+    // correct and must not regress.
+    assert!(
+        !mentions_ident(&code, "id_index"),
+        "the identity field must NOT get a redundant secondary index (#258)"
+    );
+}
+
+#[test]
+fn test_rust_generation_identity_modifiers_stay_redundant() {
+    // #258 companion: the identity is excluded because it IS the identity, not
+    // because it is auto-generated.  Both spellings of identity — a field named
+    // `id`, and a differently-named `+` field standing in as the identity — build
+    // no secondary index even when marked `&` / `^`.  (Schema validation warns and
+    // suggests dropping the modifier; see the parser-side guard.)
+    let src = r#"
+Widget {
+  id: &+uuid
+  name: string
+}
+
+Gadget {
+  code: ^+u64
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !mentions_ident(&code, "id_index"),
+        "`&` on an `id`-named identity stays redundant (#258)"
+    );
+    assert!(
+        !mentions_ident(&code, "code_index"),
+        "`^` on a `+`-field identity stays redundant (#258)"
+    );
+}
+
+#[test]
+fn test_rust_generation_single_and_composite_index_agree_on_auto_fields() {
+    // #258: composite indexes never applied the auto-field exclusion, so before
+    // the fix the SAME field was indexable via `@index(a, b)` but not via `^`.
+    // That asymmetry is what proved the exclusion was an oversight rather than a
+    // design choice, so guard the two paths against diverging again.
+    let composite = r#"
+Event {
+  id: +uuid
+  created_at: +timestamp
+  name: string
+  @index(created_at, name)
+}
+"#;
+    let single = r#"
+Event {
+  id: +uuid
+  created_at: ^+timestamp
+  name: string
+}
+"#;
+    let emit = |src: &str| {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        RustGenerator::generate(&schema).unwrap().code
+    };
+
+    assert!(
+        mentions_ident(&emit(composite), "created_at_name_index"),
+        "a composite index over an auto field is built (pre-existing behavior)"
+    );
+    assert!(
+        mentions_ident(&emit(single), "created_at_index"),
+        "a single index over the same auto field must also be built (#258)"
+    );
+}
+
 #[test]
 fn test_rust_generation_txn_commit_journal() {
     // MVCC Tier 1 (#83, M1b): the atomic multi-model commit journal.  Commit fsyncs
