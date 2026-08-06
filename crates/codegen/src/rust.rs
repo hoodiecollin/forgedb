@@ -24,6 +24,45 @@ thread_local! {
 /// Rust code generator
 pub struct RustGenerator;
 
+/// A `@min`/`@max` bound literal as written in the schema (#239).
+///
+/// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
+/// happens against the known field type: exact for `decimal`, correctly rounded
+/// for `f64`. Parsing to a float earlier would round before anything knew which
+/// of those two applied.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundLiteral {
+    Int(i64),
+    Frac(String),
+}
+
+impl BoundLiteral {
+    /// The bound as it should read in a violation message — the author's own
+    /// spelling, so `must be >= 0.01` rather than a re-rendered float.
+    fn render(&self) -> String {
+        match self {
+            BoundLiteral::Int(n) => n.to_string(),
+            BoundLiteral::Frac(s) => s.clone(),
+        }
+    }
+
+    /// Split a numeric lexeme into `(mantissa, scale)` so it can be emitted as an
+    /// exact `Decimal`: `-2.50` → `(-250, 2)`, `7` → `(7, 0)`.
+    ///
+    /// `None` if the digits do not fit an `i128`. Whether the result is
+    /// representable as a `Decimal` (≤ 28 fractional digits, 96-bit mantissa) is
+    /// checked in validation, so a schema that reaches codegen is already sound.
+    pub(crate) fn decimal_parts(lexeme: &str) -> Option<(i128, u32)> {
+        let (int_part, frac_part) = lexeme.split_once('.').unwrap_or((lexeme, ""));
+        // A lone `-` sign must not survive concatenation as `-` + digits alone.
+        let digits = format!("{int_part}{frac_part}");
+        digits
+            .parse::<i128>()
+            .ok()
+            .map(|m| (m, frac_part.len() as u32))
+    }
+}
+
 /// On-delete referential-integrity policy for a relation FK field (delete
 /// semantics).  Declared via `@on_delete(...)`; `Restrict` is the default when
 /// the directive is absent.
@@ -1931,6 +1970,27 @@ impl RustGenerator {
         }
     }
 
+    /// A `@min`/`@max` bound as written: the literal, plus whether it is exclusive.
+    ///
+    /// `None` when the constraint carries no usable bound. Validation has already
+    /// rejected the shapes that are errors (a fractional or exclusive bound on an
+    /// integer field, a mismatched operator), so by the time codegen runs, anything
+    /// present here is meant to be emitted.
+    fn constraint_bound(c: &forgedb_parser::ast::Constraint) -> Option<(BoundLiteral, bool)> {
+        use forgedb_parser::ast::ConstraintParam as P;
+        fn literal(p: &P) -> Option<BoundLiteral> {
+            match p {
+                P::Number(n) => Some(BoundLiteral::Int(*n)),
+                P::Fractional(s) => Some(BoundLiteral::Frac(s.clone())),
+                _ => None,
+            }
+        }
+        c.params.iter().find_map(|p| match p {
+            P::Exclusive { value, .. } => literal(value).map(|l| (l, true)),
+            other => literal(other).map(|l| (l, false)),
+        })
+    }
+
     /// The `(lhs, rhs)` operands for a `@min`/`@max` comparison, in a domain that
     /// can represent both the field's value and the bound exactly (#239).
     ///
@@ -1953,22 +2013,48 @@ impl RustGenerator {
     /// [`Self::is_numeric_type`], so `None` means the two have drifted apart.
     fn numeric_bound_operands(
         field_type: &forgedb_parser::FieldType,
-        bound: i64,
+        bound: &BoundLiteral,
     ) -> Option<(TokenStream, TokenStream)> {
         use forgedb_parser::FieldType;
-        match field_type {
-            FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => Some((
-                quote! { (*__v as i128) },
-                quote! { (#bound as i128) },
-            )),
-            FieldType::F64 => Some((quote! { (*__v as f64) }, quote! { (#bound as f64) })),
-            // `#bound` interpolates as an `i64`-suffixed literal, so this resolves
-            // to `From<i64> for Decimal` with no annotation and no cast.
-            FieldType::Decimal => Some((
+        match (field_type, bound) {
+            (
+                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64,
+                BoundLiteral::Int(n),
+            ) => Some((quote! { (*__v as i128) }, quote! { (#n as i128) })),
+            (FieldType::F64, BoundLiteral::Int(n)) => {
+                Some((quote! { (*__v as f64) }, quote! { (#n as f64) }))
+            }
+            // `#n` interpolates as an `i64`-suffixed literal, so this resolves to
+            // `From<i64> for Decimal` with no annotation and no cast.
+            (FieldType::Decimal, BoundLiteral::Int(n)) => Some((
                 quote! { (*__v) },
-                quote! { rust_decimal::Decimal::from(#bound) },
+                quote! { rust_decimal::Decimal::from(#n) },
             )),
-            FieldType::Nullable(inner) => Self::numeric_bound_operands(inner, bound),
+            // A fractional bound on an `f64` field rounds into the field's own
+            // domain, which is inherent rather than lossy — there is nothing more
+            // exact for an `f64` to be compared against.
+            (FieldType::F64, BoundLiteral::Frac(lex)) => {
+                let v: f64 = lex.parse().ok()?;
+                let lit = proc_macro2::Literal::f64_suffixed(v);
+                Some((quote! { (*__v as f64) }, quote! { #lit }))
+            }
+            // The exact case, and the reason the lexeme is carried this far: the
+            // literal is reconstructed as mantissa + scale, so `0.01` is the
+            // Decimal `1e-2` and never passes through a binary float.
+            (FieldType::Decimal, BoundLiteral::Frac(lex)) => {
+                let (mantissa, scale) = BoundLiteral::decimal_parts(lex)?;
+                Some((
+                    quote! { (*__v) },
+                    quote! { rust_decimal::Decimal::from_i128_with_scale(#mantissa, #scale) },
+                ))
+            }
+            // A fractional bound on an integer field is a validation error, so it
+            // never reaches here; refusing it again keeps the drift guard honest.
+            (
+                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64,
+                BoundLiteral::Frac(_),
+            ) => None,
+            (FieldType::Nullable(inner), _) => Self::numeric_bound_operands(inner, bound),
             _ => None,
         }
     }
@@ -2033,32 +2119,34 @@ impl RustGenerator {
                 let mut checks: Vec<TokenStream> = Vec::new();
                 for c in &field.constraints {
                     match c.name.as_str() {
-                        "min" if is_numeric => {
-                            if let Some(&n) = Self::constraint_numbers(c).first()
+                        // `@min(n)` rejects `v < n`; the exclusive `@min(>n)` rejects
+                        // `v <= n`. `@max` mirrors it (#239).
+                        "min" | "max" if is_numeric => {
+                            if let Some((bound, exclusive)) = Self::constraint_bound(c)
                                 && let Some((lhs, rhs)) =
-                                    Self::numeric_bound_operands(&field.field_type, n)
+                                    Self::numeric_bound_operands(&field.field_type, &bound)
                             {
-                                let msg = format!("must be >= {n}");
+                                let is_min = c.name == "min";
+                                let cmp = match (is_min, exclusive) {
+                                    (true, false) => quote! { < },
+                                    (true, true) => quote! { <= },
+                                    (false, false) => quote! { > },
+                                    (false, true) => quote! { >= },
+                                };
+                                // The message states the *satisfying* relation, so
+                                // it is the mirror of the rejecting comparison.
+                                let rel = match (is_min, exclusive) {
+                                    (true, false) => ">=",
+                                    (true, true) => ">",
+                                    (false, false) => "<=",
+                                    (false, true) => "<",
+                                };
+                                let rule = if is_min { "min" } else { "max" };
+                                let msg = format!("must be {rel} {}", bound.render());
                                 checks.push(quote! {
-                                    if #lhs < #rhs {
+                                    if #lhs #cmp #rhs {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "min",
-                                            message: #msg.to_string(),
-                                        });
-                                    }
-                                });
-                            }
-                        }
-                        "max" if is_numeric => {
-                            if let Some(&n) = Self::constraint_numbers(c).first()
-                                && let Some((lhs, rhs)) =
-                                    Self::numeric_bound_operands(&field.field_type, n)
-                            {
-                                let msg = format!("must be <= {n}");
-                                checks.push(quote! {
-                                    if #lhs > #rhs {
-                                        return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "max",
+                                            field: #fname_str, rule: #rule,
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -10995,7 +11083,8 @@ mod tests {
         ];
         for ty in types {
             let gated = RustGenerator::is_numeric_type(&ty);
-            let comparable = RustGenerator::numeric_bound_operands(&ty, 1).is_some();
+            let comparable =
+                RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(1)).is_some();
             assert_eq!(
                 gated, comparable,
                 "{ty:?}: is_numeric_type says {gated}, but numeric_bound_operands \
@@ -11016,7 +11105,7 @@ mod tests {
                 "nullable {inner:?} is numeric"
             );
             assert!(
-                RustGenerator::numeric_bound_operands(&ty, 1).is_some(),
+                RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(1)).is_some(),
                 "nullable {inner:?} must compare in the inner domain"
             );
         }
@@ -11029,7 +11118,7 @@ mod tests {
     #[test]
     fn each_numeric_domain_compares_without_a_lossy_cast() {
         let rhs = |ty: FieldType| {
-            RustGenerator::numeric_bound_operands(&ty, 7)
+            RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(7))
                 .unwrap()
                 .1
                 .to_string()
