@@ -58,6 +58,14 @@ pub enum ValidationError {
         rule: &'static str,
         message: String,
     },
+    /// A `+u32`/`+u64` auto-increment field ran out of values (#187) →
+    /// 500.  Refused rather than wrapped: wrapping would re-issue `0`,
+    /// which is also the "allocate one for me" sentinel, and then
+    /// collide with every value already handed out.
+    ///
+    /// A server-side exhaustion, not a bad request — which is why it is
+    /// the one `ValidationError` class that maps to 5xx.
+    SequenceExhausted { model: &'static str, field: &'static str },
 }
 impl ValidationError {
     /// The HTTP status the generated API boundary returns for this class:
@@ -69,6 +77,7 @@ impl ValidationError {
             | ValidationError::DanglingReference { .. }
             | ValidationError::ReferencedByChildren { .. } => 409,
             ValidationError::Constraint { .. } => 422,
+            ValidationError::SequenceExhausted { .. } => 500,
         }
     }
 }
@@ -92,6 +101,11 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::Constraint { model, field, rule, message } => {
                 write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
+            }
+            ValidationError::SequenceExhausted { model, field } => {
+                write!(
+                    f, "auto-increment sequence for `{}.{}` is exhausted", model, field
+                )
             }
         }
     }
@@ -392,6 +406,11 @@ impl UserStorage {
         let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.format_version)
             .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
             schema_version: 1,
             row_count: self.row_count,
@@ -404,6 +423,7 @@ impl UserStorage {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
         let _ = manifest.save_to(&__manifest_abs);
     }
