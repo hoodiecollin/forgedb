@@ -297,9 +297,16 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // processes would both commit and neither would notice.
         //
         // Fatal rather than advisory: the failure it prevents is a silent
-        // duplicate in committed data. Supporting the bare shape would require
-        // coordinator-side sequence allocation, which would push a schema-shaped
-        // concern into schema-agnostic substrate — so it is refused outright.
+        // duplicate in committed data, and a warning would be read past.
+        //
+        // It is a deliberate SCOPE CUT, not an impossibility (#260): the write-set
+        // is opaque bytes the coordinator only equality-compares, so a third claim
+        // class would make the bare shape conflict-visible with no substrate change.
+        // Refused anyway, because (a) a `.forge` schema must not be
+        // deployment-conditional — validity cannot hinge on whether the user later
+        // runs `forgedb coordinate`; (b) `&unique` is enforced durably against
+        // already-committed rows, where a claim key would catch only concurrent
+        // collisions; and (c) the escape is one character, `&`.
         let identity_name = model
             .fields
             .iter()
