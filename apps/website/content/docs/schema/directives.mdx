@@ -27,8 +27,8 @@ The generated code checks these and rejects a bad write.
 
 | Directive | Args | Applies to | Effect |
 |-----------|------|-----------|--------|
-| `@min` | `(number)` | numeric | Value must be ≥ the minimum, else **422** |
-| `@max` | `(number)` | numeric | Value must be ≤ the maximum, else **422**. *Not* a string-length check — use `@length` for strings |
+| `@min` | `(whole number)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≥ the minimum, else **422** |
+| `@max` | `(whole number)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≤ the maximum, else **422**. *Not* a string-length check — use `@length` for strings |
 | `@length` | `(count)` or `(min, max)` | `string` | String length must be in range, else **422** |
 | `@email` | none | `string` | Must be a valid email, else **422** |
 | `@url` | none | `string` | Must be a valid URL, else **422** |
@@ -40,6 +40,10 @@ The generated code checks these and rejects a bad write.
 The generated `validate_<model>` enforces these at the top of `insert`/`update`; a
 violation is a field-constraint error (HTTP **422**). A nullable field is validated only
 when `Some`.
+
+Each numeric bound is compared in its field's own domain, so a `decimal` bound stays
+exact and a 64-bit integer bound never rounds. Bounds are **whole numbers** and
+**inclusive** — there is no fractional or exclusive form yet.
 
 ```forge
 User {
