@@ -7979,10 +7979,11 @@ Ticket {
     );
 }
 
-/// A *non-identity* integer auto is the shape the conflict-visible rule forces to
-/// carry `&`, so allocation and the #258 uniqueness enforcement must coexist on
-/// the same field. Guarded together because the two features touch adjacent
-/// generated code and either could plausibly be written to replace the other.
+/// A *non-identity* integer auto carrying `&` puts allocation and the #258
+/// uniqueness enforcement on the same field, so they must coexist. Guarded together
+/// because the two features touch adjacent generated code and either could
+/// plausibly be written to replace the other. (#187 once *required* the `&` here;
+/// since #260 it is a choice, which makes the coexistence no less load-bearing.)
 #[test]
 fn test_rust_generation_non_identity_integer_auto_allocates_and_stays_unique() {
     let src = r#"
@@ -8094,6 +8095,89 @@ Ticket {
         "a floor that cannot be persisted must ABORT the compaction, not proceed \
          (#187):\n{compact}"
     );
+}
+
+/// #260: a **bare** integer auto — neither the model's identity nor `&unique` —
+/// claims its allocated value in the opaque write-set via a third key class.
+///
+/// This is the entire feature. Without the claim, two coordinated writers that
+/// derive the same next value both commit and neither notices, which is why #187
+/// refused the shape outright rather than shipping it unprotected.
+///
+/// All three write-set builders must emit it. They are separate code paths —
+/// `TxHandle::__write_set` (`db.transaction()`), `transaction_concurrent`, and
+/// `transaction_coordinated` — and missing one leaves a silent hole on that path
+/// alone, which no single-path test would catch.
+#[test]
+fn test_rust_generation_bare_integer_auto_claims_its_value() {
+    let src = r#"
+Ticket {
+  id: +uuid
+  seq: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("staged_sequence_keys"),
+        "a bare integer auto needs a staging buffer for its claims (#260)"
+    );
+    // The claim must be keyed off the record's final value, so it covers an
+    // explicitly-supplied value too (#187 decision 5 lets one through, and an
+    // explicit 7 racing an allocated 7 is the same collision).
+    assert!(
+        code.contains("staged_sequence_keys.insert"),
+        "the allocated value must actually be staged, not just buffered (#260)"
+    );
+
+    let claims = code.matches("b\"s\"").count();
+    assert!(
+        claims >= 3,
+        "all THREE write-set builders must emit the sequence claim — \
+         __write_set, transaction_concurrent, transaction_coordinated — \
+         found {claims} (#260)"
+    );
+    assert!(
+        extract_fn(&code, "pub fn __write_set").contains("b\"s\""),
+        "the Tier-1/2 db.transaction() path must claim (#260)"
+    );
+}
+
+/// The zero-churn guard for #260: an integer auto that is already conflict-visible
+/// — the identity, or `&unique` — must emit **no** sequence-claim machinery.
+///
+/// Load-bearing for two reasons. It keeps the new key class off every schema that
+/// was legal before #260 (the identity contributes a row key and `&unique` a
+/// unique-claim key, so a third claim would be redundant work on every insert).
+/// And because the staging buffer lives on the schema-level `TxHandle` /
+/// `ConcurrentTxHandle` — not per model — an ungated field would appear in every
+/// generated crate and diff every snapshot in this file for a feature the schema
+/// does not use.
+#[test]
+fn test_rust_generation_conflict_visible_autos_emit_no_sequence_claim() {
+    for src in [
+        // identity integer auto — already contributes the row key
+        "Ticket {\n  id: +u64\n  title: string\n}\n",
+        // non-identity but unique — already contributes the unique-claim key
+        "Ticket {\n  id: +uuid\n  seq: &+u64\n  title: string\n}\n",
+    ] {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        let code = RustGenerator::generate(&schema).unwrap().code;
+
+        assert!(
+            !code.contains("staged_sequence_keys"),
+            "{src:?} is already conflict-visible; a sequence claim would be dead \
+             weight, and the field would churn every snapshot (#260)"
+        );
+        assert!(
+            !code.contains("b\"s\""),
+            "{src:?} must emit no sequence claim key (#260)"
+        );
+    }
 }
 
 /// The no-regression guard for the whole existing corpus: a model whose only autos
