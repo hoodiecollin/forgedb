@@ -106,6 +106,9 @@ pub fn collect_naming_errors(schema: &Schema, errors: &mut Vec<ValidationError>)
 ///
 /// These are always run (the parser does not gate them behind `use_validation`).
 pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    // `@min`/`@max` bound shape vs the field's numeric domain (#239).
+    check_numeric_bounds(schema, errors);
+
     // Duplicate top-level names.
     check_duplicate_names(
         schema.models.iter().map(|m| (m.name.as_str(), m.position)),
@@ -286,6 +289,201 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
                 }
             }
         }
+    }
+}
+
+/// Whether a field type is (or wraps) a **discrete** numeric type — one whose
+/// values are countable, so that `> n` and `>= n+1` denote the same set.
+fn is_discrete_numeric(field_type: &FieldType) -> bool {
+    match field_type {
+        FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => true,
+        FieldType::Nullable(inner) => is_discrete_numeric(inner),
+        _ => false,
+    }
+}
+
+/// Whether a field type is (or wraps) a **continuous** numeric type, where a
+/// fractional or exclusive bound is meaningful.
+fn is_continuous_numeric(field_type: &FieldType) -> bool {
+    match field_type {
+        FieldType::F64 | FieldType::Decimal => true,
+        FieldType::Nullable(inner) => is_continuous_numeric(inner),
+        _ => false,
+    }
+}
+
+/// `@min`/`@max` bound diagnostics (#239).
+///
+/// Three rules, each rejecting a form that would otherwise be silently
+/// misinterpreted rather than loudly refused:
+///
+/// 1. **Fractional bound on an integer field** (`u32 @min(0.5)`) is an error, not
+///    a warning. It is always a confusion — the author meant `1` — and a
+///    warning-only path lets the schema keep shipping with a bound that does not
+///    mean what it reads as.
+/// 2. **Exclusive bound on an integer field** (`u32 @min(>0)`) is an error. On a
+///    discrete domain `>0` and `>=1` are the same set, so the operator adds a
+///    second spelling without adding expressiveness — the same reasoning that
+///    declined operators for `@length` on #235. On a continuous domain there is
+///    no equivalent inclusive spelling, which is why the form exists at all.
+/// 3. **A mismatched operator** (`@min(<5)`, `@max(>5)`) is an error rather than
+///    being read as "exclusive" with the direction ignored.
+///
+/// Bounds on a non-numeric field are not reported here: `@min` on a `string` is
+/// already inert by type, and reporting it belongs with the wider "directive does
+/// not apply to this type" rule rather than with bound *shape*.
+fn check_numeric_bounds(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for model in &schema.models {
+        for field in &model.fields {
+            let discrete = is_discrete_numeric(&field.field_type);
+            let continuous = is_continuous_numeric(&field.field_type);
+            if !discrete && !continuous {
+                continue;
+            }
+            for c in &field.constraints {
+                let is_min = c.name == "min";
+                if !is_min && c.name != "max" {
+                    continue;
+                }
+                for p in &c.params {
+                    match p {
+                        crate::ast::ConstraintParam::Fractional(lex) if discrete => {
+                            errors.push(positioned(
+                                format!(
+                                    "Field '{}.{}' is an integer type, so @{}({}) cannot be \
+                                     fractional — use a whole number",
+                                    model.name, field.name, c.name, lex
+                                ),
+                                field.position,
+                            ));
+                        }
+                        crate::ast::ConstraintParam::Fractional(lex) if is_decimal(&field.field_type) => {
+                            check_decimal_representable(
+                                lex,
+                                &model.name,
+                                field,
+                                &c.name,
+                                errors,
+                            );
+                        }
+                        crate::ast::ConstraintParam::Exclusive { greater, value } => {
+                            let op = if *greater { '>' } else { '<' };
+                            if discrete {
+                                errors.push(positioned(
+                                    format!(
+                                        "Field '{}.{}' is an integer type, so the exclusive \
+                                         bound @{}({}{}) is redundant — shift the value and \
+                                         write an inclusive bound instead",
+                                        model.name,
+                                        field.name,
+                                        c.name,
+                                        op,
+                                        render_bound(value)
+                                    ),
+                                    field.position,
+                                ));
+                            } else if *greater != is_min {
+                                // `@min` pairs with `>`, `@max` with `<`.
+                                let want = if is_min { '>' } else { '<' };
+                                errors.push(positioned(
+                                    format!(
+                                        "Field '{}.{}': @{} takes '{}' for an exclusive bound, \
+                                         found '{}'",
+                                        model.name, field.name, c.name, want, op
+                                    ),
+                                    field.position,
+                                ));
+                            }
+                            if let crate::ast::ConstraintParam::Fractional(lex) = value.as_ref() {
+                                if discrete {
+                                    errors.push(positioned(
+                                        format!(
+                                            "Field '{}.{}' is an integer type, so @{}({}{}) \
+                                             cannot be fractional — use a whole number",
+                                            model.name, field.name, c.name, op, lex
+                                        ),
+                                        field.position,
+                                    ));
+                                } else if is_decimal(&field.field_type) {
+                                    check_decimal_representable(
+                                        lex,
+                                        &model.name,
+                                        field,
+                                        &c.name,
+                                        errors,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether a field type is (or wraps) `decimal`.
+fn is_decimal(field_type: &FieldType) -> bool {
+    match field_type {
+        FieldType::Decimal => true,
+        FieldType::Nullable(inner) => is_decimal(inner),
+        _ => false,
+    }
+}
+
+/// `rust_decimal::Decimal` holds a 96-bit mantissa and at most 28 fractional
+/// digits. A bound outside that is rejected here rather than in codegen, because
+/// codegen constructs the value with `Decimal::from_i128_with_scale`, which
+/// **panics** on an out-of-range input — turning an author's typo into a
+/// generator crash instead of a schema diagnostic.
+fn check_decimal_representable(
+    lexeme: &str,
+    model_name: &str,
+    field: &crate::ast::Field,
+    directive: &str,
+    errors: &mut Vec<ValidationError>,
+) {
+    const MAX_SCALE: usize = 28;
+    const MAX_MANTISSA: i128 = 79_228_162_514_264_337_593_543_950_335; // 2^96 - 1
+
+    let (int_part, frac_part) = lexeme.split_once('.').unwrap_or((lexeme, ""));
+    if frac_part.len() > MAX_SCALE {
+        errors.push(positioned(
+            format!(
+                "Field '{}.{}': @{}({}) has {} fractional digits, but a decimal holds at \
+                 most {}",
+                model_name,
+                field.name,
+                directive,
+                lexeme,
+                frac_part.len(),
+                MAX_SCALE
+            ),
+            field.position,
+        ));
+        return;
+    }
+    let digits = format!("{int_part}{frac_part}");
+    match digits.parse::<i128>() {
+        Ok(m) if m.abs() <= MAX_MANTISSA => {}
+        _ => errors.push(positioned(
+            format!(
+                "Field '{}.{}': @{}({}) is too large to represent as a decimal",
+                model_name, field.name, directive, lexeme
+            ),
+            field.position,
+        )),
+    }
+}
+
+/// Render a bound parameter back to something close to its source spelling, for
+/// a diagnostic message.
+fn render_bound(p: &crate::ast::ConstraintParam) -> String {
+    match p {
+        crate::ast::ConstraintParam::Number(n) => n.to_string(),
+        crate::ast::ConstraintParam::Fractional(s) => s.clone(),
+        other => format!("{other:?}"),
     }
 }
 
