@@ -25,7 +25,7 @@ No `text` type. See [scalar types](/docs/schema/scalar-types/).
 
 | Sigil | Position | Meaning | Notes |
 |-------|----------|---------|-------|
-| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — all fill on create when omitted. Integer autos are monotonic, **not gapless**, cannot take an explicit `0`, and must be the identity or `&unique` |
+| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — all fill on create when omitted. Integer autos are monotonic, **not gapless**, and cannot take an explicit `0`; any shape (identity, `&`, `^`, or bare) is valid |
 | `&` | prefix | unique (enforced) | any type; also indexes |
 | `^` | prefix | indexed | any indexable type |
 | `?` | postfix (or prefix) | nullable | any type |
