@@ -278,70 +278,6 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
             }
         }
 
-        // An integer auto (`+u32`/`+u64`) must be **conflict-visible** (#187).
-        //
-        // Unlike `+uuid` (random) and `+timestamp` (the clock), an integer auto
-        // allocates from a counter that each process derives for itself. Two
-        // writers coordinated through `forgedb coordinate` open the same data dir
-        // lock-free, so they can and do allocate the same number. The design does
-        // not prevent that — it relies on the collision being *detected*.
-        //
-        // Detection runs entirely off the opaque write-set the coordinator
-        // equality-compares. Exactly two things put a field in it: being the
-        // identity (contributes a row key) and carrying `&unique` (contributes a
-        // unique-claim key). Either one turns a duplicate into a `Nack`, and the
-        // retry re-refreshes past the winner and allocates again.
-        //
-        // `^` is NOT sufficient, and that is the whole point of the rule: an index
-        // makes a value fast to *find*, but claims nothing at commit time, so two
-        // processes would both commit and neither would notice.
-        //
-        // Fatal rather than advisory: the failure it prevents is a silent
-        // duplicate in committed data, and a warning would be read past.
-        //
-        // It is a deliberate SCOPE CUT, not an impossibility (#260): the write-set
-        // is opaque bytes the coordinator only equality-compares, so a third claim
-        // class would make the bare shape conflict-visible with no substrate change.
-        // Refused anyway, because (a) a `.forge` schema must not be
-        // deployment-conditional — validity cannot hinge on whether the user later
-        // runs `forgedb coordinate`; (b) `&unique` is enforced by a **durable**
-        // index that outlives every process, whereas a claim key is only as old as
-        // the coordinator's in-memory conflict map — which does retain committed
-        // keys (it is deliberately never `gc()`d), but is rebuilt empty on
-        // restart; and (c) the escape is one character, `&`.
-        let identity_name = model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-            .map(|f| f.name.as_str());
-        for field in &model.fields {
-            let is_integer_auto = field.auto_generate
-                && matches!(field.field_type, FieldType::U32 | FieldType::U64);
-            if !is_integer_auto || field.unique || Some(field.name.as_str()) == identity_name {
-                continue;
-            }
-            errors.push(
-                positioned(
-                    format!(
-                        "Field '{}.{}' is an integer auto-increment that is neither the \
-                         model's identity nor unique, so a duplicate allocated by a second \
-                         writer process would not be conflict-visible to the commit \
-                         coordinator and would commit silently.",
-                        model.name, field.name
-                    ),
-                    field.position.or(model.position),
-                )
-                .with_suggestion(format!(
-                    "mark it unique ('{}: &+{}'), or make it the model's identity",
-                    field.name,
-                    match field.field_type {
-                        FieldType::U32 => "u32",
-                        _ => "u64",
-                    }
-                )),
-            );
-        }
-
         // Composite indexes reference existing fields.
         for comp_idx in &model.composite_indexes {
             for field_name in &comp_idx.fields {
@@ -783,53 +719,35 @@ mod tests {
         }
     }
 
-    // ---- #187: integer autos must be conflict-visible ------------------------
+    // ---- #187/#260: every integer auto shape is conflict-visible -------------
 
-    /// An integer auto allocates from a **per-process** counter, so two coordinated
-    /// writers can hand out the same number. What makes that collision *detected*
-    /// rather than silent is the opaque write-set: an identity contributes an id
-    /// key, and `&unique` contributes a unique-claim key, so the coordinator
-    /// equality-compares and `Nack`s one writer. A bare non-unique integer auto
-    /// contributes neither and would duplicate in silence — so it is refused.
+    /// A bare non-unique integer auto is **accepted** (#260).
+    ///
+    /// #187 refused it, because detection ran entirely off two write-set classes —
+    /// the identity's row key and `&unique`'s claim key — and a bare field
+    /// contributed neither, so a duplicate allocated by a second coordinated writer
+    /// would commit in silence. #260 adds a third class (`b"s" ++ model ++ field ++
+    /// value`), so the bare shape claims too and the premise of the refusal is gone.
+    ///
+    /// Pinned as its own test rather than folded into the acceptance loop below,
+    /// because it is the shape the rule used to reject: if a future change
+    /// reintroduces the check, this is the test that says why it must not.
     #[test]
-    fn bare_non_unique_integer_auto_is_rejected() {
-        for (src, field) in [
-            ("Thing {\n  id: +uuid\n  seq: +u64\n}\n", "seq"),
-            ("Thing {\n  id: +uuid\n  n: +u32\n}\n", "n"),
+    fn bare_non_unique_integer_auto_is_accepted() {
+        for src in [
+            "Thing {\n  id: +uuid\n  seq: +u64\n}\n",
+            "Thing {\n  id: +uuid\n  n: +u32\n}\n",
         ] {
             let errors = validate_schema(&ast(src));
-            let seq: Vec<_> = errors
-                .iter()
-                .filter(|e| e.message.contains("conflict-visible"))
-                .collect();
-
-            assert_eq!(seq.len(), 1, "exactly one for {src:?}: {errors:?}");
             assert!(
-                !seq[0].is_warning(),
-                "a silent duplicate is not something to warn about — {src:?}"
-            );
-            assert!(
-                seq[0].message.contains(&format!("'Thing.{field}'")),
-                "names the offending field: {:?}",
-                seq[0].message
-            );
-            assert!(
-                seq[0].position.is_some(),
-                "positioned at the field so an editor can anchor a quick-fix"
-            );
-            // Must name BOTH escapes, not merely refuse: the author has to be able
-            // to act on it without reading the RFC.
-            let suggestion = seq[0].suggestion.as_deref().unwrap_or("");
-            assert!(
-                suggestion.contains('&') && suggestion.contains("identity"),
-                "the fix names both routes (mark it '&', or make it the identity): {suggestion:?}"
+                errors.is_empty(),
+                "a bare integer auto is conflict-visible via its sequence claim key \
+                 (#260) and must validate clean: {src:?} → {errors:?}"
             );
         }
     }
 
-    /// The three shapes that satisfy the rule. `^` is deliberately NOT among them:
-    /// an index is not a write-set claim, so it does not make a duplicate visible
-    /// to the coordinator — which is exactly the distinction this rule turns on.
+    /// Every integer-auto shape validates, however the field is marked.
     #[test]
     fn conflict_visible_integer_autos_are_accepted() {
         for src in [
@@ -845,19 +763,20 @@ mod tests {
         }
     }
 
-    /// `^` alone does not satisfy the rule. Pinned separately from the acceptance
-    /// cases above because it is the plausible-looking near-miss: it *reads* like
-    /// it enforces something, and an index does make the value fast to look up —
-    /// but it claims nothing in the write-set, so two processes still both commit.
+    /// `^` on an integer auto is accepted (#260).
+    ///
+    /// Kept as a distinct case because under #187 this was the deliberate
+    /// near-miss — an index *reads* like it enforces something while claiming
+    /// nothing at commit time. That reasoning was sound and is now simply moot:
+    /// the claim comes from the sequence key, not from the index, so whether the
+    /// field is indexed no longer bears on validity either way.
     #[test]
-    fn indexed_only_integer_auto_is_still_rejected() {
+    fn indexed_only_integer_auto_is_accepted() {
         let src = "Thing {\n  id: +uuid\n  seq: ^+u64\n}\n";
         let errors = validate_schema(&ast(src));
         assert!(
-            errors
-                .iter()
-                .any(|e| e.message.contains("conflict-visible") && !e.is_warning()),
-            "'^' is not a write-set claim and must not satisfy the rule: {errors:?}"
+            errors.is_empty(),
+            "'^' neither grants nor withholds conflict-visibility now: {errors:?}"
         );
     }
 
@@ -878,10 +797,11 @@ mod tests {
         }
     }
 
-    /// The new fatal rule and the #258 redundancy warning must not collide on the
-    /// same field. An `id`-named integer identity marked `&` is *redundant* (warn,
-    /// stay valid) — it must NOT also trip the #187 rule, and a non-identity
-    /// `&+u64` must warn about nothing at all now that `&` is load-bearing there.
+    /// The #258 redundancy warning still fires exactly where it should. An
+    /// `id`-named integer identity marked `&` is *redundant* (warn, stay valid); a
+    /// non-identity `&+u64` warns about nothing, because there `&` still buys a
+    /// real unique index — it is no longer *required* since #260, but it is not
+    /// redundant either.
     #[test]
     fn integer_auto_rule_and_redundancy_warning_do_not_collide() {
         let redundant = validate_schema(&ast("Thing {\n  id: &+u64\n  name: string\n}\n"));
