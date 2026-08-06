@@ -2,20 +2,20 @@
 //!
 //! # Why this test exists at all
 //!
-//! It is the only thing that demonstrates **decision 6** of RFC #187 — the rule
-//! that an integer auto must be the identity or carry `&unique`.
+//! It covers the **identity** integer auto specifically — the shape whose claim on
+//! the write-set is its row key (`b"r"`). `tests/sequence_claim_test.rs` is its
+//! sibling for the bare shape, which claims via `b"s"` (#260); keeping them apart
+//! means a regression in one cannot be masked by the other still passing.
 //!
 //! The counter is per-process. Two coordinated writers open the same data dir
 //! lock-free and each derive their own, so they *can* allocate the same number.
 //! Nothing prevents that, and the design deliberately does not try to. What makes
-//! it safe is that the collision is **detected**: the opaque write-set carries an
-//! id key for an identity and a unique-claim key for `&unique`, so the coordinator
-//! equality-compares, `Nack`s the loser, and the retry re-refreshes past the
-//! winner's value and allocates again.
+//! it safe is that the collision is **detected**: the opaque write-set carries a
+//! key the coordinator equality-compares, so it `Nack`s the loser and the retry
+//! re-derives past the winner's value and allocates again.
 //!
-//! An index (`^`) claims nothing in the write-set. That is the whole reason `^`
-//! alone is refused by validation, and the reason this file's assertion is
-//! "every value distinct across processes" rather than "it compiles".
+//! That is why this file's assertion is "every value distinct across processes"
+//! rather than "it compiles".
 //!
 //! # Shape
 //!

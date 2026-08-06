@@ -38,9 +38,10 @@
 mod common;
 
 /// `Ticket` is the plain integer identity. `Invoice` carries a *non-identity*
-/// `&+u64` — the shape the conflict-visible rule (#187 decision 6) forces `&` onto,
-/// and the one whose counter must be seeded by a column the ungated reopen scan
-/// does not otherwise decode. `Small` is `+u32`, for the overflow guard.
+/// `&+u64` — the shape whose counter must be seeded by a column the ungated reopen
+/// scan does not otherwise decode. (#187 decision 6 once *required* that `&`; since
+/// #260 a bare `+u64` is legal too, and `&` marks a deliberate uniqueness
+/// constraint rather than a workaround.) `Small` is `+u32`, for the overflow guard.
 const SCHEMA: &str = r#"
 Ticket {
   id: +u64
