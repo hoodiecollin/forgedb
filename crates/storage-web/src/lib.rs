@@ -242,6 +242,7 @@ mod tests {
                 relative_path: "tombstones.bin".into(),
                 bytes_per_row: 1,
             }),
+            auto_sequences: Default::default(),
         };
         m.save_to(&p("m/manifest.json")).unwrap();
         let back = Manifest::load_from(&p("m/manifest.json")).unwrap();

@@ -782,6 +782,7 @@ mod tests {
                 relative_path: "tombstones.bin".into(),
                 bytes_per_row: 1,
             }),
+            auto_sequences: Default::default(),
         };
         manifest.save_to(&dir.join("manifest.json")).unwrap();
     }
