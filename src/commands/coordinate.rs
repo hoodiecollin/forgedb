@@ -12,7 +12,8 @@
 //! ```
 //!
 //! The socket path defaults to `<root>/_coord.sock`.  Generated writers connect
-//! via `Database::connect_coordinator(socket_path)`.
+//! via `Database::connect(root, socket_path)`, which establishes the turn-channel
+//! before opening the data dir lock-free (T3-5).
 
 use std::path::PathBuf;
 
