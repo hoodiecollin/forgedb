@@ -914,23 +914,163 @@ User {
 
 #[test]
 fn test_parse_constraint_negative_number() {
-    // Test that negative numbers in constraints fail gracefully
-    // Current implementation doesn't support negative numbers in lexer
+    // #239 gap 4: `-` never entered the lexer's number path, so a signed field
+    // could carry only a non-negative bound and `@min(-273)` — the textbook
+    // lower bound — failed to lex. This test previously asserted that failure
+    // and documented it as a known limitation; it now pins the fix.
     let input = r#"
 Temperature {
-  celsius: i32 @min(-273)
   id: +uuid
+  celsius: i32 @min(-273) @max(1000)
+}
+"#;
+    let mut parser = Parser::new(input).expect("negative bounds lex");
+    let schema = parser.parse().expect("negative bounds parse");
+    let field = &schema.models[0].fields[1];
+    assert_eq!(field.constraints[0].params[0], ConstraintParam::Number(-273));
+    assert_eq!(field.constraints[1].params[0], ConstraintParam::Number(1000));
+}
+
+#[test]
+fn test_parse_bare_dash_is_still_an_error() {
+    // `-` starts a number only when a digit follows. A stray dash must keep
+    // failing loudly rather than being absorbed by the numeric path.
+    let input = r#"
+Temperature {
+  id: +uuid
+  celsius: i32 @min(-)
 }
 "#;
     let result = Parser::new(input);
+    assert!(result.is_err(), "a bare '-' is not a numeric literal");
+}
 
-    // Lexer should fail on the '-' character (not a valid token)
-    // This test documents the current limitation
-    assert!(result.is_err());
-    if let Err(e) = result {
-        // Should fail during lexing, not parsing
-        assert!(e.contains("Unexpected character") || e.contains("Expected"));
+#[test]
+fn test_parse_fractional_bound_keeps_the_verbatim_lexeme() {
+    // #239: the literal is carried as source text, not parsed to f64. `0.10` must
+    // survive as written — re-rendering it from a float would print `0.1`, and on
+    // a `decimal` field the round trip would lose exactness entirely.
+    let input = r#"
+Product {
+  id: +uuid
+  price: decimal @min(0.01) @max(99999.99)
+  ratio: f64 @min(-273.15)
+  padded: decimal @min(0.10)
+}
+"#;
+    let mut parser = Parser::new(input).expect("fractional bounds lex");
+    let schema = parser.parse().expect("fractional bounds parse");
+    let fields = &schema.models[0].fields;
+    assert_eq!(
+        fields[1].constraints[0].params[0],
+        ConstraintParam::Fractional("0.01".to_string())
+    );
+    assert_eq!(
+        fields[1].constraints[1].params[0],
+        ConstraintParam::Fractional("99999.99".to_string())
+    );
+    assert_eq!(
+        fields[2].constraints[0].params[0],
+        ConstraintParam::Fractional("-273.15".to_string())
+    );
+    assert_eq!(
+        fields[3].constraints[0].params[0],
+        ConstraintParam::Fractional("0.10".to_string()),
+        "trailing zero is preserved, not normalized away"
+    );
+}
+
+#[test]
+fn test_parse_exclusive_bound_operators() {
+    // #239: `@min(>0)` / `@max(<1)` on a continuous domain, where there is no
+    // inclusive spelling for "strictly greater than zero".
+    let input = r#"
+Rate {
+  id: +uuid
+  value: f64 @min(>0) @max(<1)
+  price: decimal @min(>0.00)
+}
+"#;
+    let mut parser = Parser::new(input).expect("exclusive bounds lex");
+    let schema = parser.parse().expect("exclusive bounds parse");
+    let fields = &schema.models[0].fields;
+    assert_eq!(
+        fields[1].constraints[0].params[0],
+        ConstraintParam::Exclusive {
+            greater: true,
+            value: Box::new(ConstraintParam::Number(0)),
+        }
+    );
+    assert_eq!(
+        fields[1].constraints[1].params[0],
+        ConstraintParam::Exclusive {
+            greater: false,
+            value: Box::new(ConstraintParam::Number(1)),
+        }
+    );
+    assert_eq!(
+        fields[2].constraints[0].params[0],
+        ConstraintParam::Exclusive {
+            greater: true,
+            value: Box::new(ConstraintParam::Fractional("0.00".to_string())),
+        }
+    );
+}
+
+#[test]
+fn test_reject_fractional_and_exclusive_bounds_on_integer_fields() {
+    // #239 decisions: on a discrete domain a fractional bound is always a
+    // confusion, and `>0` ≡ `>=1` adds a spelling without adding expressiveness.
+    // Both are errors, not warnings — a warning-only path lets the schema ship.
+    for (src, want) in [
+        ("age: u32 @min(0.5)", "cannot be fractional"),
+        ("age: u32 @min(>0)", "redundant"),
+        ("age: i64 @max(<10)", "redundant"),
+    ] {
+        let input = format!("Person {{\n  id: +uuid\n  {src}\n}}\n");
+        let err = match Parser::new(&input) {
+            Ok(mut p) => p.parse().err(),
+            Err(e) => Some(e),
+        };
+        let err = err.unwrap_or_else(|| panic!("`{src}` should be rejected"));
+        assert!(
+            err.contains(want),
+            "`{src}` should mention {want:?}, got: {err}"
+        );
     }
+}
+
+#[test]
+fn test_reject_mismatched_exclusive_operator() {
+    // `@min(<5)` is not "exclusive with the direction ignored" — it is a mistake.
+    let input = r#"
+Rate {
+  id: +uuid
+  value: f64 @min(<5)
+}
+"#;
+    let err = match Parser::new(input) {
+        Ok(mut p) => p.parse().err(),
+        Err(e) => Some(e),
+    };
+    let err = err.expect("@min(<5) should be rejected");
+    assert!(err.contains("takes '>'"), "got: {err}");
+}
+
+#[test]
+fn test_reject_unrepresentable_decimal_bound() {
+    // Codegen builds the bound with `Decimal::from_i128_with_scale`, which PANICS
+    // out of range. Rejecting it here turns a generator crash into a diagnostic.
+    let input = format!(
+        "Product {{\n  id: +uuid\n  price: decimal @min(0.{})\n}}\n",
+        "1".repeat(29)
+    );
+    let err = match Parser::new(&input) {
+        Ok(mut p) => p.parse().err(),
+        Err(e) => Some(e),
+    };
+    let err = err.expect("a 29-digit scale should be rejected");
+    assert!(err.contains("at most 28"), "got: {err}");
 }
 
 #[test]
