@@ -48,23 +48,23 @@ The sequence also refuses to wrap: a `+u32` that reaches `u32::MAX` fails the cr
 than rolling back to `0` and colliding with every id already issued.
 </Callout>
 
-<Callout type="warning" title="An integer auto must be the identity or `&unique`">
-A bare non-unique `seq: +u64` is a **fatal** validation error. Mark it `&`, or make it the
-model's identity.
-
+<Callout type="info" title="Every integer-auto shape is safe across writer processes">
 The counter lives in each writer process, so two processes coordinated through
 `forgedb coordinate` can allocate the same number. What makes that *detected* instead of
-silent is the write-set the coordinator compares — and only the identity field and a
-`&unique` field put a claim there. `^` alone is not enough: an index makes a value fast to
-find, but claims nothing at commit time, so both writers would commit and neither would
-notice.
+silent is the write-set the coordinator compares — and every shape puts a claim there: the
+identity field via its row key, a `&unique` field via its unique claim, and a bare field via
+its own sequence claim.
 
 ```forge
 Invoice {
   id: +uuid
-  number: &+u64   // non-identity integer auto — the `&` is required
+  number: +u64    // bare integer auto — claims its value, no `&` needed
 }
 ```
+
+Adding `&` is still meaningful when you want uniqueness **enforced against every row ever
+written**: that index is durable, while a sequence claim only detects collisions for as long
+as the current coordinator process has been running.
 </Callout>
 
 ## `&` — unique

@@ -282,6 +282,7 @@ list-scan-test:
 auto-increment-test:
 	cargo test --test auto_increment_test -- --ignored --nocapture
 	cargo test --test auto_increment_coordinated_test -- --ignored --nocapture
+	cargo test --test sequence_claim_test -- --ignored --nocapture
 
 .PHONY: scripts-typecheck
 
