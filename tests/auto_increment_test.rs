@@ -94,6 +94,16 @@ fn ticket(title: &str) -> Ticket {
     Ticket { id: 0, title: title.to_string() }
 }
 
+/// The persisted `Ticket.id` allocation floor, read straight off disk.
+fn manifest_floor(root: &std::path::Path) -> u64 {
+    let bytes = match std::fs::read(root.join("ticket/manifest.json")) {
+        Ok(b) => b,
+        Err(_) => return 0,
+    };
+    let m: serde_json::Value = serde_json::from_slice(&bytes).expect("parse manifest");
+    m["auto_sequences"]["id"].as_u64().unwrap_or(0)
+}
+
 fn main() {
     let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir"));
 
@@ -192,6 +202,79 @@ fn main() {
         // silently when the counter is not carried across `compact()`'s reset.
         let mut db = Database::open_at(root);
         eq("compaction + restart does not re-issue", db.create_ticket(ticket("after")).unwrap(), highest + 2);
+    }
+
+    // ---- 4b. Compaction refuses to run if the floor cannot be persisted -----
+    // Scenario 4 proves the floor is right once `compact()` has *returned*, which
+    // a re-persist placed AFTER the destructive rewrite satisfies just as well.
+    // This one pins the ordering, and it is the assertion scenario 4 cannot make.
+    //
+    // The floor reaches disk at open and at compaction, and nowhere between — so
+    // between them it holds the counter as of process *open*. Every value allocated
+    // since exists only in memory and in the rows themselves, and
+    // `compact_model_keeping` is about to delete those rows. Persist only after
+    // that rewrite and a crash in the window leaves a reopen scanning a LOWER
+    // maximum and re-issuing the difference: exactly what the floor exists to
+    // prevent, in the one case a rescan cannot recover from.
+    //
+    // Making that window observable needs the manifest write to fail while the
+    // column rewrite still succeeds, so the two orderings diverge in the final
+    // state. Replacing `manifest.json` with a *directory* does it precisely:
+    // `save_to`'s temp-file rename cannot land on a directory, and the compactor
+    // never touches the manifest at all (it rewrites `fixed/`, `variable/` and
+    // `tombstones.bin`). So:
+    //
+    //   floor first → the write fails → compaction ABORTS → rows survive → the
+    //     ungated reopen scan still sees 15 → the next id is 16.
+    //   rewrite first → rows are destroyed → the re-persist then fails with
+    //     nothing left to fall back on → the reopen scan sees 5 → 6..=15 are
+    //     handed out a second time.
+    //
+    // Deliberately two processes: a single fresh one opens at floor 0, where the
+    // gap is easy to misread as "nothing written yet." Opening onto existing rows
+    // starts the floor at 5 while 15 have been issued, which is unambiguous.
+    #[cfg(unix)]
+    {
+        let root = dir.join("prefloor");
+        {
+            let mut db = Database::open_at(root.clone());
+            for i in 0..5 { db.create_ticket(ticket(&format!("seed{i}"))).unwrap(); }
+            db.commit().unwrap();
+        }
+
+        let mut db = Database::open_at(root.clone());
+        // Opening is what stamps the floor: the scan seeds the counter and the
+        // constructor persists it. Nothing between now and compaction writes it
+        // again, which is precisely why the window below exists.
+        eq("reopen persists the scanned maximum as the floor", manifest_floor(&root), 5u64);
+        let mut highest = 0u64;
+        let mut doomed = Vec::new();
+        for i in 0..10 {
+            let id = db.create_ticket(ticket(&format!("doomed{i}"))).unwrap();
+            highest = highest.max(id);
+            doomed.push(id);
+        }
+        // Delete every row allocated this run so compaction reclaims all of them:
+        // afterwards nothing on disk would mention 6..=15.
+        for id in &doomed { db.delete_ticket(*id).unwrap(); }
+        db.commit().unwrap();
+
+        // Jam the manifest write, and leave it jammed across the reopen — the
+        // point is that there is no persisted floor to rescue a lost scan.
+        let manifest = root.join("ticket/manifest.json");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+
+        db.compact();
+        db.commit().unwrap();
+        drop(db);
+
+        let mut db = Database::open_at(root);
+        eq(
+            "compaction that cannot persist the floor first re-issues nothing",
+            db.create_ticket(ticket("after")).unwrap(),
+            highest + 1,
+        );
     }
 
     // ---- 5. An explicitly supplied value advances the counter ---------------

@@ -7861,6 +7861,33 @@ Link {
     );
 }
 
+/// Slice out a function body by its signature prefix, brace-balanced.
+///
+/// Unlike [`extract_struct`], a method body nests braces freely, so stopping at
+/// the first `}` would cut it off inside the first block and quietly make any
+/// ordering assertion vacuous.
+fn extract_fn<'a>(code: &'a str, sig: &str) -> &'a str {
+    let start = code
+        .find(sig)
+        .unwrap_or_else(|| panic!("`{sig}` not found in generated code"));
+    let rest = &code[start..];
+    let open = rest.find('{').expect("function has no body");
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function body for `{sig}`");
+}
+
 /// Slice out a struct body by its declaration line, for the assertions above.
 fn extract_struct<'a>(code: &'a str, decl: &str) -> &'a str {
     let start = code
@@ -8020,6 +8047,52 @@ Ticket {
     assert!(
         storage.contains("__autoseq_id"),
         "the writer is where the counter lives (#187):\n{storage}"
+    );
+}
+
+/// The floor must reach disk **before** the destructive rewrite, not only after.
+///
+/// `compact_model_keeping` physically drops the dead rows, and for every value
+/// allocated since process open those rows are the only remaining record that the
+/// value was issued (the manifest is written at open and at compaction, never in
+/// between). Persist only afterwards and a crash in that window leaves the reopen
+/// scan deriving a lower maximum and re-issuing the difference — the one case a
+/// rescan cannot recover from, which is the entire reason the floor exists.
+///
+/// `tests/auto_increment_test.rs` proves the behaviour by running it; this pins
+/// the *ordering* in the emitted source, because the two orderings produce an
+/// identical final state on the success path and diverge only across a crash.
+#[test]
+fn test_rust_generation_autoseq_floor_persists_before_compaction() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let compact = extract_fn(&code, "pub fn compact");
+    let write = compact
+        .find("write_manifest")
+        .expect("compact() must persist the floor");
+    let destroy = compact
+        .find("compact_model_keeping")
+        .expect("compact() must call the byte GC");
+    assert!(
+        write < destroy,
+        "the auto-increment floor must be persisted BEFORE compact_model_keeping \
+         destroys the rows that are its only other evidence (#187):\n{compact}"
+    );
+    // And the failure is a refusal, not a warning: compaction is always safe to
+    // retry later, whereas re-issuing an id escapes through the replication log,
+    // backups, and any URL holding the value.
+    assert!(
+        compact[..destroy].contains("return;"),
+        "a floor that cannot be persisted must ABORT the compaction, not proceed \
+         (#187):\n{compact}"
     );
 }
 
