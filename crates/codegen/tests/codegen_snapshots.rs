@@ -2655,6 +2655,157 @@ Post {
 }
 
 #[test]
+fn test_rust_generation_numeric_bounds_per_domain() {
+    // #239: `@min`/`@max` compare in a domain that represents both the value and
+    // the bound exactly. Three defects motivated this, all in one code path:
+    //
+    //  1. `decimal` was absent from `is_numeric_type`, and because both arms are
+    //     gated on that predicate a bound on the exact-money type emitted NO check
+    //     — parsed, carried through the AST, silently enforcing nothing.
+    //  2. The compare ran through `(*__v as f64)`, which `decimal` cannot even do
+    //     (it is a struct, not a primitive) — so (1) could not be fixed by adding a
+    //     match arm alone.
+    //  3. That same f64 cast rounds a 64-bit integer past the 53-bit mantissa, so
+    //     `qty: u64 @min(9007199254740993)` ACCEPTED 9007199254740992 — a value
+    //     below the declared minimum.
+    let src = r#"
+Product {
+  id: +uuid
+  price: decimal @min(1) @max(1000000)
+  discount: ?decimal @min(0)
+  qty: u64 @min(9007199254740993)
+  ratio: f64 @max(1)
+  age: ?i32 @min(0)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat = code.replace([' ', '\n'], "");
+
+    // (1) + (2): decimal bounds are enforced, compared as Decimal — never via f64.
+    assert!(
+        flat.contains("(*__v)<rust_decimal::Decimal::from(1i64)"),
+        "decimal @min compares in the decimal domain"
+    );
+    assert!(
+        flat.contains("(*__v)>rust_decimal::Decimal::from(1000000i64)"),
+        "decimal @max compares in the decimal domain"
+    );
+    // A nullable decimal must get the same treatment, inside its `Some` guard.
+    assert!(
+        flat.contains("(*__v)<rust_decimal::Decimal::from(0i64)"),
+        "nullable decimal @min is enforced too"
+    );
+
+    // (3): integer bounds promote to i128, which holds all of u64/i64 losslessly.
+    assert!(
+        flat.contains("(*__vasi128)<(9007199254740993i64asi128)"),
+        "u64 @min compares as i128, not f64"
+    );
+    assert!(
+        flat.contains("(*__vasi128)<(0i64asi128)"),
+        "nullable i32 @min compares as i128"
+    );
+
+    // f64 fields keep the float compare — their own domain IS binary float, so
+    // there is nothing more exact to promote to.
+    assert!(
+        flat.contains("(*__vasf64)>(1i64asf64)"),
+        "f64 @max stays in the f64 domain"
+    );
+
+    // The lossy form must be gone for every non-f64 numeric field. `ratio` is the
+    // only field allowed to produce an `as f64` compare.
+    assert_eq!(
+        flat.matches("(*__vasf64)").count(),
+        1,
+        "only the f64 field compares through f64"
+    );
+
+    // All four bounded fields actually emit a rule, i.e. none silently vanished.
+    for field in ["price", "discount", "qty", "ratio", "age"] {
+        assert!(
+            code.contains(&format!("field: \"{field}\"")),
+            "{field} emits a constraint check"
+        );
+    }
+}
+
+#[test]
+fn test_rust_generation_fractional_and_exclusive_bounds() {
+    // #239 gaps 1, 2 and 4: fractional bounds, exclusive bounds, and negative
+    // bounds. The load-bearing assertion is the `decimal` one — the literal is
+    // reconstructed as mantissa+scale, so `0.01` is the exact Decimal 1e-2 and
+    // never passes through a binary float, which is the entire reason the lexeme
+    // is carried from the lexer instead of being parsed to f64 there.
+    let src = r#"
+Product {
+  id: +uuid
+  price: decimal @min(0.01) @max(99999.99)
+  fee: decimal @min(>0.00)
+  rate: f64 @min(>0) @max(<1)
+  temp: f64 @min(-273.15)
+  celsius: i32 @min(-273)
+  opt: ?decimal @min(0.05)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat = code.replace([' ', '\n'], "");
+
+    // Exact decimal reconstruction: 0.01 → 1e-2, 99999.99 → 9999999e-2.
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(1i128,2u32)"),
+        "0.01 is built exactly as mantissa 1, scale 2"
+    );
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(9999999i128,2u32)"),
+        "99999.99 is built exactly"
+    );
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(5i128,2u32)"),
+        "a nullable decimal bound is built exactly too"
+    );
+    // No decimal bound may be routed through a float literal.
+    assert!(
+        !flat.contains("Decimal::from_str") && !flat.contains("0.01f64"),
+        "a decimal bound never passes through a parse or an f64 literal"
+    );
+
+    // Exclusive bounds flip the rejecting comparison: `@min(>n)` rejects `v <= n`.
+    assert!(
+        flat.contains("(*__v)<=rust_decimal::Decimal::from_i128_with_scale(0i128,2u32)"),
+        "@min(>0.00) rejects values <= the bound"
+    );
+    assert!(
+        flat.contains("(*__vasf64)<=(0i64asf64)"),
+        "@min(>0) is exclusive"
+    );
+    assert!(
+        flat.contains("(*__vasf64)>=(1i64asf64)"),
+        "@max(<1) is exclusive"
+    );
+
+    // A fractional f64 bound rounds only into the field's own domain.
+    assert!(flat.contains("(*__vasf64)<-273.15f64"), "f64 fractional bound");
+
+    // Negative bounds (gap 4) reach codegen at all.
+    assert!(
+        flat.contains("(*__vasi128)<(-273i64asi128)"),
+        "negative integer bound"
+    );
+
+    // Messages quote the author's own spelling, including exclusivity and the
+    // trailing zero, rather than a re-rendered float.
+    assert!(code.contains(r#""must be >= 0.01""#), "inclusive message");
+    assert!(code.contains(r#""must be > 0.00""#), "exclusive message");
+    assert!(code.contains(r#""must be < 1""#), "exclusive max message");
+    assert!(code.contains(r#""must be >= -273.15""#), "negative message");
+}
+
+#[test]
 fn test_rust_generation_delete_restrict() {
     // Delete semantics — restrict (the default): deleting a parent with live
     // children is refused via ReferencedByChildren (409).  Absent @on_delete

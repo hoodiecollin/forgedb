@@ -218,8 +218,8 @@ Order {
 
 | Directive              | Arguments       | Field Types         | Meaning                                  | Example                      |
 |------------------------|-----------------|---------------------|------------------------------------------|------------------------------|
-| `@min`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Minimum value — **ENFORCED** (violation → 422)     | `age: u32 @min(13)` |
-| `@max`                 | `(number)`      | Numeric (u32/u64/i32/i64/f64) | Maximum value — **ENFORCED** (violation → 422). *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)` |
+| `@min`                 | `(n)` or `(>n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Minimum value — **ENFORCED** (violation → 422). `>n` is an exclusive bound (continuous types only). | `age: u32 @min(13)`, `rate: f64 @min(>0)` |
+| `@max`                 | `(n)` or `(<n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Maximum value — **ENFORCED** (violation → 422). `<n` is exclusive. *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)`, `rate: f64 @max(<1)` |
 | `@length`              | `(min: n)`, `(max: n)`, `(min: a, max: b)`, `(a, b)`, or `(n)` | `string` | String length in **characters** — **ENFORCED** (violation → 422). See the table below — single-arg `@length(n)` means **exactly** n. | `name: string @length(min: 1, max: 100)` |
 | `@email`               | (none)          | `string`            | Email format — **ENFORCED** (violation → 422)      | `email: string @email` |
 | `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
@@ -681,7 +681,7 @@ The rules in this reference are grounded in the parser and validator source:
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
 3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
-5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
+5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable

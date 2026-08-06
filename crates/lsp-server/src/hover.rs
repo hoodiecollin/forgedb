@@ -130,8 +130,8 @@ fn get_directive_info(directive_name: &str) -> Option<String> {
     let s = match directive_name {
         "email" => "**@email** — Email validation\n\n```\nemail: &string @email\n```",
         "url" => "**@url** — URL validation\n\n```\nwebsite: string? @url\n```",
-        "min" => "**@min(value)** — Minimum value or length\n\n```\nage: u32 @min(0)\n```",
-        "max" => "**@max(value)** — Maximum value or length\n\n```\nage: u32 @max(150)\n```",
+        "min" => "**@min(n)** — Minimum numeric value (ENFORCED)\n\nRejects smaller values at runtime (422). Applies to `u32`/`u64`/`i32`/`i64`/`f64`/`decimal` — *not* a string length, use `@length`.\n\n- `@min(n)` — at least n (inclusive)\n- `@min(>n)` — strictly greater than n (`f64`/`decimal` only)\n\nBounds may be negative and fractional. Each field type compares in its own domain, so a `decimal` bound stays exact.\n\n```\nage: u32 @min(13)\nprice: decimal @min(0.01)\nrate: f64 @min(>0)\n```",
+        "max" => "**@max(n)** — Maximum numeric value (ENFORCED)\n\nRejects larger values at runtime (422). Applies to `u32`/`u64`/`i32`/`i64`/`f64`/`decimal` — *not* a string length, use `@length`.\n\n- `@max(n)` — at most n (inclusive)\n- `@max(<n)` — strictly less than n (`f64`/`decimal` only)\n\nBounds may be negative and fractional. Each field type compares in its own domain, so a `decimal` bound stays exact.\n\n```\nage: u32 @max(150)\nprice: decimal @max(99999.99)\nrate: f64 @max(<1)\n```",
         "pattern" | "regex" => "**@pattern(\"…\")** — Regex validation (ENFORCED)\n\nRejects non-matching values at runtime (422). `@regex` is an alias.\n\n```\nphone: string @pattern(\"^\\\\+?[1-9]\\\\d{1,14}$\")\n```",
         "length" => "**@length(…)** — String length in characters (ENFORCED)\n\nRejects out-of-range values at runtime (422).\n\n- `@length(min: n)` — at least n\n- `@length(max: n)` — at most n\n- `@length(min: a, max: b)` / `@length(a, b)` — between a and b\n- `@length(n)` — **exactly** n\n\n```\nslug: string @length(min: 3, max: 64)\nzipcode: string @length(5)\n```",
         "index" => "**@index(a, b, …)** — Composite index (model level)\n\n```\n@index(user, created_at)\n```",

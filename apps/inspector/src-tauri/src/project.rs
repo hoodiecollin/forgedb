@@ -320,8 +320,14 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
 fn render_param(p: &ConstraintParam) -> String {
     match p {
         ConstraintParam::Number(n) => n.to_string(),
+        // The verbatim lexeme (#239), so `@min(0.10)` displays as written rather
+        // than re-rendered from a float as `0.1`.
+        ConstraintParam::Fractional(s) => s.clone(),
         ConstraintParam::String(s) => s.clone(),
         ConstraintParam::Named { name, value } => format!("{name}: {}", render_param(value)),
+        ConstraintParam::Exclusive { greater, value } => {
+            format!("{}{}", if *greater { '>' } else { '<' }, render_param(value))
+        }
     }
 }
 

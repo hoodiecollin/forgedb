@@ -27,8 +27,8 @@ The generated code checks these and rejects a bad write.
 
 | Directive | Args | Applies to | Effect |
 |-----------|------|-----------|--------|
-| `@min` | `(number)` | numeric | Value must be ≥ the minimum, else **422** |
-| `@max` | `(number)` | numeric | Value must be ≤ the maximum, else **422**. *Not* a string-length check — use `@length` for strings |
+| `@min` | `(n)` or `(>n)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≥ the minimum, else **422**. `>n` makes it exclusive |
+| `@max` | `(n)` or `(<n)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≤ the maximum, else **422**. `<n` makes it exclusive. *Not* a string-length check — use `@length` for strings |
 | `@length` | `(count)` or `(min, max)` | `string` | String length must be in range, else **422** |
 | `@email` | none | `string` | Must be a valid email, else **422** |
 | `@url` | none | `string` | Must be a valid URL, else **422** |
@@ -40,6 +40,26 @@ The generated code checks these and rejects a bad write.
 The generated `validate_<model>` enforces these at the top of `insert`/`update`; a
 violation is a field-constraint error (HTTP **422**). A nullable field is validated only
 when `Some`.
+
+Each numeric bound is compared in its field's own domain, so a `decimal` bound stays
+exact and a 64-bit integer bound never rounds. A bound written as `0.01` on a `decimal`
+field is the exact value one cent — it never round-trips through a binary float.
+
+Bounds may be negative (`@min(-273)`) and fractional (`@min(0.01)`).
+
+```forge
+Product {
+  price: decimal @min(0.01)      // at least one cent, exactly
+  rate: f64 @min(>0) @max(<1)    // strictly between zero and one
+  celsius: i32 @min(-273)
+}
+```
+
+The exclusive forms `>n` and `<n` apply to **continuous** types only (`f64`,
+`decimal`). On an integer field `>0` and `>=1` are the same set, so the operator adds
+a spelling without adding meaning and is rejected — write the inclusive bound instead.
+A fractional bound on an integer field is likewise an error rather than a silent
+truncation.
 
 ```forge
 User {

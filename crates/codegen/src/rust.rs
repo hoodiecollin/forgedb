@@ -24,6 +24,45 @@ thread_local! {
 /// Rust code generator
 pub struct RustGenerator;
 
+/// A `@min`/`@max` bound literal as written in the schema (#239).
+///
+/// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
+/// happens against the known field type: exact for `decimal`, correctly rounded
+/// for `f64`. Parsing to a float earlier would round before anything knew which
+/// of those two applied.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BoundLiteral {
+    Int(i64),
+    Frac(String),
+}
+
+impl BoundLiteral {
+    /// The bound as it should read in a violation message — the author's own
+    /// spelling, so `must be >= 0.01` rather than a re-rendered float.
+    fn render(&self) -> String {
+        match self {
+            BoundLiteral::Int(n) => n.to_string(),
+            BoundLiteral::Frac(s) => s.clone(),
+        }
+    }
+
+    /// Split a numeric lexeme into `(mantissa, scale)` so it can be emitted as an
+    /// exact `Decimal`: `-2.50` → `(-250, 2)`, `7` → `(7, 0)`.
+    ///
+    /// `None` if the digits do not fit an `i128`. Whether the result is
+    /// representable as a `Decimal` (≤ 28 fractional digits, 96-bit mantissa) is
+    /// checked in validation, so a schema that reaches codegen is already sound.
+    pub(crate) fn decimal_parts(lexeme: &str) -> Option<(i128, u32)> {
+        let (int_part, frac_part) = lexeme.split_once('.').unwrap_or((lexeme, ""));
+        // A lone `-` sign must not survive concatenation as `-` + digits alone.
+        let digits = format!("{int_part}{frac_part}");
+        digits
+            .parse::<i128>()
+            .ok()
+            .map(|m| (m, frac_part.len() as u32))
+    }
+}
+
 /// On-delete referential-integrity policy for a relation FK field (delete
 /// semantics).  Declared via `@on_delete(...)`; `Restrict` is the default when
 /// the directive is absent.
@@ -1910,6 +1949,13 @@ impl RustGenerator {
     }
 
     /// Whether a field type is (or wraps) a numeric scalar `@min`/`@max` can bound.
+    ///
+    /// `Decimal` is included (#239): it is the exact-money type, which makes it the
+    /// type most likely to carry a bound and the one where dropping that bound costs
+    /// the most.  It was previously absent, and because both `@min`/`@max` arms are
+    /// gated on this predicate a bound on a `decimal` field parsed, was carried
+    /// through the AST, and then emitted **no check at all** — a silent no-op with
+    /// no error and no warning.
     fn is_numeric_type(field_type: &forgedb_parser::FieldType) -> bool {
         use forgedb_parser::FieldType;
         match field_type {
@@ -1917,9 +1963,99 @@ impl RustGenerator {
             | FieldType::U64
             | FieldType::I32
             | FieldType::I64
-            | FieldType::F64 => true,
+            | FieldType::F64
+            | FieldType::Decimal => true,
             FieldType::Nullable(inner) => Self::is_numeric_type(inner),
             _ => false,
+        }
+    }
+
+    /// A `@min`/`@max` bound as written: the literal, plus whether it is exclusive.
+    ///
+    /// `None` when the constraint carries no usable bound. Validation has already
+    /// rejected the shapes that are errors (a fractional or exclusive bound on an
+    /// integer field, a mismatched operator), so by the time codegen runs, anything
+    /// present here is meant to be emitted.
+    fn constraint_bound(c: &forgedb_parser::ast::Constraint) -> Option<(BoundLiteral, bool)> {
+        use forgedb_parser::ast::ConstraintParam as P;
+        fn literal(p: &P) -> Option<BoundLiteral> {
+            match p {
+                P::Number(n) => Some(BoundLiteral::Int(*n)),
+                P::Fractional(s) => Some(BoundLiteral::Frac(s.clone())),
+                _ => None,
+            }
+        }
+        c.params.iter().find_map(|p| match p {
+            P::Exclusive { value, .. } => literal(value).map(|l| (l, true)),
+            other => literal(other).map(|l| (l, false)),
+        })
+    }
+
+    /// The `(lhs, rhs)` operands for a `@min`/`@max` comparison, in a domain that
+    /// can represent both the field's value and the bound exactly (#239).
+    ///
+    /// The bound literal is an `i64`; the field is not.  The original form compared
+    /// `(*__v as f64) < #n as f64`, which is lossy in two ways that matter:
+    ///
+    /// - **`decimal`** cannot cast to `f64` at all (it is a struct, not a primitive),
+    ///   and routing an exact fixed-point value through a binary float would defeat
+    ///   the entire point of the type.  It compares against `Decimal::from(i64)`,
+    ///   which is exact for every bound the grammar can express.
+    /// - **64-bit integers** beyond f64's 53-bit mantissa round *before* the compare,
+    ///   so a `u64`/`i64` bound near the top of the range could admit a value that
+    ///   violates it.  `i128` holds all of `u64` and `i64` losslessly, so the compare
+    ///   is exact for every integer field.
+    ///
+    /// `f64` fields keep the float compare — the field's own domain *is* binary
+    /// float, so there is nothing more exact to promote to.
+    ///
+    /// Returns `None` for a non-numeric type; callers are already gated on
+    /// [`Self::is_numeric_type`], so `None` means the two have drifted apart.
+    fn numeric_bound_operands(
+        field_type: &forgedb_parser::FieldType,
+        bound: &BoundLiteral,
+    ) -> Option<(TokenStream, TokenStream)> {
+        use forgedb_parser::FieldType;
+        match (field_type, bound) {
+            (
+                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64,
+                BoundLiteral::Int(n),
+            ) => Some((quote! { (*__v as i128) }, quote! { (#n as i128) })),
+            (FieldType::F64, BoundLiteral::Int(n)) => {
+                Some((quote! { (*__v as f64) }, quote! { (#n as f64) }))
+            }
+            // `#n` interpolates as an `i64`-suffixed literal, so this resolves to
+            // `From<i64> for Decimal` with no annotation and no cast.
+            (FieldType::Decimal, BoundLiteral::Int(n)) => Some((
+                quote! { (*__v) },
+                quote! { rust_decimal::Decimal::from(#n) },
+            )),
+            // A fractional bound on an `f64` field rounds into the field's own
+            // domain, which is inherent rather than lossy — there is nothing more
+            // exact for an `f64` to be compared against.
+            (FieldType::F64, BoundLiteral::Frac(lex)) => {
+                let v: f64 = lex.parse().ok()?;
+                let lit = proc_macro2::Literal::f64_suffixed(v);
+                Some((quote! { (*__v as f64) }, quote! { #lit }))
+            }
+            // The exact case, and the reason the lexeme is carried this far: the
+            // literal is reconstructed as mantissa + scale, so `0.01` is the
+            // Decimal `1e-2` and never passes through a binary float.
+            (FieldType::Decimal, BoundLiteral::Frac(lex)) => {
+                let (mantissa, scale) = BoundLiteral::decimal_parts(lex)?;
+                Some((
+                    quote! { (*__v) },
+                    quote! { rust_decimal::Decimal::from_i128_with_scale(#mantissa, #scale) },
+                ))
+            }
+            // A fractional bound on an integer field is a validation error, so it
+            // never reaches here; refusing it again keeps the drift guard honest.
+            (
+                FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64,
+                BoundLiteral::Frac(_),
+            ) => None,
+            (FieldType::Nullable(inner), _) => Self::numeric_bound_operands(inner, bound),
+            _ => None,
         }
     }
 
@@ -1983,26 +2119,34 @@ impl RustGenerator {
                 let mut checks: Vec<TokenStream> = Vec::new();
                 for c in &field.constraints {
                     match c.name.as_str() {
-                        "min" if is_numeric => {
-                            if let Some(&n) = Self::constraint_numbers(c).first() {
-                                let msg = format!("must be >= {n}");
+                        // `@min(n)` rejects `v < n`; the exclusive `@min(>n)` rejects
+                        // `v <= n`. `@max` mirrors it (#239).
+                        "min" | "max" if is_numeric => {
+                            if let Some((bound, exclusive)) = Self::constraint_bound(c)
+                                && let Some((lhs, rhs)) =
+                                    Self::numeric_bound_operands(&field.field_type, &bound)
+                            {
+                                let is_min = c.name == "min";
+                                let cmp = match (is_min, exclusive) {
+                                    (true, false) => quote! { < },
+                                    (true, true) => quote! { <= },
+                                    (false, false) => quote! { > },
+                                    (false, true) => quote! { >= },
+                                };
+                                // The message states the *satisfying* relation, so
+                                // it is the mirror of the rejecting comparison.
+                                let rel = match (is_min, exclusive) {
+                                    (true, false) => ">=",
+                                    (true, true) => ">",
+                                    (false, false) => "<=",
+                                    (false, true) => "<",
+                                };
+                                let rule = if is_min { "min" } else { "max" };
+                                let msg = format!("must be {rel} {}", bound.render());
                                 checks.push(quote! {
-                                    if (*__v as f64) < #n as f64 {
+                                    if #lhs #cmp #rhs {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "min",
-                                            message: #msg.to_string(),
-                                        });
-                                    }
-                                });
-                            }
-                        }
-                        "max" if is_numeric => {
-                            if let Some(&n) = Self::constraint_numbers(c).first() {
-                                let msg = format!("must be <= {n}");
-                                checks.push(quote! {
-                                    if (*__v as f64) > #n as f64 {
-                                        return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "max",
+                                            field: #fname_str, rule: #rule,
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -10910,6 +11054,82 @@ mod tests {
                  supports_range_queries() claims {claimed}"
             );
         }
+    }
+
+    /// `is_numeric_type` gates whether a `@min`/`@max` arm runs at all;
+    /// `numeric_bound_operands` decides what that arm compares. If the first says
+    /// yes and the second says `None`, the directive silently emits no check — which
+    /// is exactly the `decimal` defect of #239, where a bound on the exact-money type
+    /// parsed, was carried, and enforced nothing.
+    ///
+    /// Adding a numeric type to one list and not the other reintroduces it, so they
+    /// are asserted equal rather than each being spot-checked.
+    #[test]
+    fn numeric_bound_operands_cover_every_numeric_type() {
+        let types = [
+            FieldType::U32,
+            FieldType::U64,
+            FieldType::I32,
+            FieldType::I64,
+            FieldType::F64,
+            FieldType::Decimal,
+            FieldType::Timestamp,
+            FieldType::String,
+            FieldType::Bool,
+            FieldType::Uuid,
+            FieldType::Json,
+            FieldType::Bytes(8),
+            FieldType::Enum("Status".to_string()),
+        ];
+        for ty in types {
+            let gated = RustGenerator::is_numeric_type(&ty);
+            let comparable =
+                RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(1)).is_some();
+            assert_eq!(
+                gated, comparable,
+                "{ty:?}: is_numeric_type says {gated}, but numeric_bound_operands \
+                 says {comparable} — a `true`/`None` pair emits no check at all"
+            );
+        }
+    }
+
+    /// A bound on a nullable numeric field must still compare in the inner type's
+    /// domain. `@min` on `decimal?` that fell through to the `_ => None` arm would
+    /// be the #239 silent no-op again, restricted to optional fields.
+    #[test]
+    fn nullable_numeric_fields_still_get_bound_operands() {
+        for inner in [FieldType::U64, FieldType::F64, FieldType::Decimal] {
+            let ty = FieldType::Nullable(Box::new(inner.clone()));
+            assert!(
+                RustGenerator::is_numeric_type(&ty),
+                "nullable {inner:?} is numeric"
+            );
+            assert!(
+                RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(1)).is_some(),
+                "nullable {inner:?} must compare in the inner domain"
+            );
+        }
+    }
+
+    /// The three comparison domains are distinct on purpose (#239): `decimal` cannot
+    /// cast to `f64` at all, and a 64-bit integer bound rounds if it goes through
+    /// one. Pinning the emitted operands keeps a future "simplify" from collapsing
+    /// them back to a single lossy `as f64`.
+    #[test]
+    fn each_numeric_domain_compares_without_a_lossy_cast() {
+        let rhs = |ty: FieldType| {
+            RustGenerator::numeric_bound_operands(&ty, &BoundLiteral::Int(7))
+                .unwrap()
+                .1
+                .to_string()
+                .replace(' ', "")
+        };
+        assert_eq!(rhs(FieldType::U64), "(7i64asi128)");
+        assert_eq!(rhs(FieldType::I64), "(7i64asi128)");
+        assert_eq!(rhs(FieldType::F64), "(7i64asf64)");
+        // The `i64` suffix is load-bearing, not incidental: `Decimal::from` is
+        // generic, and a bare `7` would be an ambiguous-integer inference error.
+        assert_eq!(rhs(FieldType::Decimal), "rust_decimal::Decimal::from(7i64)");
     }
 
     /// Nullability is decided by `ordered_key_type` alone — `supports_range_queries`
