@@ -254,12 +254,23 @@ no shared allocator and no coordinator-side sequence. A counter is seeded at ope
 
 Across processes the design does **not** prevent two coordinated writers deriving the same next
 value; it relies on the collision being *detected*. Detection runs entirely off the opaque
-write-set the coordinator equality-compares, and exactly two shapes put a field in it: being the
-model's identity (a row key) or carrying `&unique` (a unique-claim key). Either turns a duplicate
-into a `Nack`, and the retry re-derives past the winner. `^` makes a value fast to *find* but
-claims nothing at commit time — so an integer auto that is neither the identity nor unique is a
-**fatal schema error**, refused at parse rather than warned about, because the failure it prevents
-is a silent duplicate in committed data.
+write-set the coordinator equality-compares, via three key classes — `b"r"` for the model's
+identity, `b"u"` for a `&unique` field, and `b"s"` for an integer auto that is neither (#260).
+Any of them turns a duplicate into a `Nack`. `^` contributes nothing: an index makes a value fast
+to *find* but claims nothing at commit time — which is now immaterial, since the sequence claim
+covers the bare shape regardless of whether it is indexed.
+
+A `Nack`ed sequence claim triggers a `__peer_refresh` before the retry. This is not an
+optimization but a **termination** requirement: the retry re-runs the prepare closure, which
+allocates the *next* value, so a writer N values behind a peer would need N attempts and exhaust
+a bounded retry budget. It cannot rely on the ordinary peer-refresh gate, because a client's
+view of the coordinator LSN advances only on its own `Ack` — a `Nack` never trips it. Nor can it
+read the winning value out of the returned key: the coordinator hands back the key that
+*collided*, which is the one **we** sent, carrying our own proposal. Re-reading the shared
+columns is what actually re-derives the counter past every committed value.
+
+`&unique` remains the stronger marking where uniqueness must hold against all history: its index
+is durable, while the coordinator's conflict map is rebuilt empty on restart.
 
 Identity-wise, `Manifest.auto_sequences` is **inert substrate**: the two `Manifest` backends store
 and return the map and never parse a key or branch on a value. Which fields appear, what the
@@ -283,7 +294,8 @@ a guard test, not only by a doc comment.
 - **Per-process auto-increment counters made conflict-visible, over a shared allocator.** A
   coordinator-side sequence would put a schema-shaped concern inside schema-agnostic substrate;
   instead each process allocates locally and the *collision* is detected through the opaque
-  write-set. The cost is that only conflict-visible shapes (identity or `&unique`) are allowed.
+  write-set. The cost is one extra opaque key per insert per bare auto field, and a conflict map
+  that grows with committed keys.
 - **Substrate / compiler-internals split.** Generated code links only schema-agnostic crates;
   the compiler crates stay off the runtime path, which is what makes the generator identity
   verifiable.

@@ -176,12 +176,14 @@ Order {
   - **Integer autos are monotonic and unique, not contiguous.** A rolled-back transaction, or an
     attempt the commit coordinator rejects, burns its number — the same contract Postgres and
     MySQL offer. Do not rely on the sequence being gapless.
-  - **An integer auto must be the model's identity or carry `&`** — a bare non-unique `seq: +u64`
-    is a **fatal** validation error. The counter is per-process, so two writers coordinated
-    through `forgedb coordinate` can allocate the same number; what makes that *detected* rather
-    than silent is the write-set the coordinator compares, and only the identity and `&unique`
-    put a field there. `^` is not sufficient — an index makes a value fast to find but claims
-    nothing at commit time.
+  - **Any integer-auto shape is valid** — the identity, `&unique`, `^`, or a bare
+    `seq: +u64`. The counter is per-process, so two writers coordinated through
+    `forgedb coordinate` can allocate the same number; what makes that *detected* rather than
+    silent is the write-set the coordinator compares, and every shape puts a claim there — the
+    identity via its row key, `&unique` via its unique claim, and a bare field via its own
+    sequence claim (#260). Marking it `&` is still worth considering when you want uniqueness
+    *enforced* against all history: that index is durable, whereas a sequence claim is only as
+    old as the running coordinator.
 - `&` (unique) can be applied to any field (no type restriction in parser)
 - **`&`/`^` on the model's identity field warns** (#258). The identity is already
   unique — the generated `id_to_row` is a map keyed by it — so the modifier has no

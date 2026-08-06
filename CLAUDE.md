@@ -261,11 +261,10 @@ must also have an **identity field** — named `id`, or any `+` auto-generate fi
 likewise fatal (#248); convention is `id: +uuid`.
 Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — all four
 are synthesized on create; integer `+u32`/`+u64` allocate from a per-field counter seeded by an
-ungated reopen scan and floored by `Manifest.auto_sequences`, #187. An integer auto must be the
-model's **identity** or carry `&unique` — a bare non-unique one is **fatal at parse**, because
-only those two shapes enter the opaque write-set and make a cross-process double-allocation a
-detected conflict; lifting that is #260. `0` is the allocate sentinel, so it cannot be inserted
-explicitly), `&`
+ungated reopen scan and floored by `Manifest.auto_sequences`, #187. Every shape is valid — a
+cross-process double-allocation is a detected conflict via one of three opaque write-set key
+classes: `b"r"` (identity), `b"u"` (`&unique`), `b"s"` (a bare integer auto, #260). `0` is the
+allocate sentinel, so it cannot be inserted explicitly), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
 FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `bytes(N)` (raw fixed-size bytes,
 NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
