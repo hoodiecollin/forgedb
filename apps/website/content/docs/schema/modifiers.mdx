@@ -76,9 +76,26 @@ Any combination of `+`, `&`, `^` is allowed, in any order, all before the type �
 subject to the rule that `+` is valid only on `u32`/`u64`/`uuid`/`timestamp`:
 
 ```forge
-id: +&^uuid               // auto-gen + unique + indexed (auto-gen needs an eligible type)
+ref_id: &+uuid            // auto-generated, and unique across rows
+seen_at: ^+timestamp      // auto-generated, and indexed
 email: ^&string @email    // indexed + unique
 ```
+
+<Callout type="warning" title="`&`/`^` on the identity field does nothing">
+Your model's **identity** — the field named `id`, or the first `+` field if there is
+no `id` — is already unique: the generated code keys its primary map by it. So `&`
+and `^` on that field have no effect, no secondary index is built, and validation
+warns and suggests dropping the modifier.
+
+```forge
+id: &+uuid   // ⚠ '&' has no effect — id is already the primary key
+id: +uuid    // ✓
+```
+
+The schema is still **valid** — this is advisory, not an error. And it applies only
+to the *identity*: on any **other** auto field, `&` and `^` are fully enforced
+(that is what `ref_id`/`seen_at` above rely on).
+</Callout>
 
 ## `?` — nullable
 

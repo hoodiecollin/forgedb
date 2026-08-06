@@ -172,6 +172,29 @@ Order {
     the integer id. Correct integer auto-increment is RFC #187 (blocked on transaction/coordinator
     sequence-allocation design), deliberately unshipped rather than shipped subtly wrong.
 - `&` (unique) can be applied to any field (no type restriction in parser)
+- **`&`/`^` on the model's identity field warns** (#258). The identity is already
+  unique — the generated `id_to_row` is a map keyed by it — so the modifier has no
+  effect and no secondary index is built for it. The schema stays **valid**; this is
+  advisory only, and the fix is to drop the modifier:
+
+  ```forge
+  Widget { id: &+uuid }   // ⚠ '&' has no effect — id is already the primary key
+  Widget { id: +uuid }    // ✓
+  ```
+
+  The *identity* is what is excluded, not "any `+` field". On a **non-identity**
+  auto field, `&` and `^` are fully meaningful and enforced:
+
+  ```forge
+  Event {
+    id: +uuid
+    ref_id: &+uuid        // ✓ indexed AND unique — a duplicate is rejected
+    seen_at: ^+timestamp  // ✓ indexed
+  }
+  ```
+
+  (Before #258 both of those were silently dropped: no index was built and `&`
+  enforced nothing. That affected `+uuid`/`+timestamp`, which synthesize today.)
 
 **NOT implemented:**
 - `~` (auto-update) does not exist — the AST `Field` carries only `auto_generate: bool` (the `+`
