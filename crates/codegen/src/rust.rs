@@ -332,6 +332,29 @@ impl RustGenerator {
             fn __forgedb_default_ts() -> Timestamp {
                 Timestamp::from_seconds(0)
             }
+
+            /// Build an opaque MVCC conflict key from its components (#257).
+            ///
+            /// Each part is length-prefixed, so no component list can ever encode
+            /// to the same bytes as a different one.  A bare concatenation cannot
+            /// promise that: `("User", "12")` and `("User1", "2")` are the same
+            /// bytes, which would make two unrelated writes conflict.  The leading
+            /// discriminant part additionally keeps a row key and a unique-claim
+            /// key in separate spaces.
+            ///
+            /// Identity: the caller assembles the parts; this only frames bytes.
+            /// The sequencer and the coordinator still compare for equality and
+            /// never decode (`forgedb-txn` / `forgedb-coordinator` unchanged).
+            fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8> {
+                let mut k = Vec::with_capacity(
+                    parts.iter().map(|p| p.len() + 4).sum::<usize>(),
+                );
+                for p in parts {
+                    k.extend_from_slice(&(p.len() as u32).to_le_bytes());
+                    k.extend_from_slice(p);
+                }
+                k
+            }
         });
 
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
@@ -346,16 +369,25 @@ impl RustGenerator {
             #[derive(Debug, Clone, PartialEq)]
             pub enum ValidationError {
                 /// A `&unique` field already holds this value on another row → 409.
-                Unique { field: &'static str },
+                Unique { model: &'static str, field: &'static str },
                 /// A required/optional foreign key points at a non-existent row → 409.
-                DanglingReference { field: &'static str, target: &'static str },
+                DanglingReference {
+                    model: &'static str,
+                    field: &'static str,
+                    target: &'static str,
+                },
                 /// A `delete` was refused because live child rows still reference
                 /// this parent under an `@on_delete(restrict)` FK (the default
                 /// on-delete policy) → 409.
                 ReferencedByChildren { model: &'static str, field: &'static str },
                 /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
                 /// was violated → 422.
-                Constraint { field: &'static str, rule: &'static str, message: String },
+                Constraint {
+                    model: &'static str,
+                    field: &'static str,
+                    rule: &'static str,
+                    message: String,
+                },
             }
 
             impl ValidationError {
@@ -375,11 +407,15 @@ impl RustGenerator {
             impl std::fmt::Display for ValidationError {
                 fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                     match self {
-                        ValidationError::Unique { field } => {
-                            write!(f, "unique constraint violated on field `{}`", field)
+                        ValidationError::Unique { model, field } => {
+                            write!(f, "unique constraint violated on field `{}.{}`", model, field)
                         }
-                        ValidationError::DanglingReference { field, target } => {
-                            write!(f, "field `{}` references a non-existent {}", field, target)
+                        ValidationError::DanglingReference { model, field, target } => {
+                            write!(
+                                f,
+                                "field `{}.{}` references a non-existent {}",
+                                model, field, target
+                            )
                         }
                         ValidationError::ReferencedByChildren { model, field } => {
                             write!(
@@ -388,8 +424,8 @@ impl RustGenerator {
                                 model, field
                             )
                         }
-                        ValidationError::Constraint { field, rule, message } => {
-                            write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+                        ValidationError::Constraint { model, field, rule, message } => {
+                            write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
                         }
                     }
                 }
@@ -1569,6 +1605,10 @@ impl RustGenerator {
     fn generate_field_validation(model: &forgedb_parser::Model) -> TokenStream {
         let fn_name = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let model_name = format_ident!("{}", model.name);
+        // #257: a field is identified by (model, field), never by field alone —
+        // two models may declare the same field name, and an error naming only
+        // `code` says nothing about which row was rejected.
+        let mtag = model.name.as_str();
 
         // `LazyLock<Regex>` statics for each `@pattern`/`@regex` field (#104),
         // compiled once and shared across every validate call.
@@ -1591,7 +1631,7 @@ impl RustGenerator {
                                 checks.push(quote! {
                                     if (*__v as f64) < #n as f64 {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "min",
+                                            model: #mtag, field: #fname_str, rule: "min",
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -1604,7 +1644,7 @@ impl RustGenerator {
                                 checks.push(quote! {
                                     if (*__v as f64) > #n as f64 {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "max",
+                                            model: #mtag, field: #fname_str, rule: "max",
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -1619,7 +1659,7 @@ impl RustGenerator {
                                 checks.push(quote! {
                                     if __v.chars().count() > #max as usize {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "length",
+                                            model: #mtag, field: #fname_str, rule: "length",
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -1631,7 +1671,7 @@ impl RustGenerator {
                                     let __len = __v.chars().count();
                                     if __len < #min as usize || __len > #max as usize {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "length",
+                                            model: #mtag, field: #fname_str, rule: "length",
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -1649,7 +1689,7 @@ impl RustGenerator {
                                     && !__v.chars().any(|__c| __c.is_whitespace());
                                 if !__ok {
                                     return Err(ValidationError::Constraint {
-                                        field: #fname_str, rule: "email",
+                                        model: #mtag, field: #fname_str, rule: "email",
                                         message: "must be a valid email address".to_string(),
                                     });
                                 }
@@ -1659,7 +1699,7 @@ impl RustGenerator {
                             checks.push(quote! {
                                 if !(__v.starts_with("http://") || __v.starts_with("https://")) {
                                     return Err(ValidationError::Constraint {
-                                        field: #fname_str, rule: "url",
+                                        model: #mtag, field: #fname_str, rule: "url",
                                         message: "must be an http(s) URL".to_string(),
                                     });
                                 }
@@ -1690,7 +1730,7 @@ impl RustGenerator {
                                 checks.push(quote! {
                                     if !#rident.is_match(__v.as_str()) {
                                         return Err(ValidationError::Constraint {
-                                            field: #fname_str, rule: "pattern",
+                                            model: #mtag, field: #fname_str, rule: "pattern",
                                             message: #msg.to_string(),
                                         });
                                     }
@@ -1745,6 +1785,7 @@ impl RustGenerator {
     /// already be present with an unchanged value — index maintenance runs AFTER
     /// commit, so the pre-commit index still keys the old value to `id`).
     fn generate_unique_checks(model: &forgedb_parser::Model, exclude_self: bool) -> Vec<TokenStream> {
+        let mtag = model.name.as_str();
         Self::indexed_fields(model)
             .iter()
             .filter(|f| f.unique)
@@ -1761,7 +1802,7 @@ impl RustGenerator {
                             let __uk: String = { #key };
                             if let Some(__ids) = self.#ident.get(&__uk) {
                                 if __ids.iter().any(|__i| *__i != id) {
-                                    return Err(ValidationError::Unique { field: #fname });
+                                    return Err(ValidationError::Unique { model: #mtag, field: #fname });
                                 }
                             }
                         }
@@ -1771,7 +1812,7 @@ impl RustGenerator {
                         {
                             let __uk: String = { #key };
                             if self.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
-                                return Err(ValidationError::Unique { field: #fname });
+                                return Err(ValidationError::Unique { model: #mtag, field: #fname });
                             }
                         }
                     }
@@ -7310,12 +7351,13 @@ impl RustGenerator {
                     let fk_field = format_ident!("{}", field.name);
                     let fname = field.name.as_str();
                     let tname = target.name.as_str();
+                    let mtag = model.name.as_str();
                     Some(if optional {
                         quote! {
                             if let Some(__fk) = record.#fk_field {
                                 if self.#target_storage.get(__fk).is_none() {
                                     return Err(ValidationError::DanglingReference {
-                                        field: #fname, target: #tname,
+                                        model: #mtag, field: #fname, target: #tname,
                                     });
                                 }
                             }
@@ -7324,7 +7366,7 @@ impl RustGenerator {
                         quote! {
                             if self.#target_storage.get(record.#fk_field).is_none() {
                                 return Err(ValidationError::DanglingReference {
-                                    field: #fname, target: #tname,
+                                    model: #mtag, field: #fname, target: #tname,
                                 });
                             }
                         }
@@ -7758,13 +7800,23 @@ impl RustGenerator {
                 pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, usize, Vec<u8>)>,
                 /// Unique keys claimed by staged writes in this transaction (M1a fix).
                 ///
-                /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
-                /// committed index so that two `create_<model>` calls with the SAME
-                /// `&unique` value in one transaction both see the conflict — the
-                /// committed index only reflects rows visible before the txn started.
-                /// Rollback discards the set automatically (it is owned by `TxHandle`
-                /// and never touches the real index maps, so no undo is needed).
-                staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+                /// Each entry is `(model_name, field_name, encoded_key)`.  Checked
+                /// ALONGSIDE the committed index so that two `create_<model>` calls
+                /// with the SAME `&unique` value in one transaction both see the
+                /// conflict — the committed index only reflects rows visible before
+                /// the txn started.  Rollback discards the set automatically (it is
+                /// owned by `TxHandle` and never touches the real index maps, so no
+                /// undo is needed).
+                ///
+                /// The **model name is part of the key** (#257).  This set stands in
+                /// for the committed index, and that index is addressed per model
+                /// *and* per column (`db.<model>.<field_index>`); keying it by field
+                /// name alone put two unrelated models that merely share a field
+                /// name — `code`, `slug`, `sku` — into one uniqueness namespace, so
+                /// writing the same value to both in one transaction was rejected as
+                /// a duplicate.  The key must match what it is a pre-image of.
+                staged_unique_keys:
+                    std::collections::BTreeSet<(&'static str, &'static str, String)>,
                 /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
                 committed: bool,
             }
@@ -7882,20 +7934,27 @@ impl RustGenerator {
                     // transactions that both write the same logical entity conflict,
                     // regardless of which physical rows they stage.
                     for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
-                        let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                        k.extend_from_slice(__model.as_bytes());
-                        k.extend_from_slice(__id_bytes);
-                        keys.push(k.into_boxed_slice());
+                        keys.push(
+                            __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                                .into_boxed_slice(),
+                        );
                     }
-                    // Unique-key opaque keys: field_name_bytes ++ encoded_key_bytes.
+                    // Unique-claim keys: (model, field, encoded value) — #257.  The
+                    // model is part of the identity because this mirrors the committed
+                    // index, which is per model AND per column.
                     // Capturing unique-key claims prevents two concurrent txns from
                     // committing the same unique value even when they staged different
                     // physical rows (which have different row-level keys above).
-                    for (__fname, __ekey) in &self.staged_unique_keys {
-                        let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                        k.extend_from_slice(__fname.as_bytes());
-                        k.extend_from_slice(__ekey.as_bytes());
-                        keys.push(k.into_boxed_slice());
+                    for (__mtag, __fname, __ekey) in &self.staged_unique_keys {
+                        keys.push(
+                            __forgedb_ws_key(&[
+                                b"u",
+                                __mtag.as_bytes(),
+                                __fname.as_bytes(),
+                                __ekey.as_bytes(),
+                            ])
+                            .into_boxed_slice(),
+                        );
                     }
                     forgedb_txn::WriteSet { keys, snapshot_lsn }
                 }
@@ -8184,22 +8243,23 @@ impl RustGenerator {
                     let ident = Self::index_field_ident(f);
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
+                    let mtag = model.name.as_str();
                     let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
                         {
                             let __uk: String = { #key };
-                            if self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
-                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            if self.staged_unique_keys.contains(&(#mtag, #fname, __uk.clone())) {
+                                return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                             }
                             {
                                 let __db = self.inner.read().unwrap();
                                 if __db.#field.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
-                                    return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                                    return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                                 }
                             }
-                            self.staged_unique_keys.insert((#fname, __uk));
+                            self.staged_unique_keys.insert((#mtag, #fname, __uk));
                         }
                     }
                 })
@@ -8213,6 +8273,7 @@ impl RustGenerator {
                     let ident = Self::index_field_ident(f);
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
+                    let mtag = model.name.as_str();
                     let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
@@ -8223,7 +8284,7 @@ impl RustGenerator {
                                 let __db = self.inner.read().unwrap();
                                 if let Some(__ids) = __db.#field.#ident.get(&__uk) {
                                     if __ids.iter().any(|__i| *__i != id) {
-                                        return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                                        return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                                     }
                                 }
                             }
@@ -8231,10 +8292,10 @@ impl RustGenerator {
                                 let __db = self.inner.read().unwrap();
                                 __db.#field.#ident.get(&__uk).is_some_and(|__ids| __ids.contains(&id))
                             };
-                            if !__committed_owns && self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
-                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            if !__committed_owns && self.staged_unique_keys.contains(&(#mtag, #fname, __uk.clone())) {
+                                return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                             }
-                            self.staged_unique_keys.insert((#fname, __uk));
+                            self.staged_unique_keys.insert((#mtag, #fname, __uk));
                         }
                     }
                 })
@@ -8262,12 +8323,13 @@ impl RustGenerator {
                     let fk_field = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
                     let tname = target.name.as_str();
+                    let mtag = model.name.as_str();
                     Some(if optional {
                         quote! {
                             if let Some(__fk) = record.#fk_field {
                                 if self.#target_get_fn(__fk).is_none() {
                                     return Err(TxError::Validation(ValidationError::DanglingReference {
-                                        field: #fname, target: #tname,
+                                        model: #mtag, field: #fname, target: #tname,
                                     }));
                                 }
                             }
@@ -8276,7 +8338,7 @@ impl RustGenerator {
                         quote! {
                             if self.#target_get_fn(record.#fk_field).is_none() {
                                 return Err(TxError::Validation(ValidationError::DanglingReference {
-                                    field: #fname, target: #tname,
+                                    model: #mtag, field: #fname, target: #tname,
                                 }));
                             }
                         }
@@ -8430,16 +8492,21 @@ impl RustGenerator {
                         // Identity red line: the sequencer sees only opaque bytes.
                         let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
                         for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                            k.extend_from_slice(__model.as_bytes());
-                            k.extend_from_slice(__id_bytes);
-                            __ws_keys.push(k.into_boxed_slice());
+                            __ws_keys.push(
+                                __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                                    .into_boxed_slice(),
+                            );
                         }
-                        for (__fname, __ekey) in &__tx.staged_unique_keys {
-                            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                            k.extend_from_slice(__fname.as_bytes());
-                            k.extend_from_slice(__ekey.as_bytes());
-                            __ws_keys.push(k.into_boxed_slice());
+                        for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                            __ws_keys.push(
+                                __forgedb_ws_key(&[
+                                    b"u",
+                                    __mtag.as_bytes(),
+                                    __fname.as_bytes(),
+                                    __ekey.as_bytes(),
+                                ])
+                                .into_boxed_slice(),
+                            );
                         }
                         let __ws = forgedb_txn::WriteSet { keys: __ws_keys, snapshot_lsn: __snap_lsn };
                         // Step 5: serialized conflict check (sequencer mutex only, no RwLock).
@@ -8484,7 +8551,8 @@ impl RustGenerator {
                 /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
                 buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
                 /// Claimed unique keys (field_name, encoded_key).
-                staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+                staged_unique_keys:
+                    std::collections::BTreeSet<(&'static str, &'static str, String)>,
                 /// Pending events: (model_tag, kind, id_bytes, record_bytes).
                 pending_events: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>)>,
             }
@@ -8634,6 +8702,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
+                let mtag = model.name.as_str();
                 let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
@@ -8642,14 +8711,14 @@ impl RustGenerator {
                         let __uk: String = { #key };
                         // Check committed index.
                         if self.db.#field.#ident.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
-                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
                         // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
-                        if self.staged_unique_keys.contains(&(#fname, __uk.clone())) {
-                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                        if self.staged_unique_keys.contains(&(#mtag, #fname, __uk.clone())) {
+                            return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
                         // Claim the key for this transaction.
-                        self.staged_unique_keys.insert((#fname, __uk));
+                        self.staged_unique_keys.insert((#mtag, #fname, __uk));
                     }
                 }
             })
@@ -8661,6 +8730,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
+                let mtag = model.name.as_str();
                 let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
@@ -8670,7 +8740,7 @@ impl RustGenerator {
                         // Check committed index (exclude self-id).
                         if let Some(__ids) = self.db.#field.#ident.get(&__uk) {
                             if __ids.iter().any(|__i| *__i != id) {
-                                return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                                return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                             }
                         }
                         // Check staged-key buffer (intra-txn duplicate guard, M1a fix).
@@ -8689,12 +8759,12 @@ impl RustGenerator {
                             .get(&__uk)
                             .is_some_and(|__ids| __ids.contains(&id));
                         if !__committed_owns
-                            && self.staged_unique_keys.contains(&(#fname, __uk.clone()))
+                            && self.staged_unique_keys.contains(&(#mtag, #fname, __uk.clone()))
                         {
-                            return Err(TxError::Validation(ValidationError::Unique { field: #fname }));
+                            return Err(TxError::Validation(ValidationError::Unique { model: #mtag, field: #fname }));
                         }
                         // Claim the key for this transaction.
-                        self.staged_unique_keys.insert((#fname, __uk));
+                        self.staged_unique_keys.insert((#mtag, #fname, __uk));
                     }
                 }
             })
@@ -8725,12 +8795,13 @@ impl RustGenerator {
                 let fk_field = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
                 let tname = target.name.as_str();
+                let mtag = model.name.as_str();
                 Some(if optional {
                     quote! {
                         if let Some(__fk) = record.#fk_field {
                             if self.#target_get(__fk).is_none() {
                                 return Err(TxError::Validation(ValidationError::DanglingReference {
-                                    field: #fname, target: #tname,
+                                    model: #mtag, field: #fname, target: #tname,
                                 }));
                             }
                         }
@@ -8739,7 +8810,7 @@ impl RustGenerator {
                     quote! {
                         if self.#target_get(record.#fk_field).is_none() {
                             return Err(TxError::Validation(ValidationError::DanglingReference {
-                                field: #fname, target: #tname,
+                                model: #mtag, field: #fname, target: #tname,
                             }));
                         }
                     }
@@ -10051,16 +10122,19 @@ impl RustGenerator {
                         // Step 4 – build opaque write-set (identity red line: coordinator sees bytes only).
                         let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
                         for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                            k.extend_from_slice(__model.as_bytes());
-                            k.extend_from_slice(__id_bytes);
-                            __ws_keys.push(k);
+                            __ws_keys.push(__forgedb_ws_key(&[
+                                b"r",
+                                __model.as_bytes(),
+                                __id_bytes,
+                            ]));
                         }
-                        for (__fname, __ekey) in &__tx.staged_unique_keys {
-                            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                            k.extend_from_slice(__fname.as_bytes());
-                            k.extend_from_slice(__ekey.as_bytes());
-                            __ws_keys.push(k);
+                        for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                            __ws_keys.push(__forgedb_ws_key(&[
+                                b"u",
+                                __mtag.as_bytes(),
+                                __fname.as_bytes(),
+                                __ekey.as_bytes(),
+                            ]));
                         }
 
                         // Step 5 – RequestTurn: coordinator conflict-check + LSN assignment.

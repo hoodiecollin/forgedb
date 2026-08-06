@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-codegen"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "Code generators (Rust, TypeScript SDK, REST API, OpenAPI) for the ForgeDB schema compiler"

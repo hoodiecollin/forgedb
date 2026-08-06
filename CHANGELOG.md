@@ -6,6 +6,13 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
+## [0.3.2] - 2026-08-06
+
+### Bug Fixes
+
+- **codegen:** Identify a staged &unique claim by its model, not field alone ([#257](https://github.com/hoodiecollin/forgedb/issues/257))
+- **codegen:** Name the model in every ValidationError ([#257](https://github.com/hoodiecollin/forgedb/issues/257))
+
 ## [0.3.1] - 2026-08-01
 
 ### Performance
