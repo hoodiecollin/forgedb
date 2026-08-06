@@ -1932,12 +1932,29 @@ impl RustGenerator {
     ///     (a reverse one-to-many getter that would otherwise scan always exists),
     ///     so the index intent is the relation itself, no `^`/`&` needed.
     ///
-    /// Excludes the primary id (already covered by `id_to_row`).  Empty when the
-    /// model has no id/auto field (it cannot be inserted, so nothing to index).
+    /// Excludes the **identity** field (already covered by `id_to_row`).  Empty
+    /// when the model has no id/auto field (it cannot be inserted, so nothing to
+    /// index).
+    ///
+    /// #258: the exclusion is the *identity* field specifically — NOT "any
+    /// auto-generate field", which is what it used to say.  Skipping the identity
+    /// is correct: `id_to_row` is a map keyed by id, so its uniqueness is already
+    /// enforced structurally and a second index would be pure redundancy (schema
+    /// validation warns and suggests dropping the modifier).  But that reasoning
+    /// does not extend to a *non-identity* `+` field: in
+    /// `Event { id: +uuid, ref_id: &+uuid }` the identity is `id`, and `ref_id` is
+    /// an ordinary field that merely happens to be server-populated.  Excluding it
+    /// meant `&` built no index and enforced no uniqueness, and `^` built no index
+    /// — silently, with no warning, on `+uuid`/`+timestamp` fields that synthesize
+    /// today.  Composite indexes never applied the exclusion, so the same field was
+    /// indexable via `@index(a, b)` but not via `^`.
     fn indexed_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
-        if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+        // A model with no identity cannot be inserted, so there is nothing to
+        // index.  (Same predicate codegen uses to *find* the identity, so this
+        // cannot disagree with `identity_field` about whether one exists.)
+        let Some(identity) = Self::identity_field(model).map(|f| f.name.as_str()) else {
             return Vec::new();
-        }
+        };
         model
             .fields
             .iter()
@@ -1950,8 +1967,7 @@ impl RustGenerator {
                     )
                 );
                 let is_explicit = (f.indexed || f.unique)
-                    && f.name != "id"
-                    && !f.auto_generate
+                    && f.name != identity
                     && Self::is_filterable_scalar(&f.field_type);
                 is_explicit || is_fk
             })

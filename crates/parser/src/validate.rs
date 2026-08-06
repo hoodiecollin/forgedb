@@ -250,6 +250,34 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
             );
         }
 
+        // `&`/`^` on the IDENTITY field is redundant (#258). The identity's
+        // uniqueness is already enforced structurally by the generated
+        // `id_to_row`, which is a map keyed by id — so codegen deliberately
+        // builds no secondary index for it, and the modifier has no effect.
+        //
+        // This is advisory, never fatal: the schema is valid and generates
+        // correct code, the author has just written something that does nothing.
+        // Silence would be defensible for a *redundant* modifier; it was NOT
+        // defensible for the non-identity case, where the same silence meant no
+        // uniqueness enforcement at all (the bug #258 fixes).
+        if let Some(identity) = model.fields.iter().find(|f| f.name == "id" || f.auto_generate) {
+            if identity.unique || identity.indexed {
+                let modifier = if identity.unique { "&" } else { "^" };
+                errors.push(
+                    positioned(
+                        format!(
+                            "Field '{}.{}' is the model's identity, so '{}' has no effect — \
+                             identity uniqueness is already enforced by the primary key.",
+                            model.name, identity.name, modifier
+                        ),
+                        identity.position.or(model.position),
+                    )
+                    .with_suggestion(format!("drop the '{}' from '{}'", modifier, identity.name))
+                    .with_severity(forgedb_validation::Severity::Warning),
+                );
+            }
+        }
+
         // Composite indexes reference existing fields.
         for comp_idx in &model.composite_indexes {
             for field_name in &comp_idx.fields {
@@ -635,5 +663,59 @@ mod tests {
             .collect();
         assert_eq!(identity.len(), 1, "only the bad one: {identity:?}");
         assert!(identity[0].message.contains("'Bad'"));
+    }
+
+    /// `&`/`^` on the identity field is redundant, so it warns rather than being
+    /// silently accepted (#258). Advisory only — the schema stays valid.
+    #[test]
+    fn redundant_modifier_on_identity_warns() {
+        for (src, modifier, field) in [
+            ("Thing {\n  id: &+uuid\n  name: string\n}\n", "&", "id"),
+            ("Thing {\n  id: ^uuid\n  name: string\n}\n", "^", "id"),
+            ("Thing {\n  code: &+u64\n  name: string\n}\n", "&", "code"),
+        ] {
+            let errors = validate_schema(&ast(src));
+            let redundant: Vec<_> =
+                errors.iter().filter(|e| e.message.contains("has no effect")).collect();
+
+            assert_eq!(redundant.len(), 1, "exactly one for {src:?}: {errors:?}");
+            assert!(
+                redundant[0].is_warning(),
+                "redundancy is advisory, never fatal — {src:?}"
+            );
+            assert!(redundant[0].message.contains(&format!("'{modifier}'")));
+            assert!(redundant[0].message.contains(&format!("'Thing.{field}'")));
+            assert_eq!(
+                redundant[0].suggestion.as_deref(),
+                Some(format!("drop the '{modifier}' from '{field}'").as_str())
+            );
+            assert!(
+                redundant[0].position.is_some(),
+                "positioned at the field so an editor can anchor a quick-fix"
+            );
+            // Advisory must not fail the schema.
+            assert!(
+                !errors.iter().any(|e| !e.is_warning()),
+                "{src:?} is a VALID schema: {errors:?}"
+            );
+        }
+    }
+
+    /// The warning is for the *identity* only. `&`/`^` on a non-identity field —
+    /// including a non-identity auto field — is meaningful and must stay silent
+    /// (#258: it now builds a real index and enforces uniqueness).
+    #[test]
+    fn modifier_on_non_identity_field_does_not_warn() {
+        for src in [
+            "Thing {\n  id: +uuid\n  ref_id: &+uuid\n}\n", // auto, but not the identity
+            "Thing {\n  id: +uuid\n  seen_at: ^+timestamp\n}\n",
+            "Thing {\n  id: +uuid\n  email: &string\n}\n", // ordinary field, control
+        ] {
+            let errors = validate_schema(&ast(src));
+            assert!(
+                !errors.iter().any(|e| e.message.contains("has no effect")),
+                "{src:?} carries a meaningful modifier: {errors:?}"
+            );
+        }
     }
 }

@@ -1401,10 +1401,21 @@ impl Parser {
 
     /// Parse the input into a [`Schema`], running the full positioned semantic
     /// validation ([`crate::validate::validate_schema`]) and failing fast on the
-    /// first diagnostic to preserve the historical `Result<Schema, String>`
+    /// first **error** to preserve the historical `Result<Schema, String>`
     /// contract. Naming diagnostics are gated by the parser's `use_validation`
     /// flag (see [`Self::new_with_validation`]); structural/reference diagnostics
     /// always run.
+    ///
+    /// Non-fatal diagnostics (#237) do **not** fail the parse. They are moved into
+    /// the warning buffer, so a caller on this fail-fast path still surfaces them
+    /// via [`Self::warnings`] / [`Self::take_warnings`] — which is exactly what
+    /// `forgedb generate` does.
+    ///
+    /// This partitioning is load-bearing (#258). `Severity` shipped with no
+    /// emitters, so until the first `validate_schema` warning existed nothing
+    /// exercised this path — and the old `errors.first()` would have turned that
+    /// warning into a hard parse failure, which is a removal rather than a
+    /// deprecation. Any new advisory must stay non-fatal here.
     pub fn parse(&mut self) -> Result<Schema, String> {
         let schema = self.parse_unvalidated()?;
 
@@ -1414,9 +1425,12 @@ impl Parser {
         }
         crate::validate::collect_structure_errors(&schema, &mut errors);
 
-        if let Some(first) = errors.first() {
+        if let Some(first) = errors.iter().find(|d| !d.is_warning()) {
             return Err(first.to_string());
         }
+        // No error: keep the advisories on the warning channel rather than
+        // dropping them. `parse_unvalidated` cleared the buffer for this run.
+        self.warnings.extend(errors.into_iter().filter(|d| d.is_warning()));
 
         Ok(schema)
     }
@@ -2346,6 +2360,38 @@ B
         assert!(p.parse().is_ok(), "a warning never fails a parse");
         assert_eq!(p.warnings().len(), 1);
         assert!(p.warnings()[0].is_warning());
+    }
+
+    /// A warning produced by `validate_schema` (not by the parser's own buffer)
+    /// must also stay non-fatal on the fail-fast path (#258).
+    ///
+    /// `Severity` shipped with no emitters, so this path was never exercised: the
+    /// old `errors.first()` took the first diagnostic of ANY severity, which would
+    /// have turned the first semantic advisory into a hard parse failure — and
+    /// `forgedb generate` parses through here, so every affected schema would have
+    /// stopped generating. That is a removal, not a deprecation.
+    #[test]
+    fn fail_fast_parse_does_not_fail_on_a_validate_schema_warning() {
+        // `&` on the identity is redundant → advisory (#258).
+        let mut p = Parser::new("Thing {\n  id: &+uuid\n  name: string\n}\n").unwrap();
+        let schema = p.parse().expect("a redundant modifier is valid, not an error");
+        assert_eq!(schema.models.len(), 1);
+
+        let warnings = p.take_warnings();
+        assert_eq!(warnings.len(), 1, "surfaced, not dropped: {warnings:?}");
+        assert!(warnings[0].is_warning());
+        assert!(warnings[0].message.contains("has no effect"));
+    }
+
+    /// The partition keys on severity, not on position in the list: a real error
+    /// still fails even when an advisory was collected first.
+    #[test]
+    fn fail_fast_parse_still_fails_on_an_error_beside_a_warning() {
+        // `Thing` warns (redundant `&`); `Bad` is a hard error (no identity).
+        let mut p =
+            Parser::new("Thing {\n  id: &+uuid\n}\n\nBad {\n  name: string\n}\n").unwrap();
+        let err = p.parse().expect_err("the missing identity is still fatal");
+        assert!(err.contains("no identity field"), "reported the error, not the warning: {err}");
     }
 
     // ---- #233: `char(n)` → `bytes(n)` ---------------------------------------
