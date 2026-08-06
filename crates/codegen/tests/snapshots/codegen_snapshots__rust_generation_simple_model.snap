@@ -18,21 +18,46 @@ const EXPECTED_FORMAT_VERSION: u32 = 1;
 fn __forgedb_default_ts() -> Timestamp {
     Timestamp::from_seconds(0)
 }
+/// Build an opaque MVCC conflict key from its components (#257).
+///
+/// Each part is length-prefixed, so no component list can ever encode
+/// to the same bytes as a different one.  A bare concatenation cannot
+/// promise that: `("User", "12")` and `("User1", "2")` are the same
+/// bytes, which would make two unrelated writes conflict.  The leading
+/// discriminant part additionally keeps a row key and a unique-claim
+/// key in separate spaces.
+///
+/// Identity: the caller assembles the parts; this only frames bytes.
+/// The sequencer and the coordinator still compare for equality and
+/// never decode (`forgedb-txn` / `forgedb-coordinator` unchanged).
+fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(parts.iter().map(|p| p.len() + 4).sum::<usize>());
+    for p in parts {
+        k.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        k.extend_from_slice(p);
+    }
+    k
+}
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     /// A `&unique` field already holds this value on another row → 409.
-    Unique { field: &'static str },
+    Unique { model: &'static str, field: &'static str },
     /// A required/optional foreign key points at a non-existent row → 409.
-    DanglingReference { field: &'static str, target: &'static str },
+    DanglingReference { model: &'static str, field: &'static str, target: &'static str },
     /// A `delete` was refused because live child rows still reference
     /// this parent under an `@on_delete(restrict)` FK (the default
     /// on-delete policy) → 409.
     ReferencedByChildren { model: &'static str, field: &'static str },
     /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
     /// was violated → 422.
-    Constraint { field: &'static str, rule: &'static str, message: String },
+    Constraint {
+        model: &'static str,
+        field: &'static str,
+        rule: &'static str,
+        message: String,
+    },
 }
 impl ValidationError {
     /// The HTTP status the generated API boundary returns for this class:
@@ -50,11 +75,13 @@ impl ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::Unique { field } => {
-                write!(f, "unique constraint violated on field `{}`", field)
+            ValidationError::Unique { model, field } => {
+                write!(f, "unique constraint violated on field `{}.{}`", model, field)
             }
-            ValidationError::DanglingReference { field, target } => {
-                write!(f, "field `{}` references a non-existent {}", field, target)
+            ValidationError::DanglingReference { model, field, target } => {
+                write!(
+                    f, "field `{}.{}` references a non-existent {}", model, field, target
+                )
             }
             ValidationError::ReferencedByChildren { model, field } => {
                 write!(
@@ -63,8 +90,8 @@ impl std::fmt::Display for ValidationError {
                     model, field
                 )
             }
-            ValidationError::Constraint { field, rule, message } => {
-                write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+            ValidationError::Constraint { model, field, rule, message } => {
+                write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
             }
         }
     }
@@ -429,6 +456,7 @@ impl UserStorage {
             };
             if self.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
                 return Err(ValidationError::Unique {
+                    model: "User",
                     field: "email",
                 });
             }
@@ -532,6 +560,7 @@ impl UserStorage {
             if let Some(__ids) = self.email_index.get(&__uk) {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     });
                 }
@@ -2183,13 +2212,22 @@ pub struct TxHandle<'db> {
     >,
     /// Unique keys claimed by staged writes in this transaction (M1a fix).
     ///
-    /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
-    /// committed index so that two `create_<model>` calls with the SAME
-    /// `&unique` value in one transaction both see the conflict — the
-    /// committed index only reflects rows visible before the txn started.
-    /// Rollback discards the set automatically (it is owned by `TxHandle`
-    /// and never touches the real index maps, so no undo is needed).
-    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    /// Each entry is `(model_name, field_name, encoded_key)`.  Checked
+    /// ALONGSIDE the committed index so that two `create_<model>` calls
+    /// with the SAME `&unique` value in one transaction both see the
+    /// conflict — the committed index only reflects rows visible before
+    /// the txn started.  Rollback discards the set automatically (it is
+    /// owned by `TxHandle` and never touches the real index maps, so no
+    /// undo is needed).
+    ///
+    /// The **model name is part of the key** (#257).  This set stands in
+    /// for the committed index, and that index is addressed per model
+    /// *and* per column (`db.<model>.<field_index>`); keying it by field
+    /// name alone put two unrelated models that merely share a field
+    /// name — `code`, `slug`, `sku` — into one uniqueness namespace, so
+    /// writing the same value to both in one transaction was rejected as
+    /// a duplicate.  The key must match what it is a pre-image of.
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, &'static str, String)>,
     /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
     committed: bool,
 }
@@ -2236,18 +2274,20 @@ impl<'db> TxHandle<'db> {
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            if self.staged_unique_keys.contains(&("email", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("User", "email", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -2284,6 +2324,7 @@ impl<'db> TxHandle<'db> {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "User",
                             field: "email",
                         }),
                     );
@@ -2296,15 +2337,16 @@ impl<'db> TxHandle<'db> {
                 .get(&__uk)
                 .is_some_and(|__ids| __ids.contains(&id));
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("email", __uk.clone()))
+                && self.staged_unique_keys.contains(&("User", "email", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -2444,16 +2486,18 @@ impl<'db> TxHandle<'db> {
     pub fn __write_set(&self, snapshot_lsn: forgedb_txn::Lsn) -> forgedb_txn::WriteSet {
         let mut keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
         for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
-            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-            k.extend_from_slice(__model.as_bytes());
-            k.extend_from_slice(__id_bytes);
-            keys.push(k.into_boxed_slice());
+            keys.push(
+                __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                    .into_boxed_slice(),
+            );
         }
-        for (__fname, __ekey) in &self.staged_unique_keys {
-            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-            k.extend_from_slice(__fname.as_bytes());
-            k.extend_from_slice(__ekey.as_bytes());
-            keys.push(k.into_boxed_slice());
+        for (__mtag, __fname, __ekey) in &self.staged_unique_keys {
+            keys.push(
+                __forgedb_ws_key(
+                        &[b"u", __mtag.as_bytes(), __fname.as_bytes(), __ekey.as_bytes()],
+                    )
+                    .into_boxed_slice(),
+            );
         }
         forgedb_txn::WriteSet {
             keys,
@@ -2643,16 +2687,25 @@ impl SharedDatabase {
             };
             let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
             for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                k.extend_from_slice(__model.as_bytes());
-                k.extend_from_slice(__id_bytes);
-                __ws_keys.push(k.into_boxed_slice());
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                            .into_boxed_slice(),
+                    );
             }
-            for (__fname, __ekey) in &__tx.staged_unique_keys {
-                let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                k.extend_from_slice(__fname.as_bytes());
-                k.extend_from_slice(__ekey.as_bytes());
-                __ws_keys.push(k.into_boxed_slice());
+            for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(
+                                &[
+                                    b"u",
+                                    __mtag.as_bytes(),
+                                    __fname.as_bytes(),
+                                    __ekey.as_bytes(),
+                                ],
+                            )
+                            .into_boxed_slice(),
+                    );
             }
             let __ws = forgedb_txn::WriteSet {
                 keys: __ws_keys,
@@ -2696,7 +2749,7 @@ pub struct ConcurrentTxHandle {
     /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
     buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
     /// Claimed unique keys (field_name, encoded_key).
-    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, &'static str, String)>,
     /// Pending events: (model_tag, kind, id_bytes, record_bytes).
     pending_events: Vec<
         (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>),
@@ -2719,9 +2772,10 @@ impl ConcurrentTxHandle {
                     __k
                 }
             };
-            if self.staged_unique_keys.contains(&("email", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("User", "email", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
@@ -2736,12 +2790,13 @@ impl ConcurrentTxHandle {
                 {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "User",
                             field: "email",
                         }),
                     );
                 }
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -2785,6 +2840,7 @@ impl ConcurrentTxHandle {
                     if __ids.iter().any(|__i| *__i != id) {
                         return Err(
                             TxError::Validation(ValidationError::Unique {
+                                model: "User",
                                 field: "email",
                             }),
                         );
@@ -2796,15 +2852,16 @@ impl ConcurrentTxHandle {
                 __db.user.email_index.get(&__uk).is_some_and(|__ids| __ids.contains(&id))
             };
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("email", __uk.clone()))
+                && self.staged_unique_keys.contains(&("User", "email", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -3113,16 +3170,21 @@ impl CoordinatedDatabase {
             };
             let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
             for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                k.extend_from_slice(__model.as_bytes());
-                k.extend_from_slice(__id_bytes);
-                __ws_keys.push(k);
+                __ws_keys
+                    .push(__forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes]));
             }
-            for (__fname, __ekey) in &__tx.staged_unique_keys {
-                let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                k.extend_from_slice(__fname.as_bytes());
-                k.extend_from_slice(__ekey.as_bytes());
-                __ws_keys.push(k);
+            for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(
+                            &[
+                                b"u",
+                                __mtag.as_bytes(),
+                                __fname.as_bytes(),
+                                __ekey.as_bytes(),
+                            ],
+                        ),
+                    );
             }
             let __turn = {
                 let mut __busy_retries = 0u32;

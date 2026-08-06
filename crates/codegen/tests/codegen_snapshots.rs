@@ -2622,8 +2622,15 @@ Post {
 
     // ValidationError type with the three integrity classes + status mapping.
     assert!(code.contains("pub enum ValidationError"), "ValidationError type emitted");
-    assert!(code.contains("Unique { field") && code.contains("DanglingReference { field")
-        && code.contains("Constraint { field"), "three integrity variants");
+    // Every variant names its model as well as its field (#257): a field is only
+    // identified by the pair, since two models may declare the same field name.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("Unique{model:&'staticstr,field:&'staticstr")
+            && flat.contains("DanglingReference{model:&'staticstr,field:&'staticstr,target:&'staticstr")
+            && flat.contains("Constraint{model:&'staticstr,field:&'staticstr,rule:&'staticstr,message:String"),
+        "three integrity variants, each carrying (model, field)"
+    );
     assert!(code.contains("pub fn status_code(&self) -> u16"), "status_code maps to HTTP");
 
     // Per-model field validator with the declared directives.
@@ -5887,8 +5894,15 @@ Post {
 
     // Intra-txn `&unique` duplicate guard (M1a fix): the `staged_unique_keys` buffer
     // catches two `create_<model>` calls with the same `&unique` value in ONE txn.
+    // Keyed by (model, field, value) since #257 — see
+    // `test_rust_generation_txn_unique_is_model_scoped`.
     assert!(
-        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
+        code.chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .contains(
+                "staged_unique_keys:std::collections::BTreeSet<(&'staticstr,&'staticstr,String)>"
+            ),
         "TxHandle carries a staged-unique-key buffer for intra-txn duplicate detection"
     );
     assert!(
@@ -5942,10 +5956,13 @@ User {
     let schema = parser.parse().unwrap();
     let code = RustGenerator::generate(&schema).unwrap().code;
 
-    // The buffer is declared on TxHandle and initialized empty.
+    // The buffer is declared on TxHandle and initialized empty.  The key is the
+    // (model, field, value) triple — see `test_rust_generation_txn_unique_is_model_scoped`.
+    let flat_decl: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        code.contains("staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>"),
-        "TxHandle must carry a staged-unique buffer"
+        flat_decl
+            .contains("staged_unique_keys:std::collections::BTreeSet<(&'staticstr,&'staticstr,String)>"),
+        "TxHandle must carry a staged-unique buffer keyed by (model, field, value)"
     );
     assert!(
         code.contains("staged_unique_keys: std::collections::BTreeSet::new()"),
@@ -5974,6 +5991,74 @@ User {
     assert!(
         contains_pos < stage_pos,
         "staged-unique check fires before the stage append (a rejected dup leaves no row)"
+    );
+}
+
+#[test]
+fn test_rust_generation_txn_unique_is_model_scoped() {
+    // #257: a `&unique` claim staged inside a transaction is identified by
+    // (model, field, value) — NOT by field name alone.  Keyed by field alone, two
+    // unrelated models that merely share a field name landed in one uniqueness
+    // namespace, and writing the same value to both in a single transaction was
+    // rejected as a duplicate.  The staged set stands in for the committed index,
+    // and that index is addressed per model AND per column, so the key must match.
+    let src = r#"
+Widget {
+  id: +uuid
+  code: &u64
+  name: string
+}
+
+Gadget {
+  id: +uuid
+  code: &u64
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Both models declare `code`; each must claim it under its OWN model tag.
+    for model in ["Widget", "Gadget"] {
+        let claim = format!("staged_unique_keys.insert(({model:?}, \"code\"");
+        assert!(
+            code.contains(&claim),
+            "{model}.code must claim its staged key under its own model tag, not bare `code`"
+        );
+    }
+    // The unqualified form must be gone everywhere — that IS the bug.
+    assert!(
+        !code.contains("staged_unique_keys.insert((\"code\","),
+        "no staged claim may be keyed by field name alone (#257)"
+    );
+    assert!(
+        !code.contains("staged_unique_keys.contains(&(\"code\","),
+        "no staged lookup may be keyed by field name alone (#257)"
+    );
+
+    // The same qualification reaches the opaque MVCC write-set, at every tier.
+    // Keys are length-framed so no component list can encode to another's bytes,
+    // and tagged so a row key and a unique claim never share a space.
+    assert!(
+        code.contains("fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8>"),
+        "conflict keys are built by the length-framing helper"
+    );
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        flat.matches("&[b\"u\",__mtag.as_bytes(),__fname.as_bytes(),__ekey.as_bytes()")
+            .count(),
+        3,
+        "all three write-set builders (TxHandle, Tier 2, Tier 3) carry the model tag"
+    );
+    assert_eq!(
+        flat.matches("&[b\"r\",__model.as_bytes(),__id_bytes").count(),
+        3,
+        "all three write-set builders frame the row key the same way"
+    );
+    assert!(
+        !flat.contains("k.extend_from_slice(__fname.as_bytes());"),
+        "no write-set key may be a bare concatenation starting at the field name (#257)"
     );
 }
 
