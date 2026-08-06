@@ -113,8 +113,14 @@ pub fn generate_compile_run(tag: &str, schema: &str, driver: &str) -> (Output, P
         String::from_utf8_lossy(&build.stderr)
     );
 
+    // `argv[1]` is the data dir. `argv[2]` is the `forgedb` binary, for a driver
+    // that needs to drive the CLI itself — the Tier-3 probe spawns
+    // `forgedb coordinate` and then re-execs *itself* as two writer processes,
+    // which is the only way to prove a multi-process property from one test.
+    // Additive: drivers that read only `argv[1]` are unaffected.
     let out = Command::new(target.join(format!("debug/{tag}")))
         .arg(proj.join("data"))
+        .arg(forgedb)
         .output()
         .expect("run driver");
     (out, proj)
