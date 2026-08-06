@@ -355,6 +355,22 @@ everything still builds locally. The complete "can we tag?" query:
 gh issue list --label release-gate --state open      # any row ⇒ blocked
 ```
 
+**The release-gate issue MUST carry a versioned-asset ledger (§5.2).** Its body holds a table of
+**every** independently versioned asset in this repo — all 18 `crates/*` plus the root `forgedb`
+crate plus `apps/vscode-forgedb` — each row defaulting to **"no change"**, created when the
+milestone opens. **When a change touches one of those, set its row in the same pass that lands the
+change.** Deciding "does this need a bump?" with the change in front of you is reliable;
+reconstructing it at tag time from a diff is not.
+
+An absent row and a "no change" row look identical at tag time and mean opposite things
+(*verified untouched* vs *never considered*), which is why every asset gets a row rather than only
+the touched ones. This is not the same check as the publish gap: the gap is about a *missing*
+version, the ledger is about a *stale* one. The stale case is the quiet one — the version exists,
+so `cargo publish -p forgedb --dry-run` passes, the workspace builds (path deps shadow the
+registry), and the release ships old source behind a correct-looking number. Use
+`git log --oneline main..develop -- crates/<c>` against the version line; never the version alone.
+Template: `.github/ISSUE_TEMPLATE/release-gate.md`.
+
 **Surfaces (§6.1).** A `surface:*` label marks a separately shippable product face. This repo uses
 `surface:website` and `surface:ide-extension`; **core is the implicit default and carries no label.**
 **Never put a non-core `surface:*` issue on a core `v*` milestone** — it would read as "done,
@@ -513,6 +529,29 @@ of truth.
    `needs-design`-style status label, and **effort labels are banned**. Templates for gates 1–2 live
    in `.github/ISSUE_TEMPLATE/`. When a feature ships, fold its durable design into
    `docs/ARCHITECTURE.md` and **close the `rfc`**.
+
+7. **Reopening an accepted gate? Purge the issue body FIRST (§9.1).** Gates get redone — new
+   information lands, a constraint turns out to be an artifact of an assumption. The moment you
+   decide to redo one, the body is purged *before any new thinking*, down to a placeholder saying
+   the gate is being redone and that the body deliberately holds no design content. Stashing the
+   old body to a scratch file while you work is fine; **delete the stash** once the new gate is
+   accepted and the new body is written.
+
+   A withdrawn design left in the body does not read as withdrawn — it reads as **the** accepted
+   design, because that is what a body *is*. The correction invariably lands in a comment, and
+   top-down readers never reach it, so the next planning pass builds on it silently and the plan
+   looks correct (it is internally consistent with the wrong premise). #187 hit exactly this: a
+   Gate 2 was written against a body describing a design that acceptance had rejected. Repopulate
+   the body **only at acceptance**, from the accepted outcome — never patch it incrementally as
+   thinking evolves, which recreates the half-superseded state the purge exists to prevent.
+
+8. **Run `sync-sources` on BOTH sides of every gate (§9.2) — no triviality exemption.** The global
+   rule scopes it to non-trivial tasks; gates are exempt from that exemption. `verify` before
+   (check every claim source against code, fix what drifted), `propagate` after (push the accepted
+   outcome into the issue body, docs, memory, cross-linked issues). A gate's input is the previous
+   gate's output, so a stale claim there is not caught downstream — it is *built on*. This burns
+   tokens; do it anyway, because the cost is bounded and paid once while planning against a stale
+   claim is unbounded and discovered late.
 
 ## Conventions
 
