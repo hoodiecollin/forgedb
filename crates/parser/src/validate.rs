@@ -1242,4 +1242,110 @@ mod tests {
         // A non-identity inline string in the same model is fine.
         assert!(errs("T {\n  id: +uuid\n  code: string(26!)\n}\n").is_empty());
     }
+
+    // ---- #266: FKs follow the target's identity type -------------------------
+
+    /// **Scenario 15.** An identity that is itself a foreign key makes the
+    /// codegen resolver mutually recursive with `id_type_tokens`. `Left { id:
+    /// *Right }` / `Right { id: *Left }` parses and validates cleanly today and
+    /// generates (wrongly, as `Uuid` on both sides); once the FK arm resolves
+    /// through the target it would exhaust the generator's stack with no
+    /// diagnostic at all.
+    ///
+    /// So the cycle is reported HERE, where there is a span, rather than left to
+    /// crash there.
+    #[test]
+    fn an_identity_fk_cycle_is_a_positioned_error() {
+        let d = diags("Left {\n  id: *Right\n}\n\nRight {\n  id: *Left\n}\n");
+        let cycle: Vec<_> = d.iter().filter(|e| e.message.contains("cycle")).collect();
+        assert!(!cycle.is_empty(), "the cycle is reported: {d:?}");
+        assert!(!cycle[0].is_warning(), "a cycle cannot generate — it is an error");
+        assert!(
+            cycle[0].position.is_some(),
+            "positioned at the offending identity: {:?}",
+            cycle[0]
+        );
+        assert!(
+            cycle[0].message.contains("Left") && cycle[0].message.contains("Right"),
+            "names both ends of the cycle: {:?}",
+            cycle[0]
+        );
+
+        // A three-model cycle is caught the same way — the bound is on the walk,
+        // not on a two-model special case.
+        let d = diags("A {\n  id: *B\n}\n\nB {\n  id: *C\n}\n\nC {\n  id: *A\n}\n");
+        assert!(
+            d.iter().any(|e| e.message.contains("cycle")),
+            "a longer cycle is caught too: {d:?}"
+        );
+    }
+
+    /// **Scenario 16.** A self-referential FK is legal and must stay legal:
+    /// `parent` resolves to `Category`'s *identity*, which is a uuid, and
+    /// terminates. This is the scenario that stops scenario 15's fix from being
+    /// over-broad.
+    #[test]
+    fn a_self_referential_fk_is_not_a_cycle() {
+        assert!(
+            validate_schema(&ast("Category {\n  id: +uuid\n  parent: ?Category\n}\n")).is_empty(),
+            "a self-FK through a non-identity field terminates at the identity"
+        );
+
+        // A CHAIN through identities is the feature, not the hazard: `Order.id`
+        // resolves to `Customer`'s uuid and stops.
+        assert!(
+            validate_schema(&ast(
+                "Customer {\n  id: +uuid\n}\n\nOrder {\n  id: *Customer\n  total: i64\n}\n"
+            ))
+            .is_empty(),
+            "an identity chain that terminates is legal"
+        );
+    }
+
+    /// **Scenario 17 (resolution 3).** #238's width advisory is checked at the
+    /// *declaration*. #266 gives it a second firing site: an FK inherits the
+    /// target's key width and pays it on every row of the referencing model,
+    /// without its author ever writing a width.
+    ///
+    /// The fixture leans on `parse_unvalidated` — a `string(N)` identity is
+    /// refused by #238's interim check (that refusal is #252's to delete), so
+    /// the schema carries an error alongside. The advisory is asserted
+    /// independently of it, which is also the point: the warning must survive
+    /// once that error goes.
+    #[test]
+    fn an_fk_to_a_wide_key_warns_on_the_child_that_pays() {
+        let src = "Customer {\n  code: string(254)\n}\n\nOrder {\n  id: +uuid\n  \
+                   customer_ref: *Customer\n}\n";
+        let w = warns(src);
+        let fk: Vec<_> = w
+            .iter()
+            .filter(|e| e.message.contains("customer_ref"))
+            .collect();
+        assert_eq!(fk.len(), 1, "exactly one advisory on the child: {w:?}");
+        assert!(fk[0].is_warning(), "a width advisory is never an error");
+        assert_eq!(
+            fk[0].position.map(|p| p.line),
+            Some(6),
+            "positioned at the CHILD field that pays, not the parent declaration"
+        );
+        assert!(
+            fk[0].message.contains("Customer") && fk[0].message.contains("254"),
+            "names the target it inherits from and the width: {:?}",
+            fk[0]
+        );
+
+        // A narrow key is silent — the advisory is about width, not about FKs.
+        let quiet = warns("Customer {\n  code: string(8)\n}\n\nOrder {\n  id: +uuid\n  \
+                           customer_ref: *Customer\n}\n");
+        assert!(
+            !quiet.iter().any(|e| e.message.contains("customer_ref")),
+            "a narrow inherited key says nothing: {quiet:?}"
+        );
+
+        // ...and a uuid key, the convention, says nothing either.
+        let conventional = warns(
+            "Customer {\n  id: +uuid\n}\n\nOrder {\n  id: +uuid\n  customer_ref: *Customer\n}\n",
+        );
+        assert!(conventional.is_empty(), "{conventional:?}");
+    }
 }

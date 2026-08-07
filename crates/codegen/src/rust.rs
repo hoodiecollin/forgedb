@@ -1662,6 +1662,24 @@ impl RustGenerator {
         }
     }
 
+    /// SPEC-FIRST STUB (#266) — deliberately wrong, replaced by the real
+    /// resolver in the implementation commit.  It exists so the resolver
+    /// scenarios fail on their ASSERTIONS rather than on a missing symbol: a
+    /// test that is red only because the tree does not compile has proven
+    /// nothing (`red-for-the-wrong-reason`).
+    pub(crate) fn fk_backing_type(
+        _schema: &Schema,
+        ft: &forgedb_parser::FieldType,
+    ) -> Option<forgedb_parser::FieldType> {
+        match ft {
+            forgedb_parser::FieldType::Relation(
+                forgedb_parser::RelationType::RequiredReference(_)
+                | forgedb_parser::RelationType::OptionalReference(_),
+            ) => Some(forgedb_parser::FieldType::Uuid),
+            _ => None,
+        }
+    }
+
     /// Whether a model's primary key is a `Uuid` (vs an integer PK).
     ///
     /// Relation traversal is generated only between UUID-keyed models: FK scalar
@@ -12590,5 +12608,173 @@ mod tests {
         assert!(code.contains("pub struct PostStorage"));
         assert!(code.contains("pub user: UserStorage"));
         assert!(code.contains("pub post: PostStorage"));
+    }
+
+    // ---- #266: the FK backing-type resolver --------------------------------
+
+    /// A model whose identity is `id` of `ft`.
+    fn keyed(name: &str, ft: FieldType) -> Model {
+        Model {
+            position: None,
+            name: name.to_string(),
+            fields: vec![Field {
+                position: None,
+                name: "id".to_string(),
+                field_type: ft,
+                auto_generate: false,
+                unique: false,
+                indexed: false,
+                constraints: vec![],
+                index_type: IndexType::Hash,
+                is_computed: false,
+                fulltext_indexed: false,
+                is_materialized: false,
+            }],
+            composite_indexes: vec![],
+            projections: Vec::new(),
+            soft_delete: false,
+        }
+    }
+
+    fn schema_of(models: Vec<Model>) -> Schema {
+        Schema {
+            models,
+            structs: vec![],
+            enums: vec![],
+        }
+    }
+
+    /// **Scenario 8 (resolution 2).** `None => true` was backwards: a model with
+    /// no identity field reported as UUID-keyed, and a `true` default on a
+    /// predicate whose false branch REMOVES code is the wrong direction.
+    ///
+    /// #248 already makes an id-less model fatal, so this is defence in depth —
+    /// asserted directly on the resolver so the old default cannot come back in
+    /// another spelling.
+    #[test]
+    fn fk_backing_type_is_none_for_an_identity_less_target() {
+        let ghost = Model {
+            position: None,
+            name: "Ghost".to_string(),
+            fields: vec![],
+            composite_indexes: vec![],
+            projections: Vec::new(),
+            soft_delete: false,
+        };
+        let schema = schema_of(vec![ghost]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Ghost".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            None,
+            "an identity-less target resolves to nothing, never to Uuid by default"
+        );
+
+        // ...and an unknown target likewise.
+        let missing = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Nope".to_string(),
+        ));
+        assert_eq!(RustGenerator::fk_backing_type(&schema, &missing), None);
+    }
+
+    /// The resolution is transitive: an identity that is itself an FK resolves
+    /// through to the far end of the chain (resolution 1's second reproduction).
+    #[test]
+    fn fk_backing_type_resolves_through_a_chain() {
+        let schema = schema_of(vec![
+            keyed("Customer", FieldType::Uuid),
+            keyed(
+                "Order",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Customer".into(),
+                )),
+            ),
+        ]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Order".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            Some(FieldType::Uuid)
+        );
+
+        // An optional FK backs onto `Nullable(K)`, which is what makes every
+        // physical helper's existing `Nullable` arm the right one.
+        let opt = FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+            "Order".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &opt),
+            Some(FieldType::Nullable(Box::new(FieldType::Uuid)))
+        );
+    }
+
+    /// **Scenario 15, resolver half.** `Left { id: *Right }` / `Right { id: *Left }`
+    /// is legal to parse today. Once the FK arm resolves through the target, the
+    /// resolver is mutually recursive with `id_type_tokens` — so without a bound
+    /// it exhausts the stack rather than reporting anything.
+    ///
+    /// The bound is what keeps a *validation-skipping* caller degrading instead
+    /// of crashing; the diagnostic itself is `validate.rs`'s (scenario 15 proper).
+    #[test]
+    fn fk_backing_type_is_depth_bounded_against_an_identity_cycle() {
+        let schema = schema_of(vec![
+            keyed(
+                "Left",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Right".into(),
+                )),
+            ),
+            keyed(
+                "Right",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Left".into(),
+                )),
+            ),
+        ]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Left".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            None,
+            "a cycle resolves to nothing — it must not recurse forever"
+        );
+
+        // And generation returns rather than dying, so the CLI can report the
+        // validation error instead of the process disappearing.
+        assert!(RustGenerator::generate(&schema).is_ok());
+    }
+
+    /// **Scenario 16, resolver half.** A self-referential FK is NOT a cycle: it
+    /// resolves through the target's *identity*, which is a uuid. Nothing about
+    /// the bound may catch it.
+    #[test]
+    fn a_self_referential_fk_is_not_an_identity_cycle() {
+        let mut category = keyed("Category", FieldType::Uuid);
+        category.fields.push(Field {
+            position: None,
+            name: "parent".to_string(),
+            field_type: FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+                "Category".into(),
+            )),
+            auto_generate: false,
+            unique: false,
+            indexed: false,
+            constraints: vec![],
+            index_type: IndexType::Hash,
+            is_computed: false,
+            fulltext_indexed: false,
+            is_materialized: false,
+        });
+        let schema = schema_of(vec![category]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+            "Category".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            Some(FieldType::Nullable(Box::new(FieldType::Uuid)))
+        );
     }
 }

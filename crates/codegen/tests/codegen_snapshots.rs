@@ -8634,3 +8634,474 @@ fn test_generation_string_n_is_a_string_on_every_wire() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #266: a foreign key's type and column width follow the TARGET model's
+// identity type.  Before this, `map_field_type_ident` typed every FK scalar
+// `Uuid` and `RustGenerator::is_uuid_pk` skipped every non-UUID-keyed target at
+// 21 sites — silently dropping referential integrity, `@on_delete`, forward
+// traversal, reverse getters, eager load, and M2M junctions.  It compiled, ran,
+// and warned about nothing.
+//
+// The invariant these scenarios pin:
+//
+//   An FK column is physically identical to the column the target's identity
+//   field itself occupies.
+//
+// Fixtures are inline: all 18 corpus schemas are UUID-keyed and are the
+// zero-churn control (scenario 1) — they must stay untouched.
+// ---------------------------------------------------------------------------
+
+/// A `u64`-keyed parent with a one-to-many back-reference, a required FK child,
+/// an optional FK child field, and a self-FK.  The workhorse fixture for the
+/// widening scenarios.
+const U64_PARENT_SRC: &str = r#"
+Post {
+  id: +u64
+  title: string
+  comments: [Comment]
+}
+
+Comment {
+  id: +uuid
+  body: string
+  post: *Post
+  reply_to: ?Comment
+}
+"#;
+
+/// **Scenario 1 (the control).** For a UUID-keyed target the resolution returns
+/// `FieldType::Uuid`, and every helper's `Uuid` arm is byte-for-byte what its FK
+/// arm hardcoded — so nothing about a conventional schema moves.  The operative
+/// proof is procedural (the whole snapshot suite accepts nothing); this pins the
+/// four physical facts that would have to change first if it were not true.
+///
+/// If this is red, resolution 5's "not a format break" claim is void.
+#[test]
+fn test_rust_generation_fk_to_a_uuid_key_is_byte_identical() {
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  comments: [Comment]
+}
+
+Comment {
+  id: +uuid
+  post: *Post
+  editor: ?Post
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub post: Uuid"), "FK record field stays `Uuid`");
+    assert!(
+        code.contains("comment/fixed/uuid_1.bin"),
+        "FK column keeps the `uuid` file-path label — a rename reads as an empty database"
+    );
+    assert!(code.contains("16usize"), "FK column keeps its 16-byte width");
+    assert!(
+        code.contains("forgedb_storage::ColumnType::Uuid"),
+        "FK manifest entry keeps `ColumnType::Uuid`"
+    );
+    assert!(code.contains("append_uuid"), "FK write path keeps `append_uuid`");
+    assert!(
+        code.contains("size_of::<Option<Uuid>>()"),
+        "the optional FK keeps `Option<Uuid>` sizing"
+    );
+}
+
+/// **Scenario 2.** The width, the Rust type, the file-path label and the
+/// manifest `ColumnType` all follow the target's identity.  Today the column is
+/// 16 bytes of `Uuid` that nothing can ever populate with a matching value.
+#[test]
+fn test_rust_generation_fk_follows_a_u64_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub post: u64"),
+        "the FK scalar is typed as the target's key, not `Uuid`"
+    );
+    assert!(
+        code.contains("comment/fixed/u64_"),
+        "the FK column file is labelled by the resolved type — a wrong label \
+         renames the column file, which reads as a fresh empty database"
+    );
+    assert!(
+        !code.contains("comment/fixed/uuid_"),
+        "no `uuid`-labelled column survives on Comment's FK"
+    );
+    assert!(
+        code.contains("forgedb_storage::ColumnType::U64"),
+        "the manifest entry is the target key's ColumnType"
+    );
+    assert!(code.contains("append_u64"), "the FK write path uses the u64 accessor");
+    assert!(
+        !code.contains("record.post.as_bytes()"),
+        "the FK is no longer written through the uuid byte path"
+    );
+}
+
+/// **Scenario 3.** Every relation capability `is_uuid_pk` was silently skipping
+/// is emitted.  Asserted as *presence*: absence was the bug, and absence is what
+/// a regression looks like.
+#[test]
+fn test_rust_generation_u64_key_gets_the_whole_relation_surface() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub fn comment_post(&self, record: &Comment) -> Option<Post>"),
+        "forward traversal getter"
+    );
+    assert!(
+        code.contains("pub fn post_comments(&self, id: u64) -> Vec<Comment>"),
+        "reverse collection getter, keyed by the parent's own id type"
+    );
+    assert!(
+        code.contains("pub struct CommentWithRelations"),
+        "eager-load struct"
+    );
+    assert!(
+        code.contains("pub fn comment_with_relations(&self, id: Uuid) -> Option<CommentWithRelations>"),
+        "eager-load getter"
+    );
+    assert!(
+        code.contains("self.comment.find_by_post(id)"),
+        "the reverse getter probes the child's FK index rather than scanning (#100)"
+    );
+}
+
+/// **Scenario 4.** Deleting a referenced `Post` is refused.  Today it succeeds
+/// and orphans every child — the delete wrapper is a bare delegate for a
+/// non-UUID key.
+#[test]
+fn test_rust_generation_non_uuid_parent_delete_is_referentially_checked() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub fn delete_post(&mut self, id: u64)"),
+        "the delete wrapper takes the parent's own key type"
+    );
+    assert!(
+        code.contains("pub fn delete_post_cascade") || code.contains("fn delete_post_cascade"),
+        "the depth-bounded cascade worker is emitted for a u64-keyed parent"
+    );
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::ReferencedByChildren{model:\"Comment\",field:\"post\"}"),
+        "default `restrict` refuses the delete (409) instead of orphaning the child"
+    );
+}
+
+/// **Scenario 5.** `@on_delete(cascade)` and `@on_delete(set_null)` both fire
+/// against a `u64`-keyed parent.
+#[test]
+fn test_rust_generation_on_delete_policies_fire_for_a_u64_parent() {
+    let src = r#"
+Post {
+  id: +u64
+  title: string
+  comments: [Comment]
+  drafts: [Draft]
+}
+
+Comment {
+  id: +uuid
+  post: *Post @on_delete(cascade)
+}
+
+Draft {
+  id: +uuid
+  post: ?Post @on_delete(set_null)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("self.delete_comment_cascade(__c.id,__depth+1)?"),
+        "cascade recurses into the referencing child"
+    );
+    assert!(
+        flat.contains("__c.post=None;"),
+        "set_null nulls the optional FK on the referencing child"
+    );
+    assert!(
+        flat.contains("self.draft.find_by_post(Some(id))"),
+        "the set_null child probe passes the parent key wrapped in Some"
+    );
+}
+
+/// **Scenario 6.** The generated prose asserted the false premise for the whole
+/// life of the bug.  A doc comment that lies is what made this invisible
+/// (`silent-capability-holes-in-codegen`), so its absence is a scenario.
+#[test]
+fn test_rust_generation_delete_doc_does_not_deny_a_referencing_model() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !code.contains("no model references it via a foreign key"),
+        "the delete wrapper claimed nothing references a u64-keyed model, in a \
+         schema where `Comment.post` does"
+    );
+    assert!(
+        !code.contains("integer-keyed"),
+        "an integer key is no longer a second-class FK target, so nothing calls \
+         it out as one"
+    );
+}
+
+/// **Scenario 7 (resolution 1).** `Order { id: *Customer }` — an identity that is
+/// itself a foreign key.  Everything about the emitted key is already `Uuid`, yet
+/// this shape passed `is_uuid_pk` nowhere, so it lost the relation surface for a
+/// reason that was never true.
+#[test]
+fn test_rust_generation_identity_that_is_itself_an_fk_resolves_through() {
+    let src = r#"
+Customer {
+  id: +uuid
+  name: string
+  orders: [Order]
+}
+
+Order {
+  id: *Customer
+  total: i64
+  lines: [Line]
+}
+
+Line {
+  id: +uuid
+  order: *Order
+  qty: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub id: Uuid"), "the FK identity resolves to Uuid");
+    assert!(
+        code.contains("pub order: Uuid"),
+        "an FK pointing AT the FK-keyed model resolves through the chain"
+    );
+    assert!(
+        code.contains("pub fn line_order(&self, record: &Line) -> Option<Order>"),
+        "the chain-keyed model is an ordinary FK target"
+    );
+    assert!(
+        code.contains("pub fn customer_orders(&self, id: Uuid) -> Vec<Order>"),
+        "and an ordinary FK source"
+    );
+}
+
+/// **Scenario 9.** The OpenAPI document described every FK as
+/// `{"type":"string","format":"uuid"}`.  For a `u64`-keyed target that is not
+/// merely unhelpful, it is wrong: the server serializes a JSON number.
+#[test]
+fn test_api_generation_openapi_fk_follows_the_target_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let doc = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&doc).unwrap();
+
+    let post = &spec["components"]["schemas"]["Comment"]["properties"]["post"];
+    assert_eq!(post["type"], "integer", "an FK to a u64 key is an integer: {post}");
+    assert_eq!(post["format"], "int64", "{post}");
+
+    // The control: an FK to a uuid-keyed target is unchanged.
+    let reply = &spec["components"]["schemas"]["Comment"]["properties"]["reply_to"];
+    assert_eq!(reply["format"], "uuid", "a uuid-keyed FK target is untouched: {reply}");
+}
+
+/// **Scenario 10.** The three REST SDKs deserialize the FK; a `u64` arriving as a
+/// JSON number into a `String`/`str`/`string` field is a client that cannot parse
+/// its own server's response.
+#[test]
+fn test_sdk_generation_fk_follows_the_target_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let rust = RustSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        rust.contains("pub post: u64"),
+        "rust-sdk types the FK as the target key:\n{rust}"
+    );
+
+    let python = PythonSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        python.contains("post: int"),
+        "python-sdk types the FK as the target key:\n{python}"
+    );
+
+    let go = GoSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        go.contains("Post uint64"),
+        "go-sdk types the FK as the target key:\n{go}"
+    );
+}
+
+/// **Scenario 11.** The three in-process bindings compile either way — they
+/// `.to_string()` the FK — so the defect is silent: the FK surfaces as `"42"`
+/// while the target's own `id` surfaces as `42` on the very same object.
+///
+/// Asserted as an EQUALITY between the two mappings rather than against a
+/// literal, so it cannot rot when a key type is added.
+#[test]
+fn test_bindings_fk_type_equals_the_targets_own_id_type() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+
+    // Go binding: the struct field for `Comment.post` must be spelled the same
+    // as `Post.id`'s own field.
+    let go = GoGenerator::generate(&schema).unwrap().code;
+    let post_id = go
+        .lines()
+        .find(|l| l.trim_start().starts_with("ID "))
+        .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+        .expect("Post.ID field present in the Go binding");
+    let comment_fk = go
+        .lines()
+        .find(|l| l.trim_start().starts_with("Post "))
+        .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+        .expect("Comment.Post field present in the Go binding");
+    assert_eq!(
+        comment_fk, post_id,
+        "the Go FK field and the target's own id field must have one type"
+    );
+
+    // NAPI + PyO3: the FK must not be stringified when the key is not a uuid.
+    let napi = NapiGenerator::generate(&schema).unwrap().code;
+    assert!(
+        !napi.contains("record.post.to_string()"),
+        "napi stringifies a u64 FK while `Post.id` surfaces as a number"
+    );
+    let pyo3 = PyO3Generator::generate(&schema).unwrap().code;
+    assert!(
+        !pyo3.contains("record.post.to_string()"),
+        "pyo3 stringifies a u64 FK while `Post.id` surfaces as a number"
+    );
+}
+
+/// A mixed-key many-to-many: `Student` is `u64`-keyed, `Course` is `uuid`-keyed.
+/// `valid_m2m` excludes this pair entirely today.
+const MIXED_M2M_SRC: &str = r#"
+Student {
+  id: +u64
+  name: string
+  courses: [Course]
+}
+
+Course {
+  id: +uuid
+  title: string
+  students: [Student]
+}
+"#;
+
+/// **Scenario 12.** `valid_m2m` admits a mixed-key pair, and the junction's two
+/// columns are the two endpoints' own widths — not a hardcoded 16/16.
+#[test]
+fn test_rust_generation_junction_admits_a_mixed_key_pair() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(code.contains("pub struct StudentCourseLink"), "the junction exists at all");
+    assert!(
+        flat.contains("root.join(\"student_course_link/fixed/left.bin\"),8usize,"),
+        "the left column is the u64 endpoint's width"
+    );
+    assert!(
+        flat.contains("root.join(\"student_course_link/fixed/right.bin\"),16usize,"),
+        "the right column is the uuid endpoint's width"
+    );
+    assert!(
+        flat.contains("pubfnlink_student_course(&mutself,left:u64,right:Uuid)"),
+        "the link helper takes each endpoint's own key type"
+    );
+    assert!(
+        flat.contains("left_index:std::collections::HashMap<u64,Vec<Uuid>>")
+            && flat.contains("right_index:std::collections::HashMap<Uuid,Vec<u64>>"),
+        "the traversal indexes key on the endpoint types (#154)"
+    );
+}
+
+/// **Scenario 13.** `link` / `unlink` / `pairs` and the rehydration pass all run
+/// over the endpoint key types — the five places the junction hardcoded the UUID
+/// pair, none of which greps for `is_uuid_pk`.
+#[test]
+fn test_rust_generation_junction_round_trip_is_key_typed() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("self.left_col.append_u64(left)"),
+        "link appends the left endpoint through its own accessor"
+    );
+    assert!(
+        flat.contains("self.right_col.append_uuid(*right.as_bytes())"),
+        "...and the right one through its own"
+    );
+    assert!(
+        flat.contains("pubfnpairs(&self)->Vec<(u64,Uuid)>"),
+        "pairs() yields the endpoint key types"
+    );
+    assert!(
+        flat.contains("self.left_col.read_u64(i)"),
+        "the rehydration/latest-wins pass reads the left endpoint as u64"
+    );
+    assert!(
+        flat.contains("pubfnrights_of(&self,left:u64)->Vec<Uuid>")
+            && flat.contains("pubfnlefts_of(&self,right:Uuid)->Vec<u64>"),
+        "the traversal probes are key-typed"
+    );
+    assert!(
+        flat.contains("pubfnstudent_courses(&self,id:u64)->Vec<Course>")
+            && flat.contains("pubfncourse_students(&self,id:Uuid)->Vec<Student>"),
+        "the Database-level M2M getters take each side's own key"
+    );
+}
+
+/// **Scenario 14.** The replication follower frames a junction link as an opaque
+/// byte pair.  Its width is `left + right`, and the literal `32` is the single
+/// thing most likely to survive a careless edit.
+#[test]
+fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("ev.bytes.len()==24"),
+        "the replay arm accepts an 8 + 16 frame"
+    );
+    assert!(
+        !flat.contains("ev.bytes.len()==32"),
+        "...and no longer a 32-byte one for this junction"
+    );
+    assert!(
+        flat.contains("Vec::with_capacity(24)"),
+        "the broker record reserves the same width it writes"
+    );
+    assert!(
+        flat.contains("left.to_le_bytes()"),
+        "an integer endpoint is framed little-endian, matching its column"
+    );
+}
