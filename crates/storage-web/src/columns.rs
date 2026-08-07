@@ -105,6 +105,22 @@ impl BufferedFixedColumn {
     pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
         Ok(self.slot_bytes(slot)?.to_vec())
     }
+
+    /// The whole slot, borrowed — no allocation (#238). Browser twin of the
+    /// native `BufferedFixedColumn::read_slice`; generated code calls this name
+    /// on both targets.
+    pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
+        self.slot_bytes(slot)
+    }
+
+    /// The whole slot as UTF-8, borrowed (#238) — for a column where the slot IS
+    /// the value and carries no length prefix (`string(N!)`). Browser twin of the
+    /// native `BufferedFixedColumn::read_str`. Prefix decoding stays in generated
+    /// code on both targets.
+    pub fn read_str(&self, slot: usize) -> io::Result<&str> {
+        core::str::from_utf8(self.slot_bytes(slot)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 /// In-memory bulk-loaded selection of a [`VariableColumn`]'s rows (#168), the
