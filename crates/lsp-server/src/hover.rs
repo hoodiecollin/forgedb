@@ -176,6 +176,11 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Timestamp => "timestamp".to_string(),
         FieldType::Enum(name) => name.clone(),
         FieldType::Bytes(n) => format!("bytes({n})"),
+        // #238: render the declaration back verbatim, `!` and all — the width and
+        // its exactness are the whole point of hovering an inline string.
+        FieldType::StringN { chars, exact } => {
+            format!("string({chars}{})", if *exact { "!" } else { "" })
+        }
         FieldType::FixedArray(inner, size) => format!("[{}; {}]", format_field_type(inner), size),
         FieldType::StructType(name) => name.clone(),
         FieldType::OptionalStructType(name) => format!("{name}?"),

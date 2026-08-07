@@ -253,6 +253,19 @@ impl OpenApiGenerator {
             FieldType::F64 => json!({ "type": "number", "format": "double" }),
             FieldType::Bool => json!({ "type": "boolean" }),
             FieldType::String => json!({ "type": "string" }),
+            // #238: an inline `string(N)` is a *string* on the wire — its fixed
+            // slot is a storage fact, invisible to a client. The width is the
+            // one thing worth publishing, and it is a CHARACTER count, which is
+            // exactly what OpenAPI's `maxLength` means. The exact form pins
+            // `minLength` to the same number.
+            FieldType::StringN { chars, exact } => {
+                let n = *chars as u64;
+                if *exact {
+                    json!({ "type": "string", "minLength": n, "maxLength": n })
+                } else {
+                    json!({ "type": "string", "maxLength": n })
+                }
+            }
             // `json` accepts any JSON value. In JSON Schema 2020-12 an empty
             // schema validates everything; keep a description for readability.
             FieldType::Json => json!({ "description": "Arbitrary JSON value" }),

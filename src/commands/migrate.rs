@@ -761,7 +761,13 @@ fn add_field_default_json(
                     FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
                     | FieldType::Timestamp,
                 ) => "0".to_string(),
-                Some(FieldType::String | FieldType::Bytes(_)) => "\"\"".to_string(),
+                // #238: an inline `string(N)` is a `String` in the generated
+                // struct, so its type-zero is the empty string like any other.
+                // (`string(N!)` would reject `""` at write, but this arm is
+                // defensive residue for a mis-tagged hop, not a real default.)
+                Some(FieldType::String | FieldType::StringN { .. } | FieldType::Bytes(_)) => {
+                    "\"\"".to_string()
+                }
                 _ => "null".to_string(),
             }
         }

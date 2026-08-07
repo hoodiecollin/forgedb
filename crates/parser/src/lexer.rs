@@ -51,6 +51,13 @@ pub enum Token {
     RBracket,    // ]
     Asterisk,    // *
     Question,    // ?
+    /// `!` — the *exactly N* marker inside an inline string width, `string(26!)`
+    /// (#238 res 2). Claimed by that one production and nothing else, so a `!`
+    /// anywhere else is a positioned parse error rather than a skipped character.
+    ///
+    /// New in #238. `!` had no lexer arm before, so no existing schema can
+    /// contain one — the token is purely additive.
+    Bang,        // !
     At,          // @
     LParen,      // (
     RParen,      // )
@@ -343,6 +350,10 @@ impl Lexer {
             Some('?') => {
                 self.advance();
                 Ok(Token::Question)
+            }
+            Some('!') => {
+                self.advance();
+                Ok(Token::Bang)
             }
             Some('@') => {
                 self.advance();

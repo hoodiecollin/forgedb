@@ -245,7 +245,10 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::I64 => "i64",
         FieldType::F64 => "f64",
         FieldType::Bool => "bool",
-        FieldType::String => "string",
+        // #238: an inline `string(N)` reports as a string — the inspector shows
+        // logical shape, and the fixed slot is a storage fact the manifest
+        // already carries as a `FixedBytes(width)` column.
+        FieldType::String | FieldType::StringN { .. } => "string",
         FieldType::Json => "json",
         FieldType::Decimal => "decimal",
         FieldType::Uuid => "uuid",
