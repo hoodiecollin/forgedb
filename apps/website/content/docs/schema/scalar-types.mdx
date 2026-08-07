@@ -18,6 +18,8 @@ inline structs) see [relations](/docs/schema/relations/); for closed value sets 
 | `f64` | `f64` | `number` | fixed 8-byte column | ✅ (filter/sort; ordered index deferred) |
 | `bool` | `bool` | `boolean` | fixed 1-byte column | ✅ |
 | `string` | `String` | `string` | variable-length column | ✅ |
+| `string(N)` | `String` | `string` | fixed N-character slot in the row | ✅ |
+| `string(N!)` | `String` | `string` | fixed N-character slot, exact length | ✅ |
 | `json` | `serde_json::Value` | `unknown` | variable-length column (serialized JSON) | ❌ |
 | `decimal` | `rust_decimal::Decimal` | `string` | fixed 16-byte column | ✅ |
 | `uuid` | `uuid::Uuid` | `string` | fixed 16-byte column | ✅ |
@@ -44,6 +46,61 @@ Variable-length UTF-8 text, stored on the variable-length column. Indexable, fil
 and sortable. A hash index on a string is **exact-match only** (see
 [indexes](/docs/schema/indexes-and-projections/)).
 
+## `string(N)` — fixed-width inline strings
+
+A bare `string` stores a 16-byte `(offset, length)` pair in the row and keeps the bytes
+elsewhere, so every read costs a second lookup and a copy. `string(N)` instead reserves a
+**fixed slot in the row itself**, and the value is read by slicing the row's own bytes — no
+second lookup, and on the list/filter path no allocation at all.
+
+```forge
+Account {
+  id:       +uuid
+  code:     &string(12)      // at most 12 characters, unique
+  currency: ^string(3!)      // exactly 3 — an ISO 4217 code
+  label:    string(24)?      // nullable
+  bio:      string           // still variable-length; nothing changed here
+}
+```
+
+`N` counts **characters**, not bytes — the same unit `@length` uses — and must be between
+1 and 255. Bare `string(N)` is a maximum; the `!` suffix makes it an exact length. Both are
+enforced on every insert and update (violation → `422`), not only when the schema is
+validated.
+
+On every wire it is an ordinary string: `String` in Rust, `string` in TypeScript, a JSON
+string, and `{"type": "string", "maxLength": N}` in OpenAPI. A client cannot tell the two
+spellings apart. It is filterable, sortable, and indexable exactly like `string`.
+
+<Callout type="warning" title="Inline strings are ASCII unless you opt in">
+One byte per character is what keeps the slot small enough to be worth having, so a
+non-ASCII character is rejected with a `422`. Add [`@utf8`](/docs/schema/directives/) to
+widen the reservation to four bytes per character. `@utf8` on a bare `string` — or on
+anything that is not an inline string — is a schema error, because there is nothing there
+to widen.
+</Callout>
+
+The width in the type is already the length bound, so the length **directives do not
+apply**: `@max`, `@length(max: n)`, `@length(n)`, and the max component of `@length(a, b)`
+are schema errors on `string(N)` — declare the width you mean instead. `@min` and
+`@length(min: n)` still work, since a floor is something the type does not say. On the
+exact form `string(N!)` the length is fully determined, so every length directive is an
+error. A bare `string` keeps all of them.
+
+<Callout type="note" title="Wide slots stop paying for themselves">
+Above 64 characters the parser warns and still generates. A [measured
+experiment](https://github.com/hoodiecollin/forgedb/issues/261) compared a fixed slot
+against pointer storage across 200 configurations: the slot wins while it is small and
+loses once it is wide. Past that point prefer `string`, unless the value has to be a
+fixed-width key.
+</Callout>
+
+Two things it cannot do yet. It cannot live inside an [inline
+struct](/docs/schema/relations/#inline-structs) or a fixed array — those store their fields
+as the Rust value's bytes, and the Rust value here is a heap `String`, so embedding one
+would persist a pointer; use `bytes(N)` there. And it cannot be a model's identity: the
+generated API layer parses every non-integer key as a `uuid`.
+
 ## `bytes(N)`
 
 A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Being fixed-width, it can
@@ -55,7 +112,8 @@ It holds raw bytes: no UTF-8 guarantee, no length tracking, no text semantics. O
 it is a JSON **array of integers**, so `"USD"` in a `bytes(3)` arrives as `[85, 83, 68]`.
 Reach for it only for genuinely binary fixed-width data — a git object id, a digest, a
 fixed-width protocol field. For text of any kind, including short fixed-length codes like
-ISO currency or IATA airport codes, use `string` (with `@length` to enforce the length).
+ISO currency or IATA airport codes, use [`string(N!)`](#stringn--fixed-width-inline-strings) —
+text on the wire, length-checked on every write, and still stored in a fixed slot.
 </Callout>
 
 `bytes` is a *contextual* keyword rather than a reserved word: it only means the type in
