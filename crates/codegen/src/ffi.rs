@@ -797,7 +797,7 @@ impl FfiGenerator {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
@@ -1236,7 +1236,7 @@ impl FfiGenerator {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
@@ -1658,7 +1658,7 @@ impl FfiGenerator {
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
-            let id_ty = RustGenerator::id_type_tokens(model);
+            let id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
                 let target_name = match &field.field_type {
@@ -1671,9 +1671,6 @@ impl FfiGenerator {
                     _ => continue,
                 };
                 let Some(target) = schema.find_model(target_name) else { continue };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -1762,9 +1759,6 @@ impl FfiGenerator {
         }
         for p in &pairs {
             let Some(parent) = schema.find_model(&p.parent_model) else { continue };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -1967,7 +1961,7 @@ impl FfiGenerator {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
             for field in &model.fields {
-                let Some(fmt) = RustGenerator::arrow_export_format(&field.field_type) else {
+                let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
                 let sym = format_ident!("forgedb_{}_{}_export_arrow", snake, field.name);

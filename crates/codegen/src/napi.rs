@@ -551,7 +551,7 @@ impl NapiGenerator {
                 let model_ident = format_ident!("{}", model.name);
                 let napi_ident = format_ident!("Napi{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
 
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
@@ -762,7 +762,7 @@ impl NapiGenerator {
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
-            let source_id_ty = RustGenerator::id_type_tokens(model);
+            let source_id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
                 let target_name = match &field.field_type {
@@ -773,9 +773,6 @@ impl NapiGenerator {
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -824,9 +821,6 @@ impl NapiGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -974,7 +968,7 @@ impl NapiGenerator {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
             for field in &model.fields {
-                let Some(fmt) = RustGenerator::arrow_export_format(&field.field_type) else {
+                let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
                 let method_ident = format_ident!("{}_{}_arrow", snake, field.name);

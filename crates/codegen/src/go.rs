@@ -214,7 +214,7 @@ impl GoGenerator {
         {
             let snake = RustGenerator::to_snake_case(&model.name);
             for field in &model.fields {
-                if RustGenerator::arrow_export_format(&field.field_type).is_some() {
+                if RustGenerator::arrow_export_format(schema, &field.field_type).is_some() {
                     cols.push(ArrowCol {
                         sym: format!("{snake}_{}_export_arrow", field.name),
                         method: format!(
@@ -349,9 +349,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -380,9 +377,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);

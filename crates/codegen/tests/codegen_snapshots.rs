@@ -8731,9 +8731,11 @@ fn test_rust_generation_fk_follows_a_u64_key() {
         "the FK column file is labelled by the resolved type — a wrong label \
          renames the column file, which reads as a fresh empty database"
     );
+    // `Comment.id` is `+uuid`, so a `uuid` column legitimately exists on the
+    // model — what must be gone is the FK's own one.  `post` is field index 2.
     assert!(
-        !code.contains("comment/fixed/uuid_"),
-        "no `uuid`-labelled column survives on Comment's FK"
+        !code.contains("comment/fixed/uuid_2.bin"),
+        "the FK no longer occupies a `uuid`-labelled column"
     );
     assert!(
         code.contains("forgedb_storage::ColumnType::U64"),
@@ -8796,7 +8798,7 @@ fn test_rust_generation_non_uuid_parent_delete_is_referentially_checked() {
     );
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        flat.contains("ValidationError::ReferencedByChildren{model:\"Comment\",field:\"post\"}"),
+        flat.contains("ValidationError::ReferencedByChildren{model:\"Comment\",field:\"post\",}"),
         "default `restrict` refuses the delete (409) instead of orphaning the child"
     );
 }

@@ -322,9 +322,6 @@ impl WasmGenerator {
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 let method_ident = format_ident!("{method_name}");
                 let js = lower_camel_from_snake(&method_name);
@@ -364,9 +361,6 @@ impl WasmGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);

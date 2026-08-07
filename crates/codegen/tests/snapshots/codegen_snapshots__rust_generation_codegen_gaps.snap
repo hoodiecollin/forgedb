@@ -1943,8 +1943,26 @@ impl Database {
     ) -> Result<bool, ValidationError> {
         self.place.update(id, record)
     }
-    ///Delete a Place (integer-keyed): no model references it via a foreign key, so this delegates to storage `delete`.  Returns `Ok(false)` if the id is absent.
+    ///Delete a Place with referential integrity (delete semantics): each child FK's `@on_delete` policy (restrict/cascade/set_null) is applied, this model's M2M junction rows are unlinked, then the row is tombstoned. Returns `Ok(false)` if the id is absent, `Err(ReferencedByChildren)` (409) if a `restrict` child blocks the delete.  The REST DELETE route goes through this wrapper; the direct `db.place.delete` storage path does NOT (it skips these checks).
     pub fn delete_place(&mut self, id: u64) -> Result<bool, ValidationError> {
+        self.delete_place_cascade(id, 0)
+    }
+    /// Internal depth-bounded cascade worker.  `depth` guards a
+    /// pathological FK cycle (bounded by `MAX_CASCADE_DEPTH`).
+    fn delete_place_cascade(
+        &mut self,
+        id: u64,
+        __depth: u32,
+    ) -> Result<bool, ValidationError> {
+        if __depth > MAX_CASCADE_DEPTH {
+            return Err(ValidationError::ReferencedByChildren {
+                model: "Place",
+                field: "on_delete cascade depth exceeded",
+            });
+        }
+        if self.place.get(id).is_none() {
+            return Ok(false);
+        }
         Ok(self.place.delete(id))
     }
 }
