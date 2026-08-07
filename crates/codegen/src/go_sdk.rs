@@ -292,7 +292,10 @@ impl GoSdkGenerator {
             FieldType::F64 => (false, "float64".into()),
             FieldType::Timestamp => (false, "int64".into()),
             FieldType::Bool => (false, "bool".into()),
-            FieldType::String | FieldType::Uuid => (false, "string".into()),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                (false, "string".into())
+            }
             FieldType::Decimal => (false, "string".into()),
             FieldType::Enum(name) => (false, name.clone()),
             FieldType::Relation(RelationType::RequiredReference(_))

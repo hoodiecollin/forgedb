@@ -846,6 +846,10 @@ fn pk_parse_opt(model: &Model) -> TokenStream {
         Some(FieldType::U64) => quote! { id.parse::<u64>().ok() },
         Some(FieldType::I32) => quote! { id.parse::<i32>().ok() },
         Some(FieldType::I64) => quote! { id.parse::<i64>().ok() },
+        // A string identity IS the string — parsing it as a uuid would reject
+        // every id. #238 adds `string(N)` here; bare `string` was already in the
+        // fall-through and already wrong, so both arms land together.
+        Some(FieldType::String | FieldType::StringN { .. }) => quote! { Some(id) },
         _ => quote! { Uuid::parse_str(&id).ok() },
     }
 }

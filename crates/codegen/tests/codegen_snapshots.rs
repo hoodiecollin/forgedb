@@ -8312,3 +8312,293 @@ Small {
         "the guard is against the field's own width, not u64's (#187)"
     );
 }
+
+// ===========================================================================
+// #238 — `string(N)` / `string(N!)`: fixed-width inline string columns.
+//
+// These are LAYOUT guards, and they exist because every failure mode in this
+// area produces working, wrong code rather than a build error. `rust.rs` has
+// three fall-throughs a missing `StringN` arm would land in — `_ => 8` for the
+// column width, `_ => String` for the field type, and a `FixedBytes(size)` that
+// is only as right as the width arm above it. An 8-byte stride silently
+// truncates every value and the generated crate compiles clean.
+//
+// So each of these asserts the emitted *width*, not merely that it generated.
+// ===========================================================================
+
+/// Generate `database.rs` for a one-model schema.
+fn db_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    RustGenerator::generate(&schema).unwrap().code
+}
+
+/// The `FixedColumn::new(...)` initializer for one field's column, whitespace
+/// collapsed so assertions track the shape rather than prettyplease's wrapping.
+fn column_init(code: &str, field: &str) -> String {
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle = format!("{field}_col: FixedColumn::new(");
+    let at = flat.find(&needle).unwrap_or_else(|| {
+        panic!("no FixedColumn init for `{field}` — it did not get a fixed column at all")
+    });
+    let tail = &flat[at..];
+    tail[..tail.find(") .expect").unwrap_or(tail.len().min(200))].to_string()
+}
+
+/// Res 6: the exact form is exactly N bytes, with no length prefix — the
+/// narrowest of the three shapes, and byte-identical in construction to
+/// `bytes(N)`.
+#[test]
+fn test_rust_generation_string_n_exact_stride_is_n() {
+    let code = db_for("Doc {\n  id: +uuid\n  currency: string(3!)\n}\n");
+    let init = column_init(&code, "currency");
+    assert!(
+        init.contains("3usize"),
+        "`string(3!)` is a 3-byte slot, not the `_ => 8` fall-through: {init}"
+    );
+    assert!(!init.contains("8usize"), "a fall-through width would be 8: {init}");
+}
+
+/// Res 6's derived prefix width, asserted from both sides of the 1→2 byte
+/// boundary. A flat one-byte prefix cannot work under `@utf8`: 64 characters at
+/// four bytes each is 256, which does not fit in a byte.
+#[test]
+fn test_rust_generation_string_n_slot_widths() {
+    for (decl, field, want) in [
+        // default alphabet: one byte per character, one prefix byte
+        ("string(32)", "sku", 33usize),
+        ("string(255)", "wide", 256),
+        ("string(26!)", "key", 26),
+        // @utf8: four bytes per character; prefix crosses to two bytes when the
+        // payload passes 255, i.e. at N = 64
+        ("string(63) @utf8", "just_under", 63 * 4 + 1),
+        ("string(64) @utf8", "just_over", 64 * 4 + 2),
+        // the exact form still carries a prefix under @utf8 — exactly N
+        // *characters* is still a variable N..4N *bytes*
+        ("string(4!) @utf8", "quad", 4 * 4 + 1),
+    ] {
+        let src = format!("Doc {{\n  id: +uuid\n  {field}: {decl}\n}}\n");
+        let init = column_init(&db_for(&src), field);
+        assert!(
+            init.contains(&format!("{want}usize")),
+            "`{decl}` must emit a {want}-byte slot, got: {init}"
+        );
+    }
+}
+
+/// A nullable inline string prepends a one-byte presence tag, so `None` and
+/// `Some("")` round-trip distinctly — the same encoding every other nullable
+/// column on this path uses.
+#[test]
+fn test_rust_generation_string_n_nullable_adds_a_presence_byte() {
+    let code = db_for("Doc {\n  id: +uuid\n  note: string(10)?\n}\n");
+    let init = column_init(&code, "note");
+    assert!(
+        init.contains("12usize"),
+        "`string(10)?` is 1 (present) + 10 (payload) + 1 (prefix) = 12: {init}"
+    );
+}
+
+/// The finding-2 guard. `string(N)` must NOT be classified as a variable column;
+/// if it were, every other scenario here would still pass and the type would
+/// have silently become the thing it was invented to replace.
+#[test]
+fn test_rust_generation_string_n_is_not_a_variable_column() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n  body: string\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("sku_col: FixedColumn"),
+        "`string(32)` gets a FixedColumn"
+    );
+    assert!(
+        !flat.contains("sku_col: VariableColumn"),
+        "`string(32)` must never get a VariableColumn"
+    );
+    // The bare `string` beside it is untouched (res 10).
+    assert!(
+        flat.contains("body_col: VariableColumn"),
+        "bare `string` still gets a VariableColumn"
+    );
+    // ...and it does not ride the variable codec either.
+    assert!(
+        !flat.contains("self.sku_col.append_string"),
+        "`string(32)` must not be appended through the variable-string codec"
+    );
+}
+
+/// The manifest records a *physical* width. `ColumnType::String` would claim the
+/// variable layout and mislead every schema-blind reader (backup, inspector).
+#[test]
+fn test_rust_generation_string_n_manifest_is_fixed_bytes() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let at = flat.find("\"sku\"").expect("sku appears in the manifest writer");
+    let window = &flat[at..(at + 300).min(flat.len())];
+    assert!(
+        window.contains("ColumnType::FixedBytes(33usize)"),
+        "manifest column type is FixedBytes(33): {window}"
+    );
+}
+
+/// The finding-1 guard, at the codegen layer: the scan decodes a `string(N)` by
+/// BORROWING the slot, never by allocating a `Vec` per row. `read_bytes` is what
+/// every other fixed column uses, and it is what this must not use — the
+/// difference is invisible to a snapshot and inverts the issue's entire result.
+#[test]
+fn test_rust_generation_string_n_scan_borrows_the_slot() {
+    let code = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n  sku: string(32)\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The exact form: the slot IS the value, so the substrate can do the whole
+    // read (`read_str`), no prefix decode at all.
+    assert!(
+        flat.contains("key_col .read_str"),
+        "`string(26!)` reads the whole slot as UTF-8: {flat}"
+    );
+    // The at-most form: borrow the slot, decode the prefix in generated code.
+    assert!(
+        flat.contains("sku_col .read_slice"),
+        "`string(32)` borrows the slot rather than copying it"
+    );
+
+    // The borrow is what the SCAN does. `get`/`all` still materialize a `String`
+    // and read through `read_bytes` like every other fixed column — a borrow is
+    // not available there, because the live column reads through the file on
+    // every access and has nothing to lend. So scope the absence to the scan
+    // scope's body rather than to the whole file.
+    let scan = &code[code.find("pub fn __with_scan").expect("the scan scope is emitted")..];
+    let scan: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
+    let scan = &scan[..scan.find("pub fn ").map(|i| i + 7).unwrap_or(scan.len())];
+    assert!(
+        !scan.contains("read_bytes"),
+        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid: {scan}"
+    );
+}
+
+/// Res 6, asserted as an *absence*: the exact form has no prefix to decode. A
+/// present-but-unused prefix is merely slower rather than wrong, so nothing else
+/// here would catch it.
+#[test]
+fn test_rust_generation_string_n_exact_has_no_prefix_decode() {
+    let exact = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n}\n");
+    let inexact = db_for("Doc {\n  id: +uuid\n  key: string(26)\n}\n");
+    assert!(
+        inexact.contains("__forgedb_inline_len"),
+        "the at-most form decodes a length prefix"
+    );
+    assert!(
+        !exact.contains("__forgedb_inline_len"),
+        "the exact form has no prefix, so there is nothing to decode"
+    );
+}
+
+/// Res 4: the ASCII restriction is a *value* constraint — enforced on every
+/// write, like `@pattern`, not a validation-time-only check. And it runs FIRST,
+/// because it is the only check that can make a later one report a cause that is
+/// not the real one (a `@pattern` failure over a non-ASCII value).
+#[test]
+fn test_rust_generation_string_n_ascii_check_runs_before_the_directives() {
+    let code = db_for(
+        "Doc {\n  id: +uuid\n  code: string(8) @pattern(\"^[a-z]+$\") @length(min: 2)\n}\n",
+    );
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ascii = flat.find("rule: \"ascii\"").expect("an ascii rule is emitted");
+    let pattern = flat.find("rule: \"pattern\"").expect("the @pattern check survives");
+    let length = flat.find("rule: \"length\"").expect("the @length check survives");
+    assert!(ascii < pattern, "ASCII is checked before @pattern");
+    assert!(ascii < length, "ASCII is checked before @length");
+    // ...and the message points at the way out.
+    assert!(flat.contains("@utf8"), "the ascii diagnostic names the opt-in");
+}
+
+/// `@utf8` removes the ASCII check — that is the whole of what it does to the
+/// write path.
+#[test]
+fn test_rust_generation_utf8_drops_the_ascii_check() {
+    let code = db_for("Doc {\n  id: +uuid\n  title: string(8) @utf8\n}\n");
+    assert!(
+        !code.contains("\"ascii\""),
+        "@utf8 opts out of the one-byte-per-character alphabet"
+    );
+}
+
+/// Res 1 + res 2: the width bound is enforced at write, in characters, and the
+/// exact form rejects a short value as well as a long one.
+#[test]
+fn test_rust_generation_string_n_enforces_the_character_bound() {
+    let at_most = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n}\n");
+    let flat: String = at_most.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("chars().count()"),
+        "the bound counts characters, not bytes (res 3)"
+    );
+    assert!(flat.contains("rule: \"string_n\""), "a width violation is its own rule");
+
+    let exact = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n}\n");
+    let eflat: String = exact.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        eflat.contains("!= 26usize"),
+        "the exact form rejects any length but N: {eflat}"
+    );
+}
+
+/// `string(N)` is `Ord`, so it joins the same filterable/sortable class as bare
+/// `string`, and its index key is the `\u{1}` string class — the SAME key the
+/// same content would produce in a bare `string` column, so widening a column
+/// later keeps its index semantics.
+#[test]
+fn test_api_generation_string_n_is_filterable_and_indexed_as_a_string() {
+    let src = "Doc {\n  id: +uuid\n  sku: ^string(32)\n}\n";
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let db_code = RustGenerator::generate(&schema).unwrap().code;
+    let api_code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(db_code.contains("sku_index"), "an `^string(N)` field is indexed");
+    assert!(
+        db_code.contains("find_by_sku"),
+        "and gets the generated probe"
+    );
+    assert!(
+        db_code.contains("'\\u{1}'"),
+        "the index key is the string class, like a bare `string`"
+    );
+    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        api_flat.contains("\"sku\""),
+        "the REST filter admits the column"
+    );
+}
+
+/// The wire is a string, everywhere. The fixed slot is a storage fact; a client
+/// must not be able to tell.
+#[test]
+fn test_generation_string_n_is_a_string_on_every_wire() {
+    let src = "Doc {\n  id: +uuid\n  sku: string(32)\n  key: string(26!)\n}\n";
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let ts = TypeScriptGenerator::generate(&schema).unwrap().code;
+    assert!(ts.contains("sku: string"), "TS: a string\n{ts}");
+
+    let openapi = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&openapi).unwrap();
+    let props = &spec["components"]["schemas"]["Doc"]["properties"];
+    assert_eq!(props["sku"]["type"], "string");
+    assert_eq!(props["sku"]["maxLength"], 32);
+    assert!(props["sku"].get("minLength").is_none(), "at-most has no floor");
+    assert_eq!(props["key"]["minLength"], 26, "the exact form pins both");
+    assert_eq!(props["key"]["maxLength"], 26);
+
+    for (label, code) in [
+        ("rust-sdk", RustSdkGenerator::generate(&schema).unwrap().code),
+        ("python-sdk", PythonSdkGenerator::generate(&schema).unwrap().code),
+        ("go-sdk", GoSdkGenerator::generate(&schema).unwrap().code),
+        ("go", GoGenerator::generate(&schema).unwrap().code),
+    ] {
+        assert!(
+            !code.contains("StringN") && !code.contains("string_n"),
+            "{label} leaked the storage spelling onto the wire"
+        );
+    }
+}

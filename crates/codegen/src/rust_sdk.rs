@@ -434,7 +434,10 @@ impl ForgeDbClient {
             FieldType::F64 => (false, "f64".into()),
             FieldType::Timestamp => (false, "i64".into()),
             FieldType::Bool => (false, "bool".into()),
-            FieldType::String | FieldType::Uuid => (false, "String".into()),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                (false, "String".into())
+            }
             // decimal rides the wire as a precision-preserving JSON string.
             FieldType::Decimal => (false, "String".into()),
             FieldType::Enum(name) => (false, name.clone()),

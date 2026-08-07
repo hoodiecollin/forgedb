@@ -864,6 +864,9 @@ impl ApiGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp
             | FieldType::String
+            // #238: an inline `string(N)` is a `String` in the record — same
+            // `Ord`, same comparisons, same wire form. Only its storage differs.
+            | FieldType::StringN { .. }
             // decimal is `Ord`, so it is filterable + sortable (sort uses the
             // `Ord::cmp` branch, not float `partial_cmp`).
             | FieldType::Decimal
@@ -943,7 +946,7 @@ impl ApiGenerator {
             FieldType::I64 => quote! { want.parse::<i64>().ok() },
             FieldType::F64 => quote! { want.parse::<f64>().ok() },
             FieldType::Bool => quote! { want.parse::<bool>().ok() },
-            FieldType::String => quote! { Some(want.clone()) },
+            FieldType::String | FieldType::StringN { .. } => quote! { Some(want.clone()) },
             FieldType::Uuid => quote! { want.parse::<Uuid>().ok() },
             FieldType::Decimal => quote! { want.parse::<rust_decimal::Decimal>().ok() },
             FieldType::Timestamp => {
@@ -964,7 +967,7 @@ impl ApiGenerator {
         };
 
         let cmp = if nullable {
-            if borrowed && matches!(base, FieldType::String) {
+            if borrowed && matches!(base, FieldType::String | FieldType::StringN { .. }) {
                 quote! { record.#fname == Some(__w.as_str()) }
             } else {
                 quote! { record.#fname == Some(__w) }

@@ -242,8 +242,9 @@ impl PyO3Generator {
                 quote! { Ok(self.inner.#field_name) },
             ),
 
-            // String — clone; Python `str`.
-            FieldType::String => (
+            // String — clone; Python `str`. `string(N)` too (#238): it is a
+            // `String` in the generated record.
+            FieldType::String | FieldType::StringN { .. } => (
                 quote! { String },
                 quote! { Ok(self.inner.#field_name.clone()) },
             ),
@@ -335,7 +336,7 @@ impl PyO3Generator {
                 quote! { Option<bool> },
                 quote! { Ok(self.inner.#field_name) },
             ),
-            FieldType::String => (
+            FieldType::String | FieldType::StringN { .. } => (
                 quote! { Option<String> },
                 quote! { Ok(self.inner.#field_name.clone()) },
             ),

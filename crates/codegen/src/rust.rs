@@ -776,6 +776,14 @@ impl RustGenerator {
             });
         }
 
+        // Inline-string prefix decoder (#238).  Emitted only when some column
+        // actually carries a prefix, so a schema whose inline strings are all
+        // `string(N!)` — the prefix-free shape — carries no prefix machinery at
+        // all (same discipline as the `f64` key above).
+        if Self::needs_inline_len_helper(schema) {
+            tokens.extend(Self::generate_inline_len_helper());
+        }
+
         // Data-integrity error type (#91 Phase 3).  Generated once per schema; a
         // generic *shape* (three integrity classes) but every field name, rule,
         // and message is filled in by generated per-field checks — there is no
@@ -2266,6 +2274,9 @@ impl RustGenerator {
             | FieldType::Uuid
             | FieldType::Timestamp
             | FieldType::String
+            // #238: an inline string is a `String` in the record, so it is `Ord` +
+            // `Hash` on exactly the same terms as a bare one.
+            | FieldType::StringN { .. }
             // decimal is `Ord` + `Hash`, so it is filterable / sortable / indexable
             // (index keyed scale-invariantly via `index_value_expr`).
             | FieldType::Decimal
@@ -2451,6 +2462,67 @@ impl RustGenerator {
                 let fname_str = field.name.as_str();
 
                 let mut checks: Vec<TokenStream> = Vec::new();
+
+                // #238: the inline-string column's own constraints, and they go
+                // FIRST — before `@length`, `@pattern`, `@email`, `@url`.
+                //
+                // Two reasons, and the first is the one that matters. The ASCII
+                // restriction is the only check here that can make a *later* one
+                // report a cause that is not the real one: a `@pattern` run over a
+                // value containing `é` fails, and the message says the value did
+                // not match the regex, when what actually happened is that the
+                // column does not admit that character without `@utf8`. Second, it
+                // is a property of the column rather than of the value's content,
+                // which is the order an author debugs in.
+                //
+                // Both are *value* constraints, enforced on every insert and
+                // update (422) — the same class as `@pattern` and `@length`, not a
+                // validation-time-only check.
+                if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
+                    let n = chars as usize;
+                    if !Self::is_utf8_field(field) {
+                        let msg = format!(
+                            "must contain only ASCII characters (add @utf8 to this field to \
+                             allow the rest of Unicode, at four bytes per character)"
+                        );
+                        checks.push(quote! {
+                            if let Some((__i, __c)) =
+                                __v.char_indices().find(|(_, __c)| !__c.is_ascii())
+                            {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "ascii",
+                                    message: format!(
+                                        "{} — found {:?} at byte {}",
+                                        #msg, __c, __i,
+                                    ),
+                                });
+                            }
+                        });
+                    }
+                    // N counts CHARACTERS (res 3), consistent with `@length`.
+                    if exact {
+                        let msg = format!("must be exactly {n} characters");
+                        checks.push(quote! {
+                            if __v.chars().count() != #n {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "string_n",
+                                    message: #msg.to_string(),
+                                });
+                            }
+                        });
+                    } else {
+                        let msg = format!("must be at most {n} characters");
+                        checks.push(quote! {
+                            if __v.chars().count() > #n {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "string_n",
+                                    message: #msg.to_string(),
+                                });
+                            }
+                        });
+                    }
+                }
+
                 for c in &field.constraints {
                     match c.name.as_str() {
                         // `@min(n)` rejects `v < n`; the exclusive `@min(>n)` rejects
@@ -2855,7 +2927,10 @@ impl RustGenerator {
 
         match field_type {
             // --- JSON string class (tag \u{1}) --------------------------------
-            FieldType::String => quote! {
+            // #238: `string(N)` keys IDENTICALLY to a bare `string` of the same
+            // content, so a column that is later widened (or narrowed) keeps its
+            // index semantics and its existing keys stay meaningful.
+            FieldType::String | FieldType::StringN { .. } => quote! {
                 let mut __k = String::with_capacity(1 + __v.len());
                 __k.push('\u{1}');
                 __k.push_str(__v);
@@ -3540,7 +3615,7 @@ impl RustGenerator {
                 );
                 // C3: emit size_of in generated code so column size matches the Rust type
                 let value_size_expr =
-                    Self::column_value_size_expr(&field.field_type);
+                    Self::column_value_size_expr(&field.field_type, Self::is_utf8_field(field));
 
                 inits.push(quote! {
                     #field_col_name: FixedColumn::new(
@@ -3776,8 +3851,33 @@ impl RustGenerator {
     /// Emit a `size_of`-based expression for the column's value size so it matches
     /// the actual Rust type layout (C3).  For complex/struct types we defer to
     /// `std::mem::size_of::<T>()` evaluated at compile time in the generated code.
-    fn column_value_size_expr(field_type: &forgedb_parser::FieldType) -> TokenStream {
+    fn column_value_size_expr(
+        field_type: &forgedb_parser::FieldType,
+        utf8: bool,
+    ) -> TokenStream {
         match field_type {
+            // #238: an inline string's width is the ONE case that depends on a
+            // directive as well as the type — hence the `utf8` argument. It is
+            // matched before the `Nullable` arm below, which would otherwise
+            // compute `size_of::<Option<String>>()` (24) for a nullable one:
+            // a plausible-looking number, silently unrelated to the column.
+            forgedb_parser::FieldType::StringN { chars, exact } => {
+                let (slot, _, _) = Self::inline_string_layout(*chars, *exact, utf8);
+                quote! { #slot }
+            }
+            forgedb_parser::FieldType::Nullable(inner)
+                if matches!(**inner, forgedb_parser::FieldType::StringN { .. }) =>
+            {
+                let forgedb_parser::FieldType::StringN { chars, exact } = **inner else {
+                    unreachable!("guarded by the matches! above")
+                };
+                let (slot, _, _) = Self::inline_string_layout(chars, exact, utf8);
+                // One leading presence byte, so `None` and `Some("")` round-trip
+                // distinctly — the same encoding every other nullable column on
+                // this path uses.
+                let slot = slot + 1;
+                quote! { #slot }
+            }
             // enum: a 1-byte discriminant column (`__to_u8`/`__from_u8`), or a
             // 2-byte `[present, disc]` column for nullable enum — both stored via
             // an explicit `append_bytes`/`read_bytes` path (never `read_unaligned`).
@@ -3844,7 +3944,10 @@ impl RustGenerator {
     /// fixed-size type (char(N), fixed array, struct, nullable-fixed, optional
     /// FK) is a `FixedBytes(width)` — a physical byte-width fact, never schema
     /// semantics.  Variable strings are handled by the caller (`ColumnType::String`).
-    fn storage_column_type_tokens(field_type: &forgedb_parser::FieldType) -> TokenStream {
+    fn storage_column_type_tokens(
+        field_type: &forgedb_parser::FieldType,
+        utf8: bool,
+    ) -> TokenStream {
         use forgedb_parser::FieldType;
         match field_type {
             FieldType::U32 => quote! { forgedb_storage::ColumnType::U32 },
@@ -3861,7 +3964,7 @@ impl RustGenerator {
             }
             // Any remaining fixed-size type is opaque fixed bytes of its width.
             _ => {
-                let size = Self::column_value_size_expr(field_type);
+                let size = Self::column_value_size_expr(field_type, utf8);
                 quote! { forgedb_storage::ColumnType::FixedBytes(#size) }
             }
         }
@@ -3956,8 +4059,9 @@ impl RustGenerator {
                     Self::type_name(&field.field_type),
                     column_index
                 );
-                let col_type = Self::storage_column_type_tokens(&field.field_type);
-                let value_size = Self::column_value_size_expr(&field.field_type);
+                let __utf8 = Self::is_utf8_field(field);
+                let col_type = Self::storage_column_type_tokens(&field.field_type, __utf8);
+                let value_size = Self::column_value_size_expr(&field.field_type, __utf8);
                 col_entries.push(quote! {
                     forgedb_storage::ColumnMetadata {
                         name: #name.to_string(),
@@ -4140,6 +4244,52 @@ impl RustGenerator {
                         }
                     });
                 }
+            } else if let Some((chars, exact)) =
+                Self::inline_string_params(&field.field_type)
+            {
+                // Inline `string(N)` (#238): pack the value into its fixed slot.
+                // This branch must precede the generic fixed-size one below, whose
+                // `needs_byte_conversion` path transmutes the Rust value's bytes —
+                // which for a `String` would persist a pointer.
+                let utf8 = Self::is_utf8_field(field);
+                let (slot, _, _) = Self::inline_string_layout(chars, exact, utf8);
+                if field.is_nullable() {
+                    let slot = slot + 1;
+                    let pack = Self::inline_string_pack_body(
+                        chars,
+                        exact,
+                        utf8,
+                        1,
+                        quote! { __v.as_str() },
+                    );
+                    append_statements.push(quote! {
+                        {
+                            let mut __buf = [0u8; #slot];
+                            if let Some(__v) = &record.#field_name {
+                                __buf[0] = 1u8;
+                                #pack
+                            }
+                            self.#field_col_name.append_bytes(&__buf)
+                                .expect("Failed to append to column");
+                        }
+                    });
+                } else {
+                    let pack = Self::inline_string_pack_body(
+                        chars,
+                        exact,
+                        utf8,
+                        0,
+                        quote! { record.#field_name.as_str() },
+                    );
+                    append_statements.push(quote! {
+                        {
+                            let mut __buf = [0u8; #slot];
+                            #pack
+                            self.#field_col_name.append_bytes(&__buf)
+                                .expect("Failed to append to column");
+                        }
+                    });
+                }
             } else if Self::is_variable_string_type(&field.field_type) {
                 if field.is_nullable() {
                     // Nullable string (`string?` -> Option<String>).  Encode with a
@@ -4319,6 +4469,26 @@ impl RustGenerator {
         } else if is_string {
             quote! {
                 #receiver.#col.read_string(#row_var).expect("Failed to read id column")
+            }
+        } else if let Some((chars, exact)) = Self::inline_string_params(&f.field_type) {
+            // A `string(N)` identity (#238 makes the type legal here; #252 gives it
+            // a `Copy` key). Same slot decode as any other inline string column —
+            // an id is never nullable, so there is no presence byte.
+            let bytes = Self::inline_string_bytes_expr(
+                chars,
+                exact,
+                Self::is_utf8_field(f),
+                0,
+                quote! { __slot_bytes },
+            );
+            quote! {
+                {
+                    let __slot_bytes = #receiver.#col.read_bytes(#row_var)
+                        .expect("Failed to read id column");
+                    std::str::from_utf8(#bytes)
+                        .expect("inline string column holds UTF-8")
+                        .to_string()
+                }
             }
         } else {
             let read_method = Self::get_read_method(&f.field_type);
@@ -4505,6 +4675,22 @@ impl RustGenerator {
                     }
                 };
                 out.push((col, one));
+            } else if Self::is_inline_string_type(&field.field_type) {
+                // Inline `string(N)` backfill (#238): a zeroed slot. That decodes
+                // to `None` when nullable, and otherwise to the empty string —
+                // except under `string(N!)`, where the prefix-free slot decodes to
+                // N NUL characters, which is exactly N characters and therefore
+                // still satisfies the column. Either way it is the meaningful
+                // zero and it matches the append encoding byte for byte.
+                let value_size = Self::column_value_size_expr(
+                    &field.field_type,
+                    Self::is_utf8_field(field),
+                );
+                let one = quote! {
+                    self.#col.append_bytes(&vec![0u8; #value_size])
+                        .expect("Failed to backfill inline string column");
+                };
+                out.push((col, one));
             } else if Self::is_variable_string_type(&field.field_type) {
                 let one = if field.is_nullable() {
                     // Nullable string: the 1-byte presence tag `0x00` = None (#231 —
@@ -4536,7 +4722,8 @@ impl RustGenerator {
                     // Byte-blob types (char(N), arrays, inline struct, nullable /
                     // optional-FK) backfill as zeroed bytes of the column width —
                     // decodes to None / all-zero, matching the append encoding.
-                    let value_size = Self::column_value_size_expr(&field.field_type);
+                    let value_size =
+                        Self::column_value_size_expr(&field.field_type, Self::is_utf8_field(field));
                     quote! {
                         self.#col.append_bytes(&vec![0u8; #value_size])
                             .expect("Failed to backfill column");
@@ -6386,6 +6573,97 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
+        } else if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
+            // Inline `string(N)` (#238). Two shapes, and the difference is the
+            // whole point of the type:
+            //
+            //   borrowed (the scan) — the slot is borrowed out of the buffered
+            //     column and never copied. `read_str` when the slot IS the value
+            //     (`string(N!)`, no prefix); `read_slice` + a generated prefix
+            //     decode otherwise. Zero allocations per row, which is what makes
+            //     a fixed slot beat pointer storage at all (#261).
+            //   owned (`get`/`all`) — materializes a `String` anyway, so it reads
+            //     through `read_bytes` like every other fixed column. A borrow is
+            //     not available here: the live `FixedColumn` and `FixedColumnReader`
+            //     read through the file on every access and have nothing to lend.
+            let utf8 = Self::is_utf8_field(field);
+            let (_, prefix, _) = Self::inline_string_layout(chars, exact, utf8);
+            let base = if field.is_nullable() { 1usize } else { 0 };
+            let stmt = if borrowed {
+                if !field.is_nullable() && prefix == 0 {
+                    // The substrate can do the whole read: the slot is exactly the
+                    // value, so there is no framing for generated code to decode.
+                    quote! {
+                        let #field_value_name = #receiver.#field_col_name
+                            .read_str(#row_index)
+                            .expect("Failed to read inline string");
+                    }
+                } else {
+                    let bytes = Self::inline_string_bytes_expr(
+                        chars,
+                        exact,
+                        utf8,
+                        base,
+                        quote! { __slot_bytes },
+                    );
+                    let decode = quote! {
+                        std::str::from_utf8(#bytes)
+                            .expect("inline string column holds UTF-8")
+                    };
+                    if field.is_nullable() {
+                        quote! {
+                            let #field_value_name = {
+                                let __slot_bytes = #receiver.#field_col_name
+                                    .read_slice(#row_index)
+                                    .expect("Failed to read inline string");
+                                if __slot_bytes[0] == 1u8 { Some(#decode) } else { None }
+                            };
+                        }
+                    } else {
+                        quote! {
+                            let #field_value_name = {
+                                let __slot_bytes = #receiver.#field_col_name
+                                    .read_slice(#row_index)
+                                    .expect("Failed to read inline string");
+                                #decode
+                            };
+                        }
+                    }
+                }
+            } else {
+                let bytes = Self::inline_string_bytes_expr(
+                    chars,
+                    exact,
+                    utf8,
+                    base,
+                    quote! { __slot_bytes },
+                );
+                let decode = quote! {
+                    std::str::from_utf8(#bytes)
+                        .expect("inline string column holds UTF-8")
+                        .to_string()
+                };
+                if field.is_nullable() {
+                    quote! {
+                        let #field_value_name = {
+                            let __slot_bytes = #receiver.#field_col_name
+                                .read_bytes(#row_index)
+                                .expect("Failed to read inline string");
+                            if __slot_bytes[0] == 1u8 { Some(#decode) } else { None }
+                        };
+                    }
+                } else {
+                    quote! {
+                        let #field_value_name = {
+                            let __slot_bytes = #receiver.#field_col_name
+                                .read_bytes(#row_index)
+                                .expect("Failed to read inline string");
+                            #decode
+                        };
+                    }
+                }
+            };
+            Some((field_value_name, stmt))
         } else if Self::is_variable_string_type(&field.field_type) {
             let stmt = if field.is_nullable() {
                 // Decode the 1-byte presence tag written by insert
@@ -7489,6 +7767,12 @@ impl RustGenerator {
             // BEFORE the generic fixed path everywhere, so this only makes column
             // layout / iteration agree that an enum field HAS a column.
             | forgedb_parser::FieldType::Enum(_)
+            // #238: `string(N)` occupies one fixed-width slot of a `FixedColumn`.
+            // Note that the parser's `FieldType::is_fixed_size()` says the
+            // OPPOSITE — deliberately. That one asks whether the type may be
+            // embedded in an inline `struct`, where storage transmutes the Rust
+            // value's bytes, and the Rust value here is a heap `String`.
+            | forgedb_parser::FieldType::StringN { .. }
             | forgedb_parser::FieldType::Bytes(_)
             | forgedb_parser::FieldType::FixedArray(_, _)
             | forgedb_parser::FieldType::StructType(_)
@@ -7642,6 +7926,163 @@ impl RustGenerator {
         }
     }
 
+    /// The physical layout of one inline-string slot (#238) — `(slot, prefix,
+    /// payload)`, all in bytes.
+    ///
+    /// * `payload` is the widest the value can be: N bytes by default, `4N`
+    ///   under `@utf8` (res 4/5). N counts *characters*, so this is the only
+    ///   place the two units meet.
+    /// * `prefix` records how many payload bytes are actually used, so a read
+    ///   knows where the value ends. Its width is **derived from the payload**
+    ///   rather than fixed (res 6): one byte while the payload fits in a byte,
+    ///   two otherwise. A flat one-byte prefix cannot work under `@utf8` — 255
+    ///   characters at four bytes each is 1020 — and storing a *character* count
+    ///   instead does not rescue it, because slicing needs the byte end and
+    ///   recovering that from a character count means walking the UTF-8 on every
+    ///   row.
+    /// * `string(N!)` **without** `@utf8` has **no prefix at all**: every value
+    ///   is exactly N ASCII characters, therefore exactly N bytes, and there is
+    ///   nothing left to record. That makes the exact form the narrowest of the
+    ///   three shapes and byte-identical in construction to `bytes(N)` — and it
+    ///   is the form most likely to hold a key, which is where scan width costs
+    ///   most. (Under `@utf8`, exactly N *characters* is still a variable
+    ///   N..4N *bytes*, so the prefix stays.)
+    ///
+    /// The slot is **not** padded to an alignment boundary. #261 measured
+    /// unaligned strides throughout, so an aligned variant is unmeasured — and
+    /// padding would reintroduce exactly the over-reservation that experiment
+    /// identified as the thing that kills a fixed slot (at N=17 an 8-byte
+    /// alignment wastes 6 bytes on every row). Calibration is #264.
+    fn inline_string_layout(chars: u8, exact: bool, utf8: bool) -> (usize, usize, usize) {
+        let payload = chars as usize * if utf8 { 4 } else { 1 };
+        let prefix = if exact && !utf8 {
+            0
+        } else if payload <= u8::MAX as usize {
+            1
+        } else {
+            2
+        };
+        (payload + prefix, prefix, payload)
+    }
+
+    /// Emit the body that packs one inline string into its slot (#238).
+    ///
+    /// `value_expr` must be a `&str`. Writes into a `[u8; slot]` named `__buf`
+    /// that the caller has already zeroed, at `base` (0, or 1 past a nullable
+    /// field's presence byte).
+    ///
+    /// **The unused tail stays zero.** Nothing requires it — the prefix bounds
+    /// the read, and the exact form has no tail — but it makes a column file
+    /// byte-reproducible for the same logical content, which is what lets a diff
+    /// of two data dirs mean something and what the compaction and backup
+    /// fixtures rely on.
+    ///
+    /// The `min(payload)` clamp is defensive rather than load-bearing: a value
+    /// wider than the column is rejected at validation with a 422. It is here
+    /// because this same body also runs during WAL replay, where the record comes
+    /// off disk rather than through the validator, and a panic there would turn a
+    /// corrupt byte into an unopenable database.
+    fn inline_string_pack_body(
+        chars: u8,
+        exact: bool,
+        utf8: bool,
+        base: usize,
+        value_expr: TokenStream,
+    ) -> TokenStream {
+        let (_, prefix, payload) = Self::inline_string_layout(chars, exact, utf8);
+        let start = base + prefix;
+        let write_prefix = match prefix {
+            0 => quote! {},
+            1 => quote! { __buf[#base] = __n as u8; },
+            _ => quote! {
+                __buf[#base..#base + 2].copy_from_slice(&(__n as u16).to_le_bytes());
+            },
+        };
+        quote! {
+            let __s: &str = #value_expr;
+            let __b = __s.as_bytes();
+            let __n = __b.len().min(#payload);
+            #write_prefix
+            __buf[#start..#start + __n].copy_from_slice(&__b[..__n]);
+        }
+    }
+
+    /// Emit the expression that recovers one inline string's used byte range from
+    /// its slot (#238) — `&raw_expr[start..start + n]`, as a `&[u8]`.
+    ///
+    /// For the exact form without `@utf8` there is no prefix and the whole slot
+    /// *is* the value, so this degenerates to a plain slice with no decode at all.
+    fn inline_string_bytes_expr(
+        chars: u8,
+        exact: bool,
+        utf8: bool,
+        base: usize,
+        raw_expr: TokenStream,
+    ) -> TokenStream {
+        let (_, prefix, payload) = Self::inline_string_layout(chars, exact, utf8);
+        let start = base + prefix;
+        if prefix == 0 {
+            return quote! { &#raw_expr[#start..#start + #payload] };
+        }
+        quote! {
+            {
+                let __raw = &#raw_expr;
+                let __n = __forgedb_inline_len(&__raw[#base..], #prefix).min(#payload);
+                &__raw[#start..#start + __n]
+            }
+        }
+    }
+
+    /// Does any field in the schema need the inline-string prefix decoder (#238)?
+    ///
+    /// Emitted conditionally so a schema whose inline strings are all `string(N!)`
+    /// — the prefix-free shape — carries no prefix machinery at all.
+    fn needs_inline_len_helper(schema: &forgedb_parser::Schema) -> bool {
+        schema.models.iter().flat_map(|m| &m.fields).any(|f| {
+            Self::inline_string_params(&f.field_type)
+                .map(|(chars, exact)| {
+                    Self::inline_string_layout(chars, exact, Self::is_utf8_field(f)).1 > 0
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// The `__forgedb_inline_len` free function, emitted once per generated file
+    /// when some column actually carries a length prefix (#238).
+    fn generate_inline_len_helper() -> TokenStream {
+        quote! {
+            /// Read an inline string slot's length prefix (#238).
+            ///
+            /// The prefix records a BYTE count, not a character count: slicing
+            /// needs the byte end, and recovering that from a character count
+            /// would mean walking the UTF-8 on every row — reintroducing exactly
+            /// the per-row recovery cost that makes a fixed slot lose.
+            ///
+            /// Its width is derived from the slot (1 byte while the payload fits
+            /// in a byte, 2 above), so the common case — ASCII `string(N)` — pays
+            /// one byte and only `@utf8` above N = 63 pays two.
+            #[inline]
+            fn __forgedb_inline_len(__raw: &[u8], __prefix: usize) -> usize {
+                if __prefix == 1 {
+                    __raw[0] as usize
+                } else {
+                    u16::from_le_bytes([__raw[0], __raw[1]]) as usize
+                }
+            }
+        }
+    }
+
+    /// Did this field opt into four bytes per character (#238 res 5)?
+    ///
+    /// `@utf8` stays a directive rather than part of the type: it does not change
+    /// what the column *is*, only how wide a character may be. That does mean the
+    /// slot width is a function of the declaration **and** the directive, which is
+    /// why the layout helpers take it as an explicit argument instead of reading
+    /// it off the `FieldType`.
+    fn is_utf8_field(field: &forgedb_parser::Field) -> bool {
+        field.has_constraint("utf8")
+    }
+
     /// Is this field an **inline `string(N)` / `string(N!)`** (#238)?
     ///
     /// The fixed-slot string: one `FixedColumn` slot per row, one byte per
@@ -7777,6 +8218,9 @@ impl RustGenerator {
             forgedb_parser::FieldType::Decimal => "decimal",
             // enum persists as a raw 1-byte discriminant (append_bytes/read_bytes).
             forgedb_parser::FieldType::Enum(_) => "enum",
+            // #238: its own label so a data dir reads honestly — the file holds
+            // text in fixed slots, not an opaque byte blob.
+            forgedb_parser::FieldType::StringN { .. } => "inline_string",
             forgedb_parser::FieldType::Bytes(_) => "bytes",
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
@@ -11391,7 +11835,11 @@ impl RustGenerator {
             forgedb_parser::FieldType::I64 => quote! { i64 },
             forgedb_parser::FieldType::F64 => quote! { f64 },
             forgedb_parser::FieldType::Bool => quote! { bool },
-            forgedb_parser::FieldType::String => quote! { String },
+            // #238: an inline `string(N)` presents as an ordinary `String` in
+            // the generated struct — a client cannot tell, and every wire
+            // generator agrees. Only the storage differs.
+            forgedb_parser::FieldType::String
+            | forgedb_parser::FieldType::StringN { .. } => quote! { String },
             forgedb_parser::FieldType::Json => quote! { serde_json::Value },
             forgedb_parser::FieldType::Decimal => quote! { rust_decimal::Decimal },
             forgedb_parser::FieldType::Enum(name) => {

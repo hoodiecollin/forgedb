@@ -290,8 +290,9 @@ impl NapiGenerator {
             FieldType::F64 => Some(quote! { f64 }),
             FieldType::Bool => Some(quote! { bool }),
 
-            // String-typed fields.
-            FieldType::String => Some(quote! { String }),
+            // String-typed fields. #238: an inline `string(N)` is a `String` in
+            // the generated record and a string on every wire.
+            FieldType::String | FieldType::StringN { .. } => Some(quote! { String }),
 
             // uuid serializes as a hyphenated string in serde.
             FieldType::Uuid => Some(quote! { String }),
@@ -364,8 +365,10 @@ impl NapiGenerator {
             // counts; the serde path also truncates via JSON number).
             FieldType::U64 => quote! { __src.#field_name as i64 },
 
-            // String — clone (String → String).
-            FieldType::String => quote! { __src.#field_name.clone() },
+            // String — clone (String → String). `string(N)` too (#238).
+            FieldType::String | FieldType::StringN { .. } => {
+                quote! { __src.#field_name.clone() }
+            }
 
             // uuid → hyphenated string (matches serde's `Serialize for Uuid`).
             FieldType::Uuid => quote! { __src.#field_name.to_string() },
@@ -426,7 +429,9 @@ impl NapiGenerator {
     ) -> TokenStream {
         use forgedb_parser::FieldType;
         match inner {
-            FieldType::String => quote! { __src.#field_name.clone() },
+            FieldType::String | FieldType::StringN { .. } => {
+                quote! { __src.#field_name.clone() }
+            }
             FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
                 quote! { __src.#field_name }
             }
