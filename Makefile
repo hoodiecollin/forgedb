@@ -311,3 +311,18 @@ else ifdef ISSUE
 else
 	@echo "usage: make cycle-scope ISSUE=<n[,n...]>   (or PR=<n>)"; exit 2
 endif
+
+.PHONY: experiment-261
+
+## Experiment #261 — inline `string(N)` slot vs pointer indirection, the gate on
+## #238's soft form. Runs the full capacity x overflow-length x mix grid, then
+## renders the SVG figures and rasterizes them. Detached crate: it measures the
+## storage substrate directly and must not pull in benchmarks/'s comparative-DB
+## deps. See benchmarks/experiments/261/README.md; the verdict lives on the issue.
+experiment-261:
+	@(cd benchmarks/experiments/261 && \
+	  mkdir -p results && \
+	  cargo run --release -- target/data > results/raw.json && \
+	  $(BUN) plot.ts && \
+	  $(BUN) svg2png.ts results/grid.svg results/grid.png && \
+	  $(BUN) svg2png.ts results/summary.svg results/summary.png)
