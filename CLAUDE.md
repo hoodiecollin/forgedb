@@ -269,14 +269,20 @@ unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an
 FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `bytes(N)` (raw fixed-size bytes,
 NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
 keyword, so it is still usable as a field name) — **there is no
-`text`**. `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
+`text`**. `string(N)` / `string(N!)` (#238) are the same `String` on every wire as bare `string`, but occupy a
+fixed row slot instead of the variable column: N counts **characters**, `!` means *exactly* N (bare = at most),
+1..=255, ASCII at one byte/char unless the field carries `@utf8` (four) — a non-ASCII value without it is a 422.
+There is no overflow path (experiment #261 measured inline-or-overflow losing 198/200). Length directives are
+refused on it (the width IS the bound); `@min`/`@length(min:)` survive on the non-exact form only; above 64 chars
+it warns and still generates. Not embeddable in a `struct`/`[T; N]` (the Rust value is a heap `String`) and not
+yet usable as an identity (#252). `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
 sortable — no total order); `decimal` (→ `rust_decimal::Decimal`, exact fixed-point on the 16-byte column, string
 serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p,s)` precision/scale deferred). Enums:
 top-level `enum Name { A, B, C }` (PascalCase name + variants), referenced by bare name — 1-byte discriminant column,
 serialized as the variant-name string, filterable/sortable (declaration order)/indexable. Relations: `[Model]`
 one-to-many, `*Model` required FK, `?Model` optional FK, bidirectional `[..]`/`[..]` = many-to-many; `[type; N]`
 fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives — **the validating
-ones are `@min @max @length @email @url @pattern`/`@regex`, all ENFORCED** (violation → 422; `@length` counts
+ones are `@min @max @length @email @url @pattern`/`@regex` `@utf8`, all ENFORCED** (violation → 422; `@length` counts
 **chars**, not bytes, and takes named args — `@length(min: a, max: b)`, either alone, or positional `(a, b)`;
 single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
 #104). **Semantic-only markers** (parsed, carried,
