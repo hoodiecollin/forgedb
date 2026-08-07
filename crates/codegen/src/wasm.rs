@@ -405,13 +405,19 @@ impl WasmGenerator {
         }
 
         // --- Many-to-many query helpers --------------------------------------
-        // Mirror section C: `<model1>_<field1>` and `<model2>_<field2>` both take
-        // a uuid id and return the linked records. (The `link_*` mutators are NOT
-        // exposed — a read replica is a follower.)
+        // Mirror section C: `<model1>_<field1>` and `<model2>_<field2>` each take
+        // THAT endpoint's own id (#266) and return the linked records. (The
+        // `link_*` mutators are NOT exposed — a read replica is a follower.)
         for m in RustGenerator::valid_m2m(schema) {
             for (model_name, field) in
                 [(&m.model1, &m.field1), (&m.model2, &m.field2)]
             {
+                // The id arrives from JS as a string and is parsed as the
+                // endpoint model's OWN key type.
+                let Some(endpoint) = schema.find_model(model_name) else {
+                    continue;
+                };
+                let pk_parse = pk_parse_opt(schema, endpoint);
                 let method_name =
                     format!("{}_{}", RustGenerator::to_snake_case(model_name), field);
                 let method_ident = format_ident!("{method_name}");
@@ -427,9 +433,8 @@ impl WasmGenerator {
                         #[doc = #doc]
                         #[wasm_bindgen(js_name = #js)]
                         pub fn #method_ident(&self, id: String) -> String {
-                            let __pk = match Uuid::parse_str(&id) {
-                                Ok(__u) => __u,
-                                Err(_) => return "[]".to_string(),
+                            let Some(__pk) = #pk_parse else {
+                                return "[]".to_string();
                             };
                             serde_json::to_string(&self.db.borrow().#method_ident(__pk))
                                 .unwrap_or_else(|_| "[]".to_string())

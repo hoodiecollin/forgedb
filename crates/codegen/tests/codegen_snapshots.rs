@@ -3969,8 +3969,20 @@ Tag {
     assert!(flat.contains("\"Post\"=>"), "model tag arm present");
     assert!(flat.contains("\"post_tag_link\"=>"), "junction tag arm present");
     // The junction arm re-links from the opaque 32-byte pair, no field decode.
+    // #266 made the decode per-endpoint (each side is its own key type), so the
+    // pair is bound first and passed positionally; for this uuid/uuid junction
+    // the framed width is still 32 and each half is still `Uuid::from_bytes`.
     assert!(
-        flat.contains("self.post_tag_link.link(Uuid::from_bytes(__l),Uuid::from_bytes(__r))"),
+        flat.contains("ifev.bytes.len()==32{"),
+        "the junction frame is still the two endpoint widths"
+    );
+    assert!(
+        flat.contains("__b.copy_from_slice(&ev.bytes[0..16]);Uuid::from_bytes(__b)")
+            && flat.contains("__b.copy_from_slice(&ev.bytes[16..32]);Uuid::from_bytes(__b)"),
+        "each half of the opaque pair decodes as that endpoint's key"
+    );
+    assert!(
+        flat.contains("self.post_tag_link.link(__l,__r)"),
         "junction frames re-link from the opaque left++right pair"
     );
 
@@ -8217,11 +8229,14 @@ Event {
 /// updated in the same pass. Pinned because "it compiles" is the only feedback that
 /// site otherwise gives.
 ///
-/// The fixture needs a third model to say anything: a junction is only generated
-/// between two **uuid-PK** models (`valid_m2m` → `is_uuid_pk`), so the M2M pair can
-/// never itself carry an integer auto. `Ticket` supplies one alongside, which is
-/// what makes the junction's empty map a real assertion rather than a description
-/// of a schema where nothing allocates anywhere.
+/// The fixture keeps a third model because the assertion needs an integer auto
+/// *somewhere*: the junction itself has no fields of its own — only the two
+/// endpoint ids — so its sequence map is empty no matter what the endpoints are
+/// keyed on (#266 widened `valid_m2m` past the old uuid-PK-only gate, so the
+/// endpoints may now carry integer autos themselves). `Ticket` supplies a model
+/// that does allocate, which is what makes the junction's empty map a real
+/// assertion rather than a description of a schema where nothing allocates
+/// anywhere.
 #[test]
 fn test_rust_generation_junction_manifest_carries_empty_sequence_map() {
     let src = r#"
@@ -8999,6 +9014,10 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
 
 /// A mixed-key many-to-many: `Student` is `u64`-keyed, `Course` is `uuid`-keyed.
 /// `valid_m2m` excludes this pair entirely today.
+///
+/// `detect_many_to_many_relations` names the pair `(Course, Student)` — the
+/// junction's LEFT endpoint is the uuid-keyed `Course` and its RIGHT is the
+/// u64-keyed `Student`, which is why the assertions below read 16 then 8.
 const MIXED_M2M_SRC: &str = r#"
 Student {
   id: +u64
@@ -9022,22 +9041,22 @@ fn test_rust_generation_junction_admits_a_mixed_key_pair() {
     let code = RustGenerator::generate(&schema).unwrap().code;
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
-    assert!(code.contains("pub struct StudentCourseLink"), "the junction exists at all");
+    assert!(code.contains("pub struct CourseStudentLink"), "the junction exists at all");
     assert!(
-        flat.contains("root.join(\"student_course_link/fixed/left.bin\"),8usize,"),
-        "the left column is the u64 endpoint's width"
+        flat.contains("root.join(\"course_student_link/fixed/left.bin\"),16usize,"),
+        "the left column is the uuid endpoint's width"
     );
     assert!(
-        flat.contains("root.join(\"student_course_link/fixed/right.bin\"),16usize,"),
-        "the right column is the uuid endpoint's width"
+        flat.contains("root.join(\"course_student_link/fixed/right.bin\"),8usize,"),
+        "the right column is the u64 endpoint's width"
     );
     assert!(
-        flat.contains("pubfnlink_student_course(&mutself,left:u64,right:Uuid)"),
+        flat.contains("pubfnlink_course_student(&mutself,left:Uuid,right:u64)"),
         "the link helper takes each endpoint's own key type"
     );
     assert!(
-        flat.contains("left_index:std::collections::HashMap<u64,Vec<Uuid>>")
-            && flat.contains("right_index:std::collections::HashMap<Uuid,Vec<u64>>"),
+        flat.contains("left_index:std::collections::HashMap<Uuid,Vec<u64>>")
+            && flat.contains("right_index:std::collections::HashMap<u64,Vec<Uuid>>"),
         "the traversal indexes key on the endpoint types (#154)"
     );
 }
@@ -9053,29 +9072,29 @@ fn test_rust_generation_junction_round_trip_is_key_typed() {
     let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
-        flat.contains("self.left_col.append_u64(left)"),
+        flat.contains("self.left_col.append_uuid(*left.as_bytes())"),
         "link appends the left endpoint through its own accessor"
     );
     assert!(
-        flat.contains("self.right_col.append_uuid(*right.as_bytes())"),
+        flat.contains("self.right_col.append_u64(right)"),
         "...and the right one through its own"
     );
     assert!(
-        flat.contains("pubfnpairs(&self)->Vec<(u64,Uuid)>"),
+        flat.contains("pubfnpairs(&self)->Vec<(Uuid,u64)>"),
         "pairs() yields the endpoint key types"
     );
     assert!(
-        flat.contains("self.left_col.read_u64(i)"),
-        "the rehydration/latest-wins pass reads the left endpoint as u64"
+        flat.contains("self.right_col.read_u64(i)"),
+        "the rehydration/latest-wins pass reads the right endpoint as u64"
     );
     assert!(
-        flat.contains("pubfnrights_of(&self,left:u64)->Vec<Uuid>")
-            && flat.contains("pubfnlefts_of(&self,right:Uuid)->Vec<u64>"),
+        flat.contains("pubfnrights_of(&self,left:Uuid)->Vec<u64>")
+            && flat.contains("pubfnlefts_of(&self,right:u64)->Vec<Uuid>"),
         "the traversal probes are key-typed"
     );
     assert!(
-        flat.contains("pubfnstudent_courses(&self,id:u64)->Vec<Course>")
-            && flat.contains("pubfncourse_students(&self,id:Uuid)->Vec<Student>"),
+        flat.contains("pubfncourse_students(&self,id:Uuid)->Vec<Student>")
+            && flat.contains("pubfnstudent_courses(&self,id:u64)->Vec<Course>"),
         "the Database-level M2M getters take each side's own key"
     );
 }
@@ -9092,7 +9111,7 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
 
     assert!(
         flat.contains("ev.bytes.len()==24"),
-        "the replay arm accepts an 8 + 16 frame"
+        "the replay arm accepts a 16 + 8 frame"
     );
     assert!(
         !flat.contains("ev.bytes.len()==32"),
@@ -9103,7 +9122,11 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
         "the broker record reserves the same width it writes"
     );
     assert!(
-        flat.contains("left.to_le_bytes()"),
+        flat.contains("right.to_le_bytes()"),
         "an integer endpoint is framed little-endian, matching its column"
+    );
+    assert!(
+        flat.contains("<u64>::from_le_bytes(&ev.bytes[16..24]"),
+        "...and the follower decodes that slot back at the right offset"
     );
 }

@@ -1782,15 +1782,192 @@ impl RustGenerator {
         }
     }
 
+    /// The identity type a many-to-many junction keys an endpoint on (#266), or
+    /// `None` if the model cannot be a junction endpoint.
+    ///
+    /// #266 replaced the old blanket "uuid PK only" gate with the *physical*
+    /// requirement the junction actually has: it stores each endpoint's id in a
+    /// `FixedColumn`, indexes it in a `HashMap`, and frames it in a fixed-width
+    /// replication record — so the key must be fixed-width, hashable and totally
+    /// equatable.  `uuid`, the four integer types and `timestamp` qualify, which
+    /// is every shape an identity field is realistically written in (all four
+    /// `+` autos among them).  Anything else is reported by validation as an
+    /// error rather than silently dropping the relation — see
+    /// `collect_m2m_key_errors`, which is derived from exactly this predicate.
+    pub(crate) fn junction_key_type(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+    ) -> Option<forgedb_parser::FieldType> {
+        use forgedb_parser::FieldType as FT;
+        let ty = Self::identity_type(schema, model)?;
+        matches!(
+            ty,
+            FT::Uuid | FT::U32 | FT::U64 | FT::I32 | FT::I64 | FT::Timestamp
+        )
+        .then_some(ty)
+    }
+
     /// Many-to-many relations that can be generated.
     ///
-    /// #266 removed the UUID-key filter that used to sit here: the junction's
-    /// two columns are now each endpoint's own key width, so no shape of key is
-    /// excluded.  Kept as a named helper because *every* junction consumer must
-    /// agree on the same list (junction structs, `Database` fields, the delete
-    /// wrapper's cascade-unlink, the replication replay arms).
+    /// #266 replaced the UUID-key filter that used to sit here: the junction's
+    /// two columns are now each endpoint's own key width, so a mixed pair (a
+    /// `+u64` model linked to a `+uuid` one) generates.  What remains is the
+    /// physical floor — see `junction_key_type` — and a schema that trips it is
+    /// a validation *error*, so this filter never silently swallows a relation
+    /// the user wrote.  Kept as a named helper because *every* junction consumer
+    /// must agree on the same list (junction structs, `Database` fields, the
+    /// delete wrapper's cascade-unlink, the replication replay arms).
     pub(crate) fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
-        schema.detect_many_to_many_relations()
+        schema
+            .detect_many_to_many_relations()
+            .into_iter()
+            .filter(|m| {
+                schema
+                    .find_model(&m.model1)
+                    .and_then(|md| Self::junction_key_type(schema, md))
+                    .is_some()
+                    && schema
+                        .find_model(&m.model2)
+                        .and_then(|md| Self::junction_key_type(schema, md))
+                        .is_some()
+            })
+            .collect()
+    }
+
+    /// The on-disk width of a junction endpoint key (#266).  A plain `usize`
+    /// rather than a token expression so the emitted junction reads as
+    /// `24usize`, not `16usize + 8usize` — the widths are known at generation
+    /// time and the frame check is easier to read (and to spot-check) folded.
+    fn junction_key_width(ty: &forgedb_parser::FieldType) -> usize {
+        use forgedb_parser::FieldType as FT;
+        match ty {
+            FT::U32 | FT::I32 => 4,
+            FT::U64 | FT::I64 | FT::Timestamp => 8,
+            // `junction_key_type` admits nothing else.
+            _ => 16,
+        }
+    }
+
+    /// The two endpoint key types of a junction, left then right (#266).
+    /// Both are `Some` for every relation `valid_m2m` returns.
+    fn junction_key_pair(
+        schema: &Schema,
+        m: &forgedb_parser::ast::ManyToManyRelation,
+    ) -> (forgedb_parser::FieldType, forgedb_parser::FieldType) {
+        let of = |name: &str| {
+            schema
+                .find_model(name)
+                .and_then(|md| Self::junction_key_type(schema, md))
+                .unwrap_or(forgedb_parser::FieldType::Uuid)
+        };
+        (of(&m.model1), of(&m.model2))
+    }
+
+    /// The two endpoint key **type tokens** of a junction, left then right
+    /// (#266) — what every non-Rust surface needs to decode an id argument as
+    /// the key it actually is.
+    pub(crate) fn junction_key_idents(
+        schema: &Schema,
+        m: &forgedb_parser::ast::ManyToManyRelation,
+    ) -> (TokenStream, TokenStream) {
+        let (lt, rt) = Self::junction_key_pair(schema, m);
+        (
+            Self::map_field_type_ident(schema, &lt),
+            Self::map_field_type_ident(schema, &rt),
+        )
+    }
+
+    /// Append an endpoint id to a junction column, in the SAME encoding the
+    /// endpoint model's own id column uses (#266) — so a junction column is
+    /// byte-compatible with the id column it mirrors.
+    fn junction_append_expr(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        col: &TokenStream,
+        val: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! { #col.append_uuid(*#val.as_bytes()) },
+            forgedb_parser::FieldType::Timestamp => {
+                quote! { #col.append_timestamp(i64::from(#val)) }
+            }
+            other => {
+                let m = Self::get_append_method(schema, other);
+                quote! { #col.#m(#val) }
+            }
+        }
+    }
+
+    /// Read an endpoint id back out of a junction column (#266) — the inverse of
+    /// `junction_append_expr`, yielding the key-typed value.
+    fn junction_read_expr(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        col: &TokenStream,
+        row: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! {
+                Uuid::from_bytes(#col.read_uuid(#row).expect("Failed to read link"))
+            },
+            forgedb_parser::FieldType::Timestamp => quote! {
+                Timestamp::from(#col.read_timestamp(#row).expect("Failed to read link"))
+            },
+            other => {
+                let m = Self::get_read_method(schema, other);
+                quote! { #col.#m(#row).expect("Failed to read link") }
+            }
+        }
+    }
+
+    /// Decode an endpoint id back out of a durable replication frame (#82) —
+    /// the inverse of `junction_frame_stmt` (#266).
+    fn junction_frame_decode(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        slice: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! {
+                {
+                    let mut __b = [0u8; 16];
+                    __b.copy_from_slice(#slice);
+                    Uuid::from_bytes(__b)
+                }
+            },
+            forgedb_parser::FieldType::Timestamp => quote! {
+                Timestamp::from(i64::from_le_bytes(
+                    #slice.try_into().expect("junction frame slot is the key width"),
+                ))
+            },
+            other => {
+                let ident = Self::map_field_type_ident(schema, other);
+                quote! {
+                    <#ident>::from_le_bytes(
+                        #slice.try_into().expect("junction frame slot is the key width"),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Push an endpoint id onto the durable replication frame (#82) in the
+    /// junction column's own little-endian encoding, so the frame is exactly
+    /// `left_width + right_width` bytes (#266).
+    fn junction_frame_stmt(
+        ty: &forgedb_parser::FieldType,
+        buf: &TokenStream,
+        val: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => {
+                quote! { #buf.extend_from_slice(#val.as_bytes()); }
+            }
+            forgedb_parser::FieldType::Timestamp => {
+                quote! { #buf.extend_from_slice(&i64::from(#val).to_le_bytes()); }
+            }
+            _ => quote! { #buf.extend_from_slice(&#val.to_le_bytes()); },
+        }
     }
 
     /// Junction struct identifier for an M2M pair, e.g. `AuthorBookLink`.
@@ -8725,8 +8902,8 @@ impl RustGenerator {
         // generated match — the follower reads no `.forge` at runtime; it only
         // routes by the string tag the server stamped and lets generated code
         // materialize the typed record.  Id-bearing models dispatch to their
-        // per-model `apply`; a junction tag decodes the 32-byte opaque pair and
-        // re-links.  (Guard: this method must never `match` on a *decoded field*.)
+        // per-model `apply`; a junction tag decodes the opaque pair (one slot per
+        // endpoint key, #266) and re-links.  (Guard: this method must never `match` on a *decoded field*.)
         let apply_model_arms: Vec<_> = schema
             .models
             .iter()
@@ -8746,17 +8923,25 @@ impl RustGenerator {
                     Self::to_snake_case(&m.model1),
                     Self::to_snake_case(&m.model2)
                 );
+                let (lt, rt) = Self::junction_key_pair(schema, m);
+                let lwv = Self::junction_key_width(&lt);
+                let sumv = lwv + Self::junction_key_width(&rt);
+                let lw = proc_macro2::Literal::usize_unsuffixed(lwv);
+                let sw = proc_macro2::Literal::usize_unsuffixed(sumv);
+                let (lw, sw) = (quote! { #lw }, quote! { #sw });
+                let l_dec = Self::junction_frame_decode(schema, &lt, &quote! { &ev.bytes[0..#lw] });
+                let r_dec =
+                    Self::junction_frame_decode(schema, &rt, &quote! { &ev.bytes[#lw..#sw] });
                 quote! {
                     #base => {
-                        // Opaque 32-byte pair: left uuid ++ right uuid, exactly as
-                        // the junction broker recorded it.  The follower re-links
-                        // through the same generated `link` (broker `None`, inert).
-                        if ev.bytes.len() == 32 {
-                            let mut __l = [0u8; 16];
-                            __l.copy_from_slice(&ev.bytes[0..16]);
-                            let mut __r = [0u8; 16];
-                            __r.copy_from_slice(&ev.bytes[16..32]);
-                            self.#field.link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                        // Opaque pair: left ++ right, one slot per endpoint key
+                        // (#266), exactly as the junction broker recorded it.  The
+                        // follower re-links through the same generated `link`
+                        // (broker `None`, inert).
+                        if ev.bytes.len() == #sw {
+                            let __l = #l_dec;
+                            let __r = #r_dec;
+                            self.#field.link(__l, __r);
                         }
                         Ok(())
                     }
@@ -9302,10 +9487,10 @@ impl RustGenerator {
     /// storage-scoped `insert`/`update` cannot make — **foreign-key existence** —
     /// because it needs sibling-collection access (`self.<target>.get(fk)`), then
     /// delegate to the storage method (which enforces field constraints + `&unique`).
-    /// Required FKs must resolve; optional FKs must resolve *when set*.  Only
-    /// UUID-keyed targets are checked (an FK is always a `Uuid`, so an integer-PK
-    /// target cannot be resolved by it — the same restriction as relation
-    /// traversal).  The generated REST boundary routes creates/updates through
+    /// Required FKs must resolve; optional FKs must resolve *when set*.  Since
+    /// #266 an FK carries its target's OWN key type, so **every** target is
+    /// checked — a `+u64`-keyed parent resolves its children exactly as a
+    /// uuid-keyed one does.  The generated REST boundary routes creates/updates through
     /// these, so both the Rust API and REST get full integrity.
     fn generate_validated_writes(schema: &Schema) -> TokenStream {
         let mut methods = Vec::new();
@@ -9427,7 +9612,8 @@ impl RustGenerator {
     }
 
     /// Generate the `delete_<model>` referential-integrity wrappers on `Database`
-    /// (delete semantics).  For each UUID-keyed parent model, emits:
+    /// (delete semantics).  For each id-bearing parent model, emits (#266 — the
+    /// wrapper is no longer restricted to uuid-keyed parents):
     ///   * a public `delete_<model>(id) -> Result<bool, ValidationError>` that
     ///     evaluates every child FK's `@on_delete` policy before delegating to
     ///     `<model>Storage::delete`, and unlinks the model's M2M junction rows;
@@ -10937,6 +11123,27 @@ impl RustGenerator {
         for m in Self::valid_m2m(schema) {
             let struct_ident = Self::junction_struct_ident(&m);
             let reader_ident = format_ident!("{}Reader", struct_ident);
+            // #266: each endpoint's column, index and frame slot is that
+            // endpoint's OWN identity type — a junction is no longer uuid-shaped.
+            let (lt, rt) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
+            let rk = Self::map_field_type_ident(schema, &rt);
+            let lwv = Self::junction_key_width(&lt);
+            let rwv = Self::junction_key_width(&rt);
+            let lw = quote! { #lwv };
+            let rw = quote! { #rwv };
+            let l_col_ty = Self::storage_column_type_tokens(schema, &lt, false);
+            let r_col_ty = Self::storage_column_type_tokens(schema, &rt, false);
+            let l_read_local = Self::junction_read_expr(schema, &lt, &quote! { left_col }, &quote! { i });
+            let r_read_local = Self::junction_read_expr(schema, &rt, &quote! { right_col }, &quote! { i });
+            let l_read_self = Self::junction_read_expr(schema, &lt, &quote! { self.left_col }, &quote! { i });
+            let r_read_self = Self::junction_read_expr(schema, &rt, &quote! { self.right_col }, &quote! { i });
+            let l_append = Self::junction_append_expr(schema, &lt, &quote! { self.left_col }, &quote! { left });
+            let r_append = Self::junction_append_expr(schema, &rt, &quote! { self.right_col }, &quote! { right });
+            let sumv = proc_macro2::Literal::usize_unsuffixed(lwv + rwv);
+            let sw = quote! { #sumv };
+            let l_frame = Self::junction_frame_stmt(&lt, &quote! { __row_bytes }, &quote! { left });
+            let r_frame = Self::junction_frame_stmt(&rt, &quote! { __row_bytes }, &quote! { right });
             let reader_doc = format!(
                 "Read-only, lock-free reader handle for the {}<->{} junction (#56 Direction B)",
                 m.model1, m.model2
@@ -10972,8 +11179,8 @@ impl RustGenerator {
                     /// `Vec` preserves first-link order and never holds a duplicate
                     /// (idempotent add).  Writer-only, like the FK `find_by_*`
                     /// indexes (#100) — readers/snapshots still use the `_at` scans.
-                    left_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
-                    right_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
+                    left_index: std::collections::HashMap<#lk, Vec<#rk>>,
+                    right_index: std::collections::HashMap<#rk, Vec<#lk>>,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
                     broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
                 }
@@ -10994,11 +11201,11 @@ impl RustGenerator {
                     pub fn new_at(root: &std::path::Path) -> Self {
                         let left_col = FixedColumn::new(
                             root.join(#left_path),
-                            16usize,
+                            #lw,
                         ).expect("Failed to create junction column");
                         let right_col = FixedColumn::new(
                             root.join(#right_path),
-                            16usize,
+                            #rw,
                         ).expect("Failed to create junction column");
                         let mut tombstones = Tombstones::new(
                             root.join(#tombstones_path),
@@ -11020,21 +11227,17 @@ impl RustGenerator {
                         // edges are indexed (an unlinked-then-not-relinked pair is
                         // excluded).  Single pass over the prefix, mirroring
                         // `pairs_prefix` but populating both directions.
-                        let mut left_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                        let mut left_index: std::collections::HashMap<#lk, Vec<#rk>> =
                             std::collections::HashMap::new();
-                        let mut right_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                        let mut right_index: std::collections::HashMap<#rk, Vec<#lk>> =
                             std::collections::HashMap::new();
                         {
-                            let mut __state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                            let mut __state: std::collections::HashMap<(#lk, #rk), bool> =
                                 std::collections::HashMap::new();
-                            let mut __order: Vec<(Uuid, Uuid)> = Vec::new();
+                            let mut __order: Vec<(#lk, #rk)> = Vec::new();
                             for i in 0..row_count {
-                                let l = Uuid::from_bytes(
-                                    left_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                let r = Uuid::from_bytes(
-                                    right_col.read_uuid(i).expect("Failed to read link"),
-                                );
+                                let l = #l_read_local;
+                                let r = #r_read_local;
                                 if !__state.contains_key(&(l, r)) {
                                     __order.push((l, r));
                                 }
@@ -11064,7 +11267,7 @@ impl RustGenerator {
                     /// Add a live edge to both traversal indexes (#154), idempotent
                     /// per direction (a re-link of an already-live pair is a no-op in
                     /// the index — `pairs()`/`get` already dedup by pair).
-                    fn __index_add(&mut self, left: Uuid, right: Uuid) {
+                    fn __index_add(&mut self, left: #lk, right: #rk) {
                         let rs = self.left_index.entry(left).or_default();
                         if !rs.contains(&right) {
                             rs.push(right);
@@ -11077,7 +11280,7 @@ impl RustGenerator {
 
                     /// Remove an edge from both traversal indexes (#154); prunes an
                     /// emptied bucket so the maps stay bounded by the live degree.
-                    fn __index_remove(&mut self, left: Uuid, right: Uuid) {
+                    fn __index_remove(&mut self, left: #lk, right: #rk) {
                         if let Some(rs) = self.left_index.get_mut(&left) {
                             rs.retain(|r| *r != right);
                             if rs.is_empty() {
@@ -11094,12 +11297,12 @@ impl RustGenerator {
 
                     /// Live right-ids linked to `left` (#154): an O(degree) index
                     /// probe, not an O(all-links) scan.  Order is first-link order.
-                    pub fn rights_of(&self, left: Uuid) -> Vec<Uuid> {
+                    pub fn rights_of(&self, left: #lk) -> Vec<#rk> {
                         self.left_index.get(&left).cloned().unwrap_or_default()
                     }
 
                     /// Live left-ids linked to `right` (#154): the reverse probe.
-                    pub fn lefts_of(&self, right: Uuid) -> Vec<Uuid> {
+                    pub fn lefts_of(&self, right: #rk) -> Vec<#lk> {
                         self.right_index.get(&right).cloned().unwrap_or_default()
                     }
 
@@ -11118,26 +11321,27 @@ impl RustGenerator {
                         self.broker = broker;
                     }
 
-                    /// Write the junction's physical-layout manifest (#57): two
-                    /// 16-byte uuid columns and a row-count anchor on `right.bin`
-                    /// (appended last per link, 16 bytes/row).  Layout only —
-                    /// carries no relation semantics.  Best-effort; reopen anchors
-                    /// on the file length regardless.
+                    /// Write the junction's physical-layout manifest (#57): one
+                    /// fixed column per endpoint, each the width of that endpoint's
+                    /// own identity type (#266), and a row-count anchor on
+                    /// `right.bin` (appended last per link).  Layout only — carries
+                    /// no relation semantics.  Best-effort; reopen anchors on the
+                    /// file length regardless.
                     fn write_manifest(&self, root: &std::path::Path) {
                         let columns = vec![
                             forgedb_storage::ColumnMetadata {
                                 name: "left".to_string(),
-                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_type: #l_col_ty,
                                 column_index: 0usize,
-                                value_size: 16usize,
+                                value_size: #lw,
                                 kind: forgedb_storage::ColumnKind::Fixed,
                                 relative_path: "fixed/left.bin".to_string(),
                             },
                             forgedb_storage::ColumnMetadata {
                                 name: "right".to_string(),
-                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_type: #r_col_ty,
                                 column_index: 1usize,
-                                value_size: 16usize,
+                                value_size: #rw,
                                 kind: forgedb_storage::ColumnKind::Fixed,
                                 relative_path: "fixed/right.bin".to_string(),
                             },
@@ -11169,10 +11373,10 @@ impl RustGenerator {
                             format_version: __format_version,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
-                                bytes_per_row: 16usize,
+                                bytes_per_row: #rw,
                             }),
                             // A junction has no fields of its own — only the two
-                            // uuid endpoints — so it can never carry a `+u32`/`+u64`
+                            // endpoint ids — so it can never carry a `+u32`/`+u64`
                             // auto and its sequence map is always empty (#187).
                             auto_sequences: Default::default(),
                         };
@@ -11181,12 +11385,10 @@ impl RustGenerator {
 
                     /// Record a link between a `left` (model1) id and a `right`
                     /// (model2) id.
-                    pub fn link(&mut self, left: Uuid, right: Uuid) {
+                    pub fn link(&mut self, left: #lk, right: #rk) {
                         let row_index = self.row_count;
-                        self.left_col.append_uuid(*left.as_bytes())
-                            .expect("Failed to append link");
-                        self.right_col.append_uuid(*right.as_bytes())
-                            .expect("Failed to append link");
+                        #l_append.expect("Failed to append link");
+                        #r_append.expect("Failed to append link");
                         // A live link — tombstone `false`, appended in lockstep.
                         self.tombstones.append(false)
                             .expect("Failed to append junction tombstone");
@@ -11199,11 +11401,12 @@ impl RustGenerator {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
                         }
                         // Durable replication record (#82): the link pair as opaque
-                        // bytes (left ++ right, 32 bytes) at a global offset.
+                        // bytes (left ++ right, one slot per endpoint key) at a
+                        // global offset.
                         if let Some(__broker) = &self.broker {
-                            let mut __row_bytes = Vec::with_capacity(32);
-                            __row_bytes.extend_from_slice(left.as_bytes());
-                            __row_bytes.extend_from_slice(right.as_bytes());
+                            let mut __row_bytes = Vec::with_capacity(#sw);
+                            #l_frame
+                            #r_frame
                             if let Ok(mut __b) = __broker.lock() {
                                 let _ = __b.record(
                                     #base,
@@ -11222,7 +11425,7 @@ impl RustGenerator {
                     /// a live link existed, `false` if the pair was not linked.
                     /// Re-`link` after `unlink` restores the edge (a later live row
                     /// supersedes the retraction).
-                    pub fn unlink(&mut self, left: Uuid, right: Uuid) -> bool {
+                    pub fn unlink(&mut self, left: #lk, right: #rk) -> bool {
                         // Is the pair currently live?  O(degree) index probe (#154)
                         // instead of the old O(all-links) latest-wins scan.
                         let __live = self
@@ -11234,10 +11437,8 @@ impl RustGenerator {
                             return false;
                         }
                         let row_index = self.row_count;
-                        self.left_col.append_uuid(*left.as_bytes())
-                            .expect("Failed to append unlink");
-                        self.right_col.append_uuid(*right.as_bytes())
-                            .expect("Failed to append unlink");
+                        #l_append.expect("Failed to append unlink");
+                        #r_append.expect("Failed to append unlink");
                         self.tombstones.append(true)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
@@ -11247,9 +11448,9 @@ impl RustGenerator {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Deleted);
                         }
                         if let Some(__broker) = &self.broker {
-                            let mut __row_bytes = Vec::with_capacity(32);
-                            __row_bytes.extend_from_slice(left.as_bytes());
-                            __row_bytes.extend_from_slice(right.as_bytes());
+                            let mut __row_bytes = Vec::with_capacity(#sw);
+                            #l_frame
+                            #r_frame
                             if let Ok(mut __b) = __broker.lock() {
                                 let _ = __b.record(
                                     #base,
@@ -11264,7 +11465,7 @@ impl RustGenerator {
 
                     /// Retract every live pair whose `left` id equals `id` (M2M
                     /// cascade-unlink when the left model's row is deleted).
-                    pub fn unlink_all_left(&mut self, id: Uuid) {
+                    pub fn unlink_all_left(&mut self, id: #lk) {
                         // O(degree) index probe (#154) instead of an O(all-links)
                         // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.rights_of(id);
@@ -11275,7 +11476,7 @@ impl RustGenerator {
 
                     /// Retract every live pair whose `right` id equals `id` (M2M
                     /// cascade-unlink when the right model's row is deleted).
-                    pub fn unlink_all_right(&mut self, id: Uuid) {
+                    pub fn unlink_all_right(&mut self, id: #rk) {
                         // O(degree) index probe (#154) instead of an O(all-links)
                         // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.lefts_of(id);
@@ -11309,24 +11510,20 @@ impl RustGenerator {
                     /// Every LIVE (left, right) id pair (latest-wins per pair):
                     /// a pair is live iff its most-recent row is not retracted, so
                     /// `unlink`ed edges are excluded and a re-`link` restores it.
-                    pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs(&self) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(self.row_count)
                     }
 
                     /// Shared latest-wins resolution over the row prefix `0..end`.
-                    fn pairs_prefix(&self, end: usize) -> Vec<(Uuid, Uuid)> {
+                    fn pairs_prefix(&self, end: usize) -> Vec<(#lk, #rk)> {
                         // Preserve first-link order while applying latest-wins on
                         // the retraction flag.
-                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
-                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                        let mut order: Vec<(#lk, #rk)> = Vec::new();
+                        let mut state: std::collections::HashMap<(#lk, #rk), bool> =
                             std::collections::HashMap::new();
                         for i in 0..end {
-                            let left = Uuid::from_bytes(
-                                self.left_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            let right = Uuid::from_bytes(
-                                self.right_col.read_uuid(i).expect("Failed to read link"),
-                            );
+                            let left = #l_read_self;
+                            let right = #r_read_self;
                             let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
                             if !state.contains_key(&(left, right)) {
                                 order.push((left, right));
@@ -11352,7 +11549,7 @@ impl RustGenerator {
                     /// Live link pairs committed as of `snap` (#56): latest-wins
                     /// over the prefix `0..snap.watermark()`, excluding links
                     /// appended after the snapshot AND pairs retracted within it.
-                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(snap.watermark())
                     }
 
@@ -11382,18 +11579,14 @@ impl RustGenerator {
                     /// Live link pairs committed as of `snap` (#56 Direction B): the
                     /// same latest-wins prefix resolution as the writer junction,
                     /// reading through the shared-fd reader columns.
-                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         let end = snap.watermark();
-                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
-                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                        let mut order: Vec<(#lk, #rk)> = Vec::new();
+                        let mut state: std::collections::HashMap<(#lk, #rk), bool> =
                             std::collections::HashMap::new();
                         for i in 0..end {
-                            let left = Uuid::from_bytes(
-                                self.left_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            let right = Uuid::from_bytes(
-                                self.right_col.read_uuid(i).expect("Failed to read link"),
-                            );
+                            let left = #l_read_self;
+                            let right = #r_read_self;
                             let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
                             if !state.contains_key(&(left, right)) {
                                 order.push((left, right));
@@ -11437,7 +11630,9 @@ impl RustGenerator {
                     ) => (t, true),
                     _ => continue,
                 };
-                // Only when the target exists and is UUID-keyed.
+                // Only when the target model actually exists (a dangling FK is a
+                // validation error; codegen just skips it).  #266: its key type no
+                // longer matters — the getter takes whatever key the target has.
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
@@ -11564,6 +11759,10 @@ impl RustGenerator {
             let model2_ident = format_ident!("{}", m.model2);
             let model1_storage = format_ident!("{}", Self::to_snake_case(&m.model1));
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+            // #266: each side of the junction is keyed on its OWN identity type.
+            let (lt, rt) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
+            let rk = Self::map_field_type_ident(schema, &rt);
 
             // link_<a>_<b>
             let link_name = format!(
@@ -11581,7 +11780,7 @@ impl RustGenerator {
                 // collide for a self-referential M2M (model1 == model2).
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #link_ident(&mut self, left: Uuid, right: Uuid) {
+                    pub fn #link_ident(&mut self, left: #lk, right: #rk) {
                         self.#junction_field.link(left, right);
                     }
                 });
@@ -11606,7 +11805,7 @@ impl RustGenerator {
                 );
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #unlink_ident(&mut self, left: Uuid, right: Uuid) -> bool {
+                    pub fn #unlink_ident(&mut self, left: #lk, right: #rk) -> bool {
                         self.#junction_field_u.unlink(left, right)
                     }
                 });
@@ -11619,7 +11818,7 @@ impl RustGenerator {
                 let doc = format!("All linked {} for the given {} id.", m.model2, m.model1);
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #fwd_ident(&self, id: Uuid) -> Vec<#model2_ident> {
+                    pub fn #fwd_ident(&self, id: #lk) -> Vec<#model2_ident> {
                         // O(degree) junction-index probe (#154), not an
                         // O(all-links) `pairs()` scan.
                         self.#junction_field
@@ -11653,7 +11852,7 @@ impl RustGenerator {
                         pub fn #fwd_at_ident(
                             &self,
                             snap: &DatabaseSnapshot,
-                            id: Uuid,
+                            id: #lk,
                         ) -> Vec<#model2_ident> {
                             self.#junction_field2
                                 .pairs_at(&snap.#junction_field2)
@@ -11675,7 +11874,7 @@ impl RustGenerator {
                 let doc = format!("All linked {} for the given {} id.", m.model1, m.model2);
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #rev_ident(&self, id: Uuid) -> Vec<#model1_ident> {
+                    pub fn #rev_ident(&self, id: #rk) -> Vec<#model1_ident> {
                         // O(degree) junction-index probe (#154), not an
                         // O(all-links) `pairs()` scan.
                         self.#junction_field
@@ -11715,6 +11914,9 @@ impl RustGenerator {
             let junction_field = Self::junction_field_ident(&m);
             let model2_ident = format_ident!("{}", m.model2);
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+            // #266: the left endpoint's own identity type.
+            let (lt, _) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
 
             let fwd_at_name = format!("{}_{}_at", Self::to_snake_case(&m.model1), m.field1);
             if seen.insert(fwd_at_name.clone()) {
@@ -11728,7 +11930,7 @@ impl RustGenerator {
                     pub fn #fwd_at_ident(
                         &self,
                         snap: &DatabaseSnapshot,
-                        id: Uuid,
+                        id: #lk,
                     ) -> Vec<#model2_ident> {
                         self.#junction_field
                             .pairs_at(&snap.#junction_field)
@@ -11756,17 +11958,17 @@ impl RustGenerator {
 
     /// Generate `<Model>WithRelations` structs and their eager-load getters.
     ///
-    /// For every model with at least one forward foreign key to a UUID-keyed
-    /// target, emit a struct bundling the base record with each resolved
-    /// reference (`Option<Target>`, since the referent may be missing), and a
-    /// `<model>_with_relations(id)` getter that populates them in one call.  The
-    /// getter's `id` parameter uses the model's own PK type, so integer-PK models
-    /// are supported as long as their FK *targets* are UUID-keyed.
+    /// For every model with at least one forward foreign key, emit a struct
+    /// bundling the base record with each resolved reference (`Option<Target>`,
+    /// since the referent may be missing), and a `<model>_with_relations(id)`
+    /// getter that populates them in one call.  Both the getter's `id` and each
+    /// resolved reference use the relevant model's OWN identity type (#266) —
+    /// the target no longer has to be uuid-keyed.
     fn generate_eager_load(schema: &Schema) -> TokenStream {
         let mut items = Vec::new();
 
         for model in &schema.models {
-            // Collect forward FKs to UUID-keyed targets, preserving field order.
+            // Collect forward FKs, preserving field order (#266: any key type).
             let fks: Vec<(&forgedb_parser::Field, &str, bool)> = model
                 .fields
                 .iter()

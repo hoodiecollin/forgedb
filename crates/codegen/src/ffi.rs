@@ -1592,9 +1592,11 @@ impl FfiGenerator {
         };
 
         // The snapshot-scoped sibling of `vec_getter`: a `Vec`-returning getter
-        // over a decoded `Uuid` id AND a `*const Snapshot` handle:
+        // over a decoded `#id_ty` id (#266 — the endpoint's own key) AND a
+        // `*const Snapshot` handle:
         // `forgedb_<name>(db, snap, id, ...)`.  `call` uses the borrowed `snap`.
         let snap_vec_getter = |sym: &proc_macro2::Ident,
+                               id_ty: &proc_macro2::TokenStream,
                                call: proc_macro2::TokenStream,
                                doc: &str| {
             quote! {
@@ -1630,7 +1632,7 @@ impl FfiGenerator {
                         set_error(err_out, FORGEDB_ERR_INVALID_ARG, "id buffer is null".to_string());
                         return false;
                     };
-                    let id: Uuid = match serde_json::from_slice(id_bytes) {
+                    let id: #id_ty = match serde_json::from_slice(id_bytes) {
                         Ok(v) => v,
                         Err(e) => {
                             set_error(err_out, FORGEDB_ERR_INVALID_ARG, format!("invalid id JSON: {e}"));
@@ -1790,6 +1792,8 @@ impl FfiGenerator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
 
             // link_<a>_<b>
             let link_name = format!("link_{snake1}_{snake2}");
@@ -1822,10 +1826,10 @@ impl FfiGenerator {
                             return false;
                         };
                         let (Ok(left), Ok(right)) = (
-                            serde_json::from_slice::<Uuid>(lb),
-                            serde_json::from_slice::<Uuid>(rb),
+                            serde_json::from_slice::<#lk>(lb),
+                            serde_json::from_slice::<#rk>(rb),
                         ) else {
-                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid UUID JSON".to_string());
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid endpoint id JSON".to_string());
                             return false;
                         };
                         match catch_unwind(AssertUnwindSafe(|| db.inner.#link_ident(left, right))) {
@@ -1870,10 +1874,10 @@ impl FfiGenerator {
                             return -1;
                         };
                         let (Ok(left), Ok(right)) = (
-                            serde_json::from_slice::<Uuid>(lb),
-                            serde_json::from_slice::<Uuid>(rb),
+                            serde_json::from_slice::<#lk>(lb),
+                            serde_json::from_slice::<#rk>(rb),
                         ) else {
-                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid UUID JSON".to_string());
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid endpoint id JSON".to_string());
                             return -1;
                         };
                         match catch_unwind(AssertUnwindSafe(|| db.inner.#unlink_ident(left, right))) {
@@ -1893,7 +1897,7 @@ impl FfiGenerator {
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
                 let sym = format_ident!("forgedb_{}", fwd_name);
-                let id_ty = quote! { Uuid };
+                let id_ty = lk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model2, m.model1);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#fwd_ident(id) }, &doc));
 
@@ -1913,6 +1917,7 @@ impl FfiGenerator {
                     );
                     ops.push(snap_vec_getter(
                         &at_sym,
+                        &lk,
                         quote! { db.inner.#fwd_at_ident(&snap.inner, id) },
                         &at_doc,
                     ));
@@ -1924,7 +1929,7 @@ impl FfiGenerator {
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
                 let sym = format_ident!("forgedb_{}", rev_name);
-                let id_ty = quote! { Uuid };
+                let id_ty = rk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model1, m.model2);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#rev_ident(id) }, &doc));
             }

@@ -722,6 +722,8 @@ impl PyO3Generator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
             let model1 = schema.find_model(&m.model1);
             let model2 = schema.find_model(&m.model2);
 
@@ -733,8 +735,8 @@ impl PyO3Generator {
                 methods.push(quote! {
                     #[doc = #doc]
                     fn #link_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<()> {
-                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
-                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#link_ident(left, right))) {
                             Ok(()) => Ok(()),
                             Err(p) => Err(panic_to_py_err(p)),
@@ -751,8 +753,8 @@ impl PyO3Generator {
                 methods.push(quote! {
                     #[doc = #doc]
                     fn #unlink_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
-                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
-                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#unlink_ident(left, right))) {
                             Ok(removed) => Ok(removed),
                             Err(p) => Err(panic_to_py_err(p)),
@@ -772,7 +774,7 @@ impl PyO3Generator {
                         methods.push(quote! {
                             #[doc = #doc]
                             fn #fwd_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_b>> {
-                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                let id: #lk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
                                     Ok(rows) => Ok(rows.into_iter().map(#py_b::from_record).collect()),
                                     Err(p) => Err(panic_to_py_err(p)),
@@ -794,7 +796,7 @@ impl PyO3Generator {
                         methods.push(quote! {
                             #[doc = #doc]
                             fn #rev_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_a>> {
-                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                let id: #rk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
                                     Ok(rows) => Ok(rows.into_iter().map(#py_a::from_record).collect()),
                                     Err(p) => Err(panic_to_py_err(p)),

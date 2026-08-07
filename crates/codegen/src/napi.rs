@@ -867,6 +867,8 @@ impl NapiGenerator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
 
             // link_<a>_<b>
             let link_name = format!("link_{snake1}_{snake2}");
@@ -877,8 +879,8 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #link_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<()> {
-                        let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
-                        let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
+                        let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
+                        let right: #rk = env.from_js_value(right).map_err(to_napi_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.write().#link_ident(left, right))) {
                             Ok(()) => Ok(()),
                             Err(p) => Err(panic_to_napi_err(p)),
@@ -896,8 +898,8 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #unlink_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<bool> {
-                        let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
-                        let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
+                        let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
+                        let right: #rk = env.from_js_value(right).map_err(to_napi_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.write().#unlink_ident(left, right))) {
                             Ok(removed) => Ok(removed),
                             Err(p) => Err(panic_to_napi_err(p)),
@@ -916,7 +918,7 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_b>> {
-                        let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
+                        let id: #lk = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#fwd_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
@@ -936,7 +938,7 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_a>> {
-                        let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
+                        let id: #rk = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#rev_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),

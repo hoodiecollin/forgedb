@@ -4381,11 +4381,12 @@ impl PostTagLink {
     ) {
         self.broker = broker;
     }
-    /// Write the junction's physical-layout manifest (#57): two
-    /// 16-byte uuid columns and a row-count anchor on `right.bin`
-    /// (appended last per link, 16 bytes/row).  Layout only —
-    /// carries no relation semantics.  Best-effort; reopen anchors
-    /// on the file length regardless.
+    /// Write the junction's physical-layout manifest (#57): one
+    /// fixed column per endpoint, each the width of that endpoint's
+    /// own identity type (#266), and a row-count anchor on
+    /// `right.bin` (appended last per link).  Layout only — carries
+    /// no relation semantics.  Best-effort; reopen anchors on the
+    /// file length regardless.
     fn write_manifest(&self, root: &std::path::Path) {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "left".to_string(), column_type :
@@ -4994,12 +4995,17 @@ impl Database {
             "Tag" => self.tag.apply(ev.kind, &ev.bytes),
             "post_tag_link" => {
                 if ev.bytes.len() == 32 {
-                    let mut __l = [0u8; 16];
-                    __l.copy_from_slice(&ev.bytes[0..16]);
-                    let mut __r = [0u8; 16];
-                    __r.copy_from_slice(&ev.bytes[16..32]);
-                    self.post_tag_link
-                        .link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                    let __l = {
+                        let mut __b = [0u8; 16];
+                        __b.copy_from_slice(&ev.bytes[0..16]);
+                        Uuid::from_bytes(__b)
+                    };
+                    let __r = {
+                        let mut __b = [0u8; 16];
+                        __b.copy_from_slice(&ev.bytes[16..32]);
+                        Uuid::from_bytes(__b)
+                    };
+                    self.post_tag_link.link(__l, __r);
                 }
                 Ok(())
             }
