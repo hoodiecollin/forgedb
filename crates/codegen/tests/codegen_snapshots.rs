@@ -8969,16 +8969,16 @@ fn test_bindings_fk_type_equals_the_targets_own_id_type() {
     // Go binding: the struct field for `Comment.post` must be spelled the same
     // as `Post.id`'s own field.
     let go = GoGenerator::generate(&schema).unwrap().code;
-    let post_id = go
-        .lines()
-        .find(|l| l.trim_start().starts_with("ID "))
-        .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
-        .expect("Post.ID field present in the Go binding");
-    let comment_fk = go
-        .lines()
-        .find(|l| l.trim_start().starts_with("Post "))
-        .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
-        .expect("Comment.Post field present in the Go binding");
+    let field_type = |decl: &str, name: &str| {
+        let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
+        body.lines()
+            .take_while(|l| !l.starts_with('}'))
+            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+            .unwrap_or_else(|| panic!("field `{name}` in `{decl}`"))
+    };
+    let post_id = field_type("type Post struct {", "Id");
+    let comment_fk = field_type("type Comment struct {", "Post");
     assert_eq!(
         comment_fk, post_id,
         "the Go FK field and the target's own id field must have one type"

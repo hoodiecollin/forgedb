@@ -1670,7 +1670,7 @@ impl FfiGenerator {
                     ) => t,
                     _ => continue,
                 };
-                let Some(target) = schema.find_model(target_name) else { continue };
+                if schema.find_model(target_name).is_none() { continue; }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -1777,7 +1777,8 @@ impl FfiGenerator {
             }
             let method_ident = format_ident!("{}", method_name);
             let sym = format_ident!("forgedb_{}", method_name);
-            let id_ty = quote! { Uuid };
+            // #266: the C-ABI id buffer decodes as the PARENT's own key type.
+            let id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id (JSON array).",
                 p.child_model, p.child_field, p.parent_model

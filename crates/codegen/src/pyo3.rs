@@ -210,7 +210,7 @@ impl PyO3Generator {
     /// type so PyO3 emits typed Python stubs.  For types without a natural single
     /// Python type (`json`, `char(N)`, inline `struct`) we fall back to pythonize
     /// and return `Bound<'py, PyAny>`.
-    fn pyo3_getter(
+    fn pyo3_getter(schema: &Schema, 
         field_type: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
     ) -> (TokenStream, TokenStream) {
@@ -277,17 +277,12 @@ impl PyO3Generator {
                 },
             ),
 
-            // Required FK (Uuid) → hyphenated string.
-            FieldType::Relation(RelationType::RequiredReference(_)) => (
-                quote! { String },
-                quote! { Ok(self.inner.#field_name.to_string()) },
-            ),
-
-            // Optional FK (Option<Uuid>) → Option<String>.
-            FieldType::Relation(RelationType::OptionalReference(_)) => (
-                quote! { Option<String> },
-                quote! { Ok(self.inner.#field_name.map(|__u| __u.to_string())) },
-            ),
+            // #266: an FK surfaces with the SAME Python type as the target's
+            // own `id` — resolved through the target key's own arm rather than
+            // hardcoded to the uuid form.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::pyo3_getter(schema, &RustGenerator::resolved_type(schema, field_type), field_name),
 
             // Nullable(inner) — recurse; the outer getter wraps in Option.
             FieldType::Nullable(inner) => {
@@ -393,7 +388,7 @@ impl PyO3Generator {
                     .map(|f| {
                         let fname = format_ident!("{}", f.name);
                         let doc = format!("The `{}` field.", f.name);
-                        let (ret_ty, body) = Self::pyo3_getter(&f.field_type, &fname);
+                        let (ret_ty, body) = Self::pyo3_getter(schema, &f.field_type, &fname);
                         // Whether the return type references the `'py` lifetime
                         // (only for the pythonize fallback path).
                         let needs_py_lifetime = matches!(
@@ -705,6 +700,8 @@ impl PyO3Generator {
             }
             let method_ident = format_ident!("{}", method_name);
             let py_child = format_ident!("Py{}", child.name);
+            // #266: the id arrives as the PARENT's own key type.
+            let parent_id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id.",
                 p.child_model, p.child_field, p.parent_model
@@ -712,7 +709,7 @@ impl PyO3Generator {
             methods.push(quote! {
                 #[doc = #doc]
                 fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_child>> {
-                    let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                    let id: #parent_id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                     match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
                         Ok(rows) => Ok(rows.into_iter().map(#py_child::from_record).collect()),
                         Err(p) => Err(panic_to_py_err(p)),

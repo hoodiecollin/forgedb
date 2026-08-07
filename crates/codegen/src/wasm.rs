@@ -280,7 +280,7 @@ impl WasmGenerator {
                 let get_rust = format!("get_{model_snake}");
                 let get_js = format!("get{}", model.name);
                 let get_ident = format_ident!("{get_rust}");
-                let pk_parse = pk_parse_opt(model);
+                let pk_parse = pk_parse_opt(schema, model);
                 push(
                     &mut methods,
                     &get_rust,
@@ -312,16 +312,16 @@ impl WasmGenerator {
             };
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_field = format_ident!("{model_snake}");
-            let pk_parse = pk_parse_opt(model);
+            let pk_parse = pk_parse_opt(schema, model);
             for field in &model.fields {
                 let target_name = match &field.field_type {
                     FieldType::Relation(RelationType::RequiredReference(t))
                     | FieldType::Relation(RelationType::OptionalReference(t)) => t,
                     _ => continue,
                 };
-                let Some(target) = schema.find_model(target_name) else {
+                if schema.find_model(target_name).is_none() {
                     continue;
-                };
+                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 let method_ident = format_ident!("{method_name}");
                 let js = lower_camel_from_snake(&method_name);
@@ -348,8 +348,9 @@ impl WasmGenerator {
 
         // --- Reverse one-to-many collection getters --------------------------
         // Mirror section B, including the by-child-field disambiguation for a
-        // parent whose child holds multiple FKs back to it. Parents are
-        // UUID-keyed, so the argument is always a uuid string.
+        // parent whose child holds multiple FKs back to it. #266: the argument
+        // is parsed as the parent's OWN key type, so a non-uuid-keyed parent is
+        // an ordinary FK target here too.
         let pairs = schema.detect_relations();
         let mut group_counts: HashMap<(String, String), usize> = HashMap::new();
         for p in &pairs {
@@ -361,6 +362,8 @@ impl WasmGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
+            // #266: the argument is the PARENT's key, whatever it is.
+            let parent_pk_parse = pk_parse_opt(schema, parent);
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -391,9 +394,8 @@ impl WasmGenerator {
                     #[doc = #doc]
                     #[wasm_bindgen(js_name = #js)]
                     pub fn #method_ident(&self, id: String) -> String {
-                        let __pk = match Uuid::parse_str(&id) {
-                            Ok(__u) => __u,
-                            Err(_) => return "[]".to_string(),
+                        let Some(__pk) = #parent_pk_parse else {
+                            return "[]".to_string();
                         };
                         serde_json::to_string(&self.db.borrow().#method_ident(__pk))
                             .unwrap_or_else(|_| "[]".to_string())
@@ -475,7 +477,7 @@ impl WasmGenerator {
                     let get_js = format!("get{}{}", model.name, pascal);
                     let get_ident = format_ident!("{get_rust}");
                     let proj_get = format_ident!("get_{}", proj.name);
-                    let pk_parse = pk_parse_opt(model);
+                    let pk_parse = pk_parse_opt(schema, model);
                     push(
                         &mut methods,
                         &get_rust,
@@ -834,8 +836,10 @@ fn identity_field(model: &Model) -> Option<&forgedb_parser::Field> {
 /// An expression yielding `Option<PkType>` from a `String` binding named `id`,
 /// matching the model's identity type (uuid or integer). Only used for
 /// id-bearing models.
-fn pk_parse_opt(model: &Model) -> TokenStream {
-    match identity_field(model).map(|f| &f.field_type) {
+fn pk_parse_opt(schema: &Schema, model: &Model) -> TokenStream {
+    // #266: resolved, so a model whose identity is itself a foreign key
+    // (`Order { id: *Customer }`) parses its key as the far end of the chain.
+    match RustGenerator::identity_type(schema, model).as_ref() {
         Some(FieldType::U32) => quote! { id.parse::<u32>().ok() },
         Some(FieldType::U64) => quote! { id.parse::<u64>().ok() },
         Some(FieldType::I32) => quote! { id.parse::<i32>().ok() },

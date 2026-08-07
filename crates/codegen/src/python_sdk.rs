@@ -71,15 +71,15 @@ impl PythonSdkGenerator {
 
         // Models + create-input + projection dataclasses.
         for model in &schema.models {
-            Self::push_dataclass(&mut c, &model.name, &model.fields.iter().collect::<Vec<_>>(),
+            Self::push_dataclass(schema, &mut c, &model.name, &model.fields.iter().collect::<Vec<_>>(),
                 &format!("{} — mirrors the wire shape of the generated model.", model.name));
-            Self::push_dataclass(&mut c, &format!("{}Create", model.name),
+            Self::push_dataclass(schema, &mut c, &format!("{}Create", model.name),
                 &RustGenerator::creatable_fields(model),
                 &format!("Input to create_{} — a {} without server-synthesized (+uuid/+timestamp) fields.",
                     RustGenerator::to_snake_case(&model.name), model.name));
             for proj in &model.projections {
                 let ty = format!("{}{}", model.name, RustGenerator::projection_pascal(&proj.name));
-                Self::push_dataclass(&mut c, &ty, &RustGenerator::projected_field_set(model, proj),
+                Self::push_dataclass(schema, &mut c, &ty, &RustGenerator::projected_field_set(model, proj),
                     &format!("Projection `{}` of {} — PK + declared columns only.", proj.name, model.name));
             }
         }
@@ -93,12 +93,12 @@ impl PythonSdkGenerator {
     /// defaulted (nullable/opaque, `= None`) so the class body never puts a
     /// defaulted field before a required one (a Python `dataclass` error). JSON
     /// (de)serialization is by field name, so the reorder is behavior-neutral.
-    fn push_dataclass(c: &mut String, name: &str, fields: &[&Field], doc: &str) {
+    fn push_dataclass(schema: &Schema, c: &mut String, name: &str, fields: &[&Field], doc: &str) {
         c.push_str(&format!("@dataclass\nclass {name}:\n    \"\"\"{doc}\"\"\"\n"));
         let mut required: Vec<&Field> = Vec::new();
         let mut optional: Vec<&Field> = Vec::new();
         for &f in fields {
-            if Self::is_defaulted(f) {
+            if Self::is_defaulted(schema, f) {
                 optional.push(f);
             } else {
                 required.push(f);
@@ -109,10 +109,10 @@ impl PythonSdkGenerator {
             return;
         }
         for f in required {
-            c.push_str(&format!("    {}: {}\n", f.name, Self::py_type(f)));
+            c.push_str(&format!("    {}: {}\n", f.name, Self::py_type(schema, f)));
         }
         for f in optional {
-            c.push_str(&format!("    {}: {} = None\n", f.name, Self::py_type(f)));
+            c.push_str(&format!("    {}: {} = None\n", f.name, Self::py_type(schema, f)));
         }
         c.push_str("\n\n");
     }
@@ -212,8 +212,8 @@ impl PythonSdkGenerator {
 
     /// Whether a field is emitted with a `= None` default (and so goes in the
     /// trailing partition): nullable fields and the opaque bucket.
-    fn is_defaulted(field: &Field) -> bool {
-        let (opaque, _) = Self::base_type(&field.field_type);
+    fn is_defaulted(schema: &Schema, field: &Field) -> bool {
+        let (opaque, _) = Self::base_type(schema, &field.field_type);
         opaque || field.is_nullable()
     }
 
@@ -222,8 +222,8 @@ impl PythonSdkGenerator {
     /// `char(N)`, fixed arrays, inline structs, and virtual one-to-many / M2M
     /// relations, which the server serializes as `null`) maps to `Any` — the
     /// honest analogue of the TS SDK's `unknown`/`any`.
-    fn py_type(field: &Field) -> String {
-        let (opaque, base) = Self::base_type(&field.field_type);
+    fn py_type(schema: &Schema, field: &Field) -> String {
+        let (opaque, base) = Self::base_type(schema, &field.field_type);
         if opaque {
             "Any".to_string()
         } else if field.is_nullable() {
@@ -233,7 +233,7 @@ impl PythonSdkGenerator {
         }
     }
 
-    fn base_type(ft: &FieldType) -> (bool, String) {
+    fn base_type(schema: &Schema, ft: &FieldType) -> (bool, String) {
         match ft {
             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => (false, "int".into()),
             FieldType::Timestamp => (false, "int".into()),
@@ -245,9 +245,11 @@ impl PythonSdkGenerator {
             }
             FieldType::Decimal => (false, "str".into()),
             FieldType::Enum(name) => (false, name.clone()),
-            FieldType::Relation(RelationType::RequiredReference(_))
-            | FieldType::Relation(RelationType::OptionalReference(_)) => (false, "str".into()),
-            FieldType::Nullable(inner) => Self::base_type(inner),
+            // #266: an FK carries the target's identity value on the wire.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::base_type(schema, &RustGenerator::resolved_type(schema, ft)),
+            FieldType::Nullable(inner) => Self::base_type(schema, inner),
             _ => (true, "Any".into()),
         }
     }
