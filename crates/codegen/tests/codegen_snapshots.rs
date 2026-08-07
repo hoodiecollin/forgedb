@@ -8492,6 +8492,38 @@ fn test_rust_generation_string_n_exact_has_no_prefix_decode() {
     );
 }
 
+/// Two properties of the packed slot that every other assertion here is blind
+/// to, because both are about the *bytes written* rather than the shape of the
+/// code. Added after a mutation run: breaking either one left the whole suite
+/// green.
+///
+///  1. The length prefix records a **byte** count. A character count reads back
+///     a truncated value for any multi-byte `@utf8` field, and recovering the
+///     byte end from a character count would mean walking the UTF-8 on every
+///     row — the per-row cost #238 exists to avoid.
+///  2. The slot's unused tail is **zero**. Nothing correctness-critical needs
+///     it (the prefix bounds the read), but it is what makes a column file
+///     byte-reproducible for the same logical content, which is what lets a
+///     diff of two data dirs mean anything.
+#[test]
+fn test_rust_generation_string_n_prefix_is_bytes_and_the_tail_is_zeroed() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n  tag: string(8) @utf8\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        flat.contains("let __n = __b.len().min("),
+        "the prefix is written from the value's BYTE length: {flat}"
+    );
+    assert!(
+        !flat.contains("chars().count().min("),
+        "a character count in the prefix truncates every multi-byte value"
+    );
+    assert!(
+        flat.contains("let mut __buf = [0u8;"),
+        "the packing buffer is zero-filled, so the unused tail is deterministic"
+    );
+}
+
 /// Res 4: the ASCII restriction is a *value* constraint — enforced on every
 /// write, like `@pattern`, not a validation-time-only check. And it runs FIRST,
 /// because it is the only check that can make a later one report a cause that is
