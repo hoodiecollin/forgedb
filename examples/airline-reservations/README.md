@@ -11,7 +11,7 @@ via composite index.
 
 | Model | Role |
 |---|---|
-| `Airport` | Airport with a unique IATA code (`string`, exactly 3 chars) |
+| `Airport` | Airport with a unique IATA code (`string(3!)` — inline, exactly 3 chars) |
 | `Aircraft` | Airframe with capacity; owns `[Seat]` and `[Flight]` |
 | `Flight` | Scheduled service with two `*Airport` FKs (origin + destination) and an `*Aircraft` FK |
 | `Seat` | Physical seat on an aircraft; composite index prevents duplicate seat numbers per aircraft |
@@ -27,7 +27,7 @@ Key relationships:
 
 ## Grammar features showcased
 
-- `^&string @length(3, 3)` on `Airport.iata_code` — indexed unique text field with an exact length (IATA codes are text, not bytes)
+- `^&string(3!)` on `Airport.iata_code` — an indexed, unique, fixed-width inline string. IATA codes are text, not bytes, so `bytes(3)` would put `[83, 70, 79]` on the wire; and the length belongs in the type rather than in a `@length(3, 3)` directive, which is why the directive is rejected here
 - Dual FK to the same model (`Flight.origin_airport: *Airport`, `Flight.destination_airport: *Airport`)
 - Composite `@index(aircraft, seat_number)` on `Seat` — unique seat per airframe
 - Composite `@index(flight, seat)` on `Booking` — the discrete seat-lock reservation constraint
