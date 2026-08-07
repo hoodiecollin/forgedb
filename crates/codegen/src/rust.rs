@@ -2446,7 +2446,7 @@ impl RustGenerator {
             .fields
             .iter()
             .filter_map(|field| {
-                let is_string = Self::is_string_type(&field.field_type);
+                let is_string = Self::is_string_semantic(&field.field_type);
                 let is_numeric = Self::is_numeric_type(&field.field_type);
                 let fname_str = field.name.as_str();
 
@@ -2730,12 +2730,12 @@ impl RustGenerator {
         match &field.field_type {
             FieldType::Relation(RelationType::RequiredReference(_)) => quote! { Uuid },
             FieldType::Relation(RelationType::OptionalReference(_)) => quote! { Option<Uuid> },
-            FieldType::Nullable(inner) if Self::is_string_type(inner) => quote! { Option<&str> },
+            FieldType::Nullable(inner) if Self::is_string_semantic(inner) => quote! { Option<&str> },
             FieldType::Nullable(inner) => {
                 let ty = Self::map_field_type_ident(inner);
                 quote! { Option<#ty> }
             }
-            _ if Self::is_string_type(&field.field_type) => quote! { &str },
+            _ if Self::is_string_semantic(&field.field_type) => quote! { &str },
             _ => {
                 let ty = Self::map_field_type_ident(&field.field_type);
                 quote! { #ty }
@@ -4140,7 +4140,7 @@ impl RustGenerator {
                         }
                     });
                 }
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_string_type(&field.field_type) {
                 if field.is_nullable() {
                     // Nullable string (`string?` -> Option<String>).  Encode with a
                     // 1-byte presence tag so `None` and `Some("")` round-trip
@@ -4301,7 +4301,7 @@ impl RustGenerator {
                 )
         );
         let is_timestamp = matches!(&f.field_type, forgedb_parser::FieldType::Timestamp);
-        let is_string = Self::is_string_type(&f.field_type);
+        let is_string = Self::is_variable_string_type(&f.field_type);
 
         let expr = if is_uuid_like {
             quote! {
@@ -4505,7 +4505,7 @@ impl RustGenerator {
                     }
                 };
                 out.push((col, one));
-            } else if Self::is_string_type(&field.field_type) {
+            } else if Self::is_variable_string_type(&field.field_type) {
                 let one = if field.is_nullable() {
                     // Nullable string: the 1-byte presence tag `0x00` = None (#231 —
                     // one known byte, no allocation).
@@ -6362,7 +6362,7 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
-        } else if Self::is_string_type(&field.field_type) && borrowed {
+        } else if Self::is_variable_string_type(&field.field_type) && borrowed {
             // #224: borrow the slot out of the buffered span instead of allocating
             // a `String` per field per row.  Same presence-tag decode as the owned
             // arm below — the tag byte is `0x01`, so slicing at byte 1 is always a
@@ -6386,7 +6386,7 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
-        } else if Self::is_string_type(&field.field_type) {
+        } else if Self::is_variable_string_type(&field.field_type) {
             let stmt = if field.is_nullable() {
                 // Decode the 1-byte presence tag written by insert
                 // (0x01 = Some, anything else = None).
@@ -6826,7 +6826,7 @@ impl RustGenerator {
     /// field twice.  Underscores are appended until the name is free, so the two
     /// emission sites agree by construction.
     fn scan_ref_anchor(fields: &[&forgedb_parser::Field]) -> Option<proc_macro2::Ident> {
-        if fields.iter().any(|f| Self::is_string_type(&f.field_type)) {
+        if fields.iter().any(|f| Self::is_string_semantic(&f.field_type)) {
             return None;
         }
         let mut name = String::from("__borrow");
@@ -6843,7 +6843,7 @@ impl RustGenerator {
     /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
     /// both std, so `record.<field> == <parsed param>` needs no second form.
     fn scan_ref_field_type(field: &forgedb_parser::Field) -> TokenStream {
-        if Self::is_string_type(&field.field_type) {
+        if Self::is_string_semantic(&field.field_type) {
             return if field.is_nullable() {
                 quote! { Option<&'a str> }
             } else {
@@ -6894,7 +6894,7 @@ impl RustGenerator {
         for field in fields {
             let fname = format_ident!("{}", field.name);
             let col_ident = format_ident!("{}_col", field.name);
-            let buffered_ty = if Self::is_string_type(&field.field_type)
+            let buffered_ty = if Self::is_variable_string_type(&field.field_type)
                 || Self::is_json_type(&field.field_type)
             {
                 Some(quote! { forgedb_storage::BufferedVariableColumn })
@@ -7035,7 +7035,7 @@ impl RustGenerator {
         for field in fields {
             let fname = format_ident!("{}", field.name);
             let col_ident = format_ident!("{}_col", field.name);
-            let buffered_ty = if Self::is_string_type(&field.field_type)
+            let buffered_ty = if Self::is_variable_string_type(&field.field_type)
                 || Self::is_json_type(&field.field_type)
             {
                 Some(quote! { forgedb_storage::BufferedVariableColumn })
@@ -7612,19 +7612,66 @@ impl RustGenerator {
         Some((schema_attr, quote! { #[serde(with = #path)] }))
     }
 
-    /// Check if a field type is a string (variable-length).
+    /// Is this field a **bare `string`** — the variable-storage one?
     ///
-    /// This is the *semantic* "String" predicate — it gates the string-specific
-    /// encode/decode body (`append_string`/`read_string` with UTF-8 conversion)
-    /// and the string validation directives (`@length`/`@email`/…).  For
-    /// column-layout classification (does this field get a `VariableColumn`?) use
-    /// `is_variable_column_type`, which also covers `json`.
-    fn is_string_type(field_type: &forgedb_parser::FieldType) -> bool {
+    /// This is the *storage/codec* predicate. It gates the
+    /// `append_string`/`read_string` bodies, the `BufferedVariableColumn` used to
+    /// scan the field, and (via `is_variable_column_type`) whether the field gets
+    /// a `VariableColumn` at all.
+    ///
+    /// It deliberately does **not** admit `string(N)` (#238), whose whole purpose
+    /// is to be stored in a `FixedColumn`. There are three predicates here, and
+    /// picking the wrong one is silent rather than loud, so the split is spelled
+    /// out:
+    ///
+    /// | predicate | asks | admits |
+    /// |---|---|---|
+    /// | `is_variable_string_type` | which codec / which column? | `string` |
+    /// | `is_inline_string_type` | is this the fixed-slot string? | `string(N)` |
+    /// | `is_string_semantic` | is the *value* a Rust `String`? | both |
+    ///
+    /// Before #238 the first and the third were one function, and its own doc
+    /// comment already recorded that it gated two unrelated things. Merging them
+    /// again would give `string(N)` a `VariableColumn` while every snapshot test
+    /// passed — which is exactly the storage this type exists to avoid.
+    fn is_variable_string_type(field_type: &forgedb_parser::FieldType) -> bool {
         match field_type {
             forgedb_parser::FieldType::String => true,
-            forgedb_parser::FieldType::Nullable(inner) => Self::is_string_type(inner),
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_variable_string_type(inner),
             _ => false,
         }
+    }
+
+    /// Is this field an **inline `string(N)` / `string(N!)`** (#238)?
+    ///
+    /// The fixed-slot string: one `FixedColumn` slot per row, one byte per
+    /// character (four under `@utf8`), no `(offset, length)` indirection. See
+    /// [`Self::is_variable_string_type`] for why this is a separate predicate.
+    fn is_inline_string_type(field_type: &forgedb_parser::FieldType) -> bool {
+        match field_type {
+            forgedb_parser::FieldType::StringN { .. } => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_inline_string_type(inner),
+            _ => false,
+        }
+    }
+
+    /// Peel to the inline-string parameters, through a `Nullable` wrapper (#238).
+    fn inline_string_params(field_type: &forgedb_parser::FieldType) -> Option<(u8, bool)> {
+        match field_type {
+            forgedb_parser::FieldType::StringN { chars, exact } => Some((*chars, *exact)),
+            forgedb_parser::FieldType::Nullable(inner) => Self::inline_string_params(inner),
+            _ => None,
+        }
+    }
+
+    /// Does this field's *value* present as a Rust `String`?
+    ///
+    /// The semantic predicate: it gates the string validation directives
+    /// (`@length`/`@email`/`@url`/`@pattern`), the `&str` probe-parameter type,
+    /// and the borrowed `&'a str` scan view. All of those are properties of the
+    /// value, not of where the bytes live, so both spellings qualify (#238).
+    fn is_string_semantic(field_type: &forgedb_parser::FieldType) -> bool {
+        Self::is_variable_string_type(field_type) || Self::is_inline_string_type(field_type)
     }
 
     /// Check if a field type is `json` (variable-length, typed `serde_json::Value`).
@@ -7685,9 +7732,19 @@ impl RustGenerator {
     /// This is the classification predicate for storage layout / column
     /// iteration / projectability — everywhere the question is "does this field
     /// get a `VariableColumn`?" (as opposed to the string-semantic checks that
-    /// stay on `is_string_type`).
+    /// stay on `is_string_semantic`).
+    ///
+    /// #238: this matches on the variants **directly** rather than delegating to a
+    /// string predicate. It used to be `is_string_type(ft) || is_json_type(ft)`,
+    /// and that delegation is a trap once a second string spelling exists —
+    /// widening the string predicate to admit `string(N)` would silently hand it a
+    /// `VariableColumn` here, through a call site that reads as unrelated.
     fn is_variable_column_type(field_type: &forgedb_parser::FieldType) -> bool {
-        Self::is_string_type(field_type) || Self::is_json_type(field_type)
+        match field_type {
+            forgedb_parser::FieldType::String | forgedb_parser::FieldType::Json => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_variable_column_type(inner),
+            _ => false,
+        }
     }
 
     /// Check if a field type is (or wraps) a `Timestamp`.
