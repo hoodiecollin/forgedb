@@ -9837,3 +9837,98 @@ fn test_string_key_is_admitted_by_the_shared_junction_predicate() {
         "a bare `string` is variable-width and still cannot be one"
     );
 }
+
+/// The five breaks the compile-and-run check found that no snapshot could
+/// (#252). Every one of them was a *green* snapshot suite over generated code
+/// that did not compile — the exact reason CLAUDE.md makes compiling the output
+/// a separate discipline from snapshotting it.
+///
+/// They share one root cause worth stating once: the inline-string branches were
+/// gated on the DECLARED field type, and an FK's declared type is a relation. So
+/// every one of them is a place where an FK to a string-keyed model had to be
+/// recognized as the inline-string column it physically is.
+#[test]
+fn test_rust_generation_a_string_fk_is_an_inline_string_column() {
+    let code = db_for(
+        "Airport {\n  id: string(3!)\n  city: string\n  flights: [Flight]\n}\n\n\
+         Flight {\n  id: +uuid\n  origin: *Airport\n  alt: ?Airport\n}\n",
+    );
+    let f = flat(&code);
+
+    // 1. The column methods. `type_name` maps `StringN` to `inline_string` so
+    //    the column FILE reads honestly (#238) — which means composing a method
+    //    name from it names a method that does not exist. The FK must reach the
+    //    pack/unpack path instead, exactly as a declared `string(N)` does.
+    assert!(
+        !f.contains("append_inline_string") && !f.contains("read_inline_string"),
+        "no column method is named after the inline-string label: {f:.400}"
+    );
+
+    // 2. The transmute path is the one a nullable FK fell into, and it would
+    //    have persisted the Rust `Option<InlineStr>` layout rather than the
+    //    column's `[tag, payload]` framing.
+    assert!(
+        f.contains("let mut __buf = [0u8; 4usize]"),
+        "a nullable string FK packs a tagged slot, not a transmuted Option: {f:.400}"
+    );
+
+    // 3. `#[schema(value_type = String)]` on the FK, not just on the identity —
+    //    `InlineStr` implements no `ToSchema`, so the derive does not resolve.
+    let flight = f
+        .split("pub struct Flight {")
+        .nth(1)
+        .expect("the Flight struct")
+        .split('}')
+        .next()
+        .expect("its body")
+        .to_string();
+    assert!(
+        flight.contains("#[schema(value_type = String)] pub origin:"),
+        "the required FK is annotated, not only the identity: {flight}"
+    );
+    assert!(
+        flight.contains("#[schema(value_type = Option<String>)] pub alt:"),
+        "and the optional one documents an optional string: {flight}"
+    );
+
+    // 4. The cascade/reverse-getter probe takes `&str` (an index probe over a
+    //    string-semantic column does, deliberately), but these call sites hold
+    //    the key by value.
+    assert!(
+        f.contains("self.flight.find_by_origin(&id)"),
+        "the cascade borrows the key for the probe: {f:.400}"
+    );
+    assert!(
+        f.contains("self.flight.find_by_alt(Some(&id))"),
+        "and so does the optional one"
+    );
+}
+
+/// A `string(N)` key is the one string-semantic field the scan view does NOT
+/// borrow (#252). The scan *scope* (#228) returns a vector of ids that outlives
+/// the buffers they were decoded from, so a borrowed key cannot escape it —
+/// and `InlineStr<N>` being `Copy` means holding it by value costs the scan
+/// nothing, since not allocating was the only thing the borrow ever bought.
+#[test]
+fn test_rust_generation_the_scan_view_holds_a_string_key_by_value() {
+    let code = db_for("Airport {\n  id: string(3!)\n  city: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub struct AirportScanRef<'a> { pub id: InlineStr<3usize>"),
+        "the scan view's key is owned and Copy: {f:.400}"
+    );
+    assert!(
+        f.contains("pub city: &'a str"),
+        "while an ordinary string column still borrows"
+    );
+
+    // ...and with the key no longer borrowing, a model whose ONLY string-
+    // semantic field is its key borrows nothing at all, so #250's lifetime
+    // anchor is needed again. Without it: `error[E0392]: lifetime parameter
+    // 'a is never used`.
+    let bare = flat(&db_for("Tag {\n  id: string(8!)\n  weight: u32\n}\n"));
+    assert!(
+        bare.contains("PhantomData<&'a ()>"),
+        "a key-only string model re-anchors 'a: {bare:.400}"
+    );
+}
