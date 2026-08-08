@@ -130,6 +130,19 @@ Key properties that the rest of the system is built on:
   or an FK to a string-keyed model silently misses the packing path it physically needs. The wire
   form is unchanged — `InlineStr` serializes as a plain JSON string, by hand rather than by derive,
   since serde's array derive stops at 32 elements and a key may be wider.
+- **Which field is the identity, and which types may be one, are each decided in exactly one
+  place.** `Model::identity_field` (`crates/parser/src/ast.rs`) picks the field — a field named
+  `id`, else the first `+` field, in that order — and `FieldType::is_identity_key` names the
+  admitted set (`uuid`, the four integers, `timestamp`, `string(N)`), with a required FK admitted
+  by resolution rather than by type. Both used to be open-coded: the picker in 31 places across 8
+  files, and the key-type test twice (once as the many-to-many endpoint rule). Neither duplication
+  was a style problem. A *single-pass* picker — `find(|f| f.name == "id" || f.auto_generate)` —
+  keys `Event { seq: +u64, id: u32 }` on `seq` while every generated signature still says `id`,
+  which compiles, runs, round-trips, and diffs clean in a snapshot; only reading a row back by the
+  key the author meant can see it. And two independent key-type tests produce two diagnostics for
+  one mistake, then drift. So the endpoint test now *delegates* to the identity test rather than
+  restating it, and a grep-based guard (`tests/identity_predicate_test.rs`) fails the build if
+  either predicate is open-coded again (#251).
 - **Watermark snapshots.** A snapshot is just a row-count watermark (`forgedb_storage::Snapshot`);
   point-in-time reads resolve the newest version *within* the watermark. No `xmin`/`xmax`, no
   version chains.

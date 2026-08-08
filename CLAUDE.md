@@ -260,7 +260,17 @@ Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_c
 must also have an **identity field** — named `id`, or any `+` auto-generate field — which is
 likewise fatal (#248); convention is `id: +uuid`. `id` wins by **name** over a `+` field declared
 above it (#254 — the single-pass `find` this used to be silently mis-keyed a model whose stamp
-came first).
+came first). Both halves of "what is the identity" now have exactly ONE definition, on the AST
+(#251): `Model::identity_field` picks the field (`id` by name, else the first `+`) — it was
+open-coded 31× across 8 files — and `FieldType::is_identity_key` names the admitted **type**
+allow-list: `uuid`, `u32`/`u64`/`i32`/`i64`, `timestamp(s|ms|us)` (incl. `+timestamp`, `id`-only),
+`string(N)`/`string(N!)`, plus a required FK `*Model` (admitted by resolving through, #266).
+Anything else is ONE positioned error naming the field + the allowed set: bare `string`, `bytes(N)`,
+`f64`, `bool`, `decimal`, `json`, enum, struct, `[T; N]`, any nullable incl. `?Model`, `[Model]`.
+The m2m endpoint rule is not a second check — `is_junction_key` **delegates** to `is_identity_key`,
+and #252's two `string` rows were folded into the allow-list rather than placed beside it (one
+mistake, one diagnostic). `tests/identity_predicate_test.rs` greps the tree and fails the build if
+either predicate is open-coded again.
 Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — all four
 are synthesized on create; integer `+u32`/`+u64` allocate from a per-field counter seeded by an
 ungated reopen scan and floored by `Manifest.auto_sequences`, #187. Every shape is valid — a

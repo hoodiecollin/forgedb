@@ -31,7 +31,8 @@ ModelName {
   identity is what `create_*` writes, what the row index is keyed on, what
   relations point at, and what three of the five REST routes take as a path
   parameter, so there is almost no generated surface left without one. Convention
-  is `id: +uuid`
+  is `id: +uuid`. Its **type** is checked against an allow-list — see
+  [The identity field](#the-identity-field) below
 - Field names must be **snake_case** (validated in `crates/parser/src/parser/core.rs:462-466` via `validate_field_name`)
 - Model names must be unique within schema (`crates/parser/src/parser/core.rs:814-818`)
 
@@ -43,6 +44,50 @@ User {
   created_at: +timestamp
 }
 ```
+
+### The identity field
+
+**Which field it is.** A field named `id`, or — failing that — the first field
+carrying `+`. **`id` wins by name**, even over a `+` field declared above it:
+
+```
+Event {
+  seq:  +u64      // allocated on every insert, but a column, not the key
+  id:    u32      // THE identity: what create returns, what get() takes,
+  note:  string   // what relations point at, what the cascade walks
+}
+```
+
+This ordering is the whole rule, and it is one shared predicate
+(`Model::identity_field` in `crates/parser/src/ast.rs`) that every generator
+routes through. It used to be open-coded as a single-pass
+`find(|f| f.name == "id" || f.auto_generate)` in 31 places, which picked `seq`
+above — and *silently*: the model compiled, ran, and keyed itself on the stamp
+while calling the parameter `id`. No compile error and no snapshot could see it,
+which is why the predicate now has exactly one definition (#251/#254).
+
+**Which types it may be.** An identity has to be a fixed-width value that is
+`Copy`, `Hash + Eq`, and totally ordered, because it lives in the row index, in
+every FK column pointing at the model, in a junction `HashMap`, and in a
+fixed-width replication frame. The admitted set is exactly:
+
+| Identity type | Notes |
+|---|---|
+| `uuid` | The convention. `+uuid` synthesizes on create |
+| `u32` `u64` `i32` `i64` | `+u32`/`+u64` allocate from the #187 counter (`0` is the allocate sentinel); `i32`/`i64` admit a signed natural key |
+| `timestamp` / `timestamp(s\|ms\|us)` | A written value is floored to the declared quantum (§3) |
+| `+timestamp` | Legal, but **only when the field is named `id`** — an auto stamp under any other name is a stamp, not a key (#254) |
+| `string(N)` / `string(N!)` | A `Copy` `InlineStr<N>`, not a heap `String` — see [§3](#stringn-as-an-identity) for the URL-alphabet rule (#252/#238) |
+| `*Model` | An identity that *is* a required foreign key; it resolves to whatever the target's identity ultimately is, and that chain must terminate (#266) |
+
+Everything else is a **positioned** validation error naming the field, the
+offending type, and the allowed set — `bare string` (no width, so not `Copy`),
+`bytes(N)` (raw bytes, not text, and it would not survive a URL path segment),
+`f64` (no total equality), `bool` (a two-row key space), `decimal`, `json` (no
+total order), an enum, a struct, a fixed array, any nullable type including
+`?Model`, and a `[Model]` collection. One bad key earns exactly **one**
+diagnostic: this list is the single place an identity's type is refused, and the
+many-to-many endpoint rule below is the same set rather than a second check.
 
 ---
 
@@ -276,7 +321,9 @@ Isbn {
   string, TypeScript `string`, OpenAPI `{"type": "string"}`. A client cannot tell.
   An ordinary `string(N)` *column* is unaffected and stays a `String`.
 - **A bare `string` identity is refused.** A key has to be fixed-width to be `Copy`,
-  so the width has to be in the type. The error tells you to write one.
+  so the width has to be in the type. It is one row of the identity allow-list
+  (§1), and it keeps its own message — the error tells you to declare a width
+  rather than to pick a different type.
 - **`@utf8` on an identity is a schema error.** The alphabet below is a strict subset
   of ASCII, so `@utf8` would reserve four bytes per character to hold characters the
   write path rejects.
@@ -430,12 +477,11 @@ Order {
 - A wide inherited key is warned about on the *referencing* field: an FK to a model whose identity
   is a wide `string(N)` pays that width on every row of the child.
 - **Many-to-many endpoints:** a junction stores each endpoint's id in a fixed-width, hashable
-  column, so an endpoint's identity must be `uuid`, an integer type, `timestamp`, or
-  `string(N)`/`string(N!)` — the last of which qualifies because a key of that type is a
-  `Copy`, fixed-capacity `InlineStr<N>` rather than a heap `String` (#252). Mixed pairs
-  are fine — a `+u64`-keyed model links to a `+uuid`-keyed one, and each junction column is that
-  endpoint's own width. An identity outside that set is a validation error rather than a silently
-  missing M2M surface.
+  column — which is the same requirement the identity allow-list already enforces, so **any legal
+  identity is a legal junction endpoint** and there is no second rule to satisfy or to drift from
+  (`FieldType::is_junction_key` delegates to `is_identity_key`). Mixed pairs are fine — a
+  `+u64`-keyed model links to a `+uuid`-keyed one, and each junction column is that endpoint's own
+  width. An endpoint whose identity is an `*Model` FK resolves through to the terminal key type.
 
 ---
 
@@ -810,6 +856,18 @@ field: string  // inline comment
     author: *Undefined    // ERROR: model 'Undefined' doesn't exist
     ```
 
+16. **An identity of a type that cannot be a key** (see §1)
+    ```
+    Reading { id: f64      }   // ERROR: no total equality
+    Flag    { id: bool     }   // ERROR: a two-row key space
+    Blob    { id: bytes(8) }   // ERROR: raw bytes, not text
+    Doc     { id: string   }   // ERROR: declare a width — string(N) / string(N!)
+    Row     { id: u32?     }   // ERROR: a nullable identity is not an identity
+    Item    { id: ?Owner   }   // ERROR: same, for an optional FK
+    ```
+    Also rejected: `decimal`, `json`, an enum, a struct, `[u32; 4]`, `[Model]`. The
+    error is positioned on the field and names the allowed set.
+
 ---
 
 ## 11. Example Valid Schemas
@@ -912,6 +970,7 @@ The rules in this reference are grounded in the parser and validator source:
 **Write schemas using this recipe:**
 
 1. **Define models** (PascalCase names) with **snake_case fields**
+1b. **Give every model an identity** — a field named `id` (which wins over any `+` field above it), or a `+` field. Its type must be `uuid`, `u32`/`u64`/`i32`/`i64`, `timestamp`, `string(N)`/`string(N!)`, or a required FK `*Model`; anything else is a validation error
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
 3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, string(N) / string(N!), json, decimal, uuid, timestamp / timestamp(s|ms|us), bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
