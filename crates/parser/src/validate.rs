@@ -1735,10 +1735,21 @@ mod tests {
         assert_eq!(e.len(), 1, "exactly one diagnostic: {d:?}");
         assert!(e[0].message.contains("Doc.id"), "names the field: {e:?}");
         assert!(
-            e[0].message.contains("string(N)"),
+            e[0].message.contains("Declare the width"),
             "and says what to write instead: {e:?}"
         );
         assert!(e[0].position.is_some(), "positioned: {e:?}");
+        // #251 folded this into the allow-list, where the generic message also
+        // names `string(N)` — as one of the *allowed* types. So the assertion
+        // has to be on what only the width row says. Its suggestion is the
+        // crispest discriminator: a width to add, not a different type to pick.
+        assert!(
+            e[0]
+                .suggestion
+                .as_deref()
+                .is_some_and(|s| s.contains("declared width")),
+            "the fix offered is a width, not `+uuid`: {e:?}"
+        );
     }
 
     /// **Scenario 10.** `@utf8` on an identity is an error (res 3).
@@ -2145,7 +2156,10 @@ mod tests {
         // Same for a bare `string` endpoint (the row #252 wrote).
         let e = errs("A {\n  id: string\n  bs: [B]\n}\n\nB {\n  id: +uuid\n  as: [A]\n}\n");
         assert_eq!(e.len(), 1, "one mistake, one message: {e:?}");
-        assert!(e[0].contains("string(N)"), "the width message survives: {e:?}");
+        assert!(
+            e[0].contains("Declare the width"),
+            "the width message survives the fold: {e:?}"
+        );
     }
 
     /// The admitted set and `FieldType::is_junction_key` are the same set, and
