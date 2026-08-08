@@ -78,7 +78,7 @@ forgedb-codegen = { path = "crates/codegen", version = "0.3.0" }
 forgedb-watcher = { path = "crates/watcher", version = "0.2.1" }
 forgedb-migrations = { path = "crates/migrations", version = "0.2.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
-forgedb-backup = { path = "crates/backup", version = "0.2.0" }
+forgedb-backup = { path = "crates/backup", version = "0.3.0" }
 forgedb-coordinator = { path = "crates/coordinator", version = "0.2.1" }
 # Bundled only under the `lsp` feature (drives the `forgedb-lsp` binary). Also a
 # dev-dependency below so the CLI↔LSP parity test always links it, feature or not.

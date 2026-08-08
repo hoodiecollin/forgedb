@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-storage-web"
-version = "0.1.7"
+version = "0.2.0"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "In-memory-arena columnar storage backend for ForgeDB's browser read-replica (wasm32). Byte-identical positional semantics to the native engine; async only at the hydrate/commit boundary (IndexedDB/OPFS). Schema-agnostic substrate."

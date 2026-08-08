@@ -123,14 +123,17 @@ pub fn list(opts: ListOptions) -> Result<(), CliError> {
     }
     println!();
     println!(
-        "{:<24} {:>10} {:>10} {:>8}",
-        "Model", "Rows", "Epoch", "SchemaV"
+        "{:<24} {:>10} {:>10} {:>8} {:>8}",
+        "Model", "Rows", "Epoch", "SchemaV", "EngineV"
     );
-    println!("{}", "=".repeat(56));
+    println!("{}", "=".repeat(65));
     for m in &header.models {
+        // `SchemaV` is the app's migration serial and `EngineV` ForgeDB's
+        // byte-format generation (#254) — two orthogonal counters.  Before #254
+        // this column copied a manifest constant that was always `1`.
         println!(
-            "{:<24} {:>10} {:>10} {:>8}",
-            m.dir, m.row_count, m.compaction_epoch, m.schema_version
+            "{:<24} {:>10} {:>10} {:>8} {:>8}",
+            m.dir, m.row_count, m.compaction_epoch, m.schema_version, m.engine_version
         );
     }
     Ok(())
