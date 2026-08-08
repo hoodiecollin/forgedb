@@ -109,6 +109,9 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
     // `@min`/`@max` bound shape vs the field's numeric domain (#239).
     check_numeric_bounds(schema, errors);
 
+    // `string(N)` / `string(N!)` / `@utf8` (#238).
+    check_inline_strings(schema, errors);
+
     // Duplicate top-level names.
     check_duplicate_names(
         schema.models.iter().map(|m| (m.name.as_str(), m.position)),
@@ -140,13 +143,28 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
                 ));
             }
             if !field.field_type.is_fixed_size() {
-                errors.push(positioned(
-                    format!(
-                        "Struct '{}' field '{}' contains variable-length type. Structs can only contain fixed-size types.",
-                        struct_def.name, field.name
-                    ),
-                    field.position,
-                ));
+                // An inline string gets its own diagnostic (#238): the generic
+                // "variable-length" wording is actively misleading for a type
+                // whose *column* is fixed-width. What disqualifies it is the
+                // Rust value, not the column — see `inline_string_embedding`.
+                if let Some(spelling) = inline_string_spelling(&field.field_type) {
+                    errors.push(positioned(
+                        inline_string_embedding(
+                            &format!("Struct '{}' field '{}'", struct_def.name, field.name),
+                            &spelling,
+                            &field.field_type,
+                        ),
+                        field.position,
+                    ));
+                } else {
+                    errors.push(positioned(
+                        format!(
+                            "Struct '{}' field '{}' contains variable-length type. Structs can only contain fixed-size types.",
+                            struct_def.name, field.name
+                        ),
+                        field.position,
+                    ));
+                }
             }
         }
     }
@@ -447,6 +465,284 @@ fn check_numeric_bounds(schema: &Schema, errors: &mut Vec<ValidationError>) {
                     }
                 }
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #238 — inline fixed-width strings, `string(N)` / `string(N!)`
+// ---------------------------------------------------------------------------
+
+/// The character width above which an inline string stops paying for itself.
+///
+/// Experiment #261 measured a fixed slot against the variable column's 16-byte
+/// `(offset, length)` pair across 200 configurations. The slot wins while it is
+/// small and loses once it is wide, and 64 is the conservative end of the
+/// bracket where the crossover sat. Above it the declaration still *generates* —
+/// a `Copy`, fixed-width key can be worth paying for even when the bytes are not
+/// (#252) — so this is an advisory, never an error.
+const INLINE_STRING_ADVISORY_WIDTH: u8 = 64;
+
+/// The `(chars, exact)` of a field that **is** an inline string, peeling only
+/// `?`. A `[string(4!); 3]` is deliberately *not* one of these — see
+/// [`nested_inline_string`].
+fn direct_inline_string(field_type: &FieldType) -> Option<(u8, bool)> {
+    match field_type {
+        FieldType::StringN { chars, exact } => Some((*chars, *exact)),
+        FieldType::Nullable(inner) => direct_inline_string(inner),
+        _ => None,
+    }
+}
+
+/// The `(chars, exact)` of an inline string reachable through any composite —
+/// `?` and `[T; N]`. Used to catch an *embedded* one, which is an error.
+fn nested_inline_string(field_type: &FieldType) -> Option<(u8, bool)> {
+    match field_type {
+        FieldType::StringN { chars, exact } => Some((*chars, *exact)),
+        FieldType::Nullable(inner) | FieldType::FixedArray(inner, _) => nested_inline_string(inner),
+        _ => None,
+    }
+}
+
+/// Render an inline string back to its source spelling, for a diagnostic.
+fn spell_inline_string(chars: u8, exact: bool) -> String {
+    format!("string({}{})", chars, if exact { "!" } else { "" })
+}
+
+/// The spelling of the inline string reachable inside a type, if any.
+fn inline_string_spelling(field_type: &FieldType) -> Option<String> {
+    nested_inline_string(field_type).map(|(c, e)| spell_inline_string(c, e))
+}
+
+/// Why an inline string cannot live inside a by-value container.
+///
+/// The column is fixed-width, so "variable-length" is the wrong reason and the
+/// generic struct diagnostic reads as nonsense here. The real reason is the
+/// *Rust* value: an inline string materialises as a heap `String`, and a
+/// `struct` / `[T; N]` is persisted by writing the Rust value's bytes — which
+/// would store a pointer into this process's heap.
+fn inline_string_embedding(subject: &str, spelling: &str, field_type: &FieldType) -> String {
+    let chars = nested_inline_string(field_type).map(|(c, _)| c).unwrap_or(0);
+    format!(
+        "{subject} is `{spelling}`, but a by-value container stores its fields as the Rust \
+         value's bytes and an inline string materialises as a heap `String` — embedding one \
+         would persist a pointer, not the text. Use `bytes({chars})` for fixed-size bytes there."
+    )
+}
+
+/// Res 8's width advisory, factored out of the field walk on purpose.
+///
+/// #266 makes a foreign key's type follow its target's identity type, which
+/// gives this warning a **second firing site**: an FK that inherits a wide
+/// inline key pays the same per-row cost without its author ever writing a
+/// width. That walk is a second loop over relation fields calling this same
+/// helper — no restructuring of [`check_inline_strings`] required.
+///
+/// It lives in `validate.rs` rather than in codegen's `column_value_size_expr`
+/// because a diagnostic needs a span and a sink, and that helper is a pure
+/// `FieldType -> TokenStream` function called three to four times per field.
+fn warn_wide_inline_string(
+    subject: &str,
+    chars: u8,
+    position: Option<forgedb_validation::Position>,
+    errors: &mut Vec<ValidationError>,
+) {
+    if chars <= INLINE_STRING_ADVISORY_WIDTH {
+        return;
+    }
+    errors.push(
+        positioned(
+            format!(
+                "{subject}: `string({chars})` reserves a {chars}-character slot in every row. \
+                 Above {INLINE_STRING_ADVISORY_WIDTH} characters that generally costs more than \
+                 the 16-byte pointer pair a bare `string` uses (#261) — prefer `string` unless \
+                 the value has to be a fixed-width key.",
+            ),
+            position,
+        )
+        .with_severity(forgedb_validation::Severity::Warning),
+    );
+}
+
+/// `@utf8` widens each character of an inline string from one byte to four. On
+/// anything else there is nothing to widen — a bare `string` is already UTF-8
+/// and lives in the variable column, and a non-string has no characters at all —
+/// so the directive can only mean its author misunderstood it. Reported rather
+/// than ignored, because silence here reads as "the field is now multi-byte".
+fn check_utf8_placement(
+    subject: &str,
+    field: &crate::ast::Field,
+    errors: &mut Vec<ValidationError>,
+) {
+    if field.has_constraint("utf8") && direct_inline_string(&field.field_type).is_none() {
+        errors.push(positioned(
+            format!(
+                "{subject}: @utf8 only applies to an inline `string(N)`, where it widens each \
+                 character to four bytes. A bare `string` is already UTF-8, and a non-string \
+                 field has no characters to widen."
+            ),
+            field.position,
+        ));
+    }
+}
+
+/// Res 9: on an inline string the *type* already carries the length bound, so a
+/// length directive is either a redundant restatement or a contradiction — there
+/// is no reading in which the author benefits from stating both.
+///
+/// On `string(N)` the width is the maximum, so lower bounds (`@min`,
+/// `@length(min:)`) stay meaningful and only upper bounds are refused. On
+/// `string(N!)` the length is fully determined, so every length directive goes,
+/// lower bounds included. A bare `string` is untouched (res 10).
+fn check_inline_string_directives(
+    subject: &str,
+    chars: u8,
+    exact: bool,
+    field: &crate::ast::Field,
+    errors: &mut Vec<ValidationError>,
+) {
+    use crate::ast::ConstraintParam;
+    let ty = spell_inline_string(chars, exact);
+
+    // One diagnostic per offending *directive*, never per parameter — a
+    // `@length(3, 40)` that is wrong in one component is one mistake.
+    let second_bound = |directive: String, want: String| {
+        positioned(
+            format!(
+                "{subject}: the width in `{ty}` is already the upper bound, so {directive} \
+                 states a second one. Declare the width you mean — `string({want})` — and drop \
+                 the directive."
+            ),
+            field.position,
+        )
+    };
+
+    for c in &field.constraints {
+        if !matches!(c.name.as_str(), "min" | "max" | "length") {
+            continue;
+        }
+        if exact {
+            errors.push(positioned(
+                format!(
+                    "{subject}: `{ty}` fixes the length at exactly {chars} characters, so \
+                     @{} can never change the outcome — drop it.",
+                    c.name
+                ),
+                field.position,
+            ));
+            continue;
+        }
+        match c.name.as_str() {
+            // A lower bound narrows nothing the type already said.
+            "min" => {}
+            "max" => {
+                let want = c.params.first().map(render_bound).unwrap_or_default();
+                errors.push(second_bound(format!("@max({want})"), want.clone()));
+            }
+            "length" => {
+                let named_max = c.params.iter().find_map(|p| match p {
+                    ConstraintParam::Named { name, value } if name == "max" => Some(value.as_ref()),
+                    _ => None,
+                });
+                let positional: Vec<&ConstraintParam> = c
+                    .params
+                    .iter()
+                    .filter(|p| !matches!(p, ConstraintParam::Named { .. }))
+                    .collect();
+
+                if let Some(v) = named_max {
+                    let want = render_bound(v);
+                    errors.push(second_bound(format!("@length(max: {want})"), want.clone()));
+                } else if positional.len() == 1 {
+                    // #235: the single-argument form means EXACTLY n, which is
+                    // precisely what the `!` spelling says in the type.
+                    let n = render_bound(positional[0]);
+                    errors.push(positioned(
+                        format!(
+                            "{subject}: @length({n}) means exactly {n} characters (#235), which \
+                             is what `string({n}!)` spells directly — write the type, not the \
+                             directive."
+                        ),
+                        field.position,
+                    ));
+                } else if positional.len() >= 2 {
+                    let want = render_bound(positional[1]);
+                    errors.push(second_bound(
+                        format!("the max component of @length({}, {want})", render_bound(positional[0])),
+                        want.clone(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The whole of #238's semantic layer: `@utf8` placement, the length-directive
+/// matrix, the width advisory, and the two shapes an inline string may not take
+/// (embedded by value, or serving as a model's identity).
+fn check_inline_strings(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for model in &schema.models {
+        for field in &model.fields {
+            let subject = format!("Field '{}.{}'", model.name, field.name);
+            check_utf8_placement(&subject, field, errors);
+
+            let direct = direct_inline_string(&field.field_type);
+
+            // Reachable only through a by-value container — same rejection the
+            // struct walk makes, for the `[T; N]` spelling.
+            if direct.is_none()
+                && let Some((c, e)) = nested_inline_string(&field.field_type)
+            {
+                errors.push(positioned(
+                    inline_string_embedding(
+                        &subject,
+                        &spell_inline_string(c, e),
+                        &field.field_type,
+                    ),
+                    field.position,
+                ));
+                continue;
+            }
+
+            let Some((chars, exact)) = direct else {
+                continue;
+            };
+
+            // An inline-string identity does not generate compilable code yet.
+            // The hole is older than #238 — a bare `string` identity has never
+            // compiled either, because the generated REST layer parses every
+            // non-integer key as a uuid (`ApiGenerator::id_parse_type`). #252
+            // closes it with a `Copy` `InlineStr<N>` key; until then this is a
+            // loud refusal rather than the silent generation of a crate that
+            // will not build.
+            if field.name == "id" || field.auto_generate {
+                errors.push(positioned(
+                    format!(
+                        "{subject} is the model's identity, and a `{}` identity does not \
+                         generate compilable code yet — the generated API layer parses every \
+                         non-integer key as a uuid. Use `+uuid` or an integer auto for now.",
+                        spell_inline_string(chars, exact)
+                    ),
+                    field.position,
+                ));
+                continue;
+            }
+
+            check_inline_string_directives(&subject, chars, exact, field, errors);
+            warn_wide_inline_string(&subject, chars, field.position, errors);
+        }
+    }
+
+    // Struct fields: a `string(N)` there is already rejected by the fixed-size
+    // walk in `collect_structure_errors`, so only `@utf8` placement is left.
+    for struct_def in &schema.structs {
+        for field in &struct_def.fields {
+            check_utf8_placement(
+                &format!("Struct '{}' field '{}'", struct_def.name, field.name),
+                field,
+                errors,
+            );
         }
     }
 }
@@ -820,5 +1116,130 @@ mod tests {
             "'&' on a non-identity integer auto is REQUIRED, so it warns about \
              nothing and errors about nothing: {required:?}"
         );
+    }
+
+    // ---- #238: `string(N)` ---------------------------------------------------
+
+    /// Every diagnostic message on a schema, error or warning.
+    fn diags(src: &str) -> Vec<ValidationError> {
+        validate_schema(&ast(src))
+    }
+
+    fn errs(src: &str) -> Vec<String> {
+        diags(src)
+            .into_iter()
+            .filter(|d| !d.is_warning())
+            .map(|d| d.message)
+            .collect()
+    }
+
+    fn warns(src: &str) -> Vec<ValidationError> {
+        diags(src).into_iter().filter(|d| d.is_warning()).collect()
+    }
+
+    /// Res 5: `@utf8` widens an inline string's characters. On a bare `string`
+    /// there is nothing to widen — variable storage is already UTF-8 — so the
+    /// directive can only mean its author misunderstood it.
+    #[test]
+    fn utf8_on_a_bare_string_is_an_error() {
+        let e = errs("T {\n  id: +uuid\n  body: string @utf8\n}\n");
+        assert_eq!(e.len(), 1, "exactly one diagnostic: {e:?}");
+        assert!(e[0].contains("@utf8"), "{e:?}");
+        assert!(e[0].contains("string(N)"), "names where it does apply: {e:?}");
+
+        // ...and on a non-string it is equally meaningless.
+        let e = errs("T {\n  id: +uuid\n  n: u32 @utf8\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+
+        // On an inline string it is accepted.
+        assert!(errs("T {\n  id: +uuid\n  t: string(8) @utf8\n}\n").is_empty());
+    }
+
+    /// Res 9, the whole matrix. N *is* the maximum, so a second upper bound is
+    /// either a redundant restatement or a contradiction, and there is no reading
+    /// where the author benefits from stating two. Lower bounds stay meaningful.
+    #[test]
+    fn upper_bound_directives_are_rejected_on_an_inline_string() {
+        // `string(N)` — lower bounds allowed.
+        for ok in ["@min(3)", "@length(min: 3)"] {
+            let src = format!("T {{\n  id: +uuid\n  f: string(64) {ok}\n}}\n");
+            assert!(errs(&src).is_empty(), "`{ok}` is allowed: {:?}", errs(&src));
+        }
+        // `string(N)` — upper bounds rejected, at any value.
+        for bad in ["@max(40)", "@max(64)", "@max(100)", "@length(max: 40)"] {
+            let src = format!("T {{\n  id: +uuid\n  f: string(64) {bad}\n}}\n");
+            let e = errs(&src);
+            assert_eq!(e.len(), 1, "`{bad}` is one error: {e:?}");
+            assert!(e[0].contains("string(64)"), "names the width that already bounds it: {e:?}");
+        }
+        // `@length(n)` means EXACTLY n (#235), so it duplicates the `!` spelling —
+        // and the diagnostic says which one to write.
+        let e = errs("T {\n  id: +uuid\n  f: string(64) @length(40)\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("string(40!)"), "names the direct spelling: {e:?}");
+        // The positional two-arg form is rejected through its max component.
+        let e = errs("T {\n  id: +uuid\n  f: string(64) @length(3, 40)\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+
+        // `string(N!)` — the length is fully determined by the type, so EVERY
+        // length directive is redundant, lower bounds included.
+        for bad in ["@min(3)", "@max(3)", "@length(3)", "@length(min: 3)", "@length(max: 3)"] {
+            let src = format!("T {{\n  id: +uuid\n  f: string(26!) {bad}\n}}\n");
+            let e = errs(&src);
+            assert_eq!(e.len(), 1, "`{bad}` on the exact form is one error: {e:?}");
+        }
+
+        // A bare `string` is untouched: all three still allowed (res 10).
+        for ok in ["@min(3)", "@max(40)", "@length(40)", "@length(min: 1, max: 9)"] {
+            let src = format!("T {{\n  id: +uuid\n  f: string {ok}\n}}\n");
+            assert!(errs(&src).is_empty(), "bare `string` keeps `{ok}`: {:?}", errs(&src));
+        }
+    }
+
+    /// Res 8: above M the declaration WARNS and still generates. #261 shows a wide
+    /// slot losing to pointer storage, but a `Copy` key can be worth paying for
+    /// anyway (#252), so this informs rather than forbids.
+    #[test]
+    fn a_wide_inline_string_warns_and_still_generates() {
+        // At M it does not warn — the threshold is where it stops winning, and 64
+        // is already the conservative end of #261's bracket.
+        assert!(warns("T {\n  id: +uuid\n  f: string(64)\n}\n").is_empty());
+
+        let w = warns("T {\n  id: +uuid\n  f: string(120)\n}\n");
+        assert_eq!(w.len(), 1, "exactly one advisory: {w:?}");
+        assert!(w[0].is_warning(), "a width advisory is never an error");
+        assert_eq!(w[0].position.map(|p| p.line), Some(3), "positioned at the field");
+        assert!(w[0].message.contains("120"), "names the declared width: {:?}", w[0]);
+        // ...and it is not ALSO an error — the schema still generates.
+        assert!(errs("T {\n  id: +uuid\n  f: string(120)\n}\n").is_empty());
+    }
+
+    /// A `string(N)` cannot be embedded in an inline `struct` or a `[T; N]`.
+    /// Both are stored by transmuting the Rust value's bytes, and the Rust value
+    /// is a heap `String` — embedding one would persist a pointer. A silent
+    /// acceptance here would generate code that compiles and corrupts.
+    #[test]
+    fn an_inline_string_cannot_be_embedded() {
+        let e = errs("struct P {\n  code: string(4!)\n}\n\nT {\n  id: +uuid\n  p: P\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("bytes("), "names the fixed-size alternative: {e:?}");
+
+        let e = errs("T {\n  id: +uuid\n  f: [string(4!); 3]\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("bytes("), "{e:?}");
+    }
+
+    /// A `string(N)` identity does not generate compilable code yet — the whole
+    /// API layer parses a non-integer key as a uuid. That hole is older than
+    /// #238 (a bare `string` identity has never compiled either) and belongs to
+    /// #252, which lands a `Copy` key type. Until then this is a loud refusal
+    /// rather than a silent generation of a crate that will not build.
+    #[test]
+    fn an_inline_string_identity_is_refused_for_now() {
+        let e = errs("T {\n  id: string(26!)\n  name: string\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("identity"), "{e:?}");
+        // A non-identity inline string in the same model is fine.
+        assert!(errs("T {\n  id: +uuid\n  code: string(26!)\n}\n").is_empty());
     }
 }

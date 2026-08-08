@@ -305,6 +305,60 @@ impl Parser {
         Ok(FieldType::Bytes(size))
     }
 
+    /// Is the cursor sitting on a **parameterized** `string`, i.e. `string (`?
+    ///
+    /// Unlike `bytes` (#233), `string` is a reserved word and already lexes as
+    /// [`Token::TypeString`], so this is not a contextual-keyword dance — there is
+    /// no field named `string` to protect and no corpus hazard. The lookahead is
+    /// only here to split `string` from `string(N)`: bare `string` must keep
+    /// meaning exactly what it meant (#238 res 10).
+    fn at_parameterized_string(&self) -> bool {
+        matches!(self.current_token(), Token::TypeString)
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `string ( N )` / `string ( N ! )` and return
+    /// [`FieldType::StringN`] (#238). The cursor must be on `string`.
+    ///
+    /// Res 7's `1 ≤ N ≤ 255` is enforced *here*, at the one place the literal is
+    /// read, because the AST carries N as a `u8` — every later site is handed a
+    /// width that cannot violate the cap rather than one it has to re-check.
+    fn parse_string_type(&mut self) -> Result<FieldType, String> {
+        // Anchor the diagnostic at the keyword, not wherever the width parse ends.
+        let keyword_position = self.get_current_position();
+        self.advance();
+        self.expect(Token::LParen)?;
+        let raw = match self.current_token() {
+            Token::Number(n) => *n,
+            _ => {
+                return Err(format!(
+                    "Expected a character count after 'string(', found {:?}",
+                    self.current_token()
+                ))
+            }
+        };
+        let chars = u8::try_from(raw).ok().filter(|n| *n >= 1).ok_or_else(|| {
+            let at = keyword_position
+                .map(|p| format!(" at line {}, column {}", p.line, p.column))
+                .unwrap_or_default();
+            format!(
+                "Inline string width must be between 1 and 255 characters, found {raw}{at}. \
+                 For an unbounded value use bare `string`."
+            )
+        })?;
+        self.advance();
+        // The `!` lives inside the parens, bound to the width — the width and its
+        // exactness are one fact about the column, so they are written as one.
+        let exact = if matches!(self.current_token(), Token::Bang) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        self.expect(Token::RParen)?;
+        Ok(FieldType::StringN { chars, exact })
+    }
+
     fn skip_newlines(&mut self) {
         while matches!(self.current_token(), Token::Newline) {
             self.advance();
@@ -599,6 +653,11 @@ impl Parser {
         if self.at_bytes_type() {
             return self.parse_bytes_type();
         }
+        // `string(N)` needs no such rescue — `string` is reserved — but it does
+        // need claiming before the bare-`string` arm in `parse_primitive_type`.
+        if self.at_parameterized_string() {
+            return self.parse_string_type();
+        }
 
         // Check for relation types first
         match self.current_token() {
@@ -794,6 +853,11 @@ impl Parser {
             Token::TypeI64 => FieldType::I64,
             Token::TypeF64 => FieldType::F64,
             Token::TypeBool => FieldType::Bool,
+            // `string(N)` is the parameterized form (#238); bare `string` falls
+            // through to the variable-storage type below, unchanged (res 10).
+            Token::TypeString if matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_string_type()
+            }
             Token::TypeString => FieldType::String,
             Token::TypeJson => FieldType::Json,
             Token::TypeDecimal => FieldType::Decimal,
@@ -1006,6 +1070,7 @@ impl Parser {
                 | FieldType::F64
                 | FieldType::Bool
                 | FieldType::String
+                | FieldType::StringN { .. }
                 | FieldType::Json
                 | FieldType::Decimal
                 | FieldType::Uuid
@@ -2514,5 +2579,99 @@ B
         // Unresolvable as a struct, so validation rejects it — the point is that
         // it was never parsed as `FieldType::Bytes`.
         assert!(p.parse().is_err(), "a sizeless `bytes` is not a type");
+    }
+
+    // ---- #238: `string(N)` / `string(N!)` -----------------------------------
+    //
+    // A fixed-width inline string column. `N` counts CHARACTERS (res 3), capped
+    // at 255 (res 7) — which the AST makes a type-level fact by carrying a `u8`,
+    // so the range check happens exactly once, here. `!` is a brand-new token
+    // meaning *exactly N* (res 2); it never appeared in the language before.
+
+    /// The at-most-N spelling.
+    #[test]
+    fn string_n_parses_to_the_inexact_variant() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  slug: string(64)\n}\n", "slug");
+        assert_eq!(ty, FieldType::StringN { chars: 64, exact: false });
+        assert!(warnings.is_empty(), "no diagnostic for a well-formed width: {warnings:?}");
+    }
+
+    /// The exactly-N spelling. `!` binds to the width, inside the parens.
+    #[test]
+    fn string_n_bang_parses_to_the_exact_variant() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: string(26!)\n}\n", "code");
+        assert_eq!(ty, FieldType::StringN { chars: 26, exact: true });
+        assert!(warnings.is_empty(), "no diagnostic: {warnings:?}");
+    }
+
+    /// Res 7's bound is enforced at the point the `u8` is constructed, so no
+    /// downstream site can ever be handed an over-wide N. Zero is refused for the
+    /// same reason: a column that can hold nothing is never what was meant.
+    #[test]
+    fn string_n_width_is_bounded_at_the_parse() {
+        for src in ["string(0)", "string(256)", "string(1000)", "string(0!)", "string(256!)"] {
+            let schema = format!("T {{\n  id: +uuid\n  f: {src}\n}}\n");
+            let mut p = Parser::new(&schema).unwrap();
+            let err = p.parse().expect_err("`{src}` must not parse");
+            assert!(
+                err.contains("between 1 and 255"),
+                "`{src}` names the admissible range, got: {err}"
+            );
+        }
+    }
+
+    /// A negative width never reaches the range check — the lexer reads `-1` as a
+    /// number, so the diagnostic still has to name the range rather than report a
+    /// type mismatch.
+    #[test]
+    fn string_n_rejects_a_negative_width() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: string(-1)\n}\n").unwrap();
+        let err = p.parse().expect_err("a negative width must not parse");
+        assert!(err.contains("between 1 and 255"), "got: {err}");
+    }
+
+    /// Res 10's regression guard: bare `string` is untouched — still the
+    /// variable-storage type, in every position.
+    #[test]
+    fn bare_string_is_unchanged() {
+        for (src_type, expected) in [
+            ("string", FieldType::String),
+            ("string?", FieldType::Nullable(Box::new(FieldType::String))),
+            ("?string", FieldType::Nullable(Box::new(FieldType::String))),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` is still bare `string`");
+            assert!(warnings.is_empty());
+        }
+    }
+
+    /// `string(N)` reaches every compound type position, each of which is a
+    /// separate arm of `parse_type`.
+    #[test]
+    fn string_n_parses_in_every_type_position() {
+        for (src_type, expected) in [
+            ("string(8)?", FieldType::Nullable(Box::new(FieldType::StringN { chars: 8, exact: false }))),
+            ("?string(8)", FieldType::Nullable(Box::new(FieldType::StringN { chars: 8, exact: false }))),
+            ("string(4!)?", FieldType::Nullable(Box::new(FieldType::StringN { chars: 4, exact: true }))),
+            ("^&string(5!)", FieldType::StringN { chars: 5, exact: true }),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert!(warnings.is_empty(), "`{src_type}`: {warnings:?}");
+        }
+    }
+
+    /// `!` is a new token and it is claimed by exactly one grammar production. A
+    /// stray one is a positioned parse error, not a silently skipped character —
+    /// which is what it would be if the lexer had no arm for it at all.
+    #[test]
+    fn a_stray_bang_is_a_parse_error() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: !string\n}\n").unwrap();
+        assert!(p.parse().is_err(), "`!` outside `string(N!)` is not a modifier");
+
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes(3!)\n}\n").unwrap();
+        assert!(p.parse().is_err(), "`!` is not admitted by `bytes(N)`");
     }
 }

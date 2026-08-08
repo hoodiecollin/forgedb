@@ -123,6 +123,34 @@ pub enum FieldType {
     /// deprecated spelling `char(N)` (#233) parses to this same variant and warns;
     /// `char` was a false friend, since SQL's `CHAR(N)` is fixed-length *text*.
     Bytes(usize),
+    /// `string(N)` / `string(N!)` — a fixed-width **inline string** column (#238).
+    ///
+    /// The value lives in the row's own slot of a `FixedColumn` rather than
+    /// behind an `(offset, length)` pair in a `VariableColumn`, which is what
+    /// makes a scan of it read one contiguous run instead of chasing pointers.
+    /// Bare [`FieldType::String`] is untouched and still variable-width.
+    ///
+    /// `chars` is N, the **character** count (res 3) — not a byte count, and
+    /// consistent with `@length`, which also counts characters. One byte per
+    /// character by default, four under `@utf8` (res 4/5); the physical slot
+    /// width is therefore a function of the declaration *and* that directive, and
+    /// is computed in codegen, never here.
+    ///
+    /// `chars` is a `u8` rather than a `usize` on purpose: res 7 caps N at 255,
+    /// and carrying the cap in the type makes an over-wide N unrepresentable
+    /// instead of merely rejected. The check happens exactly once, where the
+    /// parser reads the literal — there is no downstream site that has to
+    /// remember it.
+    ///
+    /// `exact` is the `!` (res 2): at-most-N when `false`, exactly-N when `true`.
+    /// The exact form is the narrow one — every value is exactly N characters, so
+    /// under the default alphabet it is exactly N bytes and the slot carries no
+    /// length prefix at all.
+    ///
+    /// There is no overflow. A value exceeding N is a write error (res 1);
+    /// experiment #261 measured the inline-or-overflow alternative losing in 198
+    /// of 200 configurations.
+    StringN { chars: u8, exact: bool },
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
     StructType(String),                // Reference to a struct by name
     OptionalStructType(String),        // Optional struct reference
@@ -423,7 +451,11 @@ impl FieldType {
             FieldType::I64 => "i64".to_string(),
             FieldType::F64 => "f64".to_string(),
             FieldType::Bool => "bool".to_string(),
-            FieldType::String => "String".to_string(),
+            // #238: an inline `string(N)` presents as an ordinary `String` in the
+            // generated struct and on every wire. Only its *storage* differs —
+            // a fixed slot instead of an (offset, length) pair — and the scan path
+            // borrows out of that slot rather than allocating.
+            FieldType::String | FieldType::StringN { .. } => "String".to_string(),
             FieldType::Json => "serde_json::Value".to_string(),
             FieldType::Decimal => "rust_decimal::Decimal".to_string(),
             FieldType::Enum(name) => name.clone(),
@@ -486,6 +518,14 @@ impl FieldType {
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
             FieldType::Nullable(inner) => inner.is_fixed_size(),
             FieldType::String => false,
+            // #238: `string(N)` occupies a fixed-width *column slot*, but this
+            // predicate asks a different question — may the type be embedded in an
+            // inline `struct` (and, transitively, a `[T; N]`)? Those are stored by
+            // transmuting the Rust value's bytes, and the Rust value here is a
+            // heap `String`; embedding one would persist a pointer. So: no. The
+            // codegen-side `is_fixed_size_type`, which decides column layout, says
+            // yes — the two predicates are deliberately different questions.
+            FieldType::StringN { .. } => false,
             FieldType::Json => false, // JSON is a variable-length column, like String
             FieldType::Relation(_) => false, // Relations are virtual or variable
             FieldType::Component(_) => false, // Components are virtual

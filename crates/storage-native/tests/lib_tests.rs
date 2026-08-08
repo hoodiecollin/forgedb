@@ -1892,3 +1892,89 @@ fn test_append_tagged_survives_reopen() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// #238: the borrowed read on the fixed path.
+//
+// `BufferedFixedColumn` owns its bytes (a `Vec` or an `Mmap` alias), so a
+// `&self` borrow of a slot is sound by construction — the same property that let
+// #224 add `BufferedVariableColumn::read_str`.  Until #238 the only whole-slot
+// read on this type was `read_bytes`, which allocates a `Vec` per row per scan.
+// A `string(N)` column routed through it would have been SLOWER than the
+// `VariableColumn` it replaces, which is the one outcome #238 exists to avoid.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn buffered_fixed_column_read_slice_borrows_the_slot() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_slice");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 4).unwrap();
+    for v in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+        col.append_bytes(v).unwrap();
+    }
+
+    // Dense prefix: the mmap-alias path.
+    let buf = col.gather_buffered(&[0, 1, 2, 3]).unwrap();
+    for slot in 0..4usize {
+        // Byte-for-byte the same answer `read_bytes` gives, without the `Vec`.
+        assert_eq!(buf.read_slice(slot).unwrap(), &buf.read_bytes(slot).unwrap()[..]);
+    }
+    assert_eq!(buf.read_slice(0).unwrap(), b"aaaa");
+    assert_eq!(buf.read_slice(3).unwrap(), b"dddd");
+
+    // Reordered: the gathered-copy path. Slots follow the selection order.
+    let buf = col.gather_buffered(&[3, 0]).unwrap();
+    assert_eq!(buf.read_slice(0).unwrap(), b"dddd");
+    assert_eq!(buf.read_slice(1).unwrap(), b"aaaa");
+
+    // Out of range mirrors every other reader on this type.
+    assert!(buf.read_slice(2).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+/// `read_str` is the whole slot as UTF-8 — the complete read for a column where
+/// the slot IS the value and carries no framing (`string(N!)`, #238 res 6).
+/// It deliberately does NOT understand a length prefix: that is #238's layout
+/// choice and belongs to generated code, not to a schema-agnostic crate.
+#[test]
+fn buffered_fixed_column_read_str_is_the_whole_slot() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_str");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 3).unwrap();
+    for v in [b"USD", b"EUR", b"JPY"] {
+        col.append_bytes(v).unwrap();
+    }
+
+    let buf = col.gather_buffered(&[0, 1, 2]).unwrap();
+    assert_eq!(buf.read_str(0).unwrap(), "USD");
+    assert_eq!(buf.read_str(1).unwrap(), "EUR");
+    assert_eq!(buf.read_str(2).unwrap(), "JPY");
+    assert!(buf.read_str(3).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+/// Invalid UTF-8 in the slot is `InvalidData`, not a panic and not silent
+/// replacement — same contract as `BufferedVariableColumn::read_str`.
+#[test]
+fn buffered_fixed_column_read_str_rejects_invalid_utf8() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_str_bad");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 2).unwrap();
+    col.append_bytes(&[0xff, 0xfe]).unwrap();
+
+    let buf = col.gather_buffered(&[0]).unwrap();
+    let err = buf.read_str(0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    // The raw bytes are still reachable through `read_slice`.
+    assert_eq!(buf.read_slice(0).unwrap(), &[0xff, 0xfe]);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}

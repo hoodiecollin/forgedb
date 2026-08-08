@@ -921,7 +921,10 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
             FieldType::I64 => ("int64".to_string(), false),
             FieldType::F64 => ("float64".to_string(), false),
             FieldType::Bool => ("bool".to_string(), false),
-            FieldType::String | FieldType::Uuid => ("string".to_string(), false),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                ("string".to_string(), false)
+            }
             // Timestamp serializes as an i64; decimal serializes as a string.
             FieldType::Timestamp => ("int64".to_string(), false),
             FieldType::Decimal => ("string".to_string(), false),

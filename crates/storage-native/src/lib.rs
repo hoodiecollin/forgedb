@@ -556,6 +556,44 @@ impl BufferedFixedColumn {
     pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
         Ok(self.slot_bytes(slot)?.to_vec())
     }
+
+    /// The whole `value_size`-wide slot at `slot`, **borrowed** (#238).
+    ///
+    /// The zero-copy counterpart of [`Self::read_bytes`], which is exactly this
+    /// plus a `.to_vec()`; both stay, because a caller that wants an owned buffer
+    /// should not have to write the copy itself.
+    ///
+    /// Borrowing is sound here and nowhere else on the fixed path: this type owns
+    /// its bytes (a gathered `Vec` or an `Mmap` alias of the dense prefix), so the
+    /// `&self` lifetime is the buffer's. [`FixedColumn`] and [`FixedColumnReader`]
+    /// read through the file on every access and have nothing to lend — the same
+    /// split that put [`BufferedVariableColumn::read_str`] on the buffered tier
+    /// only (#224).
+    pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
+        self.slot_bytes(slot)
+    }
+
+    /// The whole `value_size`-wide slot at `slot` as UTF-8, **borrowed** (#238).
+    ///
+    /// For a column where the slot *is* the value and carries no framing:
+    /// `string(N!)` (#238 res 6 — exactly N ASCII characters, therefore exactly N
+    /// bytes, therefore no length prefix), and any other fixed UTF-8 payload.
+    ///
+    /// It deliberately does **not** understand a length prefix. Which slots carry
+    /// one, and how wide it is, is #238's per-declaration layout choice; teaching
+    /// it to a schema-agnostic crate would move generated knowledge into the
+    /// substrate. Prefixed slots read through [`Self::read_slice`] and decode in
+    /// generated code.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the slot is out of range; `InvalidData` if the slot's
+    /// bytes are not valid UTF-8 — same contract as
+    /// [`BufferedVariableColumn::read_str`].
+    pub fn read_str(&self, slot: usize) -> io::Result<&str> {
+        std::str::from_utf8(self.slot_bytes(slot)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
 }
 
 /// Selection size at or above which [`FixedColumn::gather`] maps the spanned

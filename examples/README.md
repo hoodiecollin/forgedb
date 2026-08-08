@@ -41,7 +41,7 @@ is skipped by design — see the root CLAUDE.md).
 | `hotel-reservations` | Synthetic | 6 | RoomType template vs Room inventory, date-range availability, `i64` money |
 | `food-delivery` | Synthetic | 8 | `struct GeoPoint` (required + optional), `OrderItem` join, timestamped status-event audit log |
 | `banking-ledger` | Synthetic | 6 | Double-entry transactions, `Transfer` dual FK to `Account`, joint-account M2M, `string` currency codes |
-| `airline-reservations` | Synthetic | 7 | Flight dual FK to `Airport`, unique-seat composite index (seat lock), IATA codes as `string` |
+| `airline-reservations` | Synthetic | 7 | Flight dual FK to `Airport`, unique-seat composite index (seat lock), IATA codes as `string(3!)` (inline fixed-width) |
 | `blog-cms` | Synthetic | 5 | **Correct snake_case component refs** (`tsx://`/`jsx://`/`api://`), self-ref comments/categories, `@fulltext`, `@soft_delete` |
 | `project-management` | Synthetic | 8 | Org→Team→Project→Issue hierarchy, sub-issue self-ref, label M2M, dual composite indexes |
 | `saas-multitenant` | Synthetic | 7 | Per-tenant `*Organization` scoping, `Membership` RBAC join, API keys, audit log |

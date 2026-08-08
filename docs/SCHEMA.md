@@ -99,6 +99,8 @@ status: string? @default("pending")     // nullable string with a default (seman
 | `f64`     | `f64`             | `f64`               | Floating-point 64-bit            |
 | `bool`    | `bool`            | `bool`              | Boolean (true/false)             |
 | `string`  | `string`          | `String`            | Variable-length UTF-8 string     |
+| `string(N)` | `string(32)`    | `String`            | **At most** N characters, in a fixed-width column slot (see below) |
+| `string(N!)` | `string(3!)`   | `String`            | **Exactly** N characters, in a fixed-width column slot |
 | `json`    | `json`            | `serde_json::Value` | Arbitrary JSON value (variable-length column, stored as serialized JSON) |
 | `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
@@ -113,8 +115,8 @@ status: string? @default("pending")     // nullable string with a default (seman
   **array of integers** — `"USD"` in a `bytes(3)` goes on the wire as `[85, 83, 68]`.
   Use it for genuinely binary fixed-width data (a git object id, a digest, a
   fixed-width protocol field). For text of any kind — including short fixed-length
-  codes like ISO currency or IATA airport codes — use `string`, with `@length` if you
-  want the length enforced.
+  codes like ISO currency or IATA airport codes — use `string(N!)`, which is text on
+  the wire, length-checked on every write, and stored in a fixed slot.
 - **`char(N)` is the deprecated spelling of `bytes(N)`** (#233). It still parses and
   produces identical code, but emits a deprecation warning (`forgedb validate` and
   `forgedb generate` both report it and still exit 0), and it is removed at the next
@@ -124,6 +126,56 @@ status: string? @default("pending")     // nullable string with a default (seman
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 - `f64` **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*` + `find_by_*_range`), even though Rust's `f64` has no `Ord`. The index key is the IEEE 754 **total-order encoding**, which gives a strict order `-Inf < negatives < ±0 < positives < +Inf < NaN` — so `NaN` and both infinities are each their own bucket rather than sharing the null bucket with an unset value (#242). Two canonicalizations follow from float equality: `-0.0` keys as `0.0` (they compare equal, so a probe of one finds the other), and all `NaN` payloads fold to one key. Note `NaN` sorts **above** every number, so it is excluded from any finite range. For money or quantities use `decimal` — binary floats cannot represent `0.1` exactly, and no index key can repair that.
 - `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
+
+### Inline fixed-width strings — `string(N)` and `string(N!)`
+
+A bare `string` lives in the variable-length column: the row stores a 16-byte
+`(offset, length)` pair and the bytes live elsewhere, so reading one costs a second
+lookup and a copy. `string(N)` instead reserves a **fixed slot in the row itself**, so
+the value is read by slicing the row's own bytes.
+
+```
+enum Level { Silver, Gold }
+
+Account {
+  id:       +uuid
+  code:     &string(12)      // at most 12 characters, unique
+  currency: ^string(3!)      // exactly 3 — an ISO 4217 code
+  label:    string(24)?      // nullable
+  tier:     Level
+  bio:      string           // still variable-length; nothing changed here
+}
+```
+
+- **N counts CHARACTERS, not bytes** — the same unit `@length` uses.
+- **`string(N)` is a maximum; `string(N!)` is an exact length.** Both are **ENFORCED**
+  on every insert and update (violation → 422), like `@pattern`, not only at
+  validation time. `N` must be between 1 and 255.
+- **The value is ASCII by default.** One byte per character is what makes the slot
+  small enough to win, so a non-ASCII character is rejected (422) unless the field
+  opts in with `@utf8` — which widens the reservation to four bytes per character and
+  otherwise changes nothing about the type. `@utf8` on a bare `string` (or on a
+  non-string) is a schema error, because there is nothing there to widen.
+- **On the wire it is a `string`.** Rust `String`, TypeScript `string`, JSON string,
+  OpenAPI `{"type": "string", "maxLength": N}` (plus `minLength` for the exact form).
+  A client cannot tell the two spellings apart; only the storage differs.
+- **Filterable, sortable, indexable** (`^` / `&` / composite `@index` / `find_by_*`) —
+  it is a string everywhere the closed-set matcher is concerned.
+- **The length directives do not apply.** The width in the type is already the bound,
+  so `@max`, `@length(max: n)`, `@length(n)` and the max component of `@length(a, b)`
+  are schema errors on `string(N)` — declare the width you mean instead. `@min` and
+  `@length(min: n)` still work, because a lower bound is something the type does not
+  say. On `string(N!)` the length is fully determined, so **every** length directive
+  is an error. A bare `string` keeps all of them.
+- **Above 64 characters the parser warns and still generates.** Experiment #261
+  measured a fixed slot against pointer storage across 200 configurations: the slot
+  wins while it is small and loses once it is wide. Past that point prefer `string`
+  unless the value has to be a fixed-width key.
+- **It cannot go inside a `struct` or a `[T; N]`.** Those store their fields as the
+  Rust value's bytes, and the Rust value here is a heap `String` — see §7. Use
+  `bytes(N)` there.
+- **It cannot yet be a model's identity.** `id: string(26!)` is refused for now; the
+  generated API layer parses every non-integer key as a uuid.
 
 ### Enum types
 
@@ -257,6 +309,7 @@ Order {
 | `@min`                 | `(n)` or `(>n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Minimum value — **ENFORCED** (violation → 422). `>n` is an exclusive bound (continuous types only). | `age: u32 @min(13)`, `rate: f64 @min(>0)` |
 | `@max`                 | `(n)` or `(<n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Maximum value — **ENFORCED** (violation → 422). `<n` is exclusive. *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)`, `rate: f64 @max(<1)` |
 | `@length`              | `(min: n)`, `(max: n)`, `(min: a, max: b)`, `(a, b)`, or `(n)` | `string` | String length in **characters** — **ENFORCED** (violation → 422). See the table below — single-arg `@length(n)` means **exactly** n. | `name: string @length(min: 1, max: 100)` |
+| `@utf8`                | (none)          | `string(N)` only    | Widen an inline string's slot to four bytes per character — **ENFORCED** (without it a non-ASCII character is a 422). An error on any other type. | `title: string(60) @utf8` |
 | `@email`               | (none)          | `string`            | Email format — **ENFORCED** (violation → 422)      | `email: string @email` |
 | `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
 | `@pattern`             | `(regex_string)` | `string`           | Regex match — **ENFORCED** via `LazyLock<Regex>` (non-match → 422) | `phone: string @pattern("^[0-9]+$")` |
@@ -342,8 +395,11 @@ Product {
 }
 ```
 
-Note there is no way to put *text* in a fixed array: `string` is variable-length, and
-`bytes(N)` is not a string type. Model a list of strings as a related model.
+Note there is no way to put *text* in a fixed array. `string` is variable-length;
+`string(N)` has a fixed *column* slot but its Rust value is a heap `String`, and a
+fixed array is stored by writing the element values' bytes — embedding one would
+persist a pointer, so it is a schema error. `bytes(N)` is not a string type. Model a
+list of strings as a related model.
 ```
 
 ### Inline Structs
@@ -370,8 +426,10 @@ field: StructName?         // optional struct field
 
 **This rules out text.** A struct cannot hold a `string`, and `bytes(N)` is not a string
 type — so there is no way to embed an address, a name, or any other free text in a
-struct. Text belongs on the model, or on a related model. Structs are for fixed-width
-numeric/binary groupings.
+struct. Nor can it hold a `string(N)`: that type's *column* is fixed-width, but a struct
+is persisted by writing the Rust value's bytes and the Rust value is a heap `String`, so
+embedding one would store a pointer. Text belongs on the model, or on a related model.
+Structs are for fixed-width numeric/binary groupings.
 
 **Example:**
 ```
@@ -715,9 +773,9 @@ The rules in this reference are grounded in the parser and validator source:
 
 1. **Define models** (PascalCase names) with **snake_case fields**
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
-3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, json, decimal, uuid, timestamp, bytes(N)
+3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, string(N) / string(N!), json, decimal, uuid, timestamp, bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
-5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`. Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
+5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`, `@utf8` (inline strings only). Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
 7. **Structs:** Define with `struct Name { ... }` and use in models (fixed-size only)
 7b. **Enums:** Define with `enum Name { V1, V2, ... }` (PascalCase variants) and reference by bare name; stored as a 1-byte discriminant, serialized as the variant name string, filterable/sortable/indexable

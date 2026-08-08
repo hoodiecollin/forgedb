@@ -409,9 +409,11 @@ export interface ListOptions {\n\
             | forgedb_parser::FieldType::F64
             | forgedb_parser::FieldType::Timestamp => "number".to_string(),
             forgedb_parser::FieldType::Bool => "boolean".to_string(),
-            forgedb_parser::FieldType::String | forgedb_parser::FieldType::Uuid => {
-                "string".to_string()
-            }
+            // #238: an inline `string(N)` is a string on the wire — the fixed
+            // slot is a storage fact a client cannot observe.
+            forgedb_parser::FieldType::String
+            | forgedb_parser::FieldType::StringN { .. }
+            | forgedb_parser::FieldType::Uuid => "string".to_string(),
             // json is an arbitrary JSON value; `unknown` keeps callers honest
             // under `tsc --strict` (they must narrow before use).
             forgedb_parser::FieldType::Json => "unknown".to_string(),

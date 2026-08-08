@@ -239,7 +239,10 @@ impl PythonSdkGenerator {
             FieldType::Timestamp => (false, "int".into()),
             FieldType::F64 => (false, "float".into()),
             FieldType::Bool => (false, "bool".into()),
-            FieldType::String | FieldType::Uuid => (false, "str".into()),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                (false, "str".into())
+            }
             FieldType::Decimal => (false, "str".into()),
             FieldType::Enum(name) => (false, name.clone()),
             FieldType::Relation(RelationType::RequiredReference(_))
