@@ -39,6 +39,40 @@ User {
 }
 ```
 
+## The identity field
+
+A field named `id` is the identity. If there is no `id`, the first field carrying `+`
+is. Name beats position, so `id` wins even over a `+` field declared above it:
+
+```forge
+Event {
+  seq:  +u64      // allocated on every insert, but a column, not the key
+  id:    u32      // the identity: what create returns, what get() takes
+  note:  string
+}
+```
+
+An identity has to be fixed-width, `Copy`, hashable, and totally ordered. It lives in
+the row index, in every foreign-key column pointing at the model, in a many-to-many
+junction map, and in a fixed-width replication frame. That rules most types out, and
+the admitted set is short:
+
+| Identity type | Notes |
+| --- | --- |
+| `uuid` | The convention. `+uuid` fills on create |
+| `u32` `u64` `i32` `i64` | `+u32`/`+u64` allocate monotonically; `i32`/`i64` admit a signed natural key |
+| `timestamp` `timestamp(s\|ms\|us)` | A written value is floored to the declared precision |
+| `+timestamp` | Only when the field is named `id`, and only at `us` precision |
+| `string(N)` `string(N!)` | A `Copy` [`InlineStr<N>`](/docs/schema/scalar-types/#stringn-as-an-identity), not a heap `String` |
+| `*Model` | An identity that is itself a required foreign key. It takes the target's key type, and the chain must terminate |
+
+<Callout type="warning" title="Any other identity type is a validation error">
+Rejected, each with the field and the allowed set named in the message: bare `string`
+(no width, so not `Copy`), `bytes(N)`, `f64`, `bool`, `decimal`, `json`, an enum, a
+struct, a fixed array, any nullable type including `?Model`, and a `[Model]`
+collection. You get one error per bad key, not one per rule it breaks.
+</Callout>
+
 ## Field syntax
 
 Each field has the form:

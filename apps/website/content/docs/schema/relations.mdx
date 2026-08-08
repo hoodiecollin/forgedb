@@ -105,10 +105,10 @@ db.tag_posts(tag_id);    // -> Vec<Post>
 
 Each junction column is that endpoint's own key width, so a **mixed pair** works — a
 `+u64`-keyed model may be linked to a `+uuid`-keyed one. A junction stores each endpoint's
-id in a fixed-width, hashable column, so an endpoint's identity must be `uuid`, an integer
-type, `timestamp`, or [`string(N)`](/docs/schema/scalar-types/#stringn-as-an-identity) —
-the last of which qualifies because a key of that type is a `Copy`, fixed-capacity
-`InlineStr<N>` rather than a heap `String`. Anything else is reported as a schema error.
+id in a fixed-width, hashable column, which is the same thing being an identity already
+requires. So any legal [identity](/docs/schema/models-and-fields/#the-identity-field) is a
+legal endpoint, and there is no second rule to check here. An endpoint keyed on a `*Model`
+foreign key resolves through to the terminal key type.
 
 ## Fixed-size arrays — `[type; N]`
 

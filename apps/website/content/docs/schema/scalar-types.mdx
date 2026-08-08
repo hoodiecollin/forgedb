@@ -129,9 +129,12 @@ between. `:` and `@` are `pchar` without being *unreserved*, which is what makes
 </Callout>
 
 A bare `string` identity is refused — a key has to be fixed-width to be `Copy`, so the
-width belongs in the type, and the error says so. [`@utf8`](/docs/schema/directives/) on an
-identity is a schema error too: the alphabet above is a strict subset of ASCII, so widening
-the slot would reserve four bytes per character to hold characters the write path rejects.
+width belongs in the type. It is one row of the
+[identity type list](/docs/schema/models-and-fields/#the-identity-field), and it keeps its
+own message: declare a width, rather than pick a different type.
+[`@utf8`](/docs/schema/directives/) on an identity is a schema error too: the alphabet
+above is a strict subset of ASCII, so widening the slot would reserve four bytes per
+character to hold characters the write path rejects.
 
 A string-keyed model is an ordinary [relation](/docs/schema/relations/) target — foreign
 keys, `@on_delete` in all three modes, traversal, eager loading, and many-to-many all work

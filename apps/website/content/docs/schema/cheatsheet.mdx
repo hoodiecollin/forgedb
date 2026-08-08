@@ -22,6 +22,18 @@ A compact lookup for the whole `.forge` language. Follow the links for the full 
 
 No `text` type. See [scalar types](/docs/schema/scalar-types/).
 
+## Identity
+
+Every model needs one: a field named `id`, else the first `+` field. `id` wins by name
+even over a `+` field declared above it. Legal types, and nothing else:
+
+`uuid` · `u32` `u64` `i32` `i64` · `timestamp(s|ms|us)` (`+timestamp` only when named `id`,
+only at `us`) · `string(N)` `string(N!)` · `*Model` (resolves to the target's key)
+
+Anything else — bare `string`, `bytes(N)`, `f64`, `bool`, `decimal`, `json`, an enum, a
+struct, an array, any nullable including `?Model` — is a validation error naming the field.
+See [the identity field](/docs/schema/models-and-fields/#the-identity-field).
+
 ## Modifiers
 
 | Sigil | Position | Meaning | Notes |
