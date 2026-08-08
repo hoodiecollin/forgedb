@@ -104,7 +104,7 @@ status: string? @default("pending")     // nullable string with a default (seman
 | `json`    | `json`            | `serde_json::Value` | Arbitrary JSON value (variable-length column, stored as serialized JSON) |
 | `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
-| `timestamp` | `timestamp`     | `i64`               | Unix timestamp (milliseconds)    |
+| `timestamp` | `timestamp`, `timestamp(s\|ms\|us)` | `forgedb_types::Timestamp` | An instant. Stored as `i64` **microseconds** since the Unix epoch; RFC 3339 string on the wire (see below) |
 | `bytes(N)` | `bytes(20)`      | `[u8; 20]`          | Fixed-size **byte** array (not text — see below) |
 
 **Key points:**
@@ -126,6 +126,82 @@ status: string? @default("pending")     // nullable string with a default (seman
 - `json` rides the same variable-length column path as `string` (its serialized JSON, always valid UTF-8, is stored via the string column) but is typed `serde_json::Value`. It is **not indexable, filterable, or sortable** (no `^`/`&` index, no REST `?field=` filter/sort, no `find_by_*`) — JSON has no total order the closed-set matcher can key on. `json?` uses the same 1-byte presence tag as `string?`, so `None` and `Some(Value::Null)` round-trip distinctly.
 - `f64` **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*` + `find_by_*_range`), even though Rust's `f64` has no `Ord`. The index key is the IEEE 754 **total-order encoding**, which gives a strict order `-Inf < negatives < ±0 < positives < +Inf < NaN` — so `NaN` and both infinities are each their own bucket rather than sharing the null bucket with an unset value (#242). Two canonicalizations follow from float equality: `-0.0` keys as `0.0` (they compare equal, so a probe of one finds the other), and all `NaN` payloads fold to one key. Note `NaN` sorts **above** every number, so it is excluded from any finite range. For money or quantities use `decimal` — binary floats cannot represent `0.1` exactly, and no index key can repair that.
 - `decimal` is an **exact** fixed-point number (`rust_decimal::Decimal`) for money/quantity where `f64` would drift. It rides the fixed **16-byte column** path (like `uuid`), encoded via `Decimal::serialize()`/`deserialize()`. It serializes to/from JSON as a **string** (precision-preserving; the TS SDK types it `string`, OpenAPI `{type:string,format:decimal}`). Because `Decimal` is `Ord`+`Hash` it **is filterable, sortable, and indexable** (`^`/`&`/composite `@index` + `find_by_*`) — the index key is normalized (`.normalize()`) so scale-only differences (`1.0` vs `1.00`) share one bucket. `decimal?` (`Option<Decimal>`) rides the same nullable fixed-byte path as `timestamp?`/`u64?`. Bare `decimal` only — `decimal(p, s)` precision/scale metadata is not yet parsed (deferred).
+
+### Timestamps and declared precision — `timestamp(s|ms|us)`
+
+A `timestamp` is an **instant**, not a wall-clock time and not a date: there is no
+timezone, and `Z` is the only offset ever emitted.
+
+```
+Trade {
+  id:         +timestamp(us)   // an allocated key, microsecond-precise
+  filled_at:  timestamp(ms)
+  settled_on: timestamp(s)
+  created_at: +timestamp       // a stamp — bare, so milliseconds
+}
+```
+
+**Storage is always microseconds.** The declared key does not change what is on
+disk; it is the **quantum**:
+
+- a value you supply is **floored** to it on write (floor, never truncate — a
+  pre-epoch value truncated toward zero would round *forward* in time);
+- an allocated `+timestamp` identity advances by one unit of it.
+
+So precision buys *fidelity*, not correctness. `timestamp(s)` is a promise that the
+stored value is second-aligned, which is what makes it meaningful to display, index
+and compare as a second.
+
+A bare `timestamp` is **`timestamp(ms)`**. Milliseconds is the default because it
+matches what almost every producer of a timestamp actually has, and because
+seconds — the pre-v0.4.0 unit — cannot order two rows written in the same second.
+
+`ns` is not offerable: microseconds is the storage unit, and `i64` nanoseconds would
+cap the type at 1678–2262.
+
+**The wire form is RFC 3339**, with six fractional digits and a `Z`:
+
+```json
+{ "created_at": "2026-03-31T23:33:20.123456Z" }
+```
+
+That is the form in JSON bodies, the TS SDK (`string`), the OpenAPI document
+(`{"type":"string","format":"date-time"}`), the Rust/Python/Go REST SDKs, and the
+REST filter parameters — every surface that goes through serde. It is *not* the form
+of the **index key**, which stays the stored number so a timestamp index keeps
+numeric order rather than lexicographic order.
+
+Two consequences worth knowing:
+
+- **An instant outside RFC 3339's year range (`0000`–`9999`) is rejected with a
+  422.** `i64` microseconds reaches ±292 000 years, so such a value is *storable* and
+  not *serializable* — a row that could be written and would then fail on every read.
+  The write path refuses it instead.
+- **A timestamp key survives a URL path segment** by construction: RFC 3339 contains
+  no reserved URL character. This is what makes `id: +timestamp(us)` usable as a REST
+  identity.
+
+**`+timestamp` as an identity.** An auto-generate timestamp is a legal primary key,
+with two rules:
+
+1. **It must be named `id`.** Under any other name a `+timestamp` is a *stamp* —
+   `created_at`, `seen_at` — and inferring a primary key from one would silently
+   mis-key the model. (This is deliberately asymmetric with `+u32`/`+u64`: the only
+   reason to write an auto integer is to get an allocated sequence, so an auto
+   integer is unambiguously key-ish.)
+2. **It must be declared `us`.** `id: +timestamp` and `id: +timestamp(ms)` are
+   rejected, naming the floor.
+
+The reason for rule 2 is that **precision does not make a key unique — monotonic
+allocation does.** The allocator is `next = max(now, last + 1)`, so a burst of
+inserts inside one clock tick still yields distinct, strictly increasing keys, but it
+does so by running the counter *ahead* of the wall clock. Recovery time is
+proportional to the declared unit: a million-row import lands rows about 17 minutes in
+the future at `ms`, and one second ahead at `us`.
+
+`0` (1970-01-01T00:00:00Z) is the "not set" sentinel for a `+timestamp`, so it cannot
+be inserted explicitly — supplying it means "generate one". Supplying any other value
+is honoured verbatim *and* advances the counter past it.
 
 ### Inline fixed-width strings — `string(N)` and `string(N!)`
 
@@ -221,6 +297,10 @@ Order {
 - `+` (auto-generate) only valid on auto-generatable types: u32, u64, uuid, timestamp (`crates/parser/src/parser/core.rs:526-531`)
   - **All four synthesize on create** (#187). Each type has an "unset" sentinel the create path
     looks for: a nil UUID, a zero timestamp, and — for `+u32`/`+u64` — **`0`**.
+  - **A `+timestamp` is a stamp by default and a key only when named `id`** (#254). Under any
+    other name it is filled with `now()`, floored to the field's declared precision; named `id`
+    it becomes an allocated identity, and must then be declared `us`
+    (`id: +timestamp(us)`). See *Timestamps and declared precision* above.
   - **`0` cannot be inserted explicitly** into an auto-integer field. Supplying it means
     "allocate one for me". Supplying any other value is honoured verbatim *and* advances the
     counter past it, so restoring a backup or importing a dataset does not collide on the next
@@ -787,7 +867,7 @@ The rules in this reference are grounded in the parser and validator source:
 
 1. **Define models** (PascalCase names) with **snake_case fields**
 2. **Use type modifiers** (`+`, `&`, `^`) **before type**, nullable `?` **after type**
-3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, string(N) / string(N!), json, decimal, uuid, timestamp, bytes(N)
+3. **Valid scalar types:** u32, u64, i32, i64, f64, bool, string, string(N) / string(N!), json, decimal, uuid, timestamp / timestamp(s|ms|us), bytes(N)
 4. **Relations:** `[Model]` (one-to-many), `*Model` (required FK), `?Model` (optional FK)
 5. **Constraints are ENFORCED at write (violation → 422):** `@min`/`@max` (numeric only, `decimal` included — each compares in its own domain, so a `decimal` bound stays exact and a 64-bit integer bound never rounds; bounds may be negative or fractional, and `>n`/`<n` make them exclusive on `f64`/`decimal`), `@length` (string length in characters; `min:`/`max:` named args, and single-arg `@length(n)` means **exactly** n), `@email`, `@url`, `@pattern`/`@regex`, `@utf8` (inline strings only). Still semantic-only markers (parsed, not applied): `@default`, `@computed`, `@fulltext`, `@materialized`, field-level `@index`
 6. **Composite indexes:** `@index(field1, field2, ...)` at model level (≥2 fields)
