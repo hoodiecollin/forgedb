@@ -36,7 +36,7 @@ type Account struct {
 	Metadata json.RawMessage `json:"metadata"`
 	Bio *string `json:"bio"`
 	LoginCount uint64 `json:"login_count"`
-	CreatedAt int64 `json:"created_at"`
+	CreatedAt string `json:"created_at"`
 	Projects json.RawMessage `json:"projects"`
 }
 
@@ -89,7 +89,7 @@ type ProjectCard struct {
 type AuditEvent struct {
 	Id string `json:"id"`
 	Kind string `json:"kind"`
-	At int64 `json:"at"`
+	At string `json:"at"`
 }
 
 // AuditEventCreate is the input to CreateX — a AuditEvent without the fields the

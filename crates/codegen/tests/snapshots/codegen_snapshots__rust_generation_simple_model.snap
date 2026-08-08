@@ -17,7 +17,7 @@ const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_SCHEMA_VERSION: u32 = 1;
 const EXPECTED_ENGINE_VERSION: u32 = 2;
 fn __forgedb_default_ts() -> Timestamp {
-    Timestamp::from_seconds(0)
+    Timestamp::from_micros(0)
 }
 /// Build an opaque MVCC conflict key from its components (#257).
 ///

@@ -17,7 +17,7 @@ const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_SCHEMA_VERSION: u32 = 1;
 const EXPECTED_ENGINE_VERSION: u32 = 2;
 fn __forgedb_default_ts() -> Timestamp {
-    Timestamp::from_seconds(0)
+    Timestamp::from_micros(0)
 }
 /// Build an opaque MVCC conflict key from its components (#257).
 ///
@@ -314,8 +314,9 @@ impl PlaceStorage {
         {
             let mut __max: u64 = 0;
             for (&__k, _) in db.id_to_row.iter() {
-                if (__k as u64) > __max {
-                    __max = __k as u64;
+                let __v = (__k) as u64;
+                if __v > __max {
+                    __max = __v;
                 }
             }
             db.__autoseq_id.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
@@ -1004,8 +1005,9 @@ impl PlaceStorage {
         {
             let mut __max: u64 = 0;
             for (&__k, _) in self.id_to_row.iter() {
-                if (__k as u64) > __max {
-                    __max = __k as u64;
+                let __v = (__k) as u64;
+                if __v > __max {
+                    __max = __v;
                 }
             }
             self.__autoseq_id.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
@@ -1026,7 +1028,8 @@ impl PlaceStorage {
                 .entry(id)
                 .or_default()
                 .push(__r);
-            self.__autoseq_id.fetch_max(id as u64, std::sync::atomic::Ordering::SeqCst);
+            self.__autoseq_id
+                .fetch_max((id) as u64, std::sync::atomic::Ordering::SeqCst);
             if !__deleted {}
         }
     }

@@ -9,7 +9,7 @@ use forgedb_codegen::{
     WasmGenerator,
 };
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
-use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
+use forgedb_parser::{Field, FieldType, Model, RelationType, Schema, TimestampPrecision};
 
 /// Helper to create a simple test schema with one model
 fn simple_user_schema() -> Schema {
@@ -167,7 +167,7 @@ fn test_rust_generation_auto_generate_synthesis() {
             name: "Event".to_string(),
             fields: vec![
                 auto_field("id", FieldType::Uuid),
-                auto_field("created_at", FieldType::Timestamp),
+                auto_field("created_at", FieldType::Timestamp(TimestampPrecision::Millis)),
             ],
             composite_indexes: vec![],
             projections: Vec::new(),
@@ -708,7 +708,7 @@ fn test_different_field_types() {
                 },
                 Field { position: None,
                     name: "created_at".to_string(),
-                    field_type: FieldType::Timestamp,
+                    field_type: FieldType::Timestamp(TimestampPrecision::Millis),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -5464,8 +5464,10 @@ Widget {
         "i32 filter parses the param to i32"
     );
     assert!(
-        code.contains("forgedb_types::Timestamp::from_seconds"),
-        "timestamp filter parses seconds into Timestamp"
+        code.contains("want.parse::<forgedb_types::Timestamp>()"),
+        "#254: a timestamp filter parses the RFC 3339 wire form, the same form the \
+         body uses — parsing a bare integer here would have silently meant SECONDS \
+         against microsecond storage, matching nothing instead of failing"
     );
     // (The generic path may wrap across lines in the formatted output, so match
     // the pieces rather than one contiguous span.)
@@ -7421,8 +7423,10 @@ Owner {
         "integer keys write digits straight in"
     );
     assert!(
-        flat.contains(r#"write!(__k,"{}",__v.as_seconds())"#),
-        "timestamp is #[serde(transparent)] over i64 — its key is the bare number"
+        flat.contains(r#"write!(__k,"{}",__v.as_micros())"#),
+        "#254: the INDEX key stays the bare stored number and stays in the numeric \
+         class — the RFC 3339 change is the wire form only, and keying on the \
+         string would silently reorder every timestamp index lexicographically"
     );
     assert!(
         flat.contains(r#"__k.push_str(if*__v{"true"}else{"false"});"#),

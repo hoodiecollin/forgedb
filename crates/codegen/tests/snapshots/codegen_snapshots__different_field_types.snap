@@ -17,7 +17,7 @@ const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
 const EXPECTED_SCHEMA_VERSION: u32 = 1;
 const EXPECTED_ENGINE_VERSION: u32 = 2;
 fn __forgedb_default_ts() -> Timestamp {
-    Timestamp::from_seconds(0)
+    Timestamp::from_micros(0)
 }
 /// Build an opaque MVCC conflict key from its components (#257).
 ///
@@ -204,7 +204,7 @@ pub struct ComplexModel {
     pub count: i64,
     pub price: f64,
     pub active: bool,
-    #[schema(value_type = i64)]
+    #[schema(value_type = String)]
     pub created_at: Timestamp,
 }
 ///Borrowed narrow scan view for `ComplexModel` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
@@ -479,6 +479,21 @@ impl ComplexModelStorage {
     /// existence is checked by `Database::create_<model>`, which has the
     /// sibling-collection access this storage-scoped method lacks.)
     pub fn insert(&mut self, record: ComplexModel) -> Result<Uuid, ValidationError> {
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_complex_model(&record)?;
         let row_index = self.row_count;
         let id = record.id;
@@ -553,6 +568,21 @@ impl ComplexModelStorage {
     ) -> Result<bool, ValidationError> {
         if !self.id_to_row.contains_key(&id) {
             return Ok(false);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_complex_model(&record)?;
         let row_index = self.row_count;
@@ -2063,6 +2093,21 @@ impl<'db> TxHandle<'db> {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_complex_model(&record)?;
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -2088,6 +2133,21 @@ impl<'db> TxHandle<'db> {
             return Ok(false);
         }
         self.__mark_complex_model();
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_complex_model(&record)?;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -2509,6 +2569,21 @@ impl ConcurrentTxHandle {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_complex_model(&record)?;
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -2538,6 +2613,21 @@ impl ConcurrentTxHandle {
     ) -> Result<bool, TxError> {
         if self.get_complex_model(id).is_none() {
             return Ok(false);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "ComplexModel",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_complex_model(&record)?;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
