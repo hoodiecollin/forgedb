@@ -26,13 +26,15 @@ The `forgedb-types` crate provides type definitions that match ForgeDB's schema 
 | `bool` | `bool` | Boolean value |
 | `string` | `String` | UTF-8 encoded text |
 | `uuid` | [`Uuid`](https://docs.rs/uuid) | Universally unique identifier |
-| `timestamp` | `Timestamp` | Unix timestamp (seconds since epoch) |
+| `timestamp` | `Timestamp` | Instant, as microseconds since the Unix epoch |
 
 ### Special Types
 
 #### `Timestamp`
 
-A wrapper around `i64` that represents Unix timestamps (seconds since January 1, 1970 00:00:00 UTC).
+A wrapper around `i64` holding **microseconds** since January 1, 1970 00:00:00 UTC.
+Microseconds are the one canonical unit, whatever precision a field declares
+(`timestamp(s|ms|us)`); the JSON/`Display`/`FromStr` form is RFC 3339.
 
 ```rust
 use forgedb_types::Timestamp;
@@ -40,15 +42,19 @@ use forgedb_types::Timestamp;
 // Create from current time
 let now = Timestamp::now();
 
-// Create from seconds
-let ts = Timestamp::from_seconds(1234567890);
+// Create from microseconds
+let ts = Timestamp::from_micros(1_775_000_000_123_456);
 
 // Get underlying value
-let seconds = ts.as_seconds();
+let micros = ts.as_micros();
 
-// Convert to/from i64
-let ts: Timestamp = 1234567890_i64.into();
-let seconds: i64 = ts.into();
+// The wire form is RFC 3339, in both directions
+assert_eq!(ts.to_rfc3339(), "2026-03-31T23:33:20.123456Z");
+let back: Timestamp = "2026-03-31T23:33:20.123456Z".parse().unwrap();
+
+// Convert to/from i64 (microseconds)
+let ts: Timestamp = 1_775_000_000_123_456_i64.into();
+let micros: i64 = ts.into();
 ```
 
 #### `Value`
@@ -90,7 +96,7 @@ use forgedb_types::{Timestamp, Value, Uuid};
 
 // Work with timestamps
 let ts = Timestamp::now();
-println!("Current timestamp: {}", ts.as_seconds());
+println!("Current timestamp: {}", ts); // RFC 3339
 
 // Create typed values
 let values = vec![
@@ -123,10 +129,10 @@ println!("JSON: {}", json);
 let deserialized: Value = serde_json::from_str(&json).unwrap();
 assert_eq!(val, deserialized);
 
-// Timestamps serialize as plain i64
-let ts = Timestamp::from_seconds(1234567890);
+// Timestamps serialize as an RFC 3339 string, never a bare number
+let ts = Timestamp::from_micros(1_775_000_000_123_456);
 let json = serde_json::to_string(&ts).unwrap();
-assert_eq!(json, "1234567890");
+assert_eq!(json, "\"2026-03-31T23:33:20.123456Z\"");
 ```
 
 ### Type Conversions
@@ -155,9 +161,12 @@ if val.is_string() {
 
 #### `Timestamp`
 
-- `Timestamp::from_seconds(i64) -> Timestamp` - Create from seconds since epoch
+- `Timestamp::from_micros(i64) -> Timestamp` - Create from microseconds since epoch
 - `Timestamp::now() -> Timestamp` - Get current timestamp
-- `ts.as_seconds() -> i64` - Get seconds value
+- `ts.as_micros() -> i64` - Get the microseconds value
+- `ts.to_rfc3339() -> String` / `Timestamp::from_rfc3339(&str)` - The wire form
+- `ts.floor_to_micros(quantum) -> Timestamp` - Floor to a declared precision
+- `ts.is_rfc3339_representable() -> bool` - Inside RFC 3339's year range 0000-9999
 - Implements: `Debug`, `Clone`, `Copy`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Serialize`, `Deserialize`
 
 #### `Value`
@@ -178,7 +187,7 @@ Re-exported from the [`uuid`](https://docs.rs/uuid) crate. See its documentation
 
 While ForgeDB stores timestamps as plain `i64` values, we provide a `Timestamp` wrapper type for:
 - Type safety (prevents mixing timestamps with other integers)
-- Convenient constructors (`now()`, `from_seconds()`)
+- Convenient constructors (`now()`, `from_micros()`, `from_rfc3339()`)
 - Clear intent in APIs
 - Future extensibility (e.g., different time units)
 
