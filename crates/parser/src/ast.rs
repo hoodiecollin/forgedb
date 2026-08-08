@@ -586,28 +586,36 @@ impl FieldType {
         matches!(self, FieldType::Relation(_))
     }
 
-    /// May a model whose identity is this type be an endpoint of a many-to-many
-    /// junction (#266)?
+    /// May a value of this type be a model's key (#251)?
     ///
-    /// The junction stores each endpoint's id in a fixed-width column, indexes it
-    /// in a `HashMap`, and frames it in a fixed-width replication record — so the
-    /// key must be fixed-width, hashable and totally equatable. That admits
-    /// `uuid`, the four integer types, `timestamp`, and — since #252 backed it
-    /// with a `Copy + Hash + Eq` `InlineStr<N>` — `string(N)` / `string(N!)`,
-    /// which is every shape an identity is realistically written in (all four
-    /// `+` autos among them).
+    /// This is the **scalar** half of the identity allow-list — the set a key
+    /// ultimately resolves to. (A `*Model` identity is admitted too, but it is not
+    /// a scalar: its key is the target's, resolved transitively by #266, and the
+    /// terminal type is one of these.)
     ///
-    /// A **bare** `string` is outside it and always will be: it is variable-width,
-    /// so it can occupy neither a `FixedColumn` slot nor a fixed-width frame.
-    /// (#252 refuses it as an identity one step earlier, so a schema never
-    /// reaches this predicate carrying one.)
+    /// Three properties are needed, and only enumeration gets all three right:
+    ///
+    /// - **fixed width**, because the key sits in a `FixedColumn` slot and in a
+    ///   fixed-width replication frame — which is what bars a bare `string`;
+    /// - **`Copy`**, because the generated code passes a key by value repeatedly
+    ///   (`get`, `delete`, relation resolution, the delta enum) — a `String` there
+    ///   is 31 move/borrow errors in a single model;
+    /// - **`Hash + Eq`**, because `id_to_row` is a `HashMap` keyed on it — which is
+    ///   what bars `f64` despite its being `Copy` and fixed-width.
+    ///
+    /// `bool` satisfies all three and is still excluded: two rows exhaust the key
+    /// space. `bytes(N)` satisfies all three and is excluded on **modelling**
+    /// grounds — the identifiers that motivate a non-uuid key (ULIDs, nanoids,
+    /// prefixed vendor keys, ISINs) are text, and text is `string(N)`. Both are
+    /// why this is an allow-list rather than a `Copy + Eq` rule; admitting either
+    /// later is a non-breaking widening.
     ///
     /// This lives on the AST rather than in the generator because BOTH sides need
-    /// it and they cannot see each other: `forgedb-codegen`'s `valid_m2m` filters
-    /// on it, and the parser's validator reports a schema outside it as an error.
-    /// If those two ever disagree, a relation is silently dropped again — which is
-    /// exactly the failure #266 exists to remove.
-    pub fn is_junction_key(&self) -> bool {
+    /// it and they cannot see each other: `forgedb-codegen` filters on it, and the
+    /// parser's validator reports a schema outside it as an error. If those two
+    /// ever disagree, generated code silently loses a capability — exactly the
+    /// failure #265/#266 exists to remove.
+    pub fn is_identity_key(&self) -> bool {
         matches!(
             self,
             FieldType::Uuid
@@ -620,11 +628,24 @@ impl FieldType {
         )
     }
 
-    // #251 RED STUB — deliberately admits everything, so the allow-list scenarios
-    // fail on their assertions rather than on a missing symbol.
-    pub fn is_identity_key(&self) -> bool {
-        let _ = self;
-        true
+    /// May a model whose identity is this type be an endpoint of a many-to-many
+    /// junction (#266)?
+    ///
+    /// **Identical to [`FieldType::is_identity_key`], and that is load-bearing
+    /// rather than a coincidence.** The junction stores each endpoint's id in a
+    /// fixed-width column, indexes it in a `HashMap`, and frames it in a
+    /// fixed-width replication record; a model's own `id_to_row` map wants the
+    /// same three properties for the same reasons. Two sets that must coincide are
+    /// one set, so this delegates instead of re-listing — if they were ever
+    /// allowed to drift, either a junction silently vanishes (#266's original
+    /// defect) or one bad identity earns two diagnostics pointing at two different
+    /// fixes (#251's fold).
+    ///
+    /// Kept as its own name because the *question* differs, and the generator's
+    /// junction code should read as asking the junction's question. Codegen calls
+    /// this one; the validator's allow-list calls the other.
+    pub fn is_junction_key(&self) -> bool {
+        self.is_identity_key()
     }
 
     /// Check if this type is fixed-size (Sprint 8)
@@ -820,14 +841,56 @@ impl Struct {
 }
 
 impl Model {
-    // #251 RED STUB — deliberately the OLD single-pass form, so the scenarios
-    // fail on their assertions rather than on a missing symbol.
+    /// **The** identity field: a field named `id`, or any `+` auto-generate field
+    /// (#248 makes one of the two mandatory).
+    ///
+    /// # `id` wins by name, then by `+`
+    ///
+    /// Written as a two-pass search rather than one
+    /// `find(|f| f.name == "id" || f.auto_generate)`, because the single-pass form
+    /// tests both conditions at each field in **declaration order** and so returns
+    /// whichever comes first — a `+` field above `id` beats `id` itself. With a
+    /// key-shaped `+` type that result compiles and runs:
+    ///
+    /// ```forge
+    /// Event { seq: +u64  id: u32  note: string }
+    /// ```
+    ///
+    /// keys the database on `seq` while naming the generated parameter `id`, so
+    /// `/events/{id}` takes a sequence number and every relation pointing at this
+    /// model points at the wrong column (#251 shape 4). It is the only shape in
+    /// that issue that ships a *working* binary with the wrong key, and a primary
+    /// key cannot be changed later without an on-disk format change.
+    ///
+    /// # Why this lives on the AST
+    ///
+    /// It was open-coded 31 times across 8 files, and a partial fix is worse than
+    /// none: if the validator selects a different field than the generator keys
+    /// on, the guard checks a field the database does not have. Both
+    /// `crates/parser` (validation) and every `crates/codegen` backend need it and
+    /// they cannot see each other — codegen depends on parser, not the reverse —
+    /// so the one definition has to be here. `tests/identity_predicate_test.rs`
+    /// asserts no copy comes back.
+    ///
+    /// Note what this deliberately does **not** do: it does not filter by type.
+    /// Whether the chosen field *can* serve as a key is the allow-list's question
+    /// (`validate.rs::check_identity_types`), and answering it here would make a
+    /// bad identity silently become "no identity" — a diagnostic pointing at the
+    /// model when the offending token is on a field.
     pub fn identity_field(&self) -> Option<&Field> {
         self.fields
             .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
+            .find(|f| f.name == "id")
+            .or_else(|| self.fields.iter().find(|f| f.auto_generate))
     }
 
+    /// Whether the model has an identity field at all (#248).
+    ///
+    /// Derived from [`Model::identity_field`] rather than open-coded, so the
+    /// existence test and the selection can never disagree. (They agree for any
+    /// *ordering* — a model has an identity under first-match iff it has one
+    /// under precedence — but only sharing the definition keeps that true when
+    /// the rule changes.)
     pub fn has_identity(&self) -> bool {
         self.identity_field().is_some()
     }
