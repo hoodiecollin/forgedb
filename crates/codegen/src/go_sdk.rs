@@ -290,7 +290,8 @@ impl GoSdkGenerator {
             FieldType::I32 => (false, "int32".into()),
             FieldType::I64 => (false, "int64".into()),
             FieldType::F64 => (false, "float64".into()),
-            FieldType::Timestamp => (false, "int64".into()),
+            // #254: RFC 3339 string on the wire.
+            FieldType::Timestamp(_) => (false, "string".into()),
             FieldType::Bool => (false, "bool".into()),
             // #238: an inline `string(N)` is a string on the wire.
             FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {

@@ -432,7 +432,8 @@ impl ForgeDbClient {
             FieldType::I32 => (false, "i32".into()),
             FieldType::I64 => (false, "i64".into()),
             FieldType::F64 => (false, "f64".into()),
-            FieldType::Timestamp => (false, "i64".into()),
+            // #254: RFC 3339 string on the wire.
+            FieldType::Timestamp(_) => (false, "String".into()),
             FieldType::Bool => (false, "bool".into()),
             // #238: an inline `string(N)` is a string on the wire.
             FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {

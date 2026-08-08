@@ -297,9 +297,12 @@ impl NapiGenerator {
             // uuid serializes as a hyphenated string in serde.
             FieldType::Uuid => Some(quote! { String }),
 
-            // timestamp (`forgedb_types::Timestamp` newtype over i64) serializes
-            // as i64 in serde.
-            FieldType::Timestamp => Some(quote! { i64 }),
+            // timestamp serializes as an RFC 3339 string since #254.  This has
+            // to track serde, not the in-memory representation: the async ops
+            // return raw `serde_json::Value`, so a typed struct that disagreed
+            // would give the same field two shapes depending on which method
+            // was called.
+            FieldType::Timestamp(_) => Some(quote! { String }),
 
             // decimal serializes as a string (serde-with-str feature).
             FieldType::Decimal => Some(quote! { String }),
@@ -374,8 +377,8 @@ impl NapiGenerator {
             // uuid → hyphenated string (matches serde's `Serialize for Uuid`).
             FieldType::Uuid => quote! { __src.#field_name.to_string() },
 
-            // timestamp → i64 (the `Timestamp` newtype wraps i64; `From<Timestamp> for i64`).
-            FieldType::Timestamp => quote! { i64::from(__src.#field_name) },
+            // timestamp → its RFC 3339 rendering (#254), matching serde.
+            FieldType::Timestamp(_) => quote! { __src.#field_name.to_string() },
 
             // decimal → string (matches serde-with-str).
             FieldType::Decimal => quote! { __src.#field_name.to_string() },
@@ -438,7 +441,7 @@ impl NapiGenerator {
             }
             FieldType::U64 => quote! { __src.#field_name.map(|__v| __v as i64) },
             FieldType::Uuid => quote! { __src.#field_name.map(|__u| __u.to_string()) },
-            FieldType::Timestamp => quote! { __src.#field_name.map(|__t| i64::from(__t)) },
+            FieldType::Timestamp(_) => quote! { __src.#field_name.map(|__t| __t.to_string()) },
             FieldType::Decimal => quote! { __src.#field_name.map(|__d| __d.to_string()) },
             FieldType::Enum(_) => {
                 quote! {
@@ -1040,8 +1043,8 @@ name = "forgedb"
 crate-type = ["cdylib"]
 
 [dependencies]
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"

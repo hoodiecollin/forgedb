@@ -272,10 +272,15 @@ impl OpenApiGenerator {
             // decimal serializes as a precision-preserving JSON string.
             FieldType::Decimal => json!({ "type": "string", "format": "decimal" }),
             FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
-            FieldType::Timestamp => json!({
-                "type": "integer",
-                "format": "int64",
-                "description": "Unix timestamp"
+            // #254: RFC 3339 on the wire — a strictly better contract than
+            // `format: int64`, and one every OpenAPI client already understands.
+            FieldType::Timestamp(p) => json!({
+                "type": "string",
+                "format": "date-time",
+                "description": format!(
+                    "RFC 3339 instant, declared precision `{}` (stored as microseconds)",
+                    p.key()
+                )
             }),
             // char(N) serializes as an N-byte array (`[u8; N]`), so it is a
             // fixed-length array of bytes on the wire, not a string.
