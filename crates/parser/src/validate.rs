@@ -112,6 +112,11 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
     // `string(N)` / `string(N!)` / `@utf8` (#238).
     check_inline_strings(schema, errors);
 
+    // #252: a string identity must carry a declared width, and may not widen its
+    // characters. Runs BEFORE the junction check so a bare `string` identity is
+    // reported once, as an identity, rather than a second time as an endpoint.
+    check_string_identities(schema, errors);
+
     // #266: an identity that is itself a foreign key must terminate; a foreign
     // key inherits its target's key width; a junction endpoint's key must be one
     // the junction can physically hold.
@@ -775,26 +780,13 @@ fn check_inline_strings(schema: &Schema, errors: &mut Vec<ValidationError>) {
                 continue;
             };
 
-            // An inline-string identity does not generate compilable code yet.
-            // The hole is older than #238 — a bare `string` identity has never
-            // compiled either, because the generated REST layer parses every
-            // non-integer key as a uuid (`ApiGenerator::id_parse_type`). #252
-            // closes it with a `Copy` `InlineStr<N>` key; until then this is a
-            // loud refusal rather than the silent generation of a crate that
-            // will not build.
-            if field.name == "id" || field.auto_generate {
-                errors.push(positioned(
-                    format!(
-                        "{subject} is the model's identity, and a `{}` identity does not \
-                         generate compilable code yet — the generated API layer parses every \
-                         non-integer key as a uuid. Use `+uuid` or an integer auto for now.",
-                        spell_inline_string(chars, exact)
-                    ),
-                    field.position,
-                ));
-                continue;
-            }
-
+            // #238's interim identity refusal used to sit here and `continue`.
+            // It was a marker for `ApiGenerator::id_parse_type`'s `_ => Uuid`
+            // fall-through, not a design position; #252 closed that hole with a
+            // `Copy` `InlineStr<N>` key, so an inline string identity now runs
+            // through the same directive matrix and width advisory as any other
+            // inline string. (The identity-specific rules — the declared width
+            // and the `@utf8` ban — are `check_string_identities`.)
             check_inline_string_directives(&subject, chars, exact, field, errors);
             warn_wide_inline_string(&subject, chars, field.position, errors);
         }
@@ -808,6 +800,71 @@ fn check_inline_strings(schema: &Schema, errors: &mut Vec<ValidationError>) {
                 &format!("Struct '{}' field '{}'", struct_def.name, field.name),
                 field,
                 errors,
+            );
+        }
+    }
+}
+
+/// The two identity-specific string rules (#252): a key must carry a declared
+/// width, and it may not widen its characters.
+///
+/// **For #251, which lands the identity allow-list ONCE:** this is the `string`
+/// *row* of that table, written here because #252 is where the key type is
+/// declared. Fold it into the allow-list rather than adding a second rejection —
+/// two diagnostics for one mistake is worse than either alone. The bare-`string`
+/// arm below is the only place a non-admitted identity type is refused today.
+fn check_string_identities(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for model in &schema.models {
+        let Some(field) = identity_field(model) else {
+            continue;
+        };
+        let subject = format!("Field '{}.{}'", model.name, field.name);
+
+        // Res 1: a key cannot be variable-width and stay `Copy`, and `Copy` is
+        // the whole mechanism — the generated code passes the identity by value
+        // repeatedly (`get`, `delete`, relation resolution, the delta enum). A
+        // `String` there is 31 move/borrow errors in a single model.
+        if matches!(field.field_type, FieldType::String) {
+            errors.push(
+                positioned(
+                    format!(
+                        "{subject} is the model's identity, and a bare `string` cannot be one: \
+                         the generated code passes a key by value, which needs a fixed-width \
+                         `Copy` type. Declare the width — `string(N)` for at most N characters, \
+                         `string(N!)` for exactly N."
+                    ),
+                    field.position,
+                )
+                .with_suggestion(format!(
+                    "give '{}' a declared width, e.g. `{}: string(26!)`",
+                    field.name, field.name
+                )),
+            );
+            continue;
+        }
+
+        // Res 3: the path-segment alphabet (res 4) is a strict subset of ASCII,
+        // so a key can never hold a character `@utf8` exists to admit. Allowing
+        // it would reserve 4N bytes per row for values the write path rejects.
+        if let Some((chars, exact)) = direct_inline_string(&field.field_type)
+            && field.has_constraint("utf8")
+        {
+            errors.push(
+                positioned(
+                    format!(
+                        "{subject} is the model's identity, so `@utf8` cannot apply to it: an \
+                         identity's value must survive a URL path segment unencoded, which \
+                         admits only ASCII. `@utf8` would reserve {} bytes per row to hold \
+                         characters the write path refuses.",
+                        chars as usize * 4
+                    ),
+                    field.position,
+                )
+                .with_suggestion(format!(
+                    "drop `@utf8` from '{}' (it stays `{}`)",
+                    field.name,
+                    spell_inline_string(chars, exact)
+                )),
             );
         }
     }
@@ -1047,12 +1104,19 @@ fn check_m2m_endpoint_keys(schema: &Schema, errors: &mut Vec<ValidationError>) {
             if ty.is_junction_key() {
                 continue;
             }
+            // A bare `string` identity is already refused as an identity at all
+            // (#252, `check_string_identities`), and that is the earlier and more
+            // useful diagnostic. Reporting it a second time here would give one
+            // mistake two messages pointing at two different fixes.
+            if matches!(ty, FieldType::String) {
+                continue;
+            }
             errors.push(positioned(
                 format!(
                     "Model '{}' cannot be an endpoint of the many-to-many relation \
                      '{}.{}' <-> '{}.{}': its identity is `{}`, and a junction stores each \
-                     endpoint's id in a fixed-width, hashable column. Use a `uuid`, integer or \
-                     `timestamp` identity.",
+                     endpoint's id in a fixed-width, hashable column. Use a `uuid`, integer, \
+                     `timestamp` or `string(N)` identity.",
                     name,
                     m.model1,
                     m.field1,

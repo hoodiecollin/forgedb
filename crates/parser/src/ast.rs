@@ -592,8 +592,15 @@ impl FieldType {
     /// The junction stores each endpoint's id in a fixed-width column, indexes it
     /// in a `HashMap`, and frames it in a fixed-width replication record — so the
     /// key must be fixed-width, hashable and totally equatable. That admits
-    /// `uuid`, the four integer types and `timestamp`, which is every shape an
-    /// identity is realistically written in (all four `+` autos among them).
+    /// `uuid`, the four integer types, `timestamp`, and — since #252 backed it
+    /// with a `Copy + Hash + Eq` `InlineStr<N>` — `string(N)` / `string(N!)`,
+    /// which is every shape an identity is realistically written in (all four
+    /// `+` autos among them).
+    ///
+    /// A **bare** `string` is outside it and always will be: it is variable-width,
+    /// so it can occupy neither a `FixedColumn` slot nor a fixed-width frame.
+    /// (#252 refuses it as an identity one step earlier, so a schema never
+    /// reaches this predicate carrying one.)
     ///
     /// This lives on the AST rather than in the generator because BOTH sides need
     /// it and they cannot see each other: `forgedb-codegen`'s `valid_m2m` filters
@@ -609,6 +616,7 @@ impl FieldType {
                 | FieldType::I32
                 | FieldType::I64
                 | FieldType::Timestamp(_)
+                | FieldType::StringN { .. }
         )
     }
 
