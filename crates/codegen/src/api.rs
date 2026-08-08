@@ -1,5 +1,6 @@
 //! REST API server code generator
 
+use crate::rust::RustGenerator;
 use crate::{GenConfig, GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
@@ -57,6 +58,7 @@ impl ApiGenerator {
         tokens.extend(header);
 
         // Imports
+        let inline_str_import = RustGenerator::inline_str_import(schema);
         let imports = quote! {
             #![allow(dead_code, unused_imports)]
 
@@ -77,6 +79,7 @@ impl ApiGenerator {
             // #254: a `+timestamp` identity is a legal primary key, so the path
             // param can be a `Timestamp` — it round-trips through a URL segment as
             // RFC 3339 by construction (res 3).
+            #inline_str_import
             use forgedb_types::{Timestamp, Uuid};
             use serde_json::json;
             use std::collections::HashMap;
@@ -129,7 +132,7 @@ impl ApiGenerator {
 
         // Generate handler functions for each model
         for model in &schema.models {
-            let handler_tokens = Self::generate_handlers(model)?;
+            let handler_tokens = Self::generate_handlers(schema, model)?;
             tokens.extend(handler_tokens);
         }
 
@@ -143,7 +146,7 @@ impl ApiGenerator {
         // B): reuses the per-model closed-set filter defined above, so it must be
         // emitted after the subscription handlers.
         for model in &schema.models {
-            tokens.extend(Self::generate_live_query(model));
+            tokens.extend(Self::generate_live_query(schema, model));
         }
 
         // Generate the durable replication WS endpoint (#82 Direction C): a single
@@ -195,23 +198,24 @@ impl ApiGenerator {
             .or_else(|| model.fields.iter().find(|f| f.auto_generate))
     }
 
-    fn id_parse_type(model: &forgedb_parser::Model) -> TokenStream {
-        match Self::identity_field(model) {
-            Some(f) => match &f.field_type {
-                forgedb_parser::FieldType::U32 => quote! { u32 },
-                forgedb_parser::FieldType::U64 => quote! { u64 },
-                forgedb_parser::FieldType::I32 => quote! { i32 },
-                forgedb_parser::FieldType::I64 => quote! { i64 },
-                forgedb_parser::FieldType::Uuid => quote! { Uuid },
-                // #254: `id: +timestamp(us)` is a legal identity.  RFC 3339 has no
-                // reserved URL character, so the key survives a path segment and
-                // axum's `Path<Timestamp>` resolves it through the same serde
-                // string form the body uses.
-                forgedb_parser::FieldType::Timestamp(_) => quote! { Timestamp },
-                _ => quote! { Uuid },
-            },
-            None => quote! { Uuid },
-        }
+    fn id_parse_type(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        // #252 closed the `_ => quote! { Uuid }` fall-through this used to end in
+        // — by DELETING the duplicate match, not by adding one more arm.
+        //
+        // The fall-through had been here since 9a54319 (2026-07-06) and made every
+        // non-integer, non-uuid identity generate an `api.rs` that does not
+        // compile: a bare `string` identity produced 32 errors of one class. It
+        // was also blind to a relation identity (`id: *Customer` matched `_`), so
+        // an integer-keyed parent's child parsed its own path segment as a uuid.
+        // Both are the `is_uuid_pk` shape #265 named: a generator that falls
+        // through instead of failing turns a compile error into a silent hole.
+        //
+        // The path segment must parse into exactly the type storage is keyed on,
+        // so there is no second definition of that type to keep in step —
+        // `RustGenerator::id_type_tokens` is it. Every type it yields carries
+        // `FromStr` (`Uuid`, the integers, `Timestamp` via #254's RFC 3339 parse,
+        // `InlineStr<N>` via #252), which is what axum's `Path<T>` extracts with.
+        RustGenerator::id_type_tokens(schema, model)
     }
 
     /// The field identifier used as a model's identity (`id`, or the first
@@ -330,9 +334,9 @@ impl ApiGenerator {
         (get_block, list_block)
     }
 
-    fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
+    fn generate_handlers(schema: &Schema, model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
-        let id_type = Self::id_parse_type(model);
+        let id_type = Self::id_parse_type(schema, model);
         let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
         let (proj_get_block, proj_list_block) =
             Self::generate_projection_rest(model, &storage_field, &id_type);
@@ -1312,7 +1316,7 @@ impl ApiGenerator {
     /// that match the filter (not every column of every row) — but a broad filter
     /// still materializes its whole matching set.  `Updated` detection uses a typed
     /// per-field comparison (`<model>_record_changed`, #84).
-    fn generate_live_query(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_live_query(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
         let snake = Self::to_snake_case(&model.name);
@@ -1335,7 +1339,7 @@ impl ApiGenerator {
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let id_field = Self::id_field_ident(model);
-        let id_type = Self::id_parse_type(model);
+        let id_type = Self::id_parse_type(schema, model);
         let model_name_str = &model.name;
 
         let subscribe_doc = format!(
