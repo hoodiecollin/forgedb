@@ -288,8 +288,12 @@ fixed row slot instead of the variable column: N counts **characters**, `!` mean
 1..=255, ASCII at one byte/char unless the field carries `@utf8` (four) — a non-ASCII value without it is a 422.
 There is no overflow path (experiment #261 measured inline-or-overflow losing 198/200). Length directives are
 refused on it (the width IS the bound); `@min`/`@length(min:)` survive on the non-exact form only; above 64 chars
-it warns and still generates. Not embeddable in a `struct`/`[T; N]` (the Rust value is a heap `String`) and not
-yet usable as an identity (#252). `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
+it warns and still generates. Not embeddable in a `struct`/`[T; N]` (the Rust value is a heap `String`). **In a KEY
+position it is a `forgedb_types::InlineStr<N>` instead — `Copy`, one byte/char, serde as a plain string (#252):** an
+identity (`id: string(26!)`), an FK that resolves to one, and a junction endpoint. A key's value must be RFC 3986
+`pchar` minus `%` (so the URL path segment is byte-identical to the key) and non-empty, both enforced at write (422);
+`@utf8` on an identity is a schema error, and a bare `string` identity is refused (a key cannot be variable-width and
+stay `Copy`). `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
 sortable — no total order); `decimal` (→ `rust_decimal::Decimal`, exact fixed-point on the 16-byte column, string
 serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p,s)` precision/scale deferred). Enums:
 top-level `enum Name { A, B, C }` (PascalCase name + variants), referenced by bare name — 1-byte discriminant column,

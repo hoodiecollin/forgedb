@@ -95,11 +95,49 @@ loses once it is wide. Past that point prefer `string`, unless the value has to 
 fixed-width key.
 </Callout>
 
-Two things it cannot do yet. It cannot live inside an [inline
+One thing it cannot do. It cannot live inside an [inline
 struct](/docs/schema/relations/#inline-structs) or a fixed array — those store their fields
 as the Rust value's bytes, and the Rust value here is a heap `String`, so embedding one
-would persist a pointer; use `bytes(N)` there. And it cannot be a model's identity: the
-generated API layer parses every non-integer key as a `uuid`.
+would persist a pointer; use `bytes(N)` there.
+
+### `string(N)` as an identity
+
+Both spellings are legal identities, so a model can key on the identifier it already has
+rather than carrying a `uuid` beside it:
+
+```forge
+Airport {
+  id:   string(3!)          // exactly 3 — an IATA code
+  city: string
+}
+```
+
+A key is the one place an inline string stops being a `String`. In a key position — the
+identity, a foreign key that resolves to one, a many-to-many junction endpoint — the Rust
+type is `forgedb_types::InlineStr<N>`: a `Copy`, fixed-capacity string, so it sits in the
+row index and in a junction map the way every other key type does. On the wire nothing
+changes: it is still a JSON string, still `string` in TypeScript. An ordinary `string(N)`
+**column** is untouched and stays a `String`.
+
+<Callout type="warning" title="A key has to survive a URL">
+A key's value is checked on every write (violation → `422`) against RFC 3986 `pchar`
+**minus** `%` — `A-Z a-z 0-9 - . _ ~ ! $ & ' ( ) * + , ; = : @` — and must be non-empty.
+Excluding `%` buys the strong version of the property: the path segment is byte-identical
+to the key, so `GET /airports/SFO` is literally the row's address, with no escaping in
+between. `:` and `@` are `pchar` without being *unreserved*, which is what makes
+`urn:isbn:0451450523` and `user@example.com` usable as keys.
+</Callout>
+
+A bare `string` identity is refused — a key has to be fixed-width to be `Copy`, so the
+width belongs in the type, and the error says so. [`@utf8`](/docs/schema/directives/) on an
+identity is a schema error too: the alphabet above is a strict subset of ASCII, so widening
+the slot would reserve four bytes per character to hold characters the write path rejects.
+
+A string-keyed model is an ordinary [relation](/docs/schema/relations/) target — foreign
+keys, `@on_delete` in all three modes, traversal, eager loading, and many-to-many all work
+as they do for a `uuid`-keyed model. Do watch the width: the identity map holds
+`InlineStr<N>` per row in memory, and every foreign key pointing at the model carries the
+same `N` bytes on every child row, so a wide key costs more than a wide column does.
 
 ## `bytes(N)`
 

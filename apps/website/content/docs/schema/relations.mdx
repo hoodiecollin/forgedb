@@ -19,7 +19,8 @@ and eager-load).
 <Callout title="A foreign key follows its target's identity">
 There is no separate FK type. An FK column is **physically identical to the column the
 target's identity field itself occupies** — `author: *User` is a 16-byte uuid column when
-`User { id: +uuid }`, and an 8-byte `u64` column when `User { id: +u64 }`. Every relation
+`User { id: +uuid }`, an 8-byte `u64` column when `User { id: +u64 }`, and a 3-byte inline
+string when `Airport { id: string(3!) }`. Every relation
 capability (forward getters, reverse getters, eager load, referential integrity,
 `@on_delete`, many-to-many) is generated for whatever key the target has.
 </Callout>
@@ -105,7 +106,9 @@ db.tag_posts(tag_id);    // -> Vec<Post>
 Each junction column is that endpoint's own key width, so a **mixed pair** works — a
 `+u64`-keyed model may be linked to a `+uuid`-keyed one. A junction stores each endpoint's
 id in a fixed-width, hashable column, so an endpoint's identity must be `uuid`, an integer
-type, or `timestamp`; anything else is reported as a schema error.
+type, `timestamp`, or [`string(N)`](/docs/schema/scalar-types/#stringn-as-an-identity) —
+the last of which qualifies because a key of that type is a `Copy`, fixed-capacity
+`InlineStr<N>` rather than a heap `String`. Anything else is reported as a schema error.
 
 ## Fixed-size arrays — `[type; N]`
 
