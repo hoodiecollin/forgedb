@@ -1171,7 +1171,7 @@ impl RustGenerator {
         let fields: Vec<_> = model
             .fields
             .iter()
-            .map(|f| Self::model_struct_field(schema, f, true, Self::is_identity(model, f)))
+            .map(|f| Self::model_struct_field(schema, f, true, Self::is_inline_key_field(schema, model, f)))
             .collect();
 
         // Generate columnar storage fields
@@ -3331,6 +3331,28 @@ impl RustGenerator {
         }
     }
 
+    /// The argument expression for a `find_by_<fk>` probe run over a parent key
+    /// bound to `id` (#252).
+    ///
+    /// [`Self::index_param_type`] gives a string-semantic column a `&str`
+    /// parameter — ergonomic, and the reason a probe can be called with a
+    /// literal. A `string(N)` key is string-semantic but arrives at these
+    /// internal call sites *by value* (`InlineStr<N>` is `Copy`), so it has to
+    /// be borrowed here. Every other key type is passed by value, exactly as
+    /// before.
+    fn fk_probe_arg(schema: &Schema, parent_model: &str, required: bool) -> TokenStream {
+        let borrows = schema
+            .find_model(parent_model)
+            .and_then(|m| Self::identity_type(schema, m))
+            .is_some_and(|t| Self::is_string_semantic(&t));
+        let inner = if borrows { quote! { &id } } else { quote! { id } };
+        if required {
+            inner
+        } else {
+            quote! { Some(#inner) }
+        }
+    }
+
     /// Pre-transform a field value expression before it is fed to `index_key_expr`,
     /// so the resulting index key is **scale-invariant** for `decimal` fields.
     ///
@@ -4797,9 +4819,13 @@ impl RustGenerator {
                     });
                 }
             } else if let Some((chars, exact)) =
-                Self::inline_string_params(&field.field_type)
+                Self::inline_string_column_params(schema, &field.field_type)
             {
                 // Inline `string(N)` (#238): pack the value into its fixed slot.
+                // #252: *resolved*, so an FK to a string-keyed model packs its
+                // key here too rather than falling through to the generic fixed
+                // path below, whose typed-method arm would name a column method
+                // (`append_inline_string`) that does not exist.
                 // This branch must precede the generic fixed-size one below, whose
                 // `needs_byte_conversion` path transmutes the Rust value's bytes —
                 // which for a `String` would persist a pointer.
@@ -5230,8 +5256,9 @@ impl RustGenerator {
                     }
                 };
                 out.push((col, one));
-            } else if Self::is_inline_string_type(&field.field_type) {
-                // Inline `string(N)` backfill (#238): a zeroed slot. That decodes
+            } else if Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type)) {
+                // Inline `string(N)` backfill (#238; resolved for an FK, #252): a
+                // zeroed slot. That decodes
                 // to `None` when nullable, and otherwise to the empty string —
                 // except under `string(N!)`, where the prefix-free slot decodes to
                 // N NUL characters, which is exactly N characters and therefore
@@ -7132,7 +7159,15 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
-        } else if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
+        } else if let Some((chars, exact)) =
+            Self::inline_string_column_params(schema, &field.field_type)
+        {
+            // #252: an FK to a string-keyed model is an inline-string column and
+            // its Rust value is the key, so it decodes here and materializes the
+            // key type — the caller cannot know that, since it sees the model's
+            // identity only.
+            let as_key =
+                as_key || Self::fk_backing_type(schema, &field.field_type).is_some();
             // Inline `string(N)` (#238). Two shapes, and the difference is the
             // whole point of the type:
             //
@@ -7148,14 +7183,41 @@ impl RustGenerator {
             let utf8 = Self::is_utf8_field(field);
             let (_, prefix, _) = Self::inline_string_layout(chars, exact, utf8);
             let base = if field.is_nullable() { 1usize } else { 0 };
+            // #252: a key does not borrow. `InlineStr<N>` is `Copy` and owns its
+            // bytes, so the scan view holds it by value — which costs the scan
+            // nothing (no allocation, which is the only thing borrowing bought)
+            // and is what lets the id vector the scan scope returns outlive the
+            // buffers it was decoded from.
+            let key_ty = if as_key {
+                Some(Self::key_type_ident(schema, &field.field_type))
+            } else {
+                None
+            };
+            let materialize = |s: TokenStream| match &key_ty {
+                Some(kt) => quote! {
+                    <#kt>::try_from(#s).unwrap_or_default()
+                },
+                None => s,
+            };
             let stmt = if borrowed {
                 if !field.is_nullable() && prefix == 0 {
                     // The substrate can do the whole read: the slot is exactly the
                     // value, so there is no framing for generated code to decode.
-                    quote! {
-                        let #field_value_name = #receiver.#field_col_name
-                            .read_str(#row_index)
-                            .expect("Failed to read inline string");
+                    if let Some(kt) = &key_ty {
+                        quote! {
+                            let #field_value_name = <#kt>::try_from(
+                                #receiver.#field_col_name
+                                    .read_str(#row_index)
+                                    .expect("Failed to read inline string"),
+                            )
+                            .unwrap_or_default();
+                        }
+                    } else {
+                        quote! {
+                            let #field_value_name = #receiver.#field_col_name
+                                .read_str(#row_index)
+                                .expect("Failed to read inline string");
+                        }
                     }
                 } else {
                     let bytes = Self::inline_string_bytes_expr(
@@ -7165,10 +7227,10 @@ impl RustGenerator {
                         base,
                         quote! { __slot_bytes },
                     );
-                    let decode = quote! {
+                    let decode = materialize(quote! {
                         std::str::from_utf8(#bytes)
                             .expect("inline string column holds UTF-8")
-                    };
+                    });
                     if field.is_nullable() {
                         quote! {
                             let #field_value_name = {
@@ -7909,9 +7971,10 @@ impl RustGenerator {
         // ever appears behind a `&` in a closure argument, so no caller of the
         // generated crate names its lifetime.
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
+        let key_name = Self::identity_field_name(model);
         let ref_field_decls = scan_fields.iter().map(|f| {
             let fname = format_ident!("{}", f.name);
-            let fty = Self::scan_ref_field_type(schema, f);
+            let fty = Self::scan_ref_field_type(schema, f, Some(f.name.as_str()) == key_name);
             quote! { pub #fname: #fty }
         });
         let ref_doc = format!(
@@ -7936,7 +7999,7 @@ impl RustGenerator {
         // across the module boundary.  `PhantomData<&'a ()>` — the shared-reference
         // form, so the view stays covariant over `'a` exactly as the real borrows
         // are; `&'a mut ()` would make it invariant and reject sound callers.
-        let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields) {
+        let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! {
                 /// #250: anchors `'a` for a view whose every field is fixed-size.
@@ -7959,7 +8022,7 @@ impl RustGenerator {
         // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
         let with_scan_method =
-            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields);
+            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields, key_name);
 
         let methods = quote! {
             #with_scan_method
@@ -7982,8 +8045,19 @@ impl RustGenerator {
     /// string-free model a hardcoded anchor would collide with it and emit the
     /// field twice.  Underscores are appended until the name is free, so the two
     /// emission sites agree by construction.
-    fn scan_ref_anchor(fields: &[&forgedb_parser::Field]) -> Option<proc_macro2::Ident> {
-        if fields.iter().any(|f| Self::is_string_semantic(&f.field_type)) {
+    fn scan_ref_anchor(
+        fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+    ) -> Option<proc_macro2::Ident> {
+        // #252: a `string(N)` *key* is held by value (`InlineStr<N>` is `Copy`),
+        // so it borrows nothing and cannot anchor `'a`. A model whose only
+        // string-semantic field is its own identity therefore still needs the
+        // PhantomData — miss this and the view fails to compile with E0392,
+        // which is the same class of break #250 fixed.
+        if fields
+            .iter()
+            .any(|f| Self::is_string_semantic(&f.field_type) && Some(f.name.as_str()) != key_name)
+        {
             return None;
         }
         let mut name = String::from("__borrow");
@@ -7999,7 +8073,18 @@ impl RustGenerator {
     /// what lets the SAME generated filter checks compile against both views —
     /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
     /// both std, so `record.<field> == <parsed param>` needs no second form.
-    fn scan_ref_field_type(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
+    fn scan_ref_field_type(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        is_key: bool,
+    ) -> TokenStream {
+        // #252: the key is the one string-semantic field that does NOT borrow.
+        // `InlineStr<N>` is `Copy`, so holding it by value allocates nothing —
+        // the only thing the borrow bought — and it is what lets the vector of
+        // ids the scan scope returns outlive the buffers it decoded from.
+        if is_key {
+            return Self::key_type_ident(schema, &field.field_type);
+        }
         if Self::is_string_semantic(&field.field_type) {
             return if field.is_nullable() {
                 quote! { Option<&'a str> }
@@ -8042,6 +8127,7 @@ impl RustGenerator {
         ref_ident: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
     ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
@@ -8063,7 +8149,8 @@ impl RustGenerator {
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true, false)) {
+            let as_key = Some(field.name.as_str()) == key_name;
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true, as_key)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -8082,7 +8169,7 @@ impl RustGenerator {
 
         // #250: initialize the lifetime anchor iff the struct declares one.  Same
         // derivation as the emission site, so the name cannot drift apart from it.
-        let ref_borrow_init = match Self::scan_ref_anchor(fields) {
+        let ref_borrow_init = match Self::scan_ref_anchor(fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
         };
@@ -8184,6 +8271,7 @@ impl RustGenerator {
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
         doc: &str,
+        key_name: Option<&str>,
     ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
@@ -8205,7 +8293,8 @@ impl RustGenerator {
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false, false)) {
+            let as_key = Some(field.name.as_str()) == key_name;
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false, as_key)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -8466,7 +8555,7 @@ impl RustGenerator {
             let struct_field_defs: Vec<_> =
                 fields
                     .iter()
-                    .map(|f| Self::model_struct_field(schema, f, false, Self::is_identity(model, f)))
+                    .map(|f| Self::model_struct_field(schema, f, false, Self::is_inline_key_field(schema, model, f)))
                     .collect();
 
             let read_at_name = format_ident!("read_{}_at", proj.name);
@@ -8497,7 +8586,15 @@ impl RustGenerator {
                 proj.name
             );
             let all_method =
-                Self::generate_buffered_scan_method(schema, &proj_ident, &all_name, &proj_holder, &fields, &all_doc);
+                Self::generate_buffered_scan_method(
+                    schema,
+                    &proj_ident,
+                    &all_name,
+                    &proj_holder,
+                    &fields,
+                    &all_doc,
+                    Self::identity_field_name(model),
+                );
 
             structs.push(quote! {
                 #[doc = #doc]
@@ -8951,7 +9048,11 @@ impl RustGenerator {
     /// — the prefix-free shape — carries no prefix machinery at all.
     fn needs_inline_len_helper(schema: &forgedb_parser::Schema) -> bool {
         schema.models.iter().flat_map(|m| &m.fields).any(|f| {
-            Self::inline_string_params(&f.field_type)
+            // Resolved (#252): an FK to a string-keyed model is an inline-string
+            // column, and a non-exact target key gives it a length prefix to
+            // decode — so the helper has to be emitted for the FK's sake even
+            // when no `string(N)` is declared in that model at all.
+            Self::inline_string_column_params(schema, &f.field_type)
                 .map(|(chars, exact)| {
                     Self::inline_string_layout(chars, exact, Self::is_utf8_field(f)).1 > 0
                 })
@@ -9062,6 +9163,42 @@ impl RustGenerator {
             forgedb_parser::FieldType::Nullable(inner) => Self::inline_string_params(inner),
             _ => None,
         }
+    }
+
+    /// The **storage-layout** view of [`Self::inline_string_params`] (#252).
+    ///
+    /// Resolves an FK to its target's identity first (#266), so a column that
+    /// *stores* a string key is packed, read, sized and backfilled as an inline
+    /// string wherever the declared type is a relation. The unresolved form
+    /// stays the one the *value* predicates use: an FK's value is a key, not a
+    /// `String`, so it must not pick up `@length`/`@pattern`/the ASCII check.
+    ///
+    /// The width is always the target key's own, and `@utf8` is a validation
+    /// error on an identity (res 3), so an FK column is exactly N bytes wide —
+    /// the same layout the target's id column has, which is what lets a probe
+    /// key and a stored key compare byte for byte.
+    fn inline_string_column_params(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> Option<(u8, bool)> {
+        Self::inline_string_params(&Self::resolved_type(schema, field_type))
+    }
+
+    /// Does this field's Rust type come out as `InlineStr<N>` (#252)?
+    ///
+    /// True in exactly the two key positions: the model's identity, and an FK
+    /// that resolves to a string-keyed identity. A `string(N)` *column* of the
+    /// same declared type is a `String` — the distinction `key_type_ident`
+    /// exists for. Drives the `#[schema(value_type = String)]` annotation,
+    /// since `InlineStr` implements no `ToSchema`.
+    fn is_inline_key_field(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        field: &forgedb_parser::Field,
+    ) -> bool {
+        (Self::is_identity(model, field)
+            || Self::fk_backing_type(schema, &field.field_type).is_some())
+            && Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type))
     }
 
     /// Does this field's *value* present as a Rust `String`?
@@ -10394,11 +10531,7 @@ impl RustGenerator {
                     let fk_probe = format_ident!("find_by_{}", field.name);
                     let child_field_str = field.name.as_str();
                     let child_name_str = child.name.as_str();
-                    let probe_arg = if optional {
-                        quote! { Some(id) }
-                    } else {
-                        quote! { id }
-                    };
+                    let probe_arg = Self::fk_probe_arg(schema, &parent.name, !optional);
                     let child_indexed = child
                         .fields
                         .iter()
@@ -12446,11 +12579,7 @@ impl RustGenerator {
 
             let body = if child_indexed {
                 // Required FK probe takes the key; optional FK probe takes `Option<key>`.
-                let arg = if p.is_required {
-                    quote! { id }
-                } else {
-                    quote! { Some(id) }
-                };
+                let arg = Self::fk_probe_arg(schema, &p.parent_model, p.is_required);
                 quote! { self.#child_field.#fk_probe(#arg) }
             } else {
                 let fk_field = format_ident!("{}", p.child_field);
