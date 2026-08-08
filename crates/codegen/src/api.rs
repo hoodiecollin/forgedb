@@ -182,22 +182,6 @@ impl ApiGenerator {
     /// identity type).  UUID PKs parse as `Uuid`; integer PKs as `u64` / `u32` /
     /// `i64` / `i32` so the generated `get` handler passes the right key type to
     /// storage.
-    /// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
-    /// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
-    /// single-pass form returns whichever comes FIRST in declaration order, so a
-    /// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
-    /// to the stamp.  Before #254 that produced a `Timestamp` id type and the
-    /// generated crate simply did not compile — loud, if obscure.  #254 makes a
-    /// `timestamp` identity legal, so the same schema would now compile and silently
-    /// key every row on its creation stamp.
-    fn identity_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
-        model
-            .fields
-            .iter()
-            .find(|f| f.name == "id")
-            .or_else(|| model.fields.iter().find(|f| f.auto_generate))
-    }
-
     fn id_parse_type(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         // #252 closed the `_ => quote! { Uuid }` fall-through this used to end in
         // — by DELETING the duplicate match, not by adding one more arm.
@@ -222,7 +206,7 @@ impl ApiGenerator {
     /// auto-generate field).  Used by the live-query handler (#62 Direction B) to
     /// key result-set membership by id.  Falls back to `id`.
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
-        match Self::identity_field(model) {
+        match model.identity_field() {
             Some(f) => format_ident!("{}", f.name),
             None => format_ident!("id"),
         }
@@ -365,7 +349,7 @@ impl ApiGenerator {
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
         let filter_fn = format_ident!("{}_event_matches", Self::to_snake_case(&model.name));
         // #160: narrow scan filter/sort for the live list path (id-bearing models).
-        let has_id = crate::rust::RustGenerator::identity_field(model).is_some();
+        let has_id = model.identity_field().is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
@@ -802,7 +786,7 @@ impl ApiGenerator {
     /// Neither is a semantic change — `&str` and `Option<&str>` are both `Ord`, so
     /// the emitted arms are unchanged.
     fn generate_list_scan_helpers(model: &forgedb_parser::Model) -> TokenStream {
-        if crate::rust::RustGenerator::identity_field(model).is_none() {
+        if model.identity_field().is_none() {
             return quote! {};
         }
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);

@@ -244,7 +244,7 @@ impl NapiGenerator {
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
     }
 
     /// Whether a field type is a virtual relation (no stored column).
@@ -765,7 +765,7 @@ impl NapiGenerator {
         // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
-            let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
+            let model_has_id = model.has_identity();
             let source_id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {

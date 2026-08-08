@@ -278,7 +278,7 @@ impl WasmGenerator {
             );
 
             // get(id) -> JSON | null — only for id-bearing models.
-            if identity_field(model).is_some() {
+            if model.identity_field().is_some() {
                 let get_rust = format!("get_{model_snake}");
                 let get_js = format!("get{}", model.name);
                 let get_ident = format_ident!("{get_rust}");
@@ -309,7 +309,7 @@ impl WasmGenerator {
         // (only possible when the source model is itself id-bearing), then
         // resolves through the generated getter.
         for model in &schema.models {
-            let Some(_) = identity_field(model) else {
+            let Some(_) = model.identity_field() else {
                 continue;
             };
             let model_snake = RustGenerator::to_snake_case(&model.name);
@@ -479,7 +479,7 @@ impl WasmGenerator {
                 );
 
                 // get_<name>(id) -> JSON | null — id-bearing models only.
-                if identity_field(model).is_some() {
+                if model.identity_field().is_some() {
                     let get_rust = format!("get_{model_snake}_{}", proj.name);
                     let get_js = format!("get{}{}", model.name, pascal);
                     let get_ident = format_ident!("{get_rust}");
@@ -834,24 +834,6 @@ self.onmessage = async (e) => {
   }
 };
 "#;
-
-/// A model's identity field (`id`, or the first auto-generate field), if any.
-///
-/// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
-/// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
-/// single-pass form returns whichever comes FIRST in declaration order, so a
-/// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
-/// to the stamp.  Before #254 that produced a `Timestamp` id type and the
-/// generated crate simply did not compile — loud, if obscure.  #254 makes a
-/// `timestamp` identity legal, so the same schema would now compile and silently
-/// key every row on its creation stamp.
-fn identity_field(model: &Model) -> Option<&forgedb_parser::Field> {
-    model
-        .fields
-        .iter()
-        .find(|f| f.name == "id")
-        .or_else(|| model.fields.iter().find(|f| f.auto_generate))
-}
 
 /// An expression yielding `Option<PkType>` from a `String` binding named `id`,
 /// matching the model's identity type (uuid or integer). Only used for

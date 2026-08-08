@@ -9932,3 +9932,91 @@ fn test_rust_generation_the_scan_view_holds_a_string_key_by_value() {
         "a key-only string model re-anchors 'a: {bare:.400}"
     );
 }
+
+// ---- #251: the identity allow-list, one predicate, and the precedence fix ----
+
+/// **Scenario 9 — shape 4, the silent mis-key, at the generator.**
+///
+/// ```forge
+/// Event { seq: +u64  id: u32  note: string }
+/// ```
+///
+/// Under the old first-match predicate this **compiles and runs**: the database
+/// is keyed on `seq` while the generated parameter is *named* `id`, so
+/// `/events/{id}` takes a sequence number and every relation pointing here points
+/// at the wrong column. It is the only shape in #251 that produces a working
+/// binary with the wrong key — which is why it is a v0.4.0 item rather than a
+/// deferred cleanup, since changing a model's primary key later is an on-disk
+/// format change for anyone who shipped it.
+///
+/// #254 fixed the four picking sites; #251 makes them one definition. The guard
+/// belongs here, on this issue, because this is its defining defect.
+#[test]
+fn test_rust_generation_an_id_field_wins_over_an_auto_declared_above_it() {
+    let code = db_for("Event {\n  seq: +u64\n  id: u32\n  note: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub fn get(&self, id: u32)"),
+        "the key is the `id` field, not the `+u64` above it: {f:.400}"
+    );
+    assert!(
+        !f.contains("pub fn get(&self, id: u64)"),
+        "and emphatically not the sequence: {f:.400}"
+    );
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<u32, usize>>"),
+        "the identity map is keyed on `id`: {f:.400}"
+    );
+
+    // Declaration order must not matter — the same schema written the other way
+    // round generates byte-identical code.
+    let other = db_for("Event {\n  id: u32\n  seq: +u64\n  note: string\n}\n");
+    assert_eq!(
+        flat(&other).contains("pub fn get(&self, id: u32)"),
+        true,
+        "precedence, not position"
+    );
+}
+
+/// The same precedence, in **every** generator that picks an identity. This is
+/// the assertion the 37-site sweep exists for: before it, `validate.rs` could
+/// select one field while `rust.rs` keyed on another, and the guard would then be
+/// checking a field the database does not use.
+#[test]
+fn test_generators_agree_on_which_field_is_the_identity() {
+    let src = "Event {\n  seq: +u64\n  id: u32\n  note: string\n}\n";
+
+    let api = flat(&api_for(src));
+    assert!(
+        api.contains("id.parse::<u32>()"),
+        "the REST path segment parses the `id` field's type: {api:.400}"
+    );
+    assert!(
+        !api.contains("id.parse::<u64>()"),
+        "not the sequence's: {api:.400}"
+    );
+
+    let wasm = flat(&wasm_for(src));
+    assert!(
+        wasm.contains("id.parse::<u32>()"),
+        "the browser replica agrees: {wasm:.400}"
+    );
+    assert!(!wasm.contains("id.parse::<u64>()"), "{wasm:.400}");
+}
+
+/// A model whose identity is an auto under a **different** name keeps working —
+/// `code: +uuid` with no `id` field is the #248 spelling the corpus uses, and
+/// precedence must not quietly demote it. An allow-list that rejects too much is
+/// as broken as one that rejects too little, and this failure is the quieter one.
+#[test]
+fn test_rust_generation_an_auto_under_another_name_is_still_the_identity() {
+    let f = flat(&db_for("Token {\n  code: +uuid\n  label: string\n}\n"));
+    assert!(
+        f.contains("pub fn get(&self, id: Uuid)"),
+        "the auto field serves as identity: {f:.400}"
+    );
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<Uuid, usize>>"),
+        "{f:.400}"
+    );
+}

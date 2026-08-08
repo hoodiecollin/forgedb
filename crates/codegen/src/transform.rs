@@ -96,7 +96,7 @@ pub struct ModelOp {
 /// are addressed by id via `all()`/`insert`). Non-id models (pure value tables) are
 /// out of scope for the transformer, exactly as they are for the mutation surface.
 fn is_transactable(model: &Model) -> bool {
-    model.fields.iter().any(|f| f.name == "id" || f.auto_generate)
+    model.has_identity()
 }
 
 /// Generates the offline transformer crate.
