@@ -541,7 +541,6 @@ Note there is no way to put *text* in a fixed array. `string` is variable-length
 fixed array is stored by writing the element values' bytes — embedding one would
 persist a pointer, so it is a schema error. `bytes(N)` is not a string type. Model a
 list of strings as a related model.
-```
 
 ### Inline Structs
 
@@ -674,9 +673,9 @@ User {
   posts: [Post]
   comments: [Comment]
   
-  profileCard: tsx://components/user/ProfileCard @relations(*)
+  profile_card: tsx://components/user/ProfileCard @relations(*)
   avatar: jsx://components/user/Avatar @relations(posts)
-  updateEndpoint: api://routes/user/update
+  update_endpoint: api://routes/user/update
 }
 ```
 
@@ -876,8 +875,8 @@ User {
   email: string
   posts: [Post]
   
-  profileCard: tsx://components/user/ProfileCard @relations(posts)
-  updateEndpoint: api://routes/user/update
+  profile_card: tsx://components/user/ProfileCard @relations(posts)
+  update_endpoint: api://routes/user/update
 }
 ```
 
