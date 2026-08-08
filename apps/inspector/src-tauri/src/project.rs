@@ -252,7 +252,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::Json => "json",
         FieldType::Decimal => "decimal",
         FieldType::Uuid => "uuid",
-        FieldType::Timestamp => "timestamp",
+        FieldType::Timestamp(_) => "timestamp",
         FieldType::Bytes(n) => {
             bytes_len = Some(*n);
             "bytes"

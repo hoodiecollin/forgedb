@@ -173,7 +173,7 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Decimal => "decimal".to_string(),
         FieldType::Json => "json".to_string(),
         FieldType::Uuid => "uuid".to_string(),
-        FieldType::Timestamp => "timestamp".to_string(),
+        FieldType::Timestamp(_) => "timestamp".to_string(),
         FieldType::Enum(name) => name.clone(),
         FieldType::Bytes(n) => format!("bytes({n})"),
         // #238: render the declaration back verbatim, `!` and all — the width and

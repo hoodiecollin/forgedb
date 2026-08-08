@@ -169,7 +169,10 @@ Model {
     assert_eq!(model.fields[5].field_type, FieldType::Bool);
     assert_eq!(model.fields[6].field_type, FieldType::String);
     assert_eq!(model.fields[7].field_type, FieldType::Uuid);
-    assert_eq!(model.fields[8].field_type, FieldType::Timestamp);
+    assert_eq!(
+        model.fields[8].field_type,
+        FieldType::Timestamp(TimestampPrecision::Millis)
+    );
 }
 
 #[test]
@@ -227,8 +230,13 @@ User {
 
 #[test]
 fn test_parse_timestamp_with_auto_generate() {
+    // The `id` is load-bearing, not decoration: since #254 a `+timestamp` is
+    // identity-eligible only when it is named `id`, so a model whose ONLY field
+    // is an auto timestamp is now rejected — it would silently acquire a
+    // timestamp primary key.
     let input = r#"
 User {
+  id: +uuid
   created_at: +timestamp
 }
 "#;
@@ -236,8 +244,11 @@ User {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    let field = &model.fields[0];
-    assert_eq!(field.field_type, FieldType::Timestamp);
+    let field = &model.fields[1];
+    assert_eq!(
+        field.field_type,
+        FieldType::Timestamp(TimestampPrecision::Millis)
+    );
     assert!(field.auto_generate);
 }
 

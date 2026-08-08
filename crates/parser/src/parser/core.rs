@@ -1,6 +1,7 @@
 use crate::ast::{
     ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, EnumDef,
     Field, FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
+    TimestampPrecision,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{Position, ValidationError};
@@ -359,6 +360,55 @@ impl Parser {
         Ok(FieldType::StringN { chars, exact })
     }
 
+    /// Is the cursor sitting on a **parameterized** `timestamp`, i.e.
+    /// `timestamp (`?
+    ///
+    /// Same shape as [`Self::at_parameterized_string`] (#238) and for the same
+    /// reason: `timestamp` is a reserved word, so this is not a
+    /// contextual-keyword dance — the lookahead only splits `timestamp` from
+    /// `timestamp(<key>)` so the bare spelling keeps parsing where it always did.
+    fn at_parameterized_timestamp(&self) -> bool {
+        matches!(self.current_token(), Token::TypeTimestamp)
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `timestamp ( s | ms | us )` and return [`FieldType::Timestamp`]
+    /// carrying the declared precision (#254). The cursor must be on
+    /// `timestamp`.
+    ///
+    /// The key arrives as a [`Token::Ident`] — none of `s`/`ms`/`us` is a
+    /// keyword, and none of them should become one. The closed set is validated
+    /// here, at the one place the lexeme is read, so no later site is ever handed
+    /// a precision the type system cannot express.
+    ///
+    /// This deliberately mirrors [`Self::parse_string_type`] rather than sharing
+    /// a helper with it: the two argument grammars have nothing in common (a
+    /// bounded integer versus a closed set of unit identifiers), so a shared
+    /// helper would be a parameter bag, not an abstraction.
+    fn parse_timestamp_type(&mut self) -> Result<FieldType, String> {
+        // Anchor the diagnostic at the keyword, not wherever the key parse ends.
+        let keyword_position = self.get_current_position();
+        self.advance();
+        self.expect(Token::LParen)?;
+        let key = match self.current_token() {
+            Token::Ident(name) => name.clone(),
+            other => format!("{other:?}"),
+        };
+        let precision = TimestampPrecision::from_key(&key).ok_or_else(|| {
+            let at = keyword_position
+                .map(|p| format!(" at line {}, column {}", p.line, p.column))
+                .unwrap_or_default();
+            format!(
+                "Unknown timestamp precision `{key}`{at}. The precisions are `s`, `ms` and \
+                 `us`; a bare `timestamp` means `timestamp(ms)`. Nanoseconds are not \
+                 offerable — the on-disk unit is microseconds."
+            )
+        })?;
+        self.advance();
+        self.expect(Token::RParen)?;
+        Ok(FieldType::Timestamp(precision))
+    }
+
     fn skip_newlines(&mut self) {
         while matches!(self.current_token(), Token::Newline) {
             self.advance();
@@ -658,6 +708,10 @@ impl Parser {
         if self.at_parameterized_string() {
             return self.parse_string_type();
         }
+        // `timestamp(<key>)` — the same claim, for the same reason (#254).
+        if self.at_parameterized_timestamp() {
+            return self.parse_timestamp_type();
+        }
 
         // Check for relation types first
         match self.current_token() {
@@ -862,7 +916,10 @@ impl Parser {
             Token::TypeJson => FieldType::Json,
             Token::TypeDecimal => FieldType::Decimal,
             Token::TypeUuid => FieldType::Uuid,
-            Token::TypeTimestamp => FieldType::Timestamp,
+            Token::TypeTimestamp if matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_timestamp_type()
+            }
+            Token::TypeTimestamp => FieldType::Timestamp(TimestampPrecision::default()),
             Token::TypeCharDeprecated => return self.parse_bytes_type(),
             // The contextual `bytes(N)` spelling arrives as an identifier (#233).
             Token::Ident(name) if name == "bytes" && matches!(self.peek_token(), Token::LParen) => {
@@ -1074,7 +1131,7 @@ impl Parser {
                 | FieldType::Json
                 | FieldType::Decimal
                 | FieldType::Uuid
-                | FieldType::Timestamp
+                | FieldType::Timestamp(_)
                 | FieldType::Bytes(_)
                 | FieldType::FixedArray(_, _) => {
                     let inner = field_type.clone();
@@ -2673,5 +2730,90 @@ B
 
         let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes(3!)\n}\n").unwrap();
         assert!(p.parse().is_err(), "`!` is not admitted by `bytes(N)`");
+    }
+
+    // ---- #254: `timestamp(s|ms|us)` -----------------------------------------
+    //
+    // Precision is a property of the TYPE, not of the field, so it survives
+    // `?` and `[T; N]`. Storage stays microseconds whatever is declared; the key
+    // is the allocation quantum and the guarantee about stored values.
+
+    /// Scenario 10 — a bare `timestamp` is `timestamp(ms)`. The default lives on
+    /// `TimestampPrecision`, so no site has to remember the rule.
+    #[test]
+    fn a_bare_timestamp_is_millis() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  at: timestamp\n}\n", "at");
+        assert_eq!(ty, FieldType::Timestamp(TimestampPrecision::Millis));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Scenario 11a — each declared key reaches the matching precision.
+    #[test]
+    fn each_precision_key_parses() {
+        for (key, expected) in [
+            ("s", TimestampPrecision::Seconds),
+            ("ms", TimestampPrecision::Millis),
+            ("us", TimestampPrecision::Micros),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  at: timestamp({key})\n}}\n");
+            let (ty, warnings) = parse_field(&src, "at");
+            assert_eq!(ty, FieldType::Timestamp(expected), "timestamp({key})");
+            assert!(warnings.is_empty(), "timestamp({key}): {warnings:?}");
+        }
+    }
+
+    /// Scenario 11b — anything else is a positioned parse error that NAMES the
+    /// three keys. `ns` is the one someone will actually try, and it is bounded
+    /// out by the microsecond storage unit rather than merely unimplemented.
+    #[test]
+    fn an_unknown_precision_key_names_the_three_that_exist() {
+        for bad in ["ns", "seconds", "millis", "S", "MS", "us2", "micro"] {
+            let src = format!("T {{\n  id: +uuid\n  at: timestamp({bad})\n}}\n");
+            let mut p = Parser::new(&src).unwrap();
+            let err = p.parse().expect_err("timestamp({bad}) must not parse");
+            assert!(
+                err.contains("`s`") && err.contains("`ms`") && err.contains("`us`"),
+                "timestamp({bad}) must name the three admissible keys, got: {err}"
+            );
+        }
+        // An empty or non-identifier argument is also refused, and refused with
+        // the same message — there is one thing that can go in those parens.
+        for src_type in ["timestamp()", "timestamp(1)", "timestamp(us!)"] {
+            let src = format!("T {{\n  id: +uuid\n  at: {src_type}\n}}\n");
+            let mut p = Parser::new(&src).unwrap();
+            assert!(p.parse().is_err(), "`{src_type}` must not parse");
+        }
+    }
+
+    /// Precision survives every compound type position, which is the whole
+    /// reason it rides in the variant rather than on `Field`.
+    #[test]
+    fn precision_survives_every_type_position() {
+        for (src_type, expected) in [
+            (
+                "timestamp(us)?",
+                FieldType::Nullable(Box::new(FieldType::Timestamp(TimestampPrecision::Micros))),
+            ),
+            (
+                "?timestamp(s)",
+                FieldType::Nullable(Box::new(FieldType::Timestamp(TimestampPrecision::Seconds))),
+            ),
+            (
+                "^timestamp(us)",
+                FieldType::Timestamp(TimestampPrecision::Micros),
+            ),
+            (
+                "[timestamp(us); 3]",
+                FieldType::FixedArray(
+                    Box::new(FieldType::Timestamp(TimestampPrecision::Micros)),
+                    3,
+                ),
+            ),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert!(warnings.is_empty(), "`{src_type}`: {warnings:?}");
+        }
     }
 }
