@@ -23,7 +23,7 @@ inline structs) see [relations](/docs/schema/relations/); for closed value sets 
 | `json` | `serde_json::Value` | `unknown` | variable-length column (serialized JSON) | ❌ |
 | `decimal` | `rust_decimal::Decimal` | `string` | fixed 16-byte column | ✅ |
 | `uuid` | `uuid::Uuid` | `string` | fixed 16-byte column | ✅ |
-| `timestamp` | `i64` | `number` | fixed 8-byte column | ✅ |
+| `timestamp`, `timestamp(s\|ms\|us)` | `Timestamp` | `string` (RFC 3339) | fixed 8-byte column | ✅ |
 | `bytes(N)` | `[u8; N]` | `any` | fixed N-byte column | ✅ |
 
 <Callout type="warning" title="There is no `text` type">
@@ -135,8 +135,61 @@ target's identity is, so an integer-keyed model gets the full relation surface t
 
 ## `timestamp`
 
-A Unix timestamp stored as an `i64`. Auto-generatable with `+` (fills the current time on
-insert).
+An **instant** — not a wall-clock time and not a date. There is no timezone, and `Z` is the
+only offset ever emitted.
+
+```forge
+Trade {
+  id:         +timestamp(us)   // an allocated key, microsecond-precise
+  filled_at:  timestamp(ms)
+  settled_on: timestamp(s)
+  created_at: +timestamp       // a stamp — bare, so milliseconds
+}
+```
+
+Storage is **always microseconds**, on a fixed 8-byte column. The declared key does not
+change what is on disk — it is the **quantum**: a value you supply is *floored* to it on
+write, and an allocated `+timestamp` identity advances by one unit of it. A bare `timestamp`
+is `timestamp(ms)`.
+
+`ns` is not offerable: microseconds is the storage unit, and `i64` nanoseconds would cap the
+type at 1678–2262.
+
+### The wire form is RFC 3339
+
+```json
+{ "created_at": "2026-03-31T23:33:20.123456Z" }
+```
+
+Six fractional digits, always `Z`. That is the form in JSON bodies, the TypeScript SDK
+(`string`), the OpenAPI document (`{"type":"string","format":"date-time"}`), the Rust /
+Python / Go REST clients, and the REST filter parameters — every surface that goes through
+serde. It is **not** the index key, which stays the stored number so a timestamp index keeps
+numeric order rather than lexicographic order.
+
+<Callout type="warning" title="An instant RFC 3339 cannot name is a 422">
+`i64` microseconds reaches ±292 000 years, but RFC 3339 names only years `0000`–`9999`. A
+value outside that window is *storable* and not *serializable* — a row that could be written
+and would then fail on every read — so the write path refuses it instead.
+</Callout>
+
+### `+timestamp` as an identity
+
+An auto-generate timestamp is a legal primary key, with two rules:
+
+1. **It must be named `id`.** Under any other name a `+timestamp` is a stamp — `created_at`,
+   `seen_at` — and inferring a primary key from one would silently mis-key the model.
+2. **It must be declared `us`.** `id: +timestamp` and `id: +timestamp(ms)` are rejected.
+
+Rule 2 exists because **precision does not make a key unique — monotonic allocation does.**
+The allocator is `next = max(now, last + 1)`, so a burst of inserts inside one clock tick
+still yields distinct, strictly increasing keys — but it does so by running the counter
+*ahead* of the wall clock, and recovery time is proportional to the declared unit. A
+million-row import lands rows about 17 minutes in the future at `ms`, and one second ahead at
+`us`.
+
+A timestamp key survives a URL path segment by construction: RFC 3339 contains no reserved
+URL character.
 
 ## `json`
 

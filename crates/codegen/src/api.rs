@@ -74,7 +74,10 @@ impl ApiGenerator {
                 routing::{delete, get, post, put},
                 Router,
             };
-            use forgedb_types::Uuid;
+            // #254: a `+timestamp` identity is a legal primary key, so the path
+            // param can be a `Timestamp` — it round-trips through a URL segment as
+            // RFC 3339 by construction (res 3).
+            use forgedb_types::{Timestamp, Uuid};
             use serde_json::json;
             use std::collections::HashMap;
             use std::sync::Arc;
@@ -176,18 +179,35 @@ impl ApiGenerator {
     /// identity type).  UUID PKs parse as `Uuid`; integer PKs as `u64` / `u32` /
     /// `i64` / `i32` so the generated `get` handler passes the right key type to
     /// storage.
-    fn id_parse_type(model: &forgedb_parser::Model) -> TokenStream {
-        match model
+    /// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
+    /// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
+    /// single-pass form returns whichever comes FIRST in declaration order, so a
+    /// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
+    /// to the stamp.  Before #254 that produced a `Timestamp` id type and the
+    /// generated crate simply did not compile — loud, if obscure.  #254 makes a
+    /// `timestamp` identity legal, so the same schema would now compile and silently
+    /// key every row on its creation stamp.
+    fn identity_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
+        model
             .fields
             .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
+            .find(|f| f.name == "id")
+            .or_else(|| model.fields.iter().find(|f| f.auto_generate))
+    }
+
+    fn id_parse_type(model: &forgedb_parser::Model) -> TokenStream {
+        match Self::identity_field(model) {
             Some(f) => match &f.field_type {
                 forgedb_parser::FieldType::U32 => quote! { u32 },
                 forgedb_parser::FieldType::U64 => quote! { u64 },
                 forgedb_parser::FieldType::I32 => quote! { i32 },
                 forgedb_parser::FieldType::I64 => quote! { i64 },
                 forgedb_parser::FieldType::Uuid => quote! { Uuid },
+                // #254: `id: +timestamp(us)` is a legal identity.  RFC 3339 has no
+                // reserved URL character, so the key survives a path segment and
+                // axum's `Path<Timestamp>` resolves it through the same serde
+                // string form the body uses.
+                forgedb_parser::FieldType::Timestamp(_) => quote! { Timestamp },
                 _ => quote! { Uuid },
             },
             None => quote! { Uuid },
@@ -198,11 +218,7 @@ impl ApiGenerator {
     /// auto-generate field).  Used by the live-query handler (#62 Direction B) to
     /// key result-set membership by id.  Falls back to `id`.
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
-        match model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
+        match Self::identity_field(model) {
             Some(f) => format_ident!("{}", f.name),
             None => format_ident!("id"),
         }
@@ -862,7 +878,7 @@ impl ApiGenerator {
             | FieldType::F64
             | FieldType::Bool
             | FieldType::Uuid
-            | FieldType::Timestamp
+            | FieldType::Timestamp(_)
             | FieldType::String
             // #238: an inline `string(N)` is a `String` in the record — same
             // `Ord`, same comparisons, same wire form. Only its storage differs.
@@ -949,8 +965,12 @@ impl ApiGenerator {
             FieldType::String | FieldType::StringN { .. } => quote! { Some(want.clone()) },
             FieldType::Uuid => quote! { want.parse::<Uuid>().ok() },
             FieldType::Decimal => quote! { want.parse::<rust_decimal::Decimal>().ok() },
-            FieldType::Timestamp => {
-                quote! { want.parse::<i64>().ok().map(forgedb_types::Timestamp::from_seconds) }
+            // #254: the wire form is RFC 3339, so a filter param is parsed the same
+            // way the body is.  Parsing a bare integer here would have silently
+            // meant *seconds* while storage moved to micros — a filter that
+            // matched nothing rather than failing.
+            FieldType::Timestamp(_) => {
+                quote! { want.parse::<forgedb_types::Timestamp>().ok() }
             }
             FieldType::Enum(name) => {
                 let en = format_ident!("{}", name);

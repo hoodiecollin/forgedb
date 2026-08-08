@@ -255,10 +255,11 @@ impl PyO3Generator {
                 quote! { Ok(self.inner.#field_name.to_string()) },
             ),
 
-            // timestamp (forgedb_types::Timestamp, newtype over i64) → i64.
-            FieldType::Timestamp => (
-                quote! { i64 },
-                quote! { Ok(i64::from(self.inner.#field_name)) },
+            // timestamp → its RFC 3339 rendering (#254), matching serde exactly
+            // as every other mapping in this table does.
+            FieldType::Timestamp(_) => (
+                quote! { String },
+                quote! { Ok(self.inner.#field_name.to_string()) },
             ),
 
             // decimal → string (serde-with-str produces a decimal string).
@@ -339,9 +340,9 @@ impl PyO3Generator {
                 quote! { Option<String> },
                 quote! { Ok(self.inner.#field_name.map(|__u| __u.to_string())) },
             ),
-            FieldType::Timestamp => (
-                quote! { Option<i64> },
-                quote! { Ok(self.inner.#field_name.map(i64::from)) },
+            FieldType::Timestamp(_) => (
+                quote! { Option<String> },
+                quote! { Ok(self.inner.#field_name.map(|__t| __t.to_string())) },
             ),
             FieldType::Decimal => (
                 quote! { Option<String> },
@@ -1106,8 +1107,8 @@ name = "forgedb"
 crate-type = ["cdylib"]
 
 [dependencies]
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"

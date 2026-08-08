@@ -117,12 +117,12 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 
     // On-disk format version (#74 Phase 1/2): derive it from the committed
     // migration lineage under `migrations/` and bake it into the generated app's
-    // `EXPECTED_FORMAT_VERSION` (red line #8 — lineage-sourced, never hand-edited).
+    // `EXPECTED_SCHEMA_VERSION` (red line #8 — lineage-sourced, never hand-edited).
     // Baseline `1` when there is no lineage (a project that has authored no
     // migrations yet).  The open guard compares this opaque integer and refuses a
     // stale data dir; it is threaded into every `database.rs` emission (the server
     // and the wasm replica share one lineage).
-    let format_version = forgedb_migrations::current_format_version("migrations");
+    let schema_version = forgedb_migrations::current_schema_version("migrations");
 
     // Determine the committed output directory.
     let output_dir = options.output.as_deref().unwrap_or("./generated");
@@ -152,7 +152,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     // matching generator.
     let target = resolve_target(&options.target, options.mode)?;
     ui::detail(&format!("output dir: {}", committed_path.display()));
-    ui::detail(&format!("format version: {}", format_version));
+    ui::detail(&format!("schema version: {}", schema_version));
     ui::detail(&format!("resolved target: {}", target));
     let mut generated_files = Vec::new();
 
@@ -166,13 +166,13 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &output_path,
                 force,
                 allowed,
-                format_version,
+                schema_version,
                 options.gen_config,
             )?);
         }
         "rust" => {
             let result =
-                RustGenerator::generate_with_config(&schema, format_version, options.gen_config)
+                RustGenerator::generate_with_config(&schema, schema_version, options.gen_config)
                     .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
             let path = output_path.join("database.rs");
             write_file(&path, &result.code, force)?;
@@ -214,7 +214,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &schema,
                 &output_path,
                 force,
-                format_version,
+                schema_version,
                 options.gen_config,
             )?);
         }
@@ -223,7 +223,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &schema,
                 &output_path,
                 force,
-                format_version,
+                schema_version,
             )?);
         }
         // Per-runtime ergonomic wrappers (#51/#52/#117). Resolved here from
@@ -234,7 +234,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &schema,
                 &output_path,
                 force,
-                format_version,
+                schema_version,
             )?);
         }
         "napi" => {
@@ -242,7 +242,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &schema,
                 &output_path,
                 force,
-                format_version,
+                schema_version,
             )?);
         }
         // Golang binding (RFC #203). Resolved from `go --runtime`;
@@ -252,12 +252,12 @@ pub fn run(options: GenerateOptions) -> Result<()> {
                 &schema,
                 &output_path,
                 force,
-                format_version,
+                schema_version,
             )?);
         }
         // REST client SDKs (#118/#205/#206). Resolved from `python|go|rust --sdk`.
         // Transport clients over the generated REST API — no on-disk format, so
-        // they take no `format_version`.
+        // they take no `schema_version`.
         "rust-sdk" => {
             generated_files.extend(generate_rust_sdk(&schema, &output_path, force)?);
         }
@@ -347,7 +347,7 @@ fn generate_all(
     output_path: &PathBuf,
     force: bool,
     target_filter: Option<&[String]>,
-    format_version: u32,
+    schema_version: u32,
     gen_config: forgedb_codegen::GenConfig,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let enabled = |name: &str| -> bool {
@@ -358,7 +358,7 @@ fn generate_all(
 
     // Generate Rust database code (with the #126 generate-time runtime config).
     if enabled("rust") {
-        let rust_result = RustGenerator::generate_with_config(schema, format_version, gen_config)
+        let rust_result = RustGenerator::generate_with_config(schema, schema_version, gen_config)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
         let rust_path = output_path.join("database.rs");
         write_file(&rust_path, &rust_result.code, force)?;
@@ -413,7 +413,7 @@ fn generate_all(
             schema,
             output_path,
             force,
-            format_version,
+            schema_version,
             gen_config,
         )?);
     }
@@ -422,13 +422,13 @@ fn generate_all(
     // language binding hangs off).  Also OPT-IN — the default `all` skips it; a
     // project enables it by listing `ffi` in `[generate].targets`.
     if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "ffi")) {
-        files.extend(generate_ffi_engine(schema, output_path, force, format_version)?);
+        files.extend(generate_ffi_engine(schema, output_path, force, schema_version)?);
     }
 
     // REST client SDKs (#118/#205/#206) — also OPT-IN (the default `all` skips
     // them; a project enables one by listing `rust-sdk`/`python-sdk`/`go-sdk` in
     // `[generate].targets`).  Each emits a portable network client, no on-disk
-    // format, so none take `format_version`.
+    // format, so none take `schema_version`.
     if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "rust-sdk")) {
         files.extend(generate_rust_sdk(schema, output_path, force)?);
     }
@@ -451,7 +451,7 @@ fn generate_ffi_engine(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
-    format_version: u32,
+    schema_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let ffi_dir = output_path.join("ffi");
     let src_dir = ffi_dir.join("src");
@@ -470,7 +470,7 @@ fn generate_ffi_engine(
 
     // The generated database the spine wraps (same generator as the `rust`
     // target — the FFI engine is the same data logic, exposed over the C-ABI).
-    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let db_path = src_dir.join("database.rs");
     write_file(&db_path, &rust_result.code, force)?;
@@ -490,7 +490,7 @@ fn generate_pyo3_binding(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
-    format_version: u32,
+    schema_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let pyo3_dir = output_path.join("pyo3");
     let src_dir = pyo3_dir.join("src");
@@ -508,7 +508,7 @@ fn generate_pyo3_binding(
 
     // The generated database the wrapper binds (same generator as the `rust`
     // target — the binding is the same data logic, exposed to Python).
-    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let db_path = src_dir.join("database.rs");
     write_file(&db_path, &rust_result.code, force)?;
@@ -550,7 +550,7 @@ fn generate_napi_binding(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
-    format_version: u32,
+    schema_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let napi_dir = output_path.join("napi");
     let src_dir = napi_dir.join("src");
@@ -568,7 +568,7 @@ fn generate_napi_binding(
 
     // The generated database the wrapper binds (same generator as the `rust`
     // target — the binding is the same data logic, exposed to Node/Bun).
-    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let db_path = src_dir.join("database.rs");
     write_file(&db_path, &rust_result.code, force)?;
@@ -609,11 +609,11 @@ fn generate_go_binding(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
-    format_version: u32,
+    schema_version: u32,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     // The FFI engine crate (cdylib) the Go package links against — reused
     // verbatim, so Go requires no new C symbol.
-    let mut files = generate_ffi_engine(schema, output_path, force, format_version)?;
+    let mut files = generate_ffi_engine(schema, output_path, force, schema_version)?;
 
     let go_dir = output_path.join("go");
     fs::create_dir_all(&go_dir)?;
@@ -802,7 +802,7 @@ fn generate_wasm_replica(
     schema: &forgedb_parser::Schema,
     output_path: &Path,
     force: bool,
-    format_version: u32,
+    schema_version: u32,
     gen_config: forgedb_codegen::GenConfig,
 ) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
     let replica_dir = output_path.join("replica");
@@ -820,9 +820,9 @@ fn generate_wasm_replica(
 
     // The generated database the transport compiles against (same generator as
     // the `rust` target — the follower is the same data logic, recompiled).  It
-    // shares the server's lineage version so the replica's `EXPECTED_FORMAT_VERSION`
+    // shares the server's lineage version so the replica's `EXPECTED_SCHEMA_VERSION`
     // matches the data it follows.
-    let rust_result = RustGenerator::generate_with_format_version(schema, format_version)
+    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let db_path = src_dir.join("database.rs");
     write_file(&db_path, &rust_result.code, force)?;

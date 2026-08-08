@@ -31,7 +31,7 @@ class Account:
     role: Role
     balance: str
     login_count: int
-    created_at: int
+    created_at: str
     metadata: Any = None
     bio: Optional[str] = None
     projects: Any = None
@@ -90,7 +90,7 @@ class AuditEvent:
     """AuditEvent — mirrors the wire shape of the generated model."""
     id: str
     kind: str
-    at: int
+    at: str
 
 
 @dataclass

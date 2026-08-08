@@ -236,7 +236,8 @@ impl PythonSdkGenerator {
     fn base_type(schema: &Schema, ft: &FieldType) -> (bool, String) {
         match ft {
             FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64 => (false, "int".into()),
-            FieldType::Timestamp => (false, "int".into()),
+            // #254: RFC 3339 string on the wire.
+            FieldType::Timestamp(_) => (false, "str".into()),
             FieldType::F64 => (false, "float".into()),
             FieldType::Bool => (false, "bool".into()),
             // #238: an inline `string(N)` is a string on the wire.

@@ -358,16 +358,16 @@ pub struct Migration {
     pub changes: Vec<SchemaChange>,
     /// Checksum of the migration file for integrity
     pub checksum: String,
-    /// On-disk `format_version` this migration expects BEFORE it runs (#74
+    /// On-disk schema serial this migration expects BEFORE it runs (#74
     /// Phase 2 — the serial version interlock).  `0` for a legacy record written
     /// before versioning existed; a real lineage is contiguous (`to_version` of
     /// one migration == `from_version` of the next).
     #[serde(default)]
     pub from_version: u32,
-    /// On-disk `format_version` this migration stamps AFTER it runs.  The current
+    /// On-disk schema serial this migration stamps AFTER it runs.  The current
     /// expected version of the whole database is the highest `to_version` in the
     /// lineage (see [`MigrationLineage`](crate::MigrationLineage)); that is what
-    /// codegen bakes into `EXPECTED_FORMAT_VERSION` (red line #8 — lineage-sourced,
+    /// codegen bakes into `EXPECTED_SCHEMA_VERSION` (red line #8 — lineage-sourced,
     /// never hand-edited).
     #[serde(default)]
     pub to_version: u32,

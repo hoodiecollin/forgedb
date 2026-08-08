@@ -16,7 +16,7 @@ A compact lookup for the whole `.forge` language. Follow the links for the full 
 | `string(N)` `string(N!)` | `String` | `string` | ✅ — fixed N-**character** slot in the row; `!` = exactly N, bare = at most. ASCII unless `@utf8` |
 | `bytes(N)` | `[u8; N]` | `any` | ✅ (raw bytes, **not** text; struct-safe) |
 | `uuid` | `Uuid` | `string` | ✅ |
-| `timestamp` | `i64` | `number` | ✅ |
+| `timestamp`, `timestamp(s\|ms\|us)` | `Timestamp` | `string` (RFC 3339) | ✅ |
 | `decimal` | `Decimal` | `string` | ✅ (normalized key) |
 | `json` | `serde_json::Value` | `unknown` | ❌ |
 
@@ -26,7 +26,7 @@ No `text` type. See [scalar types](/docs/schema/scalar-types/).
 
 | Sigil | Position | Meaning | Notes |
 |-------|----------|---------|-------|
-| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — all fill on create when omitted. Integer autos are monotonic, **not gapless**, and cannot take an explicit `0`; any shape (identity, `&`, `^`, or bare) is valid |
+| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — all fill on create when omitted. Integer autos are monotonic, **not gapless**, and cannot take an explicit `0`; any shape (identity, `&`, `^`, or bare) is valid. A `+timestamp` is a *stamp* unless it is named `id`, and `id: +timestamp` must be declared `us` |
 | `&` | prefix | unique (enforced) | any type; also indexes |
 | `^` | prefix | indexed | any indexable type |
 | `?` | postfix (or prefix) | nullable | any type |

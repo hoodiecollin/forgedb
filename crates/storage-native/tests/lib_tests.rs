@@ -171,6 +171,7 @@ fn test_manifest_roundtrip() {
 
     let manifest = Manifest {
         schema_version: 1,
+        engine_version: 1,
         row_count: 42,
         columns: vec![
             ColumnMetadata {
@@ -189,7 +190,6 @@ fn test_manifest_roundtrip() {
         wal_enabled: false,
         last_checkpoint: 0,
         compaction_epoch: 0,
-        format_version: 1,
         row_anchor: None,
         auto_sequences: Default::default(),
     };

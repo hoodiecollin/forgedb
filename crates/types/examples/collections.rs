@@ -12,9 +12,9 @@ fn main() {
     println!("--- Timestamps in HashSet ---");
     let mut timestamp_set = HashSet::new();
     
-    let ts1 = Timestamp::from_seconds(1000);
-    let ts2 = Timestamp::from_seconds(2000);
-    let ts3 = Timestamp::from_seconds(1000); // Duplicate of ts1
+    let ts1 = Timestamp::from_micros(1000);
+    let ts2 = Timestamp::from_micros(2000);
+    let ts3 = Timestamp::from_micros(1000); // Duplicate of ts1
 
     timestamp_set.insert(ts1);
     timestamp_set.insert(ts2);
@@ -42,15 +42,15 @@ fn main() {
     // Timestamp ordering
     println!("--- Timestamp Ordering ---");
     let mut timestamps = vec![
-        Timestamp::from_seconds(5000),
-        Timestamp::from_seconds(1000),
-        Timestamp::from_seconds(3000),
-        Timestamp::from_seconds(2000),
+        Timestamp::from_micros(5000),
+        Timestamp::from_micros(1000),
+        Timestamp::from_micros(3000),
+        Timestamp::from_micros(2000),
     ];
 
-    println!("Original: {:?}", timestamps.iter().map(|t| t.as_seconds()).collect::<Vec<_>>());
+    println!("Original: {:?}", timestamps.iter().map(|t| t.as_micros()).collect::<Vec<_>>());
     timestamps.sort();
-    println!("Sorted:   {:?}\n", timestamps.iter().map(|t| t.as_seconds()).collect::<Vec<_>>());
+    println!("Sorted:   {:?}\n", timestamps.iter().map(|t| t.as_micros()).collect::<Vec<_>>());
 
     // Mixed Value collection
     println!("--- Mixed Value Collection ---");

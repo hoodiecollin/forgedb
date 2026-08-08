@@ -31,7 +31,7 @@
 //! ```
 //!
 //! The header is versioned (`container_version`) and records each model dir's
-//! `schema_version` / `format_version` / `compaction_epoch` / `row_count`, so a
+//! `schema_version` / `engine_version` / `compaction_epoch` / `row_count`, so a
 //! restore can refuse incompatible bytes instead of silently materializing them.
 //!
 //! ## Scope (first milestone, #57)
@@ -55,8 +55,15 @@ pub type Result<T> = std::result::Result<T, BackupError>;
 
 /// Magic bytes at the head of every archive.
 const MAGIC: &[u8; 8] = b"FORGEBK1";
-/// Archive container format version (distinct from a model's `format_version`).
+/// Archive container format version (distinct from a dir's `schema_version`
+/// and from ForgeDB's `engine_version`).
 const CONTAINER_VERSION: u32 = 1;
+
+/// `#[serde(default)]` for the two version counters on a [`ModelMeta`] read out
+/// of an archive written before they were named as they are now.
+fn one() -> u32 {
+    1
+}
 /// Bytes per (offset, length) pair in a variable column's offsets file.
 const OFFSET_PAIR_BYTES: u64 = 16;
 /// The durable replication broker log (#82), a root-level file (not a model dir,
@@ -88,8 +95,18 @@ pub struct FileEntry {
 pub struct ModelMeta {
     /// Directory name relative to the data dir (e.g. `post`, `post_tag_link`).
     pub dir: String,
+    /// The app's schema-migration serial, copied from the dir's manifest.
+    ///
+    /// **On-disk key stays `format_version`** and the Rust name follows the
+    /// manifest's (#254). Before that change this field copied the manifest's
+    /// *vestigial* constant `1` while the real serial rode under the other name,
+    /// so `forgedb backup` reported `1` for every dir; it now reports the truth.
+    #[serde(rename = "format_version", default = "one")]
     pub schema_version: u32,
-    pub format_version: u32,
+    /// ForgeDB's engine byte-format generation (#254), copied from the manifest.
+    /// Defaults to the baseline for an archive written before the field existed.
+    #[serde(default = "one")]
+    pub engine_version: u32,
     pub compaction_epoch: u64,
     /// Committed row count at snapshot time (`len(anchor) / bytes_per_row`).
     pub row_count: usize,
@@ -255,7 +272,7 @@ fn plan_dir(data_dir: &Path, dir_name: &str) -> Result<(ModelMeta, Vec<FileEntry
     let meta = ModelMeta {
         dir: dir_name.to_string(),
         schema_version: manifest.schema_version,
-        format_version: manifest.format_version,
+        engine_version: manifest.engine_version,
         compaction_epoch: manifest.compaction_epoch,
         row_count: n,
     };
@@ -772,12 +789,12 @@ mod tests {
         fs::create_dir_all(dir).unwrap();
         let manifest = Manifest {
             schema_version: 1,
+            engine_version: 1,
             row_count: 0,
             columns: vec![],
             wal_enabled: false,
             last_checkpoint: 0,
             compaction_epoch: epoch,
-            format_version: 1,
             row_anchor: Some(RowAnchor {
                 relative_path: "tombstones.bin".into(),
                 bytes_per_row: 1,
@@ -796,7 +813,7 @@ mod tests {
         let models = vec![ModelMeta {
             dir: "user".into(),
             schema_version: 1,
-            format_version: 1,
+            engine_version: 1,
             compaction_epoch: 4,
             row_count: 0,
         }];

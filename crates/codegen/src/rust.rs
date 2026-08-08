@@ -27,6 +27,25 @@ pub struct RustGenerator;
 /// A `@min`/`@max` bound literal as written in the schema (#239).
 ///
 /// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
+/// ForgeDB's current on-disk **engine** generation (#254).
+///
+/// Distinct from the app's schema-migration serial: this counts *ForgeDB's* byte
+/// format, covering both value reinterpretation and physical layout. It is baked
+/// into generated code as `EXPECTED_ENGINE_VERSION`, stamped into every manifest
+/// the generated code writes, and compared by the generated `open()` guard.
+///
+/// | gen | change | issue |
+/// |---|---|---|
+/// | 1 | baseline — everything written before the field existed | — |
+/// | 2 | timestamp values are microseconds, not seconds | #254 |
+///
+/// **Generations are assigned at merge order, not at design time.** Two engine
+/// format changes in one cycle would otherwise both claim the next number, and
+/// whichever landed second would silently redefine the other's meaning. Bumping
+/// this constant obliges a hop in the engine-migration generator
+/// (`crate::engine`), because every existing data dir is now stale.
+pub const CURRENT_ENGINE_VERSION: u32 = 2;
+
 /// happens against the known field type: exact for `decimal`, correctly rounded
 /// for `f64`. Parsing to a float earlier would round before anything knew which
 /// of those two applied.
@@ -91,24 +110,45 @@ impl RustGenerator {
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         // Baseline on-disk format version (#74 Phase 1): a schema with no migration
         // lineage is at version 1.  The CLI threads the lineage-derived version via
-        // `generate_with_format_version`; snapshot tests use this baseline so their
+        // `generate_with_schema_version`; snapshot tests use this baseline so their
         // output is stable.
-        Self::generate_with_format_version(schema, 1)
+        Self::generate_with_schema_version(schema, 1)
     }
 
-    /// Generate the Rust database implementation, baking `format_version` into the
-    /// app's `EXPECTED_FORMAT_VERSION` (#74 Phase 1/2).  The version is **derived
+    /// Generate the Rust database implementation, baking the app's schema serial into the
+    /// app's `EXPECTED_SCHEMA_VERSION` (#74 Phase 1/2).  The version is **derived
     /// from the committed migration lineage** by the `generate` CLI command (red
     /// line #8: lineage-sourced, never hand-edited); it is an opaque integer the
     /// generated open guard compares and refuses on mismatch — nothing more.
     ///
     /// Uses the default generate-time runtime config (`GenConfig::DEFAULT`) — see
     /// `generate_with_config` for the #126 configurable-behavior knobs.
-    pub fn generate_with_format_version(
+    pub fn generate_with_schema_version(
         schema: &Schema,
-        format_version: u32,
+        schema_version: u32,
     ) -> Result<GeneratedCode> {
-        Self::generate_with_config(schema, format_version, GenConfig::DEFAULT)
+        Self::generate_with_config(schema, schema_version, GenConfig::DEFAULT)
+    }
+
+    /// Generate with an explicit **engine** generation as well as the app's
+    /// schema serial (#254).
+    ///
+    /// The only caller that needs this is the engine-migration generator, which
+    /// emits the *same* schema twice — once baked at the origin generation to
+    /// read the stale dir, once at the destination generation to write the new
+    /// one. Every other caller wants [`CURRENT_ENGINE_VERSION`] and gets it from
+    /// the shorter constructors.
+    pub fn generate_with_versions(
+        schema: &Schema,
+        schema_version: u32,
+        engine_version: u32,
+    ) -> Result<GeneratedCode> {
+        Self::generate_with_config_and_engine(
+            schema,
+            schema_version,
+            engine_version,
+            GenConfig::DEFAULT,
+        )
     }
 
     /// Generate the Rust database implementation with an explicit generate-time
@@ -119,11 +159,27 @@ impl RustGenerator {
     /// except the broker (default OFF — G6 sanctioned exception).
     pub fn generate_with_config(
         schema: &Schema,
-        format_version: u32,
+        schema_version: u32,
+        config: GenConfig,
+    ) -> Result<GeneratedCode> {
+        Self::generate_with_config_and_engine(
+            schema,
+            schema_version,
+            CURRENT_ENGINE_VERSION,
+            config,
+        )
+    }
+
+    /// The one real entry point: both version counters plus the generate-time
+    /// config. Everything above delegates here.
+    pub fn generate_with_config_and_engine(
+        schema: &Schema,
+        schema_version: u32,
+        engine_version: u32,
         config: GenConfig,
     ) -> Result<GeneratedCode> {
         ACTIVE_CONFIG.with(|c| c.set(config));
-        let code = Self::generate_code(schema, format_version)?;
+        let code = Self::generate_code(schema, schema_version, engine_version)?;
 
         Ok(GeneratedCode {
             code,
@@ -272,7 +328,7 @@ impl RustGenerator {
     }
 
     /// Generate the Rust code as a string
-    fn generate_code(schema: &Schema, format_version: u32) -> Result<String> {
+    fn generate_code(schema: &Schema, schema_version: u32, engine_version: u32) -> Result<String> {
         Self::validate_projections(schema)?;
         Self::validate_on_delete(schema)?;
 
@@ -345,20 +401,29 @@ impl RustGenerator {
 
         // On-disk format version this binary was generated for (#74 Phase 1 —
         // version guard).  An OPAQUE lineage-derived integer: it is compared, on
-        // open, against the `format_version` stamped in each collection's
+        // open, against the schema serial stamped in each collection's
         // `manifest.json`, and a mismatch is a fail-fast refusal — never a
         // self-healing reshape (red line DV-6: the guard reads ONE integer and
         // refuses; it never inspects column names/types to adapt).  A migration
         // bin (the offline transformer, #74 Phase 3) is what rewrites a data dir
         // from an old version to a new one; the app never migrates in place.
         // Derived from the committed migration lineage (#74 Phase 2 — the CLI
-        // threads `MigrationLineage::current_format_version`); baseline `1` for a
+        // threads `MigrationLineage::current_schema_version`); baseline `1` for a
         // schema with no lineage.  A fresh data dir is stamped with exactly this
         // value, so a dir this binary wrote always matches its own expectation.
-        let __expected_format_version =
-            proc_macro2::Literal::u32_unsuffixed(format_version);
+        let __expected_schema_version =
+            proc_macro2::Literal::u32_unsuffixed(schema_version);
+        // ForgeDB's own on-disk **engine** generation (#254), the counter
+        // orthogonal to the schema serial above.  A schema mismatch means the
+        // app's schema changed; an engine mismatch means ForgeDB's byte format
+        // did.  They have different remedies, so they are compared separately
+        // and reported separately — conflating them would send a user to
+        // regenerate a schema that is already correct.
+        let __expected_engine_version =
+            proc_macro2::Literal::u32_unsuffixed(engine_version);
         tokens.extend(quote! {
-            const EXPECTED_FORMAT_VERSION: u32 = #__expected_format_version;
+            const EXPECTED_SCHEMA_VERSION: u32 = #__expected_schema_version;
+            const EXPECTED_ENGINE_VERSION: u32 = #__expected_engine_version;
         });
 
         // serde default for an omitted `+timestamp` auto field (#187): a zero
@@ -369,7 +434,7 @@ impl RustGenerator {
         // `#![allow(dead_code)]` covers that.
         tokens.extend(quote! {
             fn __forgedb_default_ts() -> Timestamp {
-                Timestamp::from_seconds(0)
+                Timestamp::from_micros(0)
             }
 
             /// Build an opaque MVCC conflict key from its components (#257).
@@ -1239,7 +1304,7 @@ impl RustGenerator {
         // before the manifest write falls back to the scan, which never
         // over-issues, only under-issues into a range compaction already freed.
         let autoseq_floor = {
-            let loads: Vec<TokenStream> = Self::integer_auto_fields(model)
+            let loads: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
                 .map(|f| {
                     let seq = Self::autoseq_field_ident(f);
@@ -1549,6 +1614,13 @@ impl RustGenerator {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
         let id_type = Self::id_type_tokens(schema, model);
+        // #254: a timestamp identity reaches `ToSchema` here too. The identity's
+        // own declared type is what the enum carries, so ask about that rather
+        // than assuming the id is uuid- or integer-shaped.
+        let id_schema_attr = Self::identity_field(model)
+            .and_then(|f| Self::timestamp_schema_value_type(schema, &f.field_type))
+            .map(|vt| quote! { #[schema(value_type = #vt)] })
+            .unwrap_or_default();
         let doc = format!(
             "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
              membership changes over a generated closed-set query.",
@@ -1566,7 +1638,7 @@ impl RustGenerator {
                 /// A record already in the set changed.
                 Updated { row: #model_name },
                 /// An id left the matching set (deleted, or no longer matches).
-                Removed { id: #id_type },
+                Removed { #id_schema_attr id: #id_type },
             }
         }
     }
@@ -1837,7 +1909,7 @@ impl RustGenerator {
         use forgedb_parser::FieldType as FT;
         match ty {
             FT::U32 | FT::I32 => 4,
-            FT::U64 | FT::I64 | FT::Timestamp => 8,
+            FT::U64 | FT::I64 | FT::Timestamp(_) => 8,
             // `junction_key_type` admits nothing else.
             _ => 16,
         }
@@ -1883,7 +1955,7 @@ impl RustGenerator {
     ) -> TokenStream {
         match ty {
             forgedb_parser::FieldType::Uuid => quote! { #col.append_uuid(*#val.as_bytes()) },
-            forgedb_parser::FieldType::Timestamp => {
+            forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #col.append_timestamp(i64::from(#val)) }
             }
             other => {
@@ -1905,7 +1977,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::Uuid => quote! {
                 Uuid::from_bytes(#col.read_uuid(#row).expect("Failed to read link"))
             },
-            forgedb_parser::FieldType::Timestamp => quote! {
+            forgedb_parser::FieldType::Timestamp(_) => quote! {
                 Timestamp::from(#col.read_timestamp(#row).expect("Failed to read link"))
             },
             other => {
@@ -1934,7 +2006,7 @@ impl RustGenerator {
             // (`&ev.bytes[a..b]`), and `&x.try_into()` parses as `&(x.try_into())`
             // — which type-checks as a reference to an array and fails. The
             // snapshot tests could not have caught this; the compile check did.
-            forgedb_parser::FieldType::Timestamp => quote! {
+            forgedb_parser::FieldType::Timestamp(_) => quote! {
                 Timestamp::from(i64::from_le_bytes(
                     (#slice).try_into().expect("junction frame slot is the key width"),
                 ))
@@ -1962,7 +2034,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::Uuid => {
                 quote! { #buf.extend_from_slice(#val.as_bytes()); }
             }
-            forgedb_parser::FieldType::Timestamp => {
+            forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #buf.extend_from_slice(&i64::from(#val).to_le_bytes()); }
             }
             _ => quote! { #buf.extend_from_slice(&#val.to_le_bytes()); },
@@ -1994,11 +2066,7 @@ impl RustGenerator {
     /// `insert` return type, and the `get` parameter type all agree with
     /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
     pub(crate) fn id_type_tokens(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
-        match model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
+        match Self::identity_field(model) {
             Some(f) => Self::map_field_type_ident(schema, &f.field_type),
             None => quote! { Uuid },
         }
@@ -2017,7 +2085,9 @@ impl RustGenerator {
     /// Arrow layout qualify. Numerics are stored little-endian (`to_le_bytes`), so
     /// a contiguous copy is a valid Arrow primitive buffer on any host; `uuid` and
     /// a required FK are raw `[u8; 16]` → Arrow `FixedSizeBinary(16)`; `timestamp`
-    /// is an `i64` seconds column → Arrow `int64`. Deliberately excluded (each
+    /// is an `i64` **microseconds** column → Arrow `int64` (#254 changed the unit,
+    /// not the layout: the export is a copy of the physical column bytes, which
+    /// never went through serde, so the RFC 3339 wire form does not reach it). Deliberately excluded (each
     /// needs a transform, a later increment): `bool` (Arrow bit-packs; we store 1
     /// byte), any nullable field (Arrow validity bitmap vs our presence tag),
     /// `string`/`json` (variable → offsets), `decimal` (rust_decimal's internal
@@ -2035,7 +2105,7 @@ impl RustGenerator {
             FieldType::U32 => Some("I"),
             FieldType::U64 => Some("L"),
             FieldType::F64 => Some("g"),
-            FieldType::Timestamp => Some("l"),
+            FieldType::Timestamp(_) => Some("l"),
             FieldType::Uuid | FieldType::Relation(RelationType::RequiredReference(_)) => {
                 Some("w:16")
             }
@@ -2125,12 +2195,10 @@ impl RustGenerator {
                 // An inline struct carries the same `#[derive(Serialize,
                 // Deserialize)]` as a model, so an oversized array breaks it exactly
                 // the same way (#243) and takes exactly the same attributes.
-                let (schema_attr, serde_attr) = if Self::is_timestamp_type(&field.field_type) {
-                    if field.is_nullable() {
-                        (quote! { #[schema(value_type = Option<i64>)] }, quote! {})
-                    } else {
-                        (quote! { #[schema(value_type = i64)] }, quote! {})
-                    }
+                let (schema_attr, serde_attr) = if let Some(vt) =
+                    Self::timestamp_schema_value_type(schema, &field.field_type)
+                {
+                    (quote! { #[schema(value_type = #vt)] }, quote! {})
                 } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
                     attrs
                 } else {
@@ -2303,6 +2371,53 @@ impl RustGenerator {
     ///
     /// Empty for every schema in the corpus but `iot-sensors`, which is what makes
     /// this the switch that keeps #187 from changing any other model's output.
+    /// The model's `+timestamp` **identity**, if it has one (#254).
+    ///
+    /// A `+timestamp` is identity-eligible only when the field is named `id`
+    /// (res 6): 148 of 148 `+timestamp` fields in the example corpus are
+    /// `created_at`-style stamps, so inferring a timestamp key from the `+` alone
+    /// would silently mis-key a model that merely wanted a creation stamp. The
+    /// asymmetry against `+u32`/`+u64` is deliberate — the *only* reason to write
+    /// an integer auto is to get an allocated sequence, so an auto integer is
+    /// unambiguously key-ish.
+    ///
+    /// Validation additionally requires the declared precision to be `us`, so a
+    /// field reaching here is always `Timestamp(Micros)`.
+    fn timestamp_key_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
+        model.fields.iter().find(|f| {
+            f.name == "id"
+                && f.auto_generate
+                && matches!(f.field_type, forgedb_parser::FieldType::Timestamp(_))
+        })
+    }
+
+    /// Every field backed by the #187 per-field allocation counter: the integer
+    /// autos, plus a `+timestamp` identity.
+    ///
+    /// A `+timestamp` identity is structurally an integer auto-increment whose
+    /// seed is the clock instead of `0` — precision does not make it unique,
+    /// monotonic allocation does — so it reuses the same `AtomicU64`, the same
+    /// `Manifest.auto_sequences` floor and the same reopen scan, and only the
+    /// allocation expression differs.
+    fn sequence_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
+        let mut fields = Self::integer_auto_fields(model);
+        fields.extend(Self::timestamp_key_field(model));
+        fields
+    }
+
+    /// The `u64` view of `expr` for the shared counter. The counter is one type
+    /// for every sequence field, so each field type says how it projects into it.
+    fn autoseq_to_u64(field: &forgedb_parser::Field, expr: TokenStream) -> TokenStream {
+        if matches!(field.field_type, forgedb_parser::FieldType::Timestamp(_)) {
+            // Micros since the epoch. Clamped at 0 because the counter is
+            // unsigned and a pre-epoch id cannot be allocated anyway — the
+            // allocator's floor is `now`, which is not in 1969.
+            quote! { (#expr).as_micros().max(0) as u64 }
+        } else {
+            quote! { (#expr) as u64 }
+        }
+    }
+
     fn integer_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         model
             .fields
@@ -2551,7 +2666,7 @@ impl RustGenerator {
             | FieldType::F64
             | FieldType::Bool
             | FieldType::Uuid
-            | FieldType::Timestamp
+            | FieldType::Timestamp(_)
             | FieldType::String
             // #238: an inline string is a `String` in the record, so it is `Ord` +
             // `Hash` on exactly the same terms as a bare one.
@@ -3252,12 +3367,14 @@ impl RustGenerator {
                 let _ = write!(__k, "{}", __v);
                 __k
             },
-            // `Timestamp` is `#[serde(transparent)]` over an i64, so its JSON form
-            // is the bare number — NOT a formatted date.
-            FieldType::Timestamp => quote! {
+            // Keyed on the raw microseconds, NOT on the RFC 3339 rendering
+            // (#254).  The wire form changed; storage and index keys did not —
+            // the key is generated on both sides, so it is internal, and micros
+            // keep it fixed-width-comparable and free of a date format.
+            FieldType::Timestamp(_) => quote! {
                 use std::fmt::Write as _;
                 let mut __k = String::from('\u{2}');
-                let _ = write!(__k, "{}", __v.as_seconds());
+                let _ = write!(__k, "{}", __v.as_micros());
                 __k
             },
             FieldType::Bool => quote! {
@@ -3464,7 +3581,7 @@ impl RustGenerator {
             FieldType::U64 => Some(quote! { u64 }),
             FieldType::I32 => Some(quote! { i32 }),
             FieldType::I64 => Some(quote! { i64 }),
-            FieldType::Timestamp => Some(quote! { Timestamp }),
+            FieldType::Timestamp(_) => Some(quote! { Timestamp }),
             FieldType::Decimal => Some(quote! { rust_decimal::Decimal }),
             // Keyed by `__forgedb_f64_key(v)`, not by the float itself.
             FieldType::F64 => Some(quote! { u64 }),
@@ -3805,7 +3922,7 @@ impl RustGenerator {
         // carried across that reset rather than silently rebuilt at zero.
         // Always `u64` regardless of the field's width; the width only decides
         // where `__alloc_*` refuses to go further.
-        let autoseq_fields: Vec<_> = Self::integer_auto_fields(model)
+        let autoseq_fields: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::autoseq_field_ident(f);
@@ -3967,7 +4084,7 @@ impl RustGenerator {
         // `max(manifest floor, scanned max)` in `#rehydrate_logic`; the
         // no-rehydrate constructor leaves them here at 0 and `compact()` reinstalls
         // the live values across its `*self =` reset.
-        let autoseq_inits: Vec<_> = Self::integer_auto_fields(model)
+        let autoseq_inits: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::autoseq_field_ident(f);
@@ -4194,7 +4311,7 @@ impl RustGenerator {
                     // decimal = rust_decimal::Decimal, a fixed 16-byte value
                     // (Decimal::serialize() -> [u8; 16]).
                     forgedb_parser::FieldType::Decimal => 16,
-                    forgedb_parser::FieldType::Timestamp => 8,
+                    forgedb_parser::FieldType::Timestamp(_) => 8,
                     forgedb_parser::FieldType::Bytes(n) => *n,
                     forgedb_parser::FieldType::FixedArray(inner, count) => {
                         // Fall back to map_field_type_ident for array sizing
@@ -4228,7 +4345,7 @@ impl RustGenerator {
             FieldType::F64 => quote! { forgedb_storage::ColumnType::F64 },
             FieldType::Bool => quote! { forgedb_storage::ColumnType::Bool },
             FieldType::Uuid => quote! { forgedb_storage::ColumnType::Uuid },
-            FieldType::Timestamp => quote! { forgedb_storage::ColumnType::Timestamp },
+            FieldType::Timestamp(_) => quote! { forgedb_storage::ColumnType::Timestamp },
             // Any remaining fixed-size type is opaque fixed bytes of its width.
             _ => {
                 let size = Self::column_value_size_expr(schema, field_type, utf8);
@@ -4269,6 +4386,46 @@ impl RustGenerator {
     /// genuinely inside this at once.
     fn generate_autoseq_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = &model.name;
+        let timestamp_methods: Vec<TokenStream> = Self::timestamp_key_field(model)
+            .into_iter()
+            .map(|f| {
+                let alloc = Self::autoseq_alloc_ident(f);
+                let seq = Self::autoseq_field_ident(f);
+                let doc = format!(
+                    "Allocate the next `{}.{}` value (#254): `max(now_micros, last + 1)`.\n\n\
+                     Precision does NOT make a timestamp key unique — at any \
+                     precision two rows created in the same tick read the same \
+                     clock, and ForgeDB resolves duplicate ids as superseding \
+                     versions, so a collision is a SILENT overwrite. Monotonic \
+                     allocation is what guarantees uniqueness; the declared \
+                     precision only governs how far the counter drifts ahead of \
+                     the wall clock under a burst, which is fidelity, not \
+                     correctness. Never rewinds, so the clock has to catch up in \
+                     real time — the argument for the `us` floor.",
+                    model.name, f.name
+                );
+                quote! {
+                    #[doc = #doc]
+                    fn #alloc(&self) -> Result<Timestamp, ValidationError> {
+                        use std::sync::atomic::Ordering;
+                        let mut __cur = self.#seq.load(Ordering::SeqCst);
+                        loop {
+                            let __now = Timestamp::now().as_micros().max(0) as u64;
+                            let __next = __now.max(__cur.saturating_add(1));
+                            match self.#seq.compare_exchange_weak(
+                                __cur,
+                                __next,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
+                                Ok(_) => return Ok(Timestamp::from_micros(__next as i64)),
+                                Err(__actual) => __cur = __actual,
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
         let methods: Vec<TokenStream> = Self::integer_auto_fields(model)
             .iter()
             .map(|f| {
@@ -4309,7 +4466,7 @@ impl RustGenerator {
                 }
             })
             .collect();
-        quote! { #(#methods)* }
+        quote! { #(#methods)* #(#timestamp_methods)* }
     }
 
     fn generate_write_manifest(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
@@ -4360,7 +4517,7 @@ impl RustGenerator {
 
         // One max-merge per auto-integer field (#187).  Empty for every model
         // with no `+u32`/`+u64` field, which is why this changes no other output.
-        let autoseq_merges: Vec<TokenStream> = Self::integer_auto_fields(model)
+        let autoseq_merges: Vec<TokenStream> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| {
                 let seq = Self::autoseq_field_ident(f);
@@ -4401,11 +4558,11 @@ impl RustGenerator {
                 // `compaction_epoch` above: a reopen must NOT clobber a version a
                 // migration bumped (that would silently defeat the open-time guard
                 // and let stale bytes be mis-decoded).  A fresh directory is stamped
-                // with this binary's `EXPECTED_FORMAT_VERSION` baseline, so a dir
+                // with this binary's `EXPECTED_SCHEMA_VERSION` baseline, so a dir
                 // this binary writes always matches its own expectation.
-                let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-                    .map(|m| m.format_version)
-                    .unwrap_or(EXPECTED_FORMAT_VERSION);
+                let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                    .map(|m| m.schema_version)
+                    .unwrap_or(EXPECTED_SCHEMA_VERSION);
                 // Auto-increment high-water marks (#187).  This is a **max-merge**,
                 // NOT the carry-forward the two fields above do — and the
                 // difference is load-bearing.
@@ -4425,7 +4582,6 @@ impl RustGenerator {
                 let mut __auto_sequences = __persisted_seqs;
                 #(#autoseq_merges)*
                 let manifest = forgedb_storage::Manifest {
-                    schema_version: 1,
                     row_count: self.row_count,
                     columns,
                     wal_enabled: false,
@@ -4434,7 +4590,13 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                     compaction_epoch: __compaction_epoch,
-                    format_version: __format_version,
+                    schema_version: __schema_version,
+                    // Stamped, not carried forward (#254).  The open-guard above
+                    // has already established that this dir is at THIS binary's
+                    // generation or is fresh, so there is nothing older to
+                    // preserve — and no migration bumps the generation in place:
+                    // `forgedb migrate engine` writes a new dir.
+                    engine_version: EXPECTED_ENGINE_VERSION,
                     row_anchor: Some(forgedb_storage::RowAnchor {
                         relative_path: "tombstones.bin".to_string(),
                         bytes_per_row: 1usize,
@@ -4645,7 +4807,7 @@ impl RustGenerator {
                     );
                     // Timestamp is a newtype over i64; append_timestamp expects i64
                     let is_timestamp =
-                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp(_));
                     // Non-null decimal: a fixed 16-byte column stored via
                     // Decimal::serialize() -> [u8; 16], on the raw uuid byte path.
                     let is_decimal =
@@ -4683,7 +4845,7 @@ impl RustGenerator {
     /// `id` when no explicit id / auto-generate field is present (matching the
     /// historical `insert` behavior).
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
-        match model.fields.iter().find(|f| f.name == "id" || f.auto_generate) {
+        match Self::identity_field(model) {
             Some(f) => format_ident!("{}", f.name),
             None => format_ident!("id"),
         }
@@ -4703,17 +4865,14 @@ impl RustGenerator {
         receiver: &TokenStream,
         row_var: &proc_macro2::Ident,
     ) -> Option<TokenStream> {
-        let f = model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)?;
+        let f = Self::identity_field(model)?;
         let col = format_ident!("{}_col", f.name);
 
         let is_uuid_like = matches!(
             &Self::resolved_type(schema, &f.field_type),
             forgedb_parser::FieldType::Uuid
         );
-        let is_timestamp = matches!(&Self::resolved_type(schema, &f.field_type), forgedb_parser::FieldType::Timestamp);
+        let is_timestamp = matches!(&Self::resolved_type(schema, &f.field_type), forgedb_parser::FieldType::Timestamp(_));
         let is_string = Self::is_variable_string_type(&Self::resolved_type(schema, &f.field_type));
 
         let expr = if is_uuid_like {
@@ -4995,7 +5154,7 @@ impl RustGenerator {
                         forgedb_parser::FieldType::Uuid
                     );
                     let is_timestamp =
-                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp(_));
                     let is_decimal =
                         matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
                     if is_decimal {
@@ -5352,7 +5511,7 @@ impl RustGenerator {
         // allocating from 0 until it passes the floor and re-issues live ids; with
         // only the save/reinstall, the floor is never written. Miss either and it
         // reads as working until the second run after a compaction.
-        let autoseq_idents: Vec<_> = Self::integer_auto_fields(model)
+        let autoseq_idents: Vec<_> = Self::sequence_auto_fields(model)
             .iter()
             .map(|f| Self::autoseq_field_ident(f))
             .collect();
@@ -5881,22 +6040,24 @@ impl RustGenerator {
         // deleted row still spent its number.
         let autoseq_delta = {
             let identity = Self::identity_field(model).map(|f| f.name.as_str());
-            let folds: Vec<TokenStream> = Self::integer_auto_fields(model)
+            let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
                 .map(|f| {
                     let seq = Self::autoseq_field_ident(f);
                     if Some(f.name.as_str()) == identity {
                         // `id` is already decoded at the top of the loop body.
+                        let as_u64 = Self::autoseq_to_u64(f, quote! { id });
                         quote! {
-                            self.#seq.fetch_max(id as u64, std::sync::atomic::Ordering::SeqCst);
+                            self.#seq.fetch_max(#as_u64, std::sync::atomic::Ordering::SeqCst);
                         }
                     } else {
                         let col = format_ident!("{}_col", f.name);
                         let read_method = Self::get_read_method(schema, &f.field_type);
+                        let as_u64 = Self::autoseq_to_u64(f, quote! { __v });
                         quote! {
                             if let Ok(__v) = self.#col.#read_method(__r) {
                                 self.#seq.fetch_max(
-                                    __v as u64,
+                                    #as_u64,
                                     std::sync::atomic::Ordering::SeqCst,
                                 );
                             }
@@ -6020,6 +6181,8 @@ impl RustGenerator {
         // any durable side effect, so a rejected insert commits absolutely nothing.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let unique_checks = Self::generate_unique_checks(schema, model, false);
+        // #254: precision floor + RFC 3339 range, ahead of the constraint gate.
+        let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
         // Secondary-index maintenance (#90): after the row is committed and the id
         // is mapped, add this id under each indexed field's value key.  Sequenced
@@ -6056,6 +6219,7 @@ impl RustGenerator {
         let versions_push = Self::id_versions_push_stmt(model, &recv, &id_tok, &quote! { row_index });
 
         quote! {
+            #ts_gate
             // Integrity gate (#91): field constraints, then `&unique`.  Both run
             // before the WAL write, so a rejected insert leaves storage untouched.
             #validate_fn(&record)?;
@@ -6129,6 +6293,8 @@ impl RustGenerator {
         // the record's own id) before any durable side effect.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
         let unique_checks = Self::generate_unique_checks(schema, model, true);
+        // #254: precision floor + RFC 3339 range, ahead of the constraint gate.
+        let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
         // Secondary-index maintenance (#90): an update that changes an indexed
         // field must drop the OLD value key and add the NEW one, else the index
@@ -6224,6 +6390,7 @@ impl RustGenerator {
             if !self.id_to_row.contains_key(&id) {
                 return Ok(false);
             }
+            #ts_gate
             // Integrity gate (#91): validate the incoming record before touching
             // storage; `&unique` excludes this id so an unchanged value is fine.
             #validate_fn(&record)?;
@@ -6983,7 +7150,7 @@ impl RustGenerator {
                 );
                 // read_timestamp returns i64; the struct field is Timestamp
                 let is_timestamp =
-                    matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
+                    matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp(_));
                 // Non-null decimal reads raw [u8; 16] then Decimal::deserialize.
                 let is_decimal =
                     matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
@@ -7024,6 +7191,42 @@ impl RustGenerator {
         }
     }
 
+    /// The `#[schema(value_type = …)]` payload a `Timestamp`-bearing field needs,
+    /// or `None` if the field carries no timestamp.
+    ///
+    /// `forgedb_types::Timestamp` deliberately does NOT implement
+    /// `utoipa::ToSchema` — the substrate does not depend on utoipa — so every
+    /// place a `Timestamp` reaches a `#[derive(ToSchema)]` type has to say what
+    /// the wire form is, and since #254 that form is the RFC 3339 **string**.
+    /// Announcing `i64` after the wire form changed would make the OpenAPI
+    /// document a liar about its own responses.
+    ///
+    /// One helper rather than a predicate repeated per site, because the sites
+    /// that were *missed* are the ones that hurt: a `#[derive(ToSchema)]` type
+    /// carrying an un-annotated `Timestamp` does not warn — it fails to compile
+    /// in the USER's crate, which is why the compile-and-run check exists. The
+    /// three that a bare `is_timestamp_type(&field.field_type)` cannot see are a
+    /// relation FK whose target is timestamp-keyed (#266), a `[timestamp; N]`,
+    /// and a live-query event enum keyed on a timestamp identity.
+    pub(crate) fn timestamp_schema_value_type(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> Option<TokenStream> {
+        use forgedb_parser::FieldType;
+        match &Self::resolved_type(schema, field_type) {
+            FieldType::Timestamp(_) => Some(quote! { String }),
+            FieldType::Nullable(inner) => {
+                let inner = Self::timestamp_schema_value_type(schema, inner)?;
+                Some(quote! { Option<#inner> })
+            }
+            FieldType::FixedArray(inner, _) => {
+                let inner = Self::timestamp_schema_value_type(schema, inner)?;
+                Some(quote! { Vec<#inner> })
+            }
+            _ => None,
+        }
+    }
+
     /// Render one struct field (`pub name: Type`) exactly as the model struct
     /// does, with the `utoipa` Timestamp `value_type` annotation and nullable
     /// wrapping.  Shared by the model struct and every projection struct (#113)
@@ -7037,20 +7240,20 @@ impl RustGenerator {
         let field_name = format_ident!("{}", field.name);
         let field_type = Self::map_field_type_ident(schema, &field.field_type);
 
-        // forgedb_types::Timestamp is a newtype over i64 and does not implement
-        // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
-        // schema while the struct field keeps the semantic Timestamp type.
+        // forgedb_types::Timestamp does not implement utoipa::ToSchema.  Annotate
+        // those fields so utoipa documents them as the RFC 3339 *string* serde
+        // actually produces (#254) while the struct field keeps the semantic
+        // Timestamp type.  Announcing `i64` here after the wire form changed
+        // would make the OpenAPI doc a liar about its own responses.
         //
         // `decimal` (rust_decimal::Decimal) likewise does not implement ToSchema,
         // and is serialized as a JSON *string* (precision-preserving, matching the
         // TS SDK's `string` type) via rust_decimal's `serde::str` module — so it
         // gets both a `#[schema(value_type = String)]` and a `#[serde(with = ...)]`.
-        let (schema_attr, serde_attr) = if Self::is_timestamp_type(&field.field_type) {
-            if field.is_nullable() {
-                (quote! { #[schema(value_type = Option<i64>)] }, quote! {})
-            } else {
-                (quote! { #[schema(value_type = i64)] }, quote! {})
-            }
+        let (schema_attr, serde_attr) = if let Some(vt) =
+            Self::timestamp_schema_value_type(schema, &field.field_type)
+        {
+            (quote! { #[schema(value_type = #vt)] }, quote! {})
         } else if Self::is_decimal_type(&field.field_type) {
             if field.is_nullable() {
                 (
@@ -7088,7 +7291,7 @@ impl RustGenerator {
                 forgedb_parser::FieldType::Uuid
                 | forgedb_parser::FieldType::U32
                 | forgedb_parser::FieldType::U64 => quote! { #[serde(default)] },
-                forgedb_parser::FieldType::Timestamp => {
+                forgedb_parser::FieldType::Timestamp(_) => {
                     quote! { #[serde(default = "__forgedb_default_ts")] }
                 }
                 _ => quote! {},
@@ -7134,11 +7337,9 @@ impl RustGenerator {
                             record.#name = Uuid::new_v4();
                         }
                     }),
-                    forgedb_parser::FieldType::Timestamp => Some(quote! {
-                        if record.#name.as_seconds() == 0 {
-                            record.#name = Timestamp::now();
-                        }
-                    }),
+                    forgedb_parser::FieldType::Timestamp(precision) => {
+                        Some(Self::timestamp_auto_synthesis(model, f, *precision, recv))
+                    }
                     forgedb_parser::FieldType::U32 | forgedb_parser::FieldType::U64 => {
                         let alloc = Self::autoseq_alloc_ident(f);
                         let seq = Self::autoseq_field_ident(f);
@@ -7165,13 +7366,252 @@ impl RustGenerator {
         quote! { #(#stmts)* }
     }
 
+    /// The `+timestamp` half of [`Self::generate_auto_synthesis`] (#254).
+    ///
+    /// Two different jobs wear the same `+`:
+    ///
+    /// - **A stamp** (`created_at: +timestamp`) — the overwhelming case, 148 of
+    ///   148 in the corpus. Fill in `now()`, floored to the declared precision so
+    ///   the stored value actually honours what the schema says it records.
+    /// - **A key** (`id: +timestamp(us)`) — allocate monotonically off the #187
+    ///   counter instead of reading the clock, because the clock does not
+    ///   guarantee uniqueness at any precision.
+    ///
+    /// The `0` sentinel is shared with the integer autos and carries the same
+    /// user-visible consequence, which is sharper here: `0` is
+    /// 1970-01-01T00:00:00Z, a value someone might plausibly want to write, and
+    /// it cannot be inserted explicitly because supplying it means "generate one".
+    fn timestamp_auto_synthesis(
+        model: &forgedb_parser::Model,
+        field: &forgedb_parser::Field,
+        precision: forgedb_parser::TimestampPrecision,
+        recv: &TokenStream,
+    ) -> TokenStream {
+        let name = format_ident!("{}", field.name);
+        if Self::timestamp_key_field(model).map(|f| f.name.as_str()) == Some(field.name.as_str()) {
+            let alloc = Self::autoseq_alloc_ident(field);
+            let seq = Self::autoseq_field_ident(field);
+            return quote! {
+                if record.#name.as_micros() == 0 {
+                    record.#name = #recv.#alloc()?;
+                } else {
+                    // An explicitly supplied key advances the counter past
+                    // itself, exactly as an explicit integer auto does (#187
+                    // decision 5) — otherwise an imported dataset collides with
+                    // live rows on its very next insert.
+                    #recv.#seq.fetch_max(
+                        record.#name.as_micros().max(0) as u64,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            };
+        }
+        let quantum = proc_macro2::Literal::i64_unsuffixed(precision.quantum_micros());
+        quote! {
+            if record.#name.as_micros() == 0 {
+                record.#name = Timestamp::now().floor_to_micros(#quantum);
+            }
+        }
+    }
+
+    /// The #254 write-path timestamp gate: floor every declared-precision
+    /// timestamp to its quantum, then reject any instant RFC 3339 cannot name.
+    ///
+    /// Emitted at the top of `Storage::insert` / `Storage::update` — *not* only in
+    /// the `Database::create_<model>` wrapper — because the storage-scoped methods
+    /// are a documented public path (#91) and a value that skipped the gate would
+    /// be stored at a finer resolution than the schema promises, which is exactly
+    /// the guarantee `timestamp(s)` sells.
+    ///
+    /// **Floor rather than reject** (res 5): precision constrains *how finely* a
+    /// legal instant is recorded, not *which* instants are legal — a 422 would
+    /// export the flooring to every client for no gain, and would push authors to
+    /// declare `timestamp(us)` everywhere to avoid it.  A `+timestamp` identity is
+    /// pinned to `us` (quantum 1) and so is skipped by the same predicate that
+    /// skips every other `us` field, with no special case.
+    ///
+    /// **Reject rather than floor for the range** (res 3): the wire form is RFC
+    /// 3339, which names years `0000`–`9999`.  `Timestamp` is an `i64` of
+    /// microseconds and reaches ±292 000 years, so an instant outside the RFC's
+    /// window is storable but not serializable — a row that could be written and
+    /// then fail on every read.  That is a 422 at the boundary instead.
+    ///
+    /// The walk is recursive so it reaches a nullable field, a `[timestamp; N]`
+    /// element, and a struct-nested timestamp.  A gate that silently skipped those
+    /// would be a capability hole, not a smaller feature: the schema would still
+    /// say `timestamp(s)` and the stored value would still be micros.
+    fn generate_timestamp_write_gate(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        let mtag = model.name.as_str();
+        let mut stmts: Vec<TokenStream> = Vec::new();
+        for field in &model.fields {
+            let fident = format_ident!("{}", field.name);
+            Self::timestamp_gate_walk(
+                schema,
+                &field.field_type,
+                quote! { record.#fident },
+                mtag,
+                &field.name,
+                &mut stmts,
+                0,
+            );
+        }
+        if stmts.is_empty() {
+            return quote! {};
+        }
+        quote! {
+            // #254: floor to the declared precision, then refuse an instant RFC
+            // 3339 cannot name.  Runs BEFORE the constraint/`&unique` gate so a
+            // `@min`/`@max` directive sees the value that will actually be stored.
+            #[allow(unused_mut)]
+            let mut record = record;
+            #(#stmts)*
+        }
+    }
+
+    /// One leaf of [`Self::generate_timestamp_write_gate`].  `place` is an
+    /// assignable expression of the value at this position; `path` is its dotted
+    /// name for the diagnostic.
+    fn timestamp_gate_walk(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        place: TokenStream,
+        mtag: &str,
+        path: &str,
+        out: &mut Vec<TokenStream>,
+        depth: usize,
+    ) {
+        use forgedb_parser::FieldType;
+        // Struct references cannot legally cycle (validation rejects it), but the
+        // generator must not hang if one ever reaches it.
+        if depth > 8 {
+            return;
+        }
+        match ty {
+            FieldType::Timestamp(precision) => {
+                let path_str = path.to_string();
+                if precision.quantum_micros() > 1 {
+                    let quantum =
+                        proc_macro2::Literal::i64_unsuffixed(precision.quantum_micros());
+                    out.push(quote! { #place = #place.floor_to_micros(#quantum); });
+                }
+                let msg = format!(
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); \
+                     the value is storable but would fail to serialize on every read"
+                );
+                out.push(quote! {
+                    if !#place.is_rfc3339_representable() {
+                        // `Err(..)?` rather than `return Err(..)`: the same gate is
+                        // spliced into staging methods that return `TxError`, and
+                        // `?` applies the `From` conversion (reflexive when the
+                        // error type already IS `ValidationError`).
+                        Err(ValidationError::Constraint {
+                            model: #mtag,
+                            field: #path_str,
+                            rule: "timestamp_range",
+                            message: format!(
+                                "{} — got {} microseconds since the epoch",
+                                #msg,
+                                #place.as_micros(),
+                            ),
+                        })?;
+                    }
+                });
+            }
+            FieldType::Nullable(inner) => {
+                let mut nested = Vec::new();
+                Self::timestamp_gate_walk(
+                    schema,
+                    inner,
+                    quote! { (*__ts_opt) },
+                    mtag,
+                    path,
+                    &mut nested,
+                    depth + 1,
+                );
+                if !nested.is_empty() {
+                    out.push(quote! {
+                        if let Some(__ts_opt) = &mut #place { #(#nested)* }
+                    });
+                }
+            }
+            FieldType::FixedArray(inner, _) => {
+                let mut nested = Vec::new();
+                Self::timestamp_gate_walk(
+                    schema,
+                    inner,
+                    quote! { (*__ts_elem) },
+                    mtag,
+                    path,
+                    &mut nested,
+                    depth + 1,
+                );
+                if !nested.is_empty() {
+                    out.push(quote! {
+                        for __ts_elem in #place.iter_mut() { #(#nested)* }
+                    });
+                }
+            }
+            FieldType::StructType(name) => {
+                let Some(def) = schema.find_struct(name) else {
+                    return;
+                };
+                for f in &def.fields {
+                    let fident = format_ident!("{}", f.name);
+                    Self::timestamp_gate_walk(
+                        schema,
+                        &f.field_type,
+                        quote! { #place.#fident },
+                        mtag,
+                        &format!("{path}.{}", f.name),
+                        out,
+                        depth + 1,
+                    );
+                }
+            }
+            FieldType::OptionalStructType(name) => {
+                let Some(def) = schema.find_struct(name) else {
+                    return;
+                };
+                let mut nested = Vec::new();
+                for f in &def.fields {
+                    let fident = format_ident!("{}", f.name);
+                    Self::timestamp_gate_walk(
+                        schema,
+                        &f.field_type,
+                        quote! { __ts_struct.#fident },
+                        mtag,
+                        &format!("{path}.{}", f.name),
+                        &mut nested,
+                        depth + 1,
+                    );
+                }
+                if !nested.is_empty() {
+                    out.push(quote! {
+                        if let Some(__ts_struct) = &mut #place { #(#nested)* }
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The model's identity field (`id` or an `+auto` field), if any.  A
     /// projection always materializes it (#113, PM constraint 3).
+    ///
+    /// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
+    /// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
+    /// single-pass form returns whichever comes FIRST in declaration order, so a
+    /// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
+    /// to the stamp.  Before #254 that produced a `Timestamp` id type and the
+    /// generated crate simply did not compile — loud, if obscure.  #254 makes a
+    /// `timestamp` identity legal, so the same schema would now compile and silently
+    /// key every row on its creation stamp.
     pub(crate) fn identity_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
         model
             .fields
             .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
+            .find(|f| f.name == "id")
+            .or_else(|| model.fields.iter().find(|f| f.auto_generate))
     }
 
     /// Whether the server synthesizes this field's value on create, so it may be
@@ -7190,7 +7630,7 @@ impl RustGenerator {
             && matches!(
                 field.field_type,
                 forgedb_parser::FieldType::Uuid
-                    | forgedb_parser::FieldType::Timestamp
+                    | forgedb_parser::FieldType::Timestamp(_)
                     | forgedb_parser::FieldType::U32
                     | forgedb_parser::FieldType::U64
             )
@@ -7658,7 +8098,7 @@ impl RustGenerator {
                         | FieldType::I64
                         | FieldType::Bool
                         | FieldType::Decimal
-                        | FieldType::Timestamp
+                        | FieldType::Timestamp(_)
                         | FieldType::Enum(_)
                         | FieldType::Relation(RelationType::RequiredReference(_))
                 )
@@ -7702,8 +8142,11 @@ impl RustGenerator {
                 quote! { let __typed = value.parse::<rust_decimal::Decimal>().ok()?; },
                 quote! { __typed },
             ),
-            FieldType::Timestamp => (
-                quote! { let __typed = value.parse::<i64>().ok().map(Timestamp::from_seconds)?; },
+            // #254: the query-param form follows the wire form — an RFC 3339
+            // string, parsed by the type's own lenient `FromStr`.  A bare
+            // integer no longer names an instant anywhere a client can see.
+            FieldType::Timestamp(_) => (
+                quote! { let __typed = value.parse::<Timestamp>().ok()?; },
                 quote! { __typed },
             ),
             FieldType::Enum(name) => {
@@ -8020,7 +8463,7 @@ impl RustGenerator {
             | forgedb_parser::FieldType::F64
             | forgedb_parser::FieldType::Bool
             | forgedb_parser::FieldType::Uuid
-            | forgedb_parser::FieldType::Timestamp
+            | forgedb_parser::FieldType::Timestamp(_)
             // `decimal` is a fixed 16-byte column (rust_decimal::Decimal::serialize),
             // stored exactly like Uuid.
             | forgedb_parser::FieldType::Decimal
@@ -8441,20 +8884,6 @@ impl RustGenerator {
         }
     }
 
-    /// Check if a field type is (or wraps) a `Timestamp`.
-    ///
-    /// `forgedb_types::Timestamp` is a newtype over `i64` but does not implement
-    /// `utoipa::ToSchema`.  The generator uses this to decide whether to emit a
-    /// `#[schema(value_type = …)]` annotation and to use `i64::from` / `Timestamp::from`
-    /// in the insert / get helpers respectively.
-    fn is_timestamp_type(field_type: &forgedb_parser::FieldType) -> bool {
-        match field_type {
-            forgedb_parser::FieldType::Timestamp => true,
-            forgedb_parser::FieldType::Nullable(inner) => Self::is_timestamp_type(inner),
-            _ => false,
-        }
-    }
-
     /// Get the type name for storage paths
     fn type_name(schema: &Schema, field_type: &forgedb_parser::FieldType) -> &'static str {
         let field_type = &Self::resolved_type(schema, field_type);
@@ -8466,7 +8895,7 @@ impl RustGenerator {
             forgedb_parser::FieldType::F64 => "f64",
             forgedb_parser::FieldType::Bool => "bool",
             forgedb_parser::FieldType::Uuid => "uuid",
-            forgedb_parser::FieldType::Timestamp => "timestamp",
+            forgedb_parser::FieldType::Timestamp(_) => "timestamp",
             // decimal persists as a raw [u8; 16] (Decimal::serialize) — reuses the
             // uuid column file-path label, same 16-byte fixed column on disk.
             forgedb_parser::FieldType::Decimal => "decimal",
@@ -8661,17 +9090,19 @@ impl RustGenerator {
         // That cost is why the design does not encourage the shape.
         let autoseq_seed = {
             let identity = Self::identity_field(model).map(|f| f.name.as_str());
-            let folds: Vec<TokenStream> = Self::integer_auto_fields(model)
+            let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
                 .map(|f| {
                     let seq = Self::autoseq_field_ident(f);
                     if Some(f.name.as_str()) == identity {
                         // Rides the id scan: `id_to_row`'s keys ARE this column.
+                        let as_u64 = Self::autoseq_to_u64(f, quote! { __k });
                         quote! {
                             {
                                 let mut __max: u64 = 0;
                                 for (&__k, _) in #recv.id_to_row.iter() {
-                                    if (__k as u64) > __max { __max = __k as u64; }
+                                    let __v = #as_u64;
+                                    if __v > __max { __max = __v; }
                                 }
                                 #recv.#seq.fetch_max(__max, std::sync::atomic::Ordering::SeqCst);
                             }
@@ -8791,8 +9222,8 @@ impl RustGenerator {
 
         // Open-time format-version guard (#74 Phase 1).  For every collection that
         // has already been written (its `manifest.json` exists), load exactly the
-        // opaque `format_version` integer and refuse to open the dir when it does
-        // not match this binary's codegen-baked `EXPECTED_FORMAT_VERSION`.  This is
+        // opaque schema-serial integer (on-disk key `format_version`) and refuse the dir when it does
+        // not match this binary's codegen-baked `EXPECTED_SCHEMA_VERSION`.  This is
         // the fail-fast that turns a stale data dir (written under an older schema,
         // now opened by regenerated code) from a SILENT byte mis-decode into a
         // clear panic pointing at the migration bin.  Red line DV-6: it reads one
@@ -8815,16 +9246,34 @@ impl RustGenerator {
                     {
                         let __mf = root.join(#manifest_rel);
                         if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                            if __m.format_version != EXPECTED_FORMAT_VERSION {
+                            if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                                 panic!(
-                                    "ForgeDB: data dir at {} is on-disk format v{}, \
+                                    "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
                                     __mf.display(),
-                                    __m.format_version,
-                                    EXPECTED_FORMAT_VERSION,
+                                    __m.schema_version,
+                                    EXPECTED_SCHEMA_VERSION,
+                                );
+                            }
+                            // A DIFFERENT situation with a DIFFERENT remedy: the
+                            // schema did not change, ForgeDB did.  Sending the
+                            // user to the app's migration bin here would tell
+                            // them to regenerate a schema that is already correct.
+                            if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                                panic!(
+                                    "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                                    __mf.display(),
+                                    __m.engine_version,
+                                    EXPECTED_ENGINE_VERSION,
                                 );
                             }
                         }
@@ -9161,8 +9610,8 @@ impl RustGenerator {
                     _lock: Option<forgedb_storage::DirLock>,
                 ) -> Self {
                     // Format-version guard (#74 Phase 1): refuse a data dir whose
-                    // stamped `format_version` differs from this binary's baked
-                    // `EXPECTED_FORMAT_VERSION`, BEFORE opening any column/WAL file.
+                    // stamped schema serial differs from this binary's baked
+                    // `EXPECTED_SCHEMA_VERSION`, BEFORE opening any column/WAL file.
                     // Reads one opaque integer per existing manifest and fails fast
                     // on mismatch — never reshapes (DV-6).  Skipped for a fresh dir.
                     #(#version_guard_stmts)*
@@ -10415,6 +10864,11 @@ impl RustGenerator {
                 model,
                 &quote! { self.inner.read().unwrap().#snap_field },
             );
+            // #254: the concurrent staging path buffers row BYTES and commits via
+            // `__stage_append`, never through `Storage::insert` — so the gate has
+            // to be spliced here too, or a Tier-2 write would store an unfloored
+            // value the schema promised was quantized.
+            let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
             // Unique checks (insert) for ConcurrentTxHandle.
             // #260: sequence claims for bare integer autos (empty otherwise).
@@ -10531,6 +10985,7 @@ impl RustGenerator {
                 pub fn #create_fn(&mut self, mut record: #model_name) -> Result<#id_type, TxError> {
                     // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
                     #auto_synth
+                    #ts_gate
                     #validate_fn(&record)?;
                     #(#unique_checks_insert)*
                     // #260: claim the allocated value so a peer's identical
@@ -10550,6 +11005,7 @@ impl RustGenerator {
                     if self.#get_fn(id).is_none() {
                         return Ok(false);
                     }
+                    #ts_gate
                     #validate_fn(&record)?;
                     #(#unique_checks_update)*
                     #(#fk_checks)*
@@ -10874,6 +11330,10 @@ impl RustGenerator {
         let all_fn = format_ident!("all_{}", snake);
         let validate_fn = format_ident!("validate_{}", snake);
         let auto_synth = Self::generate_auto_synthesis(model, &quote! { self.db.#field });
+        // #254: same reasoning as the Tier-2 path — `__stage_append` bypasses
+        // `Storage::insert`, so the precision floor + RFC 3339 range gate is
+        // spliced into the staging methods directly.
+        let ts_gate = Self::generate_timestamp_write_gate(schema, model);
 
         // `&unique` checks: (1) against the committed index (same as the non-txn
         // path) and (2) against the staged-unique buffer (`staged_unique_keys`) so
@@ -11036,6 +11496,7 @@ impl RustGenerator {
                 self.#mark_fn();
                 // #187: synthesize omitted `+` auto fields (uuid/timestamp) first.
                 #auto_synth
+                #ts_gate
                 // #91 field constraints.
                 #validate_fn(&record)?;
                 // #91 `&unique` (committed index; within-txn duplicate = honest limit).
@@ -11063,6 +11524,7 @@ impl RustGenerator {
                     return Ok(false);
                 }
                 self.#mark_fn();
+                #ts_gate
                 #validate_fn(&record)?;
                 #(#unique_checks_update)*
                 #(#fk_checks)*
@@ -11355,12 +11817,11 @@ impl RustGenerator {
                         // Preserve the on-disk format version across reopen (#74
                         // Phase 1), same as the model path — a reopen must never
                         // clobber a migration-bumped version.  Fresh dir → this
-                        // binary's `EXPECTED_FORMAT_VERSION` baseline.
-                        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-                            .map(|m| m.format_version)
-                            .unwrap_or(EXPECTED_FORMAT_VERSION);
+                        // binary's `EXPECTED_SCHEMA_VERSION` baseline.
+                        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                            .map(|m| m.schema_version)
+                            .unwrap_or(EXPECTED_SCHEMA_VERSION);
                         let manifest = forgedb_storage::Manifest {
-                            schema_version: 1,
                             row_count: self.row_count,
                             columns,
                             wal_enabled: false,
@@ -11369,7 +11830,8 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                             compaction_epoch: __compaction_epoch,
-                            format_version: __format_version,
+                            schema_version: __schema_version,
+                            engine_version: EXPECTED_ENGINE_VERSION,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: #rw,
@@ -12091,7 +12553,7 @@ impl RustGenerator {
                 quote! { #ident }
             }
             forgedb_parser::FieldType::Uuid => quote! { Uuid },
-            forgedb_parser::FieldType::Timestamp => quote! { Timestamp },
+            forgedb_parser::FieldType::Timestamp(_) => quote! { Timestamp },
             forgedb_parser::FieldType::StructType(name) => {
                 let ident = format_ident!("{}", name);
                 quote! { #ident }
@@ -12570,7 +13032,7 @@ mod tests {
             FieldType::I32,
             FieldType::I64,
             FieldType::F64,
-            FieldType::Timestamp,
+            FieldType::Timestamp(forgedb_parser::TimestampPrecision::Millis),
             FieldType::Decimal,
             FieldType::String,
             FieldType::Bool,
@@ -12607,7 +13069,7 @@ mod tests {
             FieldType::I64,
             FieldType::F64,
             FieldType::Decimal,
-            FieldType::Timestamp,
+            FieldType::Timestamp(forgedb_parser::TimestampPrecision::Millis),
             FieldType::String,
             FieldType::Bool,
             FieldType::Uuid,

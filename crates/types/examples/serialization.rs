@@ -9,12 +9,12 @@ fn main() {
 
     // Serialize timestamps
     println!("--- Timestamp Serialization ---");
-    let ts = Timestamp::from_seconds(1234567890);
+    let ts = Timestamp::from_micros(1234567890);
     let json = serde_json::to_string(&ts).unwrap();
     println!("Timestamp as JSON: {}", json);
 
     let deserialized: Timestamp = serde_json::from_str(&json).unwrap();
-    println!("Deserialized: {}", deserialized.as_seconds());
+    println!("Deserialized: {}", deserialized.as_micros());
     println!("Match: {}\n", ts == deserialized);
 
     // Serialize Value enum
@@ -37,7 +37,7 @@ fn main() {
     println!("UUID Value:\n{}\n", json);
 
     // Timestamp value
-    let val = Value::Timestamp(Timestamp::from_seconds(1234567890));
+    let val = Value::Timestamp(Timestamp::from_micros(1234567890));
     let json = serde_json::to_string_pretty(&val).unwrap();
     println!("Timestamp Value:\n{}\n", json);
 

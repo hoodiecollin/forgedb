@@ -493,7 +493,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
         for field in &model.fields {
             let go_ty = Self::go_field_type(schema, field);
             let tag = if field.auto_generate
-                && matches!(field.field_type, FieldType::Uuid | FieldType::Timestamp)
+                && matches!(field.field_type, FieldType::Uuid | FieldType::Timestamp(_))
             {
                 // `+uuid` / `+timestamp` autos carry `#[serde(default)]`, so a
                 // create body may omit them (`create_*` synthesizes the value).
@@ -969,8 +969,11 @@ func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
             FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
                 ("string".to_string(), false)
             }
-            // Timestamp serializes as an i64; decimal serializes as a string.
-            FieldType::Timestamp => ("int64".to_string(), false),
+            // Timestamp and decimal both serialize as strings.  A row crosses
+            // cgo as opaque JSON bytes and is decoded by `encoding/json`, so
+            // every Go field type here has to be whatever *serde* produces —
+            // and since #254 that is an RFC 3339 string, not a number.
+            FieldType::Timestamp(_) => ("string".to_string(), false),
             FieldType::Decimal => ("string".to_string(), false),
             // An enum serializes as its variant-name string → its generated
             // `type <Name> string`; an inline struct → its generated Go struct.

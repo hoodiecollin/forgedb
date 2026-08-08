@@ -68,6 +68,7 @@
 //!
 //! let manifest = Manifest {
 //!     schema_version: 1,
+//!     engine_version: 1,
 //!     row_count: 42,
 //!     columns: vec![
 //!         ColumnMetadata { name: "id".to_string(), column_type: ColumnType::U64, column_index: 0, ..Default::default() },
@@ -76,7 +77,6 @@
 //!     wal_enabled: false,
 //!     last_checkpoint: 0,
 //!     compaction_epoch: 0,
-//!     format_version: 1,
 //!     row_anchor: None,
 //!     auto_sequences: Default::default(),
 //! };
@@ -192,16 +192,58 @@ fn device_barrier(file: &File) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Default `format_version` for manifests written before the field existed.
+/// Default schema serial for manifests written before the field existed.
 /// Old on-disk manifests deserialize as v1 (the original layout), not v0.
-fn default_format_version() -> u32 {
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Default engine generation for every manifest written before #254 added the
+/// field: generation 1, the baseline. This is what makes the counter additive
+/// rather than a second format break.
+fn default_engine_version() -> u32 {
     1
 }
 
 /// Manifest stores metadata about the database
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// The **app's** schema-migration serial: how many migrations from its own
+    /// `migrations/` lineage have been applied. Derived by
+    /// `MigrationLineage::current_schema_version`, baked into generated code as
+    /// `EXPECTED_SCHEMA_VERSION`, and compared by the generated `open()` guard,
+    /// which refuses a dir whose schema is not the one this binary was generated
+    /// from (#74 Phase 1). Lineage-sourced, never hand-edited.
+    ///
+    /// **The on-disk key stays `format_version` (#254).** Only the Rust name
+    /// changed, because the old one described the engine rather than the app.
+    /// A *different* vestigial `schema_version` key — hardcoded to `1` at every
+    /// write site, never incremented, never compared — used to occupy this name
+    /// on disk; it is deleted, and serde's unknown-key tolerance is what lets a
+    /// manifest still carrying it deserialize. Reading the wrong one of those two
+    /// is not a subtle bug: it would compare the open-guard against a constant.
+    #[serde(rename = "format_version", default = "default_schema_version")]
     pub schema_version: u32,
+    /// ForgeDB's own **engine byte-format generation** (#254) — owned by the
+    /// released version line, not by the app. It covers both value
+    /// reinterpretation and physical layout, which is why it is not
+    /// `layout_version`.
+    ///
+    /// Orthogonal to `schema_version` above: a schema mismatch means *the app's
+    /// schema changed* and is fixed by the app's migration bin; an engine
+    /// mismatch means *ForgeDB changed* and is fixed by `forgedb migrate engine`.
+    /// Conflating them would send a user to regenerate a schema that is correct.
+    ///
+    /// Generations are assigned at merge order, not at design time — two format
+    /// changes in one cycle would otherwise both claim the same number and
+    /// whichever landed second would silently redefine the other's meaning.
+    ///
+    /// | gen | change |
+    /// |---|---|
+    /// | 1 | baseline — everything written before this field existed |
+    /// | 2 | timestamp values are microseconds, not seconds (#254) |
+    #[serde(default = "default_engine_version")]
+    pub engine_version: u32,
     pub row_count: usize,
     pub columns: Vec<ColumnMetadata>,
     #[serde(default)]
@@ -216,8 +258,6 @@ pub struct Manifest {
     pub compaction_epoch: u64,
     /// On-disk layout format version, so a schema-blind reader (backup #57,
     /// inspector #63) can refuse mismatched bytes instead of misreading them.
-    #[serde(default = "default_format_version")]
-    pub format_version: u32,
     /// Which file's length authoritatively counts committed rows, and how many
     /// bytes it spends per row. For a model this is `tombstones.bin` (1 byte/row,
     /// appended last per insert); for an M2M junction it is `fixed/right.bin`

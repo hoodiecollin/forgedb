@@ -99,7 +99,7 @@ to the layout or the write path. Each model and each many-to-many junction is a 
 <data-root>/
   <model>/
     manifest.json            # physical layout: columns, value sizes, kinds, row anchor,
-                             # format_version, compaction_epoch
+                             # format_version, engine_version, compaction_epoch
     tombstones.bin           # 1 byte per row (liveness / delete marker)
     fixed/
       uuid_0.bin             # fixed-width columns (uuid=16B, u64/i64/f64=8B, bool=1B, …)
@@ -127,6 +127,30 @@ Key properties that the rest of the system is built on:
 - **Durability.** Generated writes journal an opaque row blob to a per-model WAL (`forgedb-wal`
   `Raw` op) + fsync *before* touching columns; recovery truncates a torn column tail and replays
   the WAL tail by absolute row index. A `DirLock` refuses a second writer.
+
+- **Two orthogonal version counters, and they are not the same axis** (#254). A manifest carries
+  both, and confusing them silently skips migrations:
+
+  | Manifest field | Owned by | Counts | Migrated by |
+  |---|---|---|---|
+  | `schema_version` (on-disk key `format_version`) | the **app's** `migrations/` lineage | applied schema migrations | `forgedb migrate up` |
+  | `engine_version` | **ForgeDB's** release line | the engine's byte-format generation | `forgedb migrate engine` |
+
+  A manifest with no `engine_version` baselines to generation 1, so the counter is additive rather
+  than a second format break. Generation 2 is #254: timestamp columns hold **microseconds**, where
+  generation 1 held seconds.
+
+  **The engine hop is a generated bin, not a schema-blind column pass.** Only a *bare*
+  `timestamp` field becomes `ColumnType::Timestamp`; every shape that merely *contains* one —
+  `timestamp?`, `[timestamp; N]`, a struct field — is written as an opaque `FixedBytes` transmute
+  of the Rust value, which `repr(Rust)` gives no decodable layout for. 81 of the 247 timestamp
+  fields in the example corpus are nullable, so a schema-blind pass would leave a third of them in
+  the old unit while the regenerated code read the new one. Which leaves are timestamps, and where
+  they sit inside an `Option` / array / struct, is *schema* knowledge — so it belongs in generated
+  code. `forgedb migrate engine` emits a crate embedding **two** generated modules of the same
+  schema, differing only in the baked `EXPECTED_ENGINE_VERSION`; the reader half opens the stale
+  dir legally, the writer half stamps the new generation, and the existing open-guard interlock
+  does the enforcement for free.
 
 The on-disk layout is part of the substrate ABI: a change a prior binary cannot read bumps the
 owning crate's major and requires a migration path (see [SEMVER.md §2](./SEMVER.md) and the

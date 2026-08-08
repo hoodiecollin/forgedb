@@ -275,6 +275,65 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
             );
         }
 
+        // A `+timestamp` is identity-eligible ONLY when the field is named `id`
+        // (#254 res 6).  Forced by the corpus, not by taste: 148 of 148
+        // `+timestamp` fields in `examples/` are `created_at`-style stamps and not
+        // one is a key.  `+` on a timestamp overwhelmingly means "stamp it now",
+        // so without this rule a model with no `id` field containing
+        // `metrics_at: +timestamp(us)` would silently acquire a timestamp primary
+        // key — the same silent mis-key class #251 exists to close.
+        //
+        // The asymmetry against #187's integer autos is deliberate: the only
+        // reason to write `+u32`/`+u64` is to get an allocated sequence, so an
+        // auto-integer is unambiguously key-ish.  Do not "clean this up".
+        if let Some(identity) = identity_field(model) {
+            if let FieldType::Timestamp(precision) = &identity.field_type {
+                if identity.auto_generate && identity.name != "id" {
+                    errors.push(
+                        positioned(
+                            format!(
+                                "Model '{}' resolves its identity to '{}', an auto-generate \
+                                 timestamp. A '+timestamp' is a stamp, not a key, unless the \
+                                 field is named 'id' — name it 'id' if it really is the key, \
+                                 or add an identity field so this one stays a stamp.",
+                                model.name, identity.name
+                            ),
+                            identity.position,
+                        )
+                        .with_suggestion("id: +uuid"),
+                    );
+                } else if identity.auto_generate
+                    && *precision != crate::ast::TimestampPrecision::Micros
+                {
+                    // The `us` floor (#254 res 2).  An allocated key must be
+                    // unique, and uniqueness comes from the monotonic allocator
+                    // `next = max(now, last + 1)`, never from the clock.  At a
+                    // coarser quantum the allocator still guarantees uniqueness but
+                    // does it by running the counter ahead of the wall clock — a
+                    // second insert inside one second lands a full second in the
+                    // future, and the recovery time after a burst is proportional
+                    // to the declared unit.  At `us` (which is also the storage
+                    // unit) that drift is bounded by the burst rate itself.
+                    errors.push(
+                        positioned(
+                            format!(
+                                "Model '{}' declares 'id: +timestamp({})'. An auto-generate \
+                                 timestamp identity must be declared 'us': the key is allocated \
+                                 monotonically rather than read from the clock, and at a coarser \
+                                 quantum a burst pushes allocated keys into the future one \
+                                 {} at a time.",
+                                model.name,
+                                precision.key(),
+                                precision.unit_noun(),
+                            ),
+                            identity.position,
+                        )
+                        .with_suggestion("id: +timestamp(us)"),
+                    );
+                }
+            }
+        }
+
         // `&`/`^` on the IDENTITY field is redundant (#258). The identity's
         // uniqueness is already enforced structurally by the generated
         // `id_to_row`, which is a map keyed by id — so codegen deliberately
@@ -285,7 +344,7 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // Silence would be defensible for a *redundant* modifier; it was NOT
         // defensible for the non-identity case, where the same silence meant no
         // uniqueness enforcement at all (the bug #258 fixes).
-        if let Some(identity) = model.fields.iter().find(|f| f.name == "id" || f.auto_generate) {
+        if let Some(identity) = identity_field(model) {
             if identity.unique || identity.indexed {
                 let modifier = if identity.unique { "&" } else { "^" };
                 errors.push(
@@ -821,11 +880,21 @@ fn render_bound(p: &crate::ast::ConstraintParam) -> String {
 /// Build a `ValidationError` with an optional position attached.
 /// The identity field of a model — named `id`, or any `+` auto-generate field
 /// (#248 makes one of the two mandatory).
+///
+/// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
+/// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
+/// single-pass form returns whichever comes FIRST in declaration order, so a
+/// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
+/// to the stamp.  Before #254 that produced a `Timestamp` id type and the
+/// generated crate simply did not compile — loud, if obscure.  #254 makes a
+/// `timestamp` identity legal, so the same schema would now compile and silently
+/// key every row on its creation stamp.
 fn identity_field(model: &crate::ast::Model) -> Option<&crate::ast::Field> {
     model
         .fields
         .iter()
-        .find(|f| f.name == "id" || f.auto_generate)
+        .find(|f| f.name == "id")
+        .or_else(|| model.fields.iter().find(|f| f.auto_generate))
 }
 
 /// The FK target named by a `*Model` / `?Model` field, if it is one.
@@ -1144,6 +1213,108 @@ mod tests {
             .collect();
         assert_eq!(identity.len(), 1, "only the bad one: {identity:?}");
         assert!(identity[0].message.contains("'Bad'"));
+    }
+
+    // ---- #254: a `+timestamp` identity ---------------------------------------
+
+    /// Scenario 12 — an auto-generate timestamp identity below the `us` floor is
+    /// rejected, and the diagnostic names the floor rather than talking about
+    /// seconds (the pre-#254 limitation it replaces).
+    #[test]
+    fn an_auto_timestamp_identity_below_the_us_floor_is_rejected() {
+        for (src, key) in [
+            ("Event {\n  id: +timestamp\n  name: string\n}\n", "ms"),
+            ("Event {\n  id: +timestamp(ms)\n  name: string\n}\n", "ms"),
+            ("Event {\n  id: +timestamp(s)\n  name: string\n}\n", "s"),
+        ] {
+            let errors = validate_schema(&ast(src));
+            let floor: Vec<_> = errors
+                .iter()
+                .filter(|e| e.message.contains("must be declared 'us'"))
+                .collect();
+            assert_eq!(floor.len(), 1, "exactly one for {src:?}: {errors:?}");
+            assert!(!floor[0].is_warning(), "the floor is fatal — {src:?}");
+            assert!(
+                floor[0].message.contains(&format!("+timestamp({key})")),
+                "the diagnostic names what was written: {:?}",
+                floor[0].message
+            );
+            assert_eq!(floor[0].suggestion.as_deref(), Some("id: +timestamp(us)"));
+        }
+    }
+
+    /// Scenario 13 — `id: +timestamp(us)` is the one accepted form. This is the
+    /// whole point of the issue: `+timestamp` stops being rejected outright.
+    #[test]
+    fn an_auto_timestamp_identity_at_us_is_accepted() {
+        let errors = validate_schema(&ast("Event {\n  id: +timestamp(us)\n  name: string\n}\n"));
+        assert!(
+            !errors.iter().any(|e| !e.is_warning()),
+            "no fatal error: {errors:?}"
+        );
+    }
+
+    /// Scenario 14 — res 6. A `+timestamp` under any other name is a stamp, so a
+    /// model whose only auto field is one does NOT silently acquire a timestamp
+    /// primary key.
+    #[test]
+    fn an_auto_timestamp_is_only_identity_eligible_when_named_id() {
+        let errors = validate_schema(&ast(
+            "Reading {\n  metrics_at: +timestamp(us)\n  value: f64\n}\n",
+        ));
+        let misuse: Vec<_> = errors
+            .iter()
+            .filter(|e| e.message.contains("is a stamp, not a key"))
+            .collect();
+        assert_eq!(misuse.len(), 1, "exactly one: {errors:?}");
+        assert!(!misuse[0].is_warning());
+        assert!(misuse[0].message.contains("'metrics_at'"));
+        assert_eq!(misuse[0].suggestion.as_deref(), Some("id: +uuid"));
+    }
+
+    /// The corpus shape — 148 of 148 `+timestamp` fields are stamps beside a real
+    /// identity — must stay clean, INCLUDING when the stamp is declared first.
+    /// That ordering is the precedence hazard #254 closes: the single-pass
+    /// `find(name == "id" || auto_generate)` would resolve identity to
+    /// `created_at` and, now that a timestamp identity compiles, silently key
+    /// every row on its creation stamp.
+    #[test]
+    fn a_stamp_beside_a_real_identity_is_never_the_identity() {
+        for src in [
+            "Post {\n  id: +uuid\n  created_at: +timestamp\n  title: string\n}\n",
+            "Post {\n  created_at: +timestamp\n  id: +uuid\n  title: string\n}\n",
+        ] {
+            let errors = validate_schema(&ast(src));
+            assert!(
+                !errors.iter().any(|e| !e.is_warning()),
+                "{src:?} is a normal schema: {errors:?}"
+            );
+        }
+        let stamp_first = ast("Post {\n  created_at: +timestamp\n  id: +uuid\n}\n");
+        assert_eq!(
+            identity_field(&stamp_first.models[0]).map(|f| f.name.as_str()),
+            Some("id"),
+            "`id` wins by name, regardless of declaration order"
+        );
+    }
+
+    /// A NON-auto timestamp identity is #251's business, not this issue's — it
+    /// must not be swept up by either #254 rule.
+    #[test]
+    fn a_non_auto_timestamp_identity_is_untouched_here() {
+        for src in [
+            "Event {\n  id: timestamp\n  name: string\n}\n",
+            "Event {\n  id: timestamp(s)\n  name: string\n}\n",
+        ] {
+            let errors = validate_schema(&ast(src));
+            assert!(
+                !errors
+                    .iter()
+                    .any(|e| e.message.contains("must be declared 'us'")
+                        || e.message.contains("is a stamp, not a key")),
+                "{src:?} carries no #254 diagnostic: {errors:?}"
+            );
+        }
     }
 
     /// `&`/`^` on the identity field is redundant, so it warns rather than being

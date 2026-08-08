@@ -86,6 +86,79 @@ pub struct Projection {
     pub fields: Vec<String>,
 }
 
+/// The declared precision of a `timestamp` field (#254).
+///
+/// It is NOT the storage unit — every timestamp persists as `i64` microseconds,
+/// because a per-field unit would make a `Timestamp` value unit-ambiguous at
+/// runtime and cost either a fatter value (a layout change) or a
+/// `Timestamp<const U>` (generated signature churn everywhere).
+///
+/// What it governs is the **quantum**: a user-supplied value is floored to it on
+/// write, and an allocated `+timestamp` identity advances by one unit of it. So
+/// it buys semantic *fidelity*, not correctness — under a burst of N rows in one
+/// tick the allocator runs N units ahead of the wall clock, and recovery time is
+/// proportional to the unit. That is the whole argument for the `us` floor on an
+/// allocated identity: the same million-row import that lands rows ~17 minutes
+/// in the future at `ms` lands them 1 second ahead at `us`.
+///
+/// `ns` is not offerable: the keys are bounded by the microsecond storage unit,
+/// and `i64` nanoseconds would cap the type at 1678–2262.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampPrecision {
+    /// `timestamp(s)` — whole seconds.
+    Seconds,
+    /// `timestamp(ms)` — milliseconds. **The default**, so a bare `timestamp`
+    /// is `timestamp(ms)`: making it a property of the type rather than a rule
+    /// the parser has to remember means no site can disagree about it.
+    #[default]
+    Millis,
+    /// `timestamp(us)` — microseconds, the storage unit itself. The only
+    /// precision an allocated `+timestamp` identity may declare.
+    Micros,
+}
+
+impl TimestampPrecision {
+    /// The spelling that parses back to this precision.
+    pub fn key(&self) -> &'static str {
+        match self {
+            TimestampPrecision::Seconds => "s",
+            TimestampPrecision::Millis => "ms",
+            TimestampPrecision::Micros => "us",
+        }
+    }
+
+    /// This precision's quantum, in microseconds — what a written value is
+    /// floored to, and what an allocated identity advances by.
+    pub fn quantum_micros(&self) -> i64 {
+        match self {
+            TimestampPrecision::Seconds => 1_000_000,
+            TimestampPrecision::Millis => 1_000,
+            TimestampPrecision::Micros => 1,
+        }
+    }
+
+    /// The singular English noun for this quantum, for diagnostics that have to
+    /// read as a sentence (`"one millisecond at a time"`) rather than as a key.
+    pub fn unit_noun(&self) -> &'static str {
+        match self {
+            TimestampPrecision::Seconds => "second",
+            TimestampPrecision::Millis => "millisecond",
+            TimestampPrecision::Micros => "microsecond",
+        }
+    }
+
+    /// Parse a declared precision key. `None` for anything else, including `ns`
+    /// (bounded out by the microsecond storage unit).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "s" => Some(TimestampPrecision::Seconds),
+            "ms" => Some(TimestampPrecision::Millis),
+            "us" => Some(TimestampPrecision::Micros),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     U32,
@@ -96,7 +169,21 @@ pub enum FieldType {
     Bool,
     String,
     Uuid,
-    Timestamp,
+    /// An instant, `timestamp` or `timestamp(s|ms|us)` (#254).
+    ///
+    /// The declared precision is carried **in the variant** rather than hung off
+    /// [`Field`], for two reasons that are not stylistic: an array's inner type
+    /// is a `FieldType` (so `[timestamp(us); 4]` is otherwise inexpressible), and
+    /// [`FieldType::Nullable`] wraps a `FieldType` (so `timestamp(us)?` would
+    /// otherwise lose its precision). Carrying it here also makes the sweep a
+    /// compiler-enforced audit: every site that matched a bare `Timestamp` has to
+    /// say what it does about precision, and the failure mode this issue guards
+    /// against is silent.
+    ///
+    /// Storage is always microseconds regardless of the declared key; the
+    /// precision is the **allocation quantum** and the guarantee about what is
+    /// stored, not a second on-disk unit. See [`TimestampPrecision`].
+    Timestamp(TimestampPrecision),
     /// JSON value stored as its serialized bytes in a variable-length column,
     /// typed `serde_json::Value` in generated Rust (#json). Rides the same
     /// variable-column storage path as `String`.
@@ -460,7 +547,7 @@ impl FieldType {
             FieldType::Decimal => "rust_decimal::Decimal".to_string(),
             FieldType::Enum(name) => name.clone(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
-            FieldType::Timestamp => "i64".to_string(),
+            FieldType::Timestamp(_) => "i64".to_string(),
             FieldType::Bytes(size) => format!("[u8; {}]", size),
             FieldType::FixedArray(inner_type, count) => {
                 format!("[{}; {}]", inner_type.to_rust_type(), count)
@@ -491,7 +578,7 @@ impl FieldType {
     pub fn is_auto_generatable(&self) -> bool {
         matches!(
             self,
-            FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp
+            FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp(_)
         )
     }
 
@@ -521,7 +608,7 @@ impl FieldType {
                 | FieldType::U64
                 | FieldType::I32
                 | FieldType::I64
-                | FieldType::Timestamp
+                | FieldType::Timestamp(_)
         )
     }
 
@@ -535,7 +622,7 @@ impl FieldType {
             | FieldType::F64
             | FieldType::Bool
             | FieldType::Uuid
-            | FieldType::Timestamp
+            | FieldType::Timestamp(_)
             | FieldType::Decimal // exact decimal is a fixed 16-byte column, like Uuid
             | FieldType::Enum(_) // enum is a fixed 1-byte discriminant column
             | FieldType::Bytes(_) => true,
@@ -580,7 +667,7 @@ impl FieldType {
     pub fn size_in_bytes(&self, schema: &Schema) -> usize {
         match self {
             FieldType::U32 | FieldType::I32 => 4,
-            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp(_) => 8,
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16,
@@ -612,7 +699,7 @@ impl FieldType {
     pub fn alignment(&self, schema: &Schema) -> usize {
         match self {
             FieldType::U32 | FieldType::I32 => 4,
-            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp(_) => 8,
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16, // UUID is typically 16-byte aligned
@@ -663,7 +750,7 @@ impl FieldType {
                 | FieldType::I32
                 | FieldType::I64
                 | FieldType::F64
-                | FieldType::Timestamp
+                | FieldType::Timestamp(_)
                 | FieldType::Decimal
         )
     }

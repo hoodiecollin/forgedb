@@ -258,7 +258,9 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 
 Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case. Every model
 must also have an **identity field** — named `id`, or any `+` auto-generate field — which is
-likewise fatal (#248); convention is `id: +uuid`.
+likewise fatal (#248); convention is `id: +uuid`. `id` wins by **name** over a `+` field declared
+above it (#254 — the single-pass `find` this used to be silently mis-keyed a model whose stamp
+came first).
 Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — all four
 are synthesized on create; integer `+u32`/`+u64` allocate from a per-field counter seeded by an
 ungated reopen scan and floored by `Manifest.auto_sequences`, #187. Every shape is valid — a
@@ -266,7 +268,19 @@ cross-process double-allocation is a detected conflict via one of three opaque w
 classes: `b"r"` (identity), `b"u"` (`&unique`), `b"s"` (a bare integer auto, #260). `0` is the
 allocate sentinel, so it cannot be inserted explicitly), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
-FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `bytes(N)` (raw fixed-size bytes,
+FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid`, `timestamp` / `timestamp(s|ms|us)`
+(#254 — an instant; storage is ALWAYS `i64` **microseconds**, the declared key is the *quantum*
+a written value is floored to and an allocated identity advances by; bare = `ms`; no `ns`. Wire
+form is the **RFC 3339 string** on every serde surface — JSON, TS SDK, OpenAPI `date-time`, the
+three REST SDKs, REST filter params — but NOT the index key, which stays the stored number so the
+order stays numeric. An instant outside RFC 3339's `0000`–`9999` is a 422. `id: +timestamp(us)` is
+a legal identity: it must be named `id` (148/148 corpus `+timestamp` fields are stamps) and must be
+`us` (uniqueness comes from the monotonic allocator `next = max(now, last+1)`, never from the
+clock, and a coarser quantum runs the counter further ahead of the wall clock). The engine's own
+byte-format generation is `Manifest.engine_version`, orthogonal to the app's `schema_version`
+(on-disk key `format_version`); `forgedb migrate engine` carries a dir across it with a
+**generated** hop crate — a schema-blind column pass cannot see the 81/247 corpus timestamp fields
+that are nullable), `bytes(N)` (raw fixed-size bytes,
 NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
 keyword, so it is still usable as a field name) — **there is no
 `text`**. `string(N)` / `string(N!)` (#238) are the same `String` on every wire as bare `string`, but occupy a

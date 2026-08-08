@@ -200,7 +200,7 @@
 //! The migration system includes safety features:
 //!
 //! - **Version interlock** - A regenerated app refuses a data dir at the wrong
-//!   `format_version` rather than mis-decoding it (fail-fast, never self-heals)
+//!   schema serial rather than mis-decoding it (fail-fast, never self-heals)
 //! - **Rollback by retention** - The transformer writes a fresh destination dir
 //!   and leaves the source untouched, so the original is the rollback
 //! - **Tracking** - Applied migrations are tracked to prevent duplicate application
@@ -227,9 +227,9 @@ mod types;
 pub use diff::{SchemaDiffer, SimpleSchema, SimpleModel, SimpleField, SimpleConstraint};
 pub use generator::MigrationGenerator;
 pub use lineage::{
-    authored_body_path, current_format_version, load_versioned_schema, migration_body_dir,
+    authored_body_path, current_schema_version, load_versioned_schema, migration_body_dir,
     save_versioned_schema, scaffold_authored_body, versioned_schema_dir, versioned_schema_path,
-    MigrationLineage, BASELINE_FORMAT_VERSION,
+    MigrationLineage, BASELINE_SCHEMA_VERSION,
 };
 pub use tracker::MigrationTracker;
 pub use types::*;

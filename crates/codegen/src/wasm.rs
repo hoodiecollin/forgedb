@@ -698,8 +698,8 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"
@@ -834,8 +834,21 @@ self.onmessage = async (e) => {
 "#;
 
 /// A model's identity field (`id`, or the first auto-generate field), if any.
+///
+/// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
+/// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
+/// single-pass form returns whichever comes FIRST in declaration order, so a
+/// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
+/// to the stamp.  Before #254 that produced a `Timestamp` id type and the
+/// generated crate simply did not compile — loud, if obscure.  #254 makes a
+/// `timestamp` identity legal, so the same schema would now compile and silently
+/// key every row on its creation stamp.
 fn identity_field(model: &Model) -> Option<&forgedb_parser::Field> {
-    model.fields.iter().find(|f| f.name == "id" || f.auto_generate)
+    model
+        .fields
+        .iter()
+        .find(|f| f.name == "id")
+        .or_else(|| model.fields.iter().find(|f| f.auto_generate))
 }
 
 /// An expression yielding `Option<PkType>` from a `String` binding named `id`,

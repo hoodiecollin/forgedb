@@ -8,8 +8,9 @@ use forgedb_codegen::{
     RustSdkGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
     WasmGenerator,
 };
+use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
-use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
+use forgedb_parser::{Field, FieldType, Model, RelationType, Schema, TimestampPrecision};
 
 /// Helper to create a simple test schema with one model
 fn simple_user_schema() -> Schema {
@@ -167,7 +168,7 @@ fn test_rust_generation_auto_generate_synthesis() {
             name: "Event".to_string(),
             fields: vec![
                 auto_field("id", FieldType::Uuid),
-                auto_field("created_at", FieldType::Timestamp),
+                auto_field("created_at", FieldType::Timestamp(TimestampPrecision::Millis)),
             ],
             composite_indexes: vec![],
             projections: Vec::new(),
@@ -708,7 +709,7 @@ fn test_different_field_types() {
                 },
                 Field { position: None,
                     name: "created_at".to_string(),
-                    field_type: FieldType::Timestamp,
+                    field_type: FieldType::Timestamp(TimestampPrecision::Millis),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -2215,8 +2216,8 @@ Tag {
 #[test]
 fn test_rust_generation_version_guard() {
     // Format-version guard (#74 Phase 1): the generated app, on open, compares the
-    // manifest's stamped `format_version` against a codegen-baked
-    // `EXPECTED_FORMAT_VERSION` and FAIL-FAST refuses a stale data dir — it never
+    // manifest's stamped schema serial against a codegen-baked
+    // `EXPECTED_SCHEMA_VERSION` and FAIL-FAST refuses a stale data dir — it never
     // reshapes/self-heals (red line DV-6).  This turns a silent byte mis-decode of
     // a dir written under an old schema into a clear refusal pointing at the
     // migration bin.
@@ -2239,15 +2240,15 @@ Tag {
 
     // An opaque, codegen-baked expected version constant is emitted.
     assert!(
-        code.contains("const EXPECTED_FORMAT_VERSION: u32 = 1"),
+        code.contains("const EXPECTED_SCHEMA_VERSION: u32 = 1"),
         "generated app bakes in the version it expects"
     );
 
     // The guard reads exactly the one opaque integer and compares it — it must NOT
     // inspect column names/types to decide anything (DV-6: refuse, don't adapt).
     assert!(
-        code.contains("__m.format_version != EXPECTED_FORMAT_VERSION"),
-        "open compares the manifest format_version against the expected version"
+        code.contains("__m.schema_version != EXPECTED_SCHEMA_VERSION"),
+        "open compares the manifest schema serial against the expected version"
     );
     assert!(
         code.contains("but this binary expects v"),
@@ -2264,7 +2265,7 @@ Tag {
     );
 
     // Identity: the guard branch must not read column shape to self-heal — the ONLY
-    // manifest field it touches in the guard is `format_version`.  (It must never
+    // manifest field it touches in the guard is the schema serial.  (It must never
     // resolve a decoder from column names/types the way a schema engine would.)
     assert!(
         !code.contains("__m.columns") && !code.contains("m.column_type"),
@@ -2272,26 +2273,26 @@ Tag {
     );
 
     // #74 Phase 2: the baked version is LINEAGE-SOURCED, not hardcoded — the CLI
-    // threads `MigrationLineage::current_format_version` via
-    // `generate_with_format_version`.  A schema with no lineage baselines to 1
+    // threads `MigrationLineage::current_schema_version` via
+    // `generate_with_schema_version`.  A schema with no lineage baselines to 1
     // (the default `generate`); a lineage at version N bakes N.
-    let code_v7 = RustGenerator::generate_with_format_version(&schema, 7)
+    let code_v7 = RustGenerator::generate_with_schema_version(&schema, 7)
         .unwrap()
         .code;
     assert!(
-        code_v7.contains("const EXPECTED_FORMAT_VERSION: u32 = 7"),
+        code_v7.contains("const EXPECTED_SCHEMA_VERSION: u32 = 7"),
         "the expected version is threaded from the migration lineage, not hardcoded"
     );
 }
 
 #[test]
-fn test_rust_generation_manifest_preserves_format_version() {
+fn test_rust_generation_manifest_preserves_schema_version() {
     // Version writer preservation (#74 Phase 1 prerequisite): `write_manifest`
     // runs on EVERY open, so it must load any existing manifest and carry its
-    // `format_version` forward (exactly as it already does for `compaction_epoch`)
+    // the schema serial forward (exactly as it already does for `compaction_epoch`)
     // — otherwise a reopen would clobber a migration's version bump back to the
     // baseline and silently defeat the open-time guard.  A fresh dir (no manifest)
-    // is stamped with `EXPECTED_FORMAT_VERSION`.
+    // is stamped with `EXPECTED_SCHEMA_VERSION`.
     let src = r#"
 User {
   id: +uuid
@@ -2305,19 +2306,19 @@ User {
     // The manifest is written with a preserved-or-baseline version, NOT a hardcoded
     // constant that would clobber a bumped version on reopen.
     assert!(
-        code.contains("let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
-            && code.contains(".map(|m| m.format_version)")
-            && code.contains(".unwrap_or(EXPECTED_FORMAT_VERSION)"),
-        "write_manifest preserves an existing format_version, baselining a fresh dir"
+        code.contains("let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
+            && code.contains(".map(|m| m.schema_version)")
+            && code.contains(".unwrap_or(EXPECTED_SCHEMA_VERSION)"),
+        "write_manifest preserves an existing schema_version, baselining a fresh dir"
     );
     assert!(
-        code.contains("format_version: __format_version"),
+        code.contains("schema_version: __schema_version"),
         "the manifest is stamped with the preserved-or-baseline version"
     );
     // The old clobbering hardcode is gone.
     assert!(
-        !code.contains("format_version: 1,"),
-        "no hardcoded format_version left to clobber a bumped version on reopen"
+        !code.contains("schema_version: 1,"),
+        "no hardcoded schema version left to clobber a bumped version on reopen"
     );
 }
 
@@ -5464,8 +5465,10 @@ Widget {
         "i32 filter parses the param to i32"
     );
     assert!(
-        code.contains("forgedb_types::Timestamp::from_seconds"),
-        "timestamp filter parses seconds into Timestamp"
+        code.contains("want.parse::<forgedb_types::Timestamp>()"),
+        "#254: a timestamp filter parses the RFC 3339 wire form, the same form the \
+         body uses — parsing a bare integer here would have silently meant SECONDS \
+         against microsecond storage, matching nothing instead of failing"
     );
     // (The generic path may wrap across lines in the formatted output, so match
     // the pieces rather than one contiguous span.)
@@ -7421,8 +7424,10 @@ Owner {
         "integer keys write digits straight in"
     );
     assert!(
-        flat.contains(r#"write!(__k,"{}",__v.as_seconds())"#),
-        "timestamp is #[serde(transparent)] over i64 — its key is the bare number"
+        flat.contains(r#"write!(__k,"{}",__v.as_micros())"#),
+        "#254: the INDEX key stays the bare stored number and stays in the numeric \
+         class — the RFC 3339 change is the wire form only, and keying on the \
+         string would silently reorder every timestamp index lexicographically"
     );
     assert!(
         flat.contains(r#"__k.push_str(if*__v{"true"}else{"false"});"#),
@@ -9128,5 +9133,294 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
     assert!(
         flat.contains("<u64>::from_le_bytes((&ev.bytes[16..24])"),
         "...and the follower decodes that slot back at the right offset"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #254 — a timestamp identity is a real key: FKs follow it, junctions hold it
+// ---------------------------------------------------------------------------
+
+/// **#254 x #266.** An FK whose target is keyed on `+timestamp(us)` resolves to
+/// `Timestamp` — the type/width/label/ColumnType chain #266 built has to carry a
+/// key type that no identity could have before this issue.
+///
+/// The failure this pins is not a compile error: `map_field_type_ident` would
+/// fall back to `Uuid`, and the FK column would be 16 bytes that nothing can
+/// ever populate with a matching value.
+#[test]
+fn test_rust_generation_fk_follows_a_timestamp_key() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  label: string
+  samples: [Sample]
+}
+
+Sample {
+  id: +u64
+  tick: *Tick @on_delete(cascade)
+  reading: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub tick: Timestamp"),
+        "the FK scalar follows the target's timestamp identity, not `Uuid`"
+    );
+    assert!(
+        code.contains("sample/fixed/timestamp_1.bin"),
+        "the FK column file is labelled by the resolved type"
+    );
+    assert!(
+        !code.contains("sample/fixed/uuid_1.bin"),
+        "the FK no longer occupies a `uuid`-labelled column"
+    );
+    assert!(
+        code.contains("forgedb_storage::ColumnType::Timestamp"),
+        "the manifest entry is the target key's ColumnType"
+    );
+    assert!(
+        code.contains("append_timestamp(i64::from(record.tick))"),
+        "the FK write path uses the timestamp accessor"
+    );
+    // The relation surface #266 unblocked is present for this key too — absence
+    // was the bug class, so presence is what a regression would remove.
+    assert!(
+        code.contains("pub fn sample_tick(&self, record: &Sample) -> Option<Tick>"),
+        "forward traversal over a timestamp FK"
+    );
+    assert!(
+        code.contains("pub fn tick_samples(&self, id: Timestamp) -> Vec<Sample>"),
+        "reverse getter keyed on the timestamp identity"
+    );
+    assert!(
+        code.contains("pub fn find_by_tick(&self, value: Timestamp)"),
+        "the FK lookup index is keyed on the resolved type"
+    );
+    assert!(
+        code.contains("pub fn delete_tick(&mut self, id: Timestamp)"),
+        "@on_delete(cascade) is wired over a timestamp-keyed parent"
+    );
+}
+
+/// **#254 x #266.** A many-to-many junction stores each endpoint's id in a
+/// fixed-width, hashable column — `FieldType::is_junction_key` already admits
+/// `FieldType::Timestamp(_)`, and the `(_)` absorbs the precision parameter this
+/// issue added, so #254 widens nothing here. This proves it by generation rather
+/// than by reading the predicate: the junction exists, and it is keyed on
+/// `Timestamp` on the timestamp side.
+#[test]
+fn test_rust_generation_timestamp_key_is_a_junction_endpoint() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  ticks: [Tick]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    // The parser's own junction floor must not reject it either — if the
+    // validator and `junction_key_type` ever disagree, the relation silently
+    // vanishes again, which is exactly the failure #266 exists to remove.
+    assert!(
+        forgedb_parser::validate_schema(&schema).is_empty(),
+        "a timestamp-keyed model is a legal junction endpoint"
+    );
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub struct TagTickLink"), "the junction is generated");
+    assert!(
+        code.contains("pub fn link_tag_tick(&mut self, left: Uuid, right: Timestamp)"),
+        "the junction links a uuid endpoint to a timestamp endpoint"
+    );
+    assert!(
+        code.contains("left_index: std::collections::HashMap<Uuid, Vec<Timestamp>>")
+            && code.contains("right_index: std::collections::HashMap<Timestamp, Vec<Uuid>>"),
+        "the traversal indexes are keyed on each endpoint's own key type"
+    );
+    assert!(
+        code.contains(".append_timestamp(i64::from(right))"),
+        "the junction's timestamp column uses the timestamp accessor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #254 — the engine-format migration hop, and the two-arm open guard
+// ---------------------------------------------------------------------------
+
+/// A schema whose timestamps sit in every position a schema-blind column pass
+/// cannot see: bare, nullable, inside a fixed array, and inside a struct.
+fn engine_hop_schema() -> Schema {
+    let src = r#"
+struct Window {
+  opened_at: timestamp(s)
+  closed_at: timestamp(us)
+}
+
+Reading {
+  id: +uuid
+  taken_at: timestamp(ms)
+  maybe_at: ?timestamp(s)
+  marks: [timestamp(s); 3]
+  window: Window
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    parser.parse().unwrap()
+}
+
+/// The engine hop reaches EVERY timestamp leaf, not only the bare ones.
+///
+/// This is the guard for the finding the plan's `verify` pass turned up: only a
+/// bare `FieldType::Timestamp` becomes `ColumnType::Timestamp`, so a schema-blind
+/// column pass would silently skip the nullable / arrayed / struct-nested ones —
+/// 81 of 247 timestamp fields in the example corpus are nullable. A migration
+/// that skips a third of the data compiles and runs perfectly.
+#[test]
+fn test_engine_generation_reaches_every_timestamp_leaf() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 1,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let code = EngineMigrationGenerator::generate_main_code(&plan).unwrap().code;
+
+    // The bare field.
+    assert!(
+        code.contains(r#"__rescale(__row.taken_at, "Reading", "taken_at")"#),
+        "a bare timestamp is rescaled: {code}"
+    );
+    // The nullable field — reached through the `Option`, not skipped.
+    assert!(
+        code.contains("if let Some(__ts_opt) = &mut __row.maybe_at"),
+        "a NULLABLE timestamp is reached (the shape the schema-blind pass misses): {code}"
+    );
+    // The array — element-wise.
+    assert!(
+        code.contains("for __ts_elem in __row.marks.iter_mut()"),
+        "every array element is rescaled: {code}"
+    );
+    // The struct — by field path, with the dotted name in the diagnostic.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(r#""Reading","window.opened_at""#)
+            && flat.contains(r#""Reading","window.closed_at""#),
+        "struct-nested timestamps are rescaled and named by path: {code}"
+    );
+    // The non-timestamp field is left alone.
+    assert!(
+        !code.contains("__row.label ="),
+        "a string field is not touched: {code}"
+    );
+    // Overflow is detected, not wrapped: a stored second count past ~year 9999
+    // would otherwise become a nonsensical instant, silently.
+    assert!(
+        code.contains("checked_mul(1000000)"),
+        "the multiply is checked: {code}"
+    );
+    // Two modules of the SAME schema — the version interlock comes for free.
+    assert!(
+        code.contains("mod e1;") && code.contains("mod e2;"),
+        "both engine generations are embedded: {code}"
+    );
+    assert!(
+        code.contains("e1::Database::open_at") && code.contains("e2::Database::open_at"),
+        "the reader half is e1 and the writer half is e2: {code}"
+    );
+}
+
+/// The two embedded modules differ ONLY in the baked engine generation. If they
+/// differed in the schema serial too, each module's own open-guard would refuse
+/// the dir the other half just wrote.
+#[test]
+fn test_engine_generation_bakes_one_schema_two_generations() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 7,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let out = EngineMigrationGenerator::generate(&plan, "forgedb-engine-migrate").unwrap();
+    let e1 = &out.sources.iter().find(|(p, _)| p == "src/e1.rs").expect("e1").1;
+    let e2 = &out.sources.iter().find(|(p, _)| p == "src/e2.rs").expect("e2").1;
+
+    assert!(e1.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e2.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e1.contains("EXPECTED_ENGINE_VERSION: u32 = 1"));
+    assert!(e2.contains("EXPECTED_ENGINE_VERSION: u32 = 2"));
+}
+
+/// A generation pair the generator does not know is REFUSED, not silently given
+/// the seconds→micros multiply. A wrong rescale corrupts exactly the data the
+/// migration claims to carry, and it corrupts it irreversibly.
+#[test]
+fn test_engine_generation_refuses_an_unknown_hop() {
+    let schema = engine_hop_schema();
+    for (from, to) in [(2u32, 3u32), (1, 3), (2, 1)] {
+        let plan = EngineHopPlan {
+            schema: &schema,
+            schema_version: 1,
+            from_engine: from,
+            to_engine: to,
+        };
+        let err = match EngineMigrationGenerator::generate(&plan, "x") {
+            Err(e) => e,
+            Ok(_) => panic!("only 1 -> 2 exists, but {from} -> {to} generated"),
+        };
+        assert!(
+            err.to_string().contains("the only hop is 1 → 2"),
+            "and it says which hop DOES exist: {err}"
+        );
+    }
+}
+
+/// The open guard's two arms describe two different situations with two
+/// different remedies, and must never collapse into one message: sending a user
+/// to the app's migration bin when ForgeDB's format changed would tell them to
+/// regenerate a schema that is already correct.
+#[test]
+fn test_rust_generation_open_guard_has_two_distinct_arms() {
+    let schema = engine_hop_schema();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    // prettyplease wraps the panic strings across source lines, so match the
+    // flattened form — dropping the line-continuation backslashes too, which is
+    // what makes a wrapped message one contiguous span again.
+    let flat: String = code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\\')
+        .collect();
+
+    assert!(
+        flat.contains("isatschemaversionv"),
+        "the schema arm names the app's serial: {code}"
+    );
+    assert!(
+        flat.contains("waswrittenbyengineformatgeneration"),
+        "the engine arm names ForgeDB's generation: {code}"
+    );
+    assert!(
+        flat.contains("forgedbmigrateengine--src<dir>--dest<new-dir>"),
+        "and points at the engine command, NOT the app's transformer: {code}"
+    );
+    assert!(
+        flat.contains("yourschemadidnot"),
+        "and says explicitly which of the two things changed: {code}"
+    );
+    assert!(
+        flat.contains("engine_version:EXPECTED_ENGINE_VERSION"),
+        "a written manifest stamps the generation this binary speaks: {code}"
     );
 }

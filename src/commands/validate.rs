@@ -191,7 +191,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
         let has_timestamp = model
             .fields
             .iter()
-            .any(|f| matches!(f.field_type, FieldType::Timestamp));
+            .any(|f| matches!(f.field_type, FieldType::Timestamp(_)));
 
         if !has_timestamp {
             warnings.push(format!(

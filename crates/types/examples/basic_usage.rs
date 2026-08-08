@@ -10,10 +10,10 @@ fn main() {
     // Working with timestamps
     println!("--- Timestamps ---");
     let now = Timestamp::now();
-    println!("Current timestamp: {}", now.as_seconds());
+    println!("Current timestamp: {}", now.as_micros());
 
-    let past = Timestamp::from_seconds(1234567890);
-    println!("Past timestamp: {}", past.as_seconds());
+    let past = Timestamp::from_micros(1234567890);
+    println!("Past timestamp: {}", past.as_micros());
     println!("Past < Now: {}\n", past < now);
 
     // Working with UUIDs
@@ -59,6 +59,6 @@ fn main() {
     let ts: Timestamp = 1234567890_i64.into();
     println!("i64 -> Timestamp: {:?}", ts);
 
-    let seconds: i64 = ts.into();
-    println!("Timestamp -> i64: {}", seconds);
+    let micros: i64 = ts.into();
+    println!("Timestamp -> i64: {}", micros);
 }
