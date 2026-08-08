@@ -99,8 +99,8 @@ status: string? @default("pending")     // nullable string with a default (seman
 | `f64`     | `f64`             | `f64`               | Floating-point 64-bit            |
 | `bool`    | `bool`            | `bool`              | Boolean (true/false)             |
 | `string`  | `string`          | `String`            | Variable-length UTF-8 string     |
-| `string(N)` | `string(32)`    | `String`            | **At most** N characters, in a fixed-width column slot (see below) |
-| `string(N!)` | `string(3!)`   | `String`            | **Exactly** N characters, in a fixed-width column slot |
+| `string(N)` | `string(32)`    | `String` (`InlineStr<N>` as a key) | **At most** N characters, in a fixed-width column slot (see below) |
+| `string(N!)` | `string(3!)`   | `String` (`InlineStr<N>` as a key) | **Exactly** N characters, in a fixed-width column slot |
 | `json`    | `json`            | `serde_json::Value` | Arbitrary JSON value (variable-length column, stored as serialized JSON) |
 | `decimal` | `decimal`         | `rust_decimal::Decimal` | Exact fixed-point decimal (money/quantity); fixed 16-byte column, JSON string on the wire |
 | `uuid`    | `uuid`            | `uuid::Uuid`        | Universal unique identifier      |
@@ -250,8 +250,53 @@ Account {
 - **It cannot go inside a `struct` or a `[T; N]`.** Those store their fields as the
   Rust value's bytes, and the Rust value here is a heap `String` — see §7. Use
   `bytes(N)` there.
-- **It cannot yet be a model's identity.** `id: string(26!)` is refused for now; the
-  generated API layer parses every non-integer key as a uuid.
+- **It can be a model's identity** — see the next section, which is where the Rust
+  value stops being a `String`.
+
+### `string(N)` as an identity
+
+Both spellings are legal identities (#252):
+
+```
+Airport {
+  id:   string(3!)          // exactly 3 — an IATA code
+  city: string
+}
+
+Isbn {
+  id:    string(17)         // at most 17
+  title: string
+}
+```
+
+- **A key is not a `String`.** In a key position the Rust type is
+  `forgedb_types::InlineStr<N>` — a `Copy`, fixed-capacity string, so it can sit in
+  the row index, in a junction `HashMap`, and in a fixed-width replication frame the
+  way every other key type does. On every wire it is still a plain string: JSON
+  string, TypeScript `string`, OpenAPI `{"type": "string"}`. A client cannot tell.
+  An ordinary `string(N)` *column* is unaffected and stays a `String`.
+- **A bare `string` identity is refused.** A key has to be fixed-width to be `Copy`,
+  so the width has to be in the type. The error tells you to write one.
+- **`@utf8` on an identity is a schema error.** The alphabet below is a strict subset
+  of ASCII, so `@utf8` would reserve four bytes per character to hold characters the
+  write path rejects.
+- **A key's value must survive a URL path segment, byte for byte.** Enforced on every
+  insert and update (violation → 422): the legal characters are RFC 3986 `pchar`
+  **minus** `%` — `A-Z a-z 0-9 - . _ ~ ! $ & ' ( ) * + , ; = : @`. `%` is excluded so
+  that no escaping is involved at all and `GET /airports/SFO` is the row's address
+  literally. Note that `:` and `@` are `pchar` without being *unreserved*, which is
+  what admits `urn:isbn:0451450523` and `user@example.com` as keys.
+- **The empty string is rejected**, since `/airports/` addresses the collection rather
+  than a row.
+- **A string-keyed model is an ordinary relation target.** `*Model` / `?Model` FKs,
+  `@on_delete` in all three modes, forward traversal, reverse getters, eager load and
+  many-to-many junctions all work exactly as they do for a uuid-keyed model — an FK's
+  column simply follows the target's key and is N bytes wide.
+- **The width is a per-row cost paid twice.** The identity map is
+  `HashMap<InlineStr<N>, usize>`, held in RAM, and every FK pointing at the model
+  carries the same N bytes on every child row. The 64-character advisory above is a
+  *scan-bandwidth* threshold and does not cover this; a wide key is worth thinking
+  about at a narrower width than a wide column is.
 
 ### Enum types
 
@@ -385,7 +430,9 @@ Order {
 - A wide inherited key is warned about on the *referencing* field: an FK to a model whose identity
   is a wide `string(N)` pays that width on every row of the child.
 - **Many-to-many endpoints:** a junction stores each endpoint's id in a fixed-width, hashable
-  column, so an endpoint's identity must be `uuid`, an integer type, or `timestamp`. Mixed pairs
+  column, so an endpoint's identity must be `uuid`, an integer type, `timestamp`, or
+  `string(N)`/`string(N!)` — the last of which qualifies because a key of that type is a
+  `Copy`, fixed-capacity `InlineStr<N>` rather than a heap `String` (#252). Mixed pairs
   are fine — a `+u64`-keyed model links to a `+uuid`-keyed one, and each junction column is that
   endpoint's own width. An identity outside that set is a validation error rather than a silently
   missing M2M surface.
@@ -403,7 +450,7 @@ Order {
 | `@min`                 | `(n)` or `(>n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Minimum value — **ENFORCED** (violation → 422). `>n` is an exclusive bound (continuous types only). | `age: u32 @min(13)`, `rate: f64 @min(>0)` |
 | `@max`                 | `(n)` or `(<n)` | Numeric (u32/u64/i32/i64/f64/decimal) | Maximum value — **ENFORCED** (violation → 422). `<n` is exclusive. *Not* a string-length check — use `@length` for strings. | `age: u32 @max(150)`, `rate: f64 @max(<1)` |
 | `@length`              | `(min: n)`, `(max: n)`, `(min: a, max: b)`, `(a, b)`, or `(n)` | `string` | String length in **characters** — **ENFORCED** (violation → 422). See the table below — single-arg `@length(n)` means **exactly** n. | `name: string @length(min: 1, max: 100)` |
-| `@utf8`                | (none)          | `string(N)` only    | Widen an inline string's slot to four bytes per character — **ENFORCED** (without it a non-ASCII character is a 422). An error on any other type. | `title: string(60) @utf8` |
+| `@utf8`                | (none)          | `string(N)` only, and never on an identity | Widen an inline string's slot to four bytes per character — **ENFORCED** (without it a non-ASCII character is a 422). An error on any other type, and an error on a model's identity field (#252 — a key's alphabet is a strict ASCII subset, so there would be nothing to widen). | `title: string(60) @utf8` |
 | `@email`               | (none)          | `string`            | Email format — **ENFORCED** (violation → 422)      | `email: string @email` |
 | `@url`                 | (none)          | `string`            | URL format — **ENFORCED** (violation → 422)        | `website: string @url` |
 | `@pattern`             | `(regex_string)` | `string`           | Regex match — **ENFORCED** via `LazyLock<Regex>` (non-match → 422) | `phone: string @pattern("^[0-9]+$")` |

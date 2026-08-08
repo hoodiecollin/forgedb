@@ -13,7 +13,7 @@ A compact lookup for the whole `.forge` language. Follow the links for the full 
 | `f64` | `f64` | `number` | filter/sort (no ordered index) |
 | `bool` | `bool` | `boolean` | ✅ |
 | `string` | `String` | `string` | ✅ (exact-match) |
-| `string(N)` `string(N!)` | `String` | `string` | ✅ — fixed N-**character** slot in the row; `!` = exactly N, bare = at most. ASCII unless `@utf8` |
+| `string(N)` `string(N!)` | `String` (`InlineStr<N>` as a key) | `string` | ✅ — fixed N-**character** slot in the row; `!` = exactly N, bare = at most. ASCII unless `@utf8`. Legal as an identity: `Copy` key, RFC 3986 `pchar` minus `%`, non-empty, no `@utf8` |
 | `bytes(N)` | `[u8; N]` | `any` | ✅ (raw bytes, **not** text; struct-safe) |
 | `uuid` | `Uuid` | `string` | ✅ |
 | `timestamp`, `timestamp(s\|ms\|us)` | `Timestamp` | `string` (RFC 3339) | ✅ |

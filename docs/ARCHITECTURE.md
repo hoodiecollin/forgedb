@@ -121,6 +121,15 @@ Key properties that the rest of the system is built on:
   generator resolves `*Target` / `?Target` to that key type once, at the boundary, so no layout
   rule and no relation capability is conditioned on the key being a uuid. A many-to-many junction
   is the same idea applied twice: one fixed column per endpoint, each that endpoint's own width.
+- **A key is `Copy`, including a string one.** Every identity type materializes as a fixed-size,
+  hashable, totally-ordered Rust value, because a key sits in the row index, in a junction
+  `HashMap`, and in a fixed-width replication frame. That is why a `string(N)` identity is a
+  `forgedb_types::InlineStr<N>` — a fixed-capacity `Copy` string — rather than the heap `String`
+  the same declared type produces in an ordinary column (#252). One consequence is worth naming:
+  the resolution above means every inline-string *layout* rule has to run on the **resolved** type,
+  or an FK to a string-keyed model silently misses the packing path it physically needs. The wire
+  form is unchanged — `InlineStr` serializes as a plain JSON string, by hand rather than by derive,
+  since serde's array derive stops at 32 elements and a key may be wider.
 - **Watermark snapshots.** A snapshot is just a row-count watermark (`forgedb_storage::Snapshot`);
   point-in-time reads resolve the newest version *within* the watermark. No `xmin`/`xmax`, no
   version chains.
@@ -189,7 +198,9 @@ per model*. The substrate crates on this path (`auth`, `query-params`) interpret
 A list request does **not** decode every column of every row. Codegen emits a *narrow scan view*
 per model — `<Model>ScanRef<'a>`, the identity field plus the filterable/sortable columns, with
 `string` as `&'a str` — and each scan column is bulk-loaded once (one `gather_buffered` per
-column, hoisted out of the row loop) rather than read per row.
+column, hoisted out of the row loop) rather than read per row. The identity is the one
+string-typed field that does *not* borrow: the scope returns a vector of ids that outlives the
+buffers, and a `Copy` key costs the scan nothing to hold by value.
 
 The scan is a **scope**, not a producer:
 

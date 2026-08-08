@@ -33,7 +33,7 @@ The generated code checks these and rejects a bad write.
 | `@email` | none | `string` | Must be a valid email, else **422** |
 | `@url` | none | `string` | Must be a valid URL, else **422** |
 | `@pattern` / `@regex` | `(regex)` | `string` | Value must match the regex, else **422** |
-| `@utf8` | none | `string(N)` only | Widen the inline slot to four bytes per character; without it a non-ASCII value is **422** |
+| `@utf8` | none | `string(N)` only, never an identity | Widen the inline slot to four bytes per character; without it a non-ASCII value is **422** |
 | `@on_delete` | `(restrict\|cascade\|set_null)` | FK field | On-delete referential policy |
 
 ### Field constraints — `@min` `@max` `@length` `@email` `@url`
@@ -102,6 +102,11 @@ Article {
 no-op: a bare `string` is already UTF-8 and lives in the variable-length column, so there is
 nothing there to widen, and silently accepting it would read as "this field is now
 multi-byte".
+
+It is also a schema error on a model's [identity](/docs/schema/scalar-types/#stringn-as-an-identity).
+A key's value is restricted to the characters that survive a URL path segment unescaped,
+which is a strict subset of ASCII — so widening the slot would reserve four bytes per
+character to hold characters the write path rejects anyway.
 
 Note that the length directives go the other way on an inline string: the width in the type
 is already the bound, so `@max` and the upper-bound spellings of `@length` are schema errors

@@ -342,6 +342,7 @@ impl RustGenerator {
         tokens.extend(header);
 
         // Attributes and imports
+        let inline_str_import = Self::inline_str_import(schema);
         let imports = quote! {
             // `irrefutable_let_patterns`: the WAL recovery path matches
             // `WalOperation::Raw` via `if let` — currently the only variant, so
@@ -355,6 +356,7 @@ impl RustGenerator {
             use std::collections::HashMap;
             use std::path::{Path, PathBuf};
             use forgedb_storage::{FixedColumn, VariableColumn, Tombstones};
+            #inline_str_import
             use forgedb_types::{Uuid, Timestamp, Value};
             use serde::{Deserialize, Serialize};
             use utoipa::ToSchema;
@@ -845,6 +847,9 @@ impl RustGenerator {
         // actually carries a prefix, so a schema whose inline strings are all
         // `string(N!)` — the prefix-free shape — carries no prefix machinery at
         // all (same discipline as the `f64` key above).
+        if Self::needs_inline_str(schema) {
+            tokens.extend(Self::generate_identity_alphabet_helper());
+        }
         if Self::needs_inline_len_helper(schema) {
             tokens.extend(Self::generate_inline_len_helper());
         }
@@ -1166,7 +1171,7 @@ impl RustGenerator {
         let fields: Vec<_> = model
             .fields
             .iter()
-            .map(|f| Self::model_struct_field(schema, f, true))
+            .map(|f| Self::model_struct_field(schema, f, true, Self::is_inline_key_field(schema, model, f)))
             .collect();
 
         // Generate columnar storage fields
@@ -1618,7 +1623,7 @@ impl RustGenerator {
         // own declared type is what the enum carries, so ask about that rather
         // than assuming the id is uuid- or integer-shaped.
         let id_schema_attr = Self::identity_field(model)
-            .and_then(|f| Self::timestamp_schema_value_type(schema, &f.field_type))
+            .and_then(|f| Self::schema_value_type(schema, &f.field_type, true))
             .map(|vt| quote! { #[schema(value_type = #vt)] })
             .unwrap_or_default();
         let doc = format!(
@@ -1910,6 +1915,11 @@ impl RustGenerator {
         match ty {
             FT::U32 | FT::I32 => 4,
             FT::U64 | FT::I64 | FT::Timestamp(_) => 8,
+            // #252: a `string(N)` key is exactly N bytes — `@utf8` is a
+            // validation error on an identity, and the exact spelling carries no
+            // length prefix, so the slot IS the value. The at-most spelling pads
+            // with zeros, which is what makes both spellings one width.
+            FT::StringN { chars, .. } => *chars as usize,
             // `junction_key_type` admits nothing else.
             _ => 16,
         }
@@ -1939,8 +1949,8 @@ impl RustGenerator {
     ) -> (TokenStream, TokenStream) {
         let (lt, rt) = Self::junction_key_pair(schema, m);
         (
-            Self::map_field_type_ident(schema, &lt),
-            Self::map_field_type_ident(schema, &rt),
+            Self::key_type_ident(schema, &lt),
+            Self::key_type_ident(schema, &rt),
         )
     }
 
@@ -1957,6 +1967,20 @@ impl RustGenerator {
             forgedb_parser::FieldType::Uuid => quote! { #col.append_uuid(*#val.as_bytes()) },
             forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #col.append_timestamp(i64::from(#val)) }
+            }
+            // #252: exactly N bytes, zero-padded — byte-identical to the way the
+            // endpoint model's own `string(N!)` id column is packed, which is the
+            // invariant that lets a junction column mirror an id column.
+            forgedb_parser::FieldType::StringN { chars, .. } => {
+                let n = *chars as usize;
+                quote! {
+                    {
+                        let mut __buf = [0u8; #n];
+                        let __b = #val.as_bytes();
+                        __buf[..__b.len()].copy_from_slice(__b);
+                        #col.append_bytes(&__buf)
+                    }
+                }
             }
             other => {
                 let m = Self::get_append_method(schema, other);
@@ -1980,6 +2004,23 @@ impl RustGenerator {
             forgedb_parser::FieldType::Timestamp(_) => quote! {
                 Timestamp::from(#col.read_timestamp(#row).expect("Failed to read link"))
             },
+            // #252: the inverse of the pack above. The zero padding is stripped
+            // by `trim_end_matches`, not by a length prefix — the junction column
+            // carries none, exactly as a `string(N!)` id column does not.
+            ty @ forgedb_parser::FieldType::StringN { .. } => {
+                let key_ty = Self::key_type_ident(schema, ty);
+                quote! {
+                    {
+                        let __raw = #col.read_bytes(#row).expect("Failed to read link");
+                        <#key_ty>::try_from(
+                            std::str::from_utf8(&__raw)
+                                .expect("junction key column holds UTF-8")
+                                .trim_end_matches('\0'),
+                        )
+                        .expect("junction key column is the key width")
+                    }
+                }
+            }
             other => {
                 let m = Self::get_read_method(schema, other);
                 quote! { #col.#m(#row).expect("Failed to read link") }
@@ -2011,8 +2052,19 @@ impl RustGenerator {
                     (#slice).try_into().expect("junction frame slot is the key width"),
                 ))
             },
+            ty @ forgedb_parser::FieldType::StringN { .. } => {
+                let key_ty = Self::key_type_ident(schema, ty);
+                quote! {
+                    <#key_ty>::try_from(
+                        std::str::from_utf8(#slice)
+                            .expect("junction frame slot holds UTF-8")
+                            .trim_end_matches('\0'),
+                    )
+                    .expect("junction frame slot is the key width")
+                }
+            }
             other => {
-                let ident = Self::map_field_type_ident(schema, other);
+                let ident = Self::key_type_ident(schema, other);
                 quote! {
                     <#ident>::from_le_bytes(
                         (#slice).try_into().expect("junction frame slot is the key width"),
@@ -2036,6 +2088,20 @@ impl RustGenerator {
             }
             forgedb_parser::FieldType::Timestamp(_) => {
                 quote! { #buf.extend_from_slice(&i64::from(#val).to_le_bytes()); }
+            }
+            // #252: the frame slot is fixed-width like every other, so a shorter
+            // key is zero-padded to N. Same encoding as the junction column, so
+            // the frame and the column agree byte for byte.
+            forgedb_parser::FieldType::StringN { chars, .. } => {
+                let n = *chars as usize;
+                quote! {
+                    {
+                        let mut __k = [0u8; #n];
+                        let __b = #val.as_bytes();
+                        __k[..__b.len()].copy_from_slice(__b);
+                        #buf.extend_from_slice(&__k);
+                    }
+                }
             }
             _ => quote! { #buf.extend_from_slice(&#val.to_le_bytes()); },
         }
@@ -2067,9 +2133,29 @@ impl RustGenerator {
     /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
     pub(crate) fn id_type_tokens(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         match Self::identity_field(model) {
-            Some(f) => Self::map_field_type_ident(schema, &f.field_type),
+            // A key position (#252): `string(N)` renders as the `Copy`
+            // `InlineStr<N>` here, where an ordinary column of the same declared
+            // type renders as a `String`.
+            Some(f) => Self::key_type_ident(schema, &f.field_type),
             None => quote! { Uuid },
         }
+    }
+
+    /// The name of `model`'s identity field, for the per-field renderers that
+    /// must give the key its [`key_type_ident`](Self::key_type_ident) type while
+    /// an ordinary column of the same declared type keeps `map_field_type_ident`.
+    ///
+    /// A name rather than a reference so it can be carried into helpers that
+    /// receive a field *slice* (projections) rather than the model.
+    pub(crate) fn identity_field_name(model: &forgedb_parser::Model) -> Option<&str> {
+        Self::identity_field(model).map(|f| f.name.as_str())
+    }
+
+    /// Is `field` this model's identity? Compared by name, because a projection
+    /// renders from a field *slice* whose elements are the model's own fields but
+    /// whose provenance the renderer no longer has.
+    pub(crate) fn is_identity(model: &forgedb_parser::Model, field: &forgedb_parser::Field) -> bool {
+        Self::identity_field_name(model) == Some(field.name.as_str())
     }
 
     /// The Arrow C-Data-Interface `format` string for a field whose column can be
@@ -2874,7 +2960,44 @@ impl RustGenerator {
                 // validation-time-only check.
                 if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
                     let n = chars as usize;
-                    if !Self::is_utf8_field(field) {
+                    // #252: a KEY carries a narrower rule than a column, and it
+                    // replaces the ASCII check rather than joining it — the
+                    // path-segment alphabet is a strict subset of ASCII, and the
+                    // ASCII diagnostic's `add @utf8` advice is *wrong* for an
+                    // identity, where `@utf8` is a validation error (res 3).
+                    if Self::is_identity(model, field) {
+                        // Non-empty FIRST (res 5), so `""` reports "a key cannot
+                        // be empty" rather than the width rule or a phantom
+                        // offending character. `/docs/` routes to the LIST
+                        // endpoint, not to a row, so an empty key is not merely
+                        // ugly — it is unaddressable.
+                        checks.push(quote! {
+                            if __v.is_empty() {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "identity_empty",
+                                    message: "a key cannot be the empty string — \
+                                              its URL would address the collection, \
+                                              not a row"
+                                        .to_string(),
+                                });
+                            }
+                        });
+                        let msg = "must consist only of characters legal unencoded in a URL                                    path segment (RFC 3986 pchar, excluding %), so the segment                                    is byte-identical to the key";
+                        checks.push(quote! {
+                            if let Some((__i, __c)) = __v
+                                .char_indices()
+                                .find(|(_, __c)| !__forgedb_identity_char_ok(*__c))
+                            {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "identity_alphabet",
+                                    message: format!(
+                                        "{} — found {:?} at byte {}",
+                                        #msg, __c, __i,
+                                    ),
+                                });
+                            }
+                        });
+                    } else if !Self::is_utf8_field(field) {
                         let msg = format!(
                             "must contain only ASCII characters (add @utf8 to this field to \
                              allow the rest of Unicode, at four bytes per character)"
@@ -3205,6 +3328,28 @@ impl RustGenerator {
                 let ty = Self::map_field_type_ident(schema, &resolved);
                 quote! { #ty }
             }
+        }
+    }
+
+    /// The argument expression for a `find_by_<fk>` probe run over a parent key
+    /// bound to `id` (#252).
+    ///
+    /// [`Self::index_param_type`] gives a string-semantic column a `&str`
+    /// parameter — ergonomic, and the reason a probe can be called with a
+    /// literal. A `string(N)` key is string-semantic but arrives at these
+    /// internal call sites *by value* (`InlineStr<N>` is `Copy`), so it has to
+    /// be borrowed here. Every other key type is passed by value, exactly as
+    /// before.
+    fn fk_probe_arg(schema: &Schema, parent_model: &str, required: bool) -> TokenStream {
+        let borrows = schema
+            .find_model(parent_model)
+            .and_then(|m| Self::identity_type(schema, m))
+            .is_some_and(|t| Self::is_string_semantic(&t));
+        let inner = if borrows { quote! { &id } } else { quote! { id } };
+        if required {
+            inner
+        } else {
+            quote! { Some(#inner) }
         }
     }
 
@@ -4674,9 +4819,13 @@ impl RustGenerator {
                     });
                 }
             } else if let Some((chars, exact)) =
-                Self::inline_string_params(&field.field_type)
+                Self::inline_string_column_params(schema, &field.field_type)
             {
                 // Inline `string(N)` (#238): pack the value into its fixed slot.
+                // #252: *resolved*, so an FK to a string-keyed model packs its
+                // key here too rather than falling through to the generic fixed
+                // path below, whose typed-method arm would name a column method
+                // (`append_inline_string`) that does not exist.
                 // This branch must precede the generic fixed-size one below, whose
                 // `needs_byte_conversion` path transmutes the Rust value's bytes —
                 // which for a `String` would persist a pointer.
@@ -4893,9 +5042,16 @@ impl RustGenerator {
                 #receiver.#col.read_string(#row_var).expect("Failed to read id column")
             }
         } else if let Some((chars, exact)) = Self::inline_string_params(&f.field_type) {
-            // A `string(N)` identity (#238 makes the type legal here; #252 gives it
-            // a `Copy` key). Same slot decode as any other inline string column —
-            // an id is never nullable, so there is no presence byte.
+            // A `string(N)` identity (#238 makes the type legal; #252 gives it a
+            // `Copy` key). Same slot decode as any other inline string column —
+            // an id is never nullable, so there is no presence byte — but it
+            // materializes the KEY type, because this expression feeds the
+            // `id_to_row` rebuild on reopen.
+            //
+            // `@utf8` is a validation error on an identity (#252 res 3), so the
+            // width here is always exactly N; `is_utf8_field` is still consulted
+            // rather than hardcoded `false`, so the layout stays derived from one
+            // place if that ever changes.
             let bytes = Self::inline_string_bytes_expr(
                 chars,
                 exact,
@@ -4903,13 +5059,16 @@ impl RustGenerator {
                 0,
                 quote! { __slot_bytes },
             );
+            let key_ty = Self::key_type_ident(schema, &f.field_type);
             quote! {
                 {
                     let __slot_bytes = #receiver.#col.read_bytes(#row_var)
                         .expect("Failed to read id column");
-                    std::str::from_utf8(#bytes)
-                        .expect("inline string column holds UTF-8")
-                        .to_string()
+                    <#key_ty>::try_from(
+                        std::str::from_utf8(#bytes)
+                            .expect("inline string column holds UTF-8"),
+                    )
+                    .unwrap_or_default()
                 }
             }
         } else {
@@ -5097,8 +5256,9 @@ impl RustGenerator {
                     }
                 };
                 out.push((col, one));
-            } else if Self::is_inline_string_type(&field.field_type) {
-                // Inline `string(N)` backfill (#238): a zeroed slot. That decodes
+            } else if Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type)) {
+                // Inline `string(N)` backfill (#238; resolved for an FK, #252): a
+                // zeroed slot. That decodes
                 // to `None` when nullable, and otherwise to the empty string —
                 // except under `string(N!)`, where the prefix-free slot decodes to
                 // N NUL characters, which is exactly N characters and therefore
@@ -6914,6 +7074,7 @@ impl RustGenerator {
         receiver: &TokenStream,
         row_index: &TokenStream,
         borrowed: bool,
+        as_key: bool,
     ) -> Option<(proc_macro2::Ident, TokenStream)> {
         let field_col_name = format_ident!("{}_col", field.name);
         let field_value_name = format_ident!("{}_value", field.name);
@@ -6998,7 +7159,15 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
-        } else if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
+        } else if let Some((chars, exact)) =
+            Self::inline_string_column_params(schema, &field.field_type)
+        {
+            // #252: an FK to a string-keyed model is an inline-string column and
+            // its Rust value is the key, so it decodes here and materializes the
+            // key type — the caller cannot know that, since it sees the model's
+            // identity only.
+            let as_key =
+                as_key || Self::fk_backing_type(schema, &field.field_type).is_some();
             // Inline `string(N)` (#238). Two shapes, and the difference is the
             // whole point of the type:
             //
@@ -7014,14 +7183,41 @@ impl RustGenerator {
             let utf8 = Self::is_utf8_field(field);
             let (_, prefix, _) = Self::inline_string_layout(chars, exact, utf8);
             let base = if field.is_nullable() { 1usize } else { 0 };
+            // #252: a key does not borrow. `InlineStr<N>` is `Copy` and owns its
+            // bytes, so the scan view holds it by value — which costs the scan
+            // nothing (no allocation, which is the only thing borrowing bought)
+            // and is what lets the id vector the scan scope returns outlive the
+            // buffers it was decoded from.
+            let key_ty = if as_key {
+                Some(Self::key_type_ident(schema, &field.field_type))
+            } else {
+                None
+            };
+            let materialize = |s: TokenStream| match &key_ty {
+                Some(kt) => quote! {
+                    <#kt>::try_from(#s).unwrap_or_default()
+                },
+                None => s,
+            };
             let stmt = if borrowed {
                 if !field.is_nullable() && prefix == 0 {
                     // The substrate can do the whole read: the slot is exactly the
                     // value, so there is no framing for generated code to decode.
-                    quote! {
-                        let #field_value_name = #receiver.#field_col_name
-                            .read_str(#row_index)
-                            .expect("Failed to read inline string");
+                    if let Some(kt) = &key_ty {
+                        quote! {
+                            let #field_value_name = <#kt>::try_from(
+                                #receiver.#field_col_name
+                                    .read_str(#row_index)
+                                    .expect("Failed to read inline string"),
+                            )
+                            .unwrap_or_default();
+                        }
+                    } else {
+                        quote! {
+                            let #field_value_name = #receiver.#field_col_name
+                                .read_str(#row_index)
+                                .expect("Failed to read inline string");
+                        }
                     }
                 } else {
                     let bytes = Self::inline_string_bytes_expr(
@@ -7031,10 +7227,10 @@ impl RustGenerator {
                         base,
                         quote! { __slot_bytes },
                     );
-                    let decode = quote! {
+                    let decode = materialize(quote! {
                         std::str::from_utf8(#bytes)
                             .expect("inline string column holds UTF-8")
-                    };
+                    });
                     if field.is_nullable() {
                         quote! {
                             let #field_value_name = {
@@ -7063,10 +7259,27 @@ impl RustGenerator {
                     base,
                     quote! { __slot_bytes },
                 );
-                let decode = quote! {
-                    std::str::from_utf8(#bytes)
-                        .expect("inline string column holds UTF-8")
-                        .to_string()
+                // #252: in a key position the owned read materializes the `Copy`
+                // key type rather than a `String`. `try_from` cannot fail here —
+                // the slot is N bytes wide and the key is N bytes at most — but
+                // it is not `expect`ed away: a corrupt column would otherwise
+                // panic mid-read, and `unwrap_or_default` degrades a garbage row
+                // to the empty key, which `get` then simply does not find.
+                let decode = if as_key {
+                    let key_ty = Self::key_type_ident(schema, &field.field_type);
+                    quote! {
+                        <#key_ty>::try_from(
+                            std::str::from_utf8(#bytes)
+                                .expect("inline string column holds UTF-8"),
+                        )
+                        .unwrap_or_default()
+                    }
+                } else {
+                    quote! {
+                        std::str::from_utf8(#bytes)
+                            .expect("inline string column holds UTF-8")
+                            .to_string()
+                    }
                 };
                 if field.is_nullable() {
                     quote! {
@@ -7212,15 +7425,34 @@ impl RustGenerator {
         schema: &Schema,
         field_type: &forgedb_parser::FieldType,
     ) -> Option<TokenStream> {
+        Self::schema_value_type(schema, field_type, false)
+    }
+
+    /// The `#[schema(value_type = …)]` payload for any field whose Rust type is a
+    /// substrate type utoipa cannot see through — today `Timestamp` (#254) and,
+    /// in a **key** position, `InlineStr<N>` (#252).
+    ///
+    /// `is_key` matters because it is the only thing that distinguishes the two
+    /// renderings of `string(N)`: as a key it is an `InlineStr<N>` and needs the
+    /// annotation, as an ordinary column it is a `String` and must not have one
+    /// (utoipa would document it correctly either way, but an annotation on a
+    /// type that already implements `ToSchema` is noise that drifts).
+    pub(crate) fn schema_value_type(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+        is_key: bool,
+    ) -> Option<TokenStream> {
         use forgedb_parser::FieldType;
         match &Self::resolved_type(schema, field_type) {
             FieldType::Timestamp(_) => Some(quote! { String }),
+            // Both spellings serialize as the JSON string `InlineStr` produces.
+            FieldType::StringN { .. } if is_key => Some(quote! { String }),
             FieldType::Nullable(inner) => {
-                let inner = Self::timestamp_schema_value_type(schema, inner)?;
+                let inner = Self::schema_value_type(schema, inner, is_key)?;
                 Some(quote! { Option<#inner> })
             }
             FieldType::FixedArray(inner, _) => {
-                let inner = Self::timestamp_schema_value_type(schema, inner)?;
+                let inner = Self::schema_value_type(schema, inner, is_key)?;
                 Some(quote! { Vec<#inner> })
             }
             _ => None,
@@ -7236,9 +7468,22 @@ impl RustGenerator {
     /// create body may omit those fields — emitted for the model struct, but NOT
     /// for read-only projection structs (which are never deserialized from a
     /// create body).
-    fn model_struct_field(schema: &Schema, field: &forgedb_parser::Field, auto_default: bool) -> TokenStream {
+    fn model_struct_field(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        auto_default: bool,
+        is_key: bool,
+    ) -> TokenStream {
         let field_name = format_ident!("{}", field.name);
-        let field_type = Self::map_field_type_ident(schema, &field.field_type);
+        // #252: a key position renders `string(N)` as the `Copy` `InlineStr<N>`;
+        // an ordinary column of the same declared type stays a `String`. `is_key`
+        // is supplied by the caller because only the caller can see the model,
+        // and only the model knows which field is the identity.
+        let field_type = if is_key {
+            Self::key_type_ident(schema, &field.field_type)
+        } else {
+            Self::map_field_type_ident(schema, &field.field_type)
+        };
 
         // forgedb_types::Timestamp does not implement utoipa::ToSchema.  Annotate
         // those fields so utoipa documents them as the RFC 3339 *string* serde
@@ -7251,7 +7496,7 @@ impl RustGenerator {
         // TS SDK's `string` type) via rust_decimal's `serde::str` module — so it
         // gets both a `#[schema(value_type = String)]` and a `#[serde(with = ...)]`.
         let (schema_attr, serde_attr) = if let Some(vt) =
-            Self::timestamp_schema_value_type(schema, &field.field_type)
+            Self::schema_value_type(schema, &field.field_type, is_key)
         {
             (quote! { #[schema(value_type = #vt)] }, quote! {})
         } else if Self::is_decimal_type(&field.field_type) {
@@ -7726,9 +7971,10 @@ impl RustGenerator {
         // ever appears behind a `&` in a closure argument, so no caller of the
         // generated crate names its lifetime.
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
+        let key_name = Self::identity_field_name(model);
         let ref_field_decls = scan_fields.iter().map(|f| {
             let fname = format_ident!("{}", f.name);
-            let fty = Self::scan_ref_field_type(schema, f);
+            let fty = Self::scan_ref_field_type(schema, f, Some(f.name.as_str()) == key_name);
             quote! { pub #fname: #fty }
         });
         let ref_doc = format!(
@@ -7753,7 +7999,7 @@ impl RustGenerator {
         // across the module boundary.  `PhantomData<&'a ()>` — the shared-reference
         // form, so the view stays covariant over `'a` exactly as the real borrows
         // are; `&'a mut ()` would make it invariant and reject sound callers.
-        let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields) {
+        let ref_borrow_anchor = match Self::scan_ref_anchor(&scan_fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! {
                 /// #250: anchors `'a` for a view whose every field is fixed-size.
@@ -7776,7 +8022,7 @@ impl RustGenerator {
         // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
         let with_scan_method =
-            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields);
+            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields, key_name);
 
         let methods = quote! {
             #with_scan_method
@@ -7799,8 +8045,19 @@ impl RustGenerator {
     /// string-free model a hardcoded anchor would collide with it and emit the
     /// field twice.  Underscores are appended until the name is free, so the two
     /// emission sites agree by construction.
-    fn scan_ref_anchor(fields: &[&forgedb_parser::Field]) -> Option<proc_macro2::Ident> {
-        if fields.iter().any(|f| Self::is_string_semantic(&f.field_type)) {
+    fn scan_ref_anchor(
+        fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+    ) -> Option<proc_macro2::Ident> {
+        // #252: a `string(N)` *key* is held by value (`InlineStr<N>` is `Copy`),
+        // so it borrows nothing and cannot anchor `'a`. A model whose only
+        // string-semantic field is its own identity therefore still needs the
+        // PhantomData — miss this and the view fails to compile with E0392,
+        // which is the same class of break #250 fixed.
+        if fields
+            .iter()
+            .any(|f| Self::is_string_semantic(&f.field_type) && Some(f.name.as_str()) != key_name)
+        {
             return None;
         }
         let mut name = String::from("__borrow");
@@ -7816,7 +8073,18 @@ impl RustGenerator {
     /// what lets the SAME generated filter checks compile against both views —
     /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
     /// both std, so `record.<field> == <parsed param>` needs no second form.
-    fn scan_ref_field_type(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
+    fn scan_ref_field_type(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        is_key: bool,
+    ) -> TokenStream {
+        // #252: the key is the one string-semantic field that does NOT borrow.
+        // `InlineStr<N>` is `Copy`, so holding it by value allocates nothing —
+        // the only thing the borrow bought — and it is what lets the vector of
+        // ids the scan scope returns outlive the buffers it decoded from.
+        if is_key {
+            return Self::key_type_ident(schema, &field.field_type);
+        }
         if Self::is_string_semantic(&field.field_type) {
             return if field.is_nullable() {
                 quote! { Option<&'a str> }
@@ -7859,6 +8127,7 @@ impl RustGenerator {
         ref_ident: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
     ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
@@ -7880,7 +8149,8 @@ impl RustGenerator {
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true)) {
+            let as_key = Some(field.name.as_str()) == key_name;
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true, as_key)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -7899,7 +8169,7 @@ impl RustGenerator {
 
         // #250: initialize the lifetime anchor iff the struct declares one.  Same
         // derivation as the emission site, so the name cannot drift apart from it.
-        let ref_borrow_init = match Self::scan_ref_anchor(fields) {
+        let ref_borrow_init = match Self::scan_ref_anchor(fields, key_name) {
             None => quote! {},
             Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
         };
@@ -8001,6 +8271,7 @@ impl RustGenerator {
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
         doc: &str,
+        key_name: Option<&str>,
     ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
@@ -8022,7 +8293,8 @@ impl RustGenerator {
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false)) {
+            let as_key = Some(field.name.as_str()) == key_name;
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false, as_key)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -8281,7 +8553,10 @@ impl RustGenerator {
             let proj_ident = format_ident!("{}{}", model.name, Self::projection_pascal(&proj.name));
             let fields = Self::projected_field_set(model, proj);
             let struct_field_defs: Vec<_> =
-                fields.iter().map(|f| Self::model_struct_field(schema, f, false)).collect();
+                fields
+                    .iter()
+                    .map(|f| Self::model_struct_field(schema, f, false, Self::is_inline_key_field(schema, model, f)))
+                    .collect();
 
             let read_at_name = format_ident!("read_{}_at", proj.name);
             let get_name = format_ident!("get_{}", proj.name);
@@ -8289,7 +8564,8 @@ impl RustGenerator {
             let get_at_name = format_ident!("get_{}_at", proj.name);
             let all_at_name = format_ident!("all_{}_at", proj.name);
 
-            let read_body = Self::generate_row_read_body(schema, &proj_ident, &fields);
+            let read_body =
+                Self::generate_row_read_body(schema, &proj_ident, &fields, Self::identity_field_name(model));
             let doc = format!(
                 "Projection `{}` of `{}` (#113): materializes only PK + \
                  declared columns, leaving unselected columns unread.",
@@ -8310,7 +8586,15 @@ impl RustGenerator {
                 proj.name
             );
             let all_method =
-                Self::generate_buffered_scan_method(schema, &proj_ident, &all_name, &proj_holder, &fields, &all_doc);
+                Self::generate_buffered_scan_method(
+                    schema,
+                    &proj_ident,
+                    &all_name,
+                    &proj_holder,
+                    &fields,
+                    &all_doc,
+                    Self::identity_field_name(model),
+                );
 
             structs.push(quote! {
                 #[doc = #doc]
@@ -8372,6 +8656,7 @@ impl RustGenerator {
         schema: &Schema,
         struct_ident: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
     ) -> TokenStream {
         let mut read_statements = Vec::new();
         let mut field_values = Vec::new();
@@ -8380,7 +8665,7 @@ impl RustGenerator {
 
         for field in fields {
             let field_name = format_ident!("{}", field.name);
-            match Self::field_read_stmt(schema, field, &recv, &row, false) {
+            match Self::field_read_stmt(schema, field, &recv, &row, false, Some(field.name.as_str()) == key_name) {
                 Some((value_ident, stmt)) => {
                     read_statements.push(stmt);
                     // C1: only push to field_values when a binding was emitted.
@@ -8417,7 +8702,7 @@ impl RustGenerator {
     fn generate_read_at_logic(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let fields: Vec<&forgedb_parser::Field> = model.fields.iter().collect();
-        Self::generate_row_read_body(schema, &model_name, &fields)
+        Self::generate_row_read_body(schema, &model_name, &fields, Self::identity_field_name(model))
     }
 
     /// Return the Rust type tokens used for raw byte storage read/write (C3).
@@ -8729,18 +9014,97 @@ impl RustGenerator {
         }
     }
 
+    /// Does any model in the schema key on an inline string (#252)?
+    ///
+    /// Gates the `InlineStr` import, so a schema without a string key is
+    /// byte-identical to what it generated before #252 — the same zero-churn
+    /// discipline #266 held to, and the same reason #238 emits its prefix decoder
+    /// conditionally.
+    ///
+    /// One predicate covers all three key positions: a foreign key and a junction
+    /// endpoint both resolve *through* a model's identity, so neither can be an
+    /// inline string unless some model's identity already is.
+    pub(crate) fn needs_inline_str(schema: &Schema) -> bool {
+        schema.models.iter().any(|m| {
+            matches!(
+                Self::identity_type(schema, m),
+                Some(forgedb_parser::FieldType::StringN { .. })
+            )
+        })
+    }
+
+    /// The `use forgedb_types::InlineStr;` line, or nothing.
+    pub(crate) fn inline_str_import(schema: &Schema) -> TokenStream {
+        if Self::needs_inline_str(schema) {
+            quote! { use forgedb_types::InlineStr; }
+        } else {
+            quote! {}
+        }
+    }
+
     /// Does any field in the schema need the inline-string prefix decoder (#238)?
     ///
     /// Emitted conditionally so a schema whose inline strings are all `string(N!)`
     /// — the prefix-free shape — carries no prefix machinery at all.
     fn needs_inline_len_helper(schema: &forgedb_parser::Schema) -> bool {
         schema.models.iter().flat_map(|m| &m.fields).any(|f| {
-            Self::inline_string_params(&f.field_type)
+            // Resolved (#252): an FK to a string-keyed model is an inline-string
+            // column, and a non-exact target key gives it a length prefix to
+            // decode — so the helper has to be emitted for the FK's sake even
+            // when no `string(N)` is declared in that model at all.
+            Self::inline_string_column_params(schema, &f.field_type)
                 .map(|(chars, exact)| {
                     Self::inline_string_layout(chars, exact, Self::is_utf8_field(f)).1 > 0
                 })
                 .unwrap_or(false)
         })
+    }
+
+    /// The `__forgedb_identity_char_ok` free function, emitted once per generated
+    /// file when some model keys on an inline string (#252 res 4).
+    ///
+    /// The rule is **RFC 3986 `pchar` minus `pct-encoded`** — every character that
+    /// is legal unencoded in a URL path segment, less `%`. Excluding `%` buys the
+    /// stronger property that the segment is **byte-identical to the key**, which
+    /// is what makes the rule checkable, explainable, and the URL for a row
+    /// obvious.
+    ///
+    /// It is chosen over the tighter *unreserved-only* set on purpose: `@` and `:`
+    /// are `pchar`, so `user@example.com` and `urn:isbn:0451450523` are admissible
+    /// natural keys — which is the ingestion scenario #252 exists for — and it is
+    /// the same rule #254's RFC 3339 timestamp key already satisfies (`:` is a
+    /// `pchar`), so the two identity types follow ONE path rule rather than two.
+    /// And it is chosen over "anything but `/` and `%`" because that admits
+    /// non-ASCII, which reopens the Unicode-normalization question res 3 and 4
+    /// close: `café` in NFC and NFD are two byte sequences for one text, and a
+    /// primary key compares byte-wise.
+    ///
+    /// **Generated, not substrate** (res 7). `InlineStr::try_from` enforces the
+    /// byte bound and nothing else — it is schema-agnostic and knows nothing about
+    /// identities or URLs. This rule applies *because the field is an identity*,
+    /// which is schema knowledge; putting it in the substrate would make
+    /// `InlineStr` a type that encodes an application-level policy.
+    fn generate_identity_alphabet_helper() -> TokenStream {
+        quote! {
+            /// Is `c` legal unencoded in a URL path segment (#252 res 4)?
+            ///
+            /// RFC 3986 `pchar` minus `pct-encoded`: `unreserved` / `sub-delims` /
+            /// `:` / `@`. Rejected: `/ ? # [ ] %`, space, and every control and
+            /// non-ASCII character.
+            #[inline]
+            fn __forgedb_identity_char_ok(__c: char) -> bool {
+                __c.is_ascii_alphanumeric()
+                    || matches!(
+                        __c,
+                        // unreserved
+                        '-' | '.' | '_' | '~'
+                        // sub-delims
+                        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+                        // the two pchar extras
+                        | ':' | '@'
+                    )
+            }
+        }
     }
 
     /// The `__forgedb_inline_len` free function, emitted once per generated file
@@ -8799,6 +9163,42 @@ impl RustGenerator {
             forgedb_parser::FieldType::Nullable(inner) => Self::inline_string_params(inner),
             _ => None,
         }
+    }
+
+    /// The **storage-layout** view of [`Self::inline_string_params`] (#252).
+    ///
+    /// Resolves an FK to its target's identity first (#266), so a column that
+    /// *stores* a string key is packed, read, sized and backfilled as an inline
+    /// string wherever the declared type is a relation. The unresolved form
+    /// stays the one the *value* predicates use: an FK's value is a key, not a
+    /// `String`, so it must not pick up `@length`/`@pattern`/the ASCII check.
+    ///
+    /// The width is always the target key's own, and `@utf8` is a validation
+    /// error on an identity (res 3), so an FK column is exactly N bytes wide —
+    /// the same layout the target's id column has, which is what lets a probe
+    /// key and a stored key compare byte for byte.
+    fn inline_string_column_params(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> Option<(u8, bool)> {
+        Self::inline_string_params(&Self::resolved_type(schema, field_type))
+    }
+
+    /// Does this field's Rust type come out as `InlineStr<N>` (#252)?
+    ///
+    /// True in exactly the two key positions: the model's identity, and an FK
+    /// that resolves to a string-keyed identity. A `string(N)` *column* of the
+    /// same declared type is a `String` — the distinction `key_type_ident`
+    /// exists for. Drives the `#[schema(value_type = String)]` annotation,
+    /// since `InlineStr` implements no `ToSchema`.
+    fn is_inline_key_field(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        field: &forgedb_parser::Field,
+    ) -> bool {
+        (Self::is_identity(model, field)
+            || Self::fk_backing_type(schema, &field.field_type).is_some())
+            && Self::is_inline_string_type(&Self::resolved_type(schema, &field.field_type))
     }
 
     /// Does this field's *value* present as a Rust `String`?
@@ -9012,7 +9412,7 @@ impl RustGenerator {
                 let field_reads: Vec<_> = read_fields
                     .iter()
                     .filter_map(|f| {
-                        Self::field_read_stmt(schema, f, recv, &row_tok, false).map(|(_, stmt)| stmt)
+                        Self::field_read_stmt(schema, f, recv, &row_tok, false, false).map(|(_, stmt)| stmt)
                     })
                     .collect();
 
@@ -10131,11 +10531,7 @@ impl RustGenerator {
                     let fk_probe = format_ident!("find_by_{}", field.name);
                     let child_field_str = field.name.as_str();
                     let child_name_str = child.name.as_str();
-                    let probe_arg = if optional {
-                        quote! { Some(id) }
-                    } else {
-                        quote! { id }
-                    };
+                    let probe_arg = Self::fk_probe_arg(schema, &parent.name, !optional);
                     let child_indexed = child
                         .fields
                         .iter()
@@ -11587,8 +11983,8 @@ impl RustGenerator {
             // #266: each endpoint's column, index and frame slot is that
             // endpoint's OWN identity type — a junction is no longer uuid-shaped.
             let (lt, rt) = Self::junction_key_pair(schema, &m);
-            let lk = Self::map_field_type_ident(schema, &lt);
-            let rk = Self::map_field_type_ident(schema, &rt);
+            let lk = Self::key_type_ident(schema, &lt);
+            let rk = Self::key_type_ident(schema, &rt);
             let lwv = Self::junction_key_width(&lt);
             let rwv = Self::junction_key_width(&rt);
             let lw = quote! { #lwv };
@@ -12183,11 +12579,7 @@ impl RustGenerator {
 
             let body = if child_indexed {
                 // Required FK probe takes the key; optional FK probe takes `Option<key>`.
-                let arg = if p.is_required {
-                    quote! { id }
-                } else {
-                    quote! { Some(id) }
-                };
+                let arg = Self::fk_probe_arg(schema, &p.parent_model, p.is_required);
                 quote! { self.#child_field.#fk_probe(#arg) }
             } else {
                 let fk_field = format_ident!("{}", p.child_field);
@@ -12222,8 +12614,8 @@ impl RustGenerator {
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
             // #266: each side of the junction is keyed on its OWN identity type.
             let (lt, rt) = Self::junction_key_pair(schema, &m);
-            let lk = Self::map_field_type_ident(schema, &lt);
-            let rk = Self::map_field_type_ident(schema, &rt);
+            let lk = Self::key_type_ident(schema, &lt);
+            let rk = Self::key_type_ident(schema, &rt);
 
             // link_<a>_<b>
             let link_name = format!(
@@ -12377,7 +12769,7 @@ impl RustGenerator {
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
             // #266: the left endpoint's own identity type.
             let (lt, _) = Self::junction_key_pair(schema, &m);
-            let lk = Self::map_field_type_ident(schema, &lt);
+            let lk = Self::key_type_ident(schema, &lt);
 
             let fwd_at_name = format!("{}_{}_at", Self::to_snake_case(&m.model1), m.field1);
             if seen.insert(fwd_at_name.clone()) {
@@ -12532,7 +12924,53 @@ impl RustGenerator {
     ///
     /// Note: for `OptionalStructType` and `Nullable`, this returns the *inner* type
     /// token.  The `Option<>` wrapper is applied by callers that check `field.is_nullable()`.
+    /// The Rust type a `FieldType` takes in a **key position** (#252).
+    ///
+    /// Three positions are key positions, and they are the only three: a model's
+    /// identity field, a foreign key (whose value *is* the target's key), and a
+    /// junction endpoint column. In all three the generated code passes the value
+    /// **by value** — `get(id)`, `delete(id)`, the `id_to_row` / `id_versions`
+    /// maps, #266's junction traversal indexes, the live-query delta enum — which
+    /// is why a key must be `Copy` and a `String` cannot be one.
+    ///
+    /// The only type that renders differently here than in
+    /// [`map_field_type_ident`](Self::map_field_type_ident) is `string(N)`:
+    /// `InlineStr<N>` as a key, a plain `String` everywhere else (#238's
+    /// decision 5).
+    ///
+    /// **Why the split is not merely a preference.** `map_field_type_ident` takes
+    /// a `FieldType`, not a `Field`, so it cannot see `@utf8` — and a
+    /// *non-identity* `string(N) @utf8` column is N..4N bytes wide, so its
+    /// `InlineStr` parameter would have to be `4N`. A key is never `@utf8`
+    /// (res 3), so in a key position — and only in a key position — the byte
+    /// width is exactly N and a `FieldType` is enough to compute it.
+    pub(crate) fn key_type_ident(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> TokenStream {
+        match field_type {
+            forgedb_parser::FieldType::StringN { chars, .. } => {
+                // Bytes, not characters — but under res 3 that mapping is the
+                // identity function, because a key is one byte per character.
+                let bytes = *chars as usize;
+                quote! { InlineStr<#bytes> }
+            }
+            // `?Model` resolves to `Nullable(K)`; the `Option<>` wrapper is added
+            // by the caller's `is_nullable()`, exactly as elsewhere.
+            forgedb_parser::FieldType::Nullable(inner) => Self::key_type_ident(schema, inner),
+            other => Self::map_field_type_ident(schema, other),
+        }
+    }
+
     fn map_field_type_ident(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
+        // #252: a foreign key's value IS the target's key, so a target keyed on
+        // an inline string gives the FK column the `Copy` key type rather than a
+        // `String`. Tested BEFORE `resolved_type` collapses the relation: after
+        // it, a resolved `StringN` is indistinguishable from an ordinary
+        // non-key `string(N)` column, which stays a `String`.
+        if Self::fk_backing_type(schema, field_type).is_some() {
+            return Self::key_type_ident(schema, &Self::resolved_type(schema, field_type));
+        }
         let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             forgedb_parser::FieldType::U32 => quote! { u32 },
