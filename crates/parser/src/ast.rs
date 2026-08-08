@@ -620,6 +620,13 @@ impl FieldType {
         )
     }
 
+    // #251 RED STUB — deliberately admits everything, so the allow-list scenarios
+    // fail on their assertions rather than on a missing symbol.
+    pub fn is_identity_key(&self) -> bool {
+        let _ = self;
+        true
+    }
+
     /// Check if this type is fixed-size (Sprint 8)
     pub fn is_fixed_size(&self) -> bool {
         match self {
@@ -809,6 +816,20 @@ impl Struct {
             .map(|f| f.field_type.alignment(schema))
             .max()
             .unwrap_or(1)
+    }
+}
+
+impl Model {
+    // #251 RED STUB — deliberately the OLD single-pass form, so the scenarios
+    // fail on their assertions rather than on a missing symbol.
+    pub fn identity_field(&self) -> Option<&Field> {
+        self.fields
+            .iter()
+            .find(|f| f.name == "id" || f.auto_generate)
+    }
+
+    pub fn has_identity(&self) -> bool {
+        self.identity_field().is_some()
     }
 }
 

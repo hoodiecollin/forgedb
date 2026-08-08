@@ -1871,4 +1871,255 @@ mod tests {
         );
         assert!(conventional.is_empty(), "{conventional:?}");
     }
+
+    // ---- #251: one predicate, with precedence, and the identity allow-list ----
+
+    /// **Scenario 1 — shape 4, the silent mis-key.**
+    ///
+    /// `identity_field` used to be `find(|f| f.name == "id" || f.auto_generate)`,
+    /// which tests both conditions at each field in **declaration order** — so a
+    /// `+` field above `id` wins over `id` itself. With a key-shaped `+` type the
+    /// result compiles and runs: the database is keyed on `seq`, the generated
+    /// parameter is *named* `id` while carrying `seq`'s value, and every relation
+    /// pointing at this model points at the wrong column.
+    ///
+    /// This asserts the **shared** predicate on the AST, which is the only
+    /// definition after #251 — every selection site routes through it, so one
+    /// assertion here covers all of them (`tests/identity_predicate_test.rs` in
+    /// the root crate proves no copy survives to disagree).
+    #[test]
+    fn an_id_field_wins_over_an_auto_declared_above_it() {
+        let schema = ast("Event {\n  seq: +u64\n  id: u32\n  note: string\n}\n");
+        let id = schema.models[0]
+            .identity_field()
+            .expect("the model has an identity");
+        assert_eq!(id.name, "id", "`id` wins by name, not by declaration order");
+        assert!(matches!(id.field_type, FieldType::U32), "{:?}", id.field_type);
+
+        // The reverse order must give the same answer — precedence, not position.
+        let schema = ast("Event {\n  id: u32\n  seq: +u64\n  note: string\n}\n");
+        assert_eq!(schema.models[0].identity_field().map(|f| f.name.as_str()), Some("id"));
+
+        // With no `id` field a `+` field still serves, which is the #248 spelling
+        // the corpus uses (`code: +uuid`). Precedence must not break it.
+        let schema = ast("Event {\n  code: +uuid\n  note: string\n}\n");
+        assert_eq!(schema.models[0].identity_field().map(|f| f.name.as_str()), Some("code"));
+
+        // And a model with neither has none — `has_identity` is the same
+        // predicate, so the two cannot disagree about existence.
+        let schema = ast("Event {\n  note: string\n}\n");
+        assert!(schema.models[0].identity_field().is_none());
+        assert!(!schema.models[0].has_identity());
+    }
+
+    /// **Scenario 2 (revised).** `OnlyAutoTimestamp { created_at: +timestamp }`
+    /// reaches identity by accident.
+    ///
+    /// Gate 2 expected #248's "no identity field" here, via a
+    /// `is_identity_eligible_auto` predicate that made a `+timestamp` un-inferable.
+    /// **#254 shipped a strictly better answer and this issue keeps it**: the
+    /// field IS selected, and a dedicated diagnostic names it and says a
+    /// `+timestamp` is a stamp rather than a key. "No identity field" would have
+    /// pointed the author at the model when the offending token is on a field.
+    ///
+    /// Either way the allow-list must not add a *second* message: `timestamp` is
+    /// an admitted identity type, so the type check passes and only the
+    /// stamp-vs-key rule fires.
+    #[test]
+    fn an_auto_timestamp_reached_by_accident_names_the_stamp() {
+        let e = errs("OnlyAutoTimestamp {\n  created_at: +timestamp(us)\n  name: string\n}\n");
+        assert_eq!(e.len(), 1, "one mistake, one diagnostic: {e:?}");
+        assert!(e[0].contains("created_at"), "names the field, not the model: {e:?}");
+        assert!(
+            e[0].contains("stamp") && e[0].contains("key"),
+            "and says what the confusion is: {e:?}"
+        );
+    }
+
+    /// **Scenario 3.** A **user-supplied** `timestamp` identity is admitted at
+    /// every declared precision — the ingestion case, where foreign data arrives
+    /// with its own event time as its natural key and the author asserts
+    /// uniqueness. #254 made precision declarable; the allow-list must admit all
+    /// three keys, not only the `us` one its *auto* sibling is floored to.
+    #[test]
+    fn a_user_supplied_timestamp_identity_is_admitted_at_every_precision() {
+        for src in [
+            "Tick {\n  id: timestamp\n  v: i64\n}\n",
+            "Tick {\n  id: timestamp(s)\n  v: i64\n}\n",
+            "Tick {\n  id: timestamp(ms)\n  v: i64\n}\n",
+            "Tick {\n  id: timestamp(us)\n  v: i64\n}\n",
+        ] {
+            assert!(errs(src).is_empty(), "{src} => {:?}", errs(src));
+        }
+    }
+
+    /// **Scenario 4.** An **allocated** timestamp identity is floored at `us`
+    /// (#254 res 2) — and the allow-list must not double-report it. `timestamp`
+    /// is on the allow-list, so the only diagnostic is the floor.
+    #[test]
+    fn an_allocated_timestamp_identity_is_floored_at_micros_exactly_once() {
+        for src in [
+            "Tick {\n  id: +timestamp\n  v: i64\n}\n",
+            "Tick {\n  id: +timestamp(s)\n  v: i64\n}\n",
+            "Tick {\n  id: +timestamp(ms)\n  v: i64\n}\n",
+        ] {
+            let e = errs(src);
+            assert_eq!(e.len(), 1, "exactly one diagnostic for {src}: {e:?}");
+            assert!(e[0].contains("us"), "names the floor: {e:?}");
+        }
+        assert!(errs("Tick {\n  id: +timestamp(us)\n  v: i64\n}\n").is_empty());
+    }
+
+    /// **Scenario 6.** Every unsupported identity type is rejected with a
+    /// **positioned** diagnostic that names the field and the allowed set.
+    ///
+    /// The list is the whole point of an allow-list rather than a `Copy` rule:
+    /// `bool` is `Copy` and nonsense as a key, `bytes(N)` is `Copy` and rejected
+    /// on modelling grounds, and `f64` is `Copy` but not `Eq` so `HashMap<f64, _>`
+    /// does not exist. Only enumeration gets all three right.
+    #[test]
+    fn every_unsupported_identity_type_is_rejected_by_name() {
+        let cases: &[(&str, &str)] = &[
+            ("bool", "T {\n  id: bool\n  n: string\n}\n"),
+            ("f64", "T {\n  id: f64\n  n: string\n}\n"),
+            ("decimal", "T {\n  id: decimal\n  n: string\n}\n"),
+            ("json", "T {\n  id: json\n  n: string\n}\n"),
+            ("bytes(N)", "T {\n  id: bytes(26)\n  n: string\n}\n"),
+            ("fixed array", "T {\n  id: [u32; 4]\n  n: string\n}\n"),
+            ("nullable scalar", "T {\n  id: u32?\n  n: string\n}\n"),
+            (
+                "enum",
+                "enum Colour {\n  Red\n  Blue\n}\n\nT {\n  id: Colour\n  n: string\n}\n",
+            ),
+            (
+                "struct",
+                "struct Point {\n  x: f64\n  y: f64\n}\n\nT {\n  id: Point\n  n: string\n}\n",
+            ),
+            (
+                "optional FK",
+                "Owner {\n  id: +uuid\n}\n\nT {\n  id: ?Owner\n  n: string\n}\n",
+            ),
+            (
+                "one-to-many",
+                "Owner {\n  id: +uuid\n  ts: [T]\n}\n\nT {\n  id: [Owner]\n  n: string\n}\n",
+            ),
+        ];
+
+        for (label, src) in cases {
+            let d = diags(src);
+            let e: Vec<_> = d.iter().filter(|x| !x.is_warning()).collect();
+            assert_eq!(e.len(), 1, "{label}: exactly one diagnostic: {d:?}");
+            assert!(
+                e[0].message.contains("T.id"),
+                "{label}: names the offending field: {:?}",
+                e[0]
+            );
+            assert!(
+                e[0].message.contains("uuid") && e[0].message.contains("string(N)"),
+                "{label}: names the allowed set: {:?}",
+                e[0]
+            );
+            assert!(e[0].position.is_some(), "{label}: positioned: {:?}", e[0]);
+            assert_eq!(
+                e[0].position.map(|p| p.line),
+                Some(if src.starts_with('T') { 2 } else { 6 }),
+                "{label}: on the field's own line: {:?}",
+                e[0]
+            );
+        }
+    }
+
+    /// **Scenario 7.** A **required** FK identity is admitted — the
+    /// shared-primary-key 1:1 idiom, which compiles and runs today and would have
+    /// been broken by the "relations rejected" reading of the original proposal.
+    /// Its key is the parent's key, resolved transitively by #266.
+    #[test]
+    fn a_required_fk_identity_is_admitted() {
+        assert!(
+            errs("Customer {\n  id: +uuid\n}\n\nProfile {\n  id: *Customer\n  bio: string\n}\n")
+                .is_empty()
+        );
+        // ...including through a chain, and onto a non-uuid key.
+        assert!(
+            errs(
+                "Region {\n  id: i64\n}\n\nStore {\n  id: *Region\n}\n\n\
+                 Till {\n  id: *Store\n  label: string\n}\n"
+            )
+            .is_empty()
+        );
+    }
+
+    /// **Scenario 8.** Every admitted shape validates clean. This is the control:
+    /// an allow-list that rejects too much is as broken as one that rejects too
+    /// little, and the failure is quieter (a schema that used to work stops).
+    #[test]
+    fn every_admitted_identity_type_validates_clean() {
+        for src in [
+            "T {\n  id: uuid\n  n: string\n}\n",
+            "T {\n  id: +uuid\n  n: string\n}\n",
+            "T {\n  code: +uuid\n  n: string\n}\n",
+            "T {\n  id: u32\n  n: string\n}\n",
+            "T {\n  id: +u32\n  n: string\n}\n",
+            "T {\n  id: u64\n  n: string\n}\n",
+            "T {\n  id: +u64\n  n: string\n}\n",
+            "T {\n  seq: +u64\n  n: string\n}\n",
+            "T {\n  id: i32\n  n: string\n}\n",
+            "T {\n  id: i64\n  n: string\n}\n",
+            "T {\n  id: timestamp(us)\n  n: string\n}\n",
+            "T {\n  id: +timestamp(us)\n  n: string\n}\n",
+            "T {\n  id: string(26!)\n  n: string\n}\n",
+            "T {\n  id: string(32)\n  n: string\n}\n",
+            "Owner {\n  id: +uuid\n}\n\nT {\n  id: *Owner\n  n: string\n}\n",
+        ] {
+            assert!(errs(src).is_empty(), "{src} => {:?}", errs(src));
+        }
+    }
+
+    /// **The fold.** #252 left two validation rows annotated to be folded into
+    /// this allow-list rather than placed beside it — `check_string_identities`
+    /// and `check_m2m_endpoint_keys`. Two overlapping checks on one field produce
+    /// two diagnostics for one mistake, pointing at two different fixes.
+    ///
+    /// A `json`-keyed model on both ends of a many-to-many is the case that
+    /// separates them: before the fold it produced *no* identity diagnostic and
+    /// one endpoint diagnostic; a naive allow-list beside the endpoint check
+    /// would produce two. The endpoint rule is subsumed — every admitted identity
+    /// resolves to a type `FieldType::is_junction_key` accepts.
+    #[test]
+    fn one_bad_identity_yields_one_diagnostic_even_on_a_junction() {
+        let e = errs("A {\n  id: json\n  bs: [B]\n}\n\nB {\n  id: +uuid\n  as: [A]\n}\n");
+        assert_eq!(e.len(), 1, "one mistake, one message: {e:?}");
+        assert!(e[0].contains("A.id"), "and it is the identity message: {e:?}");
+
+        // Same for a bare `string` endpoint (the row #252 wrote).
+        let e = errs("A {\n  id: string\n  bs: [B]\n}\n\nB {\n  id: +uuid\n  as: [A]\n}\n");
+        assert_eq!(e.len(), 1, "one mistake, one message: {e:?}");
+        assert!(e[0].contains("string(N)"), "the width message survives: {e:?}");
+    }
+
+    /// The admitted set and `FieldType::is_junction_key` are the same set, and
+    /// that is a load-bearing coincidence rather than an accident: an `id_to_row`
+    /// map and a junction column need the same three properties — fixed width,
+    /// hashable, totally equatable. If they ever diverge, either a junction
+    /// silently vanishes (#266's original defect) or the endpoint check becomes
+    /// reachable again and one mistake gets two messages.
+    #[test]
+    fn every_admitted_scalar_identity_can_hold_a_junction() {
+        for ty in [
+            FieldType::Uuid,
+            FieldType::U32,
+            FieldType::U64,
+            FieldType::I32,
+            FieldType::I64,
+            FieldType::Timestamp(crate::ast::TimestampPrecision::Micros),
+            FieldType::StringN { chars: 26, exact: true },
+        ] {
+            assert!(ty.is_identity_key(), "{ty:?} is an admitted identity");
+            assert!(ty.is_junction_key(), "{ty:?} must also hold a junction");
+        }
+        for ty in [FieldType::String, FieldType::F64, FieldType::Bool, FieldType::Json] {
+            assert!(!ty.is_identity_key(), "{ty:?} is not an admitted identity");
+            assert!(!ty.is_junction_key(), "{ty:?} cannot hold a junction either");
+        }
+    }
 }
