@@ -112,17 +112,15 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
     // `string(N)` / `string(N!)` / `@utf8` (#238).
     check_inline_strings(schema, errors);
 
-    // #252: a string identity must carry a declared width, and may not widen its
-    // characters. Runs BEFORE the junction check so a bare `string` identity is
-    // reported once, as an identity, rather than a second time as an endpoint.
-    check_string_identities(schema, errors);
+    // #251: the identity type allow-list — the ONE place an identity's type is
+    // refused. Folds in #252's `string` rules and subsumes #266's junction
+    // endpoint check, so one bad key earns exactly one diagnostic.
+    check_identity_types(schema, errors);
 
-    // #266: an identity that is itself a foreign key must terminate; a foreign
-    // key inherits its target's key width; a junction endpoint's key must be one
-    // the junction can physically hold.
+    // #266: an identity that is itself a foreign key must terminate, and a
+    // foreign key inherits its target's key width.
     check_identity_cycles(schema, errors);
     check_fk_key_widths(schema, errors);
-    check_m2m_endpoint_keys(schema, errors);
 
     // Duplicate top-level names.
     check_duplicate_names(
@@ -262,10 +260,7 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // (Whether the chosen field's *type* can serve as a key is a separate,
         // unenforced question — a `string` or `timestamp` identity still generates
         // code that does not compile. Tracked separately.)
-        if !model
-            .fields
-            .iter()
-            .any(|f| f.name == "id" || f.auto_generate)
+        if !model.has_identity()
         {
             errors.push(
                 positioned(
@@ -291,7 +286,7 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // The asymmetry against #187's integer autos is deliberate: the only
         // reason to write `+u32`/`+u64` is to get an allocated sequence, so an
         // auto-integer is unambiguously key-ish.  Do not "clean this up".
-        if let Some(identity) = identity_field(model) {
+        if let Some(identity) = model.identity_field() {
             if let FieldType::Timestamp(precision) = &identity.field_type {
                 if identity.auto_generate && identity.name != "id" {
                     errors.push(
@@ -349,7 +344,7 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
         // Silence would be defensible for a *redundant* modifier; it was NOT
         // defensible for the non-identity case, where the same silence meant no
         // uniqueness enforcement at all (the bug #258 fixes).
-        if let Some(identity) = identity_field(model) {
+        if let Some(identity) = model.identity_field() {
             if identity.unique || identity.indexed {
                 let modifier = if identity.unique { "&" } else { "^" };
                 errors.push(
@@ -805,25 +800,97 @@ fn check_inline_strings(schema: &Schema, errors: &mut Vec<ValidationError>) {
     }
 }
 
-/// The two identity-specific string rules (#252): a key must carry a declared
-/// width, and it may not widen its characters.
+/// The `.forge` spelling of a type, for a diagnostic that has to name what the
+/// author actually wrote. `FieldType::to_rust_type` renders the *generated* type,
+/// which is the wrong vocabulary for a schema error (`serde_json::Value` for
+/// `json`, `uuid::Uuid /* FK to X */` for `*X`).
+fn spell_field_type(ty: &FieldType) -> String {
+    match ty {
+        FieldType::U32 => "u32".into(),
+        FieldType::U64 => "u64".into(),
+        FieldType::I32 => "i32".into(),
+        FieldType::I64 => "i64".into(),
+        FieldType::F64 => "f64".into(),
+        FieldType::Bool => "bool".into(),
+        FieldType::String => "string".into(),
+        FieldType::StringN { chars, exact } => spell_inline_string(*chars, *exact),
+        FieldType::Json => "json".into(),
+        FieldType::Decimal => "decimal".into(),
+        FieldType::Uuid => "uuid".into(),
+        FieldType::Timestamp(p) => format!("timestamp({})", p.key()),
+        FieldType::Enum(name) => format!("{name} (an enum)"),
+        FieldType::Bytes(n) => format!("bytes({n})"),
+        FieldType::FixedArray(inner, n) => format!("[{}; {n}]", spell_field_type(inner)),
+        FieldType::StructType(name) => format!("{name} (a struct)"),
+        FieldType::OptionalStructType(name) => format!("{name}? (a struct)"),
+        FieldType::Nullable(inner) => format!("{}?", spell_field_type(inner)),
+        FieldType::Relation(RelationType::RequiredReference(t)) => format!("*{t}"),
+        FieldType::Relation(RelationType::OptionalReference(t)) => format!("?{t}"),
+        FieldType::Relation(RelationType::OneToMany(t)) => format!("[{t}]"),
+        FieldType::Relation(RelationType::ManyToMany(t)) => format!("[{t}]"),
+        FieldType::Component(_) => "a component reference".into(),
+    }
+}
+
+/// The set an identity may be declared as, rendered for a diagnostic. One string,
+/// so the allowed set is stated identically everywhere it is stated.
+const ALLOWED_IDENTITY_TYPES: &str =
+    "`uuid`, `u32`, `u64`, `i32`, `i64`, `timestamp`, `string(N)` / `string(N!)`, \
+     or a required foreign key (`*Model`)";
+
+/// **#251 — the identity type allow-list, and the ONE place an identity's type is
+/// refused.**
 ///
-/// **For #251, which lands the identity allow-list ONCE:** this is the `string`
-/// *row* of that table, written here because #252 is where the key type is
-/// declared. Fold it into the allow-list rather than adding a second rejection —
-/// two diagnostics for one mistake is worse than either alone. The bare-`string`
-/// arm below is the only place a non-admitted identity type is refused today.
-fn check_string_identities(schema: &Schema, errors: &mut Vec<ValidationError>) {
+/// #248 made an identity *mandatory*; it deliberately constrained neither which
+/// field is chosen (that is `Model::identity_field`'s precedence) nor the chosen
+/// field's **type**. Seven type shapes generated a crate that does not compile —
+/// `id: string` produced 31 errors, `id: f64` 29, `id: json` 30 — and the
+/// diagnostic the author saw named a trait bound in code they did not write.
+///
+/// # Why an allow-list rather than a `Copy + Eq` rule
+///
+/// Because two of the answers do not follow from the mechanics.
+/// [`FieldType::is_identity_key`] carries the full argument; in short, `bool` and
+/// `bytes(N)` are `Copy`, fixed-width and hashable, and are excluded anyway — one
+/// because two rows exhaust the key space, the other on modelling grounds.
+///
+/// # Why it folds in the rules #252 and #266 left beside it
+///
+/// Two overlapping checks on one field produce two diagnostics for one mistake,
+/// pointing at two different fixes. So:
+///
+/// - **#252's `check_string_identities`** is the `string` *row* of this table, and
+///   it is here, not beside it — a bare `string` gets the width-specific message
+///   (which is more useful than the generic allowed-set one) and nothing else.
+/// - **#266's `check_m2m_endpoint_keys` is deleted**, because this subsumes it:
+///   every admitted identity resolves to a type `FieldType::is_junction_key`
+///   accepts (they are the same predicate — see [`FieldType::is_junction_key`]),
+///   so an endpoint whose key a junction cannot hold is now always an identity
+///   error first. Reporting it twice was the only thing that check could still do.
+fn check_identity_types(schema: &Schema, errors: &mut Vec<ValidationError>) {
     for model in &schema.models {
-        let Some(field) = identity_field(model) else {
+        let Some(field) = model.identity_field() else {
             continue;
         };
         let subject = format!("Field '{}.{}'", model.name, field.name);
 
-        // Res 1: a key cannot be variable-width and stay `Copy`, and `Copy` is
-        // the whole mechanism — the generated code passes the identity by value
-        // repeatedly (`get`, `delete`, relation resolution, the delta enum). A
-        // `String` there is 31 move/borrow errors in a single model.
+        // A required FK identity is admitted: its key IS the target's key,
+        // resolved transitively by #266, and the chain is checked for termination
+        // by `check_identity_cycles`. This is the shared-primary-key 1:1 idiom,
+        // and it compiles and runs today — the original proposal's "relations
+        // rejected" row would have broken a working shape.
+        if matches!(
+            field.field_type,
+            FieldType::Relation(RelationType::RequiredReference(_))
+        ) {
+            continue;
+        }
+
+        // The `string` row (#252 res 1). A key cannot be variable-width and stay
+        // `Copy`, and `Copy` is the whole mechanism — the generated code passes
+        // the identity by value repeatedly (`get`, `delete`, relation resolution,
+        // the delta enum). This says what to WRITE instead, which the generic
+        // allowed-set message below cannot: the fix is a width, not another type.
         if matches!(field.field_type, FieldType::String) {
             errors.push(
                 positioned(
@@ -843,9 +910,54 @@ fn check_string_identities(schema: &Schema, errors: &mut Vec<ValidationError>) {
             continue;
         }
 
-        // Res 3: the path-segment alphabet (res 4) is a strict subset of ASCII,
-        // so a key can never hold a character `@utf8` exists to admit. Allowing
-        // it would reserve 4N bytes per row for values the write path rejects.
+        if !field.field_type.is_identity_key() {
+            // A short "why" where the mechanics are not self-evident. Rejecting a
+            // shape that does not compile is never a breaking change — nothing can
+            // be using it — but the author still deserves to know which of the
+            // three key properties their type is missing.
+            let because = match &field.field_type {
+                FieldType::F64 => {
+                    " — a float has no total equality, so it cannot key the row map"
+                }
+                FieldType::Bool => " — two rows would exhaust the key space",
+                FieldType::Bytes(_) => {
+                    " — the identifiers that motivate a non-uuid key (ULIDs, nanoids, prefixed \
+                     vendor keys, ISINs) are text, so they are `string(N)`"
+                }
+                FieldType::Json | FieldType::Decimal => {
+                    " — it has no single canonical byte form, so equal values could key \
+                     different rows"
+                }
+                FieldType::Relation(RelationType::OptionalReference(_)) => {
+                    " — the key would be `Option<K>`, and a nullable identity is not a key"
+                }
+                FieldType::Relation(_) => " — a collection is not a key",
+                FieldType::Nullable(_) | FieldType::OptionalStructType(_) => {
+                    " — the key would be `Option<K>`, and a nullable identity is not a key"
+                }
+                FieldType::FixedArray(..) | FieldType::StructType(_) => {
+                    " — a composite value is not a key"
+                }
+                _ => "",
+            };
+            errors.push(
+                positioned(
+                    format!(
+                        "{subject} is the model's identity, so its type cannot be `{}`{because}. \
+                         An identity must be one of: {ALLOWED_IDENTITY_TYPES}.",
+                        spell_field_type(&field.field_type)
+                    ),
+                    field.position,
+                )
+                .with_suggestion(format!("{}: +uuid", field.name)),
+            );
+            continue;
+        }
+
+        // #252 res 3: the path-segment alphabet (res 4) is a strict subset of
+        // ASCII, so a key can never hold a character `@utf8` exists to admit.
+        // Allowing it would reserve 4N bytes per row for values the write path
+        // rejects.
         if let Some((chars, exact)) = direct_inline_string(&field.field_type)
             && field.has_constraint("utf8")
         {
@@ -935,25 +1047,6 @@ fn render_bound(p: &crate::ast::ConstraintParam) -> String {
 }
 
 /// Build a `ValidationError` with an optional position attached.
-/// The identity field of a model — named `id`, or any `+` auto-generate field
-/// (#248 makes one of the two mandatory).
-///
-/// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
-/// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
-/// single-pass form returns whichever comes FIRST in declaration order, so a
-/// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
-/// to the stamp.  Before #254 that produced a `Timestamp` id type and the
-/// generated crate simply did not compile — loud, if obscure.  #254 makes a
-/// `timestamp` identity legal, so the same schema would now compile and silently
-/// key every row on its creation stamp.
-fn identity_field(model: &crate::ast::Model) -> Option<&crate::ast::Field> {
-    model
-        .fields
-        .iter()
-        .find(|f| f.name == "id")
-        .or_else(|| model.fields.iter().find(|f| f.auto_generate))
-}
-
 /// The FK target named by a `*Model` / `?Model` field, if it is one.
 fn fk_target(field_type: &FieldType) -> Option<&str> {
     match field_type {
@@ -976,7 +1069,7 @@ const IDENTITY_CHAIN_LIMIT: usize = 16;
 fn resolved_identity_type(schema: &Schema, model: &crate::ast::Model) -> Option<FieldType> {
     let mut current = model;
     for _ in 0..IDENTITY_CHAIN_LIMIT {
-        let field = identity_field(current)?;
+        let field = current.identity_field()?;
         match fk_target(&field.field_type) {
             Some(target) => current = schema.models.iter().find(|m| m.name == target)?,
             None => return Some(field.field_type.clone()),
@@ -1004,7 +1097,7 @@ fn check_identity_cycles(schema: &Schema, errors: &mut Vec<ValidationError>) {
         let mut path: Vec<&str> = vec![model.name.as_str()];
         let mut current = model;
         loop {
-            let Some(field) = identity_field(current) else {
+            let Some(field) = current.identity_field() else {
                 break;
             };
             let Some(target) = fk_target(&field.field_type) else {
@@ -1024,7 +1117,7 @@ fn check_identity_cycles(schema: &Schema, errors: &mut Vec<ValidationError>) {
                          (e.g. `id: +uuid`).",
                         path.join(" -> ")
                     ),
-                    identity_field(model).and_then(|f| f.position),
+                    model.identity_field().and_then(|f| f.position),
                 ));
                 break;
             }
@@ -1036,7 +1129,7 @@ fn check_identity_cycles(schema: &Schema, errors: &mut Vec<ValidationError>) {
                          at that depth; shorten the chain or give '{}' a concrete identity.",
                         model.name, IDENTITY_CHAIN_LIMIT, model.name
                     ),
-                    identity_field(model).and_then(|f| f.position),
+                    model.identity_field().and_then(|f| f.position),
                 ));
                 break;
             }
@@ -1077,55 +1170,6 @@ fn check_fk_key_widths(schema: &Schema, errors: &mut Vec<ValidationError>) {
                 field.position,
                 errors,
             );
-        }
-    }
-}
-
-/// A many-to-many junction stores each endpoint's id in a fixed-width column,
-/// indexes it in a `HashMap`, and frames it in a fixed-width replication record
-/// (#266) — so an endpoint key must be fixed-width, hashable and totally
-/// equatable (`FieldType::is_junction_key`).
-///
-/// Before #266 the generator required both endpoints to be uuid-keyed and
-/// **silently emitted nothing** otherwise: the schema compiled and the M2M
-/// surface simply did not exist. #266 removed that restriction for every key the
-/// junction can physically hold; what it cannot hold is reported here instead of
-/// disappearing, so the failure mode is a diagnostic rather than a missing
-/// feature.
-fn check_m2m_endpoint_keys(schema: &Schema, errors: &mut Vec<ValidationError>) {
-    for m in schema.detect_many_to_many_relations() {
-        for name in [&m.model1, &m.model2] {
-            let Some(model) = schema.models.iter().find(|md| &md.name == name) else {
-                continue;
-            };
-            let Some(ty) = resolved_identity_type(schema, model) else {
-                continue;
-            };
-            if ty.is_junction_key() {
-                continue;
-            }
-            // A bare `string` identity is already refused as an identity at all
-            // (#252, `check_string_identities`), and that is the earlier and more
-            // useful diagnostic. Reporting it a second time here would give one
-            // mistake two messages pointing at two different fixes.
-            if matches!(ty, FieldType::String) {
-                continue;
-            }
-            errors.push(positioned(
-                format!(
-                    "Model '{}' cannot be an endpoint of the many-to-many relation \
-                     '{}.{}' <-> '{}.{}': its identity is `{}`, and a junction stores each \
-                     endpoint's id in a fixed-width, hashable column. Use a `uuid`, integer, \
-                     `timestamp` or `string(N)` identity.",
-                    name,
-                    m.model1,
-                    m.field1,
-                    m.model2,
-                    m.field2,
-                    format!("{ty:?}"),
-                ),
-                identity_field(model).and_then(|f| f.position),
-            ));
         }
     }
 }
@@ -1356,7 +1400,7 @@ mod tests {
         }
         let stamp_first = ast("Post {\n  created_at: +timestamp\n  id: +uuid\n}\n");
         assert_eq!(
-            identity_field(&stamp_first.models[0]).map(|f| f.name.as_str()),
+            stamp_first.models[0].identity_field().map(|f| f.name.as_str()),
             Some("id"),
             "`id` wins by name, regardless of declaration order"
         );
@@ -2019,10 +2063,17 @@ mod tests {
                 "{label}: names the allowed set: {:?}",
                 e[0]
             );
-            assert!(e[0].position.is_some(), "{label}: positioned: {:?}", e[0]);
+            // Positioned on the offending FIELD's own line — not on the model,
+            // which is where "no identity field" points and is the wrong place
+            // when the mistake is a token the author typed on one line.
+            let lines: Vec<&str> = src.lines().collect();
+            let want = lines
+                .iter()
+                .rposition(|l| l.trim_start().starts_with("id:"))
+                .map(|i| i + 1);
             assert_eq!(
                 e[0].position.map(|p| p.line),
-                Some(if src.starts_with('T') { 2 } else { 6 }),
+                want,
                 "{label}: on the field's own line: {:?}",
                 e[0]
             );
