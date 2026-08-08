@@ -1585,18 +1585,121 @@ mod tests {
         assert!(e[0].contains("bytes("), "{e:?}");
     }
 
-    /// A `string(N)` identity does not generate compilable code yet — the whole
-    /// API layer parses a non-integer key as a uuid. That hole is older than
-    /// #238 (a bare `string` identity has never compiled either) and belongs to
-    /// #252, which lands a `Copy` key type. Until then this is a loud refusal
-    /// rather than a silent generation of a crate that will not build.
+    // ---- #252: `string(N)` / `string(N!)` identities --------------------------
+
+    /// **Scenario 8.** Both spellings are legal identities (res 1).
+    ///
+    /// `string(N!)` is the natural one — ULIDs, nanoids, hex digests and ISO
+    /// codes are all exact-length — but the motivating list is not all exact:
+    /// Stripe-style prefixed keys vary with the encoded suffix and an email
+    /// natural key varies by definition. Admitting only the exact form would
+    /// exclude exactly the messy foreign data this issue exists for.
+    ///
+    /// This replaces #238's interim refusal, which was a marker for
+    /// `ApiGenerator::id_parse_type`'s `_ => Uuid` fall-through rather than a
+    /// design position.
     #[test]
-    fn an_inline_string_identity_is_refused_for_now() {
-        let e = errs("T {\n  id: string(26!)\n  name: string\n}\n");
-        assert_eq!(e.len(), 1, "{e:?}");
-        assert!(e[0].contains("identity"), "{e:?}");
-        // A non-identity inline string in the same model is fine.
+    fn both_inline_string_spellings_are_legal_identities() {
+        for src in [
+            "Doc {\n  id: string(26!)\n  title: string\n}\n",
+            "Customer {\n  id: string(32)\n  name: string\n}\n",
+            "Person {\n  id: string(254)\n  name: string\n}\n",
+        ] {
+            let e = errs(src);
+            assert!(e.is_empty(), "a declared-width key is a legal identity: {e:?}");
+        }
+        // A non-identity inline string is unaffected.
         assert!(errs("T {\n  id: +uuid\n  code: string(26!)\n}\n").is_empty());
+    }
+
+    /// **Scenario 9.** A **bare** `string` identity is rejected, positioned, and
+    /// the message says what to write instead.
+    ///
+    /// A key cannot be variable-width and stay `Copy`, and `Copy` is the whole
+    /// mechanism: the generated code passes the identity by value repeatedly.
+    /// Left unrejected this generates 31 move/borrow errors in a single model —
+    /// loud, but only once the user has already run `cargo build` on output they
+    /// did not write.
+    #[test]
+    fn a_bare_string_identity_is_rejected_with_a_width_to_write() {
+        let d = diags("Doc {\n  id: string\n  title: string\n}\n");
+        let e: Vec<_> = d.iter().filter(|x| !x.is_warning()).collect();
+        assert_eq!(e.len(), 1, "exactly one diagnostic: {d:?}");
+        assert!(e[0].message.contains("Doc.id"), "names the field: {e:?}");
+        assert!(
+            e[0].message.contains("string(N)"),
+            "and says what to write instead: {e:?}"
+        );
+        assert!(e[0].position.is_some(), "positioned: {e:?}");
+    }
+
+    /// **Scenario 10.** `@utf8` on an identity is an error (res 3).
+    ///
+    /// Res 4's alphabet is a strict subset of ASCII, so a key can never contain a
+    /// character `@utf8` exists to admit. Allowing the directive would reserve 4N
+    /// bytes per row to hold characters the write path rejects — a slot four times
+    /// wider than any value it can accept.
+    ///
+    /// This is the contradiction the purged Gate 1 carried: it offered
+    /// `InlineStr<104>` for a `string(26) @utf8` identity while its own alphabet
+    /// rule made that value unwritable. Neither half was wrong in isolation.
+    #[test]
+    fn utf8_on_an_identity_is_an_error() {
+        let e = errs("Doc {\n  id: string(26!) @utf8\n  title: string\n}\n");
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(e[0].contains("@utf8"), "{e:?}");
+        assert!(
+            e[0].contains("identity"),
+            "and says it is the identity that bars it: {e:?}"
+        );
+        // The same field, not an identity, is fine.
+        assert!(errs("Doc {\n  id: +uuid\n  code: string(26!) @utf8\n}\n").is_empty());
+    }
+
+    /// A string-keyed model is an ordinary many-to-many endpoint (res 9 + #266).
+    ///
+    /// #266 kept a *physical floor* on a junction endpoint's key — fixed-width,
+    /// hashable, totally equatable — and reported anything outside it as an error
+    /// rather than silently dropping the relation. `string(N)` satisfies all three
+    /// once `InlineStr` exists, so the floor widens by one arm and this schema
+    /// stops being an error.
+    #[test]
+    fn a_string_keyed_model_can_be_a_junction_endpoint() {
+        let e = errs(
+            "Isin {\n  id: string(12!)\n  name: string\n  funds: [Fund]\n}\n\n\
+             Fund {\n  id: +uuid\n  label: string\n  holdings: [Isin]\n}\n",
+        );
+        assert!(e.is_empty(), "a string key holds a junction: {e:?}");
+
+        // A bare `string` identity still cannot — but it is refused for being an
+        // identity at all (scenario 9), which is the *earlier* and more useful
+        // diagnostic, so the junction rule must not add a second one.
+        let e = errs(
+            "A {\n  id: string\n  bs: [B]\n}\n\nB {\n  id: +uuid\n  as: [A]\n}\n",
+        );
+        assert_eq!(e.len(), 1, "one diagnostic, not two: {e:?}");
+    }
+
+    /// The identity's width advisory still fires (#238 res 8, `M = 64`), and it
+    /// stays a **warning**.
+    ///
+    /// #238's interim refusal `continue`d before reaching it, so a wide inline key
+    /// was never advised about. #261 measured a wide slot losing on bytes, but a
+    /// `Copy` key can still be worth paying for — that trade stays the schema
+    /// author's, which is what makes it a warning rather than an error. Gate 2
+    /// finding 3 is the *other* cost: `HashMap<InlineStr<254>, usize>` is ~256 MB
+    /// of key material over 1M rows, in RAM, in two maps.
+    #[test]
+    fn a_wide_inline_key_warns_and_still_generates() {
+        let d = diags("Person {\n  id: string(254)\n  name: string\n}\n");
+        assert!(
+            d.iter().all(|x| x.is_warning()),
+            "advisory only — it must still generate: {d:?}"
+        );
+        assert!(
+            d.iter().any(|x| x.message.contains("Person.id")),
+            "and it names the key that pays: {d:?}"
+        );
     }
 
     // ---- #266: FKs follow the target's identity type -------------------------

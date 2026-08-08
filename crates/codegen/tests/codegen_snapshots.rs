@@ -9424,3 +9424,386 @@ fn test_rust_generation_open_guard_has_two_distinct_arms() {
         "a written manifest stamps the generation this binary speaks: {code}"
     );
 }
+
+// ===========================================================================
+// #252 — `string(N)` / `string(N!)` identities, backed by a `Copy` `InlineStr`.
+//
+// Every failure mode here is a *silent* one, which is why each scenario asserts
+// a literal rather than "it generated". `map_field_type_ident` falls through to
+// `String`, `api.rs::id_parse_type` falls through to `Uuid`, and
+// `wasm.rs::pk_parse_opt` falls through to `Uuid::parse_str` — a missing arm in
+// any of the three produces a handler that parses the wrong type rather than a
+// build error. That is #265's `is_uuid_pk` shape, three more times.
+// ===========================================================================
+
+/// `api.rs` for a schema source.
+fn api_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    ApiGenerator::generate(&schema).unwrap().code
+}
+
+/// The wasm read-replica's `replica.rs` for a schema source.
+fn wasm_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    WasmGenerator::generate(&schema).unwrap().code
+}
+
+fn flat(code: &str) -> String {
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **Scenario 16.** The key type is `InlineStr<N>`, with N in **bytes** and the
+/// mapping the identity function.
+///
+/// The explicit guard against the withdrawn `4N` sizing: the previous Gate 1 was
+/// written against #238's inline-or-overflow design and sized `InlineStr<104>`
+/// for a 26-character key. #261 measured that design losing, #238 withdrew it,
+/// and one byte per character plus res 3's `@utf8` ban make the width exactly N.
+/// A `4N` key would still *compile*, which is why this asserts the literal.
+#[test]
+fn test_rust_generation_string_identity_is_inline_str_at_n_bytes() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("InlineStr<26usize>"),
+        "a 26-character key is `InlineStr<26>`: {f:.400}"
+    );
+    assert!(
+        !f.contains("InlineStr<104usize>"),
+        "NOT the withdrawn 4N sizing"
+    );
+    // Both spellings map to the same width — `string(N!)`'s dead `len` is the
+    // price of one key type rather than two (res 2).
+    let atmost = flat(&db_for("Doc {\n  id: string(26)\n  title: string\n}\n"));
+    assert!(
+        atmost.contains("InlineStr<26usize>"),
+        "`string(26)` keys the same width as `string(26!)`"
+    );
+}
+
+/// A **non**-identity `string(N)` stays a plain `String`.
+///
+/// The corollary of res 7 and #238's decision 5: `InlineStr` exists because a key
+/// is passed by value, and a column that is never a key has no such requirement.
+/// Widening the mapping to every inline string would change the public struct
+/// type of a feature that shipped in this same cycle, and — decisively — could
+/// not be expressed: `map_field_type_ident` sees a `FieldType`, not a `Field`, so
+/// it cannot see `@utf8` and cannot compute the `4N` width a non-identity column
+/// needs.
+#[test]
+fn test_rust_generation_a_non_key_inline_string_is_still_a_string() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(26!)\n  tag: string(8) @utf8\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub sku: String"),
+        "a non-identity inline string is a `String`: {f:.400}"
+    );
+    assert!(
+        !f.contains("InlineStr"),
+        "and no key type appears anywhere in a uuid-keyed schema"
+    );
+}
+
+/// **Scenario 19.** The in-memory identity maps are keyed on the key type, and
+/// the create handler renders the key as text.
+///
+/// `id_to_row` / `id_versions` are `HashMap`s, which is why `InlineStr` hashes on
+/// its text (#252 res 8): a key type whose `Eq` and `Hash` disagreed would
+/// produce lookup misses rather than a build error.
+#[test]
+fn test_rust_generation_string_key_reaches_the_identity_maps() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<InlineStr<26usize>, usize>>"),
+        "the row index is keyed on the key type: {f:.600}"
+    );
+    assert!(
+        f.contains("id_versions: std::sync::Arc<HashMap<InlineStr<26usize>, Vec<usize>>>"),
+        "and so is the version index"
+    );
+    assert!(
+        f.contains("pub id: InlineStr<26usize>"),
+        "and the model struct's own field agrees with them"
+    );
+}
+
+/// **Scenario 20.** Wherever the key type lands in a `utoipa::ToSchema` context
+/// it is annotated as a `String`.
+///
+/// `InlineStr` does not implement `ToSchema` — the same situation `Timestamp` and
+/// `Decimal` are already in — so without the annotation the generated crate does
+/// not compile at all. The live-query delta enum is the site most easily missed:
+/// #254's compile check found it as a third, unrouted `Timestamp` site after the
+/// model struct and the projection structs were both already handled.
+#[test]
+fn test_rust_generation_string_key_is_annotated_for_utoipa() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("#[schema(value_type = String)] pub id: InlineStr<26usize>"),
+        "the model struct's key is documented as the string it serializes to: {f:.600}"
+    );
+    let at = f.find("Removed {").expect("the live-delta enum has a Removed variant");
+    let window = &f[at.saturating_sub(120)..(at + 120).min(f.len())];
+    assert!(
+        window.contains("#[schema(value_type = String)]"),
+        "and so is the delta enum's: {window}"
+    );
+}
+
+/// **Scenario 21.** A `string(N)` identity's index key is the same `\u{1}` string
+/// class a bare `string` of the same content produces.
+///
+/// The class byte is what keeps a string key from colliding with a numeric one in
+/// the same index. Moving a key into a different class silently reorders every
+/// range scan, and no test that reads back through the same index can tell.
+#[test]
+fn test_rust_generation_string_key_stays_in_the_string_index_class() {
+    let code = db_for(
+        "Doc {\n  id: string(26!)\n  code: &string(8!)\n  slug: &string\n}\n",
+    );
+    let f = flat(&code);
+    assert!(
+        f.contains(r#"write!(__k, "\u{1}{}", __v)"#) || f.contains(r#"\u{1}"#),
+        "the inline key rides the string class: {f:.400}"
+    );
+    assert!(
+        !f.contains(r#"write!(__k, "\u{2}{}", __v)"#) || f.contains(r#"\u{2}"#),
+        "and not the numeric one"
+    );
+}
+
+/// **Scenario 17.** The REST path parameter parses as the key type, not as a
+/// `Uuid`.
+///
+/// `ApiGenerator::id_parse_type` has ended in `_ => quote! { Uuid }` since
+/// 9a54319 (2026-07-06), so *every* non-integer, non-uuid identity has generated
+/// an `api.rs` that does not compile — a bare `string` identity produces 32
+/// errors of one class on an unmodified tree. #266 handed this forward
+/// deliberately rather than write a test that could not fail; this is that test.
+#[test]
+fn test_api_generation_string_key_path_param_is_the_key_type() {
+    let code = api_for("Sku {\n  code: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("Path<InlineStr<26usize>>"),
+        "the path segment extracts the key type: {f:.800}"
+    );
+    assert!(
+        !f.contains("Path<Uuid>"),
+        "and never falls through to Uuid for a string-keyed model"
+    );
+}
+
+/// The fall-through itself is gone, not merely shadowed.
+///
+/// A `_ => Uuid` arm left in place would keep every future key type silently
+/// wrong. This asserts the *shape*: a required-FK identity pointing at an
+/// integer-keyed parent must parse as that integer, which the raw-`FieldType`
+/// match could never do because it never resolved the relation.
+#[test]
+fn test_api_generation_id_parse_type_resolves_a_relation_identity() {
+    let code = api_for(
+        "Customer {\n  id: +u64\n  name: string\n}\n\nAccount {\n  id: *Customer\n  label: string\n}\n",
+    );
+    let f = flat(&code);
+    assert!(
+        f.contains("Path<u64>"),
+        "an FK identity parses as the far end of the chain: {f:.800}"
+    );
+}
+
+/// **Scenario 18.** The browser read-replica parses a string key as itself.
+///
+/// The arm most likely to be forgotten: the replica is not in the default build,
+/// so nothing else in the suite exercises it. `pk_parse_opt` falls through to
+/// `Uuid::parse_str(&id).ok()`, which returns `None` for every well-formed string
+/// key — a replica that silently resolves nothing.
+#[test]
+fn test_wasm_generation_replica_parses_a_string_key() {
+    let code = wasm_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("InlineStr::<26usize>::try_from(id.as_str()).ok()")
+            || f.contains("InlineStr :: < 26usize > :: try_from"),
+        "the replica parses the key as the key type: {f:.800}"
+    );
+    assert!(
+        !f.contains("Uuid::parse_str(&id).ok()"),
+        "and never as a uuid"
+    );
+}
+
+/// **Scenarios 12 / 14 / 15.** The generated write path carries the identity's
+/// three value rules, and the alphabet check names the offending character and
+/// its position.
+///
+/// Res 4 (URL-path-safe), res 5 (non-empty) and #238's ASCII restriction — which
+/// for a *key* is unconditional, because res 3 removes the `@utf8` escape. All
+/// three are generated rather than substrate (res 7): they apply because the
+/// field is an identity, which `InlineStr` cannot know.
+#[test]
+fn test_rust_generation_string_key_carries_its_value_rules() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+
+    assert!(
+        f.contains(r#"rule: "identity_alphabet""#),
+        "the path-segment alphabet is checked: {f:.600}"
+    );
+    assert!(
+        f.contains(r#"rule: "identity_empty""#),
+        "and the empty key is refused"
+    );
+    // The diagnostic names the character AND its position — a key rejected with
+    // "invalid character" and nothing else is unactionable when the value came
+    // out of somebody else's system.
+    let at = f
+        .find(r#"rule: "identity_alphabet""#)
+        .expect("the alphabet rule is emitted");
+    let window = &f[at..(at + 400).min(f.len())];
+    assert!(
+        window.contains("__c") && window.contains("__i"),
+        "the message names the character and its byte offset: {window}"
+    );
+}
+
+/// **Scenario 13.** The alphabet is `pchar` minus `%`, not the tighter
+/// *unreserved* set.
+///
+/// The guard against silently tightening: `@` and `:` are sub-delims/`pchar` and
+/// must be admitted, because `user@example.com` as a natural key is exactly the
+/// ingestion scenario this issue exists for — and because #254's `+timestamp(us)`
+/// key already renders `:` into its own path segment, so tightening here would
+/// give the two identity types two different path rules.
+#[test]
+fn test_rust_generation_string_key_alphabet_is_pchar_minus_percent() {
+    let code = db_for("Doc {\n  id: string(64)\n  title: string\n}\n");
+    let f = flat(&code);
+    let at = f
+        .find("__forgedb_identity_char_ok")
+        .expect("the alphabet predicate is emitted as a named helper");
+    let window = &f[at..(at + 900).min(f.len())];
+    for admitted in ['@', ':', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '='] {
+        assert!(
+            window.contains(&format!("'{admitted}'")),
+            "`{admitted}` is a pchar and must be admitted: {window}"
+        );
+    }
+    assert!(
+        !window.contains("'%'"),
+        "`%` is excluded so the segment is byte-identical to the key: {window}"
+    );
+}
+
+/// **Scenario 11.** A `string(N)`-keyed model is an ordinary foreign-key target:
+/// the full relation surface generates, at the parent's key width.
+///
+/// Res 9, which is the resolution that constrained shipping. The failure this
+/// guards is a *clean build with the relation surface silently absent* — which is
+/// what #265 found and #266 fixed for integer keys. Asserting presence is the
+/// point.
+#[test]
+fn test_rust_generation_string_keyed_target_keeps_the_relation_surface() {
+    let code = db_for(
+        "Airport {\n  id: string(3!)\n  city: string\n  flights: [Flight]\n}\n\n\
+         Flight {\n  id: +uuid\n  origin: *Airport\n  alt: ?Airport\n}\n",
+    );
+    let f = flat(&code);
+
+    // The FK column is the parent's key type, at the parent's width.
+    assert!(
+        f.contains("pub origin: InlineStr<3usize>"),
+        "a required FK to a string-keyed parent is the parent's key: {f:.600}"
+    );
+    assert!(
+        f.contains("pub alt: Option<InlineStr<3usize>>"),
+        "and an optional FK is the same key, wrapped"
+    );
+    // ...and the column is physically identical to the parent's identity column.
+    assert!(
+        flat(&column_init(&code, "origin")).contains("3usize"),
+        "the FK column is the identity column's width"
+    );
+
+    // Referential integrity, both delete modes, traversal and the reverse getter.
+    assert!(f.contains("fn get_flight_origin"), "forward traversal exists");
+    assert!(
+        f.contains("fn get_airport_flights"),
+        "the reverse collection getter exists"
+    );
+    assert!(
+        f.contains("fn delete_airport"),
+        "the parent's delete wrapper exists"
+    );
+    assert!(
+        f.contains("ValidationError::ForeignKeyViolation")
+            || f.contains("ForeignKey"),
+        "referential integrity is enforced on create"
+    );
+}
+
+/// The M2M half of scenario 11 — #266's Gate 2 handoff 1.
+///
+/// #266 parameterized the junction on its two endpoint key types, but kept a
+/// *physical floor* (`FieldType::is_junction_key`): fixed-width, hashable and
+/// totally equatable, because the key sits in a `FixedColumn`, in a `HashMap`,
+/// and in a fixed-width replication frame. `string(N)` satisfies all three — it
+/// is a fixed slot and `InlineStr` is `Copy + Hash + Eq` — so the predicate
+/// widens by one arm and the junction picks it up.
+#[test]
+fn test_rust_generation_string_key_is_a_junction_endpoint() {
+    let code = db_for(
+        "Isin {\n  id: string(12!)\n  name: string\n  funds: [Fund]\n}\n\n\
+         Fund {\n  id: +uuid\n  label: string\n  holdings: [Isin]\n}\n",
+    );
+    let f = flat(&code);
+
+    assert!(
+        f.contains("fn link_fund_isin") || f.contains("fn link_isin_fund"),
+        "the junction generates rather than silently vanishing: {f:.600}"
+    );
+    // The junction column is the endpoint's own key width, not a blanket 16.
+    assert!(
+        f.contains("FixedColumn::new") && f.contains("12usize"),
+        "the string endpoint's junction column is 12 bytes wide"
+    );
+    // The traversal index is keyed on the key types, which is what needs
+    // `Copy + Hash + Eq`.
+    assert!(
+        f.contains("HashMap<Uuid, Vec<InlineStr<12usize>>>")
+            || f.contains("HashMap<InlineStr<12usize>, Vec<Uuid>>"),
+        "the in-memory traversal index keys on the endpoint key types: {f:.600}"
+    );
+}
+
+/// The validator and the generator must agree about which key types a junction
+/// admits, because they cannot see each other: `FieldType::is_junction_key` on
+/// the AST is the single predicate, and if the two sides drifted a relation would
+/// silently vanish again — the exact failure #266 exists to remove.
+#[test]
+fn test_string_key_is_admitted_by_the_shared_junction_predicate() {
+    assert!(
+        FieldType::StringN {
+            chars: 12,
+            exact: true
+        }
+        .is_junction_key(),
+        "the exact spelling is a junction key"
+    );
+    assert!(
+        FieldType::StringN {
+            chars: 32,
+            exact: false
+        }
+        .is_junction_key(),
+        "and so is the at-most spelling — both occupy a fixed slot"
+    );
+    assert!(
+        !FieldType::String.is_junction_key(),
+        "a bare `string` is variable-width and still cannot be one"
+    );
+}
