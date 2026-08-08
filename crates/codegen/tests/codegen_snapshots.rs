@@ -8,6 +8,7 @@ use forgedb_codegen::{
     RustSdkGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
     WasmGenerator,
 };
+use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
 use forgedb_parser::{Field, FieldType, Model, RelationType, Schema, TimestampPrecision};
 
@@ -9132,5 +9133,177 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
     assert!(
         flat.contains("<u64>::from_le_bytes((&ev.bytes[16..24])"),
         "...and the follower decodes that slot back at the right offset"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #254 — the engine-format migration hop, and the two-arm open guard
+// ---------------------------------------------------------------------------
+
+/// A schema whose timestamps sit in every position a schema-blind column pass
+/// cannot see: bare, nullable, inside a fixed array, and inside a struct.
+fn engine_hop_schema() -> Schema {
+    let src = r#"
+struct Window {
+  opened_at: timestamp(s)
+  closed_at: timestamp(us)
+}
+
+Reading {
+  id: +uuid
+  taken_at: timestamp(ms)
+  maybe_at: ?timestamp(s)
+  marks: [timestamp(s); 3]
+  window: Window
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    parser.parse().unwrap()
+}
+
+/// The engine hop reaches EVERY timestamp leaf, not only the bare ones.
+///
+/// This is the guard for the finding the plan's `verify` pass turned up: only a
+/// bare `FieldType::Timestamp` becomes `ColumnType::Timestamp`, so a schema-blind
+/// column pass would silently skip the nullable / arrayed / struct-nested ones —
+/// 81 of 247 timestamp fields in the example corpus are nullable. A migration
+/// that skips a third of the data compiles and runs perfectly.
+#[test]
+fn test_engine_generation_reaches_every_timestamp_leaf() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 1,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let code = EngineMigrationGenerator::generate_main_code(&plan).unwrap().code;
+
+    // The bare field.
+    assert!(
+        code.contains(r#"__rescale(__row.taken_at, "Reading", "taken_at")"#),
+        "a bare timestamp is rescaled: {code}"
+    );
+    // The nullable field — reached through the `Option`, not skipped.
+    assert!(
+        code.contains("if let Some(__ts_opt) = &mut __row.maybe_at"),
+        "a NULLABLE timestamp is reached (the shape the schema-blind pass misses): {code}"
+    );
+    // The array — element-wise.
+    assert!(
+        code.contains("for __ts_elem in __row.marks.iter_mut()"),
+        "every array element is rescaled: {code}"
+    );
+    // The struct — by field path, with the dotted name in the diagnostic.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(r#""Reading","window.opened_at""#)
+            && flat.contains(r#""Reading","window.closed_at""#),
+        "struct-nested timestamps are rescaled and named by path: {code}"
+    );
+    // The non-timestamp field is left alone.
+    assert!(
+        !code.contains("__row.label ="),
+        "a string field is not touched: {code}"
+    );
+    // Overflow is detected, not wrapped: a stored second count past ~year 9999
+    // would otherwise become a nonsensical instant, silently.
+    assert!(
+        code.contains("checked_mul(1000000)"),
+        "the multiply is checked: {code}"
+    );
+    // Two modules of the SAME schema — the version interlock comes for free.
+    assert!(
+        code.contains("mod e1;") && code.contains("mod e2;"),
+        "both engine generations are embedded: {code}"
+    );
+    assert!(
+        code.contains("e1::Database::open_at") && code.contains("e2::Database::open_at"),
+        "the reader half is e1 and the writer half is e2: {code}"
+    );
+}
+
+/// The two embedded modules differ ONLY in the baked engine generation. If they
+/// differed in the schema serial too, each module's own open-guard would refuse
+/// the dir the other half just wrote.
+#[test]
+fn test_engine_generation_bakes_one_schema_two_generations() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 7,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let out = EngineMigrationGenerator::generate(&plan, "forgedb-engine-migrate").unwrap();
+    let e1 = &out.sources.iter().find(|(p, _)| p == "src/e1.rs").expect("e1").1;
+    let e2 = &out.sources.iter().find(|(p, _)| p == "src/e2.rs").expect("e2").1;
+
+    assert!(e1.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e2.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e1.contains("EXPECTED_ENGINE_VERSION: u32 = 1"));
+    assert!(e2.contains("EXPECTED_ENGINE_VERSION: u32 = 2"));
+}
+
+/// A generation pair the generator does not know is REFUSED, not silently given
+/// the seconds→micros multiply. A wrong rescale corrupts exactly the data the
+/// migration claims to carry, and it corrupts it irreversibly.
+#[test]
+fn test_engine_generation_refuses_an_unknown_hop() {
+    let schema = engine_hop_schema();
+    for (from, to) in [(2u32, 3u32), (1, 3), (2, 1)] {
+        let plan = EngineHopPlan {
+            schema: &schema,
+            schema_version: 1,
+            from_engine: from,
+            to_engine: to,
+        };
+        let err = match EngineMigrationGenerator::generate(&plan, "x") {
+            Err(e) => e,
+            Ok(_) => panic!("only 1 -> 2 exists, but {from} -> {to} generated"),
+        };
+        assert!(
+            err.to_string().contains("the only hop is 1 → 2"),
+            "and it says which hop DOES exist: {err}"
+        );
+    }
+}
+
+/// The open guard's two arms describe two different situations with two
+/// different remedies, and must never collapse into one message: sending a user
+/// to the app's migration bin when ForgeDB's format changed would tell them to
+/// regenerate a schema that is already correct.
+#[test]
+fn test_rust_generation_open_guard_has_two_distinct_arms() {
+    let schema = engine_hop_schema();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    // prettyplease wraps the panic strings across source lines, so match the
+    // flattened form — dropping the line-continuation backslashes too, which is
+    // what makes a wrapped message one contiguous span again.
+    let flat: String = code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\\')
+        .collect();
+
+    assert!(
+        flat.contains("isatschemaversionv"),
+        "the schema arm names the app's serial: {code}"
+    );
+    assert!(
+        flat.contains("waswrittenbyengineformatgeneration"),
+        "the engine arm names ForgeDB's generation: {code}"
+    );
+    assert!(
+        flat.contains("forgedbmigrateengine--src<dir>--dest<new-dir>"),
+        "and points at the engine command, NOT the app's transformer: {code}"
+    );
+    assert!(
+        flat.contains("yourschemadidnot"),
+        "and says explicitly which of the two things changed: {code}"
+    );
+    assert!(
+        flat.contains("engine_version:EXPECTED_ENGINE_VERSION"),
+        "a written manifest stamps the generation this binary speaks: {code}"
     );
 }
