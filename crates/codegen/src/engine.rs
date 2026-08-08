@@ -414,5 +414,5 @@ impl EngineMigrationGenerator {
 /// A model participates in the copy loop only if its rows are addressed by id
 /// (`all()` / `insert`) — the same predicate the schema transformer uses.
 fn is_transactable(model: &Model) -> bool {
-    RustGenerator::identity_field(model).is_some()
+    model.identity_field().is_some()
 }

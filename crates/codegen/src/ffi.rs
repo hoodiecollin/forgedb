@@ -792,7 +792,7 @@ impl FfiGenerator {
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .map(|model| {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
@@ -1231,7 +1231,7 @@ impl FfiGenerator {
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .map(|model| {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
@@ -1659,7 +1659,7 @@ impl FfiGenerator {
         // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
-            let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
+            let model_has_id = model.has_identity();
             let id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
@@ -1962,7 +1962,7 @@ impl FfiGenerator {
         for model in schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
         {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);

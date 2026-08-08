@@ -223,7 +223,7 @@ impl GoGenerator {
         for model in schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
         {
             let snake = RustGenerator::to_snake_case(&model.name);
             for field in &model.fields {
@@ -328,7 +328,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .map(|m| GoModel {
                 name: m.name.clone(),
                 snake: RustGenerator::to_snake_case(&m.name),
@@ -351,7 +351,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
         // --- A. Forward FK getters (`*Target` / `?Target`) ---
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
-            let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
+            let model_has_id = model.has_identity();
             let id_go = Self::go_id_type(schema, model);
             for field in &model.fields {
                 let target_name = match &field.field_type {

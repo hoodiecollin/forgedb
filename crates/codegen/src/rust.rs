@@ -1622,7 +1622,7 @@ impl RustGenerator {
         // #254: a timestamp identity reaches `ToSchema` here too. The identity's
         // own declared type is what the enum carries, so ask about that rather
         // than assuming the id is uuid- or integer-shaped.
-        let id_schema_attr = Self::identity_field(model)
+        let id_schema_attr = model.identity_field()
             .and_then(|f| Self::schema_value_type(schema, &f.field_type, true))
             .map(|vt| quote! { #[schema(value_type = #vt)] })
             .unwrap_or_default();
@@ -1797,7 +1797,7 @@ impl RustGenerator {
             // nothing to back onto.
             _ => return None,
         };
-        let identity = Self::identity_field(schema.find_model(target)?)?;
+        let identity = schema.find_model(target)?.identity_field()?;
         let key = match &identity.field_type {
             // The target's identity is itself a foreign key — resolve through it.
             it @ FieldType::Relation(_) => Self::fk_backing_type_bounded(schema, it, depth - 1)?,
@@ -1852,7 +1852,7 @@ impl RustGenerator {
         schema: &Schema,
         model: &forgedb_parser::Model,
     ) -> Option<forgedb_parser::FieldType> {
-        let identity = Self::identity_field(model)?;
+        let identity = model.identity_field()?;
         match &identity.field_type {
             it @ forgedb_parser::FieldType::Relation(_) => Self::fk_backing_type(schema, it),
             other => Some(other.clone()),
@@ -2132,7 +2132,7 @@ impl RustGenerator {
     /// `insert` return type, and the `get` parameter type all agree with
     /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
     pub(crate) fn id_type_tokens(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
-        match Self::identity_field(model) {
+        match model.identity_field() {
             // A key position (#252): `string(N)` renders as the `Copy`
             // `InlineStr<N>` here, where an ordinary column of the same declared
             // type renders as a `String`.
@@ -2148,7 +2148,7 @@ impl RustGenerator {
     /// A name rather than a reference so it can be carried into helpers that
     /// receive a field *slice* (projections) rather than the model.
     pub(crate) fn identity_field_name(model: &forgedb_parser::Model) -> Option<&str> {
-        Self::identity_field(model).map(|f| f.name.as_str())
+        model.identity_field().map(|f| f.name.as_str())
     }
 
     /// Is `field` this model's identity? Compared by name, because a projection
@@ -2526,7 +2526,7 @@ impl RustGenerator {
     /// redundant work on every insert. Empty for every schema that was legal
     /// before #260, which is what keeps the generated output byte-identical.
     fn bare_integer_auto_fields(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
-        let identity = Self::identity_field(model).map(|f| f.name.as_str());
+        let identity = model.identity_field().map(|f| f.name.as_str());
         Self::integer_auto_fields(model)
             .into_iter()
             .filter(|f| !f.unique && Some(f.name.as_str()) != identity)
@@ -2718,7 +2718,7 @@ impl RustGenerator {
         // A model with no identity cannot be inserted, so there is nothing to
         // index.  (Same predicate codegen uses to *find* the identity, so this
         // cannot disagree with `identity_field` about whether one exists.)
-        let Some(identity) = Self::identity_field(model).map(|f| f.name.as_str()) else {
+        let Some(identity) = model.identity_field().map(|f| f.name.as_str()) else {
             return Vec::new();
         };
         model
@@ -3869,7 +3869,7 @@ impl RustGenerator {
     fn composite_indexes(
         model: &forgedb_parser::Model,
     ) -> Vec<(proc_macro2::Ident, Vec<&forgedb_parser::Field>)> {
-        if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+        if !model.has_identity() {
             return Vec::new();
         }
         model
@@ -4055,7 +4055,7 @@ impl RustGenerator {
         // scan (which made the FK snapshot-probe O(candidates × watermark)).
         // Appended in lockstep with `id_to_row` (monotonic row_count ⇒ each vec
         // stays sorted for free); Arc-shared into readers (#158).  Id-bearing only.
-        let id_versions_field = if Self::identity_field(model).is_some() {
+        let id_versions_field = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
         } else {
             quote! {}
@@ -4219,7 +4219,7 @@ impl RustGenerator {
         let wal_fsync = Self::wal_fsync_policy_tokens();
 
         // #159: empty per-id version index, rebuilt by `#rehydrate_logic` on reopen.
-        let id_versions_init = if Self::identity_field(model).is_some() {
+        let id_versions_init = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc::new(HashMap::new()), }
         } else {
             quote! {}
@@ -4321,7 +4321,7 @@ impl RustGenerator {
             .collect();
         // #159: the reader shares the per-id version index too (Arc, #158), so its
         // snapshot `_at` probes binary-search like the writer's.  Id-bearing only.
-        let id_versions_field = if Self::identity_field(model).is_some() {
+        let id_versions_field = if model.identity_field().is_some() {
             quote! { id_versions: std::sync::Arc<HashMap<#id_type, Vec<usize>>>, }
         } else {
             quote! {}
@@ -4373,7 +4373,7 @@ impl RustGenerator {
             .collect();
         // #159: share the per-id version index (Arc, O(1) capture) so the reader's
         // snapshot probes binary-search like the writer's.  Id-bearing only.
-        let id_versions_clone = if Self::identity_field(model).is_some() {
+        let id_versions_clone = if model.identity_field().is_some() {
             quote! { id_versions: self.id_versions.clone(), }
         } else {
             quote! {}
@@ -4994,7 +4994,7 @@ impl RustGenerator {
     /// `id` when no explicit id / auto-generate field is present (matching the
     /// historical `insert` behavior).
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
-        match Self::identity_field(model) {
+        match model.identity_field() {
             Some(f) => format_ident!("{}", f.name),
             None => format_ident!("id"),
         }
@@ -5014,7 +5014,7 @@ impl RustGenerator {
         receiver: &TokenStream,
         row_var: &proc_macro2::Ident,
     ) -> Option<TokenStream> {
-        let f = Self::identity_field(model)?;
+        let f = model.identity_field()?;
         let col = format_ident!("{}_col", f.name);
 
         let is_uuid_like = matches!(
@@ -5093,7 +5093,7 @@ impl RustGenerator {
         id_expr: &TokenStream,
         row_expr: &TokenStream,
     ) -> TokenStream {
-        if Self::identity_field(model).is_some() {
+        if model.identity_field().is_some() {
             quote! {
                 std::sync::Arc::make_mut(&mut #receiver.id_versions)
                     .entry(#id_expr).or_default().push(#row_expr);
@@ -5461,7 +5461,7 @@ impl RustGenerator {
     /// `None` (no method emitted) for a model with no id — it cannot be mutated
     /// and so is never replicated.
     fn generate_apply_method(model: &forgedb_parser::Model) -> Option<TokenStream> {
-        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        model.identity_field()?;
         let model_name = format_ident!("{}", model.name);
         let id_field = Self::id_field_ident(model);
         Some(quote! {
@@ -5747,17 +5747,17 @@ impl RustGenerator {
         // #162-C: `id_versions` (#159) references physical rows, so rebuild it to a
         // single-element `[new_row]` per surviving id (compaction collapses every id
         // to its one kept version).  Omitted for an id-less model (no such field).
-        let remap_versions = if Self::identity_field(model).is_some() {
+        let remap_versions = if model.identity_field().is_some() {
             quote! { __new_id_versions.insert(__id, vec![__new_row]); }
         } else {
             quote! {}
         };
-        let assign_versions = if Self::identity_field(model).is_some() {
+        let assign_versions = if model.identity_field().is_some() {
             quote! { self.id_versions = std::sync::Arc::new(__new_id_versions); }
         } else {
             quote! {}
         };
-        let decl_versions = if Self::identity_field(model).is_some() {
+        let decl_versions = if model.identity_field().is_some() {
             quote! {
                 let mut __new_id_versions: std::collections::HashMap<_, Vec<usize>> =
                     std::collections::HashMap::with_capacity(__old_id_to_row.len());
@@ -5896,7 +5896,7 @@ impl RustGenerator {
     /// txn comes from `get_at` with the watermark raised to the staged length — one
     /// decode path, no fork.
     fn generate_txn_storage_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
-        if model.fields.iter().find(|f| f.name == "id" || f.auto_generate).is_none() {
+        if !model.has_identity() {
             return quote! {};
         }
         let model_name = format_ident!("{}", model.name);
@@ -5931,7 +5931,7 @@ impl RustGenerator {
             .collect();
         let rehydrate_self = Self::generate_rehydrate_body(schema, model, &quote! { self });
         // #159: the version index is rebuilt by `#rehydrate_self` too; clear it first.
-        let clear_versions = if Self::identity_field(model).is_some() {
+        let clear_versions = if model.identity_field().is_some() {
             quote! { std::sync::Arc::make_mut(&mut self.id_versions).clear(); }
         } else {
             quote! {}
@@ -6199,7 +6199,7 @@ impl RustGenerator {
         // Ungated by tombstones, for the same reason the reopen scan is: a peer's
         // deleted row still spent its number.
         let autoseq_delta = {
-            let identity = Self::identity_field(model).map(|f| f.name.as_str());
+            let identity = model.identity_field().map(|f| f.name.as_str());
             let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
                 .map(|f| {
@@ -6440,7 +6440,7 @@ impl RustGenerator {
     /// (#57 / #56) keep working unchanged.  Returns `false` if the id is absent.
     /// `None` when the model has no id field (cannot be mutated by id).
     fn generate_update_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
-        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        model.identity_field()?;
         let append_statements = Self::generate_append_statements(schema, model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
@@ -6613,7 +6613,7 @@ impl RustGenerator {
     /// version, now tombstoned, so `get` returns `None`.  Returns `false` if the id
     /// is already absent.  `None` when the model has no id field.
     fn generate_delete_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
-        model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
+        model.identity_field()?;
         let append_statements = Self::generate_append_statements(schema, model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
@@ -7840,25 +7840,6 @@ impl RustGenerator {
         }
     }
 
-    /// The model's identity field (`id` or an `+auto` field), if any.  A
-    /// projection always materializes it (#113, PM constraint 3).
-    ///
-    /// **`id` wins by name, then by `+`.**  Written as a two-pass search rather than
-    /// one `find(|f| f.name == "id" || f.auto_generate)` on purpose (#254): the
-    /// single-pass form returns whichever comes FIRST in declaration order, so a
-    /// model writing `created_at: +timestamp` above `id: +uuid` resolves its identity
-    /// to the stamp.  Before #254 that produced a `Timestamp` id type and the
-    /// generated crate simply did not compile — loud, if obscure.  #254 makes a
-    /// `timestamp` identity legal, so the same schema would now compile and silently
-    /// key every row on its creation stamp.
-    pub(crate) fn identity_field(model: &forgedb_parser::Model) -> Option<&forgedb_parser::Field> {
-        model
-            .fields
-            .iter()
-            .find(|f| f.name == "id")
-            .or_else(|| model.fields.iter().find(|f| f.auto_generate))
-    }
-
     /// Whether the server synthesizes this field's value on create, so it may be
     /// omitted from a create body.  Mirrors `generate_auto_synthesis` +
     /// `model_struct_field`'s `#[serde(default)]`: **every** `+` auto is filled in
@@ -7914,7 +7895,7 @@ impl RustGenerator {
         proj: &forgedb_parser::Projection,
     ) -> Vec<&'a forgedb_parser::Field> {
         let mut out: Vec<&forgedb_parser::Field> = Vec::new();
-        if let Some(id_field) = Self::identity_field(model) {
+        if let Some(id_field) = model.identity_field() {
             out.push(id_field);
         }
         for fname in &proj.fields {
@@ -7949,7 +7930,7 @@ impl RustGenerator {
         schema: &Schema,
         model: &forgedb_parser::Model,
     ) -> (TokenStream, TokenStream) {
-        if Self::identity_field(model).is_none() {
+        if model.identity_field().is_none() {
             return (quote! {}, quote! {});
         }
         let scan_fields = Self::scan_field_set(model);
@@ -8465,7 +8446,7 @@ impl RustGenerator {
     /// bodies access).  Deduped, in declared order.
     pub(crate) fn scan_field_set(model: &forgedb_parser::Model) -> Vec<&forgedb_parser::Field> {
         let mut out: Vec<&forgedb_parser::Field> = Vec::new();
-        if let Some(id_field) = Self::identity_field(model) {
+        if let Some(id_field) = model.identity_field() {
             out.push(id_field);
         }
         for f in &model.fields {
@@ -9489,7 +9470,7 @@ impl RustGenerator {
         // identity column, so its counter needs its own read per physical row.
         // That cost is why the design does not encourage the shape.
         let autoseq_seed = {
-            let identity = Self::identity_field(model).map(|f| f.name.as_str());
+            let identity = model.identity_field().map(|f| f.name.as_str());
             let folds: Vec<TokenStream> = Self::sequence_auto_fields(model)
                 .iter()
                 .map(|f| {
@@ -9755,7 +9736,7 @@ impl RustGenerator {
         let apply_model_arms: Vec<_> = schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .map(|model| {
                 let field = format_ident!("{}", Self::to_snake_case(&model.name));
                 let name = model.name.as_str();
@@ -9809,7 +9790,7 @@ impl RustGenerator {
         let journal_recover_arms: Vec<_> = schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .map(|model| {
                 let field = format_ident!("{}", Self::to_snake_case(&model.name));
                 let name = model.name.as_str();
@@ -10343,7 +10324,7 @@ impl RustGenerator {
     fn generate_validated_writes(schema: &Schema) -> TokenStream {
         let mut methods = Vec::new();
         for model in &schema.models {
-            if !model.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+            if !model.has_identity() {
                 continue;
             }
             let snake = Self::to_snake_case(&model.name);
@@ -10482,7 +10463,7 @@ impl RustGenerator {
         for parent in &schema.models {
             // A wrapper is generated for every identity model (matching the
             // create/update wrappers), so the REST DELETE route always has one.
-            if !parent.fields.iter().any(|f| f.name == "id" || f.auto_generate) {
+            if !parent.has_identity() {
                 continue;
             }
             let parent_snake = Self::to_snake_case(&parent.name);
@@ -10532,10 +10513,7 @@ impl RustGenerator {
                     let child_field_str = field.name.as_str();
                     let child_name_str = child.name.as_str();
                     let probe_arg = Self::fk_probe_arg(schema, &parent.name, !optional);
-                    let child_indexed = child
-                        .fields
-                        .iter()
-                        .any(|f| f.name == "id" || f.auto_generate);
+                    let child_indexed = child.has_identity();
                     let find_children = if child_indexed {
                         quote! { self.#child_storage.#fk_probe(#probe_arg) }
                     } else {
@@ -10673,7 +10651,7 @@ impl RustGenerator {
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .collect();
         if tx_models.is_empty() {
             return quote! {};
@@ -11139,7 +11117,7 @@ impl RustGenerator {
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .collect();
         if tx_models.is_empty() {
             return quote! {};
@@ -12566,7 +12544,7 @@ impl RustGenerator {
             // probe) is empty otherwise; fall back to the scan in that case.
             let child_indexed = schema
                 .find_model(&p.child_model)
-                .is_some_and(|c| c.fields.iter().any(|f| f.name == "id" || f.auto_generate));
+                .is_some_and(|c| c.has_identity());
 
             let doc = if child_indexed {
                 format!(
@@ -13091,7 +13069,7 @@ impl RustGenerator {
         let tx_models: Vec<&forgedb_parser::Model> = schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
             .collect();
         if tx_models.is_empty() {
             return quote! {};

@@ -198,7 +198,7 @@ impl PyO3Generator {
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
     }
 
     /// The PyO3 getter return type and body for a given `.forge` field type.
@@ -585,7 +585,7 @@ impl PyO3Generator {
     /// id-addressable storage read. A traversal that would return / start from a
     /// model without one is skipped (there is no row class to marshal into).
     fn is_identity_model(model: &forgedb_parser::Model) -> bool {
-        model.fields.iter().any(|f| f.name == "id" || f.auto_generate)
+        model.has_identity()
     }
 
     /// The relation-traversal methods on `ForgeDb`, mirroring the generated
