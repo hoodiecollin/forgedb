@@ -847,6 +847,9 @@ impl RustGenerator {
         // actually carries a prefix, so a schema whose inline strings are all
         // `string(N!)` — the prefix-free shape — carries no prefix machinery at
         // all (same discipline as the `f64` key above).
+        if Self::needs_inline_str(schema) {
+            tokens.extend(Self::generate_identity_alphabet_helper());
+        }
         if Self::needs_inline_len_helper(schema) {
             tokens.extend(Self::generate_inline_len_helper());
         }
@@ -2957,7 +2960,44 @@ impl RustGenerator {
                 // validation-time-only check.
                 if let Some((chars, exact)) = Self::inline_string_params(&field.field_type) {
                     let n = chars as usize;
-                    if !Self::is_utf8_field(field) {
+                    // #252: a KEY carries a narrower rule than a column, and it
+                    // replaces the ASCII check rather than joining it — the
+                    // path-segment alphabet is a strict subset of ASCII, and the
+                    // ASCII diagnostic's `add @utf8` advice is *wrong* for an
+                    // identity, where `@utf8` is a validation error (res 3).
+                    if Self::is_identity(model, field) {
+                        // Non-empty FIRST (res 5), so `""` reports "a key cannot
+                        // be empty" rather than the width rule or a phantom
+                        // offending character. `/docs/` routes to the LIST
+                        // endpoint, not to a row, so an empty key is not merely
+                        // ugly — it is unaddressable.
+                        checks.push(quote! {
+                            if __v.is_empty() {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "identity_empty",
+                                    message: "a key cannot be the empty string — \
+                                              its URL would address the collection, \
+                                              not a row"
+                                        .to_string(),
+                                });
+                            }
+                        });
+                        let msg = "must consist only of characters legal unencoded in a URL                                    path segment (RFC 3986 pchar, excluding %), so the segment                                    is byte-identical to the key";
+                        checks.push(quote! {
+                            if let Some((__i, __c)) = __v
+                                .char_indices()
+                                .find(|(_, __c)| !__forgedb_identity_char_ok(*__c))
+                            {
+                                return Err(ValidationError::Constraint {
+                                    model: #mtag, field: #fname_str, rule: "identity_alphabet",
+                                    message: format!(
+                                        "{} — found {:?} at byte {}",
+                                        #msg, __c, __i,
+                                    ),
+                                });
+                            }
+                        });
+                    } else if !Self::is_utf8_field(field) {
                         let msg = format!(
                             "must contain only ASCII characters (add @utf8 to this field to \
                              allow the rest of Unicode, at four bytes per character)"
@@ -8917,6 +8957,53 @@ impl RustGenerator {
                 })
                 .unwrap_or(false)
         })
+    }
+
+    /// The `__forgedb_identity_char_ok` free function, emitted once per generated
+    /// file when some model keys on an inline string (#252 res 4).
+    ///
+    /// The rule is **RFC 3986 `pchar` minus `pct-encoded`** — every character that
+    /// is legal unencoded in a URL path segment, less `%`. Excluding `%` buys the
+    /// stronger property that the segment is **byte-identical to the key**, which
+    /// is what makes the rule checkable, explainable, and the URL for a row
+    /// obvious.
+    ///
+    /// It is chosen over the tighter *unreserved-only* set on purpose: `@` and `:`
+    /// are `pchar`, so `user@example.com` and `urn:isbn:0451450523` are admissible
+    /// natural keys — which is the ingestion scenario #252 exists for — and it is
+    /// the same rule #254's RFC 3339 timestamp key already satisfies (`:` is a
+    /// `pchar`), so the two identity types follow ONE path rule rather than two.
+    /// And it is chosen over "anything but `/` and `%`" because that admits
+    /// non-ASCII, which reopens the Unicode-normalization question res 3 and 4
+    /// close: `café` in NFC and NFD are two byte sequences for one text, and a
+    /// primary key compares byte-wise.
+    ///
+    /// **Generated, not substrate** (res 7). `InlineStr::try_from` enforces the
+    /// byte bound and nothing else — it is schema-agnostic and knows nothing about
+    /// identities or URLs. This rule applies *because the field is an identity*,
+    /// which is schema knowledge; putting it in the substrate would make
+    /// `InlineStr` a type that encodes an application-level policy.
+    fn generate_identity_alphabet_helper() -> TokenStream {
+        quote! {
+            /// Is `c` legal unencoded in a URL path segment (#252 res 4)?
+            ///
+            /// RFC 3986 `pchar` minus `pct-encoded`: `unreserved` / `sub-delims` /
+            /// `:` / `@`. Rejected: `/ ? # [ ] %`, space, and every control and
+            /// non-ASCII character.
+            #[inline]
+            fn __forgedb_identity_char_ok(__c: char) -> bool {
+                __c.is_ascii_alphanumeric()
+                    || matches!(
+                        __c,
+                        // unreserved
+                        '-' | '.' | '_' | '~'
+                        // sub-delims
+                        | '!' | '$' | '&' | '\'' | '(' | ')' | '*' | '+' | ',' | ';' | '='
+                        // the two pchar extras
+                        | ':' | '@'
+                    )
+            }
+        }
     }
 
     /// The `__forgedb_inline_len` free function, emitted once per generated file
