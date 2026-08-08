@@ -9586,14 +9586,22 @@ fn test_rust_generation_string_key_stays_in_the_string_index_class() {
 /// deliberately rather than write a test that could not fail; this is that test.
 #[test]
 fn test_api_generation_string_key_path_param_is_the_key_type() {
-    let code = api_for("Sku {\n  code: string(26!)\n  title: string\n}\n");
+    // Gate 2 and #266's handoff both spell this `Sku { code: string(26) }`. That
+    // model has no identity at all — #248 requires a field named `id` or a `+`
+    // auto — so it cannot parse, let alone generate. Same class of unwriteable
+    // fixture as #266's own scenario 17.
+    let code = api_for("Sku {\n  id: string(26!)\n  title: string\n}\n");
     let f = flat(&code);
+    // The segment arrives as a `String` and is parsed in the handler (so a bad
+    // key is a 400 with a message rather than axum's own rejection), which is
+    // why `FromStr` on `InlineStr` is load-bearing and nothing is generated for
+    // the extraction itself.
     assert!(
-        f.contains("Path<InlineStr<26usize>>"),
-        "the path segment extracts the key type: {f:.800}"
+        f.contains("id.parse::<InlineStr<26usize>>()"),
+        "the path segment parses into the key type: {f:.800}"
     );
     assert!(
-        !f.contains("Path<Uuid>"),
+        !f.contains("id.parse::<Uuid>()"),
         "and never falls through to Uuid for a string-keyed model"
     );
 }
@@ -9611,8 +9619,12 @@ fn test_api_generation_id_parse_type_resolves_a_relation_identity() {
     );
     let f = flat(&code);
     assert!(
-        f.contains("Path<u64>"),
+        f.contains("id.parse::<u64>()"),
         "an FK identity parses as the far end of the chain: {f:.800}"
+    );
+    assert!(
+        !f.contains("id.parse::<Uuid>()"),
+        "the old raw-FieldType match sent BOTH models' segments to Uuid: {f:.800}"
     );
 }
 
@@ -9627,8 +9639,7 @@ fn test_wasm_generation_replica_parses_a_string_key() {
     let code = wasm_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
     let f = flat(&code);
     assert!(
-        f.contains("InlineStr::<26usize>::try_from(id.as_str()).ok()")
-            || f.contains("InlineStr :: < 26usize > :: try_from"),
+        f.contains("<InlineStr<26usize>>::try_from(id.as_str()).ok()"),
         "the replica parses the key as the key type: {f:.800}"
     );
     assert!(
@@ -9687,16 +9698,26 @@ fn test_rust_generation_string_key_alphabet_is_pchar_minus_percent() {
         .find("__forgedb_identity_char_ok")
         .expect("the alphabet predicate is emitted as a named helper");
     let window = &f[at..(at + 900).min(f.len())];
-    for admitted in ['@', ':', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '='] {
+    // `'` is emitted escaped (`'\''`), so it is checked by its escaped spelling.
+    for admitted in ["'@'", "':'", "'!'", "'$'", "'&'", r"'\''", "'('", "')'", "'*'", "'+'",
+                     "','", "';'", "'='", "'-'", "'.'", "'_'", "'~'"] {
         assert!(
-            window.contains(&format!("'{admitted}'")),
-            "`{admitted}` is a pchar and must be admitted: {window}"
+            window.contains(admitted),
+            "{admitted} is a pchar and must be admitted: {window}"
         );
     }
+    // ...and the alphanumerics come from the predicate rather than a list.
     assert!(
-        !window.contains("'%'"),
-        "`%` is excluded so the segment is byte-identical to the key: {window}"
+        window.contains("is_ascii_alphanumeric"),
+        "letters and digits are admitted by predicate: {window}"
     );
+    for rejected in ["'%'", "'/'", "'?'", "'#'", "'['", "']'"] {
+        assert!(
+            !window.contains(rejected),
+            "{rejected} must NOT be admitted — `%` in particular, so the segment is \
+             byte-identical to the key: {window}"
+        );
+    }
 }
 
 /// **Scenario 11.** A `string(N)`-keyed model is an ordinary foreign-key target:
@@ -9730,19 +9751,28 @@ fn test_rust_generation_string_keyed_target_keeps_the_relation_surface() {
     );
 
     // Referential integrity, both delete modes, traversal and the reverse getter.
-    assert!(f.contains("fn get_flight_origin"), "forward traversal exists");
+    assert!(f.contains("fn flight_origin"), "forward traversal exists");
+    assert!(f.contains("fn flight_alt"), "and so does the optional one");
     assert!(
-        f.contains("fn get_airport_flights"),
+        f.contains("fn airport_flights_by_origin"),
         "the reverse collection getter exists"
+    );
+    assert!(
+        f.contains("fn flight_with_relations"),
+        "and the eager load"
     );
     assert!(
         f.contains("fn delete_airport"),
         "the parent's delete wrapper exists"
     );
     assert!(
-        f.contains("ValidationError::ForeignKeyViolation")
-            || f.contains("ForeignKey"),
-        "referential integrity is enforced on create"
+        f.contains("if self.airport.get(record.origin).is_none()"),
+        "referential integrity resolves the FK through the parent's own `get`, \
+         which only type-checks if the FK and the key agree: {f:.600}"
+    );
+    assert!(
+        f.contains("ValidationError::DanglingReference"),
+        "and refuses a dangling reference"
     );
 }
 
