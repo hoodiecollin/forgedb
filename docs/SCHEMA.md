@@ -76,7 +76,7 @@ fixed-width replication frame. The admitted set is exactly:
 | `uuid` | The convention. `+uuid` synthesizes on create |
 | `u32` `u64` `i32` `i64` | `+u32`/`+u64` allocate from the #187 counter (`0` is the allocate sentinel); `i32`/`i64` admit a signed natural key |
 | `timestamp` / `timestamp(s\|ms\|us)` | A written value is floored to the declared quantum (§3) |
-| `+timestamp` | Legal, but **only when the field is named `id`** — an auto stamp under any other name is a stamp, not a key (#254) |
+| `+timestamp` | Legal, but **only when the field is named `id`**, and only at `us` — an auto stamp under any other name is a stamp, not a key (#254). `0` is its allocate sentinel, and `0` is 1970-01-01T00:00:00Z, so unlike an integer key that is a value someone might plausibly mean: it cannot be inserted explicitly |
 | `string(N)` / `string(N!)` | A `Copy` `InlineStr<N>`, not a heap `String` — see [§3](#stringn-as-an-identity) for the URL-alphabet rule (#252/#238) |
 | `*Model` | An identity that *is* a required foreign key; it resolves to whatever the target's identity ultimately is, and that chain must terminate (#266) |
 
