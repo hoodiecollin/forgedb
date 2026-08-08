@@ -210,7 +210,7 @@ impl PyO3Generator {
     /// type so PyO3 emits typed Python stubs.  For types without a natural single
     /// Python type (`json`, `char(N)`, inline `struct`) we fall back to pythonize
     /// and return `Bound<'py, PyAny>`.
-    fn pyo3_getter(
+    fn pyo3_getter(schema: &Schema, 
         field_type: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
     ) -> (TokenStream, TokenStream) {
@@ -277,17 +277,12 @@ impl PyO3Generator {
                 },
             ),
 
-            // Required FK (Uuid) → hyphenated string.
-            FieldType::Relation(RelationType::RequiredReference(_)) => (
-                quote! { String },
-                quote! { Ok(self.inner.#field_name.to_string()) },
-            ),
-
-            // Optional FK (Option<Uuid>) → Option<String>.
-            FieldType::Relation(RelationType::OptionalReference(_)) => (
-                quote! { Option<String> },
-                quote! { Ok(self.inner.#field_name.map(|__u| __u.to_string())) },
-            ),
+            // #266: an FK surfaces with the SAME Python type as the target's
+            // own `id` — resolved through the target key's own arm rather than
+            // hardcoded to the uuid form.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::pyo3_getter(schema, &RustGenerator::resolved_type(schema, field_type), field_name),
 
             // Nullable(inner) — recurse; the outer getter wraps in Option.
             FieldType::Nullable(inner) => {
@@ -393,7 +388,7 @@ impl PyO3Generator {
                     .map(|f| {
                         let fname = format_ident!("{}", f.name);
                         let doc = format!("The `{}` field.", f.name);
-                        let (ret_ty, body) = Self::pyo3_getter(&f.field_type, &fname);
+                        let (ret_ty, body) = Self::pyo3_getter(schema, &f.field_type, &fname);
                         // Whether the return type references the `'py` lifetime
                         // (only for the pythonize fallback path).
                         let needs_py_lifetime = matches!(
@@ -485,7 +480,7 @@ impl PyO3Generator {
                 let model_ident = format_ident!("{}", model.name);
                 let py_ident = format_ident!("Py{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
 
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
@@ -626,7 +621,7 @@ impl PyO3Generator {
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = Self::is_identity_model(model);
-            let source_id_ty = RustGenerator::id_type_tokens(model);
+            let source_id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
                 let target_name = match &field.field_type {
@@ -637,9 +632,6 @@ impl PyO3Generator {
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -683,9 +675,6 @@ impl PyO3Generator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -711,6 +700,8 @@ impl PyO3Generator {
             }
             let method_ident = format_ident!("{}", method_name);
             let py_child = format_ident!("Py{}", child.name);
+            // #266: the id arrives as the PARENT's own key type.
+            let parent_id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id.",
                 p.child_model, p.child_field, p.parent_model
@@ -718,7 +709,7 @@ impl PyO3Generator {
             methods.push(quote! {
                 #[doc = #doc]
                 fn #method_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_child>> {
-                    let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                    let id: #parent_id_ty = pythonize::depythonize(id).map_err(to_py_err)?;
                     match catch_unwind(AssertUnwindSafe(|| self.inner.#method_ident(id))) {
                         Ok(rows) => Ok(rows.into_iter().map(#py_child::from_record).collect()),
                         Err(p) => Err(panic_to_py_err(p)),
@@ -731,6 +722,8 @@ impl PyO3Generator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
             let model1 = schema.find_model(&m.model1);
             let model2 = schema.find_model(&m.model2);
 
@@ -742,8 +735,8 @@ impl PyO3Generator {
                 methods.push(quote! {
                     #[doc = #doc]
                     fn #link_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<()> {
-                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
-                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#link_ident(left, right))) {
                             Ok(()) => Ok(()),
                             Err(p) => Err(panic_to_py_err(p)),
@@ -760,8 +753,8 @@ impl PyO3Generator {
                 methods.push(quote! {
                     #[doc = #doc]
                     fn #unlink_ident(&mut self, left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>) -> PyResult<bool> {
-                        let left: Uuid = pythonize::depythonize(left).map_err(to_py_err)?;
-                        let right: Uuid = pythonize::depythonize(right).map_err(to_py_err)?;
+                        let left: #lk = pythonize::depythonize(left).map_err(to_py_err)?;
+                        let right: #rk = pythonize::depythonize(right).map_err(to_py_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.inner.#unlink_ident(left, right))) {
                             Ok(removed) => Ok(removed),
                             Err(p) => Err(panic_to_py_err(p)),
@@ -781,7 +774,7 @@ impl PyO3Generator {
                         methods.push(quote! {
                             #[doc = #doc]
                             fn #fwd_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_b>> {
-                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                let id: #lk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#fwd_ident(id))) {
                                     Ok(rows) => Ok(rows.into_iter().map(#py_b::from_record).collect()),
                                     Err(p) => Err(panic_to_py_err(p)),
@@ -803,7 +796,7 @@ impl PyO3Generator {
                         methods.push(quote! {
                             #[doc = #doc]
                             fn #rev_ident(&self, id: &Bound<'_, PyAny>) -> PyResult<Vec<#py_a>> {
-                                let id: Uuid = pythonize::depythonize(id).map_err(to_py_err)?;
+                                let id: #rk = pythonize::depythonize(id).map_err(to_py_err)?;
                                 match catch_unwind(AssertUnwindSafe(|| self.inner.#rev_ident(id))) {
                                     Ok(rows) => Ok(rows.into_iter().map(#py_a::from_record).collect()),
                                     Err(p) => Err(panic_to_py_err(p)),
@@ -1028,7 +1021,7 @@ impl PyO3Generator {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
             for field in &model.fields {
-                let Some(fmt) = RustGenerator::arrow_export_format(&field.field_type) else {
+                let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
                 let method_ident = format_ident!("{}_{}_arrow", snake, field.name);
@@ -1073,7 +1066,7 @@ impl PyO3Generator {
         Self::identity_models(schema).any(|m| {
             m.fields
                 .iter()
-                .any(|f| RustGenerator::arrow_export_format(&f.field_type).is_some())
+                .any(|f| RustGenerator::arrow_export_format(schema, &f.field_type).is_some())
         })
     }
 

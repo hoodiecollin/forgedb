@@ -155,9 +155,9 @@ impl RustGenerator {
     /// Relation collections (`OneToMany`/`ManyToMany`), virtual `()` relation
     /// fields, and component refs have no column and are NOT projectable — this
     /// is exactly the set for which `field_read_stmt` returns `None`.
-    fn is_projectable(field: &forgedb_parser::Field) -> bool {
+    fn is_projectable(schema: &Schema, field: &forgedb_parser::Field) -> bool {
         Self::is_variable_column_type(&field.field_type)
-            || Self::is_fixed_size_type(&field.field_type)
+            || Self::is_fixed_size_type(schema, &field.field_type)
     }
 
     /// Compile-time validation of `@projection` directives (#113, PM constraint 2):
@@ -178,7 +178,7 @@ impl RustGenerator {
                                 proj.name, model.name, fname
                             ))
                         })?;
-                    if !Self::is_projectable(field) {
+                    if !Self::is_projectable(schema, field) {
                         return Err(CodegenError::InvalidSchema(format!(
                             "@projection '{}' on model '{}' cannot include field '{}': \
                              relation and virtual fields have no column and are not projectable \
@@ -995,7 +995,7 @@ impl RustGenerator {
         // types must exist for the emitted `size_of`/`read_unaligned` code to
         // compile (without this, struct-typed fields fail with E0425).
         for struct_def in &schema.structs {
-            let struct_tokens = Self::generate_struct(struct_def);
+            let struct_tokens = Self::generate_struct(schema, struct_def);
             tokens.extend(struct_tokens);
         }
 
@@ -1028,7 +1028,7 @@ impl RustGenerator {
         // pushes (`Init` / `Added` / `Removed` / `Updated`).  Typed model records
         // + the model's own id type — never an arbitrary runtime value.
         for model in &schema.models {
-            tokens.extend(Self::generate_live_delta_enum(model));
+            tokens.extend(Self::generate_live_delta_enum(schema, model));
         }
 
         // Generate M2M junction storage structs (referenced by the Database
@@ -1101,31 +1101,31 @@ impl RustGenerator {
         let fields: Vec<_> = model
             .fields
             .iter()
-            .map(|f| Self::model_struct_field(f, true))
+            .map(|f| Self::model_struct_field(schema, f, true))
             .collect();
 
         // Generate columnar storage fields
-        let storage_fields = Self::generate_storage_fields(model);
+        let storage_fields = Self::generate_storage_fields(schema, model);
 
         // Generate storage initialization
         let storage_inits = Self::generate_storage_inits(model, schema);
 
         // The model's identity type (Uuid for uuid PKs, u64/u32 for integer PKs).
-        let id_type = Self::id_type_tokens(model);
+        let id_type = Self::id_type_tokens(schema, model);
 
         // Generate the field-constraint validator (#91 Phase 3), a free fn the
         // generated insert/update call before committing.
         let field_validation = Self::generate_field_validation(model);
 
         // Generate insert logic
-        let insert_logic = Self::generate_insert_logic(model);
+        let insert_logic = Self::generate_insert_logic(schema, model);
 
         // Generate mutation surface (#66): superseding-version `update` / `delete`.
         // `None` (skipped) for a model with no id field, which cannot be mutated by
         // id (and cannot `insert` either).
         let mutation_methods = match (
-            Self::generate_update_logic(model),
-            Self::generate_delete_logic(model),
+            Self::generate_update_logic(schema, model),
+            Self::generate_delete_logic(schema, model),
         ) {
             (Some(update_logic), Some(delete_logic)) => quote! {
                 /// Append a superseding version of an existing record (#66).
@@ -1158,7 +1158,7 @@ impl RustGenerator {
         let apply_method = Self::generate_apply_method(model).unwrap_or_else(|| quote! {});
         // Additive commit (#110): flush every column + tombstone (native fsync;
         // wasm arena no-op — durability is the transport's IndexedDB/OPFS write).
-        let commit_method = Self::generate_commit_method(model);
+        let commit_method = Self::generate_commit_method(schema, model);
 
         // Snapshot-scoped newest-version resolution (#66 + #56): read the id at a
         // physical row so `get_at` / `all_at` can resolve the newest version
@@ -1166,7 +1166,7 @@ impl RustGenerator {
         // sees the version live as-of capture.  Present only for id-bearing models.
         let row_index_ident = format_ident!("row_index");
         let id_read_at_row =
-            Self::generate_id_read_expr(model, &quote! { self }, &row_index_ident);
+            Self::generate_id_read_expr(schema, model, &quote! { self }, &row_index_ident);
 
         // Generate the snapshot accessors (`get_at` / `all_at`).  For an id-bearing
         // model they resolve newest-within-watermark (mutation-aware); a model with
@@ -1179,42 +1179,42 @@ impl RustGenerator {
         );
 
         // Generate the shared read-by-row-index logic (feeds get / get_at / all_at)
-        let read_at_logic = Self::generate_read_at_logic(model);
+        let read_at_logic = Self::generate_read_at_logic(schema, model);
 
         // Generate declared column projections (#113): per @projection, a tailored
         // struct + narrow reads that touch only PK + selected columns.  Reuses the
         // shared `field_read_stmt` decode (one read path) and the id-at-row
         // expression for the snapshot `_at` variants.
         let (projection_structs, projection_methods) =
-            Self::generate_projections(model, &id_type, id_read_at_row.as_ref());
+            Self::generate_projections(schema, model, &id_type, id_read_at_row.as_ref());
 
         // #160: internal narrow scan record + reads for the list endpoint (filter/
         // sort touch only filterable/sortable columns; the page is materialized
         // fully).  Empty for a model with no id field.
-        let (scan_struct, scan_methods) = Self::generate_list_scan(model);
+        let (scan_struct, scan_methods) = Self::generate_list_scan(schema, model);
 
         // Generate the secondary-index probe methods (#90): find_by_* / get_by_*
         // (+ snapshot `_at` variants) for each `^index` / `&unique` field.
-        let index_lookups = Self::generate_index_lookups(model);
+        let index_lookups = Self::generate_index_lookups(schema, model);
 
         // Generate the columnar-export helpers (language bindings #51/#52): live
         // physical row indices + per Arrow-exportable column `export_col_<f>` that
         // gathers exactly those rows.  Consumed by the FFI `..._export_arrow` ops.
-        let columnar_export = Self::generate_columnar_export(model);
+        let columnar_export = Self::generate_columnar_export(schema, model);
 
         // Generate reopen/rehydration logic (#65): rebuild the in-memory
         // `row_count` + `id_to_row` index from the persisted columns so a fresh
         // process can read data written by a previous one.
-        let rehydrate_logic = Self::generate_rehydrate_logic(model);
+        let rehydrate_logic = Self::generate_rehydrate_logic(schema, model);
 
         // Generate crash-recovery (#89): torn-tail repair + WAL replay, run in
         // `new_at` before the identity-index rebuild so `id_to_row` reflects the
         // recovered rows.
-        let recover_method = Self::generate_recover_method(model);
+        let recover_method = Self::generate_recover_method(schema, model);
 
         // Generate the WAL checkpoint (#89 step 2): fsync columns + truncate the
         // WAL so it stays bounded and reopen replays only the post-checkpoint tail.
-        let checkpoint_method = Self::generate_checkpoint_method(model);
+        let checkpoint_method = Self::generate_checkpoint_method(schema, model);
 
         // Generate in-process compaction (#92 Phase 4): reclaim dead row versions
         // under the writer lock, then reopen to rebuild the in-memory maps.
@@ -1225,12 +1225,12 @@ impl RustGenerator {
         // NO id_to_row / index / changefeed / broker) the `TxHandle` uses, plus
         // `run_deferred_maintenance` (runs a checkpoint/compaction that the txn
         // guard deferred).  `None`-skipped for a model with no id (cannot mutate).
-        let txn_storage_methods = Self::generate_txn_storage_methods(model);
+        let txn_storage_methods = Self::generate_txn_storage_methods(schema, model);
 
         // Generate the per-model layout manifest writer (#57): physical column
         // layout + row-count anchor, written at open, read by schema-blind backup.
-        let write_manifest = Self::generate_write_manifest(model);
-        let autoseq_methods = Self::generate_autoseq_methods(model);
+        let write_manifest = Self::generate_write_manifest(schema, model);
+        let autoseq_methods = Self::generate_autoseq_methods(schema, model);
 
         // #187: apply the persisted high-water marks as a FLOOR after the reopen
         // scan has run. `max(persisted, scanned)` — the scan is authoritative for
@@ -1274,10 +1274,10 @@ impl RustGenerator {
         // tailored column-decode, just reading through the shared-fd reader
         // columns — so there is no second decode path to drift.
         let reader_name = format_ident!("{}StorageReader", model.name);
-        let reader_fields = Self::generate_reader_storage_fields(model);
-        let reader_inits = Self::generate_reader_inits(model);
+        let reader_fields = Self::generate_reader_storage_fields(schema, model);
+        let reader_inits = Self::generate_reader_inits(schema, model);
         // Reader index probes (#103): `_at`-only (no live `get` on a reader).
-        let reader_index_probes = Self::generate_index_probes(model, false);
+        let reader_index_probes = Self::generate_index_probes(schema, model, false);
         let reader_doc = format!(
             "Read-only, lock-free reader handle for {} storage (#56 Direction B)",
             model.name
@@ -1545,10 +1545,10 @@ impl RustGenerator {
     /// retracted rows).  Every payload is a *generated* typed record or the
     /// model's own id type — never an arbitrary runtime value.  Tagged JSON
     /// (`{"kind":"added","row":{…}}`) so a client can dispatch on `kind`.
-    fn generate_live_delta_enum(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_live_delta_enum(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
-        let id_type = Self::id_type_tokens(model);
+        let id_type = Self::id_type_tokens(schema, model);
         let doc = format!(
             "Live-query result-set delta for `{}` (#62 Direction B): removal-aware \
              membership changes over a generated closed-set query.",
@@ -1662,36 +1662,311 @@ impl RustGenerator {
         }
     }
 
-    /// Whether a model's primary key is a `Uuid` (vs an integer PK).
+    /// How many identity hops [`fk_backing_type`] will follow (#266).
     ///
-    /// Relation traversal is generated only between UUID-keyed models: FK scalar
-    /// fields are always emitted as `Uuid` (see `map_field_type_ident`), so a
-    /// forward getter `target.get(record.fk)` or a reverse filter `r.fk == id`
-    /// only type-checks when the referenced key is also `Uuid`.  Integer-PK
-    /// models are skipped (with a comment) rather than emitting code that won't
-    /// compile.
-    pub(crate) fn is_uuid_pk(model: &forgedb_parser::Model) -> bool {
-        match model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
-            Some(f) => matches!(f.field_type, forgedb_parser::FieldType::Uuid),
-            None => true,
+    /// An identity may itself be a foreign key (`Order { id: *Customer }`), so
+    /// the resolution is a walk, and a walk over a *cycle* diverges.  A chain
+    /// this deep is already an identity-cycle validation error, so the bound is
+    /// never reached by a schema that validates — it exists so a caller that
+    /// skipped validation (the LSP, a direct generator call) degrades to `None`
+    /// instead of exhausting the generator's stack with no diagnostic.
+    const FK_RESOLVE_DEPTH: u32 = 16;
+
+    /// The `FieldType` a foreign-key field is physically and logically backed by:
+    /// **the target model's identity type** (#266).  `?Model` backs onto
+    /// `Nullable(that)`.
+    ///
+    /// This is the boundary the whole change turns on.  Resolving here means the
+    /// physical helpers (`map_field_type_ident`, `type_name`,
+    /// `column_value_size_expr`, `storage_column_type_tokens`,
+    /// `is_fixed_size_type`, `index_key_body`, …) do not each grow a
+    /// schema-aware FK branch — their FK arms are *deleted*, because after
+    /// resolution an FK is no longer a special shape.  The invariant that buys:
+    ///
+    /// > An FK column is physically identical to the column the target's
+    /// > identity field itself occupies.
+    ///
+    /// Same file path, same `ColumnType`, same value size, same `append_*` /
+    /// `read_*` method, same index-key body — produced by the same code path,
+    /// not merely similar to it.  For the conventional `id: +uuid` target that
+    /// resolves to `Uuid`, whose arms are byte-for-byte what the FK arms
+    /// hardcoded, so no existing schema's output moves.
+    ///
+    /// `None` when the target is unknown, has no identity, or the resolution
+    /// cycles — all three are validation errors.  Codegen falls back to the
+    /// pre-#266 `Uuid` (see [`resolved_type`](Self::resolved_type)) so a
+    /// validation-skipping caller degrades rather than panics.
+    pub(crate) fn fk_backing_type(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> Option<forgedb_parser::FieldType> {
+        Self::fk_backing_type_bounded(schema, field_type, Self::FK_RESOLVE_DEPTH)
+    }
+
+    fn fk_backing_type_bounded(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+        depth: u32,
+    ) -> Option<forgedb_parser::FieldType> {
+        use forgedb_parser::{FieldType, RelationType};
+
+        if depth == 0 {
+            return None;
+        }
+        let (target, optional) = match field_type {
+            FieldType::Relation(RelationType::RequiredReference(t)) => (t, false),
+            FieldType::Relation(RelationType::OptionalReference(t)) => (t, true),
+            // `[Model]` / many-to-many / component are virtual: no column, and
+            // nothing to back onto.
+            _ => return None,
+        };
+        let identity = Self::identity_field(schema.find_model(target)?)?;
+        let key = match &identity.field_type {
+            // The target's identity is itself a foreign key — resolve through it.
+            it @ FieldType::Relation(_) => Self::fk_backing_type_bounded(schema, it, depth - 1)?,
+            other => other.clone(),
+        };
+        // An identity always has a value, so strip any optionality picked up on
+        // the way (an `id: ?Owner` is nonsense, but it parses; without this the
+        // FK below would nest `Option<Option<_>>`).
+        let key = match key {
+            FieldType::Nullable(inner) => *inner,
+            k => k,
+        };
+        Some(if optional {
+            FieldType::Nullable(Box::new(key))
+        } else {
+            key
+        })
+    }
+
+    /// [`fk_backing_type`](Self::fk_backing_type) where it applies, `field_type`
+    /// unchanged otherwise — the single call every physical helper makes on
+    /// entry (#266).
+    ///
+    /// The `Uuid` fallback is what an unresolvable FK produced before this
+    /// change, so a schema that skipped validation generates exactly what it
+    /// used to rather than something new and worse.
+    pub(crate) fn resolved_type(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+    ) -> forgedb_parser::FieldType {
+        use forgedb_parser::{FieldType, RelationType};
+        match field_type {
+            FieldType::Relation(RelationType::RequiredReference(_)) => {
+                Self::fk_backing_type(schema, field_type).unwrap_or(FieldType::Uuid)
+            }
+            FieldType::Relation(RelationType::OptionalReference(_)) => {
+                Self::fk_backing_type(schema, field_type)
+                    .unwrap_or_else(|| FieldType::Nullable(Box::new(FieldType::Uuid)))
+            }
+            other => other.clone(),
         }
     }
 
-    /// Many-to-many relations that can be safely generated: both endpoints must
-    /// be UUID-keyed (the junction stores two `Uuid` columns).
+    /// A model's identity `FieldType`, resolved through any identity-FK chain
+    /// (#266) — the key type callers key maps, parameters and return types on.
+    ///
+    /// `None` for a model with no identity field.  Note the direction: this is
+    /// the *inverse* of the deleted `is_uuid_pk`, whose `None => true` reported
+    /// an identity-less model as UUID-keyed and so left a `true` default on a
+    /// predicate whose false branch removed code.
+    pub(crate) fn identity_type(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+    ) -> Option<forgedb_parser::FieldType> {
+        let identity = Self::identity_field(model)?;
+        match &identity.field_type {
+            it @ forgedb_parser::FieldType::Relation(_) => Self::fk_backing_type(schema, it),
+            other => Some(other.clone()),
+        }
+    }
+
+    /// The identity type a many-to-many junction keys an endpoint on (#266), or
+    /// `None` if the model cannot be a junction endpoint.
+    ///
+    /// #266 replaced the old blanket "uuid PK only" gate with the *physical*
+    /// requirement the junction actually has: it stores each endpoint's id in a
+    /// `FixedColumn`, indexes it in a `HashMap`, and frames it in a fixed-width
+    /// replication record — so the key must be fixed-width, hashable and totally
+    /// equatable.  The admitted set lives on the AST as
+    /// `FieldType::is_junction_key`, because the parser's validator needs the
+    /// SAME predicate to report a schema outside it as an error — if the two ever
+    /// disagreed a relation would silently vanish again, which is the failure
+    /// #266 exists to remove.
+    pub(crate) fn junction_key_type(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+    ) -> Option<forgedb_parser::FieldType> {
+        let ty = Self::identity_type(schema, model)?;
+        ty.is_junction_key().then_some(ty)
+    }
+
+    /// Many-to-many relations that can be generated.
+    ///
+    /// #266 replaced the UUID-key filter that used to sit here: the junction's
+    /// two columns are now each endpoint's own key width, so a mixed pair (a
+    /// `+u64` model linked to a `+uuid` one) generates.  What remains is the
+    /// physical floor — see `junction_key_type` — and a schema that trips it is
+    /// a validation *error*, so this filter never silently swallows a relation
+    /// the user wrote.  Kept as a named helper because *every* junction consumer
+    /// must agree on the same list (junction structs, `Database` fields, the
+    /// delete wrapper's cascade-unlink, the replication replay arms).
     pub(crate) fn valid_m2m(schema: &Schema) -> Vec<forgedb_parser::ast::ManyToManyRelation> {
         schema
             .detect_many_to_many_relations()
             .into_iter()
             .filter(|m| {
-                schema.find_model(&m.model1).is_some_and(Self::is_uuid_pk)
-                    && schema.find_model(&m.model2).is_some_and(Self::is_uuid_pk)
+                schema
+                    .find_model(&m.model1)
+                    .and_then(|md| Self::junction_key_type(schema, md))
+                    .is_some()
+                    && schema
+                        .find_model(&m.model2)
+                        .and_then(|md| Self::junction_key_type(schema, md))
+                        .is_some()
             })
             .collect()
+    }
+
+    /// The on-disk width of a junction endpoint key (#266).  A plain `usize`
+    /// rather than a token expression so the emitted junction reads as
+    /// `24usize`, not `16usize + 8usize` — the widths are known at generation
+    /// time and the frame check is easier to read (and to spot-check) folded.
+    fn junction_key_width(ty: &forgedb_parser::FieldType) -> usize {
+        use forgedb_parser::FieldType as FT;
+        match ty {
+            FT::U32 | FT::I32 => 4,
+            FT::U64 | FT::I64 | FT::Timestamp => 8,
+            // `junction_key_type` admits nothing else.
+            _ => 16,
+        }
+    }
+
+    /// The two endpoint key types of a junction, left then right (#266).
+    /// Both are `Some` for every relation `valid_m2m` returns.
+    fn junction_key_pair(
+        schema: &Schema,
+        m: &forgedb_parser::ast::ManyToManyRelation,
+    ) -> (forgedb_parser::FieldType, forgedb_parser::FieldType) {
+        let of = |name: &str| {
+            schema
+                .find_model(name)
+                .and_then(|md| Self::junction_key_type(schema, md))
+                .unwrap_or(forgedb_parser::FieldType::Uuid)
+        };
+        (of(&m.model1), of(&m.model2))
+    }
+
+    /// The two endpoint key **type tokens** of a junction, left then right
+    /// (#266) — what every non-Rust surface needs to decode an id argument as
+    /// the key it actually is.
+    pub(crate) fn junction_key_idents(
+        schema: &Schema,
+        m: &forgedb_parser::ast::ManyToManyRelation,
+    ) -> (TokenStream, TokenStream) {
+        let (lt, rt) = Self::junction_key_pair(schema, m);
+        (
+            Self::map_field_type_ident(schema, &lt),
+            Self::map_field_type_ident(schema, &rt),
+        )
+    }
+
+    /// Append an endpoint id to a junction column, in the SAME encoding the
+    /// endpoint model's own id column uses (#266) — so a junction column is
+    /// byte-compatible with the id column it mirrors.
+    fn junction_append_expr(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        col: &TokenStream,
+        val: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! { #col.append_uuid(*#val.as_bytes()) },
+            forgedb_parser::FieldType::Timestamp => {
+                quote! { #col.append_timestamp(i64::from(#val)) }
+            }
+            other => {
+                let m = Self::get_append_method(schema, other);
+                quote! { #col.#m(#val) }
+            }
+        }
+    }
+
+    /// Read an endpoint id back out of a junction column (#266) — the inverse of
+    /// `junction_append_expr`, yielding the key-typed value.
+    fn junction_read_expr(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        col: &TokenStream,
+        row: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! {
+                Uuid::from_bytes(#col.read_uuid(#row).expect("Failed to read link"))
+            },
+            forgedb_parser::FieldType::Timestamp => quote! {
+                Timestamp::from(#col.read_timestamp(#row).expect("Failed to read link"))
+            },
+            other => {
+                let m = Self::get_read_method(schema, other);
+                quote! { #col.#m(#row).expect("Failed to read link") }
+            }
+        }
+    }
+
+    /// Decode an endpoint id back out of a durable replication frame (#82) —
+    /// the inverse of `junction_frame_stmt` (#266).
+    fn junction_frame_decode(
+        schema: &Schema,
+        ty: &forgedb_parser::FieldType,
+        slice: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => quote! {
+                {
+                    let mut __b = [0u8; 16];
+                    __b.copy_from_slice(#slice);
+                    Uuid::from_bytes(__b)
+                }
+            },
+            // NOTE the parentheses: `#slice` is itself a borrow expression
+            // (`&ev.bytes[a..b]`), and `&x.try_into()` parses as `&(x.try_into())`
+            // — which type-checks as a reference to an array and fails. The
+            // snapshot tests could not have caught this; the compile check did.
+            forgedb_parser::FieldType::Timestamp => quote! {
+                Timestamp::from(i64::from_le_bytes(
+                    (#slice).try_into().expect("junction frame slot is the key width"),
+                ))
+            },
+            other => {
+                let ident = Self::map_field_type_ident(schema, other);
+                quote! {
+                    <#ident>::from_le_bytes(
+                        (#slice).try_into().expect("junction frame slot is the key width"),
+                    )
+                }
+            }
+        }
+    }
+
+    /// Push an endpoint id onto the durable replication frame (#82) in the
+    /// junction column's own little-endian encoding, so the frame is exactly
+    /// `left_width + right_width` bytes (#266).
+    fn junction_frame_stmt(
+        ty: &forgedb_parser::FieldType,
+        buf: &TokenStream,
+        val: &TokenStream,
+    ) -> TokenStream {
+        match ty {
+            forgedb_parser::FieldType::Uuid => {
+                quote! { #buf.extend_from_slice(#val.as_bytes()); }
+            }
+            forgedb_parser::FieldType::Timestamp => {
+                quote! { #buf.extend_from_slice(&i64::from(#val).to_le_bytes()); }
+            }
+            _ => quote! { #buf.extend_from_slice(&#val.to_le_bytes()); },
+        }
     }
 
     /// Junction struct identifier for an M2M pair, e.g. `AuthorBookLink`.
@@ -1718,13 +1993,13 @@ impl RustGenerator {
     /// type.  Keeping this in one place makes the `id_to_row` map key, the
     /// `insert` return type, and the `get` parameter type all agree with
     /// `record.id` — otherwise an integer PK fails with `expected Uuid, found u64`.
-    pub(crate) fn id_type_tokens(model: &forgedb_parser::Model) -> TokenStream {
+    pub(crate) fn id_type_tokens(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         match model
             .fields
             .iter()
             .find(|f| f.name == "id" || f.auto_generate)
         {
-            Some(f) => Self::map_field_type_ident(&f.field_type),
+            Some(f) => Self::map_field_type_ident(schema, &f.field_type),
             None => quote! { Uuid },
         }
     }
@@ -1748,7 +2023,11 @@ impl RustGenerator {
     /// `string`/`json` (variable → offsets), `decimal` (rust_decimal's internal
     /// 16-byte repr ≠ Arrow decimal128), `enum` (1-byte discriminant loses the
     /// variant-name mapping), `char(N)` / `struct` / arrays.
-    pub(crate) fn arrow_export_format(ft: &forgedb_parser::FieldType) -> Option<&'static str> {
+    pub(crate) fn arrow_export_format(
+        schema: &Schema,
+        ft: &forgedb_parser::FieldType,
+    ) -> Option<&'static str> {
+        let ft = &Self::resolved_type(schema, ft);
         use forgedb_parser::{FieldType, RelationType};
         match ft {
             FieldType::I32 => Some("i"),
@@ -1772,11 +2051,11 @@ impl RustGenerator {
     /// `export_col_<f>(indices)` that hands the private column's class-1 `gather`
     /// the caller-computed opaque indices. The live-set decision stays in
     /// generated code (as `all()` does); `gather` reads only byte ranges.
-    fn generate_columnar_export(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_columnar_export(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_gathers: Vec<TokenStream> = model
             .fields
             .iter()
-            .filter(|f| Self::arrow_export_format(&f.field_type).is_some())
+            .filter(|f| Self::arrow_export_format(schema, &f.field_type).is_some())
             .map(|f| {
                 let field_col_name = format_ident!("{}_col", f.name);
                 let method = format_ident!("export_col_{}", f.name);
@@ -1832,7 +2111,7 @@ impl RustGenerator {
     /// parser guarantees struct fields are all fixed-size, so the same rendering
     /// rules as model fields apply: `Timestamp` needs a `#[schema(value_type)]`
     /// annotation for utoipa, and nullable fields get an `Option<>` wrapper.
-    fn generate_struct(struct_def: &forgedb_parser::Struct) -> TokenStream {
+    fn generate_struct(schema: &Schema, struct_def: &forgedb_parser::Struct) -> TokenStream {
         let struct_name = format_ident!("{}", struct_def.name);
         let struct_doc = format!("{} embedded struct", struct_def.name);
 
@@ -1841,7 +2120,7 @@ impl RustGenerator {
             .iter()
             .map(|field| {
                 let field_name = format_ident!("{}", field.name);
-                let field_type = Self::map_field_type_ident(&field.field_type);
+                let field_type = Self::map_field_type_ident(schema, &field.field_type);
 
                 // An inline struct carries the same `#[derive(Serialize,
                 // Deserialize)]` as a model, so an oversized array breaks it exactly
@@ -2744,7 +3023,7 @@ impl RustGenerator {
     /// bucket entry for a *different* id is a conflict (the record's own id may
     /// already be present with an unchanged value — index maintenance runs AFTER
     /// commit, so the pre-commit index still keys the old value to `id`).
-    fn generate_unique_checks(model: &forgedb_parser::Model, exclude_self: bool) -> Vec<TokenStream> {
+    fn generate_unique_checks(schema: &Schema, model: &forgedb_parser::Model, exclude_self: bool) -> Vec<TokenStream> {
         let mtag = model.name.as_str();
         Self::indexed_fields(model)
             .iter()
@@ -2753,7 +3032,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 if exclude_self {
@@ -2797,19 +3076,18 @@ impl RustGenerator {
     /// The arg-side key (`index_key_expr(.., value)`) and record-side key
     /// (`index_key_expr(.., record.field)`) must serialize identically; the `Option<_>`
     /// param types above are exactly the record field types, so both agree.
-    fn index_param_type(field: &forgedb_parser::Field) -> TokenStream {
-        use forgedb_parser::{FieldType, RelationType};
-        match &field.field_type {
-            FieldType::Relation(RelationType::RequiredReference(_)) => quote! { Uuid },
-            FieldType::Relation(RelationType::OptionalReference(_)) => quote! { Option<Uuid> },
+    fn index_param_type(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
+        use forgedb_parser::FieldType;
+        let resolved = Self::resolved_type(schema, &field.field_type);
+        match &resolved {
             FieldType::Nullable(inner) if Self::is_string_semantic(inner) => quote! { Option<&str> },
             FieldType::Nullable(inner) => {
-                let ty = Self::map_field_type_ident(inner);
+                let ty = Self::map_field_type_ident(schema, inner);
                 quote! { Option<#ty> }
             }
-            _ if Self::is_string_semantic(&field.field_type) => quote! { &str },
+            _ if Self::is_string_semantic(&resolved) => quote! { &str },
             _ => {
-                let ty = Self::map_field_type_ident(&field.field_type);
+                let ty = Self::map_field_type_ident(schema, &resolved);
                 quote! { #ty }
             }
         }
@@ -2876,26 +3154,27 @@ impl RustGenerator {
     /// deref coercion resolve both, which is why one emitted form serves each side
     /// and no generic bound or helper function is needed.
     fn index_key_expr(
+        schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         value_expr: TokenStream,
     ) -> TokenStream {
-        use forgedb_parser::{FieldType, RelationType};
+        use forgedb_parser::FieldType;
+        let field_type = &Self::resolved_type(schema, field_type);
 
         // Two distinct schema shapes both land in Rust as `Option<_>`: an explicit
-        // `T?` (`Nullable`), and an optional FK `?Target` — whose optionality lives
-        // in the RelationType, not a `Nullable` wrapper, but which `index_param_type`
-        // still types as `Option<Uuid>`.  Missing the second is a silent mis-key,
-        // so both are resolved here rather than only matching `Nullable`.
+        // `T?` (`Nullable`), and an optional FK `?Target`.  #266 folds the second
+        // into the first — `resolved_type` backs a `?Target` onto
+        // `Nullable(<target key>)` — so the one arm covers both and there is no
+        // second shape left to forget.
         let optional_inner: Option<FieldType> = match field_type {
             FieldType::Nullable(inner) => Some((**inner).clone()),
-            FieldType::Relation(RelationType::OptionalReference(_)) => Some(FieldType::Uuid),
             _ => None,
         };
 
         if let Some(inner) = optional_inner {
             // Match on `&Option<_>`, so the bound value is a reference and the
             // inner emission is identical to the non-nullable one.
-            let some_arm = Self::index_key_body(&inner);
+            let some_arm = Self::index_key_body(schema, &inner);
             return quote! {
                 match &(#value_expr) {
                     Some(__v) => { #some_arm }
@@ -2904,7 +3183,7 @@ impl RustGenerator {
             };
         }
 
-        let body = Self::index_key_body(field_type);
+        let body = Self::index_key_body(schema, field_type);
         quote! {
             {
                 let __v = &(#value_expr);
@@ -2922,8 +3201,9 @@ impl RustGenerator {
     /// frozen legacy implementation and asserts the equality, and the shape
     /// assertions in `codegen_snapshots.rs` pin what is emitted here.  Change one
     /// and both must move.
-    fn index_key_body(field_type: &forgedb_parser::FieldType) -> TokenStream {
-        use forgedb_parser::{FieldType, RelationType};
+    fn index_key_body(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
+        use forgedb_parser::FieldType;
+        let field_type = &Self::resolved_type(schema, field_type);
 
         match field_type {
             // --- JSON string class (tag \u{1}) --------------------------------
@@ -2938,10 +3218,7 @@ impl RustGenerator {
             },
             // A uuid renders hyphenated lowercase.  `encode_lower` writes into a
             // stack buffer, so the key costs one allocation rather than two.
-            FieldType::Uuid
-            | FieldType::Relation(
-                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
-            ) => quote! {
+            FieldType::Uuid => quote! {
                 let mut __buf = [0u8; 36];
                 let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
                 let mut __k = String::with_capacity(1 + __s.len());
@@ -3048,6 +3325,7 @@ impl RustGenerator {
     /// reuses it (a cheap `String` clone) across every index that needs it; a
     /// field in only one structure stays inline (byte-identical, no clone).
     fn field_key_token(
+        schema: &Schema,
         field: &forgedb_parser::Field,
         record_expr: &TokenStream,
         hoisted: &std::collections::HashMap<String, proc_macro2::Ident>,
@@ -3057,7 +3335,7 @@ impl RustGenerator {
         } else {
             let fname = format_ident!("{}", field.name);
             let val = Self::index_value_expr(&field.field_type, quote! { #record_expr.#fname });
-            Self::index_key_expr(&field.field_type, val)
+            Self::index_key_expr(schema, &field.field_type, val)
         }
     }
 
@@ -3089,6 +3367,7 @@ impl RustGenerator {
     /// map `field_key_token` consults. `prefix` disambiguates the add-direction
     /// (new values) from the remove-direction (old values) within one `update`.
     fn hoist_index_keys(
+        schema: &Schema,
         model: &forgedb_parser::Model,
         record_expr: &TokenStream,
         prefix: &str,
@@ -3099,7 +3378,7 @@ impl RustGenerator {
             let ident = format_ident!("__ik_{}_{}", prefix, f.name);
             let fname = format_ident!("{}", f.name);
             let val = Self::index_value_expr(&f.field_type, quote! { #record_expr.#fname });
-            let key = Self::index_key_expr(&f.field_type, val);
+            let key = Self::index_key_expr(schema, &f.field_type, val);
             binds.push(quote! { let #ident: String = { #key }; });
             map.insert(f.name.clone(), ident);
         }
@@ -3446,13 +3725,13 @@ impl RustGenerator {
     }
 
     /// Generate storage field declarations for columnar storage
-    fn generate_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_storage_fields(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
 
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
 
-            if Self::is_fixed_size_type(&field.field_type) {
+            if Self::is_fixed_size_type(schema, &field.field_type) {
                 column_fields.push(quote! {
                     #field_col_name: FixedColumn
                 });
@@ -3464,7 +3743,7 @@ impl RustGenerator {
             // Skip relations and other non-storage types
         }
 
-        let id_type = Self::id_type_tokens(model);
+        let id_type = Self::id_type_tokens(schema, model);
 
         // Secondary index fields (#90): one `value-key -> {id}` map per `^index`
         // / `&unique` scalar field, maintained alongside `id_to_row`.
@@ -3597,7 +3876,7 @@ impl RustGenerator {
     }
 
     /// Generate storage initialization code
-    fn generate_storage_inits(model: &forgedb_parser::Model, _schema: &Schema) -> TokenStream {
+    fn generate_storage_inits(model: &forgedb_parser::Model, schema: &Schema) -> TokenStream {
         let mut inits = Vec::new();
         let mut column_index = 0usize;
         // Namespace all storage paths under the model name to prevent collision
@@ -3606,16 +3885,16 @@ impl RustGenerator {
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
 
-            if Self::is_fixed_size_type(&field.field_type) {
+            if Self::is_fixed_size_type(schema, &field.field_type) {
                 let col_path = format!(
                     "{}/fixed/{}_{}.bin",
                     model_snake,
-                    Self::type_name(&field.field_type),
+                    Self::type_name(schema, &field.field_type),
                     column_index
                 );
                 // C3: emit size_of in generated code so column size matches the Rust type
                 let value_size_expr =
-                    Self::column_value_size_expr(&field.field_type, Self::is_utf8_field(field));
+                    Self::column_value_size_expr(schema, &field.field_type, Self::is_utf8_field(field));
 
                 inits.push(quote! {
                     #field_col_name: FixedColumn::new(
@@ -3737,11 +4016,11 @@ impl RustGenerator {
     /// `row_count` / `changefeed` (a reader never appends and never emits); it
     /// keeps `id_to_row` only because a no-id model's `get_at` consults it (an
     /// id-bearing model's snapshot reads scan the id column instead).
-    fn generate_reader_storage_fields(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_reader_storage_fields(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut column_fields = Vec::new();
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
-            if Self::is_fixed_size_type(&field.field_type) {
+            if Self::is_fixed_size_type(schema, &field.field_type) {
                 column_fields.push(quote! {
                     #field_col_name: forgedb_storage::FixedColumnReader
                 });
@@ -3751,7 +4030,7 @@ impl RustGenerator {
                 });
             }
         }
-        let id_type = Self::id_type_tokens(model);
+        let id_type = Self::id_type_tokens(schema, model);
         // Index maps (#103): the reader carries a point-in-time snapshot of every
         // secondary + composite index, captured on the writer at `reader()` time
         // (same instant its column readers open), so its `_at` probes are O(1)
@@ -3798,11 +4077,11 @@ impl RustGenerator {
     /// Build a `*StorageReader` literal from `&self` writer storage (#56
     /// Direction B): each column shares the writer's fd via `col.reader()`;
     /// `id_to_row` is cloned so a no-id model's `get_at` still resolves.
-    fn generate_reader_inits(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_reader_inits(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let mut inits = Vec::new();
         for field in &model.fields {
             let field_col_name = format_ident!("{}_col", field.name);
-            if Self::is_fixed_size_type(&field.field_type)
+            if Self::is_fixed_size_type(schema, &field.field_type)
                 || Self::is_variable_column_type(&field.field_type)
             {
                 inits.push(quote! {
@@ -3852,9 +4131,11 @@ impl RustGenerator {
     /// the actual Rust type layout (C3).  For complex/struct types we defer to
     /// `std::mem::size_of::<T>()` evaluated at compile time in the generated code.
     fn column_value_size_expr(
+        schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         utf8: bool,
     ) -> TokenStream {
+        let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             // #238: an inline string's width is the ONE case that depends on a
             // directive as well as the type — hence the `utf8` argument. It is
@@ -3897,20 +4178,8 @@ impl RustGenerator {
                 quote! { std::mem::size_of::<Option<#ident>>() }
             }
             forgedb_parser::FieldType::Nullable(inner) => {
-                let inner_tokens = Self::map_field_type_ident(inner);
+                let inner_tokens = Self::map_field_type_ident(schema, inner);
                 quote! { std::mem::size_of::<Option<#inner_tokens>>() }
-            }
-            // RequiredReference behaves exactly like Uuid (16-byte fixed column)
-            forgedb_parser::FieldType::Relation(
-                forgedb_parser::RelationType::RequiredReference(_),
-            ) => {
-                quote! { 16usize }
-            }
-            // OptionalReference behaves exactly like Nullable(Uuid) — Option<Uuid> bytes
-            forgedb_parser::FieldType::Relation(
-                forgedb_parser::RelationType::OptionalReference(_),
-            ) => {
-                quote! { std::mem::size_of::<Option<Uuid>>() }
             }
             _ => {
                 // For all other fixed-size types the constant is authoritative
@@ -3929,7 +4198,7 @@ impl RustGenerator {
                     forgedb_parser::FieldType::Bytes(n) => *n,
                     forgedb_parser::FieldType::FixedArray(inner, count) => {
                         // Fall back to map_field_type_ident for array sizing
-                        let inner_tokens = Self::map_field_type_ident(inner);
+                        let inner_tokens = Self::map_field_type_ident(schema, inner);
                         return quote! { std::mem::size_of::<[#inner_tokens; #count]>() };
                     }
                     _ => 8, // Default
@@ -3945,10 +4214,12 @@ impl RustGenerator {
     /// FK) is a `FixedBytes(width)` — a physical byte-width fact, never schema
     /// semantics.  Variable strings are handled by the caller (`ColumnType::String`).
     fn storage_column_type_tokens(
+        schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         utf8: bool,
     ) -> TokenStream {
         use forgedb_parser::FieldType;
+        let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             FieldType::U32 => quote! { forgedb_storage::ColumnType::U32 },
             FieldType::I32 => quote! { forgedb_storage::ColumnType::I32 },
@@ -3958,13 +4229,9 @@ impl RustGenerator {
             FieldType::Bool => quote! { forgedb_storage::ColumnType::Bool },
             FieldType::Uuid => quote! { forgedb_storage::ColumnType::Uuid },
             FieldType::Timestamp => quote! { forgedb_storage::ColumnType::Timestamp },
-            // FK scalar persists as a raw [u8; 16], same as Uuid.
-            FieldType::Relation(forgedb_parser::RelationType::RequiredReference(_)) => {
-                quote! { forgedb_storage::ColumnType::Uuid }
-            }
             // Any remaining fixed-size type is opaque fixed bytes of its width.
             _ => {
-                let size = Self::column_value_size_expr(field_type, utf8);
+                let size = Self::column_value_size_expr(schema, field_type, utf8);
                 quote! { forgedb_storage::ColumnType::FixedBytes(#size) }
             }
         }
@@ -4000,7 +4267,7 @@ impl RustGenerator {
     /// Lock-free by necessity, not preference: Tier 2's `transaction_concurrent`
     /// runs its prepare closure with **no write lock held**, so two threads are
     /// genuinely inside this at once.
-    fn generate_autoseq_methods(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_autoseq_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = &model.name;
         let methods: Vec<TokenStream> = Self::integer_auto_fields(model)
             .iter()
@@ -4008,7 +4275,7 @@ impl RustGenerator {
                 let alloc = Self::autoseq_alloc_ident(f);
                 let seq = Self::autoseq_field_ident(f);
                 let field_name = &f.name;
-                let ty = Self::map_field_type_ident(&f.field_type);
+                let ty = Self::map_field_type_ident(schema, &f.field_type);
                 let doc = format!(
                     "Allocate the next `{}.{}` value (#187). Monotonic and unique, \
                      never contiguous — a rolled-back or `Nack`ed attempt burns its \
@@ -4045,7 +4312,7 @@ impl RustGenerator {
         quote! { #(#methods)* }
     }
 
-    fn generate_write_manifest(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_write_manifest(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_snake = Self::to_snake_case(&model.name);
         let manifest_path = format!("{}/manifest.json", model_snake);
 
@@ -4053,15 +4320,15 @@ impl RustGenerator {
         let mut column_index = 0usize;
         for field in &model.fields {
             let name = &field.name;
-            if Self::is_fixed_size_type(&field.field_type) {
+            if Self::is_fixed_size_type(schema, &field.field_type) {
                 let rel_path = format!(
                     "fixed/{}_{}.bin",
-                    Self::type_name(&field.field_type),
+                    Self::type_name(schema, &field.field_type),
                     column_index
                 );
                 let __utf8 = Self::is_utf8_field(field);
-                let col_type = Self::storage_column_type_tokens(&field.field_type, __utf8);
-                let value_size = Self::column_value_size_expr(&field.field_type, __utf8);
+                let col_type = Self::storage_column_type_tokens(schema, &field.field_type, __utf8);
+                let value_size = Self::column_value_size_expr(schema, &field.field_type, __utf8);
                 col_entries.push(quote! {
                     forgedb_storage::ColumnMetadata {
                         name: #name.to_string(),
@@ -4201,7 +4468,7 @@ impl RustGenerator {
     /// the current values under a tombstone) so all three stay byte-for-byte
     /// consistent about column encoding — the whole point of the append-only /
     /// superseding-version model (#66).
-    fn generate_append_statements(model: &forgedb_parser::Model) -> Vec<TokenStream> {
+    fn generate_append_statements(schema: &Schema, model: &forgedb_parser::Model) -> Vec<TokenStream> {
         let mut append_statements = Vec::new();
 
         for field in &model.fields {
@@ -4337,19 +4604,18 @@ impl RustGenerator {
                             .expect("Failed to append to column");
                     });
                 }
-            } else if Self::is_fixed_size_type(&field.field_type) {
-                // Check if this is a complex type that needs byte conversion.
-                // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
+            } else if Self::is_fixed_size_type(schema, &field.field_type) {
+                // Complex types that persist as a raw byte blob.  #266: an
+                // optional FK is not named here any more — `resolved_type` backs
+                // it onto `Nullable(<target key>)`, so it arrives as an ordinary
+                // nullable column.
                 let needs_byte_conversion = matches!(
-                    &field.field_type,
+                    &Self::resolved_type(schema, &field.field_type),
                     forgedb_parser::FieldType::Bytes(_)
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
                         | forgedb_parser::FieldType::Nullable(_)
-                        | forgedb_parser::FieldType::Relation(
-                            forgedb_parser::RelationType::OptionalReference(_),
-                        )
                 );
 
                 if needs_byte_conversion {
@@ -4368,23 +4634,22 @@ impl RustGenerator {
                     });
                 } else {
                     // For primitives, use typed method
-                    let append_method = Self::get_append_method(&field.field_type);
+                    let append_method = Self::get_append_method(schema, &field.field_type);
 
-                    // UUID and RequiredReference (FK scalar) both store a raw [u8; 16]
+                    // A uuid stores a raw [u8; 16].  #266: an FK to a uuid-keyed
+                    // model RESOLVES to `Uuid` and takes this path unchanged; an
+                    // FK to any other key takes its own key's path.
                     let is_uuid_like = matches!(
-                        &field.field_type,
+                        &Self::resolved_type(schema, &field.field_type),
                         forgedb_parser::FieldType::Uuid
-                            | forgedb_parser::FieldType::Relation(
-                                forgedb_parser::RelationType::RequiredReference(_),
-                            )
                     );
                     // Timestamp is a newtype over i64; append_timestamp expects i64
                     let is_timestamp =
-                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
                     // Non-null decimal: a fixed 16-byte column stored via
                     // Decimal::serialize() -> [u8; 16], on the raw uuid byte path.
                     let is_decimal =
-                        matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
 
                     if is_decimal {
                         append_statements.push(quote! {
@@ -4433,6 +4698,7 @@ impl RustGenerator {
     /// mutation surface (receiver `self`, row `row_index`) so both read the id the
     /// same way (#66 + #56).
     fn generate_id_read_expr(
+        schema: &Schema,
         model: &forgedb_parser::Model,
         receiver: &TokenStream,
         row_var: &proc_macro2::Ident,
@@ -4444,14 +4710,11 @@ impl RustGenerator {
         let col = format_ident!("{}_col", f.name);
 
         let is_uuid_like = matches!(
-            &f.field_type,
+            &Self::resolved_type(schema, &f.field_type),
             forgedb_parser::FieldType::Uuid
-                | forgedb_parser::FieldType::Relation(
-                    forgedb_parser::RelationType::RequiredReference(_),
-                )
         );
-        let is_timestamp = matches!(&f.field_type, forgedb_parser::FieldType::Timestamp);
-        let is_string = Self::is_variable_string_type(&f.field_type);
+        let is_timestamp = matches!(&Self::resolved_type(schema, &f.field_type), forgedb_parser::FieldType::Timestamp);
+        let is_string = Self::is_variable_string_type(&Self::resolved_type(schema, &f.field_type));
 
         let expr = if is_uuid_like {
             quote! {
@@ -4491,7 +4754,7 @@ impl RustGenerator {
                 }
             }
         } else {
-            let read_method = Self::get_read_method(&f.field_type);
+            let read_method = Self::get_read_method(schema, &f.field_type);
             quote! {
                 #receiver.#col.#read_method(#row_var).expect("Failed to read id column")
             }
@@ -4638,7 +4901,7 @@ impl RustGenerator {
     /// numeric → 0, uuid/FK → nil); the schema `@default` is not yet honored here
     /// (a follow-up), which is why additive fields should be nullable or carry a
     /// meaningful zero.
-    fn generate_backfill_appends(model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
+    fn generate_backfill_appends(schema: &Schema, model: &forgedb_parser::Model) -> Vec<(proc_macro2::Ident, TokenStream)> {
         let mut out = Vec::new();
         for field in &model.fields {
             let col = format_ident!("{}_col", field.name);
@@ -4682,7 +4945,7 @@ impl RustGenerator {
                 // N NUL characters, which is exactly N characters and therefore
                 // still satisfies the column. Either way it is the meaningful
                 // zero and it matches the append encoding byte for byte.
-                let value_size = Self::column_value_size_expr(
+                let value_size = Self::column_value_size_expr(schema, 
                     &field.field_type,
                     Self::is_utf8_field(field),
                 );
@@ -4706,41 +4969,35 @@ impl RustGenerator {
                     }
                 };
                 out.push((col, one));
-            } else if Self::is_fixed_size_type(&field.field_type) {
+            } else if Self::is_fixed_size_type(schema, &field.field_type) {
                 let needs_byte_conversion = matches!(
-                    &field.field_type,
+                    &Self::resolved_type(schema, &field.field_type),
                     forgedb_parser::FieldType::Bytes(_)
                         | forgedb_parser::FieldType::FixedArray(_, _)
                         | forgedb_parser::FieldType::StructType(_)
                         | forgedb_parser::FieldType::OptionalStructType(_)
                         | forgedb_parser::FieldType::Nullable(_)
-                        | forgedb_parser::FieldType::Relation(
-                            forgedb_parser::RelationType::OptionalReference(_),
-                        )
                 );
                 let one = if needs_byte_conversion {
                     // Byte-blob types (char(N), arrays, inline struct, nullable /
                     // optional-FK) backfill as zeroed bytes of the column width —
                     // decodes to None / all-zero, matching the append encoding.
                     let value_size =
-                        Self::column_value_size_expr(&field.field_type, Self::is_utf8_field(field));
+                        Self::column_value_size_expr(schema, &field.field_type, Self::is_utf8_field(field));
                     quote! {
                         self.#col.append_bytes(&vec![0u8; #value_size])
                             .expect("Failed to backfill column");
                     }
                 } else {
-                    let append_method = Self::get_append_method(&field.field_type);
+                    let append_method = Self::get_append_method(schema, &field.field_type);
                     let is_uuid_like = matches!(
-                        &field.field_type,
+                        &Self::resolved_type(schema, &field.field_type),
                         forgedb_parser::FieldType::Uuid
-                            | forgedb_parser::FieldType::Relation(
-                                forgedb_parser::RelationType::RequiredReference(_),
-                            )
                     );
                     let is_timestamp =
-                        matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
                     let is_decimal =
-                        matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
+                        matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
                     if is_decimal {
                         // Non-null decimal backfills to Decimal::ZERO (its 16-byte
                         // serialized form), so a read decodes to `0` — the zero value.
@@ -4758,12 +5015,12 @@ impl RustGenerator {
                             self.#col.#append_method(0i64)
                                 .expect("Failed to backfill column");
                         }
-                    } else if matches!(&field.field_type, forgedb_parser::FieldType::F64) {
+                    } else if matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::F64) {
                         quote! {
                             self.#col.#append_method(0.0)
                                 .expect("Failed to backfill column");
                         }
-                    } else if matches!(&field.field_type, forgedb_parser::FieldType::Bool) {
+                    } else if matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Bool) {
                         quote! {
                             self.#col.#append_method(false)
                                 .expect("Failed to backfill column");
@@ -4794,14 +5051,14 @@ impl RustGenerator {
     /// its column append was lost to the page cache.  Recovery decode is generated
     /// per-model here (the columns are baked in) — the WAL crate stays field-blind,
     /// and there is no runtime `model_name` dispatch.  Emits no change-feed events.
-    fn generate_recover_method(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_recover_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
-        let append_statements = Self::generate_append_statements(model);
+        let append_statements = Self::generate_append_statements(schema, model);
         let col_idents: Vec<_> = model
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type)
+                Self::is_fixed_size_type(schema, &f.field_type)
                     || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
@@ -4809,7 +5066,7 @@ impl RustGenerator {
 
         // Additive-migration backfill (#92 Phase 4): for each column shorter than
         // the anchor, append its default until it reaches the anchor.
-        let backfill_loops: Vec<_> = Self::generate_backfill_appends(model)
+        let backfill_loops: Vec<_> = Self::generate_backfill_appends(schema, model)
             .into_iter()
             .map(|(col, append_default)| {
                 quote! {
@@ -4936,12 +5193,12 @@ impl RustGenerator {
     /// from the transport writing the arena blobs to IndexedDB/OPFS after this
     /// returns (`forgedb_storage_web::dump`).  Target-agnostic generated code —
     /// the difference lives entirely in the storage facade.
-    fn generate_commit_method(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_commit_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_idents: Vec<_> = model
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type)
+                Self::is_fixed_size_type(schema, &f.field_type)
                     || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
@@ -4973,12 +5230,12 @@ impl RustGenerator {
     /// persisted checkpoint marker is load-bearing — this only bounds the WAL and
     /// shortens reopen.  Single-writer only, and called between mutations, so all
     /// columns are aligned at `row_count` when it runs.
-    fn generate_checkpoint_method(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_checkpoint_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let col_idents: Vec<_> = model
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type)
+                Self::is_fixed_size_type(schema, &f.field_type)
                     || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
@@ -5319,12 +5576,12 @@ impl RustGenerator {
     /// buffered index ops and advances the watermark.  Read-your-writes inside the
     /// txn comes from `get_at` with the watermark raised to the staged length — one
     /// decode path, no fork.
-    fn generate_txn_storage_methods(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_txn_storage_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         if model.fields.iter().find(|f| f.name == "id" || f.auto_generate).is_none() {
             return quote! {};
         }
         let model_name = format_ident!("{}", model.name);
-        let append_statements = Self::generate_append_statements(model);
+        let append_statements = Self::generate_append_statements(schema, model);
         // #170: staged rows use the buffered (no-fsync) WAL append — durability is
         // the single `wal.flush()` at `TxHandle::commit`, so a whole transaction
         // pays one barrier instead of one per staged row.
@@ -5335,7 +5592,7 @@ impl RustGenerator {
             .fields
             .iter()
             .filter(|f| {
-                Self::is_fixed_size_type(&f.field_type)
+                Self::is_fixed_size_type(schema, &f.field_type)
                     || Self::is_variable_column_type(&f.field_type)
             })
             .map(|f| format_ident!("{}_col", f.name))
@@ -5353,7 +5610,7 @@ impl RustGenerator {
                 quote! { std::sync::Arc::make_mut(&mut self.#ident).clear(); }
             }))
             .collect();
-        let rehydrate_self = Self::generate_rehydrate_body(model, &quote! { self });
+        let rehydrate_self = Self::generate_rehydrate_body(schema, model, &quote! { self });
         // #159: the version index is rebuilt by `#rehydrate_self` too; clear it first.
         let clear_versions = if Self::identity_field(model).is_some() {
             quote! { std::sync::Arc::make_mut(&mut self.id_versions).clear(); }
@@ -5362,7 +5619,7 @@ impl RustGenerator {
         };
         // #161-B: the incremental delta variant of `__reindex_committed` for the
         // coordinated peer-refresh hot path (folds only new rows, no full rebuild).
-        let reindex_delta = Self::generate_reindex_delta_method(model);
+        let reindex_delta = Self::generate_reindex_delta_method(schema, model);
         quote! {
             /// Rebuild `id_to_row` + secondary indexes from the committed prefix
             /// in place (MVCC Tier 1, #83).  A transaction stages rows via
@@ -5522,11 +5779,11 @@ impl RustGenerator {
     /// order, so within the range a later version of an id correctly supersedes an
     /// earlier one: `self.get(id)` at row R resolves the version last folded (or
     /// the pre-`from` state), whose keys are removed before R's are added.
-    fn generate_reindex_delta_method(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_reindex_delta_method(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         // Guarded by the caller (`generate_txn_storage_methods` returns early for
         // an id-less model), but keep the None-guard local so the helper is safe.
         let row_var = format_ident!("__r");
-        let id_read = match Self::generate_id_read_expr(model, &quote! { self }, &row_var) {
+        let id_read = match Self::generate_id_read_expr(schema, model, &quote! { self }, &row_var) {
             Some(expr) => expr,
             None => return quote! {},
         };
@@ -5539,12 +5796,12 @@ impl RustGenerator {
         // Remove side — the SAME blocks the live update/delete path builds, keyed
         // off `__old_rec` (the record resolved before this row, via `self.get(id)`).
         let old = quote! { __old_rec };
-        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &old, "rem");
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &old, "rem");
         let single_removes: Vec<_> = indexed
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &old, &rem_map);
+                let key = Self::field_key_token(schema, f, &old, &rem_map);
                 Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -5552,7 +5809,7 @@ impl RustGenerator {
             .iter()
             .map(|(ident, comps)| {
                 let parts: Vec<_> =
-                    comps.iter().map(|c| Self::field_key_token(c, &old, &rem_map)).collect();
+                    comps.iter().map(|c| Self::field_key_token(schema, c, &old, &rem_map)).collect();
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
@@ -5562,12 +5819,12 @@ impl RustGenerator {
         // Add side — the SAME blocks the live update/insert path builds, keyed off
         // `__new_rec` (the row being folded, via `self.read_at(__r)`).
         let rec = quote! { __new_rec };
-        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
+        let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
         let single_adds: Vec<_> = indexed
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &rec, &add_map);
+                let key = Self::field_key_token(schema, f, &rec, &add_map);
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -5577,7 +5834,7 @@ impl RustGenerator {
             .iter()
             .map(|(ident, comps)| {
                 let parts: Vec<_> =
-                    comps.iter().map(|c| Self::field_key_token(c, &rec, &add_map)).collect();
+                    comps.iter().map(|c| Self::field_key_token(schema, c, &rec, &add_map)).collect();
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
             .collect();
@@ -5635,7 +5892,7 @@ impl RustGenerator {
                         }
                     } else {
                         let col = format_ident!("{}_col", f.name);
-                        let read_method = Self::get_read_method(&f.field_type);
+                        let read_method = Self::get_read_method(schema, &f.field_type);
                         quote! {
                             if let Ok(__v) = self.#col.#read_method(__r) {
                                 self.#seq.fetch_max(
@@ -5750,8 +6007,8 @@ impl RustGenerator {
         }
     }
 
-    fn generate_insert_logic(model: &forgedb_parser::Model) -> TokenStream {
-        let append_statements = Self::generate_append_statements(model);
+    fn generate_insert_logic(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        let append_statements = Self::generate_append_statements(schema, model);
         let id_field_name = Self::id_field_ident(model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
@@ -5762,7 +6019,7 @@ impl RustGenerator {
         // Data-integrity gate (#91): validate field constraints + `&unique` BEFORE
         // any durable side effect, so a rejected insert commits absolutely nothing.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
-        let unique_checks = Self::generate_unique_checks(model, false);
+        let unique_checks = Self::generate_unique_checks(schema, model, false);
 
         // Secondary-index maintenance (#90): after the row is committed and the id
         // is mapped, add this id under each indexed field's value key.  Sequenced
@@ -5773,12 +6030,12 @@ impl RustGenerator {
         let rec = quote! { record };
         // #157 part B: hoist the key of any field used in ≥2 index structures so
         // it is derived once and reused across the single + composite adds.
-        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
+        let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
         let index_adds: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &rec, &add_map);
+                let key = Self::field_key_token(schema, f, &rec, &add_map);
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -5790,7 +6047,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| Self::field_key_token(c, &rec, &add_map))
+                    .map(|c| Self::field_key_token(schema, c, &rec, &add_map))
                     .collect();
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
@@ -5858,9 +6115,9 @@ impl RustGenerator {
     /// mutated in place, so append-only holds and backup / watermark snapshots
     /// (#57 / #56) keep working unchanged.  Returns `false` if the id is absent.
     /// `None` when the model has no id field (cannot be mutated by id).
-    fn generate_update_logic(model: &forgedb_parser::Model) -> Option<TokenStream> {
+    fn generate_update_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
         model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
-        let append_statements = Self::generate_append_statements(model);
+        let append_statements = Self::generate_append_statements(schema, model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, false);
         let shared_record_json = Self::generate_shared_record_json();
@@ -5871,7 +6128,7 @@ impl RustGenerator {
         // Integrity gate (#91): validate field constraints + `&unique` (excluding
         // the record's own id) before any durable side effect.
         let validate_fn = format_ident!("validate_{}", Self::to_snake_case(&model.name));
-        let unique_checks = Self::generate_unique_checks(model, true);
+        let unique_checks = Self::generate_unique_checks(schema, model, true);
 
         // Secondary-index maintenance (#90): an update that changes an indexed
         // field must drop the OLD value key and add the NEW one, else the index
@@ -5897,13 +6154,13 @@ impl RustGenerator {
         // index structure. Removes are grouped under one `if let Some(__old_rec)`
         // (the old hoist lives inside it, since `__old_rec` is bound there); adds
         // run unconditionally after.
-        let (add_hoist, add_map) = Self::hoist_index_keys(model, &rec, "add");
-        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &old, "rem");
+        let (add_hoist, add_map) = Self::hoist_index_keys(schema, model, &rec, "add");
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &old, "rem");
         let single_removes: Vec<_> = indexed
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &old, &rem_map);
+                let key = Self::field_key_token(schema, f, &old, &rem_map);
                 Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -5911,7 +6168,7 @@ impl RustGenerator {
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &rec, &add_map);
+                let key = Self::field_key_token(schema, f, &rec, &add_map);
                 Self::index_add_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -5926,7 +6183,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| Self::field_key_token(c, &old, &rem_map))
+                    .map(|c| Self::field_key_token(schema, c, &old, &rem_map))
                     .collect();
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
@@ -5936,7 +6193,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| Self::field_key_token(c, &rec, &add_map))
+                    .map(|c| Self::field_key_token(schema, c, &rec, &add_map))
                     .collect();
                 Self::composite_add_block(&recv, ident, &parts, &id_tok)
             })
@@ -6028,9 +6285,9 @@ impl RustGenerator {
     /// to keep every column aligned to the row count.  Reads resolve the newest
     /// version, now tombstoned, so `get` returns `None`.  Returns `false` if the id
     /// is already absent.  `None` when the model has no id field.
-    fn generate_delete_logic(model: &forgedb_parser::Model) -> Option<TokenStream> {
+    fn generate_delete_logic(schema: &Schema, model: &forgedb_parser::Model) -> Option<TokenStream> {
         model.fields.iter().find(|f| f.name == "id" || f.auto_generate)?;
-        let append_statements = Self::generate_append_statements(model);
+        let append_statements = Self::generate_append_statements(schema, model);
         let model_name_str = model.name.clone();
         let wal_write = Self::generate_wal_record_write(model, true);
         let shared_record_json = Self::generate_shared_record_json();
@@ -6050,12 +6307,12 @@ impl RustGenerator {
         let id_tok = quote! { id };
         let rec = quote! { record };
         // #157 part B: hoist shared-field keys once (from the pre-delete `record`).
-        let (rem_hoist, rem_map) = Self::hoist_index_keys(model, &rec, "rem");
+        let (rem_hoist, rem_map) = Self::hoist_index_keys(schema, model, &rec, "rem");
         let index_removes: Vec<_> = Self::indexed_fields(model)
             .iter()
             .map(|f| {
                 let ident = Self::index_field_ident(f);
-                let key = Self::field_key_token(f, &rec, &rem_map);
+                let key = Self::field_key_token(schema, f, &rec, &rem_map);
                 Self::index_remove_block(&recv, &ident, key, &id_tok)
             })
             .collect();
@@ -6067,7 +6324,7 @@ impl RustGenerator {
             .map(|(ident, comps)| {
                 let parts: Vec<_> = comps
                     .iter()
-                    .map(|c| Self::field_key_token(c, &rec, &rem_map))
+                    .map(|c| Self::field_key_token(schema, c, &rec, &rem_map))
                     .collect();
                 Self::composite_remove_block(&recv, ident, &parts, &id_tok)
             })
@@ -6149,9 +6406,9 @@ impl RustGenerator {
     /// bypasses superseding-version (#66) / watermark (#56) resolution.  The
     /// `_at` probe additionally post-filters on the resolved value, so a
     /// candidate whose value changed *after* the snapshot is excluded.
-    fn generate_index_lookups(model: &forgedb_parser::Model) -> TokenStream {
-        let probes = Self::generate_index_probes(model, true);
-        let ranges = Self::generate_ordered_range_methods(model);
+    fn generate_index_lookups(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        let probes = Self::generate_index_probes(schema, model, true);
+        let ranges = Self::generate_ordered_range_methods(schema, model);
         quote! { #probes #ranges }
     }
 
@@ -6161,7 +6418,7 @@ impl RustGenerator {
     /// = unbounded) in value order (or reversed), resolving each id's live record,
     /// stopping at `limit` — O(matches) top-N / range, not a full scan.  Writer
     /// only (resolves via live `get`); the reader/`_at` ordered probe is deferred.
-    fn generate_ordered_range_methods(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_ordered_range_methods(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let methods: Vec<TokenStream> = Self::ordered_index_fields(model)
             .iter()
@@ -6172,7 +6429,7 @@ impl RustGenerator {
                 // but `f64` — whose key is an encoded `u64` the caller must never
                 // have to construct (#242).
                 let pty = Self::ordered_param_type(f).expect("ordered_index_fields filtered");
-                let id_type = Self::id_type_tokens(model);
+                let id_type = Self::id_type_tokens(schema, model);
                 let range_fn = format_ident!("find_by_{}_range", f.name);
                 // Map each bound through the same transform as the stored key —
                 // decimal scale-invariant, f64 total-order encoded — so a bound is
@@ -6250,7 +6507,7 @@ impl RustGenerator {
     ///
     /// `include_live = true` → writer (has `get` + `get_at`); `false` → reader
     /// (has `get_at` only, index maps cloned at `reader()` time).
-    fn generate_index_probes(model: &forgedb_parser::Model, include_live: bool) -> TokenStream {
+    fn generate_index_probes(schema: &Schema, model: &forgedb_parser::Model, include_live: bool) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let mut methods: Vec<TokenStream> = Vec::new();
 
@@ -6258,13 +6515,13 @@ impl RustGenerator {
         for f in Self::indexed_fields(model) {
             let ident = Self::index_field_ident(f);
             let fname = format_ident!("{}", f.name);
-            let param_ty = Self::index_param_type(f);
+            let param_ty = Self::index_param_type(schema, f);
             let find_fn = format_ident!("find_by_{}", f.name);
             let find_at_fn = format_ident!("find_by_{}_at", f.name);
             let params = quote! { value: #param_ty };
             let key_from_arg =
-                Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type, quote! { value }));
-            let key_from_rec = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type, quote! { value }));
+            let key_from_rec = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                 quote! { __rec.#fname },
             ));
             let subject = format!("`{}`.`{}`", model.name, f.name);
@@ -6298,7 +6555,7 @@ impl RustGenerator {
                 .iter()
                 .map(|c| {
                     let pn = format_ident!("{}", c.name);
-                    let pt = Self::index_param_type(c);
+                    let pt = Self::index_param_type(schema, c);
                     quote! { #pn: #pt }
                 })
                 .collect();
@@ -6307,14 +6564,14 @@ impl RustGenerator {
                 .iter()
                 .map(|c| {
                     let pn = format_ident!("{}", c.name);
-                    Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type, quote! { #pn }))
+                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type, quote! { #pn }))
                 })
                 .collect();
             let rec_keys: Vec<_> = comps
                 .iter()
                 .map(|c| {
                     let cf = format_ident!("{}", c.name);
-                    Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type,
+                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type,
                         quote! { __rec.#cf },
                     ))
                 })
@@ -6485,6 +6742,7 @@ impl RustGenerator {
     /// holder) can satisfy `borrowed = true`; the positional `VariableColumn` path
     /// has no span to borrow from.
     fn field_read_stmt(
+        schema: &Schema,
         field: &forgedb_parser::Field,
         receiver: &TokenStream,
         row_index: &TokenStream,
@@ -6686,25 +6944,24 @@ impl RustGenerator {
                 }
             };
             Some((field_value_name, stmt))
-        } else if Self::is_fixed_size_type(&field.field_type) {
-            // Check if this is a complex type that needs byte conversion.
-            // OptionalReference is treated like Nullable(Uuid) — stored as Option<Uuid> bytes.
+        } else if Self::is_fixed_size_type(schema, &field.field_type) {
+            // Complex types that persist as a raw byte blob.  #266: an optional
+            // FK is not named here any more — `resolved_type` backs it onto
+            // `Nullable(<target key>)`, so it arrives as an ordinary nullable
+            // column.
             let needs_byte_conversion = matches!(
-                &field.field_type,
+                &Self::resolved_type(schema, &field.field_type),
                 forgedb_parser::FieldType::Bytes(_)
                     | forgedb_parser::FieldType::FixedArray(_, _)
                     | forgedb_parser::FieldType::StructType(_)
                     | forgedb_parser::FieldType::OptionalStructType(_)
                     | forgedb_parser::FieldType::Nullable(_)
-                    | forgedb_parser::FieldType::Relation(
-                        forgedb_parser::RelationType::OptionalReference(_),
-                    )
             );
 
             let stmt = if needs_byte_conversion {
                 // C3: use the actual stored type (Option<T> for nullable/optional) for the
                 // type annotation and use ptr::read_unaligned to avoid UB on unaligned reads
-                let stored_type = Self::stored_type_tokens(&field.field_type, field.is_nullable());
+                let stored_type = Self::stored_type_tokens(schema, &field.field_type, field.is_nullable());
                 quote! {
                     let #field_value_name: #stored_type = {
                         let bytes = #receiver.#field_col_name.read_bytes(#row_index)
@@ -6716,22 +6973,20 @@ impl RustGenerator {
                 }
             } else {
                 // For primitives, use typed method
-                let read_method = Self::get_read_method(&field.field_type);
+                let read_method = Self::get_read_method(schema, &field.field_type);
 
-                // UUID and RequiredReference (FK scalar) both read raw [u8; 16]
+                // A uuid reads a raw [u8; 16] — including an FK that resolved to
+                // one (#266).
                 let is_uuid_like = matches!(
-                    &field.field_type,
+                    &Self::resolved_type(schema, &field.field_type),
                     forgedb_parser::FieldType::Uuid
-                        | forgedb_parser::FieldType::Relation(
-                            forgedb_parser::RelationType::RequiredReference(_),
-                        )
                 );
                 // read_timestamp returns i64; the struct field is Timestamp
                 let is_timestamp =
-                    matches!(&field.field_type, forgedb_parser::FieldType::Timestamp);
+                    matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Timestamp);
                 // Non-null decimal reads raw [u8; 16] then Decimal::deserialize.
                 let is_decimal =
-                    matches!(&field.field_type, forgedb_parser::FieldType::Decimal);
+                    matches!(&Self::resolved_type(schema, &field.field_type), forgedb_parser::FieldType::Decimal);
 
                 if is_decimal {
                     quote! {
@@ -6778,9 +7033,9 @@ impl RustGenerator {
     /// create body may omit those fields — emitted for the model struct, but NOT
     /// for read-only projection structs (which are never deserialized from a
     /// create body).
-    fn model_struct_field(field: &forgedb_parser::Field, auto_default: bool) -> TokenStream {
+    fn model_struct_field(schema: &Schema, field: &forgedb_parser::Field, auto_default: bool) -> TokenStream {
         let field_name = format_ident!("{}", field.name);
-        let field_type = Self::map_field_type_ident(&field.field_type);
+        let field_type = Self::map_field_type_ident(schema, &field.field_type);
 
         // forgedb_types::Timestamp is a newtype over i64 and does not implement
         // utoipa::ToSchema.  Annotate those fields so utoipa uses i64 for the
@@ -7006,6 +7261,7 @@ impl RustGenerator {
     /// buffers are still alive and lets only `(total, ids)` escape, so a `String` is
     /// never allocated for a scan row at all.
     fn generate_list_scan(
+        schema: &Schema,
         model: &forgedb_parser::Model,
     ) -> (TokenStream, TokenStream) {
         if Self::identity_field(model).is_none() {
@@ -7017,7 +7273,7 @@ impl RustGenerator {
         // not O(rows) when the list filters on an indexed field.
         let pushdown: Vec<_> = Self::scan_pushdown_fields(model)
             .into_iter()
-            .map(Self::generate_rows_by_index)
+            .map(|f| Self::generate_rows_by_index(schema, f))
             .collect();
 
         // #224: the borrowed narrow view — every filterable column, with `string`
@@ -7032,7 +7288,7 @@ impl RustGenerator {
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let ref_field_decls = scan_fields.iter().map(|f| {
             let fname = format_ident!("{}", f.name);
-            let fty = Self::scan_ref_field_type(f);
+            let fty = Self::scan_ref_field_type(schema, f);
             quote! { pub #fname: #fty }
         });
         let ref_doc = format!(
@@ -7080,7 +7336,7 @@ impl RustGenerator {
         // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
         let with_scan_method =
-            Self::generate_scan_scope_method(&scan_ref_ident, &buf_holder, &scan_fields);
+            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields);
 
         let methods = quote! {
             #with_scan_method
@@ -7120,7 +7376,7 @@ impl RustGenerator {
     /// what lets the SAME generated filter checks compile against both views —
     /// `&str: PartialEq<String>` and `Option<&str>: PartialEq<Option<String>>` are
     /// both std, so `record.<field> == <parsed param>` needs no second form.
-    fn scan_ref_field_type(field: &forgedb_parser::Field) -> TokenStream {
+    fn scan_ref_field_type(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
         if Self::is_string_semantic(&field.field_type) {
             return if field.is_nullable() {
                 quote! { Option<&'a str> }
@@ -7128,7 +7384,7 @@ impl RustGenerator {
                 quote! { &'a str }
             };
         }
-        let base = Self::map_field_type_ident(&field.field_type);
+        let base = Self::map_field_type_ident(schema, &field.field_type);
         if field.is_nullable() {
             quote! { Option<#base> }
         } else {
@@ -7159,6 +7415,7 @@ impl RustGenerator {
     /// filter allocates a `Vec` of survivors rather than of every live row. That is
     /// #224's win, preserved.
     fn generate_scan_scope_method(
+        schema: &Schema,
         ref_ident: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
@@ -7177,13 +7434,13 @@ impl RustGenerator {
             {
                 Some(quote! { forgedb_storage::BufferedVariableColumn })
             } else if Self::is_enum_type(&field.field_type)
-                || Self::is_fixed_size_type(&field.field_type)
+                || Self::is_fixed_size_type(schema, &field.field_type)
             {
                 Some(quote! { forgedb_storage::BufferedFixedColumn })
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot, true)) {
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -7298,6 +7555,7 @@ impl RustGenerator {
     /// own scan is [`Self::generate_scan_scope_method`], which shares the bulk-load
     /// but keeps everything it decodes inside the scope (#228).
     fn generate_buffered_scan_method(
+        schema: &Schema,
         struct_ident: &proc_macro2::Ident,
         method: &proc_macro2::Ident,
         holder: &proc_macro2::Ident,
@@ -7318,13 +7576,13 @@ impl RustGenerator {
             {
                 Some(quote! { forgedb_storage::BufferedVariableColumn })
             } else if Self::is_enum_type(&field.field_type)
-                || Self::is_fixed_size_type(&field.field_type)
+                || Self::is_fixed_size_type(schema, &field.field_type)
             {
                 Some(quote! { forgedb_storage::BufferedFixedColumn })
             } else {
                 None // relation/component: no storage column (see field_read_stmt None arm)
             };
-            match (buffered_ty, Self::field_read_stmt(field, &recv, &slot, false)) {
+            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false)) {
                 (Some(ty), Some((value_ident, stmt))) => {
                     buf_field_decls.push(quote! { #col_ident: #ty });
                     buf_inits.push(quote! {
@@ -7422,7 +7680,7 @@ impl RustGenerator {
     /// span.  Handing the rows to `__with_scan` instead unifies the two paths on the
     /// borrowed view and bulk-loads the candidates (one `gather_buffered` per
     /// column), so the pushdown stops being the odd one out in both senses.
-    fn generate_rows_by_index(field: &forgedb_parser::Field) -> TokenStream {
+    fn generate_rows_by_index(schema: &Schema, field: &forgedb_parser::Field) -> TokenStream {
         use forgedb_parser::{FieldType, RelationType};
         let index_ident = Self::index_field_ident(field);
         let rows_by = format_ident!("__rows_by_{}", field.name);
@@ -7462,7 +7720,7 @@ impl RustGenerator {
             // scan_pushdown_fields guarantees eligibility; other types are excluded.
             _ => return quote! {},
         };
-        let key = Self::index_key_expr(&field.field_type, Self::index_value_expr(&field.field_type, key_value));
+        let key = Self::index_key_expr(schema, &field.field_type, Self::index_value_expr(&field.field_type, key_value));
         quote! {
             /// #160 (C): resolve list candidate ROWS for this indexed field from the
             /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -7513,6 +7771,7 @@ impl RustGenerator {
     /// (`generate_id_read_expr`) used to resolve newest-version-within-watermark
     /// for the snapshot `_at` variants; `None` for a model with no identity field.
     fn generate_projections(
+        schema: &Schema,
         model: &forgedb_parser::Model,
         id_type: &TokenStream,
         id_read: Option<&TokenStream>,
@@ -7579,7 +7838,7 @@ impl RustGenerator {
             let proj_ident = format_ident!("{}{}", model.name, Self::projection_pascal(&proj.name));
             let fields = Self::projected_field_set(model, proj);
             let struct_field_defs: Vec<_> =
-                fields.iter().map(|f| Self::model_struct_field(f, false)).collect();
+                fields.iter().map(|f| Self::model_struct_field(schema, f, false)).collect();
 
             let read_at_name = format_ident!("read_{}_at", proj.name);
             let get_name = format_ident!("get_{}", proj.name);
@@ -7587,7 +7846,7 @@ impl RustGenerator {
             let get_at_name = format_ident!("get_{}_at", proj.name);
             let all_at_name = format_ident!("all_{}_at", proj.name);
 
-            let read_body = Self::generate_row_read_body(&proj_ident, &fields);
+            let read_body = Self::generate_row_read_body(schema, &proj_ident, &fields);
             let doc = format!(
                 "Projection `{}` of `{}` (#113): materializes only PK + \
                  declared columns, leaving unselected columns unread.",
@@ -7608,7 +7867,7 @@ impl RustGenerator {
                 proj.name
             );
             let all_method =
-                Self::generate_buffered_scan_method(&proj_ident, &all_name, &proj_holder, &fields, &all_doc);
+                Self::generate_buffered_scan_method(schema, &proj_ident, &all_name, &proj_holder, &fields, &all_doc);
 
             structs.push(quote! {
                 #[doc = #doc]
@@ -7667,6 +7926,7 @@ impl RustGenerator {
     /// Only the columns of `fields` are touched, which is what lets a projection
     /// skip the wasm lazy fault-in of unselected columns.
     fn generate_row_read_body(
+        schema: &Schema,
         struct_ident: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
     ) -> TokenStream {
@@ -7677,7 +7937,7 @@ impl RustGenerator {
 
         for field in fields {
             let field_name = format_ident!("{}", field.name);
-            match Self::field_read_stmt(field, &recv, &row, false) {
+            match Self::field_read_stmt(schema, field, &recv, &row, false) {
                 Some((value_ident, stmt)) => {
                     read_statements.push(stmt);
                     // C1: only push to field_values when a binding was emitted.
@@ -7711,19 +7971,20 @@ impl RustGenerator {
         }
     }
 
-    fn generate_read_at_logic(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_read_at_logic(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let fields: Vec<&forgedb_parser::Field> = model.fields.iter().collect();
-        Self::generate_row_read_body(&model_name, &fields)
+        Self::generate_row_read_body(schema, &model_name, &fields)
     }
 
     /// Return the Rust type tokens used for raw byte storage read/write (C3).
     /// For `OptionalStructType` and `Nullable` the stored type is `Option<Inner>`.
     fn stored_type_tokens(
+        schema: &Schema,
         field_type: &forgedb_parser::FieldType,
         is_nullable: bool,
     ) -> TokenStream {
-        let base = Self::map_field_type_ident(field_type);
+        let base = Self::map_field_type_ident(schema, field_type);
         if is_nullable {
             quote! { Option<#base> }
         } else {
@@ -7749,7 +8010,8 @@ impl RustGenerator {
     }
 
     /// Check if a field type is fixed-size
-    fn is_fixed_size_type(field_type: &forgedb_parser::FieldType) -> bool {
+    fn is_fixed_size_type(schema: &Schema, field_type: &forgedb_parser::FieldType) -> bool {
+        let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             forgedb_parser::FieldType::U32
             | forgedb_parser::FieldType::U64
@@ -7777,16 +8039,7 @@ impl RustGenerator {
             | forgedb_parser::FieldType::FixedArray(_, _)
             | forgedb_parser::FieldType::StructType(_)
             | forgedb_parser::FieldType::OptionalStructType(_) => true,
-            forgedb_parser::FieldType::Nullable(inner) => Self::is_fixed_size_type(inner),
-            // FK scalar references are fixed-size UUID columns (16 bytes for required,
-            // size_of::<Option<Uuid>>() for optional).  This is the load-bearing entry
-            // point that causes generate_storage_fields, generate_storage_inits,
-            // generate_insert_logic, and generate_get_logic to all agree that FK fields
-            // have a column — keeping column_index consistent across all four helpers.
-            forgedb_parser::FieldType::Relation(
-                forgedb_parser::RelationType::RequiredReference(_)
-                | forgedb_parser::RelationType::OptionalReference(_),
-            ) => true,
+            forgedb_parser::FieldType::Nullable(inner) => Self::is_fixed_size_type(schema, inner),
             _ => false,
         }
     }
@@ -8203,7 +8456,8 @@ impl RustGenerator {
     }
 
     /// Get the type name for storage paths
-    fn type_name(field_type: &forgedb_parser::FieldType) -> &'static str {
+    fn type_name(schema: &Schema, field_type: &forgedb_parser::FieldType) -> &'static str {
+        let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             forgedb_parser::FieldType::U32 => "u32",
             forgedb_parser::FieldType::U64 => "u64",
@@ -8225,25 +8479,19 @@ impl RustGenerator {
             forgedb_parser::FieldType::FixedArray(_, _) => "bytes",
             forgedb_parser::FieldType::StructType(_) => "bytes",
             forgedb_parser::FieldType::OptionalStructType(_) => "bytes",
-            forgedb_parser::FieldType::Nullable(inner) => Self::type_name(inner),
-            // Both FK reference types store UUID bytes — required as 16 raw bytes,
-            // optional as Option<Uuid> bytes; the path label is "uuid" for both.
-            forgedb_parser::FieldType::Relation(
-                forgedb_parser::RelationType::RequiredReference(_)
-                | forgedb_parser::RelationType::OptionalReference(_),
-            ) => "uuid",
+            forgedb_parser::FieldType::Nullable(inner) => Self::type_name(schema, inner),
             _ => "unknown",
         }
     }
 
     /// Get the append method name for a field type
-    fn get_append_method(field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
-        format_ident!("append_{}", Self::type_name(field_type))
+    fn get_append_method(schema: &Schema, field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
+        format_ident!("append_{}", Self::type_name(schema, field_type))
     }
 
     /// Get the read method name for a field type
-    fn get_read_method(field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
-        format_ident!("read_{}", Self::type_name(field_type))
+    fn get_read_method(schema: &Schema, field_type: &forgedb_parser::FieldType) -> proc_macro2::Ident {
+        format_ident!("read_{}", Self::type_name(schema, field_type))
     }
 
     /// Generate reopen/rehydration logic for a model storage's `new()` (#65).
@@ -8254,8 +8502,8 @@ impl RustGenerator {
     /// a local `db` binding (the just-constructed storage).  Emitted for the id
     /// field only — reconstructing the identity map is all reopen needs; the
     /// remaining columns are read on demand by `get`.
-    fn generate_rehydrate_logic(model: &forgedb_parser::Model) -> TokenStream {
-        Self::generate_rehydrate_body(model, &quote! { db })
+    fn generate_rehydrate_logic(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        Self::generate_rehydrate_body(schema, model, &quote! { db })
     }
 
     /// The shared reopen-rehydration body (#65), parameterized over the receiver
@@ -8265,6 +8513,7 @@ impl RustGenerator {
     /// tombstone anchor and rebuilds `id_to_row` + the secondary indexes from the
     /// committed prefix via the SAME narrow per-field decode path everywhere.
     fn generate_rehydrate_body(
+        schema: &Schema,
         model: &forgedb_parser::Model,
         recv: &TokenStream,
     ) -> TokenStream {
@@ -8278,7 +8527,7 @@ impl RustGenerator {
         // row is pushed in order, so each id's version vec ends up sorted ascending
         // exactly as live maintenance built it (last element = newest version).
         let versions_push = Self::id_versions_push_stmt(model, recv, &quote! { id }, &quote! { i });
-        let id_scan = match Self::generate_id_read_expr(model, recv, &i) {
+        let id_scan = match Self::generate_id_read_expr(schema, model, recv, &i) {
             Some(read_expr) => quote! {
                 for i in 0..n {
                     let id = #read_expr;
@@ -8313,7 +8562,7 @@ impl RustGenerator {
             if indexed.is_empty() && composites.is_empty() {
                 quote! {}
             } else {
-                let id_type = Self::id_type_tokens(model);
+                let id_type = Self::id_type_tokens(schema, model);
 
                 // The set of fields whose columns the rebuild must decode: every
                 // single-index field plus every composite component, de-duplicated
@@ -8334,7 +8583,7 @@ impl RustGenerator {
                 let field_reads: Vec<_> = read_fields
                     .iter()
                     .filter_map(|f| {
-                        Self::field_read_stmt(f, recv, &row_tok, false).map(|(_, stmt)| stmt)
+                        Self::field_read_stmt(schema, f, recv, &row_tok, false).map(|(_, stmt)| stmt)
                     })
                     .collect();
 
@@ -8348,7 +8597,7 @@ impl RustGenerator {
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
-                        let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type, quote! { #val }),
+                        let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type, quote! { #val }),
                         );
                         Self::index_add_block(recv, &ident, key, &id_tok)
                     })
@@ -8367,7 +8616,7 @@ impl RustGenerator {
                         .iter()
                         .map(|c| {
                             let val = format_ident!("{}_value", c.name);
-                            Self::index_key_expr(&c.field_type, Self::index_value_expr(&c.field_type, quote! { #val }),
+                            Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type, quote! { #val }),
                             )
                         })
                         .collect();
@@ -8432,7 +8681,7 @@ impl RustGenerator {
                         // identity case avoids. Ungated by tombstones for the same
                         // reason: a deleted row's number must stay spent.
                         let col = format_ident!("{}_col", f.name);
-                        let read_method = Self::get_read_method(&f.field_type);
+                        let read_method = Self::get_read_method(schema, &f.field_type);
                         quote! {
                             {
                                 let mut __max: u64 = 0;
@@ -8652,8 +8901,8 @@ impl RustGenerator {
         // generated match — the follower reads no `.forge` at runtime; it only
         // routes by the string tag the server stamped and lets generated code
         // materialize the typed record.  Id-bearing models dispatch to their
-        // per-model `apply`; a junction tag decodes the 32-byte opaque pair and
-        // re-links.  (Guard: this method must never `match` on a *decoded field*.)
+        // per-model `apply`; a junction tag decodes the opaque pair (one slot per
+        // endpoint key, #266) and re-links.  (Guard: this method must never `match` on a *decoded field*.)
         let apply_model_arms: Vec<_> = schema
             .models
             .iter()
@@ -8673,17 +8922,25 @@ impl RustGenerator {
                     Self::to_snake_case(&m.model1),
                     Self::to_snake_case(&m.model2)
                 );
+                let (lt, rt) = Self::junction_key_pair(schema, m);
+                let lwv = Self::junction_key_width(&lt);
+                let sumv = lwv + Self::junction_key_width(&rt);
+                let lw = proc_macro2::Literal::usize_unsuffixed(lwv);
+                let sw = proc_macro2::Literal::usize_unsuffixed(sumv);
+                let (lw, sw) = (quote! { #lw }, quote! { #sw });
+                let l_dec = Self::junction_frame_decode(schema, &lt, &quote! { &ev.bytes[0..#lw] });
+                let r_dec =
+                    Self::junction_frame_decode(schema, &rt, &quote! { &ev.bytes[#lw..#sw] });
                 quote! {
                     #base => {
-                        // Opaque 32-byte pair: left uuid ++ right uuid, exactly as
-                        // the junction broker recorded it.  The follower re-links
-                        // through the same generated `link` (broker `None`, inert).
-                        if ev.bytes.len() == 32 {
-                            let mut __l = [0u8; 16];
-                            __l.copy_from_slice(&ev.bytes[0..16]);
-                            let mut __r = [0u8; 16];
-                            __r.copy_from_slice(&ev.bytes[16..32]);
-                            self.#field.link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                        // Opaque pair: left ++ right, one slot per endpoint key
+                        // (#266), exactly as the junction broker recorded it.  The
+                        // follower re-links through the same generated `link`
+                        // (broker `None`, inert).
+                        if ev.bytes.len() == #sw {
+                            let __l = #l_dec;
+                            let __r = #r_dec;
+                            self.#field.link(__l, __r);
                         }
                         Ok(())
                     }
@@ -9229,10 +9486,10 @@ impl RustGenerator {
     /// storage-scoped `insert`/`update` cannot make — **foreign-key existence** —
     /// because it needs sibling-collection access (`self.<target>.get(fk)`), then
     /// delegate to the storage method (which enforces field constraints + `&unique`).
-    /// Required FKs must resolve; optional FKs must resolve *when set*.  Only
-    /// UUID-keyed targets are checked (an FK is always a `Uuid`, so an integer-PK
-    /// target cannot be resolved by it — the same restriction as relation
-    /// traversal).  The generated REST boundary routes creates/updates through
+    /// Required FKs must resolve; optional FKs must resolve *when set*.  Since
+    /// #266 an FK carries its target's OWN key type, so **every** target is
+    /// checked — a `+u64`-keyed parent resolves its children exactly as a
+    /// uuid-keyed one does.  The generated REST boundary routes creates/updates through
     /// these, so both the Rust API and REST get full integrity.
     fn generate_validated_writes(schema: &Schema) -> TokenStream {
         let mut methods = Vec::new();
@@ -9243,7 +9500,7 @@ impl RustGenerator {
             let snake = Self::to_snake_case(&model.name);
             let storage_field = format_ident!("{}", snake);
             let model_ident = format_ident!("{}", model.name);
-            let id_type = Self::id_type_tokens(model);
+            let id_type = Self::id_type_tokens(schema, model);
             let create_fn = format_ident!("create_{}", snake);
             let update_fn = format_ident!("update_{}", snake);
 
@@ -9261,9 +9518,6 @@ impl RustGenerator {
                         _ => return None,
                     };
                     let target = schema.find_model(target_name)?;
-                    if !Self::is_uuid_pk(target) {
-                        return None;
-                    }
                     let target_storage = format_ident!("{}", Self::to_snake_case(&target.name));
                     let fk_field = format_ident!("{}", field.name);
                     let fname = field.name.as_str();
@@ -9357,7 +9611,8 @@ impl RustGenerator {
     }
 
     /// Generate the `delete_<model>` referential-integrity wrappers on `Database`
-    /// (delete semantics).  For each UUID-keyed parent model, emits:
+    /// (delete semantics).  For each id-bearing parent model, emits (#266 — the
+    /// wrapper is no longer restricted to uuid-keyed parents):
     ///   * a public `delete_<model>(id) -> Result<bool, ValidationError>` that
     ///     evaluates every child FK's `@on_delete` policy before delegating to
     ///     `<model>Storage::delete`, and unlinks the model's M2M junction rows;
@@ -9386,26 +9641,13 @@ impl RustGenerator {
             let public_fn = format_ident!("delete_{}", parent_snake);
             let cascade_fn = format_ident!("delete_{}_cascade", parent_snake);
             let parent_name_str = parent.name.as_str();
-            let id_type = Self::id_type_tokens(parent);
+            let id_type = Self::id_type_tokens(schema, parent);
 
-            // Integer-PK models are never FK targets (FKs are always UUID) and
-            // never in an M2M (junctions require UUID PKs on both sides), so their
-            // wrapper is a trivial delegate — no referential-integrity work.
-            if !Self::is_uuid_pk(parent) {
-                let doc = format!(
-                    "Delete a {} (integer-keyed): no model references it via a \
-                     foreign key, so this delegates to storage `delete`.  Returns \
-                     `Ok(false)` if the id is absent.",
-                    parent.name
-                );
-                out.push(quote! {
-                    #[doc = #doc]
-                    pub fn #public_fn(&mut self, id: #id_type) -> Result<bool, ValidationError> {
-                        Ok(self.#parent_storage.delete(id))
-                    }
-                });
-                continue;
-            }
+            // #266: there is no longer a degenerate branch here.  A non-UUID key
+            // used to fall through to a bare delegate carrying the doc comment
+            // "no model references it via a foreign key" — asserted as fact in
+            // schemas where one plainly did, which is exactly what kept the hole
+            // invisible.  Every identity model now gets the real wrapper.
 
             // Every child FK field that references THIS parent, with its policy.
             // A child may have multiple FKs to the same parent (disambiguated by
@@ -9415,9 +9657,6 @@ impl RustGenerator {
             let mut restrict_checks: Vec<TokenStream> = Vec::new();
             let mut mutations: Vec<TokenStream> = Vec::new();
             for child in &schema.models {
-                if !Self::is_uuid_pk(child) {
-                    continue;
-                }
                 let child_snake = Self::to_snake_case(&child.name);
                 let child_storage = format_ident!("{}", child_snake);
                 let child_delete = format_ident!("delete_{}_cascade", child_snake);
@@ -9539,13 +9778,13 @@ impl RustGenerator {
 
             out.push(quote! {
                 #[doc = #doc]
-                pub fn #public_fn(&mut self, id: Uuid) -> Result<bool, ValidationError> {
+                pub fn #public_fn(&mut self, id: #id_type) -> Result<bool, ValidationError> {
                     self.#cascade_fn(id, 0)
                 }
 
                 /// Internal depth-bounded cascade worker.  `depth` guards a
                 /// pathological FK cycle (bounded by `MAX_CASCADE_DEPTH`).
-                fn #cascade_fn(&mut self, id: Uuid, __depth: u32) -> Result<bool, ValidationError> {
+                fn #cascade_fn(&mut self, id: #id_type, __depth: u32) -> Result<bool, ValidationError> {
                     if __depth > MAX_CASCADE_DEPTH {
                         return Err(ValidationError::ReferencedByChildren {
                             model: #parent_name_str,
@@ -10160,7 +10399,7 @@ impl RustGenerator {
             let model_tag = model.name.as_str();
             let snake = Self::to_snake_case(&model.name);
             let field = format_ident!("{}", snake);
-            let id_type = Self::id_type_tokens(model);
+            let id_type = Self::id_type_tokens(schema, model);
             let id_field = Self::id_field_ident(model);
             let validate_fn = format_ident!("validate_{}", snake);
             let create_fn = format_ident!("create_{}", snake);
@@ -10188,7 +10427,7 @@ impl RustGenerator {
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
                     let mtag = model.name.as_str();
-                    let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -10218,7 +10457,7 @@ impl RustGenerator {
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
                     let mtag = model.name.as_str();
-                    let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -10260,9 +10499,6 @@ impl RustGenerator {
                         _ => return None,
                     };
                     let target = schema.find_model(target_name)?;
-                    if !Self::is_uuid_pk(target) {
-                        return None;
-                    }
                     let target_get_fn = format_ident!("get_{}", Self::to_snake_case(&target.name));
                     let fk_field = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
@@ -10628,7 +10864,7 @@ impl RustGenerator {
         let model_tag = model.name.as_str();
         let snake = Self::to_snake_case(&model.name);
         let field = format_ident!("{}", snake);
-        let id_type = Self::id_type_tokens(model);
+        let id_type = Self::id_type_tokens(schema, model);
         let id_field = Self::id_field_ident(model);
         let mark_fn = format_ident!("__mark_{}", snake);
         let create_fn = format_ident!("create_{}", snake);
@@ -10655,7 +10891,7 @@ impl RustGenerator {
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
                 let mtag = model.name.as_str();
-                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
@@ -10683,7 +10919,7 @@ impl RustGenerator {
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
                 let mtag = model.name.as_str();
-                let key = Self::index_key_expr(&f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
@@ -10740,9 +10976,6 @@ impl RustGenerator {
                     _ => return None,
                 };
                 let target = schema.find_model(target_name)?;
-                if !Self::is_uuid_pk(target) {
-                    return None;
-                }
                 let target_get = format_ident!("get_{}", Self::to_snake_case(&target.name));
                 let fk_field = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
@@ -10889,6 +11122,27 @@ impl RustGenerator {
         for m in Self::valid_m2m(schema) {
             let struct_ident = Self::junction_struct_ident(&m);
             let reader_ident = format_ident!("{}Reader", struct_ident);
+            // #266: each endpoint's column, index and frame slot is that
+            // endpoint's OWN identity type — a junction is no longer uuid-shaped.
+            let (lt, rt) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
+            let rk = Self::map_field_type_ident(schema, &rt);
+            let lwv = Self::junction_key_width(&lt);
+            let rwv = Self::junction_key_width(&rt);
+            let lw = quote! { #lwv };
+            let rw = quote! { #rwv };
+            let l_col_ty = Self::storage_column_type_tokens(schema, &lt, false);
+            let r_col_ty = Self::storage_column_type_tokens(schema, &rt, false);
+            let l_read_local = Self::junction_read_expr(schema, &lt, &quote! { left_col }, &quote! { i });
+            let r_read_local = Self::junction_read_expr(schema, &rt, &quote! { right_col }, &quote! { i });
+            let l_read_self = Self::junction_read_expr(schema, &lt, &quote! { self.left_col }, &quote! { i });
+            let r_read_self = Self::junction_read_expr(schema, &rt, &quote! { self.right_col }, &quote! { i });
+            let l_append = Self::junction_append_expr(schema, &lt, &quote! { self.left_col }, &quote! { left });
+            let r_append = Self::junction_append_expr(schema, &rt, &quote! { self.right_col }, &quote! { right });
+            let sumv = proc_macro2::Literal::usize_unsuffixed(lwv + rwv);
+            let sw = quote! { #sumv };
+            let l_frame = Self::junction_frame_stmt(&lt, &quote! { __row_bytes }, &quote! { left });
+            let r_frame = Self::junction_frame_stmt(&rt, &quote! { __row_bytes }, &quote! { right });
             let reader_doc = format!(
                 "Read-only, lock-free reader handle for the {}<->{} junction (#56 Direction B)",
                 m.model1, m.model2
@@ -10924,8 +11178,8 @@ impl RustGenerator {
                     /// `Vec` preserves first-link order and never holds a duplicate
                     /// (idempotent add).  Writer-only, like the FK `find_by_*`
                     /// indexes (#100) — readers/snapshots still use the `_at` scans.
-                    left_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
-                    right_index: std::collections::HashMap<Uuid, Vec<Uuid>>,
+                    left_index: std::collections::HashMap<#lk, Vec<#rk>>,
+                    right_index: std::collections::HashMap<#rk, Vec<#lk>>,
                     changefeed: Option<forgedb_changefeed::ChangeFeed>,
                     broker: Option<std::sync::Arc<std::sync::Mutex<forgedb_changefeed::durable::DurableBroker>>>,
                 }
@@ -10946,11 +11200,11 @@ impl RustGenerator {
                     pub fn new_at(root: &std::path::Path) -> Self {
                         let left_col = FixedColumn::new(
                             root.join(#left_path),
-                            16usize,
+                            #lw,
                         ).expect("Failed to create junction column");
                         let right_col = FixedColumn::new(
                             root.join(#right_path),
-                            16usize,
+                            #rw,
                         ).expect("Failed to create junction column");
                         let mut tombstones = Tombstones::new(
                             root.join(#tombstones_path),
@@ -10972,21 +11226,17 @@ impl RustGenerator {
                         // edges are indexed (an unlinked-then-not-relinked pair is
                         // excluded).  Single pass over the prefix, mirroring
                         // `pairs_prefix` but populating both directions.
-                        let mut left_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                        let mut left_index: std::collections::HashMap<#lk, Vec<#rk>> =
                             std::collections::HashMap::new();
-                        let mut right_index: std::collections::HashMap<Uuid, Vec<Uuid>> =
+                        let mut right_index: std::collections::HashMap<#rk, Vec<#lk>> =
                             std::collections::HashMap::new();
                         {
-                            let mut __state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                            let mut __state: std::collections::HashMap<(#lk, #rk), bool> =
                                 std::collections::HashMap::new();
-                            let mut __order: Vec<(Uuid, Uuid)> = Vec::new();
+                            let mut __order: Vec<(#lk, #rk)> = Vec::new();
                             for i in 0..row_count {
-                                let l = Uuid::from_bytes(
-                                    left_col.read_uuid(i).expect("Failed to read link"),
-                                );
-                                let r = Uuid::from_bytes(
-                                    right_col.read_uuid(i).expect("Failed to read link"),
-                                );
+                                let l = #l_read_local;
+                                let r = #r_read_local;
                                 if !__state.contains_key(&(l, r)) {
                                     __order.push((l, r));
                                 }
@@ -11016,7 +11266,7 @@ impl RustGenerator {
                     /// Add a live edge to both traversal indexes (#154), idempotent
                     /// per direction (a re-link of an already-live pair is a no-op in
                     /// the index — `pairs()`/`get` already dedup by pair).
-                    fn __index_add(&mut self, left: Uuid, right: Uuid) {
+                    fn __index_add(&mut self, left: #lk, right: #rk) {
                         let rs = self.left_index.entry(left).or_default();
                         if !rs.contains(&right) {
                             rs.push(right);
@@ -11029,7 +11279,7 @@ impl RustGenerator {
 
                     /// Remove an edge from both traversal indexes (#154); prunes an
                     /// emptied bucket so the maps stay bounded by the live degree.
-                    fn __index_remove(&mut self, left: Uuid, right: Uuid) {
+                    fn __index_remove(&mut self, left: #lk, right: #rk) {
                         if let Some(rs) = self.left_index.get_mut(&left) {
                             rs.retain(|r| *r != right);
                             if rs.is_empty() {
@@ -11046,12 +11296,12 @@ impl RustGenerator {
 
                     /// Live right-ids linked to `left` (#154): an O(degree) index
                     /// probe, not an O(all-links) scan.  Order is first-link order.
-                    pub fn rights_of(&self, left: Uuid) -> Vec<Uuid> {
+                    pub fn rights_of(&self, left: #lk) -> Vec<#rk> {
                         self.left_index.get(&left).cloned().unwrap_or_default()
                     }
 
                     /// Live left-ids linked to `right` (#154): the reverse probe.
-                    pub fn lefts_of(&self, right: Uuid) -> Vec<Uuid> {
+                    pub fn lefts_of(&self, right: #rk) -> Vec<#lk> {
                         self.right_index.get(&right).cloned().unwrap_or_default()
                     }
 
@@ -11070,26 +11320,27 @@ impl RustGenerator {
                         self.broker = broker;
                     }
 
-                    /// Write the junction's physical-layout manifest (#57): two
-                    /// 16-byte uuid columns and a row-count anchor on `right.bin`
-                    /// (appended last per link, 16 bytes/row).  Layout only —
-                    /// carries no relation semantics.  Best-effort; reopen anchors
-                    /// on the file length regardless.
+                    /// Write the junction's physical-layout manifest (#57): one
+                    /// fixed column per endpoint, each the width of that endpoint's
+                    /// own identity type (#266), and a row-count anchor on
+                    /// `right.bin` (appended last per link).  Layout only — carries
+                    /// no relation semantics.  Best-effort; reopen anchors on the
+                    /// file length regardless.
                     fn write_manifest(&self, root: &std::path::Path) {
                         let columns = vec![
                             forgedb_storage::ColumnMetadata {
                                 name: "left".to_string(),
-                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_type: #l_col_ty,
                                 column_index: 0usize,
-                                value_size: 16usize,
+                                value_size: #lw,
                                 kind: forgedb_storage::ColumnKind::Fixed,
                                 relative_path: "fixed/left.bin".to_string(),
                             },
                             forgedb_storage::ColumnMetadata {
                                 name: "right".to_string(),
-                                column_type: forgedb_storage::ColumnType::Uuid,
+                                column_type: #r_col_ty,
                                 column_index: 1usize,
-                                value_size: 16usize,
+                                value_size: #rw,
                                 kind: forgedb_storage::ColumnKind::Fixed,
                                 relative_path: "fixed/right.bin".to_string(),
                             },
@@ -11121,10 +11372,10 @@ impl RustGenerator {
                             format_version: __format_version,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
-                                bytes_per_row: 16usize,
+                                bytes_per_row: #rw,
                             }),
                             // A junction has no fields of its own — only the two
-                            // uuid endpoints — so it can never carry a `+u32`/`+u64`
+                            // endpoint ids — so it can never carry a `+u32`/`+u64`
                             // auto and its sequence map is always empty (#187).
                             auto_sequences: Default::default(),
                         };
@@ -11133,12 +11384,10 @@ impl RustGenerator {
 
                     /// Record a link between a `left` (model1) id and a `right`
                     /// (model2) id.
-                    pub fn link(&mut self, left: Uuid, right: Uuid) {
+                    pub fn link(&mut self, left: #lk, right: #rk) {
                         let row_index = self.row_count;
-                        self.left_col.append_uuid(*left.as_bytes())
-                            .expect("Failed to append link");
-                        self.right_col.append_uuid(*right.as_bytes())
-                            .expect("Failed to append link");
+                        #l_append.expect("Failed to append link");
+                        #r_append.expect("Failed to append link");
                         // A live link — tombstone `false`, appended in lockstep.
                         self.tombstones.append(false)
                             .expect("Failed to append junction tombstone");
@@ -11151,11 +11400,12 @@ impl RustGenerator {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Linked);
                         }
                         // Durable replication record (#82): the link pair as opaque
-                        // bytes (left ++ right, 32 bytes) at a global offset.
+                        // bytes (left ++ right, one slot per endpoint key) at a
+                        // global offset.
                         if let Some(__broker) = &self.broker {
-                            let mut __row_bytes = Vec::with_capacity(32);
-                            __row_bytes.extend_from_slice(left.as_bytes());
-                            __row_bytes.extend_from_slice(right.as_bytes());
+                            let mut __row_bytes = Vec::with_capacity(#sw);
+                            #l_frame
+                            #r_frame
                             if let Ok(mut __b) = __broker.lock() {
                                 let _ = __b.record(
                                     #base,
@@ -11174,7 +11424,7 @@ impl RustGenerator {
                     /// a live link existed, `false` if the pair was not linked.
                     /// Re-`link` after `unlink` restores the edge (a later live row
                     /// supersedes the retraction).
-                    pub fn unlink(&mut self, left: Uuid, right: Uuid) -> bool {
+                    pub fn unlink(&mut self, left: #lk, right: #rk) -> bool {
                         // Is the pair currently live?  O(degree) index probe (#154)
                         // instead of the old O(all-links) latest-wins scan.
                         let __live = self
@@ -11186,10 +11436,8 @@ impl RustGenerator {
                             return false;
                         }
                         let row_index = self.row_count;
-                        self.left_col.append_uuid(*left.as_bytes())
-                            .expect("Failed to append unlink");
-                        self.right_col.append_uuid(*right.as_bytes())
-                            .expect("Failed to append unlink");
+                        #l_append.expect("Failed to append unlink");
+                        #r_append.expect("Failed to append unlink");
                         self.tombstones.append(true)
                             .expect("Failed to append junction tombstone");
                         self.row_count += 1;
@@ -11199,9 +11447,9 @@ impl RustGenerator {
                             feed.emit(#base, row_index, forgedb_changefeed::ChangeKind::Deleted);
                         }
                         if let Some(__broker) = &self.broker {
-                            let mut __row_bytes = Vec::with_capacity(32);
-                            __row_bytes.extend_from_slice(left.as_bytes());
-                            __row_bytes.extend_from_slice(right.as_bytes());
+                            let mut __row_bytes = Vec::with_capacity(#sw);
+                            #l_frame
+                            #r_frame
                             if let Ok(mut __b) = __broker.lock() {
                                 let _ = __b.record(
                                     #base,
@@ -11216,7 +11464,7 @@ impl RustGenerator {
 
                     /// Retract every live pair whose `left` id equals `id` (M2M
                     /// cascade-unlink when the left model's row is deleted).
-                    pub fn unlink_all_left(&mut self, id: Uuid) {
+                    pub fn unlink_all_left(&mut self, id: #lk) {
                         // O(degree) index probe (#154) instead of an O(all-links)
                         // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.rights_of(id);
@@ -11227,7 +11475,7 @@ impl RustGenerator {
 
                     /// Retract every live pair whose `right` id equals `id` (M2M
                     /// cascade-unlink when the right model's row is deleted).
-                    pub fn unlink_all_right(&mut self, id: Uuid) {
+                    pub fn unlink_all_right(&mut self, id: #rk) {
                         // O(degree) index probe (#154) instead of an O(all-links)
                         // `pairs()` scan per cascade (a step toward #155).
                         let __targets = self.lefts_of(id);
@@ -11261,24 +11509,20 @@ impl RustGenerator {
                     /// Every LIVE (left, right) id pair (latest-wins per pair):
                     /// a pair is live iff its most-recent row is not retracted, so
                     /// `unlink`ed edges are excluded and a re-`link` restores it.
-                    pub fn pairs(&self) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs(&self) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(self.row_count)
                     }
 
                     /// Shared latest-wins resolution over the row prefix `0..end`.
-                    fn pairs_prefix(&self, end: usize) -> Vec<(Uuid, Uuid)> {
+                    fn pairs_prefix(&self, end: usize) -> Vec<(#lk, #rk)> {
                         // Preserve first-link order while applying latest-wins on
                         // the retraction flag.
-                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
-                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                        let mut order: Vec<(#lk, #rk)> = Vec::new();
+                        let mut state: std::collections::HashMap<(#lk, #rk), bool> =
                             std::collections::HashMap::new();
                         for i in 0..end {
-                            let left = Uuid::from_bytes(
-                                self.left_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            let right = Uuid::from_bytes(
-                                self.right_col.read_uuid(i).expect("Failed to read link"),
-                            );
+                            let left = #l_read_self;
+                            let right = #r_read_self;
                             let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
                             if !state.contains_key(&(left, right)) {
                                 order.push((left, right));
@@ -11304,7 +11548,7 @@ impl RustGenerator {
                     /// Live link pairs committed as of `snap` (#56): latest-wins
                     /// over the prefix `0..snap.watermark()`, excluding links
                     /// appended after the snapshot AND pairs retracted within it.
-                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         self.pairs_prefix(snap.watermark())
                     }
 
@@ -11334,18 +11578,14 @@ impl RustGenerator {
                     /// Live link pairs committed as of `snap` (#56 Direction B): the
                     /// same latest-wins prefix resolution as the writer junction,
                     /// reading through the shared-fd reader columns.
-                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(Uuid, Uuid)> {
+                    pub fn pairs_at(&self, snap: &forgedb_storage::Snapshot) -> Vec<(#lk, #rk)> {
                         let end = snap.watermark();
-                        let mut order: Vec<(Uuid, Uuid)> = Vec::new();
-                        let mut state: std::collections::HashMap<(Uuid, Uuid), bool> =
+                        let mut order: Vec<(#lk, #rk)> = Vec::new();
+                        let mut state: std::collections::HashMap<(#lk, #rk), bool> =
                             std::collections::HashMap::new();
                         for i in 0..end {
-                            let left = Uuid::from_bytes(
-                                self.left_col.read_uuid(i).expect("Failed to read link"),
-                            );
-                            let right = Uuid::from_bytes(
-                                self.right_col.read_uuid(i).expect("Failed to read link"),
-                            );
+                            let left = #l_read_self;
+                            let right = #r_read_self;
                             let deleted = self.tombstones.is_deleted(i).unwrap_or(false);
                             if !state.contains_key(&(left, right)) {
                                 order.push((left, right));
@@ -11389,13 +11629,12 @@ impl RustGenerator {
                     ) => (t, true),
                     _ => continue,
                 };
-                // Only when the target exists and is UUID-keyed.
+                // Only when the target model actually exists (a dangling FK is a
+                // validation error; codegen just skips it).  #266: its key type no
+                // longer matters — the getter takes whatever key the target has.
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !Self::is_uuid_pk(target) {
-                    continue;
-                }
 
                 let method_name = format!("{}_{}", model_snake, field.name);
                 if !seen.insert(method_name.clone()) {
@@ -11439,9 +11678,8 @@ impl RustGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !Self::is_uuid_pk(parent) {
-                continue;
-            }
+            // #266: the reverse getter takes the PARENT's own key, whatever it is.
+            let parent_id_type = Self::id_type_tokens(schema, parent);
 
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
@@ -11482,7 +11720,7 @@ impl RustGenerator {
             };
 
             let body = if child_indexed {
-                // Required FK probe takes `Uuid`; optional FK probe takes `Option<Uuid>`.
+                // Required FK probe takes the key; optional FK probe takes `Option<key>`.
                 let arg = if p.is_required {
                     quote! { id }
                 } else {
@@ -11507,7 +11745,7 @@ impl RustGenerator {
 
             methods.push(quote! {
                 #[doc = #doc]
-                pub fn #method_ident(&self, id: Uuid) -> Vec<#child_ident> {
+                pub fn #method_ident(&self, id: #parent_id_type) -> Vec<#child_ident> {
                     #body
                 }
             });
@@ -11520,6 +11758,10 @@ impl RustGenerator {
             let model2_ident = format_ident!("{}", m.model2);
             let model1_storage = format_ident!("{}", Self::to_snake_case(&m.model1));
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+            // #266: each side of the junction is keyed on its OWN identity type.
+            let (lt, rt) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
+            let rk = Self::map_field_type_ident(schema, &rt);
 
             // link_<a>_<b>
             let link_name = format!(
@@ -11537,7 +11779,7 @@ impl RustGenerator {
                 // collide for a self-referential M2M (model1 == model2).
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #link_ident(&mut self, left: Uuid, right: Uuid) {
+                    pub fn #link_ident(&mut self, left: #lk, right: #rk) {
                         self.#junction_field.link(left, right);
                     }
                 });
@@ -11562,7 +11804,7 @@ impl RustGenerator {
                 );
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #unlink_ident(&mut self, left: Uuid, right: Uuid) -> bool {
+                    pub fn #unlink_ident(&mut self, left: #lk, right: #rk) -> bool {
                         self.#junction_field_u.unlink(left, right)
                     }
                 });
@@ -11575,7 +11817,7 @@ impl RustGenerator {
                 let doc = format!("All linked {} for the given {} id.", m.model2, m.model1);
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #fwd_ident(&self, id: Uuid) -> Vec<#model2_ident> {
+                    pub fn #fwd_ident(&self, id: #lk) -> Vec<#model2_ident> {
                         // O(degree) junction-index probe (#154), not an
                         // O(all-links) `pairs()` scan.
                         self.#junction_field
@@ -11609,7 +11851,7 @@ impl RustGenerator {
                         pub fn #fwd_at_ident(
                             &self,
                             snap: &DatabaseSnapshot,
-                            id: Uuid,
+                            id: #lk,
                         ) -> Vec<#model2_ident> {
                             self.#junction_field2
                                 .pairs_at(&snap.#junction_field2)
@@ -11631,7 +11873,7 @@ impl RustGenerator {
                 let doc = format!("All linked {} for the given {} id.", m.model1, m.model2);
                 methods.push(quote! {
                     #[doc = #doc]
-                    pub fn #rev_ident(&self, id: Uuid) -> Vec<#model1_ident> {
+                    pub fn #rev_ident(&self, id: #rk) -> Vec<#model1_ident> {
                         // O(degree) junction-index probe (#154), not an
                         // O(all-links) `pairs()` scan.
                         self.#junction_field
@@ -11671,6 +11913,9 @@ impl RustGenerator {
             let junction_field = Self::junction_field_ident(&m);
             let model2_ident = format_ident!("{}", m.model2);
             let model2_storage = format_ident!("{}", Self::to_snake_case(&m.model2));
+            // #266: the left endpoint's own identity type.
+            let (lt, _) = Self::junction_key_pair(schema, &m);
+            let lk = Self::map_field_type_ident(schema, &lt);
 
             let fwd_at_name = format!("{}_{}_at", Self::to_snake_case(&m.model1), m.field1);
             if seen.insert(fwd_at_name.clone()) {
@@ -11684,7 +11929,7 @@ impl RustGenerator {
                     pub fn #fwd_at_ident(
                         &self,
                         snap: &DatabaseSnapshot,
-                        id: Uuid,
+                        id: #lk,
                     ) -> Vec<#model2_ident> {
                         self.#junction_field
                             .pairs_at(&snap.#junction_field)
@@ -11712,17 +11957,17 @@ impl RustGenerator {
 
     /// Generate `<Model>WithRelations` structs and their eager-load getters.
     ///
-    /// For every model with at least one forward foreign key to a UUID-keyed
-    /// target, emit a struct bundling the base record with each resolved
-    /// reference (`Option<Target>`, since the referent may be missing), and a
-    /// `<model>_with_relations(id)` getter that populates them in one call.  The
-    /// getter's `id` parameter uses the model's own PK type, so integer-PK models
-    /// are supported as long as their FK *targets* are UUID-keyed.
+    /// For every model with at least one forward foreign key, emit a struct
+    /// bundling the base record with each resolved reference (`Option<Target>`,
+    /// since the referent may be missing), and a `<model>_with_relations(id)`
+    /// getter that populates them in one call.  Both the getter's `id` and each
+    /// resolved reference use the relevant model's OWN identity type (#266) —
+    /// the target no longer has to be uuid-keyed.
     fn generate_eager_load(schema: &Schema) -> TokenStream {
         let mut items = Vec::new();
 
         for model in &schema.models {
-            // Collect forward FKs to UUID-keyed targets, preserving field order.
+            // Collect forward FKs, preserving field order (#266: any key type).
             let fks: Vec<(&forgedb_parser::Field, &str, bool)> = model
                 .fields
                 .iter()
@@ -11735,9 +11980,7 @@ impl RustGenerator {
                     ) => Some((field, t.as_str(), true)),
                     _ => None,
                 })
-                .filter(|(_, target, _)| {
-                    schema.find_model(target).is_some_and(Self::is_uuid_pk)
-                })
+                .filter(|(_, target, _)| schema.find_model(target).is_some())
                 .collect();
 
             if fks.is_empty() {
@@ -11749,7 +11992,7 @@ impl RustGenerator {
             let base_ident = format_ident!("{}", base_field);
             let struct_ident = format_ident!("{}WithRelations", model.name);
             let getter_ident = format_ident!("{}_with_relations", base_field);
-            let id_type = Self::id_type_tokens(model);
+            let id_type = Self::id_type_tokens(schema, model);
             let struct_doc = format!("{} with its forward references resolved", model.name);
 
             // Choose a non-colliding field name for each resolved reference:
@@ -11827,7 +12070,8 @@ impl RustGenerator {
     ///
     /// Note: for `OptionalStructType` and `Nullable`, this returns the *inner* type
     /// token.  The `Option<>` wrapper is applied by callers that check `field.is_nullable()`.
-    fn map_field_type_ident(field_type: &forgedb_parser::FieldType) -> TokenStream {
+    fn map_field_type_ident(schema: &Schema, field_type: &forgedb_parser::FieldType) -> TokenStream {
+        let field_type = &Self::resolved_type(schema, field_type);
         match field_type {
             forgedb_parser::FieldType::U32 => quote! { u32 },
             forgedb_parser::FieldType::U64 => quote! { u64 },
@@ -11858,22 +12102,20 @@ impl RustGenerator {
             }
             forgedb_parser::FieldType::Nullable(inner) => {
                 // Return the inner type; is_nullable() causes the Option<> wrapper to be added
-                Self::map_field_type_ident(inner)
+                Self::map_field_type_ident(schema, inner)
             }
             forgedb_parser::FieldType::Bytes(size) => {
                 quote! { [u8; #size] }
             }
             forgedb_parser::FieldType::FixedArray(inner, count) => {
-                let inner_type = Self::map_field_type_ident(inner);
+                let inner_type = Self::map_field_type_ident(schema, inner);
                 quote! { [#inner_type; #count] }
             }
-            forgedb_parser::FieldType::Relation(rel) => {
-                match rel {
-                    forgedb_parser::RelationType::RequiredReference(_) => quote! { Uuid },
-                    forgedb_parser::RelationType::OptionalReference(_) => quote! { Uuid },
-                    _ => quote! { () }, // Virtual fields
-                }
-            }
+            // #266: `resolved_type` has already turned a `*Model` / `?Model`
+            // into the target's identity type, so only the VIRTUAL relation
+            // kinds (`[Model]`, many-to-many) reach this arm — they have no
+            // column and no value.
+            forgedb_parser::FieldType::Relation(_) => quote! { () },
             _ => quote! { String }, // Default fallback
         }
     }
@@ -12590,5 +12832,173 @@ mod tests {
         assert!(code.contains("pub struct PostStorage"));
         assert!(code.contains("pub user: UserStorage"));
         assert!(code.contains("pub post: PostStorage"));
+    }
+
+    // ---- #266: the FK backing-type resolver --------------------------------
+
+    /// A model whose identity is `id` of `ft`.
+    fn keyed(name: &str, ft: FieldType) -> Model {
+        Model {
+            position: None,
+            name: name.to_string(),
+            fields: vec![Field {
+                position: None,
+                name: "id".to_string(),
+                field_type: ft,
+                auto_generate: false,
+                unique: false,
+                indexed: false,
+                constraints: vec![],
+                index_type: IndexType::Hash,
+                is_computed: false,
+                fulltext_indexed: false,
+                is_materialized: false,
+            }],
+            composite_indexes: vec![],
+            projections: Vec::new(),
+            soft_delete: false,
+        }
+    }
+
+    fn schema_of(models: Vec<Model>) -> Schema {
+        Schema {
+            models,
+            structs: vec![],
+            enums: vec![],
+        }
+    }
+
+    /// **Scenario 8 (resolution 2).** `None => true` was backwards: a model with
+    /// no identity field reported as UUID-keyed, and a `true` default on a
+    /// predicate whose false branch REMOVES code is the wrong direction.
+    ///
+    /// #248 already makes an id-less model fatal, so this is defence in depth —
+    /// asserted directly on the resolver so the old default cannot come back in
+    /// another spelling.
+    #[test]
+    fn fk_backing_type_is_none_for_an_identity_less_target() {
+        let ghost = Model {
+            position: None,
+            name: "Ghost".to_string(),
+            fields: vec![],
+            composite_indexes: vec![],
+            projections: Vec::new(),
+            soft_delete: false,
+        };
+        let schema = schema_of(vec![ghost]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Ghost".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            None,
+            "an identity-less target resolves to nothing, never to Uuid by default"
+        );
+
+        // ...and an unknown target likewise.
+        let missing = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Nope".to_string(),
+        ));
+        assert_eq!(RustGenerator::fk_backing_type(&schema, &missing), None);
+    }
+
+    /// The resolution is transitive: an identity that is itself an FK resolves
+    /// through to the far end of the chain (resolution 1's second reproduction).
+    #[test]
+    fn fk_backing_type_resolves_through_a_chain() {
+        let schema = schema_of(vec![
+            keyed("Customer", FieldType::Uuid),
+            keyed(
+                "Order",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Customer".into(),
+                )),
+            ),
+        ]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Order".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            Some(FieldType::Uuid)
+        );
+
+        // An optional FK backs onto `Nullable(K)`, which is what makes every
+        // physical helper's existing `Nullable` arm the right one.
+        let opt = FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+            "Order".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &opt),
+            Some(FieldType::Nullable(Box::new(FieldType::Uuid)))
+        );
+    }
+
+    /// **Scenario 15, resolver half.** `Left { id: *Right }` / `Right { id: *Left }`
+    /// is legal to parse today. Once the FK arm resolves through the target, the
+    /// resolver is mutually recursive with `id_type_tokens` — so without a bound
+    /// it exhausts the stack rather than reporting anything.
+    ///
+    /// The bound is what keeps a *validation-skipping* caller degrading instead
+    /// of crashing; the diagnostic itself is `validate.rs`'s (scenario 15 proper).
+    #[test]
+    fn fk_backing_type_is_depth_bounded_against_an_identity_cycle() {
+        let schema = schema_of(vec![
+            keyed(
+                "Left",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Right".into(),
+                )),
+            ),
+            keyed(
+                "Right",
+                FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+                    "Left".into(),
+                )),
+            ),
+        ]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::RequiredReference(
+            "Left".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            None,
+            "a cycle resolves to nothing — it must not recurse forever"
+        );
+
+        // And generation returns rather than dying, so the CLI can report the
+        // validation error instead of the process disappearing.
+        assert!(RustGenerator::generate(&schema).is_ok());
+    }
+
+    /// **Scenario 16, resolver half.** A self-referential FK is NOT a cycle: it
+    /// resolves through the target's *identity*, which is a uuid. Nothing about
+    /// the bound may catch it.
+    #[test]
+    fn a_self_referential_fk_is_not_an_identity_cycle() {
+        let mut category = keyed("Category", FieldType::Uuid);
+        category.fields.push(Field {
+            position: None,
+            name: "parent".to_string(),
+            field_type: FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+                "Category".into(),
+            )),
+            auto_generate: false,
+            unique: false,
+            indexed: false,
+            constraints: vec![],
+            index_type: IndexType::Hash,
+            is_computed: false,
+            fulltext_indexed: false,
+            is_materialized: false,
+        });
+        let schema = schema_of(vec![category]);
+        let fk = FieldType::Relation(forgedb_parser::RelationType::OptionalReference(
+            "Category".to_string(),
+        ));
+        assert_eq!(
+            RustGenerator::fk_backing_type(&schema, &fk),
+            Some(FieldType::Nullable(Box::new(FieldType::Uuid)))
+        );
     }
 }

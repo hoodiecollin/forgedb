@@ -797,7 +797,7 @@ impl FfiGenerator {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
@@ -1236,7 +1236,7 @@ impl FfiGenerator {
                 let snake = RustGenerator::to_snake_case(&model.name);
                 let model_ident = format_ident!("{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
                 let delete_fn = format_ident!("delete_{}", snake);
@@ -1592,9 +1592,11 @@ impl FfiGenerator {
         };
 
         // The snapshot-scoped sibling of `vec_getter`: a `Vec`-returning getter
-        // over a decoded `Uuid` id AND a `*const Snapshot` handle:
+        // over a decoded `#id_ty` id (#266 — the endpoint's own key) AND a
+        // `*const Snapshot` handle:
         // `forgedb_<name>(db, snap, id, ...)`.  `call` uses the borrowed `snap`.
         let snap_vec_getter = |sym: &proc_macro2::Ident,
+                               id_ty: &proc_macro2::TokenStream,
                                call: proc_macro2::TokenStream,
                                doc: &str| {
             quote! {
@@ -1630,7 +1632,7 @@ impl FfiGenerator {
                         set_error(err_out, FORGEDB_ERR_INVALID_ARG, "id buffer is null".to_string());
                         return false;
                     };
-                    let id: Uuid = match serde_json::from_slice(id_bytes) {
+                    let id: #id_ty = match serde_json::from_slice(id_bytes) {
                         Ok(v) => v,
                         Err(e) => {
                             set_error(err_out, FORGEDB_ERR_INVALID_ARG, format!("invalid id JSON: {e}"));
@@ -1658,7 +1660,7 @@ impl FfiGenerator {
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
-            let id_ty = RustGenerator::id_type_tokens(model);
+            let id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
                 let target_name = match &field.field_type {
@@ -1670,10 +1672,7 @@ impl FfiGenerator {
                     ) => t,
                     _ => continue,
                 };
-                let Some(target) = schema.find_model(target_name) else { continue };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
+                if schema.find_model(target_name).is_none() { continue; }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -1762,9 +1761,6 @@ impl FfiGenerator {
         }
         for p in &pairs {
             let Some(parent) = schema.find_model(&p.parent_model) else { continue };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -1783,7 +1779,8 @@ impl FfiGenerator {
             }
             let method_ident = format_ident!("{}", method_name);
             let sym = format_ident!("forgedb_{}", method_name);
-            let id_ty = quote! { Uuid };
+            // #266: the C-ABI id buffer decodes as the PARENT's own key type.
+            let id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id (JSON array).",
                 p.child_model, p.child_field, p.parent_model
@@ -1795,6 +1792,8 @@ impl FfiGenerator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
 
             // link_<a>_<b>
             let link_name = format!("link_{snake1}_{snake2}");
@@ -1827,10 +1826,10 @@ impl FfiGenerator {
                             return false;
                         };
                         let (Ok(left), Ok(right)) = (
-                            serde_json::from_slice::<Uuid>(lb),
-                            serde_json::from_slice::<Uuid>(rb),
+                            serde_json::from_slice::<#lk>(lb),
+                            serde_json::from_slice::<#rk>(rb),
                         ) else {
-                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid UUID JSON".to_string());
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid endpoint id JSON".to_string());
                             return false;
                         };
                         match catch_unwind(AssertUnwindSafe(|| db.inner.#link_ident(left, right))) {
@@ -1875,10 +1874,10 @@ impl FfiGenerator {
                             return -1;
                         };
                         let (Ok(left), Ok(right)) = (
-                            serde_json::from_slice::<Uuid>(lb),
-                            serde_json::from_slice::<Uuid>(rb),
+                            serde_json::from_slice::<#lk>(lb),
+                            serde_json::from_slice::<#rk>(rb),
                         ) else {
-                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid UUID JSON".to_string());
+                            set_error(err_out, FORGEDB_ERR_INVALID_ARG, "invalid endpoint id JSON".to_string());
                             return -1;
                         };
                         match catch_unwind(AssertUnwindSafe(|| db.inner.#unlink_ident(left, right))) {
@@ -1898,7 +1897,7 @@ impl FfiGenerator {
             if seen.insert(fwd_name.clone()) {
                 let fwd_ident = format_ident!("{}", fwd_name);
                 let sym = format_ident!("forgedb_{}", fwd_name);
-                let id_ty = quote! { Uuid };
+                let id_ty = lk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model2, m.model1);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#fwd_ident(id) }, &doc));
 
@@ -1918,6 +1917,7 @@ impl FfiGenerator {
                     );
                     ops.push(snap_vec_getter(
                         &at_sym,
+                        &lk,
                         quote! { db.inner.#fwd_at_ident(&snap.inner, id) },
                         &at_doc,
                     ));
@@ -1929,7 +1929,7 @@ impl FfiGenerator {
             if seen.insert(rev_name.clone()) {
                 let rev_ident = format_ident!("{}", rev_name);
                 let sym = format_ident!("forgedb_{}", rev_name);
-                let id_ty = quote! { Uuid };
+                let id_ty = rk.clone();
                 let doc = format!("All linked `{}` for the given `{}` id (JSON array).", m.model1, m.model2);
                 ops.push(vec_getter(&sym, &id_ty, quote! { db.inner.#rev_ident(id) }, &doc));
             }
@@ -1967,7 +1967,7 @@ impl FfiGenerator {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
             for field in &model.fields {
-                let Some(fmt) = RustGenerator::arrow_export_format(&field.field_type) else {
+                let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
                 let sym = format_ident!("forgedb_{}_{}_export_arrow", snake, field.name);

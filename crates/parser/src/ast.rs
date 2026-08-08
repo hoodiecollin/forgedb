@@ -499,6 +499,32 @@ impl FieldType {
         matches!(self, FieldType::Relation(_))
     }
 
+    /// May a model whose identity is this type be an endpoint of a many-to-many
+    /// junction (#266)?
+    ///
+    /// The junction stores each endpoint's id in a fixed-width column, indexes it
+    /// in a `HashMap`, and frames it in a fixed-width replication record — so the
+    /// key must be fixed-width, hashable and totally equatable. That admits
+    /// `uuid`, the four integer types and `timestamp`, which is every shape an
+    /// identity is realistically written in (all four `+` autos among them).
+    ///
+    /// This lives on the AST rather than in the generator because BOTH sides need
+    /// it and they cannot see each other: `forgedb-codegen`'s `valid_m2m` filters
+    /// on it, and the parser's validator reports a schema outside it as an error.
+    /// If those two ever disagree, a relation is silently dropped again — which is
+    /// exactly the failure #266 exists to remove.
+    pub fn is_junction_key(&self) -> bool {
+        matches!(
+            self,
+            FieldType::Uuid
+                | FieldType::U32
+                | FieldType::U64
+                | FieldType::I32
+                | FieldType::I64
+                | FieldType::Timestamp
+        )
+    }
+
     /// Check if this type is fixed-size (Sprint 8)
     pub fn is_fixed_size(&self) -> bool {
         match self {

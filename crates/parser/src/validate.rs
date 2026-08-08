@@ -112,6 +112,13 @@ pub fn collect_structure_errors(schema: &Schema, errors: &mut Vec<ValidationErro
     // `string(N)` / `string(N!)` / `@utf8` (#238).
     check_inline_strings(schema, errors);
 
+    // #266: an identity that is itself a foreign key must terminate; a foreign
+    // key inherits its target's key width; a junction endpoint's key must be one
+    // the junction can physically hold.
+    check_identity_cycles(schema, errors);
+    check_fk_key_widths(schema, errors);
+    check_m2m_endpoint_keys(schema, errors);
+
     // Duplicate top-level names.
     check_duplicate_names(
         schema.models.iter().map(|m| (m.name.as_str(), m.position)),
@@ -812,6 +819,184 @@ fn render_bound(p: &crate::ast::ConstraintParam) -> String {
 }
 
 /// Build a `ValidationError` with an optional position attached.
+/// The identity field of a model — named `id`, or any `+` auto-generate field
+/// (#248 makes one of the two mandatory).
+fn identity_field(model: &crate::ast::Model) -> Option<&crate::ast::Field> {
+    model
+        .fields
+        .iter()
+        .find(|f| f.name == "id" || f.auto_generate)
+}
+
+/// The FK target named by a `*Model` / `?Model` field, if it is one.
+fn fk_target(field_type: &FieldType) -> Option<&str> {
+    match field_type {
+        FieldType::Relation(RelationType::RequiredReference(t))
+        | FieldType::Relation(RelationType::OptionalReference(t)) => Some(t.as_str()),
+        _ => None,
+    }
+}
+
+/// The maximum identity-FK chain the generator will resolve (#266). Mirrors
+/// `RustGenerator::FK_RESOLVE_DEPTH`: past this the resolver returns `None` and
+/// codegen falls back to `uuid`, so a chain this long has to be a diagnostic
+/// rather than silently wrong output.
+const IDENTITY_CHAIN_LIMIT: usize = 16;
+
+/// The concrete key a foreign key ultimately backs onto (#266): the target's
+/// identity type, resolved through an identity that is itself a foreign key.
+/// `None` for a dangling target, a model with no identity, or a cycle — each of
+/// which is separately reported.
+fn resolved_identity_type(schema: &Schema, model: &crate::ast::Model) -> Option<FieldType> {
+    let mut current = model;
+    for _ in 0..IDENTITY_CHAIN_LIMIT {
+        let field = identity_field(current)?;
+        match fk_target(&field.field_type) {
+            Some(target) => current = schema.models.iter().find(|m| m.name == target)?,
+            None => return Some(field.field_type.clone()),
+        }
+    }
+    None
+}
+
+/// An identity that is itself a foreign key resolves to the target's identity —
+/// which may in turn be a foreign key (#266). That chain is a **feature**
+/// (`Order { id: *Customer }` is a legal shared-key model), but it must
+/// terminate: `Left { id: *Right }` / `Right { id: *Left }` parses today, and
+/// left alone would send the generator's resolver into an unbounded recursion.
+///
+/// The resolver is depth-bounded so it cannot overflow the stack, but a bound
+/// alone turns the cycle into *silently wrong output* (the fallback key type)
+/// rather than a diagnostic. So the cycle is reported here, where the identity
+/// field has a source position to point at.
+///
+/// A self-referential FK on a NON-identity field (`Category { parent: ?Category }`)
+/// is untouched: the walk only ever follows identity fields, and `Category`'s
+/// identity is a uuid, so it terminates on the first step.
+fn check_identity_cycles(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for model in &schema.models {
+        let mut path: Vec<&str> = vec![model.name.as_str()];
+        let mut current = model;
+        loop {
+            let Some(field) = identity_field(current) else {
+                break;
+            };
+            let Some(target) = fk_target(&field.field_type) else {
+                break;
+            };
+            let Some(next) = schema.models.iter().find(|m| m.name == target) else {
+                // A dangling relation target — already reported as its own error.
+                break;
+            };
+            if path.contains(&next.name.as_str()) {
+                path.push(next.name.as_str());
+                errors.push(positioned(
+                    format!(
+                        "Identity cycle: {}. An identity field that is itself a foreign key \
+                         resolves to the target's identity, so the chain must terminate at a \
+                         concrete key type — give one of these models a concrete identity \
+                         (e.g. `id: +uuid`).",
+                        path.join(" -> ")
+                    ),
+                    identity_field(model).and_then(|f| f.position),
+                ));
+                break;
+            }
+            if path.len() > IDENTITY_CHAIN_LIMIT {
+                errors.push(positioned(
+                    format!(
+                        "Identity chain from '{}' is deeper than {} models. The generator \
+                         resolves a foreign key to the key it ultimately backs onto and stops \
+                         at that depth; shorten the chain or give '{}' a concrete identity.",
+                        model.name, IDENTITY_CHAIN_LIMIT, model.name
+                    ),
+                    identity_field(model).and_then(|f| f.position),
+                ));
+                break;
+            }
+            path.push(next.name.as_str());
+            current = next;
+        }
+    }
+}
+
+/// #238 warns about a wide inline string where it is *declared*. #266 gives the
+/// same cost a second, invisible home: a foreign key is physically the column its
+/// target's identity occupies, so `customer: *Customer` silently pays
+/// `Customer`'s key width on every row of `Order` — and its author never wrote a
+/// width at all.
+///
+/// Reported on the CHILD field that pays it, which is the one that can be
+/// changed, rather than on the parent declaration (which may be entirely
+/// reasonable in isolation).
+fn check_fk_key_widths(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for model in &schema.models {
+        for field in &model.fields {
+            let Some(target_name) = fk_target(&field.field_type) else {
+                continue;
+            };
+            let Some(target) = schema.models.iter().find(|m| m.name == target_name) else {
+                continue;
+            };
+            let Some(FieldType::StringN { chars, .. }) = resolved_identity_type(schema, target)
+            else {
+                continue;
+            };
+            warn_wide_inline_string(
+                &format!(
+                    "Field '{}' on model '{}' inherits '{}'s identity width",
+                    field.name, model.name, target_name
+                ),
+                chars,
+                field.position,
+                errors,
+            );
+        }
+    }
+}
+
+/// A many-to-many junction stores each endpoint's id in a fixed-width column,
+/// indexes it in a `HashMap`, and frames it in a fixed-width replication record
+/// (#266) — so an endpoint key must be fixed-width, hashable and totally
+/// equatable (`FieldType::is_junction_key`).
+///
+/// Before #266 the generator required both endpoints to be uuid-keyed and
+/// **silently emitted nothing** otherwise: the schema compiled and the M2M
+/// surface simply did not exist. #266 removed that restriction for every key the
+/// junction can physically hold; what it cannot hold is reported here instead of
+/// disappearing, so the failure mode is a diagnostic rather than a missing
+/// feature.
+fn check_m2m_endpoint_keys(schema: &Schema, errors: &mut Vec<ValidationError>) {
+    for m in schema.detect_many_to_many_relations() {
+        for name in [&m.model1, &m.model2] {
+            let Some(model) = schema.models.iter().find(|md| &md.name == name) else {
+                continue;
+            };
+            let Some(ty) = resolved_identity_type(schema, model) else {
+                continue;
+            };
+            if ty.is_junction_key() {
+                continue;
+            }
+            errors.push(positioned(
+                format!(
+                    "Model '{}' cannot be an endpoint of the many-to-many relation \
+                     '{}.{}' <-> '{}.{}': its identity is `{}`, and a junction stores each \
+                     endpoint's id in a fixed-width, hashable column. Use a `uuid`, integer or \
+                     `timestamp` identity.",
+                    name,
+                    m.model1,
+                    m.field1,
+                    m.model2,
+                    m.field2,
+                    format!("{ty:?}"),
+                ),
+                identity_field(model).and_then(|f| f.position),
+            ));
+        }
+    }
+}
+
 fn positioned(message: String, pos: Option<forgedb_validation::Position>) -> ValidationError {
     let err = ValidationError::new(message);
     match pos {
@@ -1241,5 +1426,111 @@ mod tests {
         assert!(e[0].contains("identity"), "{e:?}");
         // A non-identity inline string in the same model is fine.
         assert!(errs("T {\n  id: +uuid\n  code: string(26!)\n}\n").is_empty());
+    }
+
+    // ---- #266: FKs follow the target's identity type -------------------------
+
+    /// **Scenario 15.** An identity that is itself a foreign key makes the
+    /// codegen resolver mutually recursive with `id_type_tokens`. `Left { id:
+    /// *Right }` / `Right { id: *Left }` parses and validates cleanly today and
+    /// generates (wrongly, as `Uuid` on both sides); once the FK arm resolves
+    /// through the target it would exhaust the generator's stack with no
+    /// diagnostic at all.
+    ///
+    /// So the cycle is reported HERE, where there is a span, rather than left to
+    /// crash there.
+    #[test]
+    fn an_identity_fk_cycle_is_a_positioned_error() {
+        let d = diags("Left {\n  id: *Right\n}\n\nRight {\n  id: *Left\n}\n");
+        let cycle: Vec<_> = d.iter().filter(|e| e.message.contains("cycle")).collect();
+        assert!(!cycle.is_empty(), "the cycle is reported: {d:?}");
+        assert!(!cycle[0].is_warning(), "a cycle cannot generate — it is an error");
+        assert!(
+            cycle[0].position.is_some(),
+            "positioned at the offending identity: {:?}",
+            cycle[0]
+        );
+        assert!(
+            cycle[0].message.contains("Left") && cycle[0].message.contains("Right"),
+            "names both ends of the cycle: {:?}",
+            cycle[0]
+        );
+
+        // A three-model cycle is caught the same way — the bound is on the walk,
+        // not on a two-model special case.
+        let d = diags("A {\n  id: *B\n}\n\nB {\n  id: *C\n}\n\nC {\n  id: *A\n}\n");
+        assert!(
+            d.iter().any(|e| e.message.contains("cycle")),
+            "a longer cycle is caught too: {d:?}"
+        );
+    }
+
+    /// **Scenario 16.** A self-referential FK is legal and must stay legal:
+    /// `parent` resolves to `Category`'s *identity*, which is a uuid, and
+    /// terminates. This is the scenario that stops scenario 15's fix from being
+    /// over-broad.
+    #[test]
+    fn a_self_referential_fk_is_not_a_cycle() {
+        assert!(
+            validate_schema(&ast("Category {\n  id: +uuid\n  parent: ?Category\n}\n")).is_empty(),
+            "a self-FK through a non-identity field terminates at the identity"
+        );
+
+        // A CHAIN through identities is the feature, not the hazard: `Order.id`
+        // resolves to `Customer`'s uuid and stops.
+        assert!(
+            validate_schema(&ast(
+                "Customer {\n  id: +uuid\n}\n\nOrder {\n  id: *Customer\n  total: i64\n}\n"
+            ))
+            .is_empty(),
+            "an identity chain that terminates is legal"
+        );
+    }
+
+    /// **Scenario 17 (resolution 3).** #238's width advisory is checked at the
+    /// *declaration*. #266 gives it a second firing site: an FK inherits the
+    /// target's key width and pays it on every row of the referencing model,
+    /// without its author ever writing a width.
+    ///
+    /// The fixture leans on `parse_unvalidated` — a `string(N)` identity is
+    /// refused by #238's interim check (that refusal is #252's to delete), so
+    /// the schema carries an error alongside. The advisory is asserted
+    /// independently of it, which is also the point: the warning must survive
+    /// once that error goes.
+    #[test]
+    fn an_fk_to_a_wide_key_warns_on_the_child_that_pays() {
+        let src = "Customer {\n  id: string(254)\n}\n\nOrder {\n  id: +uuid\n  \
+                   customer_ref: *Customer\n}\n";
+        let w = warns(src);
+        let fk: Vec<_> = w
+            .iter()
+            .filter(|e| e.message.contains("customer_ref"))
+            .collect();
+        assert_eq!(fk.len(), 1, "exactly one advisory on the child: {w:?}");
+        assert!(fk[0].is_warning(), "a width advisory is never an error");
+        assert_eq!(
+            fk[0].position.map(|p| p.line),
+            Some(7),
+            "positioned at the CHILD field that pays, not the parent declaration"
+        );
+        assert!(
+            fk[0].message.contains("Customer") && fk[0].message.contains("254"),
+            "names the target it inherits from and the width: {:?}",
+            fk[0]
+        );
+
+        // A narrow key is silent — the advisory is about width, not about FKs.
+        let quiet = warns("Customer {\n  id: string(8)\n}\n\nOrder {\n  id: +uuid\n  \
+                           customer_ref: *Customer\n}\n");
+        assert!(
+            !quiet.iter().any(|e| e.message.contains("customer_ref")),
+            "a narrow inherited key says nothing: {quiet:?}"
+        );
+
+        // ...and a uuid key, the convention, says nothing either.
+        let conventional = warns(
+            "Customer {\n  id: +uuid\n}\n\nOrder {\n  id: +uuid\n  customer_ref: *Customer\n}\n",
+        );
+        assert!(conventional.is_empty(), "{conventional:?}");
     }
 }

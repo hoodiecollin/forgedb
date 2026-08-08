@@ -59,23 +59,36 @@ enum GoRelOp {
         source_id_go: String,
         target: String,
     },
-    /// Reverse 1:M / M2M query getter: all records for a (uuid) id → `[]Target`.
+    /// Reverse 1:M query getter: all records for a parent id → `[]Target`. The
+    /// id is typed as the PARENT's own identity type (#266).
     Vec {
         sym: String,
         method: String,
+        id_go: String,
         target: String,
     },
-    /// Snapshot-scoped M2M query getter: all linked records for a (uuid) id as of
+    /// Snapshot-scoped M2M query getter: all linked records for an id as of
     /// a `*Snapshot` → `[]Target`.
     VecAt {
         sym: String,
         method: String,
+        id_go: String,
         target: String,
     },
-    /// M2M link (both uuid ids) → `error`.
-    Link { sym: String, method: String },
-    /// M2M unlink (both uuid ids) → `(bool, error)`.
-    Unlink { sym: String, method: String },
+    /// M2M link (each endpoint's own id type) → `error`.
+    Link {
+        sym: String,
+        method: String,
+        left_go: String,
+        right_go: String,
+    },
+    /// M2M unlink (each endpoint's own id type) → `(bool, error)`.
+    Unlink {
+        sym: String,
+        method: String,
+        left_go: String,
+        right_go: String,
+    },
 }
 
 /// One Arrow-exportable column: the `Export<Model><Field>Arrow` Go method and its
@@ -102,7 +115,7 @@ impl GoGenerator {
 
         // --- Per-model row structs ---
         for model in schema.models.iter() {
-            code.push_str(&Self::model_struct(model));
+            code.push_str(&Self::model_struct(schema, model));
         }
 
         // --- Per-model CRUD + snapshot reads ---
@@ -214,7 +227,7 @@ impl GoGenerator {
         {
             let snake = RustGenerator::to_snake_case(&model.name);
             for field in &model.fields {
-                if RustGenerator::arrow_export_format(&field.field_type).is_some() {
+                if RustGenerator::arrow_export_format(schema, &field.field_type).is_some() {
                     cols.push(ArrowCol {
                         sym: format!("{snake}_{}_export_arrow", field.name),
                         method: format!(
@@ -319,7 +332,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
             .map(|m| GoModel {
                 name: m.name.clone(),
                 snake: RustGenerator::to_snake_case(&m.name),
-                id_go: Self::go_id_type(m),
+                id_go: Self::go_id_type(schema, m),
             })
             .collect()
     }
@@ -339,7 +352,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
             let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
-            let id_go = Self::go_id_type(model);
+            let id_go = Self::go_id_type(schema, model);
             for field in &model.fields {
                 let target_name = match &field.field_type {
                     FieldType::Relation(RelationType::RequiredReference(t))
@@ -349,9 +362,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -380,9 +390,6 @@ func (db *DB) {method}() (arrow.Array, error) {{
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -406,6 +413,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
             ops.push(GoRelOp::Vec {
                 method: to_pascal_case(&method_name),
                 sym: method_name,
+                id_go: Self::go_id_type(schema, parent),
                 target: p.child_model.clone(),
             });
         }
@@ -414,12 +422,21 @@ func (db *DB) {method}() (arrow.Array, error) {{
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint carries its OWN identity type.
+            let id1 = schema
+                .find_model(&m.model1)
+                .map_or_else(|| "string".to_string(), |md| Self::go_id_type(schema, md));
+            let id2 = schema
+                .find_model(&m.model2)
+                .map_or_else(|| "string".to_string(), |md| Self::go_id_type(schema, md));
 
             let link_name = format!("link_{snake1}_{snake2}");
             if seen.insert(link_name.clone()) {
                 ops.push(GoRelOp::Link {
                     method: to_pascal_case(&link_name),
                     sym: link_name,
+                    left_go: id1.clone(),
+                    right_go: id2.clone(),
                 });
             }
 
@@ -428,6 +445,8 @@ func (db *DB) {method}() (arrow.Array, error) {{
                 ops.push(GoRelOp::Unlink {
                     method: to_pascal_case(&unlink_name),
                     sym: unlink_name,
+                    left_go: id1.clone(),
+                    right_go: id2.clone(),
                 });
             }
 
@@ -436,6 +455,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
                 ops.push(GoRelOp::Vec {
                     method: to_pascal_case(&fwd_name),
                     sym: fwd_name,
+                    id_go: id1.clone(),
                     target: m.model2.clone(),
                 });
                 // The snapshot-scoped forward getter (inserted into `seen` at the
@@ -446,6 +466,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
                     ops.push(GoRelOp::VecAt {
                         method: to_pascal_case(&fwd_at_name),
                         sym: fwd_at_name,
+                        id_go: id1.clone(),
                         target: m.model2.clone(),
                     });
                 }
@@ -456,6 +477,7 @@ func (db *DB) {method}() (arrow.Array, error) {{
                 ops.push(GoRelOp::Vec {
                     method: to_pascal_case(&rev_name),
                     sym: rev_name,
+                    id_go: id2.clone(),
                     target: m.model1.clone(),
                 });
             }
@@ -466,10 +488,10 @@ func (db *DB) {method}() (arrow.Array, error) {{
 
     // --- Rendering ------------------------------------------------------------
 
-    fn model_struct(model: &forgedb_parser::Model) -> String {
+    fn model_struct(schema: &Schema, model: &forgedb_parser::Model) -> String {
         let mut s = format!("\n// {name} is a generated row of the `{name}` model.\ntype {name} struct {{\n", name = model.name);
         for field in &model.fields {
-            let go_ty = Self::go_field_type(field);
+            let go_ty = Self::go_field_type(schema, field);
             let tag = if field.auto_generate
                 && matches!(field.field_type, FieldType::Uuid | FieldType::Timestamp)
             {
@@ -781,10 +803,15 @@ func (db *DB) {method}(id {source_id_go}) (*{target}, error) {{
 }}
 "#
             ),
-            GoRelOp::Vec { sym, method, target } => format!(
+            GoRelOp::Vec {
+                sym,
+                method,
+                id_go,
+                target,
+            } => format!(
                 r#"
 // {method} returns the related {target} records for the given id.
-func (db *DB) {method}(id string) ([]{target}, error) {{
+func (db *DB) {method}(id {id_go}) ([]{target}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
 		return nil, err
@@ -804,10 +831,15 @@ func (db *DB) {method}(id string) ([]{target}, error) {{
 }}
 "#
             ),
-            GoRelOp::VecAt { sym, method, target } => format!(
+            GoRelOp::VecAt {
+                sym,
+                method,
+                id_go,
+                target,
+            } => format!(
                 r#"
 // {method} returns the linked {target} records for the given id as of a snapshot.
-func (db *DB) {method}(snap *Snapshot, id string) ([]{target}, error) {{
+func (db *DB) {method}(snap *Snapshot, id {id_go}) ([]{target}, error) {{
 	idBytes, err := json.Marshal(id)
 	if err != nil {{
 		return nil, err
@@ -827,10 +859,15 @@ func (db *DB) {method}(snap *Snapshot, id string) ([]{target}, error) {{
 }}
 "#
             ),
-            GoRelOp::Link { sym, method } => format!(
+            GoRelOp::Link {
+                sym,
+                method,
+                left_go,
+                right_go,
+            } => format!(
                 r#"
 // {method} links a left and right record in the junction.
-func (db *DB) {method}(left string, right string) error {{
+func (db *DB) {method}(left {left_go}, right {right_go}) error {{
 	lb, err := json.Marshal(left)
 	if err != nil {{
 		return err
@@ -848,10 +885,15 @@ func (db *DB) {method}(left string, right string) error {{
 }}
 "#
             ),
-            GoRelOp::Unlink { sym, method } => format!(
+            GoRelOp::Unlink {
+                sym,
+                method,
+                left_go,
+                right_go,
+            } => format!(
                 r#"
 // {method} unlinks a left/right pair. Returns false if the link did not exist.
-func (db *DB) {method}(left string, right string) (bool, error) {{
+func (db *DB) {method}(left {left_go}, right {right_go}) (bool, error) {{
 	lb, err := json.Marshal(left)
 	if err != nil {{
 		return false, err
@@ -879,11 +921,13 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
     // --- Type mapping ---------------------------------------------------------
 
     /// The Go type of a model's identity field (`string` for a uuid PK).
-    fn go_id_type(model: &forgedb_parser::Model) -> String {
-        let Some(f) = model.fields.iter().find(|f| f.name == "id" || f.auto_generate) else {
+    fn go_id_type(schema: &Schema, model: &forgedb_parser::Model) -> String {
+        // #266: an identity that is itself a foreign key resolves through to the
+        // key it ultimately backs onto.
+        let Some(ty) = RustGenerator::identity_type(schema, model) else {
             return "string".to_string();
         };
-        match &f.field_type {
+        match &ty {
             FieldType::U32 => "uint32",
             FieldType::U64 => "uint64",
             FieldType::I32 => "int32",
@@ -896,8 +940,8 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
     /// The Go type for a struct field — a pointer for a nullable value type, and
     /// `json.RawMessage` for any JSON/`char(N)`/fixed-array/virtual-relation field
     /// (a lossless passthrough that matches whatever serde emits).
-    fn go_field_type(field: &forgedb_parser::Field) -> String {
-        let (base, is_raw) = Self::go_scalar_type(&field.field_type);
+    fn go_field_type(schema: &Schema, field: &forgedb_parser::Field) -> String {
+        let (base, is_raw) = Self::go_scalar_type(schema, &field.field_type);
         if is_raw {
             // `json.RawMessage` holds `null` natively, so it already covers the
             // nullable case (virtual relation collection, char/array).
@@ -913,7 +957,7 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
     /// must be represented as `json.RawMessage` (JSON value, `char(N)`, fixed
     /// array, or a virtual relation collection). Enums and inline structs map to
     /// their generated Go named types.
-    fn go_scalar_type(ft: &FieldType) -> (String, bool) {
+    fn go_scalar_type(schema: &Schema, ft: &FieldType) -> (String, bool) {
         match ft {
             FieldType::U32 => ("uint32".to_string(), false),
             FieldType::U64 => ("uint64".to_string(), false),
@@ -934,14 +978,14 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
             FieldType::StructType(name) | FieldType::OptionalStructType(name) => {
                 (name.clone(), false)
             }
-            // FK scalars are stored as the (uuid) reference id.
-            FieldType::Relation(RelationType::RequiredReference(_))
-            | FieldType::Relation(RelationType::OptionalReference(_)) => {
-                ("string".to_string(), false)
-            }
+            // #266: an FK is the target's identity value, so it is spelled with
+            // the target key's own Go type.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::go_scalar_type(schema, &RustGenerator::resolved_type(schema, ft)),
             // Nullable wraps a scalar; return the inner mapping (the `*` is added
             // by `go_field_type` via `is_nullable`).
-            FieldType::Nullable(inner) => Self::go_scalar_type(inner),
+            FieldType::Nullable(inner) => Self::go_scalar_type(schema, inner),
             // JSON passthrough for everything whose exact shape we don't type.
             _ => ("json.RawMessage".to_string(), true),
         }
@@ -977,7 +1021,7 @@ func (db *DB) {method}(left string, right string) (bool, error) {{
                 s.push_str(&format!(
                     "\t{} {} `json:\"{}\"`\n",
                     go_field_name(&field.name),
-                    Self::go_field_type(field),
+                    Self::go_field_type(schema, field),
                     field.name
                 ));
             }

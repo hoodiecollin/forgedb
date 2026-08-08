@@ -291,10 +291,24 @@ Order {
   }
   ```
 
-**FK Scalar Generation** (from `crates/parser/src/ast.rs:382-388`):
-- `RequiredReference(Model)` fields generate scalar FK columns: `model_id: uuid` (example: `author: *User` → `author_id`)
-- `OptionalReference(Model)` fields generate nullable FK columns: `editor_id: Option<uuid>`
-- OneToMany and ManyToMany fields are **virtual** (not persisted; stored as empty `()`) (`crates/parser/src/ast.rs:389-391`)
+**FK Scalar Generation:**
+- A foreign key's type and column width **follow the target model's identity field**. `author: *User`
+  where `User { id: +uuid }` is a 16-byte uuid column; where `User { id: +u64 }` it is an 8-byte
+  `u64` column. There is no separate FK type — an FK column is physically identical to the column
+  the target's identity itself occupies.
+- `RequiredReference(Model)` → a scalar column of the target's key type.
+- `OptionalReference(Model)` → the nullable form of the same (`Option<K>`).
+- OneToMany and ManyToMany fields are **virtual** (not persisted; stored as empty `()`).
+- An identity field may itself be a foreign key (`Order { id: *Customer }`), in which case it
+  resolves to whatever `Customer`'s identity ultimately is. That chain must **terminate** —
+  `Left { id: *Right }` / `Right { id: *Left }` is a validation error naming both ends.
+- A wide inherited key is warned about on the *referencing* field: an FK to a model whose identity
+  is a wide `string(N)` pays that width on every row of the child.
+- **Many-to-many endpoints:** a junction stores each endpoint's id in a fixed-width, hashable
+  column, so an endpoint's identity must be `uuid`, an integer type, or `timestamp`. Mixed pairs
+  are fine — a `+u64`-keyed model links to a `+uuid`-keyed one, and each junction column is that
+  endpoint's own width. An identity outside that set is a validation error rather than a silently
+  missing M2M surface.
 
 ---
 
