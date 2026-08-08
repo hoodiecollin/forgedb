@@ -174,6 +174,49 @@ impl Timestamp {
     pub fn as_seconds(&self) -> i64 {
         self.0
     }
+
+    // ---- #254 STUB SURFACE (deliberately wrong; replaced by the real impl) ----
+    #[must_use]
+    pub fn from_micros(us: i64) -> Self {
+        Timestamp(us)
+    }
+    #[must_use]
+    pub fn as_micros(&self) -> i64 {
+        self.0
+    }
+    #[must_use]
+    pub fn to_rfc3339(&self) -> String {
+        // Deliberately wrong: a naive seconds-only render with no fraction.
+        format!("1970-01-01T00:00:{:02}Z", self.0 % 60)
+    }
+    pub fn from_rfc3339(_s: &str) -> std::result::Result<Self, TimestampParseError> {
+        Err(TimestampParseError)
+    }
+    #[must_use]
+    pub fn floor_to_micros(&self, quantum_us: i64) -> Self {
+        // Deliberately wrong: truncation toward zero, the bug res 5 names.
+        Timestamp(self.0 / quantum_us * quantum_us)
+    }
+    #[must_use]
+    pub fn is_rfc3339_representable(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimestampParseError;
+
+impl std::fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.to_rfc3339())
+    }
+}
+
+impl std::str::FromStr for Timestamp {
+    type Err = TimestampParseError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        Timestamp::from_rfc3339(s)
+    }
 }
 
 impl From<i64> for Timestamp {
