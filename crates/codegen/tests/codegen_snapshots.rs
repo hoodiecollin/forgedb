@@ -9137,6 +9137,123 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
 }
 
 // ---------------------------------------------------------------------------
+// #254 — a timestamp identity is a real key: FKs follow it, junctions hold it
+// ---------------------------------------------------------------------------
+
+/// **#254 x #266.** An FK whose target is keyed on `+timestamp(us)` resolves to
+/// `Timestamp` — the type/width/label/ColumnType chain #266 built has to carry a
+/// key type that no identity could have before this issue.
+///
+/// The failure this pins is not a compile error: `map_field_type_ident` would
+/// fall back to `Uuid`, and the FK column would be 16 bytes that nothing can
+/// ever populate with a matching value.
+#[test]
+fn test_rust_generation_fk_follows_a_timestamp_key() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  label: string
+  samples: [Sample]
+}
+
+Sample {
+  id: +u64
+  tick: *Tick @on_delete(cascade)
+  reading: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub tick: Timestamp"),
+        "the FK scalar follows the target's timestamp identity, not `Uuid`"
+    );
+    assert!(
+        code.contains("sample/fixed/timestamp_1.bin"),
+        "the FK column file is labelled by the resolved type"
+    );
+    assert!(
+        !code.contains("sample/fixed/uuid_1.bin"),
+        "the FK no longer occupies a `uuid`-labelled column"
+    );
+    assert!(
+        code.contains("forgedb_storage::ColumnType::Timestamp"),
+        "the manifest entry is the target key's ColumnType"
+    );
+    assert!(
+        code.contains("append_timestamp(i64::from(record.tick))"),
+        "the FK write path uses the timestamp accessor"
+    );
+    // The relation surface #266 unblocked is present for this key too — absence
+    // was the bug class, so presence is what a regression would remove.
+    assert!(
+        code.contains("pub fn sample_tick(&self, record: &Sample) -> Option<Tick>"),
+        "forward traversal over a timestamp FK"
+    );
+    assert!(
+        code.contains("pub fn tick_samples(&self, id: Timestamp) -> Vec<Sample>"),
+        "reverse getter keyed on the timestamp identity"
+    );
+    assert!(
+        code.contains("pub fn find_by_tick(&self, value: Timestamp)"),
+        "the FK lookup index is keyed on the resolved type"
+    );
+    assert!(
+        code.contains("pub fn delete_tick(&mut self, id: Timestamp)"),
+        "@on_delete(cascade) is wired over a timestamp-keyed parent"
+    );
+}
+
+/// **#254 x #266.** A many-to-many junction stores each endpoint's id in a
+/// fixed-width, hashable column — `FieldType::is_junction_key` already admits
+/// `FieldType::Timestamp(_)`, and the `(_)` absorbs the precision parameter this
+/// issue added, so #254 widens nothing here. This proves it by generation rather
+/// than by reading the predicate: the junction exists, and it is keyed on
+/// `Timestamp` on the timestamp side.
+#[test]
+fn test_rust_generation_timestamp_key_is_a_junction_endpoint() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  ticks: [Tick]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    // The parser's own junction floor must not reject it either — if the
+    // validator and `junction_key_type` ever disagree, the relation silently
+    // vanishes again, which is exactly the failure #266 exists to remove.
+    assert!(
+        forgedb_parser::validate_schema(&schema).is_empty(),
+        "a timestamp-keyed model is a legal junction endpoint"
+    );
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub struct TagTickLink"), "the junction is generated");
+    assert!(
+        code.contains("pub fn link_tag_tick(&mut self, left: Uuid, right: Timestamp)"),
+        "the junction links a uuid endpoint to a timestamp endpoint"
+    );
+    assert!(
+        code.contains("left_index: std::collections::HashMap<Uuid, Vec<Timestamp>>")
+            && code.contains("right_index: std::collections::HashMap<Timestamp, Vec<Uuid>>"),
+        "the traversal indexes are keyed on each endpoint's own key type"
+    );
+    assert!(
+        code.contains(".append_timestamp(i64::from(right))"),
+        "the junction's timestamp column uses the timestamp accessor"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // #254 — the engine-format migration hop, and the two-arm open guard
 // ---------------------------------------------------------------------------
 

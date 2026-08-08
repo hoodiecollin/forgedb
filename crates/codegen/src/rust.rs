@@ -8884,20 +8884,6 @@ impl RustGenerator {
         }
     }
 
-    /// Check if a field type is (or wraps) a `Timestamp`.
-    ///
-    /// `forgedb_types::Timestamp` is a newtype over `i64` but does not implement
-    /// `utoipa::ToSchema`.  The generator uses this to decide whether to emit a
-    /// `#[schema(value_type = …)]` annotation and to use `i64::from` / `Timestamp::from`
-    /// in the insert / get helpers respectively.
-    fn is_timestamp_type(field_type: &forgedb_parser::FieldType) -> bool {
-        match field_type {
-            forgedb_parser::FieldType::Timestamp(_) => true,
-            forgedb_parser::FieldType::Nullable(inner) => Self::is_timestamp_type(inner),
-            _ => false,
-        }
-    }
-
     /// Get the type name for storage paths
     fn type_name(schema: &Schema, field_type: &forgedb_parser::FieldType) -> &'static str {
         let field_type = &Self::resolved_type(schema, field_type);
