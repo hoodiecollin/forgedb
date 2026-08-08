@@ -116,6 +116,11 @@ Key properties that the rest of the system is built on:
 - **Self-describing length.** Every column's committed byte length is a pure function of the
   row count + layout, so a reader derives the durable prefix from file lengths — no persisted
   checkpoint marker is load-bearing.
+- **A foreign key is not its own type.** An FK column is physically identical to the column the
+  *target model's identity field* occupies — same width, same accessor, same manifest entry. The
+  generator resolves `*Target` / `?Target` to that key type once, at the boundary, so no layout
+  rule and no relation capability is conditioned on the key being a uuid. A many-to-many junction
+  is the same idea applied twice: one fixed column per endpoint, each that endpoint's own width.
 - **Watermark snapshots.** A snapshot is just a row-count watermark (`forgedb_storage::Snapshot`);
   point-in-time reads resolve the newest version *within* the watermark. No `xmin`/`xmax`, no
   version chains.

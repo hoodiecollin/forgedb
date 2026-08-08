@@ -129,8 +129,9 @@ anything but bytes.
 
 ## `uuid`
 
-A universally unique identifier, stored on a fixed 16-byte column. Foreign-key columns are
-always `uuid`, which is why relation traversal is only generated between UUID-keyed models.
+A universally unique identifier, stored on a fixed 16-byte column. It is the conventional
+identity type (`id: +uuid`), but not a requirement: a foreign key takes whatever type its
+target's identity is, so an integer-keyed model gets the full relation surface too.
 
 ## `timestamp`
 

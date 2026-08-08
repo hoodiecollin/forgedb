@@ -16,16 +16,19 @@ and eager-load).
 | `?Model` | optional FK | May reference one record, or none |
 | `[..]` / `[..]` | many-to-many | Two models each list the other |
 
-<Callout type="warning" title="Traversal is UUID-keyed only">
-Foreign keys are always stored as `uuid`, so relation traversal is generated only between
-**UUID-keyed** models. A model with an integer primary key can still be defined, but FK
-targets pointing at it are skipped.
+<Callout title="A foreign key follows its target's identity">
+There is no separate FK type. An FK column is **physically identical to the column the
+target's identity field itself occupies** — `author: *User` is a 16-byte uuid column when
+`User { id: +uuid }`, and an 8-byte `u64` column when `User { id: +u64 }`. Every relation
+capability (forward getters, reverse getters, eager load, referential integrity,
+`@on_delete`, many-to-many) is generated for whatever key the target has.
 </Callout>
 
 ## Required foreign key — `*Model`
 
-`*Model` is a required, non-null reference. It generates a scalar FK column
-(`author: *User` → an `author_id: uuid` column) and a forward getter.
+`*Model` is a required, non-null reference. It generates a scalar FK column of the
+target's key type (`author: *User` → an `author_id` column that is a uuid, a `u64`, … —
+whatever `User`'s identity is) and a forward getter.
 
 ```forge
 Post {
@@ -40,7 +43,8 @@ rejected (HTTP 409 dangling reference).
 
 ## Optional foreign key — `?Model`
 
-`?Model` is a nullable reference — the FK column is `Option<uuid>`.
+`?Model` is a nullable reference — the FK column is the nullable form of the target's key
+(`Option<Uuid>`, `Option<u64>`, …).
 
 ```forge
 Post {
@@ -97,6 +101,11 @@ db.tag_posts(tag_id);    // -> Vec<Post>
 </Compare>
 
 `link` / `unlink` maintain the junction; `post_tags` / `tag_posts` traverse it.
+
+Each junction column is that endpoint's own key width, so a **mixed pair** works — a
+`+u64`-keyed model may be linked to a `+uuid`-keyed one. A junction stores each endpoint's
+id in a fixed-width, hashable column, so an endpoint's identity must be `uuid`, an integer
+type, or `timestamp`; anything else is reported as a schema error.
 
 ## Fixed-size arrays — `[type; N]`
 
