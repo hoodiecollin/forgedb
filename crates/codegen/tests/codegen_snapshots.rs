@@ -9126,7 +9126,7 @@ fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
         "an integer endpoint is framed little-endian, matching its column"
     );
     assert!(
-        flat.contains("<u64>::from_le_bytes(&ev.bytes[16..24]"),
+        flat.contains("<u64>::from_le_bytes((&ev.bytes[16..24])"),
         "...and the follower decodes that slot back at the right offset"
     );
 }

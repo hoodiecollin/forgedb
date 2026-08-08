@@ -1789,22 +1789,17 @@ impl RustGenerator {
     /// requirement the junction actually has: it stores each endpoint's id in a
     /// `FixedColumn`, indexes it in a `HashMap`, and frames it in a fixed-width
     /// replication record — so the key must be fixed-width, hashable and totally
-    /// equatable.  `uuid`, the four integer types and `timestamp` qualify, which
-    /// is every shape an identity field is realistically written in (all four
-    /// `+` autos among them).  Anything else is reported by validation as an
-    /// error rather than silently dropping the relation — see
-    /// `collect_m2m_key_errors`, which is derived from exactly this predicate.
+    /// equatable.  The admitted set lives on the AST as
+    /// `FieldType::is_junction_key`, because the parser's validator needs the
+    /// SAME predicate to report a schema outside it as an error — if the two ever
+    /// disagreed a relation would silently vanish again, which is the failure
+    /// #266 exists to remove.
     pub(crate) fn junction_key_type(
         schema: &Schema,
         model: &forgedb_parser::Model,
     ) -> Option<forgedb_parser::FieldType> {
-        use forgedb_parser::FieldType as FT;
         let ty = Self::identity_type(schema, model)?;
-        matches!(
-            ty,
-            FT::Uuid | FT::U32 | FT::U64 | FT::I32 | FT::I64 | FT::Timestamp
-        )
-        .then_some(ty)
+        ty.is_junction_key().then_some(ty)
     }
 
     /// Many-to-many relations that can be generated.
@@ -1935,16 +1930,20 @@ impl RustGenerator {
                     Uuid::from_bytes(__b)
                 }
             },
+            // NOTE the parentheses: `#slice` is itself a borrow expression
+            // (`&ev.bytes[a..b]`), and `&x.try_into()` parses as `&(x.try_into())`
+            // — which type-checks as a reference to an array and fails. The
+            // snapshot tests could not have caught this; the compile check did.
             forgedb_parser::FieldType::Timestamp => quote! {
                 Timestamp::from(i64::from_le_bytes(
-                    #slice.try_into().expect("junction frame slot is the key width"),
+                    (#slice).try_into().expect("junction frame slot is the key width"),
                 ))
             },
             other => {
                 let ident = Self::map_field_type_ident(schema, other);
                 quote! {
                     <#ident>::from_le_bytes(
-                        #slice.try_into().expect("junction frame slot is the key width"),
+                        (#slice).try_into().expect("junction frame slot is the key width"),
                     )
                 }
             }
