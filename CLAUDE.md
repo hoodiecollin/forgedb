@@ -483,6 +483,13 @@ of truth.
 
    - **Core work branches off `develop` and merges back to `develop`** (keep branch-per-scope +
      auto-merge; only the base changes). Nothing core lands on `main` except a release merge.
+   - **Branches land as merge commits — `git merge --no-ff`, never squash, never rebase.**
+     Squash and rebase are disabled in the repo settings, so the GitHub button refuses anything
+     else; most work merges locally anyway. Subject form:
+     `Merge <branch>: <what it did> (#<issue>)`. `--no-ff` is load-bearing — a branch that is
+     merely ahead fast-forwards otherwise, erasing the boundary exactly as a rebase would.
+     **Close the issue by hand**: GitHub honours `Closes #N` only for PRs into the *default*
+     branch, so a PR merged into `develop` leaves its issue open however the body is written.
    - **The release sequence is ordered, and the order is the whole point:** publish the substrate
      → **then** merge `develop` → `main` → **then** tag. Publishing after the merge reopens the
      window the branch exists to close.

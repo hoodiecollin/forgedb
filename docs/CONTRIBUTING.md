@@ -624,16 +624,39 @@ git commit -m "address review feedback"
 git push origin feature/my-new-feature
 ```
 
-**4. Merge** when approved:
-- Squash and merge (default)
-- Rebase and merge (for clean history)
-- Merge commit (for feature branches)
+**4. Merge** when approved.
+
+**Merge commits, always.** Squash and rebase are disabled in the repository settings, so a
+merge commit is the only method GitHub will accept. A branch is a unit of work and its
+history is worth keeping — a squash throws away the story the commits were split up to tell,
+and a rebase erases the fact that the work happened on a branch at all.
+
+The subject line names the branch and what it did, with the issue in parentheses:
+
+```
+Merge feat/238-string-n: string(N) fixed-width inline string columns (#238)
+```
+
+Most work here merges **locally** rather than through the GitHub button:
+
+```bash
+make cycle-scope PR=<n>          # or ISSUE=<n> — the gate CI runs on PRs into develop
+git checkout develop             # or main, per the coupling rule in CLAUDE.md
+git merge --no-ff <branch> -m "Merge <branch>: <what it did> (#<issue>)"
+git push origin develop
+```
+
+`--no-ff` is load-bearing: without it a branch that is merely ahead fast-forwards, and the
+branch boundary disappears exactly as if it had been rebased.
 
 ### After Merge
 
-- Delete your branch
-- Close related issues
-- Update project board (if applicable)
+- **Close the issue yourself.** GitHub only honours `Closes #N` for PRs targeting the
+  *default* branch, so a PR merged into `develop` leaves its issue open no matter what the
+  body says — `closingIssuesReferences` comes back empty. Close it with a comment naming the
+  PR and the verification you ran.
+- Delete your branch, local and remote.
+- Update project board (if applicable).
 
 ---
 
