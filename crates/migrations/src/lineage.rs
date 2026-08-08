@@ -5,7 +5,7 @@
 //! and every recorded migration bumps the version by one (`from_version ->
 //! to_version`).  This module is the dev-time source of truth two consumers walk:
 //!
-//! - **`EXPECTED_FORMAT_VERSION` (Phase 1).** codegen bakes the *current* version
+//! - **`EXPECTED_SCHEMA_VERSION` (Phase 1).** codegen bakes the *current* version
 //!   — the highest `to_version` in the lineage — into the generated app so open
 //!   refuses a stale data dir (red line #8: lineage-sourced, never hand-edited).
 //! - **The transformer generator (Phase 3).** given a `--from B --to G` range it
@@ -20,8 +20,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The fresh-database baseline format version (no migrations applied yet).  Kept
-/// in agreement with codegen's `EXPECTED_FORMAT_VERSION` baseline (#74 Phase 1).
-pub const BASELINE_FORMAT_VERSION: u32 = 1;
+/// in agreement with codegen's `EXPECTED_SCHEMA_VERSION` baseline (#74 Phase 1).
+pub const BASELINE_SCHEMA_VERSION: u32 = 1;
 
 /// The ordered serial version lineage loaded from a `migrations/` directory.
 #[derive(Debug, Clone)]
@@ -52,22 +52,22 @@ impl MigrationLineage {
         &self.migrations
     }
 
-    /// The current on-disk `format_version` the whole database is expected to be
+    /// The current on-disk schema serial the whole database is expected to be
     /// at: the highest `to_version` in the lineage, or the baseline when empty.
-    /// This is exactly what codegen bakes into `EXPECTED_FORMAT_VERSION`.
-    pub fn current_format_version(&self) -> u32 {
+    /// This is exactly what codegen bakes into `EXPECTED_SCHEMA_VERSION`.
+    pub fn current_schema_version(&self) -> u32 {
         self.migrations
             .iter()
             .map(|m| m.to_version)
             .max()
             .filter(|&v| v != 0)
-            .unwrap_or(BASELINE_FORMAT_VERSION)
+            .unwrap_or(BASELINE_SCHEMA_VERSION)
     }
 
     /// The `(from_version, to_version)` a *new* migration created now would carry:
     /// it starts at the current version and bumps by one.
     pub fn next_version_span(&self) -> (u32, u32) {
-        let from = self.current_format_version();
+        let from = self.current_schema_version();
         (from, from + 1)
     }
 
@@ -129,7 +129,7 @@ pub fn versioned_schema_dir(migrations_dir: &Path) -> PathBuf {
     migrations_dir.join("schemas")
 }
 
-/// Path of the committed full-schema snapshot for one `format_version` (#74
+/// Path of the committed full-schema snapshot for one schema version (#74
 /// Phase 3): `migrations/schemas/v{version}.forge`.  Stored as raw `.forge` so it
 /// re-parses through the same grammar the app schema does.
 pub fn versioned_schema_path(migrations_dir: &Path, version: u32) -> PathBuf {
@@ -247,8 +247,8 @@ pub fn scaffold_authored_body(
 /// Convenience: the current expected format version for a `migrations/` directory
 /// (loads the lineage, returns its current version — the baseline when empty or
 /// absent).  This is what the `generate` command threads into codegen.
-pub fn current_format_version<P: AsRef<Path>>(migrations_dir: P) -> u32 {
+pub fn current_schema_version<P: AsRef<Path>>(migrations_dir: P) -> u32 {
     MigrationLineage::load(migrations_dir)
-        .map(|l| l.current_format_version())
-        .unwrap_or(BASELINE_FORMAT_VERSION)
+        .map(|l| l.current_schema_version())
+        .unwrap_or(BASELINE_SCHEMA_VERSION)
 }

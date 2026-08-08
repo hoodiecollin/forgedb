@@ -48,7 +48,7 @@ pub struct TransformCrate {
     pub sources: Vec<(String, String)>,
 }
 
-/// One version's schema in the range, paired with its serial `format_version`.
+/// One version's schema in the range, paired with its schema serial.
 pub struct VersionSchema<'a> {
     pub version: u32,
     pub schema: &'a Schema,
@@ -138,10 +138,10 @@ impl TransformGenerator {
         let mut sources = Vec::new();
 
         // One generated module per version in the range — each the full typed
-        // database for that version, baked with its own `EXPECTED_FORMAT_VERSION`
+        // database for that version, baked with its own `EXPECTED_SCHEMA_VERSION`
         // so its open-guard enforces the version interlock (C5/C11).
         for vs in &plan.versions {
-            let code = RustGenerator::generate_with_format_version(vs.schema, vs.version)?.code;
+            let code = RustGenerator::generate_with_schema_version(vs.schema, vs.version)?.code;
             sources.push((format!("src/v{}.rs", vs.version), code));
         }
 

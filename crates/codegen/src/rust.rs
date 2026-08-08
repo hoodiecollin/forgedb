@@ -27,6 +27,25 @@ pub struct RustGenerator;
 /// A `@min`/`@max` bound literal as written in the schema (#239).
 ///
 /// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
+/// ForgeDB's current on-disk **engine** generation (#254).
+///
+/// Distinct from the app's schema-migration serial: this counts *ForgeDB's* byte
+/// format, covering both value reinterpretation and physical layout. It is baked
+/// into generated code as `EXPECTED_ENGINE_VERSION`, stamped into every manifest
+/// the generated code writes, and compared by the generated `open()` guard.
+///
+/// | gen | change | issue |
+/// |---|---|---|
+/// | 1 | baseline — everything written before the field existed | — |
+/// | 2 | timestamp values are microseconds, not seconds | #254 |
+///
+/// **Generations are assigned at merge order, not at design time.** Two engine
+/// format changes in one cycle would otherwise both claim the next number, and
+/// whichever landed second would silently redefine the other's meaning. Bumping
+/// this constant obliges a hop in the engine-migration generator
+/// (`crate::engine`), because every existing data dir is now stale.
+pub const CURRENT_ENGINE_VERSION: u32 = 2;
+
 /// happens against the known field type: exact for `decimal`, correctly rounded
 /// for `f64`. Parsing to a float earlier would round before anything knew which
 /// of those two applied.
@@ -91,24 +110,45 @@ impl RustGenerator {
     pub fn generate(schema: &Schema) -> Result<GeneratedCode> {
         // Baseline on-disk format version (#74 Phase 1): a schema with no migration
         // lineage is at version 1.  The CLI threads the lineage-derived version via
-        // `generate_with_format_version`; snapshot tests use this baseline so their
+        // `generate_with_schema_version`; snapshot tests use this baseline so their
         // output is stable.
-        Self::generate_with_format_version(schema, 1)
+        Self::generate_with_schema_version(schema, 1)
     }
 
-    /// Generate the Rust database implementation, baking `format_version` into the
-    /// app's `EXPECTED_FORMAT_VERSION` (#74 Phase 1/2).  The version is **derived
+    /// Generate the Rust database implementation, baking the app's schema serial into the
+    /// app's `EXPECTED_SCHEMA_VERSION` (#74 Phase 1/2).  The version is **derived
     /// from the committed migration lineage** by the `generate` CLI command (red
     /// line #8: lineage-sourced, never hand-edited); it is an opaque integer the
     /// generated open guard compares and refuses on mismatch — nothing more.
     ///
     /// Uses the default generate-time runtime config (`GenConfig::DEFAULT`) — see
     /// `generate_with_config` for the #126 configurable-behavior knobs.
-    pub fn generate_with_format_version(
+    pub fn generate_with_schema_version(
         schema: &Schema,
-        format_version: u32,
+        schema_version: u32,
     ) -> Result<GeneratedCode> {
-        Self::generate_with_config(schema, format_version, GenConfig::DEFAULT)
+        Self::generate_with_config(schema, schema_version, GenConfig::DEFAULT)
+    }
+
+    /// Generate with an explicit **engine** generation as well as the app's
+    /// schema serial (#254).
+    ///
+    /// The only caller that needs this is the engine-migration generator, which
+    /// emits the *same* schema twice — once baked at the origin generation to
+    /// read the stale dir, once at the destination generation to write the new
+    /// one. Every other caller wants [`CURRENT_ENGINE_VERSION`] and gets it from
+    /// the shorter constructors.
+    pub fn generate_with_versions(
+        schema: &Schema,
+        schema_version: u32,
+        engine_version: u32,
+    ) -> Result<GeneratedCode> {
+        Self::generate_with_config_and_engine(
+            schema,
+            schema_version,
+            engine_version,
+            GenConfig::DEFAULT,
+        )
     }
 
     /// Generate the Rust database implementation with an explicit generate-time
@@ -119,11 +159,27 @@ impl RustGenerator {
     /// except the broker (default OFF — G6 sanctioned exception).
     pub fn generate_with_config(
         schema: &Schema,
-        format_version: u32,
+        schema_version: u32,
+        config: GenConfig,
+    ) -> Result<GeneratedCode> {
+        Self::generate_with_config_and_engine(
+            schema,
+            schema_version,
+            CURRENT_ENGINE_VERSION,
+            config,
+        )
+    }
+
+    /// The one real entry point: both version counters plus the generate-time
+    /// config. Everything above delegates here.
+    pub fn generate_with_config_and_engine(
+        schema: &Schema,
+        schema_version: u32,
+        engine_version: u32,
         config: GenConfig,
     ) -> Result<GeneratedCode> {
         ACTIVE_CONFIG.with(|c| c.set(config));
-        let code = Self::generate_code(schema, format_version)?;
+        let code = Self::generate_code(schema, schema_version, engine_version)?;
 
         Ok(GeneratedCode {
             code,
@@ -272,7 +328,7 @@ impl RustGenerator {
     }
 
     /// Generate the Rust code as a string
-    fn generate_code(schema: &Schema, format_version: u32) -> Result<String> {
+    fn generate_code(schema: &Schema, schema_version: u32, engine_version: u32) -> Result<String> {
         Self::validate_projections(schema)?;
         Self::validate_on_delete(schema)?;
 
@@ -345,20 +401,29 @@ impl RustGenerator {
 
         // On-disk format version this binary was generated for (#74 Phase 1 —
         // version guard).  An OPAQUE lineage-derived integer: it is compared, on
-        // open, against the `format_version` stamped in each collection's
+        // open, against the schema serial stamped in each collection's
         // `manifest.json`, and a mismatch is a fail-fast refusal — never a
         // self-healing reshape (red line DV-6: the guard reads ONE integer and
         // refuses; it never inspects column names/types to adapt).  A migration
         // bin (the offline transformer, #74 Phase 3) is what rewrites a data dir
         // from an old version to a new one; the app never migrates in place.
         // Derived from the committed migration lineage (#74 Phase 2 — the CLI
-        // threads `MigrationLineage::current_format_version`); baseline `1` for a
+        // threads `MigrationLineage::current_schema_version`); baseline `1` for a
         // schema with no lineage.  A fresh data dir is stamped with exactly this
         // value, so a dir this binary wrote always matches its own expectation.
-        let __expected_format_version =
-            proc_macro2::Literal::u32_unsuffixed(format_version);
+        let __expected_schema_version =
+            proc_macro2::Literal::u32_unsuffixed(schema_version);
+        // ForgeDB's own on-disk **engine** generation (#254), the counter
+        // orthogonal to the schema serial above.  A schema mismatch means the
+        // app's schema changed; an engine mismatch means ForgeDB's byte format
+        // did.  They have different remedies, so they are compared separately
+        // and reported separately — conflating them would send a user to
+        // regenerate a schema that is already correct.
+        let __expected_engine_version =
+            proc_macro2::Literal::u32_unsuffixed(engine_version);
         tokens.extend(quote! {
-            const EXPECTED_FORMAT_VERSION: u32 = #__expected_format_version;
+            const EXPECTED_SCHEMA_VERSION: u32 = #__expected_schema_version;
+            const EXPECTED_ENGINE_VERSION: u32 = #__expected_engine_version;
         });
 
         // serde default for an omitted `+timestamp` auto field (#187): a zero
@@ -4401,11 +4466,11 @@ impl RustGenerator {
                 // `compaction_epoch` above: a reopen must NOT clobber a version a
                 // migration bumped (that would silently defeat the open-time guard
                 // and let stale bytes be mis-decoded).  A fresh directory is stamped
-                // with this binary's `EXPECTED_FORMAT_VERSION` baseline, so a dir
+                // with this binary's `EXPECTED_SCHEMA_VERSION` baseline, so a dir
                 // this binary writes always matches its own expectation.
-                let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-                    .map(|m| m.format_version)
-                    .unwrap_or(EXPECTED_FORMAT_VERSION);
+                let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                    .map(|m| m.schema_version)
+                    .unwrap_or(EXPECTED_SCHEMA_VERSION);
                 // Auto-increment high-water marks (#187).  This is a **max-merge**,
                 // NOT the carry-forward the two fields above do — and the
                 // difference is load-bearing.
@@ -4425,7 +4490,6 @@ impl RustGenerator {
                 let mut __auto_sequences = __persisted_seqs;
                 #(#autoseq_merges)*
                 let manifest = forgedb_storage::Manifest {
-                    schema_version: 1,
                     row_count: self.row_count,
                     columns,
                     wal_enabled: false,
@@ -4434,7 +4498,13 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                     compaction_epoch: __compaction_epoch,
-                    format_version: __format_version,
+                    schema_version: __schema_version,
+                    // Stamped, not carried forward (#254).  The open-guard above
+                    // has already established that this dir is at THIS binary's
+                    // generation or is fresh, so there is nothing older to
+                    // preserve — and no migration bumps the generation in place:
+                    // `forgedb migrate engine` writes a new dir.
+                    engine_version: EXPECTED_ENGINE_VERSION,
                     row_anchor: Some(forgedb_storage::RowAnchor {
                         relative_path: "tombstones.bin".to_string(),
                         bytes_per_row: 1usize,
@@ -8791,8 +8861,8 @@ impl RustGenerator {
 
         // Open-time format-version guard (#74 Phase 1).  For every collection that
         // has already been written (its `manifest.json` exists), load exactly the
-        // opaque `format_version` integer and refuse to open the dir when it does
-        // not match this binary's codegen-baked `EXPECTED_FORMAT_VERSION`.  This is
+        // opaque schema-serial integer (on-disk key `format_version`) and refuse the dir when it does
+        // not match this binary's codegen-baked `EXPECTED_SCHEMA_VERSION`.  This is
         // the fail-fast that turns a stale data dir (written under an older schema,
         // now opened by regenerated code) from a SILENT byte mis-decode into a
         // clear panic pointing at the migration bin.  Red line DV-6: it reads one
@@ -8815,16 +8885,34 @@ impl RustGenerator {
                     {
                         let __mf = root.join(#manifest_rel);
                         if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                            if __m.format_version != EXPECTED_FORMAT_VERSION {
+                            if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                                 panic!(
-                                    "ForgeDB: data dir at {} is on-disk format v{}, \
+                                    "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
                                     __mf.display(),
-                                    __m.format_version,
-                                    EXPECTED_FORMAT_VERSION,
+                                    __m.schema_version,
+                                    EXPECTED_SCHEMA_VERSION,
+                                );
+                            }
+                            // A DIFFERENT situation with a DIFFERENT remedy: the
+                            // schema did not change, ForgeDB did.  Sending the
+                            // user to the app's migration bin here would tell
+                            // them to regenerate a schema that is already correct.
+                            if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                                panic!(
+                                    "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                                    __mf.display(),
+                                    __m.engine_version,
+                                    EXPECTED_ENGINE_VERSION,
                                 );
                             }
                         }
@@ -9161,8 +9249,8 @@ impl RustGenerator {
                     _lock: Option<forgedb_storage::DirLock>,
                 ) -> Self {
                     // Format-version guard (#74 Phase 1): refuse a data dir whose
-                    // stamped `format_version` differs from this binary's baked
-                    // `EXPECTED_FORMAT_VERSION`, BEFORE opening any column/WAL file.
+                    // stamped schema serial differs from this binary's baked
+                    // `EXPECTED_SCHEMA_VERSION`, BEFORE opening any column/WAL file.
                     // Reads one opaque integer per existing manifest and fails fast
                     // on mismatch — never reshapes (DV-6).  Skipped for a fresh dir.
                     #(#version_guard_stmts)*
@@ -11355,12 +11443,11 @@ impl RustGenerator {
                         // Preserve the on-disk format version across reopen (#74
                         // Phase 1), same as the model path — a reopen must never
                         // clobber a migration-bumped version.  Fresh dir → this
-                        // binary's `EXPECTED_FORMAT_VERSION` baseline.
-                        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-                            .map(|m| m.format_version)
-                            .unwrap_or(EXPECTED_FORMAT_VERSION);
+                        // binary's `EXPECTED_SCHEMA_VERSION` baseline.
+                        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+                            .map(|m| m.schema_version)
+                            .unwrap_or(EXPECTED_SCHEMA_VERSION);
                         let manifest = forgedb_storage::Manifest {
-                            schema_version: 1,
                             row_count: self.row_count,
                             columns,
                             wal_enabled: false,
@@ -11369,7 +11456,8 @@ impl RustGenerator {
                     // load-bearing for recovery, which reads the column lengths.
                     last_checkpoint: self.row_count as u64,
                             compaction_epoch: __compaction_epoch,
-                            format_version: __format_version,
+                            schema_version: __schema_version,
+                            engine_version: EXPECTED_ENGINE_VERSION,
                             row_anchor: Some(forgedb_storage::RowAnchor {
                                 relative_path: "fixed/right.bin".to_string(),
                                 bytes_per_row: #rw,

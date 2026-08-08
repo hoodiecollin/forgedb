@@ -2215,8 +2215,8 @@ Tag {
 #[test]
 fn test_rust_generation_version_guard() {
     // Format-version guard (#74 Phase 1): the generated app, on open, compares the
-    // manifest's stamped `format_version` against a codegen-baked
-    // `EXPECTED_FORMAT_VERSION` and FAIL-FAST refuses a stale data dir — it never
+    // manifest's stamped schema serial against a codegen-baked
+    // `EXPECTED_SCHEMA_VERSION` and FAIL-FAST refuses a stale data dir — it never
     // reshapes/self-heals (red line DV-6).  This turns a silent byte mis-decode of
     // a dir written under an old schema into a clear refusal pointing at the
     // migration bin.
@@ -2239,15 +2239,15 @@ Tag {
 
     // An opaque, codegen-baked expected version constant is emitted.
     assert!(
-        code.contains("const EXPECTED_FORMAT_VERSION: u32 = 1"),
+        code.contains("const EXPECTED_SCHEMA_VERSION: u32 = 1"),
         "generated app bakes in the version it expects"
     );
 
     // The guard reads exactly the one opaque integer and compares it — it must NOT
     // inspect column names/types to decide anything (DV-6: refuse, don't adapt).
     assert!(
-        code.contains("__m.format_version != EXPECTED_FORMAT_VERSION"),
-        "open compares the manifest format_version against the expected version"
+        code.contains("__m.schema_version != EXPECTED_SCHEMA_VERSION"),
+        "open compares the manifest schema serial against the expected version"
     );
     assert!(
         code.contains("but this binary expects v"),
@@ -2264,7 +2264,7 @@ Tag {
     );
 
     // Identity: the guard branch must not read column shape to self-heal — the ONLY
-    // manifest field it touches in the guard is `format_version`.  (It must never
+    // manifest field it touches in the guard is the schema serial.  (It must never
     // resolve a decoder from column names/types the way a schema engine would.)
     assert!(
         !code.contains("__m.columns") && !code.contains("m.column_type"),
@@ -2272,26 +2272,26 @@ Tag {
     );
 
     // #74 Phase 2: the baked version is LINEAGE-SOURCED, not hardcoded — the CLI
-    // threads `MigrationLineage::current_format_version` via
-    // `generate_with_format_version`.  A schema with no lineage baselines to 1
+    // threads `MigrationLineage::current_schema_version` via
+    // `generate_with_schema_version`.  A schema with no lineage baselines to 1
     // (the default `generate`); a lineage at version N bakes N.
-    let code_v7 = RustGenerator::generate_with_format_version(&schema, 7)
+    let code_v7 = RustGenerator::generate_with_schema_version(&schema, 7)
         .unwrap()
         .code;
     assert!(
-        code_v7.contains("const EXPECTED_FORMAT_VERSION: u32 = 7"),
+        code_v7.contains("const EXPECTED_SCHEMA_VERSION: u32 = 7"),
         "the expected version is threaded from the migration lineage, not hardcoded"
     );
 }
 
 #[test]
-fn test_rust_generation_manifest_preserves_format_version() {
+fn test_rust_generation_manifest_preserves_schema_version() {
     // Version writer preservation (#74 Phase 1 prerequisite): `write_manifest`
     // runs on EVERY open, so it must load any existing manifest and carry its
-    // `format_version` forward (exactly as it already does for `compaction_epoch`)
+    // the schema serial forward (exactly as it already does for `compaction_epoch`)
     // — otherwise a reopen would clobber a migration's version bump back to the
     // baseline and silently defeat the open-time guard.  A fresh dir (no manifest)
-    // is stamped with `EXPECTED_FORMAT_VERSION`.
+    // is stamped with `EXPECTED_SCHEMA_VERSION`.
     let src = r#"
 User {
   id: +uuid
@@ -2305,19 +2305,19 @@ User {
     // The manifest is written with a preserved-or-baseline version, NOT a hardcoded
     // constant that would clobber a bumped version on reopen.
     assert!(
-        code.contains("let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
-            && code.contains(".map(|m| m.format_version)")
-            && code.contains(".unwrap_or(EXPECTED_FORMAT_VERSION)"),
-        "write_manifest preserves an existing format_version, baselining a fresh dir"
+        code.contains("let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
+            && code.contains(".map(|m| m.schema_version)")
+            && code.contains(".unwrap_or(EXPECTED_SCHEMA_VERSION)"),
+        "write_manifest preserves an existing schema_version, baselining a fresh dir"
     );
     assert!(
-        code.contains("format_version: __format_version"),
+        code.contains("schema_version: __schema_version"),
         "the manifest is stamped with the preserved-or-baseline version"
     );
     // The old clobbering hardcode is gone.
     assert!(
-        !code.contains("format_version: 1,"),
-        "no hardcoded format_version left to clobber a bumped version on reopen"
+        !code.contains("schema_version: 1,"),
+        "no hardcoded schema version left to clobber a bumped version on reopen"
     );
 }
 

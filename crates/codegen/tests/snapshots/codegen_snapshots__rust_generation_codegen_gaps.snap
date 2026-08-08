@@ -14,7 +14,8 @@ use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
 const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
-const EXPECTED_FORMAT_VERSION: u32 = 1;
+const EXPECTED_SCHEMA_VERSION: u32 = 1;
+const EXPECTED_ENGINE_VERSION: u32 = 2;
 fn __forgedb_default_ts() -> Timestamp {
     Timestamp::from_seconds(0)
 }
@@ -417,9 +418,9 @@ impl PlaceStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
         let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.auto_sequences)
             .unwrap_or_default();
@@ -433,13 +434,13 @@ impl PlaceStorage {
             }
         }
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
@@ -1663,14 +1664,26 @@ impl Database {
         {
             let __mf = root.join("place/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }

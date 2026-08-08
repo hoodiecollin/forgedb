@@ -70,7 +70,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
                 .map_err(map_err)?;
             forgedb_migrations::save_versioned_schema(
                 &migrations_dir,
-                lineage.current_format_version(),
+                lineage.current_schema_version(),
                 &new_src,
             )
             .map_err(map_err)?;
@@ -102,7 +102,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         // Assign the serial version interlock (#74 Phase 2) from the committed
         // lineage: this migration bumps the on-disk format version by one, so a
         // regenerated app expects the new version and refuses a not-yet-migrated
-        // data dir (the Phase 1 open guard).  `EXPECTED_FORMAT_VERSION` is derived
+        // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
         // from this lineage at `generate` time — never hand-edited (red line #8).
         let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
             .map_err(map_err)?;
@@ -361,7 +361,7 @@ pub struct MigrateUpOptions {
 pub fn up(opts: MigrateUpOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
     let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
-    let to = opts.to.unwrap_or_else(|| lineage.current_format_version());
+    let to = opts.to.unwrap_or_else(|| lineage.current_schema_version());
     let output = opts
         .output
         .clone()
@@ -391,7 +391,7 @@ pub fn up(opts: MigrateUpOptions) -> Result<()> {
         Some(f) => f,
         None => {
             let first = &jobs[0].0;
-            detect_src_format_version(first)?.ok_or_else(|| {
+            detect_src_schema_version(first)?.ok_or_else(|| {
                 CliError::Migration(format!(
                     "could not detect the source format version of {} — pass --from explicitly",
                     first.display()
@@ -488,7 +488,7 @@ fn collect_tenant_jobs(
             continue;
         }
         // Only sweep dirs that actually hold data (a model manifest).
-        if detect_src_format_version(&path)?.is_none() {
+        if detect_src_schema_version(&path)?.is_none() {
             continue;
         }
         jobs.push((path, root.join(format!("{name}{suffix}"))));
@@ -503,12 +503,12 @@ fn collect_tenant_jobs(
     Ok(jobs)
 }
 
-/// Detect the on-disk `format_version` of a data directory by reading the first
+/// Detect the on-disk schema serial of a data directory by reading the first
 /// `<model>/manifest.json` under it (#74 Phase 4).  Every model/junction manifest
 /// in a consistent dir carries the same version (the app open-guard enforces it),
 /// so the first one found is authoritative.  `None` when the dir holds no manifest
 /// (not a data dir, or empty).
-fn detect_src_format_version(data_dir: &Path) -> Result<Option<u32>> {
+fn detect_src_schema_version(data_dir: &Path) -> Result<Option<u32>> {
     if !data_dir.is_dir() {
         return Ok(None);
     }
