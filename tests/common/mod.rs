@@ -64,7 +64,7 @@ fn cargo_toml(name: &str) -> String {
     s.push_str("axum = { version = \"0.8\", features = [\"ws\"] }\n");
     s.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
     s.push_str("tower = { version = \"0.5\", features = [\"util\"] }\n");
-    s.push_str("tower-http = { version = \"0.6\", features = [\"trace\"] }\n");
+    s.push_str("tower-http = { version = \"0.6\", features = [\"trace\", \"cors\"] }\n");
     s.push_str("\n[workspace]\n");
     s
 }

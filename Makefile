@@ -257,6 +257,19 @@ f64-index-key:
 api-wire-test:
 	cargo test --test api_wire_test -- --ignored --nocapture
 
+.PHONY: cors-test
+
+## Cross-origin proof (#140): generate + compile a real API and drive each router
+## variant through tower::oneshot. Three of #140's decisions are invisible to a
+## snapshot — that an unconfigured router still answers OPTIONS with 405 (omitting
+## the layer is NOT the same as emitting an empty one), that a preflight carrying no
+## Authorization header is answered 200 rather than 401 (the layer must sit outside
+## the tenant guard), and that a WebSocket handshake from a disallowed origin is
+## refused 403 (browsers neither preflight nor CORS-enforce a handshake). Also
+## #[ignore]d out of the fast suite (compiles a crate).
+cors-test:
+	cargo test --test cors_test -- --ignored --nocapture
+
 .PHONY: list-scan-test
 
 ## List-selection proof (#228): boot the generated router over a CHURNED corpus

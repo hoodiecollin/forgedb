@@ -1121,9 +1121,18 @@ impl ApiGenerator {
             #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| #handle_fn(socket, db, params))
             }
 
@@ -1198,9 +1207,18 @@ impl ApiGenerator {
             /// of the retained log).  Tenant-scoped by the router's auth guard.
             async fn __replicate(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| __handle_replicate(socket, db, params))
             }
 
@@ -1339,9 +1357,18 @@ impl ApiGenerator {
             #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| #handle_fn(socket, db, params))
             }
 
@@ -1687,10 +1714,173 @@ impl ApiGenerator {
             /// server-side half of Phase 5 observability; the scaffold
             /// `main.rs` installs the subscriber.
             pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
-                __data_routes()
+                create_router_with_options(db, HttpOptions::default())
+            }
+
+            /// Process-start HTTP options (#140, epic #126 Tier C).
+            ///
+            /// Deployment identity, never baked at generate time: the same generated
+            /// binary is promoted to localhost, staging, and production with
+            /// different allowed origins, so baking them would make one build
+            /// undeployable to two environments.
+            #[derive(Debug, Clone, Default)]
+            pub struct HttpOptions {
+                /// Origins allowed to call this API cross-origin.
+                ///
+                /// `None` — the default — emits **no** `CorsLayer` and applies **no**
+                /// WebSocket origin check, which is byte-identical to the behavior
+                /// before #140. `None` is not the same as `Some(vec![])`: an empty
+                /// `CorsLayer` still answers preflight `OPTIONS` with 200, whereas
+                /// these routes answer 405.
+                pub allowed_origins: Option<Vec<String>>,
+            }
+
+            /// Parse a comma-separated origin list, as read from
+            /// `FORGEDB_CORS_ORIGINS`.
+            ///
+            /// Empty or all-whitespace input is `Ok(None)` — "not configured", not an
+            /// error. Entries are trimmed. Returns `Err` for an entry that is not a
+            /// valid header value, and for `*` mixed with explicit origins: that
+            /// combination has two defensible readings and picking one silently is a
+            /// security-relevant coin flip.
+            pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
+                let parts: Vec<String> = raw
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                if parts.is_empty() {
+                    return Ok(None);
+                }
+                let wildcards = parts.iter().filter(|p| p.as_str() == "*").count();
+                if wildcards > 0 && parts.len() > 1 {
+                    return Err(
+                        "`*` cannot be combined with explicit origins — use either a \
+                         single `*` or an explicit list"
+                            .to_string(),
+                    );
+                }
+                for p in &parts {
+                    if axum::http::HeaderValue::from_str(p).is_err() {
+                        return Err(format!("`{p}` is not a valid origin header value"));
+                    }
+                }
+                Ok(Some(parts))
+            }
+
+            /// The origin allow-list as the WebSocket handlers see it.
+            ///
+            /// Always present in request extensions — `AllowedOrigins(None)` when
+            /// unconfigured — so the handlers can take it unconditionally and the
+            /// "unconfigured means accept" branch lives in exactly one place.
+            #[derive(Debug, Clone)]
+            pub struct AllowedOrigins(pub Option<Arc<Vec<String>>>);
+
+            impl AllowedOrigins {
+                /// Whether a handshake carrying `origin` may proceed.
+                ///
+                /// Unconfigured accepts everything (today's behavior, preserved). An
+                /// absent `Origin` header is accepted even when configured: native
+                /// `/replicate` followers, CLI tools and tests send none, rejecting
+                /// them would break them, and it buys nothing — an attacker who
+                /// controls the client controls the header. Origin checking defends
+                /// the *browser* threat model, where the browser sets the header and
+                /// the page cannot forge it.
+                pub fn permits(&self, origin: Option<&str>) -> bool {
+                    match (&self.0, origin) {
+                        (None, _) => true,
+                        (Some(_), None) => true,
+                        (Some(list), Some(o)) => {
+                            list.iter().any(|a| a == "*" || a == o)
+                        }
+                    }
+                }
+            }
+
+            /// Read the `Origin` header, if the request carries a valid one.
+            fn __origin_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+                headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())
+            }
+
+            /// Build the CORS layer for `origins`, or `None` when unconfigured.
+            ///
+            /// Methods are exactly the set the generated router registers; there is no
+            /// `PATCH` route. Headers are `content-type` (JSON bodies) and
+            /// `authorization` (bearer tokens when auth is on).
+            ///
+            /// **No `allow_credentials`.** ForgeDB auth is a bearer token in a header,
+            /// not a cookie, so credentials mode is unnecessary — and because nothing
+            /// is auto-attached by the browser, an explicit `*` does not create a CSRF
+            /// vector here. It also avoids tower-http's wildcard-plus-credentials
+            /// conflict. Anyone later adding cookie auth must revisit this.
+            fn __cors_layer(origins: &Option<Arc<Vec<String>>>) -> Option<tower_http::cors::CorsLayer> {
+                let list = origins.as_ref()?;
+                let methods = [
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::DELETE,
+                ];
+                let headers = [
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ];
+                let layer = tower_http::cors::CorsLayer::new()
+                    .allow_methods(methods)
+                    .allow_headers(headers);
+                if list.iter().any(|o| o == "*") {
+                    return Some(layer.allow_origin(tower_http::cors::Any));
+                }
+                let parsed: Vec<axum::http::HeaderValue> = list
+                    .iter()
+                    .filter_map(|o| axum::http::HeaderValue::from_str(o).ok())
+                    .collect();
+                Some(layer.allow_origin(parsed))
+            }
+
+            /// Apply the origin-dependent layers to an otherwise-finished router.
+            ///
+            /// The `Extension` is applied unconditionally so the WS handlers can take
+            /// it without an optional extractor; the `CorsLayer` only when configured,
+            /// because an empty one would change `OPTIONS` from 405 to 200 for every
+            /// existing deployment.
+            ///
+            /// Layer order is inverted from reading order — a layer applied later
+            /// wraps outer — so this runs **after** the `TraceLayer`, putting CORS
+            /// outermost. That is load-bearing: browsers send preflight `OPTIONS`
+            /// without an `Authorization` header, so a CORS layer inside the tenant
+            /// guard would have its preflight rejected 401 and the browser would
+            /// report an opaque CORS failure. Outermost also means error responses
+            /// (401/403/422) carry the CORS headers the browser needs in order to let
+            /// the page read the status.
+            fn __apply_origin_layers(router: Router<Arc<RwLock<super::Database>>>, opts: HttpOptions)
+                -> Router<Arc<RwLock<super::Database>>>
+            {
+                let origins = opts.allowed_origins.map(Arc::new);
+                let cors = __cors_layer(&origins);
+                let router = router.layer(axum::Extension(AllowedOrigins(origins)));
+                match cors {
+                    Some(layer) => router.layer(layer),
+                    None => router,
+                }
+            }
+
+            /// Create the API router with process-start [`HttpOptions`] (#140).
+            ///
+            /// `create_router` is this with the defaults, kept as a separate function
+            /// with its original signature because the scaffold writes `src/main.rs`
+            /// **once** at `forgedb init` and never regenerates it — changing the
+            /// arity of the existing constructors would break every existing project
+            /// the next time it ran `forgedb generate`.
+            pub fn create_router_with_options(
+                db: Arc<RwLock<super::Database>>,
+                opts: HttpOptions,
+            ) -> Router {
+                let router = __data_routes()
                     .merge(__ops_routes())
-                    .layer(tower_http::trace::TraceLayer::new_for_http())
-                    .with_state(db)
+                    .layer(tower_http::trace::TraceLayer::new_for_http());
+                __apply_origin_layers(router, opts).with_state(db)
             }
 
             /// Create the API router with the tenant-auth guard layered over the
@@ -1715,14 +1905,27 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 auth: Arc<forgedb_auth::Authenticator>,
             ) -> Router {
+                create_router_with_auth_and_options(db, auth, HttpOptions::default())
+            }
+
+            /// The tenant-auth router with process-start [`HttpOptions`] (#140).
+            ///
+            /// The CORS layer is applied **outside** the tenant guard — see
+            /// `__apply_origin_layers` for why that placement is load-bearing rather
+            /// than incidental.
+            pub fn create_router_with_auth_and_options(
+                db: Arc<RwLock<super::Database>>,
+                auth: Arc<forgedb_auth::Authenticator>,
+                opts: HttpOptions,
+            ) -> Router {
                 let guarded = __data_routes().layer(axum::middleware::from_fn_with_state(
                     auth,
                     forgedb_auth::axum_mw::require_tenant,
                 ));
-                guarded
+                let router = guarded
                     .merge(__ops_routes())
-                    .layer(tower_http::trace::TraceLayer::new_for_http())
-                    .with_state(db)
+                    .layer(tower_http::trace::TraceLayer::new_for_http());
+                __apply_origin_layers(router, opts).with_state(db)
             }
         };
 
