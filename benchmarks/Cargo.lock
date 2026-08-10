@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-coordinator"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "forgedb-changefeed",
  "forgedb-txn",
@@ -851,7 +851,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "forgedb-storage-native",
  "forgedb-storage-web",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-native"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "forgedb-wal",
  "fs2",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-storage-web"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "forgedb-wal",
  "js-sys",
@@ -889,7 +889,7 @@ version = "0.1.0"
 
 [[package]]
 name = "forgedb-types"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "serde",
  "uuid",
