@@ -66,6 +66,11 @@ harness = false
 name = "matrix_bench"
 harness = false
 
+# #226 kill gate: how much of a list request is the per-row page materialization.
+[[bench]]
+name = "list_page_bench"
+harness = false
+
 # Detached from the root workspace on purpose: keeps SQLite (and later DuckDB / PG
 # client libs) out of `cargo build --workspace` and the test baseline.
 [workspace]

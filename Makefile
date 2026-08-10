@@ -34,6 +34,12 @@ bench:
 bench-forgedb:
 	cargo bench --manifest-path $(BENCH) --bench forgedb_bench
 
+## #226 kill gate: split a list request into scan / page-materialize / serialize and
+## report the page-materialize share. #226 can only remove that share, so it is a hard
+## ceiling on the win — measurable without prototyping the buffered decode.
+bench-list-page:
+	cargo bench --manifest-path $(BENCH) --bench list_page_bench
+
 ## Benchmark SQLite only.
 bench-sqlite:
 	cargo bench --manifest-path $(BENCH) --bench sqlite_bench

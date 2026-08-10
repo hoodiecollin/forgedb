@@ -10,25 +10,59 @@ use utoipa::ToSchema;
 const WAL_CHECKPOINT_INTERVAL: u64 = 1000;
 const COMPACTION_DEAD_THRESHOLD: u64 = 1000;
 const COMPACTION_DEAD_CEILING_FACTOR: u64 = 4;
-const EXPECTED_FORMAT_VERSION: u32 = 1;
+const EXPECTED_SCHEMA_VERSION: u32 = 1;
+const EXPECTED_ENGINE_VERSION: u32 = 2;
 fn __forgedb_default_ts() -> Timestamp {
-    Timestamp::from_seconds(0)
+    Timestamp::from_micros(0)
+}
+/// Build an opaque MVCC conflict key from its components (#257).
+///
+/// Each part is length-prefixed, so no component list can ever encode
+/// to the same bytes as a different one.  A bare concatenation cannot
+/// promise that: `("User", "12")` and `("User1", "2")` are the same
+/// bytes, which would make two unrelated writes conflict.  The leading
+/// discriminant part additionally keeps a row key and a unique-claim
+/// key in separate spaces.
+///
+/// Identity: the caller assembles the parts; this only frames bytes.
+/// The sequencer and the coordinator still compare for equality and
+/// never decode (`forgedb-txn` / `forgedb-coordinator` unchanged).
+fn __forgedb_ws_key(parts: &[&[u8]]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(parts.iter().map(|p| p.len() + 4).sum::<usize>());
+    for p in parts {
+        k.extend_from_slice(&(p.len() as u32).to_le_bytes());
+        k.extend_from_slice(p);
+    }
+    k
 }
 /// A rejected write (#91).  `status_code()` maps each class to the
 /// HTTP status the generated REST boundary returns.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     /// A `&unique` field already holds this value on another row → 409.
-    Unique { field: &'static str },
+    Unique { model: &'static str, field: &'static str },
     /// A required/optional foreign key points at a non-existent row → 409.
-    DanglingReference { field: &'static str, target: &'static str },
+    DanglingReference { model: &'static str, field: &'static str, target: &'static str },
     /// A `delete` was refused because live child rows still reference
     /// this parent under an `@on_delete(restrict)` FK (the default
     /// on-delete policy) → 409.
     ReferencedByChildren { model: &'static str, field: &'static str },
     /// A field-level constraint (`@min`/`@max`/`@length`/`@email`/`@url`)
     /// was violated → 422.
-    Constraint { field: &'static str, rule: &'static str, message: String },
+    Constraint {
+        model: &'static str,
+        field: &'static str,
+        rule: &'static str,
+        message: String,
+    },
+    /// A `+u32`/`+u64` auto-increment field ran out of values (#187) →
+    /// 500.  Refused rather than wrapped: wrapping would re-issue `0`,
+    /// which is also the "allocate one for me" sentinel, and then
+    /// collide with every value already handed out.
+    ///
+    /// A server-side exhaustion, not a bad request — which is why it is
+    /// the one `ValidationError` class that maps to 5xx.
+    SequenceExhausted { model: &'static str, field: &'static str },
 }
 impl ValidationError {
     /// The HTTP status the generated API boundary returns for this class:
@@ -40,17 +74,20 @@ impl ValidationError {
             | ValidationError::DanglingReference { .. }
             | ValidationError::ReferencedByChildren { .. } => 409,
             ValidationError::Constraint { .. } => 422,
+            ValidationError::SequenceExhausted { .. } => 500,
         }
     }
 }
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ValidationError::Unique { field } => {
-                write!(f, "unique constraint violated on field `{}`", field)
+            ValidationError::Unique { model, field } => {
+                write!(f, "unique constraint violated on field `{}.{}`", model, field)
             }
-            ValidationError::DanglingReference { field, target } => {
-                write!(f, "field `{}` references a non-existent {}", field, target)
+            ValidationError::DanglingReference { model, field, target } => {
+                write!(
+                    f, "field `{}.{}` references a non-existent {}", model, field, target
+                )
             }
             ValidationError::ReferencedByChildren { model, field } => {
                 write!(
@@ -59,8 +96,13 @@ impl std::fmt::Display for ValidationError {
                     model, field
                 )
             }
-            ValidationError::Constraint { field, rule, message } => {
-                write!(f, "field `{}` violates `{}`: {}", field, rule, message)
+            ValidationError::Constraint { model, field, rule, message } => {
+                write!(f, "field `{}.{}` violates `{}`: {}", model, field, rule, message)
+            }
+            ValidationError::SequenceExhausted { model, field } => {
+                write!(
+                    f, "auto-increment sequence for `{}.{}` is exhausted", model, field
+                )
             }
         }
     }
@@ -157,17 +199,17 @@ pub struct User {
     pub id: Uuid,
     pub name: String,
     pub email: String,
-    #[schema(value_type = i64)]
+    #[schema(value_type = String)]
     #[serde(default = "__forgedb_default_ts")]
     pub created_at: Timestamp,
     pub posts: (),
 }
-///Internal narrow scan record for `User` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+///Borrowed narrow scan view for `User` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
-pub struct UserScanRow {
+pub struct UserScanRef<'a> {
     pub id: Uuid,
-    pub name: String,
-    pub email: String,
+    pub name: &'a str,
+    pub email: &'a str,
     pub created_at: Timestamp,
 }
 ///Storage for User model
@@ -282,19 +324,12 @@ impl UserStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(email_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(email_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.email_index)
@@ -303,7 +338,7 @@ impl UserStorage {
                     .insert(__id);
             }
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -356,13 +391,19 @@ impl UserStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -385,23 +426,29 @@ impl UserStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -439,26 +486,35 @@ impl UserStorage {
     /// existence is checked by `Database::create_<model>`, which has the
     /// sibling-collection access this storage-scoped method lacks.)
     pub fn insert(&mut self, record: User) -> Result<Uuid, ValidationError> {
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
                 return Err(ValidationError::Unique {
+                    model: "User",
                     field: "email",
                 });
             }
@@ -493,19 +549,12 @@ impl UserStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.email_index)
@@ -550,27 +599,36 @@ impl UserStorage {
         if !self.id_to_row.contains_key(&id) {
             return Ok(false);
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.email_index.get(&__uk) {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     });
                 }
@@ -607,19 +665,12 @@ impl UserStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -635,19 +686,12 @@ impl UserStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.email_index)
@@ -734,19 +778,12 @@ impl UserStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -1036,19 +1073,12 @@ impl UserStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(email_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(email_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.email_index)
@@ -1076,19 +1106,12 @@ impl UserStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.email)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.email);
+                            let mut __k = String::with_capacity(1 + __v.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -1112,19 +1135,12 @@ impl UserStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.email)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.email);
+                                let mut __k = String::with_capacity(1 + __v.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.email_index)
@@ -1379,19 +1395,12 @@ impl UserStorage {
     ///Index probe for `User`.`email` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_email(&self, value: &str) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1407,19 +1416,12 @@ impl UserStorage {
         value: &str,
     ) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1430,19 +1432,12 @@ impl UserStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1455,19 +1450,12 @@ impl UserStorage {
     ///Unique index probe for `User`.`email` (#90): the at-most-one live match.
     pub fn get_by_email(&self, value: &str) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = self.email_index.get(&__k)?;
@@ -1480,19 +1468,12 @@ impl UserStorage {
         value: &str,
     ) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1502,19 +1483,12 @@ impl UserStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1571,49 +1545,40 @@ impl UserStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.created_at_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&UserScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<UserScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         };
-        let name_value = self
-            .name_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let email_value = self
-            .email_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let created_at_value = Timestamp::from(
-            self
-                .created_at_col
-                .read_timestamp(row_index)
-                .expect("Failed to read from column"),
-        );
-        Some(UserScanRow {
-            id: id_value,
-            name: name_value,
-            email: email_value,
-            created_at: created_at_value,
-        })
-    }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<UserScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __UserScanBufs {
@@ -1640,7 +1605,7 @@ impl UserStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<UserScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -1651,11 +1616,11 @@ impl UserStorage {
             };
             let name_value = __bufs
                 .name_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let email_value = __bufs
                 .email_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let created_at_value = Timestamp::from(
                 __bufs
@@ -1663,45 +1628,40 @@ impl UserStorage {
                     .read_timestamp(__slot)
                     .expect("Failed to read from column"),
             );
-            rows.push(UserScanRow {
+            let __row_ref = UserScanRef {
                 id: id_value,
                 name: name_value,
                 email: email_value,
                 created_at: created_at_value,
-            });
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
         }
-        rows
+        f(&mut __refs)
     }
-    /// #160 (C): resolve list candidates for this indexed field from the
-    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-    /// param did not parse; the caller falls back to `__scan_all`.
-    pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>> {
+    /// #160 (C): resolve list candidate ROWS for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  Feed the result
+    /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+    /// the caller falls back to a full scan, so a match is never missed.
+    pub fn __rows_by_email(&self, value: &str) -> Option<Vec<usize>> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
             Some(__s) => __s,
             None => return Some(Vec::new()),
         };
-        let mut __out = Vec::new();
+        let mut __out = Vec::with_capacity(__ids.len());
         for &__id in __ids {
             if let Some(&__row) = self.id_to_row.get(&__id) {
-                if let Some(__r) = self.__scan_row_at(__row) {
-                    __out.push(__r);
-                }
+                __out.push(__row);
             }
         }
         Some(__out)
@@ -1827,19 +1787,12 @@ impl UserStorageReader {
         value: &str,
     ) -> Vec<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1850,19 +1803,12 @@ impl UserStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1879,19 +1825,12 @@ impl UserStorageReader {
         value: &str,
     ) -> Option<User> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.email_index.get(&__k) {
@@ -1901,19 +1840,12 @@ impl UserStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.email)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.email);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -1933,6 +1865,7 @@ fn validate_user(record: &User) -> Result<(), ValidationError> {
         let __len = __v.chars().count();
         if __len < 1i64 as usize || __len > 100i64 as usize {
             return Err(ValidationError::Constraint {
+                model: "User",
                 field: "name",
                 rule: "length",
                 message: "length must be between 1 and 100".to_string(),
@@ -1947,6 +1880,7 @@ fn validate_user(record: &User) -> Result<(), ValidationError> {
             && !__parts[1].ends_with('.') && !__v.chars().any(|__c| __c.is_whitespace());
         if !__ok {
             return Err(ValidationError::Constraint {
+                model: "User",
                 field: "email",
                 rule: "email",
                 message: "must be a valid email address".to_string(),
@@ -1965,7 +1899,7 @@ pub struct Post {
     pub views: u64,
     pub published: bool,
     pub author: Uuid,
-    #[schema(value_type = i64)]
+    #[schema(value_type = String)]
     #[serde(default = "__forgedb_default_ts")]
     pub created_at: Timestamp,
     pub tags: (),
@@ -1977,11 +1911,11 @@ pub struct PostAgg {
     pub views: u64,
     pub published: bool,
 }
-///Internal narrow scan record for `Post` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+///Borrowed narrow scan view for `Post` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
-pub struct PostScanRow {
+pub struct PostScanRef<'a> {
     pub id: Uuid,
-    pub title: String,
+    pub title: &'a str,
     pub views: u64,
     pub published: bool,
     pub created_at: Timestamp,
@@ -2116,19 +2050,12 @@ impl PostStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(views_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(views_value);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.views_index)
@@ -2138,19 +2065,14 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(author_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(author_value);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.author_index)
@@ -2165,7 +2087,7 @@ impl PostStorage {
                     .insert(__id);
             }
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -2221,13 +2143,19 @@ impl PostStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -2257,23 +2185,29 @@ impl PostStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -2311,6 +2245,21 @@ impl PostStorage {
     /// existence is checked by `Database::create_<model>`, which has the
     /// sibling-collection access this storage-scoped method lacks.)
     pub fn insert(&mut self, record: Post) -> Result<Uuid, ValidationError> {
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_post(&record)?;
         let row_index = self.row_count;
         let id = record.id;
@@ -2348,19 +2297,12 @@ impl PostStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.views)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.views);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.views_index)
@@ -2370,19 +2312,14 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.author_index)
@@ -2433,6 +2370,21 @@ impl PostStorage {
         if !self.id_to_row.contains_key(&id) {
             return Ok(false);
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_post(&record)?;
         let __old = self.get(id);
         let row_index = self.row_count;
@@ -2471,19 +2423,12 @@ impl PostStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.views)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.views);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -2498,19 +2443,14 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -2538,19 +2478,12 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.views)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.views);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.views_index)
@@ -2560,19 +2493,14 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.author_index)
@@ -2671,19 +2599,12 @@ impl PostStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.views)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.views);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -2698,19 +2619,14 @@ impl PostStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.author)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.author);
+                    let mut __buf = [0u8; 36];
+                    let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                    let mut __k = String::with_capacity(1 + __s.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__s);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -3050,19 +2966,12 @@ impl PostStorage {
             };
             {
                 let __k: String = {
-                    match serde_json::to_value(&(views_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(views_value);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.views_index)
@@ -3072,19 +2981,14 @@ impl PostStorage {
             }
             {
                 let __k: String = {
-                    match serde_json::to_value(&(author_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(author_value);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.author_index)
@@ -3118,19 +3022,12 @@ impl PostStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.views)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.views);
+                            use std::fmt::Write as _;
+                            let mut __k = String::from('\u{2}');
+                            let _ = write!(__k, "{}", __v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -3145,19 +3042,14 @@ impl PostStorage {
                 }
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.author)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.author);
+                            let mut __buf = [0u8; 36];
+                            let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                            let mut __k = String::with_capacity(1 + __s.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__s);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -3193,19 +3085,12 @@ impl PostStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.views)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.views);
+                                use std::fmt::Write as _;
+                                let mut __k = String::from('\u{2}');
+                                let _ = write!(__k, "{}", __v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.views_index)
@@ -3215,19 +3100,14 @@ impl PostStorage {
                     }
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.author)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.author);
+                                let mut __buf = [0u8; 36];
+                                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                                let mut __k = String::with_capacity(1 + __s.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__s);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.author_index)
@@ -3517,19 +3397,12 @@ impl PostStorage {
     ///Index probe for `Post`.`views` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_views(&self, value: u64) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.views_index.get(&__k) {
@@ -3545,19 +3418,12 @@ impl PostStorage {
         value: u64,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.views_index.get(&__k) {
@@ -3568,19 +3434,12 @@ impl PostStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.views)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.views);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -3593,19 +3452,14 @@ impl PostStorage {
     ///Index probe for `Post`.`author` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_author(&self, value: Uuid) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -3621,19 +3475,14 @@ impl PostStorage {
         value: Uuid,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -3644,19 +3493,14 @@ impl PostStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -3922,54 +3766,40 @@ impl PostStorage {
         }
         records
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<PostScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&PostScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<PostScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         };
-        let title_value = self
-            .title_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let views_value = self
-            .views_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let published_value = self
-            .published_col
-            .read_bool(row_index)
-            .expect("Failed to read from column");
-        let created_at_value = Timestamp::from(
-            self
-                .created_at_col
-                .read_timestamp(row_index)
-                .expect("Failed to read from column"),
-        );
-        Some(PostScanRow {
-            id: id_value,
-            title: title_value,
-            views: views_value,
-            published: published_value,
-            created_at: created_at_value,
-        })
-    }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<PostScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __PostScanBufs {
@@ -4001,7 +3831,7 @@ impl PostStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<PostScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -4012,7 +3842,7 @@ impl PostStorage {
             };
             let title_value = __bufs
                 .title_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let views_value = __bufs
                 .views_col
@@ -4028,47 +3858,42 @@ impl PostStorage {
                     .read_timestamp(__slot)
                     .expect("Failed to read from column"),
             );
-            rows.push(PostScanRow {
+            let __row_ref = PostScanRef {
                 id: id_value,
                 title: title_value,
                 views: views_value,
                 published: published_value,
                 created_at: created_at_value,
-            });
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
         }
-        rows
+        f(&mut __refs)
     }
-    /// #160 (C): resolve list candidates for this indexed field from the
-    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-    /// param did not parse; the caller falls back to `__scan_all`.
-    pub fn __scan_by_views(&self, value: &str) -> Option<Vec<PostScanRow>> {
+    /// #160 (C): resolve list candidate ROWS for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  Feed the result
+    /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+    /// the caller falls back to a full scan, so a match is never missed.
+    pub fn __rows_by_views(&self, value: &str) -> Option<Vec<usize>> {
         let __typed = value.parse::<u64>().ok()?;
         let __k: String = {
-            match serde_json::to_value(&(__typed)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(__typed);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.views_index.get(&__k) {
             Some(__s) => __s,
             None => return Some(Vec::new()),
         };
-        let mut __out = Vec::new();
+        let mut __out = Vec::with_capacity(__ids.len());
         for &__id in __ids {
             if let Some(&__row) = self.id_to_row.get(&__id) {
-                if let Some(__r) = self.__scan_row_at(__row) {
-                    __out.push(__r);
-                }
+                __out.push(__row);
             }
         }
         Some(__out)
@@ -4218,19 +4043,12 @@ impl PostStorageReader {
         value: u64,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.views_index.get(&__k) {
@@ -4241,19 +4059,12 @@ impl PostStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.views)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.views);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -4270,19 +4081,14 @@ impl PostStorageReader {
         value: Uuid,
     ) -> Vec<Post> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __buf = [0u8; 36];
+                let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                let mut __k = String::with_capacity(1 + __s.len());
+                __k.push('\u{1}');
+                __k.push_str(__s);
+                __k
             }
         };
         let __ids = match self.author_index.get(&__k) {
@@ -4293,19 +4099,14 @@ impl PostStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.author)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.author);
+                        let mut __buf = [0u8; 36];
+                        let __s: &str = __v.hyphenated().encode_lower(&mut __buf);
+                        let mut __k = String::with_capacity(1 + __s.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__s);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -4325,6 +4126,7 @@ fn validate_post(record: &Post) -> Result<(), ValidationError> {
         let __len = __v.chars().count();
         if __len < 1i64 as usize || __len > 200i64 as usize {
             return Err(ValidationError::Constraint {
+                model: "Post",
                 field: "title",
                 rule: "length",
                 message: "length must be between 1 and 200".to_string(),
@@ -4342,11 +4144,11 @@ pub struct Tag {
     pub name: String,
     pub posts: (),
 }
-///Internal narrow scan record for `Tag` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+///Borrowed narrow scan view for `Tag` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
-pub struct TagScanRow {
+pub struct TagScanRef<'a> {
     pub id: Uuid,
-    pub name: String,
+    pub name: &'a str,
 }
 ///Storage for Tag model
 pub struct TagStorage {
@@ -4446,19 +4248,12 @@ impl TagStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(name_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(name_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.name_index)
@@ -4467,7 +4262,7 @@ impl TagStorage {
                     .insert(__id);
             }
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -4508,13 +4303,19 @@ impl TagStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -4529,23 +4330,29 @@ impl TagStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -4586,23 +4393,17 @@ impl TagStorage {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.name_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
                 return Err(ValidationError::Unique {
+                    model: "Tag",
                     field: "name",
                 });
             }
@@ -4633,19 +4434,12 @@ impl TagStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.name_index)
@@ -4693,24 +4487,18 @@ impl TagStorage {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.name_index.get(&__uk) {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     });
                 }
@@ -4743,19 +4531,12 @@ impl TagStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.name)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.name);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -4771,19 +4552,12 @@ impl TagStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.name_index)
@@ -4866,19 +4640,12 @@ impl TagStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -5140,19 +4907,12 @@ impl TagStorage {
                 .expect("Failed to read string");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(name_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(name_value);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.name_index)
@@ -5180,19 +4940,12 @@ impl TagStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.name)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.name);
+                            let mut __k = String::with_capacity(1 + __v.len());
+                            __k.push('\u{1}');
+                            __k.push_str(__v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -5216,19 +4969,12 @@ impl TagStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.name)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.name);
+                                let mut __k = String::with_capacity(1 + __v.len());
+                                __k.push('\u{1}');
+                                __k.push_str(__v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.name_index)
@@ -5457,19 +5203,12 @@ impl TagStorage {
     ///Index probe for `Tag`.`name` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_name(&self, value: &str) -> Vec<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
@@ -5485,19 +5224,12 @@ impl TagStorage {
         value: &str,
     ) -> Vec<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
@@ -5508,19 +5240,12 @@ impl TagStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.name)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.name);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -5533,19 +5258,12 @@ impl TagStorage {
     ///Unique index probe for `Tag`.`name` (#90): the at-most-one live match.
     pub fn get_by_name(&self, value: &str) -> Option<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = self.name_index.get(&__k)?;
@@ -5558,19 +5276,12 @@ impl TagStorage {
         value: &str,
     ) -> Option<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
@@ -5580,19 +5291,12 @@ impl TagStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.name)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.name);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -5635,37 +5339,40 @@ impl TagStorage {
     ) -> std::io::Result<forgedb_storage::ColumnExport> {
         self.id_col.export(indices)
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<TagScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&TagScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<TagScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         };
-        let name_value = self
-            .name_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        Some(TagScanRow {
-            id: id_value,
-            name: name_value,
-        })
-    }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<TagScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __TagScanBufs {
@@ -5682,7 +5389,7 @@ impl TagStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<TagScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -5693,45 +5400,40 @@ impl TagStorage {
             };
             let name_value = __bufs
                 .name_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
-            rows.push(TagScanRow {
+            let __row_ref = TagScanRef {
                 id: id_value,
                 name: name_value,
-            });
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
         }
-        rows
+        f(&mut __refs)
     }
-    /// #160 (C): resolve list candidates for this indexed field from the
-    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-    /// param did not parse; the caller falls back to `__scan_all`.
-    pub fn __scan_by_name(&self, value: &str) -> Option<Vec<TagScanRow>> {
+    /// #160 (C): resolve list candidate ROWS for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  Feed the result
+    /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+    /// the caller falls back to a full scan, so a match is never missed.
+    pub fn __rows_by_name(&self, value: &str) -> Option<Vec<usize>> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
             Some(__s) => __s,
             None => return Some(Vec::new()),
         };
-        let mut __out = Vec::new();
+        let mut __out = Vec::with_capacity(__ids.len());
         for &__id in __ids {
             if let Some(&__row) = self.id_to_row.get(&__id) {
-                if let Some(__r) = self.__scan_row_at(__row) {
-                    __out.push(__r);
-                }
+                __out.push(__row);
             }
         }
         Some(__out)
@@ -5838,19 +5540,12 @@ impl TagStorageReader {
         value: &str,
     ) -> Vec<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
@@ -5861,19 +5556,12 @@ impl TagStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.name)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.name);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -5890,19 +5578,12 @@ impl TagStorageReader {
         value: &str,
     ) -> Option<Tag> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                let mut __k = String::with_capacity(1 + __v.len());
+                __k.push('\u{1}');
+                __k.push_str(__v);
+                __k
             }
         };
         let __ids = match self.name_index.get(&__k) {
@@ -5912,19 +5593,12 @@ impl TagStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.name)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.name);
+                        let mut __k = String::with_capacity(1 + __v.len());
+                        __k.push('\u{1}');
+                        __k.push_str(__v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -5944,6 +5618,7 @@ fn validate_tag(record: &Tag) -> Result<(), ValidationError> {
         let __len = __v.chars().count();
         if __len < 1i64 as usize || __len > 50i64 as usize {
             return Err(ValidationError::Constraint {
+                model: "Tag",
                 field: "name",
                 rule: "length",
                 message: "length must be between 1 and 50".to_string(),
@@ -5958,7 +5633,7 @@ fn validate_tag(record: &Tag) -> Result<(), ValidationError> {
 pub struct Metric {
     #[serde(default)]
     pub id: Uuid,
-    #[schema(value_type = i64)]
+    #[schema(value_type = String)]
     #[serde(default = "__forgedb_default_ts")]
     pub recorded_at: Timestamp,
     pub device_id: u64,
@@ -5989,9 +5664,9 @@ pub struct MetricHot {
     pub cpu_pct: f64,
     pub mem_pct: f64,
 }
-///Internal narrow scan record for `Metric` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+///Borrowed narrow scan view for `Metric` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
-pub struct MetricScanRow {
+pub struct MetricScanRef<'a> {
     pub id: Uuid,
     pub recorded_at: Timestamp,
     pub device_id: u64,
@@ -6014,6 +5689,9 @@ pub struct MetricScanRow {
     pub temp_celsius: f64,
     pub throttled: bool,
     pub healthy: bool,
+    /// #250: anchors `'a` for a view whose every field is fixed-size.
+    /// Zero-sized — the struct's layout is unchanged.
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
 ///Storage for Metric model
 pub struct MetricStorage {
@@ -6212,19 +5890,12 @@ impl MetricStorage {
                 .expect("Failed to read from column");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(device_id_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(device_id_value);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut db.device_id_index)
@@ -6239,7 +5910,7 @@ impl MetricStorage {
                     .insert(__id);
             }
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -6356,13 +6027,19 @@ impl MetricStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -6450,23 +6127,29 @@ impl MetricStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -6504,6 +6187,21 @@ impl MetricStorage {
     /// existence is checked by `Database::create_<model>`, which has the
     /// sibling-collection access this storage-scoped method lacks.)
     pub fn insert(&mut self, record: Metric) -> Result<Uuid, ValidationError> {
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
+        }
         validate_metric(&record)?;
         let row_index = self.row_count;
         let id = record.id;
@@ -6587,19 +6285,12 @@ impl MetricStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.device_id)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.device_id);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.device_id_index)
@@ -6649,6 +6340,21 @@ impl MetricStorage {
     pub fn update(&mut self, id: Uuid, record: Metric) -> Result<bool, ValidationError> {
         if !self.id_to_row.contains_key(&id) {
             return Ok(false);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
         }
         validate_metric(&record)?;
         let __old = self.get(id);
@@ -6734,19 +6440,12 @@ impl MetricStorage {
         if let Some(__old_rec) = &__old {
             {
                 let __k: String = {
-                    match serde_json::to_value(&(__old_rec.device_id)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__old_rec.device_id);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 let mut __empty = false;
@@ -6774,19 +6473,12 @@ impl MetricStorage {
         }
         {
             let __k: String = {
-                match serde_json::to_value(&(record.device_id)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.device_id);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             std::sync::Arc::make_mut(&mut self.device_id_index)
@@ -6931,19 +6623,12 @@ impl MetricStorage {
         self.row_count += 1;
         {
             let __k: String = {
-                match serde_json::to_value(&(record.device_id)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.device_id);
+                    use std::fmt::Write as _;
+                    let mut __k = String::from('\u{2}');
+                    let _ = write!(__k, "{}", __v);
+                    __k
                 }
             };
             let mut __empty = false;
@@ -7483,19 +7168,12 @@ impl MetricStorage {
                 .expect("Failed to read from column");
             {
                 let __k: String = {
-                    match serde_json::to_value(&(device_id_value)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(device_id_value);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 std::sync::Arc::make_mut(&mut self.device_id_index)
@@ -7529,19 +7207,12 @@ impl MetricStorage {
             if let Some(__old_rec) = self.get(id) {
                 {
                     let __k: String = {
-                        match serde_json::to_value(&(__old_rec.device_id)) {
-                            Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                            Ok(serde_json::Value::String(__s)) => {
-                                let mut __k = String::from('\u{1}');
-                                __k.push_str(&__s);
-                                __k
-                            }
-                            Ok(__other) => {
-                                let mut __k = String::from('\u{2}');
-                                __k.push_str(&__other.to_string());
-                                __k
-                            }
-                            Err(_) => String::from('\u{3}'),
+                        {
+                            let __v = &(__old_rec.device_id);
+                            use std::fmt::Write as _;
+                            let mut __k = String::from('\u{2}');
+                            let _ = write!(__k, "{}", __v);
+                            __k
                         }
                     };
                     let mut __empty = false;
@@ -7577,19 +7248,12 @@ impl MetricStorage {
                 if let Some(__new_rec) = self.read_at(__r) {
                     {
                         let __k: String = {
-                            match serde_json::to_value(&(__new_rec.device_id)) {
-                                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                                Ok(serde_json::Value::String(__s)) => {
-                                    let mut __k = String::from('\u{1}');
-                                    __k.push_str(&__s);
-                                    __k
-                                }
-                                Ok(__other) => {
-                                    let mut __k = String::from('\u{2}');
-                                    __k.push_str(&__other.to_string());
-                                    __k
-                                }
-                                Err(_) => String::from('\u{3}'),
+                            {
+                                let __v = &(__new_rec.device_id);
+                                use std::fmt::Write as _;
+                                let mut __k = String::from('\u{2}');
+                                let _ = write!(__k, "{}", __v);
+                                __k
                             }
                         };
                         std::sync::Arc::make_mut(&mut self.device_id_index)
@@ -8081,19 +7745,12 @@ impl MetricStorage {
     ///Index probe for `Metric`.`device_id` (#90): every live match for the argument(s). O(1) candidate lookup + newest-version resolution, not a scan.
     pub fn find_by_device_id(&self, value: u64) -> Vec<Metric> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.device_id_index.get(&__k) {
@@ -8109,19 +7766,12 @@ impl MetricStorage {
         value: u64,
     ) -> Vec<Metric> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.device_id_index.get(&__k) {
@@ -8132,19 +7782,12 @@ impl MetricStorage {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.device_id)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.device_id);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -8634,139 +8277,40 @@ impl MetricStorage {
         }
         records
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<MetricScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&MetricScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<MetricScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         };
-        let recorded_at_value = Timestamp::from(
-            self
-                .recorded_at_col
-                .read_timestamp(row_index)
-                .expect("Failed to read from column"),
-        );
-        let device_id_value = self
-            .device_id_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let sample_seq_value = self
-            .sample_seq_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let region_value = self
-            .region_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let cpu_pct_value = self
-            .cpu_pct_col
-            .read_f64(row_index)
-            .expect("Failed to read from column");
-        let mem_pct_value = self
-            .mem_pct_col
-            .read_f64(row_index)
-            .expect("Failed to read from column");
-        let disk_pct_value = self
-            .disk_pct_col
-            .read_f64(row_index)
-            .expect("Failed to read from column");
-        let net_rx_bytes_value = self
-            .net_rx_bytes_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let net_tx_bytes_value = self
-            .net_tx_bytes_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let req_count_value = self
-            .req_count_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let err_count_value = self
-            .err_count_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let p50_micros_value = self
-            .p50_micros_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let p95_micros_value = self
-            .p95_micros_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let p99_micros_value = self
-            .p99_micros_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let queue_depth_value = self
-            .queue_depth_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let open_conns_value = self
-            .open_conns_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let gc_pause_micros_value = self
-            .gc_pause_micros_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let uptime_secs_value = self
-            .uptime_secs_col
-            .read_i64(row_index)
-            .expect("Failed to read from column");
-        let temp_celsius_value = self
-            .temp_celsius_col
-            .read_f64(row_index)
-            .expect("Failed to read from column");
-        let throttled_value = self
-            .throttled_col
-            .read_bool(row_index)
-            .expect("Failed to read from column");
-        let healthy_value = self
-            .healthy_col
-            .read_bool(row_index)
-            .expect("Failed to read from column");
-        Some(MetricScanRow {
-            id: id_value,
-            recorded_at: recorded_at_value,
-            device_id: device_id_value,
-            sample_seq: sample_seq_value,
-            region: region_value,
-            cpu_pct: cpu_pct_value,
-            mem_pct: mem_pct_value,
-            disk_pct: disk_pct_value,
-            net_rx_bytes: net_rx_bytes_value,
-            net_tx_bytes: net_tx_bytes_value,
-            req_count: req_count_value,
-            err_count: err_count_value,
-            p50_micros: p50_micros_value,
-            p95_micros: p95_micros_value,
-            p99_micros: p99_micros_value,
-            queue_depth: queue_depth_value,
-            open_conns: open_conns_value,
-            gc_pause_micros: gc_pause_micros_value,
-            uptime_secs: uptime_secs_value,
-            temp_celsius: temp_celsius_value,
-            throttled: throttled_value,
-            healthy: healthy_value,
-        })
-    }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<MetricScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __MetricScanBufs {
@@ -8883,7 +8427,7 @@ impl MetricStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<MetricScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -8978,7 +8522,7 @@ impl MetricStorage {
                 .healthy_col
                 .read_bool(__slot)
                 .expect("Failed to read from column");
-            rows.push(MetricScanRow {
+            let __row_ref = MetricScanRef {
                 id: id_value,
                 recorded_at: recorded_at_value,
                 device_id: device_id_value,
@@ -9001,41 +8545,37 @@ impl MetricStorage {
                 temp_celsius: temp_celsius_value,
                 throttled: throttled_value,
                 healthy: healthy_value,
-            });
+                __borrow: ::std::marker::PhantomData,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
         }
-        rows
+        f(&mut __refs)
     }
-    /// #160 (C): resolve list candidates for this indexed field from the
-    /// secondary index (O(matches)) rather than a full scan.  `None` ⇒ the
-    /// param did not parse; the caller falls back to `__scan_all`.
-    pub fn __scan_by_device_id(&self, value: &str) -> Option<Vec<MetricScanRow>> {
+    /// #160 (C): resolve list candidate ROWS for this indexed field from the
+    /// secondary index (O(matches)) rather than a full scan.  Feed the result
+    /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
+    /// the caller falls back to a full scan, so a match is never missed.
+    pub fn __rows_by_device_id(&self, value: &str) -> Option<Vec<usize>> {
         let __typed = value.parse::<u64>().ok()?;
         let __k: String = {
-            match serde_json::to_value(&(__typed)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(__typed);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.device_id_index.get(&__k) {
             Some(__s) => __s,
             None => return Some(Vec::new()),
         };
-        let mut __out = Vec::new();
+        let mut __out = Vec::with_capacity(__ids.len());
         for &__id in __ids {
             if let Some(&__row) = self.id_to_row.get(&__id) {
-                if let Some(__r) = self.__scan_row_at(__row) {
-                    __out.push(__r);
-                }
+                __out.push(__row);
             }
         }
         Some(__out)
@@ -9343,19 +8883,12 @@ impl MetricStorageReader {
         value: u64,
     ) -> Vec<Metric> {
         let __k: String = {
-            match serde_json::to_value(&(value)) {
-                Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                Ok(serde_json::Value::String(__s)) => {
-                    let mut __k = String::from('\u{1}');
-                    __k.push_str(&__s);
-                    __k
-                }
-                Ok(__other) => {
-                    let mut __k = String::from('\u{2}');
-                    __k.push_str(&__other.to_string());
-                    __k
-                }
-                Err(_) => String::from('\u{3}'),
+            {
+                let __v = &(value);
+                use std::fmt::Write as _;
+                let mut __k = String::from('\u{2}');
+                let _ = write!(__k, "{}", __v);
+                __k
             }
         };
         let __ids = match self.device_id_index.get(&__k) {
@@ -9366,19 +8899,12 @@ impl MetricStorageReader {
         for &__id in __ids {
             if let Some(__rec) = self.get_at(snap, __id) {
                 let __rk: String = {
-                    match serde_json::to_value(&(__rec.device_id)) {
-                        Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                        Ok(serde_json::Value::String(__s)) => {
-                            let mut __k = String::from('\u{1}');
-                            __k.push_str(&__s);
-                            __k
-                        }
-                        Ok(__other) => {
-                            let mut __k = String::from('\u{2}');
-                            __k.push_str(&__other.to_string());
-                            __k
-                        }
-                        Err(_) => String::from('\u{3}'),
+                    {
+                        let __v = &(__rec.device_id);
+                        use std::fmt::Write as _;
+                        let mut __k = String::from('\u{2}');
+                        let _ = write!(__k, "{}", __v);
+                        __k
                     }
                 };
                 if __rk == __k {
@@ -9415,16 +8941,16 @@ pub struct DocMeta {
     pub seq: u64,
     pub kind: u32,
 }
-///Internal narrow scan record for `Doc` (#160): id + filterable/sortable columns, used to filter + sort the list endpoint without decoding every column of every row.  Not a wire type.
+///Borrowed narrow scan view for `Doc` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
-pub struct DocScanRow {
+pub struct DocScanRef<'a> {
     pub id: Uuid,
     pub seq: u64,
     pub kind: u32,
-    pub body_a: String,
-    pub body_b: String,
-    pub body_c: String,
-    pub body_d: String,
+    pub body_a: &'a str,
+    pub body_b: &'a str,
+    pub body_c: &'a str,
+    pub body_d: &'a str,
 }
 ///Storage for Doc model
 pub struct DocStorage {
@@ -9529,7 +9055,7 @@ impl DocStorage {
             std::sync::Arc::make_mut(&mut db.id_to_row).insert(id, i);
             std::sync::Arc::make_mut(&mut db.id_versions).entry(id).or_default().push(i);
         }
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Reopen the column handles + recover `row_count`, WITHOUT the
@@ -9588,13 +9114,19 @@ impl DocStorage {
             broker: None,
         };
         db.recover_from_wal();
-        db.write_manifest(root);
+        let _ = db.write_manifest(root);
         db
     }
     /// Write the physical-layout manifest for this model (#57).  Layout
     /// metadata only — schema-blind backup/inspector read it; it carries
     /// no `.forge` semantics.  Written at open, off the insert hot path.
-    fn write_manifest(&self, root: &std::path::Path) {
+    ///
+    /// Returns the write result rather than swallowing it (#187): for a
+    /// model with an integer auto this file is no longer advisory — it
+    /// carries the allocation floor, and the pre-compaction caller must be
+    /// able to refuse the destructive rewrite when it cannot be persisted.
+    /// Callers for whom it *is* advisory discard the result explicitly.
+    fn write_manifest(&self, root: &std::path::Path) -> std::io::Result<()> {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "id".to_string(), column_type :
             forgedb_storage::ColumnType::Uuid, column_index : 0usize, value_size :
@@ -9628,23 +9160,29 @@ impl DocStorage {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
+        let __persisted_seqs = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.auto_sequences)
+            .unwrap_or_default();
+        #[allow(unused_mut)]
+        let mut __auto_sequences = __persisted_seqs;
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "tombstones.bin".to_string(),
                 bytes_per_row: 1usize,
             }),
+            auto_sequences: __auto_sequences,
         };
-        let _ = manifest.save_to(&__manifest_abs);
+        manifest.save_to(&__manifest_abs)
     }
     /// Bump this model's `compaction_epoch` (#76): compaction renumbers
     /// rows, breaking the append-only byte-tail chain incremental backups
@@ -10640,62 +10178,40 @@ impl DocStorage {
         }
         records
     }
-    /// Narrow-decode the scan columns at a physical row (#160).  Used by the
-    /// index-pushdown path (`__scan_by_*`), which resolves a handful of
-    /// candidate rows and reads them individually.
-    fn __scan_row_at(&self, row_index: usize) -> Option<DocScanRow> {
-        if self.tombstones.is_deleted(row_index).unwrap_or(true) {
-            return None;
-        }
-        let id_value = {
-            let bytes = self
-                .id_col
-                .read_uuid(row_index)
-                .expect("Failed to read from column");
-            Uuid::from_bytes(bytes)
+    /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
+    /// endpoint's and live query's single scan entry point.
+    ///
+    /// `sel` picks the rows: `None` scans every live row; `Some(rows)` is an
+    /// index-pushdown candidate set from `__rows_by_*`.  Each scan column is
+    /// bulk-loaded once (`gather_buffered`), each selected row is decoded
+    /// into a borrowed view whose `string` fields point straight at that
+    /// buffer, and `keep` runs on it — so a row the filter rejects never
+    /// allocates.  Survivors are collected as borrowed views and handed to
+    /// `f`, which runs while the buffers are still alive.
+    ///
+    /// Only `f`'s return value escapes the scope, and it cannot borrow from
+    /// the scan (the view's lifetime is higher-ranked).  Callers return
+    /// scalars — `(total, Vec<Id>)` for the list page — and re-read the page
+    /// through `get`, so only `limit` rows ever pay a full decode.
+    pub fn __with_scan<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&DocScanRef<'_>) -> bool,
+        f: impl FnOnce(&mut Vec<DocScanRef<'_>>) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         };
-        let seq_value = self
-            .seq_col
-            .read_u64(row_index)
-            .expect("Failed to read from column");
-        let kind_value = self
-            .kind_col
-            .read_u32(row_index)
-            .expect("Failed to read from column");
-        let body_a_value = self
-            .body_a_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let body_b_value = self
-            .body_b_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let body_c_value = self
-            .body_c_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        let body_d_value = self
-            .body_d_col
-            .read_string(row_index)
-            .expect("Failed to read string");
-        Some(DocScanRow {
-            id: id_value,
-            seq: seq_value,
-            kind: kind_value,
-            body_a: body_a_value,
-            body_b: body_b_value,
-            body_c: body_c_value,
-            body_d: body_d_value,
-        })
-    }
-    ///Narrow scan of every live row (#160/#168): the list endpoint's filter/sort source, decoding only the filterable/sortable columns.  The page is full-materialized separately, so only `limit` rows pay a full decode.  #168: iterates live rows in physical order and bulk-loads each column once (`gather_buffered`) instead of per-row positional reads.
-    pub fn __scan_all(&self) -> Vec<DocScanRow> {
-        let mut __rows: Vec<usize> = self.id_to_row.values().copied().collect();
-        __rows.sort_unstable();
-        let __rows = self
-            .tombstones
-            .live_indices(&__rows)
-            .expect("Failed to read tombstone liveness");
         let __n = __rows.len();
         #[allow(non_camel_case_types)]
         struct __DocScanBufs {
@@ -10737,7 +10253,7 @@ impl DocStorage {
                 .gather_buffered(&__rows)
                 .expect("Failed to bulk-load scan column"),
         };
-        let mut rows = Vec::with_capacity(__n);
+        let mut __refs: Vec<DocScanRef<'_>> = Vec::with_capacity(__n);
         for __slot in 0..__n {
             let id_value = {
                 let bytes = __bufs
@@ -10756,21 +10272,21 @@ impl DocStorage {
                 .expect("Failed to read from column");
             let body_a_value = __bufs
                 .body_a_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let body_b_value = __bufs
                 .body_b_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let body_c_value = __bufs
                 .body_c_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
             let body_d_value = __bufs
                 .body_d_col
-                .read_string(__slot)
+                .read_str(__slot)
                 .expect("Failed to read string");
-            rows.push(DocScanRow {
+            let __row_ref = DocScanRef {
                 id: id_value,
                 seq: seq_value,
                 kind: kind_value,
@@ -10778,9 +10294,12 @@ impl DocStorage {
                 body_b: body_b_value,
                 body_c: body_c_value,
                 body_d: body_d_value,
-            });
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
         }
-        rows
+        f(&mut __refs)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
@@ -11198,11 +10717,12 @@ impl PostTagLink {
     ) {
         self.broker = broker;
     }
-    /// Write the junction's physical-layout manifest (#57): two
-    /// 16-byte uuid columns and a row-count anchor on `right.bin`
-    /// (appended last per link, 16 bytes/row).  Layout only —
-    /// carries no relation semantics.  Best-effort; reopen anchors
-    /// on the file length regardless.
+    /// Write the junction's physical-layout manifest (#57): one
+    /// fixed column per endpoint, each the width of that endpoint's
+    /// own identity type (#266), and a row-count anchor on
+    /// `right.bin` (appended last per link).  Layout only — carries
+    /// no relation semantics.  Best-effort; reopen anchors on the
+    /// file length regardless.
     fn write_manifest(&self, root: &std::path::Path) {
         let columns = vec![
             forgedb_storage::ColumnMetadata { name : "left".to_string(), column_type :
@@ -11218,21 +10738,22 @@ impl PostTagLink {
         let __compaction_epoch = forgedb_storage::Manifest::load_from(&__manifest_abs)
             .map(|m| m.compaction_epoch)
             .unwrap_or(0);
-        let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
-            .map(|m| m.format_version)
-            .unwrap_or(EXPECTED_FORMAT_VERSION);
+        let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)
+            .map(|m| m.schema_version)
+            .unwrap_or(EXPECTED_SCHEMA_VERSION);
         let manifest = forgedb_storage::Manifest {
-            schema_version: 1,
             row_count: self.row_count,
             columns,
             wal_enabled: false,
             last_checkpoint: self.row_count as u64,
             compaction_epoch: __compaction_epoch,
-            format_version: __format_version,
+            schema_version: __schema_version,
+            engine_version: EXPECTED_ENGINE_VERSION,
             row_anchor: Some(forgedb_storage::RowAnchor {
                 relative_path: "fixed/right.bin".to_string(),
                 bytes_per_row: 16usize,
             }),
+            auto_sequences: Default::default(),
         };
         let _ = manifest.save_to(&__manifest_abs);
     }
@@ -11584,14 +11105,26 @@ impl Database {
         {
             let __mf = root.join("user/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11599,14 +11132,26 @@ impl Database {
         {
             let __mf = root.join("post/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11614,14 +11159,26 @@ impl Database {
         {
             let __mf = root.join("tag/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11629,14 +11186,26 @@ impl Database {
         {
             let __mf = root.join("metric/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11644,14 +11213,26 @@ impl Database {
         {
             let __mf = root.join("doc/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11659,14 +11240,26 @@ impl Database {
         {
             let __mf = root.join("post_tag_link/manifest.json");
             if let Ok(__m) = forgedb_storage::Manifest::load_from(&__mf) {
-                if __m.format_version != EXPECTED_FORMAT_VERSION {
+                if __m.schema_version != EXPECTED_SCHEMA_VERSION {
                     panic!(
-                        "ForgeDB: data dir at {} is on-disk format v{}, \
+                        "ForgeDB: data dir at {} is at schema version v{}, \
                                      but this binary expects v{} — the schema changed \
                                      since this dir was written.  Run the migration bin \
                                      to evolve the data (the app never migrates in \
                                      place); do NOT open stale data with mismatched code.",
-                        __mf.display(), __m.format_version, EXPECTED_FORMAT_VERSION,
+                        __mf.display(), __m.schema_version, EXPECTED_SCHEMA_VERSION,
+                    );
+                }
+                if __m.engine_version != EXPECTED_ENGINE_VERSION {
+                    panic!(
+                        "ForgeDB: data dir at {} was written by engine \
+                                     format generation {}, but this binary is \
+                                     generation {} — ForgeDB's on-disk format \
+                                     changed, your schema did not.  Run \
+                                     `forgedb migrate engine --src <dir> --dest <new-dir>` \
+                                     with the app STOPPED; do NOT open it with \
+                                     mismatched code.",
+                        __mf.display(), __m.engine_version, EXPECTED_ENGINE_VERSION,
                     );
                 }
             }
@@ -11874,12 +11467,17 @@ impl Database {
             "Doc" => self.doc.apply(ev.kind, &ev.bytes),
             "post_tag_link" => {
                 if ev.bytes.len() == 32 {
-                    let mut __l = [0u8; 16];
-                    __l.copy_from_slice(&ev.bytes[0..16]);
-                    let mut __r = [0u8; 16];
-                    __r.copy_from_slice(&ev.bytes[16..32]);
-                    self.post_tag_link
-                        .link(Uuid::from_bytes(__l), Uuid::from_bytes(__r));
+                    let __l = {
+                        let mut __b = [0u8; 16];
+                        __b.copy_from_slice(&ev.bytes[0..16]);
+                        Uuid::from_bytes(__b)
+                    };
+                    let __r = {
+                        let mut __b = [0u8; 16];
+                        __b.copy_from_slice(&ev.bytes[16..32]);
+                        Uuid::from_bytes(__b)
+                    };
+                    self.post_tag_link.link(__l, __r);
                 }
                 Ok(())
             }
@@ -12045,8 +11643,8 @@ impl Database {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
         }
         self.user.insert(record)
     }
@@ -12063,11 +11661,12 @@ impl Database {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
         }
         if self.user.get(record.author).is_none() {
             return Err(ValidationError::DanglingReference {
+                model: "Post",
                 field: "author",
                 target: "User",
             });
@@ -12082,6 +11681,7 @@ impl Database {
     ) -> Result<bool, ValidationError> {
         if self.user.get(record.author).is_none() {
             return Err(ValidationError::DanglingReference {
+                model: "Post",
                 field: "author",
                 target: "User",
             });
@@ -12111,8 +11711,8 @@ impl Database {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.recorded_at.as_seconds() == 0 {
-            record.recorded_at = Timestamp::now();
+        if record.recorded_at.as_micros() == 0 {
+            record.recorded_at = Timestamp::now().floor_to_micros(1000);
         }
         self.metric.insert(record)
     }
@@ -12286,13 +11886,22 @@ pub struct TxHandle<'db> {
     >,
     /// Unique keys claimed by staged writes in this transaction (M1a fix).
     ///
-    /// Each entry is `(field_name, encoded_key)`.  Checked ALONGSIDE the
-    /// committed index so that two `create_<model>` calls with the SAME
-    /// `&unique` value in one transaction both see the conflict — the
-    /// committed index only reflects rows visible before the txn started.
-    /// Rollback discards the set automatically (it is owned by `TxHandle`
-    /// and never touches the real index maps, so no undo is needed).
-    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    /// Each entry is `(model_name, field_name, encoded_key)`.  Checked
+    /// ALONGSIDE the committed index so that two `create_<model>` calls
+    /// with the SAME `&unique` value in one transaction both see the
+    /// conflict — the committed index only reflects rows visible before
+    /// the txn started.  Rollback discards the set automatically (it is
+    /// owned by `TxHandle` and never touches the real index maps, so no
+    /// undo is needed).
+    ///
+    /// The **model name is part of the key** (#257).  This set stands in
+    /// for the committed index, and that index is addressed per model
+    /// *and* per column (`db.<model>.<field_index>`); keying it by field
+    /// name alone put two unrelated models that merely share a field
+    /// name — `code`, `slug`, `sku` — into one uniqueness namespace, so
+    /// writing the same value to both in one transaction was rejected as
+    /// a duplicate.  The key must match what it is a pre-image of.
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, &'static str, String)>,
     /// Set once `commit` runs; the `Drop` backstop rolls back otherwise.
     committed: bool,
 }
@@ -12368,43 +11977,53 @@ impl<'db> TxHandle<'db> {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.db.user.email_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty())
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            if self.staged_unique_keys.contains(&("email", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("User", "email", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -12426,28 +12045,37 @@ impl<'db> TxHandle<'db> {
             return Ok(false);
         }
         self.__mark_user();
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.db.user.email_index.get(&__uk) {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "User",
                             field: "email",
                         }),
                     );
@@ -12460,15 +12088,16 @@ impl<'db> TxHandle<'db> {
                 .get(&__uk)
                 .is_some_and(|__ids| __ids.contains(&id));
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("email", __uk.clone()))
+                && self.staged_unique_keys.contains(&("User", "email", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -12519,13 +12148,29 @@ impl<'db> TxHandle<'db> {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_post(&record)?;
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -12551,10 +12196,26 @@ impl<'db> TxHandle<'db> {
             return Ok(false);
         }
         self.__mark_post();
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_post(&record)?;
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -12612,36 +12273,31 @@ impl<'db> TxHandle<'db> {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if self.db.tag.name_index.get(&__uk).is_some_and(|__ids| !__ids.is_empty()) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     }),
                 );
             }
-            if self.staged_unique_keys.contains(&("name", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("Tag", "name", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("name", __uk));
+            self.staged_unique_keys.insert(("Tag", "name", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -12666,25 +12322,19 @@ impl<'db> TxHandle<'db> {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             if let Some(__ids) = self.db.tag.name_index.get(&__uk) {
                 if __ids.iter().any(|__i| *__i != id) {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "Tag",
                             field: "name",
                         }),
                     );
@@ -12697,15 +12347,16 @@ impl<'db> TxHandle<'db> {
                 .get(&__uk)
                 .is_some_and(|__ids| __ids.contains(&id));
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("name", __uk.clone()))
+                && self.staged_unique_keys.contains(&("Tag", "name", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("name", __uk));
+            self.staged_unique_keys.insert(("Tag", "name", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -12756,8 +12407,23 @@ impl<'db> TxHandle<'db> {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.recorded_at.as_seconds() == 0 {
-            record.recorded_at = Timestamp::now();
+        if record.recorded_at.as_micros() == 0 {
+            record.recorded_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
         }
         validate_metric(&record)?;
         let id = record.id;
@@ -12780,6 +12446,21 @@ impl<'db> TxHandle<'db> {
             return Ok(false);
         }
         self.__mark_metric();
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
+        }
         validate_metric(&record)?;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -13071,16 +12752,18 @@ impl<'db> TxHandle<'db> {
     pub fn __write_set(&self, snapshot_lsn: forgedb_txn::Lsn) -> forgedb_txn::WriteSet {
         let mut keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
         for (__model, _kind, __id_bytes, _row, _bytes) in &self.pending_events {
-            let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-            k.extend_from_slice(__model.as_bytes());
-            k.extend_from_slice(__id_bytes);
-            keys.push(k.into_boxed_slice());
+            keys.push(
+                __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                    .into_boxed_slice(),
+            );
         }
-        for (__fname, __ekey) in &self.staged_unique_keys {
-            let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-            k.extend_from_slice(__fname.as_bytes());
-            k.extend_from_slice(__ekey.as_bytes());
-            keys.push(k.into_boxed_slice());
+        for (__mtag, __fname, __ekey) in &self.staged_unique_keys {
+            keys.push(
+                __forgedb_ws_key(
+                        &[b"u", __mtag.as_bytes(), __fname.as_bytes(), __ekey.as_bytes()],
+                    )
+                    .into_boxed_slice(),
+            );
         }
         forgedb_txn::WriteSet {
             keys,
@@ -13270,16 +12953,25 @@ impl SharedDatabase {
             };
             let mut __ws_keys: Vec<forgedb_txn::OpaqueKey> = Vec::new();
             for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                k.extend_from_slice(__model.as_bytes());
-                k.extend_from_slice(__id_bytes);
-                __ws_keys.push(k.into_boxed_slice());
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes])
+                            .into_boxed_slice(),
+                    );
             }
-            for (__fname, __ekey) in &__tx.staged_unique_keys {
-                let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                k.extend_from_slice(__fname.as_bytes());
-                k.extend_from_slice(__ekey.as_bytes());
-                __ws_keys.push(k.into_boxed_slice());
+            for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(
+                                &[
+                                    b"u",
+                                    __mtag.as_bytes(),
+                                    __fname.as_bytes(),
+                                    __ekey.as_bytes(),
+                                ],
+                            )
+                            .into_boxed_slice(),
+                    );
             }
             let __ws = forgedb_txn::WriteSet {
                 keys: __ws_keys,
@@ -13323,7 +13015,7 @@ pub struct ConcurrentTxHandle {
     /// Staged rows: (model_tag, kind, id_bytes, record_bytes, deleted).
     buffer: Vec<(&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>, bool)>,
     /// Claimed unique keys (field_name, encoded_key).
-    staged_unique_keys: std::collections::BTreeSet<(&'static str, String)>,
+    staged_unique_keys: std::collections::BTreeSet<(&'static str, &'static str, String)>,
     /// Pending events: (model_tag, kind, id_bytes, record_bytes).
     pending_events: Vec<
         (&'static str, forgedb_changefeed::ChangeKind, Vec<u8>, Vec<u8>),
@@ -13335,30 +13027,39 @@ impl ConcurrentTxHandle {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
-            if self.staged_unique_keys.contains(&("email", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("User", "email", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
@@ -13373,12 +13074,13 @@ impl ConcurrentTxHandle {
                 {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "User",
                             field: "email",
                         }),
                     );
                 }
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -13405,22 +13107,30 @@ impl ConcurrentTxHandle {
         if self.get_user(id).is_none() {
             return Ok(false);
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "User",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_user(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.email)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.email);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             {
@@ -13429,6 +13139,7 @@ impl ConcurrentTxHandle {
                     if __ids.iter().any(|__i| *__i != id) {
                         return Err(
                             TxError::Validation(ValidationError::Unique {
+                                model: "User",
                                 field: "email",
                             }),
                         );
@@ -13440,15 +13151,16 @@ impl ConcurrentTxHandle {
                 __db.user.email_index.get(&__uk).is_some_and(|__ids| __ids.contains(&id))
             };
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("email", __uk.clone()))
+                && self.staged_unique_keys.contains(&("User", "email", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "User",
                         field: "email",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("email", __uk));
+            self.staged_unique_keys.insert(("User", "email", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -13537,13 +13249,29 @@ impl ConcurrentTxHandle {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.created_at.as_seconds() == 0 {
-            record.created_at = Timestamp::now();
+        if record.created_at.as_micros() == 0 {
+            record.created_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
         }
         validate_post(&record)?;
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -13574,10 +13302,26 @@ impl ConcurrentTxHandle {
         if self.get_post(id).is_none() {
             return Ok(false);
         }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.created_at = record.created_at.floor_to_micros(1000);
+        if !record.created_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Post",
+                field: "created_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.created_at.as_micros(),
+                ),
+            })?;
+        }
         validate_post(&record)?;
         if self.get_user(record.author).is_none() {
             return Err(
                 TxError::Validation(ValidationError::DanglingReference {
+                    model: "Post",
                     field: "author",
                     target: "User",
                 }),
@@ -13673,24 +13417,18 @@ impl ConcurrentTxHandle {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
-            if self.staged_unique_keys.contains(&("name", __uk.clone())) {
+            if self.staged_unique_keys.contains(&("Tag", "name", __uk.clone())) {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     }),
                 );
@@ -13701,12 +13439,13 @@ impl ConcurrentTxHandle {
                 {
                     return Err(
                         TxError::Validation(ValidationError::Unique {
+                            model: "Tag",
                             field: "name",
                         }),
                     );
                 }
             }
-            self.staged_unique_keys.insert(("name", __uk));
+            self.staged_unique_keys.insert(("Tag", "name", __uk));
         }
         let id = record.id;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -13736,19 +13475,12 @@ impl ConcurrentTxHandle {
         validate_tag(&record)?;
         {
             let __uk: String = {
-                match serde_json::to_value(&(record.name)) {
-                    Ok(serde_json::Value::Null) => String::from('\u{0}'),
-                    Ok(serde_json::Value::String(__s)) => {
-                        let mut __k = String::from('\u{1}');
-                        __k.push_str(&__s);
-                        __k
-                    }
-                    Ok(__other) => {
-                        let mut __k = String::from('\u{2}');
-                        __k.push_str(&__other.to_string());
-                        __k
-                    }
-                    Err(_) => String::from('\u{3}'),
+                {
+                    let __v = &(record.name);
+                    let mut __k = String::with_capacity(1 + __v.len());
+                    __k.push('\u{1}');
+                    __k.push_str(__v);
+                    __k
                 }
             };
             {
@@ -13757,6 +13489,7 @@ impl ConcurrentTxHandle {
                     if __ids.iter().any(|__i| *__i != id) {
                         return Err(
                             TxError::Validation(ValidationError::Unique {
+                                model: "Tag",
                                 field: "name",
                             }),
                         );
@@ -13768,15 +13501,16 @@ impl ConcurrentTxHandle {
                 __db.tag.name_index.get(&__uk).is_some_and(|__ids| __ids.contains(&id))
             };
             if !__committed_owns
-                && self.staged_unique_keys.contains(&("name", __uk.clone()))
+                && self.staged_unique_keys.contains(&("Tag", "name", __uk.clone()))
             {
                 return Err(
                     TxError::Validation(ValidationError::Unique {
+                        model: "Tag",
                         field: "name",
                     }),
                 );
             }
-            self.staged_unique_keys.insert(("name", __uk));
+            self.staged_unique_keys.insert(("Tag", "name", __uk));
         }
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
         let __bytes = serde_json::to_vec(&record).unwrap_or_default();
@@ -13855,8 +13589,23 @@ impl ConcurrentTxHandle {
         if record.id.is_nil() {
             record.id = Uuid::new_v4();
         }
-        if record.recorded_at.as_seconds() == 0 {
-            record.recorded_at = Timestamp::now();
+        if record.recorded_at.as_micros() == 0 {
+            record.recorded_at = Timestamp::now().floor_to_micros(1000);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
         }
         validate_metric(&record)?;
         let id = record.id;
@@ -13883,6 +13632,21 @@ impl ConcurrentTxHandle {
     pub fn update_metric(&mut self, id: Uuid, record: Metric) -> Result<bool, TxError> {
         if self.get_metric(id).is_none() {
             return Ok(false);
+        }
+        #[allow(unused_mut)]
+        let mut record = record;
+        record.recorded_at = record.recorded_at.floor_to_micros(1000);
+        if !record.recorded_at.is_rfc3339_representable() {
+            Err(ValidationError::Constraint {
+                model: "Metric",
+                field: "recorded_at",
+                rule: "timestamp_range",
+                message: format!(
+                    "{} — got {} microseconds since the epoch",
+                    "must be an instant RFC 3339 can name (years 0000 through 9999); the value is storable but would fail to serialize on every read",
+                    record.recorded_at.as_micros(),
+                ),
+            })?;
         }
         validate_metric(&record)?;
         let __id_bytes = serde_json::to_vec(&id).unwrap_or_default();
@@ -14469,16 +14233,21 @@ impl CoordinatedDatabase {
             };
             let mut __ws_keys: Vec<Vec<u8>> = Vec::new();
             for (__model, _kind, __id_bytes, _bytes, _del) in &__tx.buffer {
-                let mut k = Vec::with_capacity(__model.len() + __id_bytes.len());
-                k.extend_from_slice(__model.as_bytes());
-                k.extend_from_slice(__id_bytes);
-                __ws_keys.push(k);
+                __ws_keys
+                    .push(__forgedb_ws_key(&[b"r", __model.as_bytes(), __id_bytes]));
             }
-            for (__fname, __ekey) in &__tx.staged_unique_keys {
-                let mut k = Vec::with_capacity(__fname.len() + __ekey.len());
-                k.extend_from_slice(__fname.as_bytes());
-                k.extend_from_slice(__ekey.as_bytes());
-                __ws_keys.push(k);
+            for (__mtag, __fname, __ekey) in &__tx.staged_unique_keys {
+                __ws_keys
+                    .push(
+                        __forgedb_ws_key(
+                            &[
+                                b"u",
+                                __mtag.as_bytes(),
+                                __fname.as_bytes(),
+                                __ekey.as_bytes(),
+                            ],
+                        ),
+                    );
             }
             let __turn = {
                 let mut __busy_retries = 0u32;
@@ -14506,6 +14275,7 @@ impl CoordinatedDatabase {
                             );
                         }
                         Err(e) => {
+                            let _ = __coord.reconnect();
                             let mut __seq = __seq_arc.lock().unwrap();
                             __seq.release_snapshot(__snap_lsn);
                             return Err(TxError::Io(e.to_string()));
@@ -14566,6 +14336,7 @@ impl CoordinatedDatabase {
                         }
                         Err(e) => {
                             eprintln!("coordinator: Committed ack error: {e}");
+                            let _ = __coord.reconnect();
                         }
                     }
                     let mut __seq = __seq_arc.lock().unwrap();
