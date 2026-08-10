@@ -109,6 +109,12 @@ deploy path; and a stated [semver policy](./SEMVER.md).
   (`id`, `created_at`) and virtual relation fields (as `null`). The direct Rust
   `db.create_<model>` path auto-generates `+` fields; the REST layer does not
   yet. `create` returns the new id, not the full record.
+- The REST **update** body is likewise the whole record — **`PUT` replaces, and there
+  is no `PATCH`**. Changing one field means GET → mutate → `PUT`, and because there
+  is no conditional-request support either (no `ETag` / `If-Match`), two concurrent
+  editors of the same row silently clobber each other's other fields. The generated
+  SDKs have the same shape (`update<Model>(id, data: Model)`). Partial update and
+  preconditions are tracked as [#278](https://github.com/hoodiecollin/forgedb/issues/278).
 - SDK ids are typed `string` uniformly (integer-PK callers pass `String(n)`).
 - No WebSocket/subscription client in the generated SDK yet (REST only).
 
@@ -125,10 +131,13 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 ### Operations
 - `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text
   format.
-- The fsync policy and checkpoint/compaction thresholds are fixed generated
-  constants, **not yet configurable**.
-- The release workflow is authored and validated but **not yet exercised by a
-  real tag push**.
+- Generated constants **are** configurable, but only at **generate time** — the
+  `forgedb.toml` `[runtime]`/`[storage]` sections set the fsync policy, WAL
+  checkpoint interval, compaction threshold, change-feed capacity, cascade depth,
+  transaction retries and page limits (epic #126). What is deferred is **runtime**
+  mutability: a value is either specialized-away or baked as a `const`, so
+  retuning one means regenerating and rebuilding, and a live process cannot be
+  retuned at all.
 
 ### Not a general-purpose engine
 - No generic/dynamic query builder or ORM that interprets an arbitrary schema at
