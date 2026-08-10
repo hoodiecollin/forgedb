@@ -313,6 +313,133 @@ fn test_api_generation_tenant_auth_router() {
     assert!(code.contains("axum::middleware::from_fn_with_state"));
 }
 
+/// #140 — the CORS surface, and the two existing constructors kept intact.
+///
+/// The arity of `create_router` / `create_router_with_auth` is load-bearing beyond
+/// style: `src/main.rs` is written **once** by `forgedb init` and is never
+/// regenerated, so a project that has been running for a year still calls the
+/// two-and-three-argument forms. Adding a parameter would break every existing
+/// project the next time it ran `forgedb generate` — which is why the origin list
+/// arrives through *new* functions rather than through the old ones.
+#[test]
+fn test_api_generation_cors_surface_is_additive() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // The pre-#140 entry points, unchanged.
+    assert!(code.contains("pub fn create_router("), "create_router keeps its arity");
+    assert!(
+        code.contains("pub fn create_router_with_auth("),
+        "create_router_with_auth keeps its arity"
+    );
+    // The new ones.
+    assert!(code.contains("pub fn create_router_with_options("));
+    assert!(code.contains("pub fn create_router_with_auth_and_options("));
+    assert!(code.contains("pub struct HttpOptions"));
+    assert!(code.contains("pub fn parse_origins("));
+    assert!(code.contains("pub struct AllowedOrigins"));
+}
+
+/// #140 — the CORS layer is configured for exactly what this API serves, and never
+/// with credentials.
+///
+/// `PATCH` is deliberately absent: the generator imports
+/// `routing::{delete, get, post, put}` and emits no `patch` route anywhere, so
+/// allowing it would advertise a method that 405s.
+///
+/// `allow_credentials` is asserted **absent** rather than left to a comment. Nothing
+/// is auto-attached by the browser for bearer-token auth, so an explicit `*` origin
+/// creates no CSRF vector here — but that reasoning collapses the moment cookie auth
+/// is introduced, and tower-http also rejects wildcard-plus-credentials at runtime.
+/// This assertion is what makes that a decision someone has to consciously revisit.
+#[test]
+fn test_api_generation_cors_allows_only_what_is_served() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    for m in ["Method::GET", "Method::POST", "Method::PUT", "Method::DELETE"] {
+        assert!(code.contains(m), "CORS must allow {m}");
+    }
+    assert!(
+        !code.contains("Method::PATCH"),
+        "no PATCH route is generated, so CORS must not advertise it"
+    );
+    assert!(code.contains("header::CONTENT_TYPE"));
+    assert!(code.contains("header::AUTHORIZATION"));
+    // Matched with the open paren, i.e. the *call*: doc comments are part of the
+    // emitted code, and the generator's own comment explains why credentials mode is
+    // off. A bare-word check would trip on that explanation.
+    assert!(
+        !code.contains("allow_credentials("),
+        "ForgeDB auth is a bearer header, not a cookie — credentials mode must stay \
+         off, or the `*` origin becomes unsafe and tower-http rejects the combination"
+    );
+}
+
+/// #140 — the layer is applied conditionally and the extension unconditionally.
+///
+/// These are opposite decisions for one reason each, and both are easy to "tidy" into
+/// the wrong shape. An empty `CorsLayer` still answers preflight `OPTIONS` with 200
+/// while the generated routes answer 405, so emitting one unconditionally would
+/// change observable behavior for every existing deployment. The `Extension`, by
+/// contrast, has no response behavior at all, and applying it always is what lets the
+/// WS handlers take `Extension<AllowedOrigins>` outright instead of depending on
+/// axum 0.8's `Option<T>` extractor contract.
+#[test]
+fn test_api_generation_cors_layer_is_conditional() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("match cors"),
+        "the CorsLayer must be applied only when origins are configured"
+    );
+    assert!(
+        code.contains("layer(axum::Extension(AllowedOrigins("),
+        "the AllowedOrigins extension must be applied unconditionally"
+    );
+    // Layer order: a layer applied later wraps outer, so CORS must be added after
+    // TraceLayer to end up outermost — outside the tenant guard, which is what
+    // lets a token-less preflight through.
+    let trace = code.find("TraceLayer::new_for_http()").expect("trace layer emitted");
+    let apply = code.find("__apply_origin_layers(router").expect("origin layers applied");
+    assert!(
+        trace < apply,
+        "the origin layers must be applied AFTER TraceLayer so CORS ends up outermost"
+    );
+}
+
+/// #140 — every WebSocket upgrade handler checks `Origin` before upgrading.
+///
+/// This is the half that would otherwise be silently missing: a `CorsLayer` leaves
+/// `/subscribe`, `/live-query` and `/replicate` reachable from any origin, because
+/// browsers neither preflight a handshake nor apply CORS to one. Shipping "wire
+/// origins" without this would read as done when it is half done.
+///
+/// Asserted as a count, not a presence check — with three handlers, covering two of
+/// them is the realistic failure, and a presence check passes on two.
+#[test]
+fn test_api_generation_ws_handlers_check_origin() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    let extensions = code.matches("Extension<AllowedOrigins>").count();
+    assert!(
+        extensions >= 3,
+        "all three WS upgrade handlers (/subscribe, /live-query, /replicate) must \
+         take the allow-list; found {extensions}"
+    );
+    let checks = code.matches("allowed.permits(__origin_of(&headers))").count();
+    assert!(
+        checks >= 3,
+        "all three WS upgrade handlers must gate on the origin; found {checks}"
+    );
+    assert!(
+        code.contains("StatusCode::FORBIDDEN"),
+        "a disallowed origin must be refused, not merely logged"
+    );
+}
+
 #[test]
 fn test_api_generation_observability_endpoints() {
     // Phase 5: liveness/readiness/metrics handlers, the unauthenticated ops
