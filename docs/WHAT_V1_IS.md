@@ -131,10 +131,13 @@ deploy path; and a stated [semver policy](./SEMVER.md).
 ### Operations
 - `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text
   format.
-- The fsync policy and checkpoint/compaction thresholds are fixed generated
-  constants, **not yet configurable**.
-- The release workflow is authored and validated but **not yet exercised by a
-  real tag push**.
+- Generated constants **are** configurable, but only at **generate time** — the
+  `forgedb.toml` `[runtime]`/`[storage]` sections set the fsync policy, WAL
+  checkpoint interval, compaction threshold, change-feed capacity, cascade depth,
+  transaction retries and page limits (epic #126). What is deferred is **runtime**
+  mutability: a value is either specialized-away or baked as a `const`, so
+  retuning one means regenerating and rebuilding, and a live process cannot be
+  retuned at all.
 
 ### Not a general-purpose engine
 - No generic/dynamic query builder or ORM that interprets an arbitrary schema at
