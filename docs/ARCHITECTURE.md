@@ -287,6 +287,27 @@ at Tier 3: the coordinated writer is still the *same generated code*, and the co
 every substrate crate — knows nothing about any schema. It is the symmetric inverse of the durable
 replication broker (control over the write turn, vs. an ordered feed of committed changes).
 
+**The two deadlines are coupled, and a failed request fails closed.** A coordinated client blocks
+waiting for its turn while the coordinator blocks waiting for the pending turn to clear, so both
+sides hold a deadline — and only one of them can see both. The **client declares its own I/O
+deadline** on every `RequestTurn` (`client_deadline_ms`), and the **coordinator clamps its grant
+wait** to `min(turn_timeout, declared − 500ms)`, so a `Busy` reply always reaches the client before
+it stops reading. Without that coupling, raising `--turn-timeout` past the client's deadline made
+the client give up first and left the connection **desynchronized**: the coordinator's eventual
+`Grant` stayed on the socket, to be read as the answer to the client's *next* request — a turn it
+did not hold. A client that declares nothing is a pre-coupling build and is assumed to hold the
+legacy 35s, so old clients are fixed without being recompiled. This is an additive wire *field*
+rather than a connect handshake because the protocol is internally-tagged JSON with no version
+field: an unknown field is ignored in both directions, while an unknown *variant* breaks whichever
+peer ships second.
+
+Independently, any failed request **poisons** the client connection — it refuses further requests
+until `reconnect()` replaces the stream — because a timeout leaves a reply in flight no matter why
+it happened. Poisoning is deliberately not paired with automatic retry inside the substrate:
+recovery policy lives in the generated commit loop, beside the `Busy` budget and retry limit
+already there, and the generated code calls `reconnect()` in both coordinator error arms so the
+failure stays loud for the current transaction and invisible to the next one.
+
 ### Integer auto-increment allocates per process, and is made conflict-*visible*
 
 `+u32`/`+u64` fields allocate from an in-memory counter held per field, per process — there is
