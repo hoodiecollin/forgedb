@@ -13259,6 +13259,14 @@ impl RustGenerator {
                                         std::thread::sleep(std::time::Duration::from_millis(20 * __busy_retries as u64));
                                     }
                                     Err(e) => {
+                                        // #274: a failed request leaves the reply in
+                                        // flight, so the connection is poisoned. Drop
+                                        // it here rather than letting the NEXT
+                                        // transaction read a stale `Grant` as its own
+                                        // and write columns for a turn it does not
+                                        // hold. Recovery policy lives here, beside the
+                                        // `Busy` budget above — not in the substrate.
+                                        let _ = __coord.reconnect();
                                         let mut __seq = __seq_arc.lock().unwrap();
                                         __seq.release_snapshot(__snap_lsn);
                                         return Err(TxError::Io(e.to_string()));
@@ -13329,6 +13337,11 @@ impl RustGenerator {
                                         // leaves `__last_lsn` briefly stale.  Dependency-free
                                         // diagnostic so the generated crate needs no `log` dep.
                                         eprintln!("coordinator: Committed ack error: {e}");
+                                        // #274: the missing `Ack` may still be in flight, and
+                                        // the next request would read it in place of its own
+                                        // reply. Reconnect so this stays a stale-LSN nuisance
+                                        // instead of desynchronizing every later turn.
+                                        let _ = __coord.reconnect();
                                     }
                                 }
 

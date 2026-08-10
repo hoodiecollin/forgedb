@@ -6663,6 +6663,67 @@ User {
     );
 }
 
+/// #274 — both coordinator error arms must drop the connection before returning.
+///
+/// A failed `request_turn` or `committed` leaves the coordinator's reply **in
+/// flight**; it will still be written onto that socket. Without a reconnect the
+/// *next* transaction reads it as its own answer, and a stale `Grant` read that way
+/// makes the generated data plane write columns for a turn the coordinator has
+/// already reclaimed — reported as `Ok`, because the resulting `Error` on
+/// `Committed` lands in the `eprintln!` arm.
+///
+/// The substrate poisons the connection so that misread is impossible, but poison
+/// alone would strand the process: `Arc<CoordinatorClient>` is built once in
+/// `CoordinatedDatabase::connect` and never rebuilt, so every later write would fail
+/// until the app reconstructed the whole database. The `reconnect()` calls asserted
+/// here are what make the poisoning recoverable, and they live in **generated** code
+/// on purpose — beside the `Busy` retry budget, which is where this project keeps
+/// recovery policy rather than in the substrate.
+///
+/// Guarded structurally rather than by snapshot because a snapshot accepts a
+/// deletion here as readily as an addition.
+#[test]
+fn test_rust_generation_coordinator_errors_reconnect() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let reconnects = code.matches("__coord.reconnect()").count();
+    assert_eq!(
+        reconnects, 2,
+        "expected exactly two `__coord.reconnect()` calls — one in the request_turn \
+         error arm, one in the Committed ack error arm; found {reconnects}"
+    );
+
+    // The request_turn arm: reconnect must precede the return, or the connection is
+    // handed to the next transaction still desynchronized.
+    let req_arm = code
+        .find("__coord.reconnect()")
+        .expect("first reconnect present");
+    let io_return = code[req_arm..]
+        .find("TxError::Io")
+        .expect("the request_turn arm still returns TxError::Io");
+    assert!(
+        io_return < 400,
+        "the first reconnect() must sit in the request_turn error arm, immediately \
+         before its `return Err(TxError::Io(..))`"
+    );
+
+    // The Committed arm keeps returning Ok — the commit really is durable (columns +
+    // WAL are fsynced before `Committed` is sent), so a missing ack must not turn a
+    // successful commit into a reported failure.
+    assert!(
+        code.contains("coordinator: Committed ack error"),
+        "the Committed ack arm keeps its diagnostic and does not become fatal"
+    );
+}
+
 
 // ---------------------------------------------------------------------------
 // #74 Phase 3 — the offline transformer bin (uniform typed replay).
