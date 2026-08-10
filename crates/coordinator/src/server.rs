@@ -47,6 +47,26 @@ use crate::{ClientMsg, ServerMsg, decode_msg_with_limit, encode_msg};
 /// this deadline, un-wedging all other writers.
 pub const TURN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Headroom subtracted from a client's declared deadline, so the coordinator's
+/// `Busy` reply is written **before** the client stops reading (#274).
+///
+/// A fixed constant rather than a fraction of the deadline: the reply is a small
+/// JSON frame over a same-machine Unix socket, and its cost has nothing to do with
+/// how long the operator is willing to wait for a turn.  500ms is orders of
+/// magnitude above the real cost and under 2% of the default [`TURN_TIMEOUT`].
+pub const GRANT_REPLY_MARGIN: Duration = Duration::from_millis(500);
+
+/// The deadline assumed for a client that declares none — i.e. one built against
+/// `forgedb-coordinator` from before #274, which omits `client_deadline_ms`.
+///
+/// This deliberately duplicates the pre-#274 client default rather than importing
+/// [`crate::client::DEFAULT_IO_TIMEOUT`]: the two are the *same number today for
+/// different reasons*, and they must be free to diverge.  This one is a statement
+/// about clients the coordinator cannot see and cannot upgrade; that one is what
+/// clients built from this source will use.  Unifying them would make a future
+/// change to the live default silently rewrite history for old peers.
+const LEGACY_CLIENT_DEADLINE: Duration = Duration::from_secs(35);
+
 /// The data-directory single-writer lock filename.
 ///
 /// **Load-bearing cross-crate contract:** this MUST byte-match the filename
@@ -505,13 +525,14 @@ fn handle_connection(
         };
 
         match msg {
-            ClientMsg::RequestTurn { write_set_keys, snapshot_lsn } => {
+            ClientMsg::RequestTurn { write_set_keys, snapshot_lsn, client_deadline_ms } => {
                 // Spin briefly (with back-off) waiting for the pending turn to
                 // clear rather than immediately returning Busy to every client.
                 let reply = request_turn_with_wait(
                     &state,
                     write_set_keys,
                     snapshot_lsn,
+                    client_deadline_ms,
                 );
                 let frame = encode_msg(&reply)?;
                 stream.write_all(&frame)?;
@@ -568,6 +589,28 @@ fn handle_connection(
     Ok(())
 }
 
+/// How long to wait for the pending turn to clear before replying `Busy` (#274).
+///
+/// The coordinator is the only party that can see **both** deadlines, so it is the
+/// one that reconciles them: it waits for its own `turn_timeout`, or for the
+/// client's declared deadline minus [`GRANT_REPLY_MARGIN`], whichever is shorter.
+/// The clamp only ever *shortens* — a client willing to wait longer than the
+/// coordinator does not extend the coordinator's own limit.
+///
+/// Before this, a `turn_timeout` above the client's fixed 35s meant the client
+/// timed out first and left the connection desynchronized, with its own eventual
+/// `Grant` waiting to be read as the answer to its *next* request.
+fn effective_grant_wait(turn_timeout: Duration, client_deadline_ms: u64) -> Duration {
+    let declared = match client_deadline_ms {
+        0 => LEGACY_CLIENT_DEADLINE,
+        ms => Duration::from_millis(ms),
+    };
+    // `saturating_sub`, so a client whose deadline is already inside the margin
+    // gets an immediate `Busy` rather than an underflow — the honest answer for a
+    // caller that has all but given up.
+    turn_timeout.min(declared.saturating_sub(GRANT_REPLY_MARGIN))
+}
+
 /// Attempt `RequestTurn` with bounded wait-on-condvar backpressure:
 /// if the coordinator is busy, wait up to `TURN_TIMEOUT` for the current
 /// turn to clear before returning `Busy`.
@@ -575,9 +618,10 @@ fn request_turn_with_wait(
     state: &Arc<Shared>,
     write_set_keys: Vec<Vec<u8>>,
     snapshot_lsn: u64,
+    client_deadline_ms: u64,
 ) -> ServerMsg {
     let (lock, cvar) = &state.coord;
-    let deadline = Instant::now() + state.turn_timeout;
+    let deadline = Instant::now() + effective_grant_wait(state.turn_timeout, client_deadline_ms);
 
     let mut s = lock.lock().unwrap();
     loop {
@@ -605,6 +649,57 @@ fn request_turn_with_wait(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // ── #274: the grant-wait clamp ────────────────────────────────────────────
+
+    /// The client's deadline wins when it is the shorter of the two.
+    #[test]
+    fn clamp_prefers_the_clients_deadline_when_shorter() {
+        let w = effective_grant_wait(Duration::from_secs(60), 10_000);
+        assert_eq!(w, Duration::from_millis(9_500), "10s declared − 500ms margin");
+    }
+
+    /// The clamp only ever shortens: a patient client does not extend the
+    /// coordinator's own limit.
+    #[test]
+    fn clamp_never_extends_past_turn_timeout() {
+        let w = effective_grant_wait(Duration::from_secs(5), 60_000);
+        assert_eq!(w, Duration::from_secs(5));
+    }
+
+    /// **The regression guard for #274.** A client that declares nothing is a
+    /// pre-#274 build with a fixed 35s deadline; the coordinator must assume that
+    /// and clamp to it, even when the operator raised `--turn-timeout` far past it.
+    ///
+    /// This is the pairing that is broken on `v0.3.0`: with `turn_timeout = 300s`
+    /// the coordinator would wait five minutes to reply, the client would give up
+    /// at 35s, and the eventual `Grant` would be read as the answer to its next
+    /// request. It must be fixed for a client nobody recompiled.
+    #[test]
+    fn clamp_fixes_a_legacy_client_that_declares_nothing() {
+        let w = effective_grant_wait(Duration::from_secs(300), 0);
+        assert_eq!(
+            w,
+            Duration::from_millis(34_500),
+            "a declaration-less client must be treated as the legacy 35s, not as \
+             consenting to turn_timeout"
+        );
+    }
+
+    /// A declared deadline inside the margin degrades to an immediate `Busy`
+    /// instead of underflowing.
+    #[test]
+    fn clamp_saturates_instead_of_underflowing() {
+        assert_eq!(effective_grant_wait(Duration::from_secs(30), 200), Duration::ZERO);
+        assert_eq!(effective_grant_wait(Duration::from_secs(30), 500), Duration::ZERO);
+    }
+
+    /// The default client and the server's legacy assumption must agree, or a
+    /// current client would be clamped against the wrong number.
+    #[test]
+    fn legacy_assumption_matches_the_live_client_default() {
+        assert_eq!(LEGACY_CLIENT_DEADLINE, crate::client::DEFAULT_IO_TIMEOUT);
+    }
 
     fn make_coordinator(tmp: &TempDir) -> Coordinator {
         let root = tmp.path().to_owned();
