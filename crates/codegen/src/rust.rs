@@ -24,6 +24,32 @@ thread_local! {
 /// Rust code generator
 pub struct RustGenerator;
 
+/// The four emitted pieces of a buffered column gather over one field set.
+///
+/// Every buffered read in the generated crate — the scan scope (#228), the page
+/// scope (#226), and each `@projection`'s live `all_<proj>` (#113/#168) — is the
+/// same four things: a holder struct field per stored column, its `gather_buffered`
+/// initializer, the per-row decode statement, and the struct field initializer that
+/// consumes the decode's binding.  They were open-coded per site; #226 needed a
+/// third copy, which is where a repetition becomes a drift vector — the page gather
+/// has to decode its fields **exactly** as the positional `read_at` does, or the
+/// list response's bytes change on one field class and nothing says so.
+///
+/// `values` carries one entry per input field, in the input order, whether or not
+/// the field had a column — so it zips back against the field slice the caller
+/// passed, which is how the page scope interleaves scan-sourced and gather-sourced
+/// fields in model declaration order instead of concatenating them.
+struct BufferedGather {
+    /// `<field>_col: forgedb_storage::Buffered{Fixed,Variable}Column`
+    decls: Vec<TokenStream>,
+    /// `<field>_col: self.<field>_col.gather_buffered(&<rows>).expect(..)`
+    inits: Vec<TokenStream>,
+    /// The per-row decode, binding `<field>_value`.
+    reads: Vec<TokenStream>,
+    /// `<field>: <field>_value` — or a default for a field with no column.
+    values: Vec<TokenStream>,
+}
+
 /// A `@min`/`@max` bound literal as written in the schema (#239).
 ///
 /// `Frac` keeps the **verbatim lexeme** rather than an `f64`, so the conversion
@@ -8039,9 +8065,23 @@ impl RustGenerator {
         // `Serialize` on `ScanRef` — different field set, and #224's decision that
         // the scan view is never a wire type stands.
         let page_ref_tokens = Self::generate_page_ref_struct(schema, model, &scan_fields, key_name);
+        // #226: and the scope that produces a page of them.  `__with_scan` is left
+        // exactly as it is — the two live-query sites need owned, retained,
+        // comparable `Model` values and have no pagination at all, so a borrowed
+        // page view cannot serve them.
+        let with_page_method = Self::generate_page_scope_method(
+            schema,
+            model,
+            &scan_ref_ident,
+            &format_ident!("__{}PageScanBufs", model.name),
+            &scan_fields,
+            key_name,
+            &slot_field,
+        );
 
         let methods = quote! {
             #with_scan_method
+            #with_page_method
             #(#pushdown)*
         };
         let structs = quote! {
@@ -8297,6 +8337,335 @@ impl RustGenerator {
         }
     }
 
+    /// Emit the [`BufferedGather`] pieces for `fields`.
+    ///
+    /// `recv` names the holder binding the decode reads through, `rows` the
+    /// `Vec<usize>` selection each column is gathered over, and `slot` the loop
+    /// variable indexing the resulting buffers — a *position within the selection*,
+    /// not a physical row (see `FixedColumn::gather_buffered`).  `borrowed` picks the
+    /// string decode: `true` borrows out of the buffered span (#224), `false`
+    /// materializes owned values exactly as the positional `read_at` does.
+    ///
+    /// A field with no storage column (a virtual relation, a component) contributes
+    /// no decl/init/read and a `default_for_unstored_field` value — the same arm
+    /// `generate_row_read_body` takes, so a full record built here matches one built
+    /// by `read_at` field for field.
+    fn buffered_gather_pieces(
+        schema: &Schema,
+        fields: &[&forgedb_parser::Field],
+        recv: &TokenStream,
+        rows: &TokenStream,
+        slot: &TokenStream,
+        borrowed: bool,
+        key_name: Option<&str>,
+        gather_expect: &str,
+    ) -> BufferedGather {
+        let mut out = BufferedGather {
+            decls: Vec::new(),
+            inits: Vec::new(),
+            reads: Vec::new(),
+            values: Vec::new(),
+        };
+        for field in fields {
+            let fname = format_ident!("{}", field.name);
+            let col_ident = format_ident!("{}_col", field.name);
+            let buffered_ty = if Self::is_variable_string_type(&field.field_type)
+                || Self::is_json_type(&field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedVariableColumn })
+            } else if Self::is_enum_type(&field.field_type)
+                || Self::is_fixed_size_type(schema, &field.field_type)
+            {
+                Some(quote! { forgedb_storage::BufferedFixedColumn })
+            } else {
+                None // relation/component: no storage column (see field_read_stmt None arm)
+            };
+            let as_key = Some(field.name.as_str()) == key_name;
+            match (
+                buffered_ty,
+                Self::field_read_stmt(schema, field, recv, slot, borrowed, as_key),
+            ) {
+                (Some(ty), Some((value_ident, stmt))) => {
+                    out.decls.push(quote! { #col_ident: #ty });
+                    out.inits.push(quote! {
+                        #col_ident: self.#col_ident.gather_buffered(&#rows)
+                            .expect(#gather_expect)
+                    });
+                    out.reads.push(stmt);
+                    out.values.push(quote! { #fname: #value_ident });
+                }
+                _ => {
+                    let default_val = Self::default_for_unstored_field(&field.field_type);
+                    out.values.push(quote! { #fname: #default_val });
+                }
+            }
+        }
+        out
+    }
+
+    /// The `let __rows: Vec<usize> = match sel { .. };` selection both scan scopes
+    /// open with (#160/#228): a pushdown candidate set, sorted, or every live row.
+    ///
+    /// Shared by `__with_scan` and `__with_page` so the two cannot come to disagree
+    /// about what "the selection" is — they are the same scan, differing only in
+    /// what they hand the caller.
+    fn scan_row_selection() -> TokenStream {
+        quote! {
+            let __rows: Vec<usize> = match sel {
+                // Index pushdown (#160 C).  No tombstone read: delete removes
+                // the id from every secondary index, so a candidate resolved
+                // through one is live by construction.  Sorted anyway —
+                // `gather_buffered` bounds its reads to `[min, max]`, so
+                // ascending order is what keeps the spanned read tight and the
+                // column walk forward.
+                Some(mut __c) => {
+                    __c.sort_unstable();
+                    __c
+                }
+                // Live rows in ascending physical order — so a churn-free
+                // table's selection is exactly the dense prefix `[0, n)`
+                // (zero-copy mmap bulk load) and column reads march forward.
+                // `id_to_row` repoints a deleted id at its tombstoned row
+                // (delete appends a tombstone, #66), so filter those out with
+                // one bulk tombstone read.
+                None => {
+                    let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                    __all.sort_unstable();
+                    self.tombstones.live_indices(&__all)
+                        .expect("Failed to read tombstone liveness")
+                }
+            };
+        }
+    }
+
+    /// Emit the **page scope** (#226) — the list endpoint's single read path.
+    ///
+    /// `__with_scan` leaves the page materialization to the caller, which can only
+    /// take scalars out of the scope, so the list handler took `(total, Vec<Id>)` and
+    /// re-read every page row through `get(id)`: one positional `pread` per column
+    /// per row, for rows **phase A had already decoded and thrown away**.  Measured
+    /// at ~6.4 µs/row against the buffered scan's ~0.11 µs/row — a ~58× per-row
+    /// difference, and 21.8–91.8% of the request depending on page size and table
+    /// size.  This is not adding a fast path; it is deleting a redundant one.
+    ///
+    /// So the page is built inside the scope, where the scan's buffers are alive:
+    ///
+    /// 1. the scan gather + decode + `keep`, verbatim as `__with_scan` does it;
+    /// 2. `sort`, then the pagination slice;
+    /// 3. a **second** gather, over the page's physical rows only, for the columns
+    ///    the scan set does not carry (FKs, `json`, `[T; N]`, inline structs);
+    /// 4. one `<Model>PageRef` per page row — scan columns taken off the `ScanRef`
+    ///    that already holds them, the rest decoded from the page buffers.
+    ///
+    /// Both buffer sets are locals of this method, so both outlive `f`; only `R`
+    /// escapes, and it cannot name the views' lifetime.  The handler returns an
+    /// already-serialized `Response`, which is what dissolves that constraint.
+    ///
+    /// **The page's physical rows come from the ref's `__slot`, not from its position
+    /// in the vector.** `keep` filters and `sort` reorders, so after step 2 position
+    /// means nothing; mapping the page by position yields real rows in the wrong
+    /// order, which no assertion on `total` would catch.
+    ///
+    /// `sort` is a separate closure from `f` for the same reason `keep` is: it has to
+    /// run on the borrowed views, before the page is known, and the caller owns the
+    /// comparator.
+    fn generate_page_scope_method(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        ref_ident: &proc_macro2::Ident,
+        scan_holder: &proc_macro2::Ident,
+        scan_fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+        slot_field: &proc_macro2::Ident,
+    ) -> TokenStream {
+        let page_ref_ident = format_ident!("{}PageRef", model.name);
+        let page_holder = format_ident!("__{}PageBufs", model.name);
+
+        // Phase 1 — the scan, identical to `__with_scan`'s (same emitter, same
+        // arguments), so the two cannot drift in what they decode or how.
+        let scan = Self::buffered_gather_pieces(
+            schema,
+            scan_fields,
+            &quote! { __bufs },
+            &quote! { __rows },
+            &quote! { __slot },
+            true,
+            key_name,
+            "Failed to bulk-load scan column",
+        );
+        let scan_decls = &scan.decls;
+        let scan_inits = &scan.inits;
+        let scan_reads = &scan.reads;
+        let scan_values = &scan.values;
+        let ref_borrow_init = match Self::scan_ref_anchor(scan_fields, key_name) {
+            None => quote! {},
+            Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
+        };
+        let slot_init = Self::slot_field_init(slot_field);
+
+        // Phase 3 — the page-only gather, over the complement of the scan set.
+        // `borrowed = false`: these decode exactly as the positional `read_at` does,
+        // which is what keeps `json` on the `read_string` + `serde_json::Value`
+        // round-trip that normalizes a stored object's key order.
+        let page_only: Vec<&forgedb_parser::Field> = model
+            .fields
+            .iter()
+            .filter(|f| !Self::page_field_from_scan(scan_fields, f))
+            .collect();
+        let page = Self::buffered_gather_pieces(
+            schema,
+            &page_only,
+            &quote! { __page_bufs },
+            &quote! { __page_rows },
+            &quote! { __pslot },
+            false,
+            key_name,
+            "Failed to bulk-load page column",
+        );
+        let page_decls = &page.decls;
+        let page_inits = &page.inits;
+        let page_reads = &page.reads;
+
+        // Phase 4 — one view per page row, in MODEL DECLARATION ORDER.
+        //
+        // Interleaved, not concatenated: a scan column is taken off the ref that
+        // already holds it, the rest come from the page gather's own field
+        // initializers, and the two are woven together by walking `model.fields`.
+        // Concatenating (`scan_field_set` then the remainder) is gotcha 1 — it emits
+        // a semantically equal, byte-different object.
+        //
+        // `values` zips back against `page_only` because `buffered_gather_pieces`
+        // emits exactly one entry per input field in input order, including the
+        // no-column arm.
+        let page_value_by_name: std::collections::HashMap<&str, &TokenStream> = page_only
+            .iter()
+            .map(|f| f.name.as_str())
+            .zip(page.values.iter())
+            .collect();
+        let page_view_values: Vec<TokenStream> = model
+            .fields
+            .iter()
+            .map(|f| {
+                if Self::page_field_from_scan(scan_fields, f) {
+                    // `clone()` is a copy for every scan-view type: `&'a str` (and
+                    // `Option<&'a str>`) clone as the reference, and every other scan
+                    // field is a by-value `Copy` scalar.  It is the borrow the page
+                    // view keeps, not a materialization.
+                    let fname = format_ident!("{}", f.name);
+                    quote! { #fname: __ref.#fname.clone() }
+                } else {
+                    let v = page_value_by_name
+                        .get(f.name.as_str())
+                        .expect("every non-scan field is in the page gather");
+                    quote! { #v }
+                }
+            })
+            .collect();
+        let page_borrow_init = match Self::page_ref_anchor(model, scan_fields, key_name) {
+            None => quote! {},
+            Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
+        };
+
+        let row_selection = Self::scan_row_selection();
+
+        quote! {
+            /// Run `f` over one **fully-decoded page** of this model (#226) — the
+            /// list endpoint's single read path.
+            ///
+            /// Filters and sorts the narrow scan views exactly as `__with_scan`
+            /// does, then gathers the page's remaining columns over the page's
+            /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+            /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+            /// had already decoded — one positional `pread` per column per row.
+            ///
+            /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+            /// are applied with the same arithmetic as
+            /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+            /// post-sort view count.
+            ///
+            /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+            /// return value escapes and it cannot borrow the views (their lifetime is
+            /// higher-ranked). The handler returns a serialized `Response`.
+            pub fn __with_page<R>(
+                &self,
+                sel: Option<Vec<usize>>,
+                keep: impl Fn(&#ref_ident<'_>) -> bool,
+                sort: impl FnOnce(&mut Vec<#ref_ident<'_>>),
+                offset: usize,
+                limit: usize,
+                f: impl FnOnce(usize, &[#page_ref_ident<'_>]) -> R,
+            ) -> R {
+                #row_selection
+                let __n = __rows.len();
+
+                #[allow(non_camel_case_types)]
+                struct #scan_holder {
+                    #(#scan_decls,)*
+                }
+                let __bufs = #scan_holder {
+                    #(#scan_inits,)*
+                };
+
+                // One oversized allocation freed at the end, rather than ~log2(n)
+                // growth copies each memcpy-ing every view already accepted — the
+                // same trade `__with_scan` measured at ~5% on a 20 000-row scan.
+                let mut __refs: Vec<#ref_ident<'_>> = Vec::with_capacity(__n);
+                for __slot in 0..__n {
+                    #(#scan_reads)*
+                    let __row_ref = #ref_ident {
+                        #slot_init
+                        #(#scan_values,)*
+                        #ref_borrow_init
+                    };
+                    if keep(&__row_ref) {
+                        __refs.push(__row_ref);
+                    }
+                }
+
+                let __total = __refs.len();
+                sort(&mut __refs);
+
+                // `forgedb_query_params::Pagination::apply`'s arithmetic, inlined
+                // because the slice has to be taken inside the scope: clamp both
+                // ends to the length, saturating the addition so a large `offset`
+                // cannot overflow.
+                let __start = offset.min(__total);
+                let __end = offset.saturating_add(limit).min(__total);
+                let __page = &__refs[__start..__end];
+
+                // The page's PHYSICAL rows.  Via `__slot`, never via position:
+                // `keep` and `sort` have both run, so a view's index in `__refs`
+                // says nothing about which row it came from.
+                let __page_rows: Vec<usize> = __page
+                    .iter()
+                    .map(|__r| __rows[__r.#slot_field])
+                    .collect();
+
+                #[allow(non_camel_case_types)]
+                struct #page_holder {
+                    #(#page_decls,)*
+                }
+                // Bounded to the page: `limit` rows, not the table.  An empty page
+                // is legitimate (the filter matched nothing, or `offset` is past the
+                // end) and both column kinds return an empty buffer for an empty
+                // selection rather than erroring.
+                let __page_bufs = #page_holder {
+                    #(#page_inits,)*
+                };
+
+                let mut __views: Vec<#page_ref_ident<'_>> = Vec::with_capacity(__page.len());
+                for (__pslot, __ref) in __page.iter().enumerate() {
+                    #(#page_reads)*
+                    __views.push(#page_ref_ident {
+                        #(#page_view_values,)*
+                        #page_borrow_init
+                    });
+                }
+                f(__total, &__views)
+            }
+        }
+    }
+
     /// Emit the narrow-scan **scope** (#228) — the single entry point to the list
     /// path's column scan.
     ///
@@ -8327,43 +8696,20 @@ impl RustGenerator {
         key_name: Option<&str>,
         slot_field: &proc_macro2::Ident,
     ) -> TokenStream {
-        let mut buf_field_decls = Vec::new();
-        let mut buf_inits = Vec::new();
-        let mut buf_read_stmts = Vec::new();
-        let mut buf_field_values = Vec::new();
-        let recv = quote! { __bufs };
-        let slot = quote! { __slot };
-        for field in fields {
-            let fname = format_ident!("{}", field.name);
-            let col_ident = format_ident!("{}_col", field.name);
-            let buffered_ty = if Self::is_variable_string_type(&field.field_type)
-                || Self::is_json_type(&field.field_type)
-            {
-                Some(quote! { forgedb_storage::BufferedVariableColumn })
-            } else if Self::is_enum_type(&field.field_type)
-                || Self::is_fixed_size_type(schema, &field.field_type)
-            {
-                Some(quote! { forgedb_storage::BufferedFixedColumn })
-            } else {
-                None // relation/component: no storage column (see field_read_stmt None arm)
-            };
-            let as_key = Some(field.name.as_str()) == key_name;
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, true, as_key)) {
-                (Some(ty), Some((value_ident, stmt))) => {
-                    buf_field_decls.push(quote! { #col_ident: #ty });
-                    buf_inits.push(quote! {
-                        #col_ident: self.#col_ident.gather_buffered(&__rows)
-                            .expect("Failed to bulk-load scan column")
-                    });
-                    buf_read_stmts.push(stmt);
-                    buf_field_values.push(quote! { #fname: #value_ident });
-                }
-                _ => {
-                    let default_val = Self::default_for_unstored_field(&field.field_type);
-                    buf_field_values.push(quote! { #fname: #default_val });
-                }
-            }
-        }
+        let gathered = Self::buffered_gather_pieces(
+            schema,
+            fields,
+            &quote! { __bufs },
+            &quote! { __rows },
+            &quote! { __slot },
+            true,
+            key_name,
+            "Failed to bulk-load scan column",
+        );
+        let buf_field_decls = &gathered.decls;
+        let buf_inits = &gathered.inits;
+        let buf_read_stmts = &gathered.reads;
+        let buf_field_values = &gathered.values;
 
         // #250: initialize the lifetime anchor iff the struct declares one.  Same
         // derivation as the emission site, so the name cannot drift apart from it.
@@ -8375,6 +8721,7 @@ impl RustGenerator {
         // usual case; the long form only when a model declares its own `__slot`
         // field and `scan_slot_field` had to pick a different name.
         let slot_init = Self::slot_field_init(slot_field);
+        let row_selection = Self::scan_row_selection();
 
         quote! {
             /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
@@ -8398,30 +8745,7 @@ impl RustGenerator {
                 keep: impl Fn(&#ref_ident<'_>) -> bool,
                 f: impl FnOnce(&mut Vec<#ref_ident<'_>>) -> R,
             ) -> R {
-                let __rows: Vec<usize> = match sel {
-                    // Index pushdown (#160 C).  No tombstone read: delete removes
-                    // the id from every secondary index, so a candidate resolved
-                    // through one is live by construction.  Sorted anyway —
-                    // `gather_buffered` bounds its reads to `[min, max]`, so
-                    // ascending order is what keeps the spanned read tight and the
-                    // column walk forward.
-                    Some(mut __c) => {
-                        __c.sort_unstable();
-                        __c
-                    }
-                    // Live rows in ascending physical order — so a churn-free
-                    // table's selection is exactly the dense prefix `[0, n)`
-                    // (zero-copy mmap bulk load) and column reads march forward.
-                    // `id_to_row` repoints a deleted id at its tombstoned row
-                    // (delete appends a tombstone, #66), so filter those out with
-                    // one bulk tombstone read.
-                    None => {
-                        let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
-                        __all.sort_unstable();
-                        self.tombstones.live_indices(&__all)
-                            .expect("Failed to read tombstone liveness")
-                    }
-                };
+                #row_selection
                 let __n = __rows.len();
 
                 #[allow(non_camel_case_types)]
@@ -8476,45 +8800,20 @@ impl RustGenerator {
         doc: &str,
         key_name: Option<&str>,
     ) -> TokenStream {
-        let mut buf_field_decls = Vec::new();
-        let mut buf_inits = Vec::new();
-        let mut buf_read_stmts = Vec::new();
-        let mut buf_field_values = Vec::new();
-        let recv = quote! { __bufs };
-        let slot = quote! { __slot };
-        for field in fields {
-            let fname = format_ident!("{}", field.name);
-            let col_ident = format_ident!("{}_col", field.name);
-            let buffered_ty = if Self::is_variable_string_type(&field.field_type)
-                || Self::is_json_type(&field.field_type)
-            {
-                Some(quote! { forgedb_storage::BufferedVariableColumn })
-            } else if Self::is_enum_type(&field.field_type)
-                || Self::is_fixed_size_type(schema, &field.field_type)
-            {
-                Some(quote! { forgedb_storage::BufferedFixedColumn })
-            } else {
-                None // relation/component: no storage column (see field_read_stmt None arm)
-            };
-            let as_key = Some(field.name.as_str()) == key_name;
-            match (buffered_ty, Self::field_read_stmt(schema, field, &recv, &slot, false, as_key)) {
-                (Some(ty), Some((value_ident, stmt))) => {
-                    buf_field_decls.push(quote! { #col_ident: #ty });
-                    buf_inits.push(quote! {
-                        #col_ident: self.#col_ident.gather_buffered(&__rows)
-                            .expect("Failed to bulk-load scan column")
-                    });
-                    buf_read_stmts.push(stmt);
-                    buf_field_values.push(quote! { #fname: #value_ident });
-                }
-                _ => {
-                    // No storage column (virtual relation) — default, like
-                    // generate_row_read_body's None arm.
-                    let default_val = Self::default_for_unstored_field(&field.field_type);
-                    buf_field_values.push(quote! { #fname: #default_val });
-                }
-            }
-        }
+        let gathered = Self::buffered_gather_pieces(
+            schema,
+            fields,
+            &quote! { __bufs },
+            &quote! { __rows },
+            &quote! { __slot },
+            false,
+            key_name,
+            "Failed to bulk-load scan column",
+        );
+        let buf_field_decls = &gathered.decls;
+        let buf_inits = &gathered.inits;
+        let buf_read_stmts = &gathered.reads;
+        let buf_field_values = &gathered.values;
 
         quote! {
             #[doc = #doc]

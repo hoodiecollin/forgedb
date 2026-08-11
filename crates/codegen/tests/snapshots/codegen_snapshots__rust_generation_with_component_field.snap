@@ -1178,6 +1178,107 @@ impl ProductStorage {
         }
         f(&mut __refs)
     }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&ProductScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<ProductScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[ProductPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __ProductPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __ProductPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<ProductScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let __row_ref = ProductScanRef {
+                __slot,
+                id: id_value,
+                name: name_value,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __ProductPageBufs {}
+        let __page_bufs = __ProductPageBufs {};
+        let mut __views: Vec<ProductPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(ProductPageRef {
+                    id: __ref.id.clone(),
+                    name: __ref.name.clone(),
+                    reviews: (),
+                    card: Default::default(),
+                });
+        }
+        f(__total, &__views)
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix

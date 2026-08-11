@@ -10349,3 +10349,144 @@ fn test_rust_generation_page_ref_field_order() {
         "and the page view derives Serialize only — no Deserialize, no ToSchema: {f}"
     );
 }
+
+/// **#226 gotcha 2 — `json` must not go through the borrowed path.**
+///
+/// Today's page read is `get(id)` → a positional `read_string` → `from_str` into a
+/// `serde_json::Value`, and `Value`'s map is a `BTreeMap`, so that round-trip
+/// *normalizes* a stored object's key order. A borrowed `&str` / `RawValue`
+/// passthrough would emit the **stored** order instead and silently change the bytes
+/// of every json field in every list response. The win #226 measured does not depend
+/// on json at all, so the correct move is to leave it alone.
+///
+/// Two things make that concrete, and both are asserted here:
+///
+/// - `json` is not filterable (`ApiGenerator::is_filterable_field`), so it is never
+///   in `scan_field_set` and can only reach the page view through the page gather.
+/// - the page gather runs `field_read_stmt` with `borrowed = false`, so json decodes
+///   through `read_string` + `from_str` — the identical statement `read_at` emits,
+///   receiver and index aside.
+///
+/// The negative assertion is the load-bearing one: `read_str` (the borrowed
+/// accessor #224 added) must appear nowhere near the payload column.
+#[test]
+fn test_rust_generation_page_ref_excludes_json_from_buffers() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The page view holds an OWNED `serde_json::Value`, not a borrowed `&'a str`.
+    assert!(
+        f.contains("pub payload: serde_json::Value,"),
+        "json is an owned Value on the page view: {f}"
+    );
+    assert!(
+        !f.contains("pub payload: &'a str") && !f.contains("pub payload: Option<&'a str>"),
+        "and never a borrowed passthrough: {f}"
+    );
+
+    // It is gathered by the PAGE buffers (bounded to the page's physical rows),
+    // never by the scan buffers — it is not filterable, so it is not in the scan set.
+    // NOTE on the spacing in every needle below: `flat` collapses whitespace runs
+    // to one space, and prettyplease breaks method chains across lines, so the
+    // emitted text really is `self .payload_col .gather_buffered(..)`. Writing the
+    // unspaced form makes a POSITIVE assertion fail loudly — and a NEGATIVE one pass
+    // vacuously, which is the dangerous half.
+    assert!(
+        f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__page_rows) \
+             .expect(\"Failed to bulk-load page column\")"
+        ),
+        "json is gathered over the page's rows: {f}"
+    );
+    assert!(
+        !f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__rows) \
+             .expect(\"Failed to bulk-load scan column\")"
+        ),
+        "json never enters the full-table scan gather: {f}"
+    );
+
+    // The decode is the `Value` round-trip, and it is the SAME statement `read_at`
+    // emits — receiver and index aside. That equality is what makes the bytes
+    // identical rather than merely similar.
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = __page_bufs .payload_col .read_string(__pslot) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "the page decodes json through read_string + from_str: {f}"
+    );
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = self .payload_col .read_string(row_index) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "which is exactly what read_at does: {f}"
+    );
+    assert!(
+        !f.contains("payload_col .read_str(") && !f.contains("payload_col.read_str("),
+        "the borrowed accessor is never used for json: {f}"
+    );
+
+    // The complement, stated positively: the page gather holds exactly the delta
+    // Gate 2 named — FK, json, [T; N], inline struct — and nothing the scan already
+    // decoded. `parts` (a virtual `[Model]`) has no column at all and is defaulted.
+    assert!(
+        f.contains(
+            "struct __WidgetPageBufs { scores_col: forgedb_storage::BufferedFixedColumn, \
+             dims_col: forgedb_storage::BufferedFixedColumn, \
+             owner_col: forgedb_storage::BufferedFixedColumn, \
+             payload_col: forgedb_storage::BufferedVariableColumn, } let __page_bufs"
+        ),
+        "the page gather is exactly the scan set's complement: {f}"
+    );
+    assert!(
+        f.contains("parts: (),"),
+        "a virtual relation is defaulted, not gathered: {f}"
+    );
+    // A model whose every field IS in the scan set gathers nothing for the page.
+    assert!(
+        f.contains("struct __MakerPageBufs {} let __page_bufs = __MakerPageBufs {};"),
+        "and an all-scan model's page gather is empty: {f}"
+    );
+}
+
+/// **#226 gotcha 3 — the sort destroys the ref-to-row correspondence.**
+///
+/// Views are built by buffer slot, then `keep` filters and `sort` reorders. After
+/// that, a view's index in the vector says nothing about the physical row it came
+/// from, so the page's second gather must map back through the slot recorded on the
+/// view. Mapping by position instead yields a page of *real rows in the wrong order*
+/// — every value valid, `total` correct, and only a byte-exact ordered assertion
+/// (`tests/api_wire_test.rs`, the `?sort=…&order=desc` scenarios) catches it.
+#[test]
+fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    assert!(
+        f.contains("let __page_rows: Vec<usize> = __page .iter() .map(|__r| __rows[__r.__slot]) .collect();"),
+        "the page's physical rows come from the ref's recorded slot: {f}"
+    );
+    // The two things it must NOT be: the selection's own order, or the page slice's
+    // position within it.
+    assert!(
+        !f.contains("__rows[__start"),
+        "not a slice of the selection: {f}"
+    );
+    assert!(
+        f.contains("let __row_ref = WidgetScanRef { __slot,"),
+        "and the slot is recorded at decode time, before any reordering: {f}"
+    );
+
+    // Pagination is applied inside the scope, with `Pagination::apply`'s arithmetic
+    // (both ends clamped, the addition saturating) against the post-sort count.
+    assert!(
+        f.contains(
+            "let __total = __refs.len(); sort(&mut __refs); let __start = offset.min(__total); \
+             let __end = offset.saturating_add(limit).min(__total); \
+             let __page = &__refs[__start..__end];"
+        ),
+        "total is counted before the page is sliced, and the slice clamps both ends: {f}"
+    );
+}

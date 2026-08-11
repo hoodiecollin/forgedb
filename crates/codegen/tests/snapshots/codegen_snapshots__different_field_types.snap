@@ -1455,6 +1455,142 @@ impl ComplexModelStorage {
         }
         f(&mut __refs)
     }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&ComplexModelScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<ComplexModelScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[ComplexModelPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __ComplexModelPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            count_col: forgedb_storage::BufferedFixedColumn,
+            price_col: forgedb_storage::BufferedFixedColumn,
+            active_col: forgedb_storage::BufferedFixedColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __ComplexModelPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            count_col: self
+                .count_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            price_col: self
+                .price_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            active_col: self
+                .active_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<ComplexModelScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let count_value = __bufs
+                .count_col
+                .read_i64(__slot)
+                .expect("Failed to read from column");
+            let price_value = __bufs
+                .price_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let active_value = __bufs
+                .active_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            let __row_ref = ComplexModelScanRef {
+                __slot,
+                id: id_value,
+                count: count_value,
+                price: price_value,
+                active: active_value,
+                created_at: created_at_value,
+                __borrow: ::std::marker::PhantomData,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __ComplexModelPageBufs {}
+        let __page_bufs = __ComplexModelPageBufs {};
+        let mut __views: Vec<ComplexModelPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(ComplexModelPageRef {
+                    id: __ref.id.clone(),
+                    count: __ref.count.clone(),
+                    price: __ref.price.clone(),
+                    active: __ref.active.clone(),
+                    created_at: __ref.created_at.clone(),
+                    __borrow: ::std::marker::PhantomData,
+                });
+        }
+        f(__total, &__views)
+    }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
     /// (`try_clone`d) descriptors, so it reads the committed prefix
