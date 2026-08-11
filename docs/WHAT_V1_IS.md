@@ -127,6 +127,23 @@ deploy path; and a stated [semver policy](./SEMVER.md).
   deferred: prefix search, `f64`/nullable ordered indexes, and the snapshot (`_at`)
   ordered form. Many-to-many junction lookups are still linear scans (and
   `unlink_<a>_<b>` / `unlink_all_*` is likewise a linear junction scan).
+- **The REST `list` filter is equality-only**, so the ordered index above is
+  unreachable from a query string: `?views=100` is the only spelling, and there is
+  no `?views__gte=100`. A client wanting "posts over 100 views" must over-fetch and
+  filter itself, even though `find_by_<field>_range` exists and is generated.
+  Tracked as [#284](https://github.com/hoodiecollin/forgedb/issues/284), which
+  extends the typed and REST surfaces together.
+- **The filter is also silently permissive**: an unparseable value (`?views=abc`)
+  returns `{"data":[],"total":0}` rather than an error, and an unknown filter key or
+  sort field is ignored, so a typo reads as "no rows match" or "no filter applied".
+  `IS NULL` has no query-string spelling. Fixed by
+  [#283](https://github.com/hoodiecollin/forgedb/issues/283) (→ **400**).
+- **Filter + sort + paginate has no typed Rust entry point.** That composition
+  exists only inside the private generated REST handler, so the generated
+  `Database` — the *primary* surface, with REST generated on top of it — is the
+  weaker of the two for querying: a direct Rust consumer must pull `all()` and
+  filter in memory. Tracked as
+  [#283](https://github.com/hoodiecollin/forgedb/issues/283).
 
 ### Operations
 - `/metrics` is minimal JSON (per-model row counts), **not** Prometheus text
