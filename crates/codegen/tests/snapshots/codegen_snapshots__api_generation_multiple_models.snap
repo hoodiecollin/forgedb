@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
-assertion_line: 224
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -98,28 +97,29 @@ async fn list_user(
         }
         None => {
             let __sel: Option<Vec<usize>> = None;
-            let (total, __page_ids) = db
+            return db
                 .user
-                .__with_scan(
+                .__with_page(
                     __sel,
                     |r| __user_scan_matches(r, &params),
                     |__scan: &mut Vec<super::UserScanRef<'_>>| {
                         __user_scan_sort(__scan, &qp.sort);
-                        let __total = __scan.len();
-                        let __ids: Vec<_> = qp
-                            .pagination
-                            .apply(__scan)
-                            .iter()
-                            .map(|r| r.id)
-                            .collect();
-                        (__total, __ids)
+                    },
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    |__total: usize, __page: &[super::UserPageRef<'_>]| {
+                        (
+                            StatusCode::OK,
+                            Json(__ListEnvelope {
+                                data: __page,
+                                total: __total,
+                                limit: qp.pagination.limit,
+                                offset: qp.pagination.offset,
+                            }),
+                        )
+                            .into_response()
                     },
                 );
-            let page: Vec<super::User> = __page_ids
-                .iter()
-                .filter_map(|__id| db.user.get(*__id))
-                .collect();
-            (page, total)
         }
     };
     (
@@ -434,28 +434,29 @@ async fn list_post(
         }
         None => {
             let __sel: Option<Vec<usize>> = None;
-            let (total, __page_ids) = db
+            return db
                 .post
-                .__with_scan(
+                .__with_page(
                     __sel,
                     |r| __post_scan_matches(r, &params),
                     |__scan: &mut Vec<super::PostScanRef<'_>>| {
                         __post_scan_sort(__scan, &qp.sort);
-                        let __total = __scan.len();
-                        let __ids: Vec<_> = qp
-                            .pagination
-                            .apply(__scan)
-                            .iter()
-                            .map(|r| r.id)
-                            .collect();
-                        (__total, __ids)
+                    },
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    |__total: usize, __page: &[super::PostPageRef<'_>]| {
+                        (
+                            StatusCode::OK,
+                            Json(__ListEnvelope {
+                                data: __page,
+                                total: __total,
+                                limit: qp.pagination.limit,
+                                offset: qp.pagination.offset,
+                            }),
+                        )
+                            .into_response()
                     },
                 );
-            let page: Vec<super::Post> = __page_ids
-                .iter()
-                .filter_map(|__id| db.post.get(*__id))
-                .collect();
-            (page, total)
         }
     };
     (

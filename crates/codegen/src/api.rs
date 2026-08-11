@@ -384,44 +384,121 @@ impl ApiGenerator {
             });
             quote! { #(#branches else)* { None } }
         };
-        let live_list_block = if has_id {
+        let page_ref_ident = format_ident!("{}PageRef", model.name);
+        // #226: the live, non-projected page — the whole list read, done inside the
+        // scan scope and returned as an already-serialized `Response`.
+        //
+        // Returning the response from inside the closure is what dissolves the
+        // higher-ranked-lifetime constraint the naive shape hits: the page views
+        // borrow the scan's buffers, so nothing that names their lifetime can leave
+        // the scope, but `Json(envelope).into_response()` produces an OWNED
+        // `Response`.  `__ListEnvelope` (`api.rs`, above) is already generic over the
+        // row type and holds `&'a [T]`, so it takes `&[PageRef<'_>]` unchanged — no
+        // `RawValue`, no string assembly, no envelope change.
+        //
+        // Replaces `__with_scan` + `__page_ids.filter_map(get)`, which re-read every
+        // page row through one positional `pread` per column — rows the scan had
+        // already decoded and dropped.  Measured at ~6.4 µs/row against the buffered
+        // scan's ~0.11 µs/row, i.e. 21.8% of the request at (10k rows, limit 50) and
+        // 91.8% at (1k rows, limit 1000).
+        //
+        // NOTE on the lost `filter_map` skip: `get(*__id)` returned `Option`, so a
+        // row deleted between the scan and the re-read was silently dropped from the
+        // page.  Under the read lock held here that is unreachable, and the buffered
+        // path has no second read to fail — `data.len()` is now exactly
+        // `min(limit, total - offset)`.  Not an observable change, and deliberately
+        // not reintroduced.
+        let page_scope_return = quote! {
+            let __sel: Option<Vec<usize>> = #row_selection;
+            return db.#storage_field.__with_page(
+                __sel,
+                |r| #scan_matches_fn(r, &params),
+                |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                    #scan_sort_fn(__scan, &qp.sort);
+                },
+                qp.pagination.offset,
+                qp.pagination.limit,
+                |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
+                    (
+                        StatusCode::OK,
+                        Json(__ListEnvelope {
+                            data: __page,
+                            total: __total,
+                            limit: qp.pagination.limit,
+                            offset: qp.pagination.offset,
+                        }),
+                    )
+                        .into_response()
+                },
+            );
+        };
+        // The OWNED narrow path (#160/#228), kept verbatim for the one live caller
+        // that still needs `Vec<Model>`: the `?projection=` arms field-copy the page
+        // rows into the projection struct, so they cannot take a borrowed view.
+        let owned_narrow_block = quote! {
+            let __sel: Option<Vec<usize>> = #row_selection;
+            // #228: filter, sort, count and page all run INSIDE the scan scope,
+            // on the borrowed view.  Only `(total, ids)` crosses the boundary —
+            // no scan row is ever materialized, so the strings of the rows that
+            // the page does not contain are never copied out of the buffer.
+            let (total, __page_ids) = db.#storage_field.__with_scan(
+                __sel,
+                |r| #scan_matches_fn(r, &params),
+                |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                    #scan_sort_fn(__scan, &qp.sort);
+                    let __total = __scan.len();
+                    let __ids: Vec<_> = qp.pagination
+                        .apply(__scan)
+                        .iter()
+                        .map(|r| r.#id_field)
+                        .collect();
+                    (__total, __ids)
+                },
+            );
+            // Full-materialize only the paginated page (or 404-skip a row that
+            // was deleted between the scan and here — the read lock makes that
+            // impossible, but `filter_map` is the honest primitive).
+            let page: Vec<super::#model_name> = __page_ids
+                .iter()
+                .filter_map(|__id| db.#storage_field.get(*__id))
+                .collect();
+        };
+        // The `None` (live) arm of the `as_of` match, as a whole expression.
+        //
+        // Three shapes, and which one is emitted is a property of the model, not a
+        // runtime branch — a model with no `@projection` has no owned caller left, so
+        // emitting the owned block for it would be dead code AFTER a `return`, i.e. an
+        // `unreachable_code` warning in the user's crate.
+        let live_list_arm = if !has_id {
+            // No identity ⇒ no `id_to_row`, so no narrow scan and no page scope
+            // either.  Unchanged full `all()` path.
             quote! {
-                let __sel: Option<Vec<usize>> = #row_selection;
-                // #228: filter, sort, count and page all run INSIDE the scan scope,
-                // on the borrowed view.  Only `(total, ids)` crosses the boundary —
-                // no scan row is ever materialized, so the strings of the rows that
-                // the page does not contain are never copied out of the buffer.
-                let (total, __page_ids) = db.#storage_field.__with_scan(
-                    __sel,
-                    |r| #scan_matches_fn(r, &params),
-                    |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
-                        #scan_sort_fn(__scan, &qp.sort);
-                        let __total = __scan.len();
-                        let __ids: Vec<_> = qp.pagination
-                            .apply(__scan)
-                            .iter()
-                            .map(|r| r.#id_field)
-                            .collect();
-                        (__total, __ids)
-                    },
-                );
-                // Full-materialize only the paginated page (or 404-skip a row that
-                // was deleted between the scan and here — the read lock makes that
-                // impossible, but `filter_map` is the honest primitive).
-                let page: Vec<super::#model_name> = __page_ids
-                    .iter()
-                    .filter_map(|__id| db.#storage_field.get(*__id))
-                    .collect();
+                {
+                    let mut rows: Vec<super::#model_name> = db.#storage_field.all()
+                        .into_iter()
+                        .filter(|r| #filter_fn(r, &params))
+                        .collect();
+                    #sort_fn(&mut rows, &qp.sort);
+                    let total = rows.len();
+                    let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                    (page, total)
+                }
             }
+        } else if model.projections.is_empty() {
+            // The common case: the borrowed page is the only live path, and this arm
+            // diverges (`!` coerces to the match's `(Vec<Model>, usize)`).
+            quote! { { #page_scope_return } }
         } else {
+            // `?projection=` needs owned rows to field-copy from, so it keeps the
+            // #160/#228 path; everything else takes the borrowed page.
             quote! {
-                let mut rows: Vec<super::#model_name> = db.#storage_field.all()
-                    .into_iter()
-                    .filter(|r| #filter_fn(r, &params))
-                    .collect();
-                #sort_fn(&mut rows, &qp.sort);
-                let total = rows.len();
-                let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                {
+                    if params.get("projection").is_none() {
+                        #page_scope_return
+                    }
+                    #owned_narrow_block
+                    (page, total)
+                }
             }
         };
 
@@ -492,10 +569,15 @@ impl ApiGenerator {
                     None => None,
                 };
                 let db = db.read().await;
-                // Materialize `page` (Vec<Model>) + `total`.  Two paths:
-                //  - live (no `as_of`): the #160 narrow path — filter/sort a scan
-                //    record (only filterable/sortable columns), full-materialize
-                //    ONLY the paginated page.
+                // Materialize `page` (Vec<Model>) + `total`.  Paths:
+                //  - live (no `as_of`), no `?projection=`: #226 — filter/sort the
+                //    #228 borrowed scan, then serialize the page's rows straight out
+                //    of a second buffered gather.  Returns the finished `Response`
+                //    from inside the scan scope; nothing is materialized at all.
+                //  - live with `?projection=`: the #160 narrow path — filter/sort a
+                //    scan record (only filterable/sortable columns), full-materialize
+                //    ONLY the paginated page, because the projection arms field-copy
+                //    owned rows.
                 //  - `as_of` snapshot: the original full-record path over
                 //    `all_at(&Snapshot)` (a rarer inspector read; #159 already made
                 //    its newest-version resolution sub-linear).
@@ -512,10 +594,7 @@ impl ApiGenerator {
                         let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
                         (page, total)
                     }
-                    None => {
-                        #live_list_block
-                        (page, total)
-                    }
+                    None => #live_list_arm,
                 };
                 #proj_list_block
                 // #229: borrow the page into the envelope — no intermediate

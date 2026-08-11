@@ -630,25 +630,53 @@ User {
     // either.  The #160 guarantee is unchanged: the live list still sources from the
     // narrow scan, never `all()`.
     assert!(
-        api_flat.contains("db .user .__with_scan("),
-        "#160/#224/#228: live list scans narrowly, inside the scan scope.\nGot: {api_flat}"
+        api_flat.contains("db .user .__with_page("),
+        "#160/#224/#228/#226: live list scans narrowly, inside the page scope.\nGot: {api_flat}"
     );
     assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
-    assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
-        "#160: only the paginated page is full-materialized");
+    // #226: the page is no longer full-materialized at all.  `User` declares no
+    // `@projection`, so there is no owned caller left and the second read through
+    // `get(id)` — one positional `pread` per column, on rows the scan had already
+    // decoded — is GONE.  This also drops `filter_map`'s silent skip of a row that
+    // vanished between the scan and the re-read: under the read lock held here that
+    // was unreachable, and the buffered path has no second read to fail, so
+    // `data.len()` is now exactly `min(limit, total - offset)`.  Deliberately not
+    // reintroduced — asserting the lenient shape here would re-enter it by the back
+    // door.
+    assert!(!api_flat.contains(".filter_map(|__id| db.user.get(*__id))"),
+        "#226: no second positional read of the page\nGot: {api_flat}");
+    assert!(!api_flat.contains("db .user .__with_scan("),
+        "#226: the owned narrow path is gone for a model with no @projection\nGot: {api_flat}");
     // The as_of branch keeps the full-record path (unchanged correctness).
     assert!(api_code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"),
         "#160: as_of retains the full snapshot read");
-    // #228: sort, count and pagination all happen INSIDE the callback, and only
-    // `(total, ids)` comes back out.  This is the constraint the issue commits to —
-    // if a future list feature needs more than ids from a scan, it comes inside.
+    // #228 put sort/count/pagination inside the scope so only `(total, ids)` escaped;
+    // #226 keeps them inside and stops anything escaping at all.  The `sort` callback
+    // is now sort-ONLY — `__with_page` owns the count and the `Pagination::apply`
+    // arithmetic, because it needs the paged slice to drive the second gather.
     assert!(
         api_flat.contains(
-            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); \
-             let __total = __scan.len(); let __ids: Vec<_> = qp .pagination .apply(__scan) \
-             .iter() .map(|r| r.id) .collect(); (__total, __ids) }"
+            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); }"
         ),
-        "#228: filter/sort/count/page run inside the scope; only (total, ids) escape.\nGot: {api_flat}"
+        "#226: the scan callback sorts and nothing else.\nGot: {api_flat}"
+    );
+    // ...and the value that leaves the scope is an already-serialized OWNED
+    // `Response`.  This is the whole trick: the page views borrow the scan's buffers,
+    // so nothing naming their lifetime can escape a higher-ranked scope — but
+    // `Json(envelope).into_response()` names none of it.  `__ListEnvelope` takes
+    // `&[PageRef<'_>]` unchanged (it is already generic + borrowing, #229), so there
+    // is no `RawValue` and no hand-assembled JSON anywhere on this path.
+    assert!(
+        api_flat.contains(
+            "|__total: usize, __page: &[super::UserPageRef<'_>]| { ( StatusCode::OK, \
+             Json(__ListEnvelope { data: __page, total: __total, limit: qp.pagination.limit, \
+             offset: qp.pagination.offset, }), ) .into_response() }"
+        ),
+        "#226: the page serializes from the buffers; only an owned Response escapes.\nGot: {api_flat}"
+    );
+    assert!(
+        api_flat.contains("return db .user .__with_page("),
+        "#226: the handler returns from inside the scope.\nGot: {api_flat}"
     );
 
     // #160 (C): index pushdown — an eligible indexed field's list filter resolves
@@ -663,7 +691,7 @@ User {
     assert!(api_code.contains("db.user.__rows_by_status(__v)"),
         "#160 C: live list tries index pushdown");
     assert!(
-        api_flat.contains("} else { None }; let (total, __page_ids) = db .user .__with_scan( __sel,"),
+        api_flat.contains("} else { None }; return db .user .__with_page( __sel,"),
         "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
@@ -10488,5 +10516,68 @@ fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
              let __page = &__refs[__start..__end];"
         ),
         "total is counted before the page is sliced, and the slice clamps both ends: {f}"
+    );
+}
+
+/// #226: a model that declares a `@projection` keeps the OWNED narrow path — but
+/// only for `?projection=` requests.
+///
+/// This is the one branch #226's Gate 2 did not anticipate ("repoint the
+/// `live_list_block` site" reads as a single substitution).  It cannot be a single
+/// substitution: `generate_projection_rest`'s list arms field-copy the page rows
+/// into the projection struct (`page.iter().map(|r| PostCard { title: r.title.clone(),
+/// .. })`), so they need `Vec<Post>`, which a borrowed view cannot supply.
+///
+/// The guard is deliberately two-sided, because BOTH failure modes are silent:
+/// keeping only the owned path would make #226 a no-op for every model with a
+/// projection (a perf regression that no test would notice), and keeping only the
+/// borrowed path would not compile — which is loud, but only if some test compiles
+/// a projected schema, and `insta` compares strings.
+#[test]
+fn test_api_generation_projection_model_keeps_an_owned_page() {
+    let src = r#"
+Post {
+  @projection(card: title, views)
+  id: +uuid
+  title: string
+  body: string
+  views: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f: String = api.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The borrowed page is still the default — it is guarded on the ABSENCE of the
+    // parameter, so a new projection-shaped feature cannot silently opt every
+    // request back onto the owned path.
+    assert!(
+        f.contains("if params.get(\"projection\").is_none() {"),
+        "#226: the borrowed page is guarded on there being no ?projection=: {f}"
+    );
+    assert!(
+        f.contains("return db .post .__with_page("),
+        "#226: a projected model still takes the page scope when unprojected: {f}"
+    );
+    // ...and the owned path survives for the projection arms to consume.
+    assert!(
+        f.contains("db .post .__with_scan("),
+        "#226: ?projection= keeps the #160/#228 owned narrow path: {f}"
+    );
+    assert!(
+        f.contains(".filter_map(|__id| db.post.get(*__id))"),
+        "#226: the owned path still full-materializes only the page: {f}"
+    );
+    assert!(
+        f.contains("let __data: Vec<super::PostCard> = page .iter() .map(|r| super::PostCard {"),
+        "the projection arm field-copies the OWNED page — the reason it survives: {f}"
+    );
+    // Both `__sel` computations are inside their own branch: `Option<Vec<usize>>` is
+    // moved into the callee, so one shared binding could not feed both.
+    assert_eq!(
+        f.matches("let __sel: Option<Vec<usize>> =").count(),
+        2,
+        "#226: each branch computes its own moved selection: {f}"
     );
 }
