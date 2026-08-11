@@ -1778,6 +1778,93 @@ impl UserStorage {
         }
         f(__total, &__views)
     }
+    /// Run `f` over one fully-decoded page **without scanning the table**
+    /// (#281) — the unfiltered, unsorted list read.
+    ///
+    /// Only valid when no filter and no sort applies, which the caller
+    /// establishes; there is deliberately no way to express one here.  The
+    /// rows, the page window and `total` are identical to
+    /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+    /// equality is a test obligation, not a comment (`page_identity_test`).
+    ///
+    /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+    /// against the live row count.  The buffers are locals, so they outlive
+    /// `f`; only `f`'s return value escapes.
+    pub fn __with_fast_page<R>(
+        &self,
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[UserPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = {
+            let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+            __all.sort_unstable();
+            self.tombstones
+                .live_indices(&__all)
+                .expect("Failed to read tombstone liveness")
+        };
+        let __total = __rows.len();
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        #[allow(non_camel_case_types)]
+        struct __UserFastPageBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+            email_col: forgedb_storage::BufferedVariableColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __UserFastPageBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            email_col: self
+                .email_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+        };
+        let mut __views: Vec<UserPageRef<'_>> = Vec::with_capacity(__end - __start);
+        for __pslot in 0..(__end - __start) {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let email_value = __bufs
+                .email_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__pslot)
+                    .expect("Failed to read from column"),
+            );
+            __views
+                .push(UserPageRef {
+                    id: id_value,
+                    name: name_value,
+                    email: email_value,
+                    created_at: created_at_value,
+                    posts: (),
+                });
+        }
+        f(__total, &__views)
+    }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
     /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
@@ -4175,6 +4262,116 @@ impl PostStorage {
         }
         f(__total, &__views)
     }
+    /// Run `f` over one fully-decoded page **without scanning the table**
+    /// (#281) — the unfiltered, unsorted list read.
+    ///
+    /// Only valid when no filter and no sort applies, which the caller
+    /// establishes; there is deliberately no way to express one here.  The
+    /// rows, the page window and `total` are identical to
+    /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+    /// equality is a test obligation, not a comment (`page_identity_test`).
+    ///
+    /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+    /// against the live row count.  The buffers are locals, so they outlive
+    /// `f`; only `f`'s return value escapes.
+    pub fn __with_fast_page<R>(
+        &self,
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[PostPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = {
+            let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+            __all.sort_unstable();
+            self.tombstones
+                .live_indices(&__all)
+                .expect("Failed to read tombstone liveness")
+        };
+        let __total = __rows.len();
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        #[allow(non_camel_case_types)]
+        struct __PostFastPageBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            title_col: forgedb_storage::BufferedVariableColumn,
+            views_col: forgedb_storage::BufferedFixedColumn,
+            published_col: forgedb_storage::BufferedFixedColumn,
+            author_col: forgedb_storage::BufferedFixedColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __PostFastPageBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            title_col: self
+                .title_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            views_col: self
+                .views_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            published_col: self
+                .published_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            author_col: self
+                .author_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+        };
+        let mut __views: Vec<PostPageRef<'_>> = Vec::with_capacity(__end - __start);
+        for __pslot in 0..(__end - __start) {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let title_value = __bufs
+                .title_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let views_value = __bufs
+                .views_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let published_value = __bufs
+                .published_col
+                .read_bool(__pslot)
+                .expect("Failed to read from column");
+            let author_value = {
+                let bytes = __bufs
+                    .author_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__pslot)
+                    .expect("Failed to read from column"),
+            );
+            __views
+                .push(PostPageRef {
+                    id: id_value,
+                    title: title_value,
+                    views: views_value,
+                    published: published_value,
+                    author: author_value,
+                    created_at: created_at_value,
+                    tags: (),
+                });
+        }
+        f(__total, &__views)
+    }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
     /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
@@ -5823,6 +6020,71 @@ impl TagStorage {
                 .push(TagPageRef {
                     id: __ref.id,
                     name: __ref.name,
+                    posts: (),
+                });
+        }
+        f(__total, &__views)
+    }
+    /// Run `f` over one fully-decoded page **without scanning the table**
+    /// (#281) — the unfiltered, unsorted list read.
+    ///
+    /// Only valid when no filter and no sort applies, which the caller
+    /// establishes; there is deliberately no way to express one here.  The
+    /// rows, the page window and `total` are identical to
+    /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+    /// equality is a test obligation, not a comment (`page_identity_test`).
+    ///
+    /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+    /// against the live row count.  The buffers are locals, so they outlive
+    /// `f`; only `f`'s return value escapes.
+    pub fn __with_fast_page<R>(
+        &self,
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[TagPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = {
+            let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+            __all.sort_unstable();
+            self.tombstones
+                .live_indices(&__all)
+                .expect("Failed to read tombstone liveness")
+        };
+        let __total = __rows.len();
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        #[allow(non_camel_case_types)]
+        struct __TagFastPageBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __TagFastPageBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+        };
+        let mut __views: Vec<TagPageRef<'_>> = Vec::with_capacity(__end - __start);
+        for __pslot in 0..(__end - __start) {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            __views
+                .push(TagPageRef {
+                    id: id_value,
+                    name: name_value,
                     posts: (),
                 });
         }
@@ -9329,6 +9591,273 @@ impl MetricStorage {
         }
         f(__total, &__views)
     }
+    /// Run `f` over one fully-decoded page **without scanning the table**
+    /// (#281) — the unfiltered, unsorted list read.
+    ///
+    /// Only valid when no filter and no sort applies, which the caller
+    /// establishes; there is deliberately no way to express one here.  The
+    /// rows, the page window and `total` are identical to
+    /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+    /// equality is a test obligation, not a comment (`page_identity_test`).
+    ///
+    /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+    /// against the live row count.  The buffers are locals, so they outlive
+    /// `f`; only `f`'s return value escapes.
+    pub fn __with_fast_page<R>(
+        &self,
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[MetricPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = {
+            let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+            __all.sort_unstable();
+            self.tombstones
+                .live_indices(&__all)
+                .expect("Failed to read tombstone liveness")
+        };
+        let __total = __rows.len();
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        #[allow(non_camel_case_types)]
+        struct __MetricFastPageBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            recorded_at_col: forgedb_storage::BufferedFixedColumn,
+            device_id_col: forgedb_storage::BufferedFixedColumn,
+            sample_seq_col: forgedb_storage::BufferedFixedColumn,
+            region_col: forgedb_storage::BufferedFixedColumn,
+            cpu_pct_col: forgedb_storage::BufferedFixedColumn,
+            mem_pct_col: forgedb_storage::BufferedFixedColumn,
+            disk_pct_col: forgedb_storage::BufferedFixedColumn,
+            net_rx_bytes_col: forgedb_storage::BufferedFixedColumn,
+            net_tx_bytes_col: forgedb_storage::BufferedFixedColumn,
+            req_count_col: forgedb_storage::BufferedFixedColumn,
+            err_count_col: forgedb_storage::BufferedFixedColumn,
+            p50_micros_col: forgedb_storage::BufferedFixedColumn,
+            p95_micros_col: forgedb_storage::BufferedFixedColumn,
+            p99_micros_col: forgedb_storage::BufferedFixedColumn,
+            queue_depth_col: forgedb_storage::BufferedFixedColumn,
+            open_conns_col: forgedb_storage::BufferedFixedColumn,
+            gc_pause_micros_col: forgedb_storage::BufferedFixedColumn,
+            uptime_secs_col: forgedb_storage::BufferedFixedColumn,
+            temp_celsius_col: forgedb_storage::BufferedFixedColumn,
+            throttled_col: forgedb_storage::BufferedFixedColumn,
+            healthy_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __MetricFastPageBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            recorded_at_col: self
+                .recorded_at_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            device_id_col: self
+                .device_id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            sample_seq_col: self
+                .sample_seq_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            region_col: self
+                .region_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            cpu_pct_col: self
+                .cpu_pct_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            mem_pct_col: self
+                .mem_pct_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            disk_pct_col: self
+                .disk_pct_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            net_rx_bytes_col: self
+                .net_rx_bytes_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            net_tx_bytes_col: self
+                .net_tx_bytes_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            req_count_col: self
+                .req_count_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            err_count_col: self
+                .err_count_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            p50_micros_col: self
+                .p50_micros_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            p95_micros_col: self
+                .p95_micros_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            p99_micros_col: self
+                .p99_micros_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            queue_depth_col: self
+                .queue_depth_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            open_conns_col: self
+                .open_conns_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            gc_pause_micros_col: self
+                .gc_pause_micros_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            uptime_secs_col: self
+                .uptime_secs_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            temp_celsius_col: self
+                .temp_celsius_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            throttled_col: self
+                .throttled_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            healthy_col: self
+                .healthy_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+        };
+        let mut __views: Vec<MetricPageRef<'_>> = Vec::with_capacity(__end - __start);
+        for __pslot in 0..(__end - __start) {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let recorded_at_value = Timestamp::from(
+                __bufs
+                    .recorded_at_col
+                    .read_timestamp(__pslot)
+                    .expect("Failed to read from column"),
+            );
+            let device_id_value = __bufs
+                .device_id_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let sample_seq_value = __bufs
+                .sample_seq_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let region_value = __bufs
+                .region_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let cpu_pct_value = __bufs
+                .cpu_pct_col
+                .read_f64(__pslot)
+                .expect("Failed to read from column");
+            let mem_pct_value = __bufs
+                .mem_pct_col
+                .read_f64(__pslot)
+                .expect("Failed to read from column");
+            let disk_pct_value = __bufs
+                .disk_pct_col
+                .read_f64(__pslot)
+                .expect("Failed to read from column");
+            let net_rx_bytes_value = __bufs
+                .net_rx_bytes_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let net_tx_bytes_value = __bufs
+                .net_tx_bytes_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let req_count_value = __bufs
+                .req_count_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let err_count_value = __bufs
+                .err_count_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let p50_micros_value = __bufs
+                .p50_micros_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let p95_micros_value = __bufs
+                .p95_micros_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let p99_micros_value = __bufs
+                .p99_micros_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let queue_depth_value = __bufs
+                .queue_depth_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let open_conns_value = __bufs
+                .open_conns_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let gc_pause_micros_value = __bufs
+                .gc_pause_micros_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let uptime_secs_value = __bufs
+                .uptime_secs_col
+                .read_i64(__pslot)
+                .expect("Failed to read from column");
+            let temp_celsius_value = __bufs
+                .temp_celsius_col
+                .read_f64(__pslot)
+                .expect("Failed to read from column");
+            let throttled_value = __bufs
+                .throttled_col
+                .read_bool(__pslot)
+                .expect("Failed to read from column");
+            let healthy_value = __bufs
+                .healthy_col
+                .read_bool(__pslot)
+                .expect("Failed to read from column");
+            __views
+                .push(MetricPageRef {
+                    id: id_value,
+                    recorded_at: recorded_at_value,
+                    device_id: device_id_value,
+                    sample_seq: sample_seq_value,
+                    region: region_value,
+                    cpu_pct: cpu_pct_value,
+                    mem_pct: mem_pct_value,
+                    disk_pct: disk_pct_value,
+                    net_rx_bytes: net_rx_bytes_value,
+                    net_tx_bytes: net_tx_bytes_value,
+                    req_count: req_count_value,
+                    err_count: err_count_value,
+                    p50_micros: p50_micros_value,
+                    p95_micros: p95_micros_value,
+                    p99_micros: p99_micros_value,
+                    queue_depth: queue_depth_value,
+                    open_conns: open_conns_value,
+                    gc_pause_micros: gc_pause_micros_value,
+                    uptime_secs: uptime_secs_value,
+                    temp_celsius: temp_celsius_value,
+                    throttled: throttled_value,
+                    healthy: healthy_value,
+                    __borrow: ::std::marker::PhantomData,
+                });
+        }
+        f(__total, &__views)
+    }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
     /// to `__with_scan` as its selection.  `None` ⇒ the param did not parse;
@@ -11243,6 +11772,120 @@ impl DocStorage {
                     body_b: __ref.body_b,
                     body_c: __ref.body_c,
                     body_d: __ref.body_d,
+                });
+        }
+        f(__total, &__views)
+    }
+    /// Run `f` over one fully-decoded page **without scanning the table**
+    /// (#281) — the unfiltered, unsorted list read.
+    ///
+    /// Only valid when no filter and no sort applies, which the caller
+    /// establishes; there is deliberately no way to express one here.  The
+    /// rows, the page window and `total` are identical to
+    /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+    /// equality is a test obligation, not a comment (`page_identity_test`).
+    ///
+    /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+    /// against the live row count.  The buffers are locals, so they outlive
+    /// `f`; only `f`'s return value escapes.
+    pub fn __with_fast_page<R>(
+        &self,
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[DocPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = {
+            let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+            __all.sort_unstable();
+            self.tombstones
+                .live_indices(&__all)
+                .expect("Failed to read tombstone liveness")
+        };
+        let __total = __rows.len();
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        #[allow(non_camel_case_types)]
+        struct __DocFastPageBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            seq_col: forgedb_storage::BufferedFixedColumn,
+            kind_col: forgedb_storage::BufferedFixedColumn,
+            body_a_col: forgedb_storage::BufferedVariableColumn,
+            body_b_col: forgedb_storage::BufferedVariableColumn,
+            body_c_col: forgedb_storage::BufferedVariableColumn,
+            body_d_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __DocFastPageBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            seq_col: self
+                .seq_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            kind_col: self
+                .kind_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            body_a_col: self
+                .body_a_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            body_b_col: self
+                .body_b_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            body_c_col: self
+                .body_c_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+            body_d_col: self
+                .body_d_col
+                .gather_buffered(&__rows[__start..__end])
+                .expect("Failed to bulk-load fast-page column"),
+        };
+        let mut __views: Vec<DocPageRef<'_>> = Vec::with_capacity(__end - __start);
+        for __pslot in 0..(__end - __start) {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let seq_value = __bufs
+                .seq_col
+                .read_u64(__pslot)
+                .expect("Failed to read from column");
+            let kind_value = __bufs
+                .kind_col
+                .read_u32(__pslot)
+                .expect("Failed to read from column");
+            let body_a_value = __bufs
+                .body_a_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let body_b_value = __bufs
+                .body_b_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let body_c_value = __bufs
+                .body_c_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            let body_d_value = __bufs
+                .body_d_col
+                .read_str(__pslot)
+                .expect("Failed to read string");
+            __views
+                .push(DocPageRef {
+                    id: id_value,
+                    seq: seq_value,
+                    kind: kind_value,
+                    body_a: body_a_value,
+                    body_b: body_b_value,
+                    body_c: body_c_value,
+                    body_d: body_d_value,
                 });
         }
         f(__total, &__views)
