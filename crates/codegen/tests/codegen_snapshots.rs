@@ -10698,9 +10698,23 @@ Post {
     //    assertion is actually for — is that the predicate is answered ONCE, ahead of
     //    everything, rather than inside the `keep` closure. An assertion rewritten to
     //    whatever the emitter happens to say would not be a guard.
+    //
+    //    `sel` anchors on the pushdown CALL, not on `let __sel`. That distinction is
+    //    load-bearing and was found by mutating: resolving the pushdown into an
+    //    earlier binding and merely rebinding it here (`let __sel = __sel_early;`)
+    //    leaves the binding in place, so a name-anchored assertion stays green while
+    //    the index probe has moved onto the fast path — the exact waste this ordering
+    //    exists to prevent. `views` is indexed for precisely this reason: with no
+    //    indexed field the emitted selection is the literal `None` and there is no
+    //    work whose position could be wrong.
     let sel = f
-        .find("let __sel: Option<Vec<usize>> =")
-        .expect("selection binding");
+        .find("__rows_by_views(")
+        .expect("the index-pushdown selection expression");
+    assert_eq!(
+        f.matches("__rows_by_views(").count(),
+        1,
+        "#281: one pushdown site on the list path, so `sel` below is unambiguous: {f}"
+    );
     let keep = f
         .find("let __keep_all: bool =")
         .expect("hoisted predicate binding");
@@ -10711,7 +10725,7 @@ Post {
     assert!(
         keep < fast && fast < sel && sel < page,
         "#288/#281: the predicate is answered first, gates the fast page, and only \
-         then does the scan path bind its selection \
+         then does the scan path probe the index \
          (keep={keep}, fast={fast}, sel={sel}, page={page}): {f}"
     );
 }
