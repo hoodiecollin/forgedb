@@ -17,6 +17,12 @@
 //! that burstiness is made of.
 
 mod driver;
+/// `--var-sweep` only. Its `unbounded` target links the GITIGNORED `churn_probe`
+/// config variant, so the whole module is gated behind `--features matrix` (#279)
+/// — otherwise every mode of this example, including the ones that need no
+/// variant, would fail to build in a clean clone. Run it via
+/// `make bench-workload-var`, which regenerates the variants and sets the feature.
+#[cfg(feature = "matrix")]
 mod doc_targets;
 mod forgedb_target;
 mod redb_target;
@@ -374,6 +380,7 @@ fn scan_sweep(live: usize, ladder: &[f64], samples: usize, engines: &[&str]) {
 
 /// One `Doc`-subject measurement point: preload to a state, then time N scans of each
 /// kind. Returns `(projection_p50, narrow_p50, footprint, reached_amplification)`.
+#[cfg(feature = "matrix")]
 fn doc_point(
     mut t: Box<dyn WorkloadTarget>,
     cfg: &WorkloadConfig,
@@ -393,6 +400,7 @@ fn doc_point(
     (out[0], out[1], t.footprint(), amp)
 }
 
+#[cfg(feature = "matrix")]
 fn doc_cfg(live: usize, a: f64, payload: usize, skew: Option<f64>) -> WorkloadConfig {
     WorkloadConfig {
         preload: live,
@@ -415,6 +423,13 @@ fn doc_cfg(live: usize, a: f64, payload: usize, skew: Option<f64>) -> WorkloadCo
 /// Three tables, each isolating one axis. The `Projection` column is the in-run control
 /// throughout — `@projection(meta: seq, kind)` reads fixed columns only, so it never
 /// touches a `VariableColumn` and should stay flat.
+///
+/// Gated on `--features matrix`: it runs against the gitignored `churn_probe` variant,
+/// because the default build caps amplification at `1 + 4000/live_rows` and a slope
+/// cannot be established over a 1.4x lever arm. There is deliberately no fallback to
+/// the default build — that would silently measure compaction-ON and report it as this
+/// sweep.
+#[cfg(feature = "matrix")]
 fn var_sweep(live: usize, samples: usize, full: bool) {
     let ladder: &[f64] =
         if full { &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0] } else { &[1.0, 2.0, 4.0, 8.0, 16.0] };
@@ -583,8 +598,25 @@ fn main() {
 
     if args.iter().any(|a| a == "--var-sweep") {
         let (live, samples) = if full { (10_000, 50) } else { (2_000, 20) };
-        var_sweep(live, samples, full);
-        return;
+        #[cfg(feature = "matrix")]
+        {
+            var_sweep(live, samples, full);
+            return;
+        }
+        // Not built with the churn_probe variant linked in. Refuse rather than fall back
+        // to the default build, which would measure compaction-ON and label it otherwise.
+        #[cfg(not(feature = "matrix"))]
+        {
+            let _ = (live, samples);
+            eprintln!(
+                "--var-sweep needs the gitignored `churn_probe` config variant, which is only\n\
+                 compiled under `--features matrix`. Run it with:\n\n    \
+                 make bench-workload-var{}\n\n\
+                 (that regenerates benchmarks/gen/<variant>/ and sets the feature). See #279.",
+                if full { " ARGS=\"--full\"" } else { "" }
+            );
+            std::process::exit(2);
+        }
     }
 
     if args.iter().any(|a| a == "--scan-sweep") {

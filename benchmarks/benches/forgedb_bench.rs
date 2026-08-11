@@ -7,7 +7,7 @@ use std::cell::Cell;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use forgedb_benchmarks::{dataset, id_for, Dataset};
 use forgedb_benchmarks::forgedb_generated::{Database, Post, Tag, User};
-use forgedb_types::Timestamp;
+use forgedb_benchmarks::ts_from_seconds;
 use uuid::Uuid;
 
 // Fixed corpus for the read/traversal scenarios (built once, outside timing).
@@ -21,7 +21,7 @@ fn user_of(row: &forgedb_benchmarks::UserRow) -> User {
         id: Uuid::from_bytes(row.id),
         name: row.name.clone(),
         email: row.email.clone(),
-        created_at: Timestamp::from_seconds(row.created_at),
+        created_at: ts_from_seconds(row.created_at),
         posts: (),
     }
 }
@@ -33,7 +33,7 @@ fn post_of(row: &forgedb_benchmarks::PostRow) -> Post {
         views: row.views,
         published: row.published,
         author: Uuid::from_bytes(row.author),
-        created_at: Timestamp::from_seconds(row.created_at),
+        created_at: ts_from_seconds(row.created_at),
         tags: (),
     }
 }

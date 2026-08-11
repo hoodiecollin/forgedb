@@ -17,7 +17,7 @@ use std::path::Path;
 use duckdb::{params as dparams, Connection as DuckConn};
 use forgedb_benchmarks::forgedb_generated::{Database, Post, Tag, User};
 use forgedb_benchmarks::{dataset, Dataset, PostRow, TagRow, UserRow};
-use forgedb_types::Timestamp;
+use forgedb_benchmarks::ts_from_seconds;
 use redb::{Database as Redb, Durability, MultimapTableDefinition, TableDefinition};
 use rusqlite::{params, Connection};
 use uuid::Uuid;
@@ -60,7 +60,7 @@ fn user_of(r: &UserRow) -> User {
         id: Uuid::from_bytes(r.id),
         name: r.name.clone(),
         email: r.email.clone(),
-        created_at: Timestamp::from_seconds(r.created_at),
+        created_at: ts_from_seconds(r.created_at),
         posts: (),
     }
 }
@@ -71,7 +71,7 @@ fn post_of(r: &PostRow) -> Post {
         views: r.views,
         published: r.published,
         author: Uuid::from_bytes(r.author),
-        created_at: Timestamp::from_seconds(r.created_at),
+        created_at: ts_from_seconds(r.created_at),
         tags: (),
     }
 }
