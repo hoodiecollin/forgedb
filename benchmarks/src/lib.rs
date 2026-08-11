@@ -56,6 +56,17 @@ pub const TAGS_PER_POST: usize = 3;
 /// Base unix-seconds for `created_at`, so timestamps are stable across runs.
 const BASE_TS: i64 = 1_700_000_000;
 
+/// The engine-agnostic rows below keep `created_at` in unix **seconds** (see
+/// [`BASE_TS`]) because that is what SQLite / redb / DuckDB / PG store. ForgeDB's
+/// `Timestamp` is **microseconds** since #254 (`6106cc0` removed the
+/// `Timestamp::from_seconds` every bench source used to call), so the mapping into
+/// the generated types lives here exactly once — five bench sources converting
+/// independently is five chances to disagree about the unit, which would silently
+/// change what the cross-engine comparison is comparing.
+pub fn ts_from_seconds(secs: i64) -> forgedb_types::Timestamp {
+    forgedb_types::Timestamp::from_micros(secs * 1_000_000)
+}
+
 /// Engine-agnostic rows. Each engine maps these into its own types, so the bytes
 /// on disk differ only by the engine's encoding — never by the data.
 #[derive(Clone)]

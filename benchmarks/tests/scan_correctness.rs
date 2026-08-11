@@ -1,7 +1,12 @@
-//! #168 correctness: the generated bulk-buffered `__scan_all()` must return
-//! exactly the same live records — with byte-identical decoded values — as the
+//! #168 correctness: the generated bulk-buffered narrow scan must return exactly
+//! the same live records — with byte-identical decoded values — as the
 //! authoritative per-id read path (`all()` / `get()`), under insert + update +
 //! delete churn and across a string (variable) column plus fixed columns.
+//!
+//! Since #228 that scan is a **scope**, `__with_scan(sel, keep, f)`, handing `f` a
+//! `Vec<PostScanRef<'_>>` that borrows the column buffers; the owned `__scan_all()`
+//! this test was written against no longer exists. The values compared are the
+//! same, so the guard is unchanged — the refs are just copied out inside the scope.
 //!
 //! The scan drops the per-row tombstone check (it pre-filters the live set via
 //! one bulk `Tombstones::live_indices`) and decodes from bulk-loaded column
@@ -45,13 +50,24 @@ fn ground_truth(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
         .collect()
 }
 
-/// The same map, but decoded through the bulk-buffered `__scan_all()`.
+/// The same map, but decoded through the bulk-buffered scan scope `__with_scan()`.
+/// `keep` is `|_| true` (no filter) and the map is built INSIDE the scope, because a
+/// `PostScanRef` borrows the scan's column buffers and cannot outlive it.
 fn from_scan(db: &Database) -> BTreeMap<Uuid, (String, u64, bool, i64)> {
-    db.post
-        .__scan_all()
-        .into_iter()
-        .map(|r| (r.id, (r.title, r.views, r.published, i64::from(r.created_at))))
-        .collect()
+    db.post.__with_scan(
+        None,
+        |_| true,
+        |scan| {
+            scan.iter()
+                .map(|r| {
+                    (
+                        r.id,
+                        (r.title.to_string(), r.views, r.published, i64::from(r.created_at)),
+                    )
+                })
+                .collect()
+        },
+    )
 }
 
 /// The projected (views, published) columns keyed by id, from the per-id read
@@ -138,5 +154,8 @@ fn buffered_scan_matches_per_row_reads_under_churn() {
 fn buffered_scan_empty_model() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_at(dir.path().to_path_buf());
-    assert!(db.post.__scan_all().is_empty(), "empty model scans to []");
+    assert!(
+        db.post.__with_scan(None, |_| true, |scan| scan.is_empty()),
+        "empty model scans to []"
+    );
 }

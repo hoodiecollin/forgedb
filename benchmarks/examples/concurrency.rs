@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use forgedb_benchmarks::forgedb_generated::{Database, User};
 use forgedb_benchmarks::{dataset, id_for};
-use forgedb_types::Timestamp;
+use forgedb_benchmarks::ts_from_seconds;
 use uuid::Uuid;
 
 const READ_USERS: usize = 1_000;
@@ -38,7 +38,7 @@ fn run(threads: usize, with_writer: bool) -> (f64, f64) {
                 id: Uuid::from_bytes(u.id),
                 name: u.name.clone(),
                 email: u.email.clone(),
-                created_at: Timestamp::from_seconds(u.created_at),
+                created_at: ts_from_seconds(u.created_at),
                 posts: (),
             })
             .unwrap();
@@ -51,7 +51,7 @@ fn run(threads: usize, with_writer: bool) -> (f64, f64) {
                 views: p.views,
                 published: p.published,
                 author: Uuid::from_bytes(p.author),
-                created_at: Timestamp::from_seconds(p.created_at),
+                created_at: ts_from_seconds(p.created_at),
                 tags: (),
             })
             .unwrap();
@@ -82,7 +82,7 @@ fn run(threads: usize, with_writer: bool) -> (f64, f64) {
                     id,
                     name: "w".into(),
                     email: format!("conc{n}@example.com"),
-                    created_at: Timestamp::from_seconds(1_700_000_000),
+                    created_at: ts_from_seconds(1_700_000_000),
                     posts: (),
                 });
                 writes.fetch_add(1, Ordering::Relaxed);

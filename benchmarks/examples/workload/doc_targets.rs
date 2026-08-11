@@ -165,8 +165,15 @@ macro_rules! forge_doc_target {
                     // in `Narrow` attributable to the variable path rather than to
                     // machine state.
                     ScanKind::Projection => self.db().doc.all_meta().len(),
-                    // Drags all four string columns through `gather_buffered`.
-                    ScanKind::Narrow => self.db().doc.__scan_all().len(),
+                    // Drags all four string columns through `gather_buffered`. Since
+                    // #228 the narrow scan is a SCOPE (`__with_scan`) rather than an
+                    // owned `Vec<Doc>`: the refs are still built eagerly, one per live
+                    // row, so the buffered decode under test is unchanged — only the
+                    // per-row `String` allocation that #228 removed is gone.
+                    ScanKind::Narrow => self
+                        .db()
+                        .doc
+                        .__with_scan(None, |_| true, |scan| scan.len()),
                 };
                 OpOutcome::rows(n.min(limit) as u64)
             }
