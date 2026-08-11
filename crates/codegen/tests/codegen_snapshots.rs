@@ -690,13 +690,22 @@ User {
         "#160 C/#228: unique-indexed field resolves candidate rows");
     assert!(api_code.contains("db.user.__rows_by_status(__v)"),
         "#160 C: live list tries index pushdown");
+    // #281 moved the predicate ABOVE the selection, so the pushdown chain now runs
+    // straight into the page call again — its pre-#288 spelling. The two properties
+    // are asserted separately rather than as one literal, because they are two
+    // different claims and only one of them is #160's.
+    assert!(
+        api_flat.contains("} else { None }; return db .user .__with_page( __sel,"),
+        "#160 C: a parse-failure falls back to the full scan (never misses a match), \
+         and the resolved selection feeds the page call directly.\nGot: {api_flat}"
+    );
     assert!(
         api_flat.contains(
-            "} else { None }; let __keep_all: bool = __user_is_unfiltered(&params); \
-             return db .user .__with_page( __sel,"
+            "let __keep_all: bool = __user_is_unfiltered(&params); \
+             if __keep_all && qp.sort.is_none() {"
         ),
-        "#160 C: a parse-failure falls back to the full scan (never misses a match), and \
-         #288's hoist sits between the selection and the page call.\nGot: {api_flat}"
+        "#288/#281: the predicate is hoisted out of the per-row loop AND gates the \
+         fast page, both before the selection is resolved.\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
     // pushdown field — it falls through to the narrow scan.
@@ -10506,9 +10515,39 @@ fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
     );
     // The two things it must NOT be: the selection's own order, or the page slice's
     // position within it.
+    //
+    // **Scoped to `__with_page`'s own body, and that scoping is #281's doing.** This
+    // was a file-wide negative until #281 emitted `__with_fast_page`, whose page slice
+    // is literally `__rows[__start..__end]` — correct *there*, because with no `keep`
+    // and no `sort` a view's position IS its slot, and wrong *here* for exactly the
+    // reason the doc comment above gives. Rescoped rather than dodged by renaming
+    // #281's binding: the assertion's intent is about `__with_page`, and a rename
+    // would have kept the test green while deleting what it tests.
+    //
+    // The slice is bounded by the next `pub fn` AFTER the match, with the end of the
+    // string as the fallback — a following `pub fn` exists here only because
+    // `PAGE_REF_SRC`'s `Widget` happens to emit a pushdown resolver, which is a
+    // property of the fixture and not of the emitter.
+    let method_body = |name: &str| -> &str {
+        let start = f
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is emitted: {f}"));
+        let end = f[start + 1..]
+            .find("pub fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(f.len());
+        &f[start..end]
+    };
     assert!(
-        !f.contains("__rows[__start"),
+        !method_body("pub fn __with_page").contains("__rows[__start"),
         "not a slice of the selection: {f}"
+    );
+    // #281's mirror positive: in the FAST page, slicing the selection is the whole
+    // point, and the gather is bounded to that slice rather than to the table.
+    assert!(
+        method_body("pub fn __with_fast_page")
+            .contains("gather_buffered(&__rows[__start..__end])"),
+        "#281: the fast page gathers the page's rows, not the table's: {f}"
     );
     assert!(
         f.contains("let __row_ref = WidgetScanRef { __slot,"),
@@ -10649,20 +10688,45 @@ Post {
         "#288: the per-row closure short-circuits on the hoisted bool: {f}"
     );
 
-    // 3. ORDERING — the part a behaviour test cannot see. The binding sits between
-    //    the selection and the page call, so the fast test happens before the scan
-    //    rather than inside it.
+    // 3. ORDERING — the part a behaviour test cannot see. The binding is evaluated
+    //    before the scan is set up, not inside the per-row closure.
+    //
+    //    **#281 moved the binding above `__sel`** and this assertion moved with it.
+    //    #288 pinned `sel < keep < page`; #281's fast-path branch reads `__keep_all`
+    //    and returns before `#row_selection` is ever spliced, so the order is now
+    //    `keep < fast branch < sel < page`. What is preserved — and what this
+    //    assertion is actually for — is that the predicate is answered ONCE, ahead of
+    //    everything, rather than inside the `keep` closure. An assertion rewritten to
+    //    whatever the emitter happens to say would not be a guard.
+    //
+    //    `sel` anchors on the pushdown CALL, not on `let __sel`. That distinction is
+    //    load-bearing and was found by mutating: resolving the pushdown into an
+    //    earlier binding and merely rebinding it here (`let __sel = __sel_early;`)
+    //    leaves the binding in place, so a name-anchored assertion stays green while
+    //    the index probe has moved onto the fast path — the exact waste this ordering
+    //    exists to prevent. `views` is indexed for precisely this reason: with no
+    //    indexed field the emitted selection is the literal `None` and there is no
+    //    work whose position could be wrong.
     let sel = f
-        .find("let __sel: Option<Vec<usize>> =")
-        .expect("selection binding");
+        .find("__rows_by_views(")
+        .expect("the index-pushdown selection expression");
+    assert_eq!(
+        f.matches("__rows_by_views(").count(),
+        1,
+        "#281: one pushdown site on the list path, so `sel` below is unambiguous: {f}"
+    );
     let keep = f
         .find("let __keep_all: bool =")
         .expect("hoisted predicate binding");
+    let fast = f
+        .find("if __keep_all && qp.sort.is_none() {")
+        .expect("#281: fast-page branch");
     let page = f.find("return db .post .__with_page(").expect("page call");
     assert!(
-        sel < keep && keep < page,
-        "#288: the hoist must sit between `__sel` and the page call \
-         (sel={sel}, keep={keep}, page={page}): {f}"
+        keep < fast && fast < sel && sel < page,
+        "#288/#281: the predicate is answered first, gates the fast page, and only \
+         then does the scan path probe the index \
+         (keep={keep}, fast={fast}, sel={sel}, page={page}): {f}"
     );
 }
 

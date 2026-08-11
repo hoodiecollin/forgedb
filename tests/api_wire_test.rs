@@ -420,6 +420,44 @@ Churn {
   note: string
   seq: ^u32
 }
+
+// #281 (S9). `Item.vendor` is the ONE field class whose `borrowed` flag genuinely
+// flips between the two page construction sites: it is non-scan (a relation is never
+// filterable, so it is not in the scan set) AND inline-string, so the read path moves
+// between the owned and the borrowed arm of `field_read_stmt`. Nothing else in this
+// schema has that shape — `Widget.owner` is a uuid-keyed FK.
+//
+// A frozen literal here, in addition to `page_identity_test`'s site-vs-site grid,
+// because the two catch different failures: the grid catches a change that moves ONE
+// site, a literal catches one that moves BOTH.
+Vendor {
+  id: string(4!)
+  name: string
+  items: [Item]
+}
+
+Item {
+  id: +uuid
+  sku: string
+  vendor: *Vendor
+}
+
+// #281 (S11). `limit`/`offset`/`sort`/`order` are not lexer keywords, so a model may
+// legally declare them as fields — and for THIS model `?limit=1` really is a filter.
+// It is the single case where the positive predicate ("does any key name a filterable
+// field of this model?") and a negative reserved-key exclusion list visibly differ:
+// under the negative form the fast path fires and returns the unfiltered page.
+//
+// None of them is indexed, deliberately. An indexed field resolves through the
+// pushdown arm before any per-row work, which would produce the right answer on its
+// own and mask a broken predicate entirely.
+Gauge {
+  id: +uuid
+  limit: u32
+  offset: u32
+  sort: string
+  order: string
+}
 "#;
 
 #[test]
@@ -457,6 +495,10 @@ const NOTE_B: &str = "66666666-6666-6666-6666-666666666666";
 const CHURN_0: &str = "77777777-0000-0000-0000-000000000000";
 const CHURN_1: &str = "77777777-1111-1111-1111-111111111111";
 const CHURN_2: &str = "77777777-2222-2222-2222-222222222222";
+const ITEM_A: &str = "88888888-0000-0000-0000-000000000000";
+const ITEM_B: &str = "88888888-1111-1111-1111-111111111111";
+const GAUGE_A: &str = "99999999-0000-0000-0000-000000000000";
+const GAUGE_B: &str = "99999999-1111-1111-1111-111111111111";
 
 /// Superseding versions appended to `CHURN_2`. Each `update` appends a physical
 /// row, so the live set ends up `{0, 1, 2 + CHURN_UPDATES}` — a span of
@@ -601,6 +643,39 @@ async fn main() {
         })
         .expect("create churn");
     }
+    // #281 S9. One vendor, two items: `Item.vendor` is the non-scan inline-string FK
+    // whose `borrowed` flag flips between the two page construction sites.
+    db.create_vendor(Vendor {
+        id: forgedb_types::InlineStr::try_from("acme").expect("vendor key is 4 chars"),
+        name: "Acme".to_string(),
+        items: (),
+    })
+    .expect("create vendor");
+    for (id, sku) in [(ITEM_A, "sku-a"), (ITEM_B, "sku-b")] {
+        db.create_item(Item {
+            id: uuid(id),
+            sku: sku.to_string(),
+            vendor: forgedb_types::InlineStr::try_from("acme").expect("vendor key"),
+        })
+        .expect("create item");
+    }
+
+    // #281 S11. TWO gauges, and the `>= 2` is load-bearing: with a single row the
+    // negative-form predicate would take the fast path and return that same row with
+    // `total: 1` — byte-identical to the filtered answer, so the scenario would stay
+    // green under its own discriminating mutation. A second, non-matching row makes
+    // the mutation change both `total` and the `data` array.
+    for (id, lim) in [(GAUGE_A, 1u32), (GAUGE_B, 7)] {
+        db.create_gauge(Gauge {
+            id: uuid(id),
+            limit: lim,
+            offset: 0,
+            sort: "none".to_string(),
+            order: "asc".to_string(),
+        })
+        .expect("create gauge");
+    }
+
     // Same values every time: the churn is about *physical row placement*, so the
     // wire bytes must not move with it.
     for _ in 0..CHURN_UPDATES {
@@ -815,6 +890,130 @@ async fn main() {
     // live read, not merely unchanged from a literal copied beside it.
     let uri = &format!("/api/widget?as_of={widget_rows}&sort=serial");
     check(uri, call(router(), uri).await, 200, &live_page);
+
+    // --- W1 (#281): the UNFILTERED, UNSORTED page — the fast path ---
+    //
+    // Every URI above carries `?sort=` or a field filter, so before this block the
+    // fast path was invisible to the byte guard: it could have been emitted, never
+    // taken, and every assertion here would still pass. These are the requests that
+    // reach it.
+    //
+    // Byte-identical to the sorted reads above, and that equality is the assertion
+    // rather than a fresh literal: `widget_a` is created before `widget_b` and
+    // `note_a` before `note_b`, so on this fixture physical order coincides with
+    // serial/weight order. That is convenient and it is also the caveat — these
+    // three URIs pin the BYTES and the WINDOW, not the ordering. Ordering is pinned
+    // where it can actually be discriminated: `tests/list_scan_test.rs` recomputes
+    // the physical order of a churned corpus independently, and
+    // `tests/page_identity_test.rs` compares the two construction sites over a
+    // 1,000-row corpus whose updates and deletes genuinely scramble it.
+    let uri = "/api/widget";
+    check(uri, call(router(), uri).await, 200, &live_page);
+    let uri = "/api/note";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{note_a},{note_b}],"total":2,"limit":50,"offset":0}}"#),
+    );
+    let uri = "/api/churn";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_0},{churn_1},{churn_2}],"total":3,"limit":50,"offset":0}}"#),
+    );
+
+    // The fast path's own pagination arithmetic. `offset` past the end and `limit`
+    // shorter than the page are where the clamping lives, and neither is expressible
+    // through any sorted URI above.
+    let uri = "/api/widget?limit=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        // `total` is the live-row count, NOT the page length — the envelope's
+        // pagination fields describe the window, `total` describes the set it is a
+        // window onto. A fast path that returned `__page.len()` here would look
+        // right on every unpaginated URI above.
+        &format!(r#"{{"data":[{widget_a}],"total":2,"limit":1,"offset":0}}"#),
+    );
+    let uri = "/api/widget?offset=5";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        r#"{"data":[],"total":2,"limit":50,"offset":5}"#,
+    );
+    let uri = "/api/churn?limit=2&offset=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_1},{churn_2}],"total":3,"limit":2,"offset":1}}"#),
+    );
+
+    // `?projection=` on a model that declares NO `@projection`. `#proj_list_block` is
+    // empty for such a model, so `projection` is an ordinary unknown key naming no
+    // filterable field: the predicate holds and the fast path is taken. Asserted
+    // against the bare URI's own answer, so "unchanged" means unchanged from the
+    // request it must equal. If a future change makes `projection` a predicate term,
+    // this silently starts returning the scan path's envelope with no compile error.
+    let uri = "/api/widget?projection=card";
+    check(uri, call(router(), uri).await, 200, &live_page);
+
+    // #281 S9: the non-scan, inline-string FK. `Item.vendor` is decoded through a
+    // different arm of `field_read_stmt` on the fast path than on the scan path, so
+    // a frozen literal is what says the two arms produce the same bytes.
+    let item_a = format!(r#"{{"id":"{ITEM_A}","sku":"sku-a","vendor":"acme"}}"#);
+    let item_b = format!(r#"{{"id":"{ITEM_B}","sku":"sku-b","vendor":"acme"}}"#);
+    let uri = "/api/item";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{item_a},{item_b}],"total":2,"limit":50,"offset":0}}"#),
+    );
+
+    // --- W2 (#281): `?as_of=` is a DIFFERENT arm, and the watermark must cut below
+    // the create count or the scenario cannot discriminate ---
+    //
+    // Scenario 9 above asserts the snapshot page EQUALS the live page, which is the
+    // right assertion there and is exactly why it cannot catch a fast-path branch
+    // hoisted above `match __as_of`: both sides would be the live page. `Churn` does
+    // not fix that by itself — it is churned with IDENTICAL values by construction,
+    // so at any watermark at or after the three creates the snapshot read is
+    // byte-identical to the live read. `as_of=2` cuts below the third create, so the
+    // two pages differ in ROW COUNT, and a hoist returns 3 rows where 2 are expected.
+    let uri = "/api/churn?as_of=2";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_0},{churn_1}],"total":2,"limit":50,"offset":0}}"#),
+    );
+
+    // --- W3 (#281 S11): a model that legally declares `limit`/`offset`/`sort`/`order`
+    // as FIELDS — the only scenario separating the two predicate forms ---
+    //
+    // Every other scenario in this file passes under both the positive predicate
+    // ("does any key name a filterable field of this model?") and a negative
+    // reserved-key exclusion list. Here they differ: `?limit=1` names a real field of
+    // `Gauge`, so the filter must apply. Under the negative form the name is excluded,
+    // the fast path fires, and BOTH gauges come back.
+    //
+    // `?limit=1` is simultaneously a filter (set 1) and the page limit (set 3), and
+    // both behaviours are asserted — the row is filtered to `limit == 1` AND the
+    // envelope's `limit` is 1. Asserting only one documents half of what it proves.
+    let gauge_a =
+        format!(r#"{{"id":"{GAUGE_A}","limit":1,"offset":0,"sort":"none","order":"asc"}}"#);
+    let uri = "/api/gauge?limit=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{gauge_a}],"total":1,"limit":1,"offset":0}}"#),
+    );
 
     let failures = unsafe { FAILURES };
     if failures > 0 {

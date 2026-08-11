@@ -412,14 +412,50 @@ impl ApiGenerator {
         // path has no second read to fail — `data.len()` is now exactly
         // `min(limit, total - offset)`.  Not an observable change, and deliberately
         // not reintroduced.
+        // The response shape, bound once and spliced into BOTH page calls (#281).
+        // Two splices are two independent closures — it captures only the `Copy`
+        // pagination scalars — so there is no borrow interaction between them, and
+        // the envelope keeps exactly one definition.
+        let page_envelope_closure = quote! {
+            |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
+                (
+                    StatusCode::OK,
+                    Json(__ListEnvelope {
+                        data: __page,
+                        total: __total,
+                        limit: qp.pagination.limit,
+                        offset: qp.pagination.offset,
+                    }),
+                )
+                    .into_response()
+            }
+        };
         let page_scope_return = quote! {
-            let __sel: Option<Vec<usize>> = #row_selection;
             // #288: loop-invariant, so it is answered before the scan rather than on
             // every scanned row. `__keep_all || matches(..)` is exactly equivalent to
             // `matches(..)` — when no key names a filterable field, every `params.get`
             // inside `matches` misses and it returns true for every record — so this
             // is a pure evaluation-order change with no observable behaviour.
             let __keep_all: bool = #is_unfiltered_fn(&params);
+            // #281: with nothing to filter and nothing to sort, the page was knowable
+            // from the live row set alone — `keep` accepts everything, `sort` reorders
+            // nothing, so `__refs[i].__slot == i` and the scan's full-table gather
+            // decodes every row only to throw all but `limit` of them away. Take the
+            // page-bounded gather instead. Same rows, same order, same `total`, same
+            // bytes; that equality is guarded, not assumed.
+            //
+            // `__sel` is deliberately BELOW this: index pushdown resolves only fields
+            // `is_filterable_field` admits, so a request that names none resolves no
+            // index and `#row_selection` would be pure waste on this path. Placing the
+            // branch first makes that structural rather than a comment.
+            if __keep_all && qp.sort.is_none() {
+                return db.#storage_field.__with_fast_page(
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    #page_envelope_closure,
+                );
+            }
+            let __sel: Option<Vec<usize>> = #row_selection;
             return db.#storage_field.__with_page(
                 __sel,
                 |r| __keep_all || #scan_matches_fn(r, &params),
@@ -428,18 +464,7 @@ impl ApiGenerator {
                 },
                 qp.pagination.offset,
                 qp.pagination.limit,
-                |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
-                    (
-                        StatusCode::OK,
-                        Json(__ListEnvelope {
-                            data: __page,
-                            total: __total,
-                            limit: qp.pagination.limit,
-                            offset: qp.pagination.offset,
-                        }),
-                    )
-                        .into_response()
-                },
+                #page_envelope_closure,
             );
         };
         // The OWNED narrow path (#160/#228), kept verbatim for the one live caller

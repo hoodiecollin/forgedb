@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen_snapshots.rs
+assertion_line: 217
 expression: result.code
 ---
 //! Generated API server by ForgeDB
@@ -96,12 +97,32 @@ async fn list_user(
             (page, total)
         }
         None => {
+            let __keep_all: bool = __user_is_unfiltered(&params);
+            if __keep_all && qp.sort.is_none() {
+                return db
+                    .user
+                    .__with_fast_page(
+                        qp.pagination.offset,
+                        qp.pagination.limit,
+                        |__total: usize, __page: &[super::UserPageRef<'_>]| {
+                            (
+                                StatusCode::OK,
+                                Json(__ListEnvelope {
+                                    data: __page,
+                                    total: __total,
+                                    limit: qp.pagination.limit,
+                                    offset: qp.pagination.offset,
+                                }),
+                            )
+                                .into_response()
+                        },
+                    );
+            }
             let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("email") {
                 db.user.__rows_by_email(__v)
             } else {
                 None
             };
-            let __keep_all: bool = __user_is_unfiltered(&params);
             return db
                 .user
                 .__with_page(

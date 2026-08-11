@@ -67,6 +67,21 @@
 //!   correctly; it is visible only as a *warning* in the user's crate, so the test
 //!   reads build diagnostics via `common::build_warnings`.
 //!
+//! # #281 — the unfiltered fast page
+//!
+//! #281 gave the unfiltered, unsorted request its own construction site
+//! (`__with_fast_page`), which builds the page from a bounded gather rather than
+//! from a full-table scan the caller then windows. Two sites means the answer can
+//! now diverge, and the WINDOW is where it would: the fast site slices before
+//! gathering, so an off-by-one in `__start`/`__end` there is invisible to any test
+//! that only ever reads the whole set.
+//!
+//! The unfiltered cases at the end of the table close that. They matter *here*
+//! specifically because this oracle is independent — it recomputes the physical
+//! order from its own append-only mirror. `tests/page_identity_test.rs` compares the
+//! two sites against each other over a far larger corpus, which is the stronger
+//! check of agreement but no check at all of whether they agree on the right answer.
+//!
 //! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
 //! default suite. Run it explicitly:
 //!
@@ -591,6 +606,60 @@ async fn main() {
             "/api/post?sort=views&limit=500".to_string(),
             vec![],
             Some(("views", false)),
+            Some(500),
+            0,
+        ),
+        // --- #281: the UNFILTERED, UNSORTED page, WINDOWED ------------------------
+        //
+        // The one unfiltered case above (`/api/post`) reads the whole live set, so
+        // it pins the order but never exercises the window. These do both, and this
+        // is the file where they belong: the oracle recomputes the physical order
+        // from its own append-only mirror rather than comparing two readers, so it
+        // is the only place the ORDER of #281's page is checked against something
+        // that is not itself the implementation.
+        //
+        // That order is genuinely discriminating here. Updating 1, 5, 9 moves them
+        // to the tail and deleting 3, 7 punches holes, so the live physical order is
+        // [0, 2, 4, 6, 8, 10, 11, 1, 5, 9] — nothing like id order, insertion order,
+        // or any field's sort order. A window taken from the wrong sequence lands on
+        // different ids rather than the same ids differently arranged.
+        (
+            "#281 unsorted + limit — the window is cut from PHYSICAL order",
+            "/api/post?limit=3".to_string(),
+            vec![],
+            None,
+            Some(3),
+            0,
+        ),
+        (
+            "#281 unsorted + offset&limit — an interior window straddling the churn tail",
+            "/api/post?limit=3&offset=6".to_string(),
+            vec![],
+            None,
+            Some(3),
+            6,
+        ),
+        (
+            "#281 unsorted — a window running off the end clamps, it does not wrap",
+            "/api/post?limit=5&offset=9".to_string(),
+            vec![],
+            None,
+            Some(5),
+            9,
+        ),
+        (
+            "#281 unsorted — offset past the end is an empty page, total unchanged",
+            "/api/post?limit=5&offset=100".to_string(),
+            vec![],
+            None,
+            Some(5),
+            100,
+        ),
+        (
+            "#281 unsorted — limit larger than the live set",
+            "/api/post?limit=500".to_string(),
+            vec![],
+            None,
             Some(500),
             0,
         ),
