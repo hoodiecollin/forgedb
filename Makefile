@@ -258,8 +258,12 @@ f64-index-key:
 ## REST wire-format proof (#229): generate + compile a real API, boot the generated
 ## router in-process, and assert the exact response bytes of every read path —
 ## envelope key order, record key order, projections, and the error bodies. Guards
-## the list path against silent wire changes from #226/#228. Also #[ignore]d out of
-## the fast suite (compiles a crate).
+## the list path against silent wire changes from #226/#228. Two tests, so two
+## generated crates: #229's baseline, plus #226's list-page guard over a schema
+## carrying a nullable string / decimal / enum / timestamp / bytes(N) / [T; N] /
+## inline struct / required FK / virtual [Model], a model whose identity field is
+## declared SECOND, and a churned model whose live rows are sparse enough to send
+## `gather_buffered` down `gather_sparse`. Also #[ignore]d out of the fast suite.
 api-wire-test:
 	cargo test --test api_wire_test -- --ignored --nocapture
 
