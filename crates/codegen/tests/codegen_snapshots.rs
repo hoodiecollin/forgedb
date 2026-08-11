@@ -630,25 +630,53 @@ User {
     // either.  The #160 guarantee is unchanged: the live list still sources from the
     // narrow scan, never `all()`.
     assert!(
-        api_flat.contains("db .user .__with_scan("),
-        "#160/#224/#228: live list scans narrowly, inside the scan scope.\nGot: {api_flat}"
+        api_flat.contains("db .user .__with_page("),
+        "#160/#224/#228/#226: live list scans narrowly, inside the page scope.\nGot: {api_flat}"
     );
     assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
-    assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
-        "#160: only the paginated page is full-materialized");
+    // #226: the page is no longer full-materialized at all.  `User` declares no
+    // `@projection`, so there is no owned caller left and the second read through
+    // `get(id)` — one positional `pread` per column, on rows the scan had already
+    // decoded — is GONE.  This also drops `filter_map`'s silent skip of a row that
+    // vanished between the scan and the re-read: under the read lock held here that
+    // was unreachable, and the buffered path has no second read to fail, so
+    // `data.len()` is now exactly `min(limit, total - offset)`.  Deliberately not
+    // reintroduced — asserting the lenient shape here would re-enter it by the back
+    // door.
+    assert!(!api_flat.contains(".filter_map(|__id| db.user.get(*__id))"),
+        "#226: no second positional read of the page\nGot: {api_flat}");
+    assert!(!api_flat.contains("db .user .__with_scan("),
+        "#226: the owned narrow path is gone for a model with no @projection\nGot: {api_flat}");
     // The as_of branch keeps the full-record path (unchanged correctness).
     assert!(api_code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"),
         "#160: as_of retains the full snapshot read");
-    // #228: sort, count and pagination all happen INSIDE the callback, and only
-    // `(total, ids)` comes back out.  This is the constraint the issue commits to —
-    // if a future list feature needs more than ids from a scan, it comes inside.
+    // #228 put sort/count/pagination inside the scope so only `(total, ids)` escaped;
+    // #226 keeps them inside and stops anything escaping at all.  The `sort` callback
+    // is now sort-ONLY — `__with_page` owns the count and the `Pagination::apply`
+    // arithmetic, because it needs the paged slice to drive the second gather.
     assert!(
         api_flat.contains(
-            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); \
-             let __total = __scan.len(); let __ids: Vec<_> = qp .pagination .apply(__scan) \
-             .iter() .map(|r| r.id) .collect(); (__total, __ids) }"
+            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); }"
         ),
-        "#228: filter/sort/count/page run inside the scope; only (total, ids) escape.\nGot: {api_flat}"
+        "#226: the scan callback sorts and nothing else.\nGot: {api_flat}"
+    );
+    // ...and the value that leaves the scope is an already-serialized OWNED
+    // `Response`.  This is the whole trick: the page views borrow the scan's buffers,
+    // so nothing naming their lifetime can escape a higher-ranked scope — but
+    // `Json(envelope).into_response()` names none of it.  `__ListEnvelope` takes
+    // `&[PageRef<'_>]` unchanged (it is already generic + borrowing, #229), so there
+    // is no `RawValue` and no hand-assembled JSON anywhere on this path.
+    assert!(
+        api_flat.contains(
+            "|__total: usize, __page: &[super::UserPageRef<'_>]| { ( StatusCode::OK, \
+             Json(__ListEnvelope { data: __page, total: __total, limit: qp.pagination.limit, \
+             offset: qp.pagination.offset, }), ) .into_response() }"
+        ),
+        "#226: the page serializes from the buffers; only an owned Response escapes.\nGot: {api_flat}"
+    );
+    assert!(
+        api_flat.contains("return db .user .__with_page("),
+        "#226: the handler returns from inside the scope.\nGot: {api_flat}"
     );
 
     // #160 (C): index pushdown — an eligible indexed field's list filter resolves
@@ -663,7 +691,7 @@ User {
     assert!(api_code.contains("db.user.__rows_by_status(__v)"),
         "#160 C: live list tries index pushdown");
     assert!(
-        api_flat.contains("} else { None }; let (total, __page_ids) = db .user .__with_scan( __sel,"),
+        api_flat.contains("} else { None }; return db .user .__with_page( __sel,"),
         "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
@@ -7411,8 +7439,15 @@ User {
     // every other filterable field keeps the owned record's exact type (that is
     // what lets ONE emitted filter compile against both views).
     assert!(
+        flat.contains("pub struct UserScanRef<'a> {"),
+        "UserScanRef is emitted.\nGot: {flat}"
+    );
+    // #226 put the internal buffer slot first, ahead of the field set; the doc
+    // comment on it sits between the two, so this asserts the field list from
+    // `__slot` on rather than from the opening brace.
+    assert!(
         flat.contains(
-            "pub struct UserScanRef<'a> { pub id: Uuid, pub email: &'a str, \
+            "pub __slot: usize, pub id: Uuid, pub email: &'a str, \
              pub bio: Option<&'a str>, pub age: u32, pub score: f64, }"
         ),
         "UserScanRef borrows strings and mirrors every other scan field type.\nGot: {flat}"
@@ -10102,7 +10137,7 @@ fn test_rust_generation_the_scan_view_holds_a_string_key_by_value() {
     let code = db_for("Airport {\n  id: string(3!)\n  city: string\n}\n");
     let f = flat(&code);
     assert!(
-        f.contains("pub struct AirportScanRef<'a> { pub id: InlineStr<3usize>"),
+        f.contains("pub __slot: usize, pub id: InlineStr<3usize>"),
         "the scan view's key is owned and Copy: {f:.400}"
     );
     assert!(
@@ -10206,5 +10241,343 @@ fn test_rust_generation_an_auto_under_another_name_is_still_the_identity() {
     assert!(
         f.contains("id_to_row: std::sync::Arc<HashMap<Uuid, usize>>"),
         "{f:.400}"
+    );
+}
+
+// ---- #226: the borrowed full-record page view ----
+
+/// The schema #226's generator guards are written against — the same shape
+/// `tests/api_wire_test.rs`'s `PAGE_SCHEMA` uses, and for the same reasons.
+///
+/// `Widget.serial` is declared **after** every field the scan set excludes
+/// (`scores`, `dims`, `owner`, `parts`, `payload`), which is the maximal
+/// divergence between declaration order and `scan_field_set` order — a `PageRef`
+/// built by appending the excluded fields to the scan set emits
+/// `…checksum, serial, scores, dims, owner, payload` where the model emits
+/// `…checksum, scores, dims, owner, parts, payload, serial`. On a model whose
+/// filterable fields happen to be declared last, both constructions agree and the
+/// guard proves nothing.
+///
+/// `Note` declares its identity **second**, which is the only shape that catches
+/// an identity-first page view: `scan_field_set` pushes the identity field first
+/// unconditionally, so `NoteScanRef` really is `{ id, body, weight }` against a
+/// model of `{ body, id, weight }`.
+const PAGE_REF_SRC: &str = r#"
+enum Tier { Free, Pro, Enterprise }
+
+struct Dims {
+  w: u32
+  h: u32
+}
+
+Widget {
+  id: +uuid
+  label: string?
+  price: decimal
+  tier: ^Tier
+  made_at: timestamp(ms)
+  checksum: bytes(4)
+  scores: [i32; 3]
+  dims: Dims
+  owner: *Maker
+  parts: [Part]
+  payload: json
+  serial: ^u32
+}
+
+Maker {
+  id: +uuid
+  name: string
+  widgets: [Widget]
+}
+
+Part {
+  id: +uuid
+  name: string
+  widget: *Widget
+}
+
+Note {
+  body: string
+  id: +uuid
+  weight: ^u32
+}
+"#;
+
+/// **#226 gotcha 1 — JSON key order is the wire contract.**
+///
+/// `serde_json` emits struct fields in declaration order, so `<Model>PageRef`'s
+/// field order *is* the bytes on the socket. It must be `model.fields` order, NOT
+/// `scan_field_set` order (identity first, then the filterable columns) with the
+/// remaining fields appended: those two are semantically equal and byte-different,
+/// and a `Value`-comparing test cannot tell them apart.
+#[test]
+fn test_rust_generation_page_ref_field_order() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The divergence this guard exists for, made explicit: the scan view is
+    // identity-first-then-filterable and stops at `serial`...
+    assert!(
+        f.contains(
+            "pub struct WidgetScanRef<'a> { /// #226: the scan buffer slot this view \
+             was decoded at — the only /// thing that survives the sort's reordering \
+             to say which physical /// row it came from. Internal; this view is not \
+             `Serialize`. pub __slot: usize, pub id: Uuid, pub label: Option<&'a str>, \
+             pub price: rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, \
+             pub checksum: [u8; 4usize], pub serial: u32, }"
+        ),
+        "the scan view is identity-first, filterable-only: {f}"
+    );
+    // ...while the page view is the model's own declaration order, in full.
+    assert!(
+        f.contains(
+            "pub struct WidgetPageRef<'a> { pub id: Uuid, pub label: Option<&'a str>, \
+             #[serde(with = \"rust_decimal::serde::str\")] pub price: \
+             rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "the page view is model declaration order, every field: {f}"
+    );
+    // The model it has to serialize identically to, for the same field list.
+    assert!(
+        f.contains(
+            "pub struct Widget { #[serde(default)] pub id: Uuid, pub label: \
+             Option<String>, #[schema(value_type = String)] #[serde(with = \
+             \"rust_decimal::serde::str\")] pub price: rust_decimal::Decimal, pub \
+             tier: Tier, #[schema(value_type = String)] pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "and the model's order is what it is being held to: {f}"
+    );
+
+    // Identity declared SECOND — the only shape that catches an identity-first
+    // page view. The scan view really does reorder here, so this is not a
+    // hypothetical.
+    assert!(
+        f.contains("pub struct NotePageRef<'a> { pub body: &'a str, pub id: Uuid, pub weight: u32, }"),
+        "an identity declared second stays second on the wire: {f}"
+    );
+    assert!(
+        f.contains("pub id: Uuid, pub body: &'a str, pub weight: u32, }"),
+        "while the scan view for the same model IS identity-first: {f}"
+    );
+
+    // The page view is a distinct type, not `ScanRef` with `Serialize` bolted on
+    // (#224's decision that the scan view is never a wire type stands).
+    assert!(
+        f.contains("#[derive(Debug, Clone)] pub struct WidgetScanRef<'a>"),
+        "the scan view still derives neither Serialize nor ToSchema: {f}"
+    );
+    assert!(
+        f.contains("#[derive(serde::Serialize)] pub struct WidgetPageRef<'a>"),
+        "and the page view derives Serialize only — no Deserialize, no ToSchema: {f}"
+    );
+}
+
+/// **#226 gotcha 2 — `json` must not go through the borrowed path.**
+///
+/// Today's page read is `get(id)` → a positional `read_string` → `from_str` into a
+/// `serde_json::Value`, and `Value`'s map is a `BTreeMap`, so that round-trip
+/// *normalizes* a stored object's key order. A borrowed `&str` / `RawValue`
+/// passthrough would emit the **stored** order instead and silently change the bytes
+/// of every json field in every list response. The win #226 measured does not depend
+/// on json at all, so the correct move is to leave it alone.
+///
+/// Two things make that concrete, and both are asserted here:
+///
+/// - `json` is not filterable (`ApiGenerator::is_filterable_field`), so it is never
+///   in `scan_field_set` and can only reach the page view through the page gather.
+/// - the page gather runs `field_read_stmt` with `borrowed = false`, so json decodes
+///   through `read_string` + `from_str` — the identical statement `read_at` emits,
+///   receiver and index aside.
+///
+/// The negative assertion is the load-bearing one: `read_str` (the borrowed
+/// accessor #224 added) must appear nowhere near the payload column.
+#[test]
+fn test_rust_generation_page_ref_excludes_json_from_buffers() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The page view holds an OWNED `serde_json::Value`, not a borrowed `&'a str`.
+    assert!(
+        f.contains("pub payload: serde_json::Value,"),
+        "json is an owned Value on the page view: {f}"
+    );
+    assert!(
+        !f.contains("pub payload: &'a str") && !f.contains("pub payload: Option<&'a str>"),
+        "and never a borrowed passthrough: {f}"
+    );
+
+    // It is gathered by the PAGE buffers (bounded to the page's physical rows),
+    // never by the scan buffers — it is not filterable, so it is not in the scan set.
+    // NOTE on the spacing in every needle below: `flat` collapses whitespace runs
+    // to one space, and prettyplease breaks method chains across lines, so the
+    // emitted text really is `self .payload_col .gather_buffered(..)`. Writing the
+    // unspaced form makes a POSITIVE assertion fail loudly — and a NEGATIVE one pass
+    // vacuously, which is the dangerous half.
+    assert!(
+        f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__page_rows) \
+             .expect(\"Failed to bulk-load page column\")"
+        ),
+        "json is gathered over the page's rows: {f}"
+    );
+    assert!(
+        !f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__rows) \
+             .expect(\"Failed to bulk-load scan column\")"
+        ),
+        "json never enters the full-table scan gather: {f}"
+    );
+
+    // The decode is the `Value` round-trip, and it is the SAME statement `read_at`
+    // emits — receiver and index aside. That equality is what makes the bytes
+    // identical rather than merely similar.
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = __page_bufs .payload_col .read_string(__pslot) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "the page decodes json through read_string + from_str: {f}"
+    );
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = self .payload_col .read_string(row_index) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "which is exactly what read_at does: {f}"
+    );
+    assert!(
+        !f.contains("payload_col .read_str(") && !f.contains("payload_col.read_str("),
+        "the borrowed accessor is never used for json: {f}"
+    );
+
+    // The complement, stated positively: the page gather holds exactly the delta
+    // Gate 2 named — FK, json, [T; N], inline struct — and nothing the scan already
+    // decoded. `parts` (a virtual `[Model]`) has no column at all and is defaulted.
+    assert!(
+        f.contains(
+            "struct __WidgetPageBufs { scores_col: forgedb_storage::BufferedFixedColumn, \
+             dims_col: forgedb_storage::BufferedFixedColumn, \
+             owner_col: forgedb_storage::BufferedFixedColumn, \
+             payload_col: forgedb_storage::BufferedVariableColumn, } let __page_bufs"
+        ),
+        "the page gather is exactly the scan set's complement: {f}"
+    );
+    assert!(
+        f.contains("parts: (),"),
+        "a virtual relation is defaulted, not gathered: {f}"
+    );
+    // A model whose every field IS in the scan set gathers nothing for the page.
+    assert!(
+        f.contains("struct __MakerPageBufs {} let __page_bufs = __MakerPageBufs {};"),
+        "and an all-scan model's page gather is empty: {f}"
+    );
+}
+
+/// **#226 gotcha 3 — the sort destroys the ref-to-row correspondence.**
+///
+/// Views are built by buffer slot, then `keep` filters and `sort` reorders. After
+/// that, a view's index in the vector says nothing about the physical row it came
+/// from, so the page's second gather must map back through the slot recorded on the
+/// view. Mapping by position instead yields a page of *real rows in the wrong order*
+/// — every value valid, `total` correct, and only a byte-exact ordered assertion
+/// (`tests/api_wire_test.rs`, the `?sort=…&order=desc` scenarios) catches it.
+#[test]
+fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    assert!(
+        f.contains("let __page_rows: Vec<usize> = __page .iter() .map(|__r| __rows[__r.__slot]) .collect();"),
+        "the page's physical rows come from the ref's recorded slot: {f}"
+    );
+    // The two things it must NOT be: the selection's own order, or the page slice's
+    // position within it.
+    assert!(
+        !f.contains("__rows[__start"),
+        "not a slice of the selection: {f}"
+    );
+    assert!(
+        f.contains("let __row_ref = WidgetScanRef { __slot,"),
+        "and the slot is recorded at decode time, before any reordering: {f}"
+    );
+
+    // Pagination is applied inside the scope, with `Pagination::apply`'s arithmetic
+    // (both ends clamped, the addition saturating) against the post-sort count.
+    assert!(
+        f.contains(
+            "let __total = __refs.len(); sort(&mut __refs); let __start = offset.min(__total); \
+             let __end = offset.saturating_add(limit).min(__total); \
+             let __page = &__refs[__start..__end];"
+        ),
+        "total is counted before the page is sliced, and the slice clamps both ends: {f}"
+    );
+}
+
+/// #226: a model that declares a `@projection` keeps the OWNED narrow path — but
+/// only for `?projection=` requests.
+///
+/// This is the one branch #226's Gate 2 did not anticipate ("repoint the
+/// `live_list_block` site" reads as a single substitution).  It cannot be a single
+/// substitution: `generate_projection_rest`'s list arms field-copy the page rows
+/// into the projection struct (`page.iter().map(|r| PostCard { title: r.title.clone(),
+/// .. })`), so they need `Vec<Post>`, which a borrowed view cannot supply.
+///
+/// The guard is deliberately two-sided, because BOTH failure modes are silent:
+/// keeping only the owned path would make #226 a no-op for every model with a
+/// projection (a perf regression that no test would notice), and keeping only the
+/// borrowed path would not compile — which is loud, but only if some test compiles
+/// a projected schema, and `insta` compares strings.
+#[test]
+fn test_api_generation_projection_model_keeps_an_owned_page() {
+    let src = r#"
+Post {
+  @projection(card: title, views)
+  id: +uuid
+  title: string
+  body: string
+  views: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f: String = api.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The borrowed page is still the default — it is guarded on the ABSENCE of the
+    // parameter, so a new projection-shaped feature cannot silently opt every
+    // request back onto the owned path.
+    assert!(
+        f.contains("if params.get(\"projection\").is_none() {"),
+        "#226: the borrowed page is guarded on there being no ?projection=: {f}"
+    );
+    assert!(
+        f.contains("return db .post .__with_page("),
+        "#226: a projected model still takes the page scope when unprojected: {f}"
+    );
+    // ...and the owned path survives for the projection arms to consume.
+    assert!(
+        f.contains("db .post .__with_scan("),
+        "#226: ?projection= keeps the #160/#228 owned narrow path: {f}"
+    );
+    assert!(
+        f.contains(".filter_map(|__id| db.post.get(*__id))"),
+        "#226: the owned path still full-materializes only the page: {f}"
+    );
+    assert!(
+        f.contains("let __data: Vec<super::PostCard> = page .iter() .map(|r| super::PostCard {"),
+        "the projection arm field-copies the OWNED page — the reason it survives: {f}"
+    );
+    // Both `__sel` computations are inside their own branch: `Option<Vec<usize>>` is
+    // moved into the callee, so one shared binding could not feed both.
+    assert_eq!(
+        f.matches("let __sel: Option<Vec<usize>> =").count(),
+        2,
+        "#226: each branch computes its own moved selection: {f}"
     );
 }

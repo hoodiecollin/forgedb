@@ -207,10 +207,23 @@ pub struct User {
 ///Borrowed narrow scan view for `User` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct UserScanRef<'a> {
+    /// #226: the scan buffer slot this view was decoded at — the only
+    /// thing that survives the sort's reordering to say which physical
+    /// row it came from.  Internal; this view is not `Serialize`.
+    pub __slot: usize,
     pub id: Uuid,
     pub name: &'a str,
     pub email: &'a str,
     pub created_at: Timestamp,
+}
+///Borrowed full-record page view for `User` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `User` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct UserPageRef<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub email: &'a str,
+    pub created_at: Timestamp,
+    pub posts: (),
 }
 ///Storage for User model
 pub struct UserStorage {
@@ -1629,6 +1642,7 @@ impl UserStorage {
                     .expect("Failed to read from column"),
             );
             let __row_ref = UserScanRef {
+                __slot,
                 id: id_value,
                 name: name_value,
                 email: email_value,
@@ -1639,6 +1653,130 @@ impl UserStorage {
             }
         }
         f(&mut __refs)
+    }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&UserScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<UserScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[UserPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __UserPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+            email_col: forgedb_storage::BufferedVariableColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __UserPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            email_col: self
+                .email_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<UserScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let email_value = __bufs
+                .email_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            let __row_ref = UserScanRef {
+                __slot,
+                id: id_value,
+                name: name_value,
+                email: email_value,
+                created_at: created_at_value,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __UserPageBufs {}
+        let __page_bufs = __UserPageBufs {};
+        let mut __views: Vec<UserPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(UserPageRef {
+                    id: __ref.id,
+                    name: __ref.name,
+                    email: __ref.email,
+                    created_at: __ref.created_at,
+                    posts: (),
+                });
+        }
+        f(__total, &__views)
     }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -1914,11 +2052,26 @@ pub struct PostAgg {
 ///Borrowed narrow scan view for `Post` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct PostScanRef<'a> {
+    /// #226: the scan buffer slot this view was decoded at — the only
+    /// thing that survives the sort's reordering to say which physical
+    /// row it came from.  Internal; this view is not `Serialize`.
+    pub __slot: usize,
     pub id: Uuid,
     pub title: &'a str,
     pub views: u64,
     pub published: bool,
     pub created_at: Timestamp,
+}
+///Borrowed full-record page view for `Post` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Post` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct PostPageRef<'a> {
+    pub id: Uuid,
+    pub title: &'a str,
+    pub views: u64,
+    pub published: bool,
+    pub author: Uuid,
+    pub created_at: Timestamp,
+    pub tags: (),
 }
 ///Storage for Post model
 pub struct PostStorage {
@@ -3859,6 +4012,7 @@ impl PostStorage {
                     .expect("Failed to read from column"),
             );
             let __row_ref = PostScanRef {
+                __slot,
                 id: id_value,
                 title: title_value,
                 views: views_value,
@@ -3870,6 +4024,156 @@ impl PostStorage {
             }
         }
         f(&mut __refs)
+    }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&PostScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<PostScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[PostPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __PostPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            title_col: forgedb_storage::BufferedVariableColumn,
+            views_col: forgedb_storage::BufferedFixedColumn,
+            published_col: forgedb_storage::BufferedFixedColumn,
+            created_at_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __PostPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            title_col: self
+                .title_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            views_col: self
+                .views_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            published_col: self
+                .published_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            created_at_col: self
+                .created_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<PostScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let title_value = __bufs
+                .title_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let views_value = __bufs
+                .views_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let published_value = __bufs
+                .published_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let created_at_value = Timestamp::from(
+                __bufs
+                    .created_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            let __row_ref = PostScanRef {
+                __slot,
+                id: id_value,
+                title: title_value,
+                views: views_value,
+                published: published_value,
+                created_at: created_at_value,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __PostPageBufs {
+            author_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __page_bufs = __PostPageBufs {
+            author_col: self
+                .author_col
+                .gather_buffered(&__page_rows)
+                .expect("Failed to bulk-load page column"),
+        };
+        let mut __views: Vec<PostPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            let author_value = {
+                let bytes = __page_bufs
+                    .author_col
+                    .read_uuid(__pslot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            __views
+                .push(PostPageRef {
+                    id: __ref.id,
+                    title: __ref.title,
+                    views: __ref.views,
+                    published: __ref.published,
+                    author: author_value,
+                    created_at: __ref.created_at,
+                    tags: (),
+                });
+        }
+        f(__total, &__views)
     }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -4147,8 +4451,19 @@ pub struct Tag {
 ///Borrowed narrow scan view for `Tag` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct TagScanRef<'a> {
+    /// #226: the scan buffer slot this view was decoded at — the only
+    /// thing that survives the sort's reordering to say which physical
+    /// row it came from.  Internal; this view is not `Serialize`.
+    pub __slot: usize,
     pub id: Uuid,
     pub name: &'a str,
+}
+///Borrowed full-record page view for `Tag` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Tag` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct TagPageRef<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub posts: (),
 }
 ///Storage for Tag model
 pub struct TagStorage {
@@ -5403,6 +5718,7 @@ impl TagStorage {
                 .read_str(__slot)
                 .expect("Failed to read string");
             let __row_ref = TagScanRef {
+                __slot,
                 id: id_value,
                 name: name_value,
             };
@@ -5411,6 +5727,106 @@ impl TagStorage {
             }
         }
         f(&mut __refs)
+    }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&TagScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<TagScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[TagPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __TagPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            name_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __TagPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            name_col: self
+                .name_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<TagScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let name_value = __bufs
+                .name_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let __row_ref = TagScanRef {
+                __slot,
+                id: id_value,
+                name: name_value,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __TagPageBufs {}
+        let __page_bufs = __TagPageBufs {};
+        let mut __views: Vec<TagPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(TagPageRef {
+                    id: __ref.id,
+                    name: __ref.name,
+                    posts: (),
+                });
+        }
+        f(__total, &__views)
     }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -5667,6 +6083,10 @@ pub struct MetricHot {
 ///Borrowed narrow scan view for `Metric` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct MetricScanRef<'a> {
+    /// #226: the scan buffer slot this view was decoded at — the only
+    /// thing that survives the sort's reordering to say which physical
+    /// row it came from.  Internal; this view is not `Serialize`.
+    pub __slot: usize,
     pub id: Uuid,
     pub recorded_at: Timestamp,
     pub device_id: u64,
@@ -5691,6 +6111,38 @@ pub struct MetricScanRef<'a> {
     pub healthy: bool,
     /// #250: anchors `'a` for a view whose every field is fixed-size.
     /// Zero-sized — the struct's layout is unchanged.
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
+}
+///Borrowed full-record page view for `Metric` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Metric` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct MetricPageRef<'a> {
+    pub id: Uuid,
+    pub recorded_at: Timestamp,
+    pub device_id: u64,
+    pub sample_seq: u64,
+    pub region: u32,
+    pub cpu_pct: f64,
+    pub mem_pct: f64,
+    pub disk_pct: f64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub req_count: u64,
+    pub err_count: u64,
+    pub p50_micros: u32,
+    pub p95_micros: u32,
+    pub p99_micros: u32,
+    pub queue_depth: u32,
+    pub open_conns: u32,
+    pub gc_pause_micros: u32,
+    pub uptime_secs: i64,
+    pub temp_celsius: f64,
+    pub throttled: bool,
+    pub healthy: bool,
+    /// #250/#226: anchors `'a` for a page view with no borrowing field.
+    /// `skip`ped, not merely zero-sized — `PhantomData` *does* implement
+    /// `Serialize` (as a unit, i.e. `null`), so without this it would add
+    /// a field to every row of every list response.
+    #[serde(skip)]
     pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
 ///Storage for Metric model
@@ -8523,6 +8975,7 @@ impl MetricStorage {
                 .read_bool(__slot)
                 .expect("Failed to read from column");
             let __row_ref = MetricScanRef {
+                __slot,
                 id: id_value,
                 recorded_at: recorded_at_value,
                 device_id: device_id_value,
@@ -8552,6 +9005,329 @@ impl MetricStorage {
             }
         }
         f(&mut __refs)
+    }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&MetricScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<MetricScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[MetricPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __MetricPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            recorded_at_col: forgedb_storage::BufferedFixedColumn,
+            device_id_col: forgedb_storage::BufferedFixedColumn,
+            sample_seq_col: forgedb_storage::BufferedFixedColumn,
+            region_col: forgedb_storage::BufferedFixedColumn,
+            cpu_pct_col: forgedb_storage::BufferedFixedColumn,
+            mem_pct_col: forgedb_storage::BufferedFixedColumn,
+            disk_pct_col: forgedb_storage::BufferedFixedColumn,
+            net_rx_bytes_col: forgedb_storage::BufferedFixedColumn,
+            net_tx_bytes_col: forgedb_storage::BufferedFixedColumn,
+            req_count_col: forgedb_storage::BufferedFixedColumn,
+            err_count_col: forgedb_storage::BufferedFixedColumn,
+            p50_micros_col: forgedb_storage::BufferedFixedColumn,
+            p95_micros_col: forgedb_storage::BufferedFixedColumn,
+            p99_micros_col: forgedb_storage::BufferedFixedColumn,
+            queue_depth_col: forgedb_storage::BufferedFixedColumn,
+            open_conns_col: forgedb_storage::BufferedFixedColumn,
+            gc_pause_micros_col: forgedb_storage::BufferedFixedColumn,
+            uptime_secs_col: forgedb_storage::BufferedFixedColumn,
+            temp_celsius_col: forgedb_storage::BufferedFixedColumn,
+            throttled_col: forgedb_storage::BufferedFixedColumn,
+            healthy_col: forgedb_storage::BufferedFixedColumn,
+        }
+        let __bufs = __MetricPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            recorded_at_col: self
+                .recorded_at_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            device_id_col: self
+                .device_id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            sample_seq_col: self
+                .sample_seq_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            region_col: self
+                .region_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            cpu_pct_col: self
+                .cpu_pct_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            mem_pct_col: self
+                .mem_pct_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            disk_pct_col: self
+                .disk_pct_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            net_rx_bytes_col: self
+                .net_rx_bytes_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            net_tx_bytes_col: self
+                .net_tx_bytes_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            req_count_col: self
+                .req_count_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            err_count_col: self
+                .err_count_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            p50_micros_col: self
+                .p50_micros_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            p95_micros_col: self
+                .p95_micros_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            p99_micros_col: self
+                .p99_micros_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            queue_depth_col: self
+                .queue_depth_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            open_conns_col: self
+                .open_conns_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            gc_pause_micros_col: self
+                .gc_pause_micros_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            uptime_secs_col: self
+                .uptime_secs_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            temp_celsius_col: self
+                .temp_celsius_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            throttled_col: self
+                .throttled_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            healthy_col: self
+                .healthy_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<MetricScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let recorded_at_value = Timestamp::from(
+                __bufs
+                    .recorded_at_col
+                    .read_timestamp(__slot)
+                    .expect("Failed to read from column"),
+            );
+            let device_id_value = __bufs
+                .device_id_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let sample_seq_value = __bufs
+                .sample_seq_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let region_value = __bufs
+                .region_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let cpu_pct_value = __bufs
+                .cpu_pct_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let mem_pct_value = __bufs
+                .mem_pct_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let disk_pct_value = __bufs
+                .disk_pct_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let net_rx_bytes_value = __bufs
+                .net_rx_bytes_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let net_tx_bytes_value = __bufs
+                .net_tx_bytes_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let req_count_value = __bufs
+                .req_count_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let err_count_value = __bufs
+                .err_count_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let p50_micros_value = __bufs
+                .p50_micros_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let p95_micros_value = __bufs
+                .p95_micros_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let p99_micros_value = __bufs
+                .p99_micros_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let queue_depth_value = __bufs
+                .queue_depth_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let open_conns_value = __bufs
+                .open_conns_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let gc_pause_micros_value = __bufs
+                .gc_pause_micros_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let uptime_secs_value = __bufs
+                .uptime_secs_col
+                .read_i64(__slot)
+                .expect("Failed to read from column");
+            let temp_celsius_value = __bufs
+                .temp_celsius_col
+                .read_f64(__slot)
+                .expect("Failed to read from column");
+            let throttled_value = __bufs
+                .throttled_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let healthy_value = __bufs
+                .healthy_col
+                .read_bool(__slot)
+                .expect("Failed to read from column");
+            let __row_ref = MetricScanRef {
+                __slot,
+                id: id_value,
+                recorded_at: recorded_at_value,
+                device_id: device_id_value,
+                sample_seq: sample_seq_value,
+                region: region_value,
+                cpu_pct: cpu_pct_value,
+                mem_pct: mem_pct_value,
+                disk_pct: disk_pct_value,
+                net_rx_bytes: net_rx_bytes_value,
+                net_tx_bytes: net_tx_bytes_value,
+                req_count: req_count_value,
+                err_count: err_count_value,
+                p50_micros: p50_micros_value,
+                p95_micros: p95_micros_value,
+                p99_micros: p99_micros_value,
+                queue_depth: queue_depth_value,
+                open_conns: open_conns_value,
+                gc_pause_micros: gc_pause_micros_value,
+                uptime_secs: uptime_secs_value,
+                temp_celsius: temp_celsius_value,
+                throttled: throttled_value,
+                healthy: healthy_value,
+                __borrow: ::std::marker::PhantomData,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __MetricPageBufs {}
+        let __page_bufs = __MetricPageBufs {};
+        let mut __views: Vec<MetricPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(MetricPageRef {
+                    id: __ref.id,
+                    recorded_at: __ref.recorded_at,
+                    device_id: __ref.device_id,
+                    sample_seq: __ref.sample_seq,
+                    region: __ref.region,
+                    cpu_pct: __ref.cpu_pct,
+                    mem_pct: __ref.mem_pct,
+                    disk_pct: __ref.disk_pct,
+                    net_rx_bytes: __ref.net_rx_bytes,
+                    net_tx_bytes: __ref.net_tx_bytes,
+                    req_count: __ref.req_count,
+                    err_count: __ref.err_count,
+                    p50_micros: __ref.p50_micros,
+                    p95_micros: __ref.p95_micros,
+                    p99_micros: __ref.p99_micros,
+                    queue_depth: __ref.queue_depth,
+                    open_conns: __ref.open_conns,
+                    gc_pause_micros: __ref.gc_pause_micros,
+                    uptime_secs: __ref.uptime_secs,
+                    temp_celsius: __ref.temp_celsius,
+                    throttled: __ref.throttled,
+                    healthy: __ref.healthy,
+                    __borrow: ::std::marker::PhantomData,
+                });
+        }
+        f(__total, &__views)
     }
     /// #160 (C): resolve list candidate ROWS for this indexed field from the
     /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -8944,6 +9720,21 @@ pub struct DocMeta {
 ///Borrowed narrow scan view for `Doc` (#224/#228): the id field plus every filterable/sortable column, with `string` fields borrowed from the buffered column span instead of copied into a `String`.  The list endpoint's whole filter/sort/paginate pipeline runs on these, inside the scan scope, so no scan row is ever allocated.  Internal — not a wire type, never exported, and never returned (it only appears behind a `&` in a closure argument).
 #[derive(Debug, Clone)]
 pub struct DocScanRef<'a> {
+    /// #226: the scan buffer slot this view was decoded at — the only
+    /// thing that survives the sort's reordering to say which physical
+    /// row it came from.  Internal; this view is not `Serialize`.
+    pub __slot: usize,
+    pub id: Uuid,
+    pub seq: u64,
+    pub kind: u32,
+    pub body_a: &'a str,
+    pub body_b: &'a str,
+    pub body_c: &'a str,
+    pub body_d: &'a str,
+}
+///Borrowed full-record page view for `Doc` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Doc` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct DocPageRef<'a> {
     pub id: Uuid,
     pub seq: u64,
     pub kind: u32,
@@ -10287,6 +11078,7 @@ impl DocStorage {
                 .read_str(__slot)
                 .expect("Failed to read string");
             let __row_ref = DocScanRef {
+                __slot,
                 id: id_value,
                 seq: seq_value,
                 kind: kind_value,
@@ -10300,6 +11092,160 @@ impl DocStorage {
             }
         }
         f(&mut __refs)
+    }
+    /// Run `f` over one **fully-decoded page** of this model (#226) — the
+    /// list endpoint's single read path.
+    ///
+    /// Filters and sorts the narrow scan views exactly as `__with_scan`
+    /// does, then gathers the page's remaining columns over the page's
+    /// physical rows only and hands `f` `(total, &[PageRef])`.  Replaces
+    /// `__with_scan` + a per-page-row `get(id)`, which re-read rows the scan
+    /// had already decoded — one positional `pread` per column per row.
+    ///
+    /// `sel` picks the rows exactly as `__with_scan`'s does. `offset`/`limit`
+    /// are applied with the same arithmetic as
+    /// `forgedb_query_params::Pagination::apply`, against the post-filter,
+    /// post-sort view count.
+    ///
+    /// Both buffer sets are locals here, so both outlive `f`; only `f`'s
+    /// return value escapes and it cannot borrow the views (their lifetime is
+    /// higher-ranked). The handler returns a serialized `Response`.
+    pub fn __with_page<R>(
+        &self,
+        sel: Option<Vec<usize>>,
+        keep: impl Fn(&DocScanRef<'_>) -> bool,
+        sort: impl FnOnce(&mut Vec<DocScanRef<'_>>),
+        offset: usize,
+        limit: usize,
+        f: impl FnOnce(usize, &[DocPageRef<'_>]) -> R,
+    ) -> R {
+        let __rows: Vec<usize> = match sel {
+            Some(mut __c) => {
+                __c.sort_unstable();
+                __c
+            }
+            None => {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones
+                    .live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
+        };
+        let __n = __rows.len();
+        #[allow(non_camel_case_types)]
+        struct __DocPageScanBufs {
+            id_col: forgedb_storage::BufferedFixedColumn,
+            seq_col: forgedb_storage::BufferedFixedColumn,
+            kind_col: forgedb_storage::BufferedFixedColumn,
+            body_a_col: forgedb_storage::BufferedVariableColumn,
+            body_b_col: forgedb_storage::BufferedVariableColumn,
+            body_c_col: forgedb_storage::BufferedVariableColumn,
+            body_d_col: forgedb_storage::BufferedVariableColumn,
+        }
+        let __bufs = __DocPageScanBufs {
+            id_col: self
+                .id_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            seq_col: self
+                .seq_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            kind_col: self
+                .kind_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_a_col: self
+                .body_a_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_b_col: self
+                .body_b_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_c_col: self
+                .body_c_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+            body_d_col: self
+                .body_d_col
+                .gather_buffered(&__rows)
+                .expect("Failed to bulk-load scan column"),
+        };
+        let mut __refs: Vec<DocScanRef<'_>> = Vec::with_capacity(__n);
+        for __slot in 0..__n {
+            let id_value = {
+                let bytes = __bufs
+                    .id_col
+                    .read_uuid(__slot)
+                    .expect("Failed to read from column");
+                Uuid::from_bytes(bytes)
+            };
+            let seq_value = __bufs
+                .seq_col
+                .read_u64(__slot)
+                .expect("Failed to read from column");
+            let kind_value = __bufs
+                .kind_col
+                .read_u32(__slot)
+                .expect("Failed to read from column");
+            let body_a_value = __bufs
+                .body_a_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let body_b_value = __bufs
+                .body_b_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let body_c_value = __bufs
+                .body_c_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let body_d_value = __bufs
+                .body_d_col
+                .read_str(__slot)
+                .expect("Failed to read string");
+            let __row_ref = DocScanRef {
+                __slot,
+                id: id_value,
+                seq: seq_value,
+                kind: kind_value,
+                body_a: body_a_value,
+                body_b: body_b_value,
+                body_c: body_c_value,
+                body_d: body_d_value,
+            };
+            if keep(&__row_ref) {
+                __refs.push(__row_ref);
+            }
+        }
+        let __total = __refs.len();
+        sort(&mut __refs);
+        let __start = offset.min(__total);
+        let __end = offset.saturating_add(limit).min(__total);
+        let __page = &__refs[__start..__end];
+        let __page_rows: Vec<usize> = __page
+            .iter()
+            .map(|__r| __rows[__r.__slot])
+            .collect();
+        #[allow(non_camel_case_types)]
+        struct __DocPageBufs {}
+        let __page_bufs = __DocPageBufs {};
+        let mut __views: Vec<DocPageRef<'_>> = Vec::with_capacity(__page.len());
+        for (__pslot, __ref) in __page.iter().enumerate() {
+            __views
+                .push(DocPageRef {
+                    id: __ref.id,
+                    seq: __ref.seq,
+                    kind: __ref.kind,
+                    body_a: __ref.body_a,
+                    body_b: __ref.body_b,
+                    body_c: __ref.body_c,
+                    body_d: __ref.body_d,
+                });
+        }
+        f(__total, &__views)
     }
     /// Open a read-only handle over this storage (#56 Direction B).
     /// The handle shares this storage's column files via independent
