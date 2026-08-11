@@ -215,6 +215,14 @@ pub struct ProductScanRef<'a> {
     pub id: Uuid,
     pub name: &'a str,
 }
+///Borrowed full-record page view for `Product` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Product` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct ProductPageRef<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub reviews: (),
+    pub card: String,
+}
 ///Storage for Product model
 pub struct ProductStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,

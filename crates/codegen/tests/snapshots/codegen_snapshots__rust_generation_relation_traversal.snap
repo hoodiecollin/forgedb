@@ -214,6 +214,13 @@ pub struct UserScanRef<'a> {
     pub id: Uuid,
     pub name: &'a str,
 }
+///Borrowed full-record page view for `User` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `User` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct UserPageRef<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub posts: (),
+}
 ///Storage for User model
 pub struct UserStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -1278,6 +1285,15 @@ pub struct PostScanRef<'a> {
     pub __slot: usize,
     pub id: Uuid,
     pub title: &'a str,
+}
+///Borrowed full-record page view for `Post` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Post` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct PostPageRef<'a> {
+    pub id: Uuid,
+    pub title: &'a str,
+    pub author: Uuid,
+    pub editor: Option<Uuid>,
+    pub tags: (),
 }
 ///Storage for Post model
 pub struct PostStorage {
@@ -3128,6 +3144,13 @@ pub struct TagScanRef<'a> {
     pub __slot: usize,
     pub id: Uuid,
     pub label: &'a str,
+}
+///Borrowed full-record page view for `Tag` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Tag` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct TagPageRef<'a> {
+    pub id: Uuid,
+    pub label: &'a str,
+    pub posts: (),
 }
 ///Storage for Tag model
 pub struct TagStorage {

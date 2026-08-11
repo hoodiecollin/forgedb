@@ -223,6 +223,21 @@ pub struct ComplexModelScanRef<'a> {
     /// Zero-sized — the struct's layout is unchanged.
     pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
+///Borrowed full-record page view for `ComplexModel` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `ComplexModel` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct ComplexModelPageRef<'a> {
+    pub id: Uuid,
+    pub count: i64,
+    pub price: f64,
+    pub active: bool,
+    pub created_at: Timestamp,
+    /// #250/#226: anchors `'a` for a page view with no borrowing field.
+    /// `skip`ped, not merely zero-sized — `PhantomData` *does* implement
+    /// `Serialize` (as a unit, i.e. `null`), so without this it would add
+    /// a field to every row of every list response.
+    #[serde(skip)]
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
+}
 ///Storage for ComplexModel model
 pub struct ComplexModelStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,

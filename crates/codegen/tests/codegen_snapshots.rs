@@ -10215,3 +10215,137 @@ fn test_rust_generation_an_auto_under_another_name_is_still_the_identity() {
         "{f:.400}"
     );
 }
+
+// ---- #226: the borrowed full-record page view ----
+
+/// The schema #226's generator guards are written against — the same shape
+/// `tests/api_wire_test.rs`'s `PAGE_SCHEMA` uses, and for the same reasons.
+///
+/// `Widget.serial` is declared **after** every field the scan set excludes
+/// (`scores`, `dims`, `owner`, `parts`, `payload`), which is the maximal
+/// divergence between declaration order and `scan_field_set` order — a `PageRef`
+/// built by appending the excluded fields to the scan set emits
+/// `…checksum, serial, scores, dims, owner, payload` where the model emits
+/// `…checksum, scores, dims, owner, parts, payload, serial`. On a model whose
+/// filterable fields happen to be declared last, both constructions agree and the
+/// guard proves nothing.
+///
+/// `Note` declares its identity **second**, which is the only shape that catches
+/// an identity-first page view: `scan_field_set` pushes the identity field first
+/// unconditionally, so `NoteScanRef` really is `{ id, body, weight }` against a
+/// model of `{ body, id, weight }`.
+const PAGE_REF_SRC: &str = r#"
+enum Tier { Free, Pro, Enterprise }
+
+struct Dims {
+  w: u32
+  h: u32
+}
+
+Widget {
+  id: +uuid
+  label: string?
+  price: decimal
+  tier: ^Tier
+  made_at: timestamp(ms)
+  checksum: bytes(4)
+  scores: [i32; 3]
+  dims: Dims
+  owner: *Maker
+  parts: [Part]
+  payload: json
+  serial: ^u32
+}
+
+Maker {
+  id: +uuid
+  name: string
+  widgets: [Widget]
+}
+
+Part {
+  id: +uuid
+  name: string
+  widget: *Widget
+}
+
+Note {
+  body: string
+  id: +uuid
+  weight: ^u32
+}
+"#;
+
+/// **#226 gotcha 1 — JSON key order is the wire contract.**
+///
+/// `serde_json` emits struct fields in declaration order, so `<Model>PageRef`'s
+/// field order *is* the bytes on the socket. It must be `model.fields` order, NOT
+/// `scan_field_set` order (identity first, then the filterable columns) with the
+/// remaining fields appended: those two are semantically equal and byte-different,
+/// and a `Value`-comparing test cannot tell them apart.
+#[test]
+fn test_rust_generation_page_ref_field_order() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The divergence this guard exists for, made explicit: the scan view is
+    // identity-first-then-filterable and stops at `serial`...
+    assert!(
+        f.contains(
+            "pub struct WidgetScanRef<'a> { /// #226: the scan buffer slot this view \
+             was decoded at — the only /// thing that survives the sort's reordering \
+             to say which physical /// row it came from. Internal; this view is not \
+             `Serialize`. pub __slot: usize, pub id: Uuid, pub label: Option<&'a str>, \
+             pub price: rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, \
+             pub checksum: [u8; 4usize], pub serial: u32, }"
+        ),
+        "the scan view is identity-first, filterable-only: {f}"
+    );
+    // ...while the page view is the model's own declaration order, in full.
+    assert!(
+        f.contains(
+            "pub struct WidgetPageRef<'a> { pub id: Uuid, pub label: Option<&'a str>, \
+             #[serde(with = \"rust_decimal::serde::str\")] pub price: \
+             rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "the page view is model declaration order, every field: {f}"
+    );
+    // The model it has to serialize identically to, for the same field list.
+    assert!(
+        f.contains(
+            "pub struct Widget { #[serde(default)] pub id: Uuid, pub label: \
+             Option<String>, #[schema(value_type = String)] #[serde(with = \
+             \"rust_decimal::serde::str\")] pub price: rust_decimal::Decimal, pub \
+             tier: Tier, #[schema(value_type = String)] pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "and the model's order is what it is being held to: {f}"
+    );
+
+    // Identity declared SECOND — the only shape that catches an identity-first
+    // page view. The scan view really does reorder here, so this is not a
+    // hypothetical.
+    assert!(
+        f.contains("pub struct NotePageRef<'a> { pub body: &'a str, pub id: Uuid, pub weight: u32, }"),
+        "an identity declared second stays second on the wire: {f}"
+    );
+    assert!(
+        f.contains("pub id: Uuid, pub body: &'a str, pub weight: u32, }"),
+        "while the scan view for the same model IS identity-first: {f}"
+    );
+
+    // The page view is a distinct type, not `ScanRef` with `Serialize` bolted on
+    // (#224's decision that the scan view is never a wire type stands).
+    assert!(
+        f.contains("#[derive(Debug, Clone)] pub struct WidgetScanRef<'a>"),
+        "the scan view still derives neither Serialize nor ToSchema: {f}"
+    );
+    assert!(
+        f.contains("#[derive(serde::Serialize)] pub struct WidgetPageRef<'a>"),
+        "and the page view derives Serialize only — no Deserialize, no ToSchema: {f}"
+    );
+}

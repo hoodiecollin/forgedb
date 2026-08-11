@@ -214,6 +214,17 @@ pub struct UserScanRef<'a> {
     /// Zero-sized — the struct's layout is unchanged.
     pub __borrow: ::std::marker::PhantomData<&'a ()>,
 }
+///Borrowed full-record page view for `User` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `User` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct UserPageRef<'a> {
+    pub id: Uuid,
+    /// #250/#226: anchors `'a` for a page view with no borrowing field.
+    /// `skip`ped, not merely zero-sized — `PhantomData` *does* implement
+    /// `Serialize` (as a unit, i.e. `null`), so without this it would add
+    /// a field to every row of every list response.
+    #[serde(skip)]
+    pub __borrow: ::std::marker::PhantomData<&'a ()>,
+}
 ///Storage for User model
 pub struct UserStorage {
     id_to_row: std::sync::Arc<HashMap<Uuid, usize>>,
@@ -1209,6 +1220,12 @@ pub struct PostScanRef<'a> {
     /// thing that survives the sort's reordering to say which physical
     /// row it came from.  Internal; this view is not `Serialize`.
     pub __slot: usize,
+    pub id: Uuid,
+    pub title: &'a str,
+}
+///Borrowed full-record page view for `Post` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Post` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct PostPageRef<'a> {
     pub id: Uuid,
     pub title: &'a str,
 }

@@ -223,6 +223,14 @@ pub struct PlaceScanRef<'a> {
     pub name: &'a str,
     pub description: Option<&'a str>,
 }
+///Borrowed full-record page view for `Place` (#226): every field the model struct has, in the model's DECLARATION order, with `string` fields borrowed out of the buffered column span the scan already holds.  The list endpoint serializes its page from these instead of re-reading each page row through `get(id)` one positional column read per field.  Serializes byte-identically to `Place` — that is the contract, guarded by `tests/api_wire_test.rs`.  Internal: `Serialize` only, never `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.
+#[derive(serde::Serialize)]
+pub struct PlacePageRef<'a> {
+    pub id: u64,
+    pub name: &'a str,
+    pub description: Option<&'a str>,
+    pub location: GeoPoint,
+}
 ///Storage for Place model
 pub struct PlaceStorage {
     id_to_row: std::sync::Arc<HashMap<u64, usize>>,

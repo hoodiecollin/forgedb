@@ -7485,41 +7485,7 @@ impl RustGenerator {
             Self::map_field_type_ident(schema, &field.field_type)
         };
 
-        // forgedb_types::Timestamp does not implement utoipa::ToSchema.  Annotate
-        // those fields so utoipa documents them as the RFC 3339 *string* serde
-        // actually produces (#254) while the struct field keeps the semantic
-        // Timestamp type.  Announcing `i64` here after the wire form changed
-        // would make the OpenAPI doc a liar about its own responses.
-        //
-        // `decimal` (rust_decimal::Decimal) likewise does not implement ToSchema,
-        // and is serialized as a JSON *string* (precision-preserving, matching the
-        // TS SDK's `string` type) via rust_decimal's `serde::str` module — so it
-        // gets both a `#[schema(value_type = String)]` and a `#[serde(with = ...)]`.
-        let (schema_attr, serde_attr) = if let Some(vt) =
-            Self::schema_value_type(schema, &field.field_type, is_key)
-        {
-            (quote! { #[schema(value_type = #vt)] }, quote! {})
-        } else if Self::is_decimal_type(&field.field_type) {
-            if field.is_nullable() {
-                (
-                    quote! { #[schema(value_type = Option<String>)] },
-                    quote! { #[serde(with = "rust_decimal::serde::str_option")] },
-                )
-            } else {
-                (
-                    quote! { #[schema(value_type = String)] },
-                    quote! { #[serde(with = "rust_decimal::serde::str")] },
-                )
-            }
-        } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
-            // An array past serde's N = 32 ceiling (#243).  Without this the derive
-            // on the struct does not resolve and the generated crate does not
-            // compile — for an indexed *or* a plain field.  Points at the emitted
-            // helper, whose wire form is identical to serde's own.
-            attrs
-        } else {
-            (quote! {}, quote! {})
-        };
+        let (schema_attr, serde_attr) = Self::field_wire_attrs(schema, field, is_key);
 
         // `+` auto-generate fields (#187) may be omitted from a create body — the
         // server synthesizes them (`create_*`) — so they deserialize with a serde
@@ -7549,6 +7515,54 @@ impl RustGenerator {
             quote! { #schema_attr #serde_attr #serde_default pub #field_name: Option<#field_type> }
         } else {
             quote! { #schema_attr #serde_attr #serde_default pub #field_name: #field_type }
+        }
+    }
+
+    /// The `(#[schema(..)], #[serde(..)])` attribute pair one struct field carries
+    /// because its Rust type's own derives are not enough to describe it.
+    ///
+    /// Three cases, in this order:
+    ///
+    /// - **`Timestamp` / a key `InlineStr<N>`** — `forgedb_types` does not depend on
+    ///   utoipa, so these need a `value_type` telling the OpenAPI document the wire
+    ///   form is the RFC 3339 / plain string serde actually produces (#254/#252).
+    ///   Serde needs nothing: the substrate type's own `Serialize` is already right.
+    /// - **`decimal`** — `rust_decimal::Decimal` implements neither, and its wire
+    ///   form is a precision-preserving *string* (matching the TS SDK), so it needs
+    ///   both halves: a `value_type` and a `#[serde(with = ...)]`.
+    /// - **an array past serde's N = 32 ceiling** (#243) — without the `with` the
+    ///   derive does not resolve at all and the generated crate fails to compile.
+    ///
+    /// Factored out (#226) because `<Model>PageRef` has to reproduce the model
+    /// struct's bytes exactly while deriving only `Serialize`: it takes the serde
+    /// half and must NOT take the schema half (a `#[schema(..)]` on a type with no
+    /// `ToSchema` derive is a compile error, not inert). Two sites computing the
+    /// same attribute set independently is precisely how a field gains a serde
+    /// `with` on the model and not on the page view — a silent byte divergence on
+    /// one field class, invisible to a snapshot diff that only reads the model.
+    fn field_wire_attrs(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+        is_key: bool,
+    ) -> (TokenStream, TokenStream) {
+        if let Some(vt) = Self::schema_value_type(schema, &field.field_type, is_key) {
+            (quote! { #[schema(value_type = #vt)] }, quote! {})
+        } else if Self::is_decimal_type(&field.field_type) {
+            if field.is_nullable() {
+                (
+                    quote! { #[schema(value_type = Option<String>)] },
+                    quote! { #[serde(with = "rust_decimal::serde::str_option")] },
+                )
+            } else {
+                (
+                    quote! { #[schema(value_type = String)] },
+                    quote! { #[serde(with = "rust_decimal::serde::str")] },
+                )
+            }
+        } else if let Some(attrs) = Self::big_array_attrs(&field.field_type) {
+            attrs
+        } else {
+            (quote! {}, quote! {})
         }
     }
 
@@ -8021,11 +8035,20 @@ impl RustGenerator {
             &slot_field,
         );
 
+        // #226: the borrowed FULL-record page view.  A second type rather than a
+        // `Serialize` on `ScanRef` — different field set, and #224's decision that
+        // the scan view is never a wire type stands.
+        let page_ref_tokens = Self::generate_page_ref_struct(schema, model, &scan_fields, key_name);
+
         let methods = quote! {
             #with_scan_method
             #(#pushdown)*
         };
-        (ref_struct_tokens, methods)
+        let structs = quote! {
+            #ref_struct_tokens
+            #page_ref_tokens
+        };
+        (structs, methods)
     }
 
     /// The name of the #226 buffer-slot field on a scan view.
@@ -8130,6 +8153,147 @@ impl RustGenerator {
             quote! { Option<#base> }
         } else {
             base
+        }
+    }
+
+    /// Is `field` one of the columns the narrow scan already decoded?
+    ///
+    /// The page view (#226) sources every such field from the `ScanRef` the scan
+    /// built — that redundancy is the whole point of the issue: phase A already
+    /// decodes each page row and today `get(id)` re-reads it from scratch.  The
+    /// complement is what the page's own gather has to fetch.
+    fn page_field_from_scan(
+        scan_fields: &[&forgedb_parser::Field],
+        field: &forgedb_parser::Field,
+    ) -> bool {
+        scan_fields.iter().any(|s| s.name == field.name)
+    }
+
+    /// The page view's type for one field: the scan view's type when the scan
+    /// already decoded it (so the value can be taken straight off the `ScanRef` —
+    /// `&'a str` for a string, by-value for everything else), otherwise the *model
+    /// struct's* type, because the page gather materializes it exactly as
+    /// `read_at` does.
+    ///
+    /// Both halves are the existing emitters, not re-derivations: a page field's
+    /// Rust type is either `scan_ref_field_type`'s answer or `model_struct_field`'s,
+    /// and never a third one.
+    fn page_ref_field_type(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        field: &forgedb_parser::Field,
+        from_scan: bool,
+        key_name: Option<&str>,
+    ) -> TokenStream {
+        if from_scan {
+            return Self::scan_ref_field_type(schema, field, Some(field.name.as_str()) == key_name);
+        }
+        let base = if Self::is_inline_key_field(schema, model, field) {
+            Self::key_type_ident(schema, &field.field_type)
+        } else {
+            Self::map_field_type_ident(schema, &field.field_type)
+        };
+        if field.is_nullable() {
+            quote! { Option<#base> }
+        } else {
+            base
+        }
+    }
+
+    /// The #250-style lifetime anchor for a page view, or `None` when it borrows
+    /// and needs no anchor.
+    ///
+    /// The *predicate* is [`Self::scan_ref_anchor`]'s, deliberately: a page view's
+    /// only borrows are the `&'a str`s it takes off the scan view, so it borrows
+    /// exactly when the scan view does.  Only the collision check differs — a page
+    /// view holds **every** model field, so the name has to be free among all of
+    /// them, not just the scan set.
+    fn page_ref_anchor(
+        model: &forgedb_parser::Model,
+        scan_fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+    ) -> Option<proc_macro2::Ident> {
+        Self::scan_ref_anchor(scan_fields, key_name).map(|_| {
+            let mut name = String::from("__borrow");
+            while model.fields.iter().any(|f| f.name == name) {
+                name.push('_');
+            }
+            format_ident!("{}", name)
+        })
+    }
+
+    /// Emit `<Model>PageRef<'a>` (#226) — the borrowed **full-record** view the list
+    /// endpoint serializes its page from, in place of a `Vec<Model>` re-read through
+    /// `get(id)` one positional column read at a time.
+    ///
+    /// Three things about it are load-bearing, and each is a way to get byte-different
+    /// JSON out of a change that looks semantically identical:
+    ///
+    /// 1. **Field order is `model.fields` order.** `serde_json` emits struct fields in
+    ///    declaration order, so the page view's order *is* the wire contract.  It is
+    ///    NOT `scan_field_set`'s order (identity first, then filterable) with the
+    ///    remaining fields appended: on a model whose identity is declared second, or
+    ///    whose filterable columns are not contiguous, that produces a semantically
+    ///    equal, byte-different object.  `tests/api_wire_test.rs` is what catches it.
+    /// 2. **It is a different type from `ScanRef`**, not `ScanRef` with `Serialize`
+    ///    added — #224's "the scan view is never a wire type" decision stands, and
+    ///    the two have different field sets anyway.
+    /// 3. **`json` is not borrowed.** Its value is a `serde_json::Value` built by
+    ///    `from_str`, whose map is sorted, so today's read *normalizes* a stored
+    ///    object's key order.  Handing the stored text through as a `&str`/`RawValue`
+    ///    would emit the stored order instead and silently change the bytes of every
+    ///    json field.  `json` is not filterable, so it is never in the scan set; the
+    ///    page gather decodes it through the same owned `read_string` + `from_str`
+    ///    path `read_at` uses.
+    ///
+    /// Serde attributes come from [`Self::field_wire_attrs`] — the same function the
+    /// model struct uses — minus the `#[schema(..)]` half, which would not compile
+    /// on a type that does not derive `ToSchema`.  No `#[serde(default)]`: that is a
+    /// deserialize-side concern for create bodies and this view is write-only.
+    fn generate_page_ref_struct(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        scan_fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+    ) -> TokenStream {
+        let page_ref_ident = format_ident!("{}PageRef", model.name);
+        let field_decls = model.fields.iter().map(|f| {
+            let fname = format_ident!("{}", f.name);
+            let from_scan = Self::page_field_from_scan(scan_fields, f);
+            let fty = Self::page_ref_field_type(schema, model, f, from_scan, key_name);
+            let (_schema_attr, serde_attr) =
+                Self::field_wire_attrs(schema, f, Self::is_inline_key_field(schema, model, f));
+            quote! { #serde_attr pub #fname: #fty }
+        });
+        let anchor = match Self::page_ref_anchor(model, scan_fields, key_name) {
+            None => quote! {},
+            Some(anchor) => quote! {
+                /// #250/#226: anchors `'a` for a page view with no borrowing field.
+                /// `skip`ped, not merely zero-sized — `PhantomData` *does* implement
+                /// `Serialize` (as a unit, i.e. `null`), so without this it would add
+                /// a field to every row of every list response.
+                #[serde(skip)]
+                pub #anchor: ::std::marker::PhantomData<&'a ()>,
+            },
+        };
+        let doc = format!(
+            "Borrowed full-record page view for `{}` (#226): every field the model \
+             struct has, in the model's DECLARATION order, with `string` fields \
+             borrowed out of the buffered column span the scan already holds.  The \
+             list endpoint serializes its page from these instead of re-reading each \
+             page row through `get(id)` one positional column read per field.  \
+             Serializes byte-identically to `{}` — that is the contract, guarded by \
+             `tests/api_wire_test.rs`.  Internal: `Serialize` only, never \
+             `Deserialize`/`ToSchema`, never returned, never a REST/TS/OpenAPI type.",
+            model.name, model.name
+        );
+        quote! {
+            #[doc = #doc]
+            #[derive(serde::Serialize)]
+            pub struct #page_ref_ident<'a> {
+                #(#field_decls,)*
+                #anchor
+            }
         }
     }
 
