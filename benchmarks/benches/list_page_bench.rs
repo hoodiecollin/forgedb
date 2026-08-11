@@ -169,13 +169,12 @@ fn populated_docs(n: usize) -> (Database, tempfile::TempDir) {
 /// traverses the relation).
 const AUTHOR: u8 = 7;
 
-/// Base instant for `created_at`, in MICROSECONDS — `Timestamp`'s only unit since
+/// Base instant for `created_at`. `Timestamp`'s only unit is microseconds since
 /// #254, which removed `Timestamp::from_seconds` outright rather than deprecating it.
-/// The sibling benches on this branch still call it and so do not compile; #279 fixed
-/// that on `develop` by adding a shared `forgedb_benchmarks::ts_from_seconds` helper.
-/// **Post-merge, switch this to that helper** — one seconds→micros conversion for the
-/// whole bench project is the point of it, and a second spelling here defeats it.
-const BASE_US: i64 = 1_700_000_000_000_000;
+/// #279 added `forgedb_benchmarks::ts_from_seconds` so the whole bench project has
+/// exactly ONE seconds→micros conversion; this goes through it rather than spelling
+/// the multiplication a second time.
+const BASE_SECS: i64 = 1_700_000_000;
 
 fn populated_posts(n: usize) -> (Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -186,7 +185,7 @@ fn populated_posts(n: usize) -> (Database, tempfile::TempDir) {
             id: author,
             name: "bench".to_string(),
             email: "bench@example.com".to_string(),
-            created_at: Timestamp::from_micros(BASE_US),
+            created_at: forgedb_benchmarks::ts_from_seconds(BASE_SECS),
             posts: (),
         })
         .expect("insert user");
@@ -198,7 +197,7 @@ fn populated_posts(n: usize) -> (Database, tempfile::TempDir) {
                 views: i as u64,
                 published: i % 2 == 0,
                 author,
-                created_at: Timestamp::from_micros(BASE_US + i as i64 * 1_000_000),
+                created_at: forgedb_benchmarks::ts_from_seconds(BASE_SECS + i as i64),
                 tags: (),
             })
             .expect("insert post");

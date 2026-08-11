@@ -25,8 +25,10 @@
 //!
 //! - Envelope key order: `data`, `total`, `limit`, `offset`.
 //! - Record key order: schema declaration order, `id` first.
-//! - That a `json` field's *own* keys are still normalized (sorted) — that payload
-//!   is a `serde_json::Value` either way, so #229 did not touch it.
+//! - That a `json` field is emitted as a sorted *object* — not a string, not
+//!   restructured. NOTE this does not prove a borrowed passthrough would be caught:
+//!   the fixture is built with `json!`, so its bytes are sorted before storage. See
+//!   the comment above `PAGE_SCHEMA` for why that is not fixable from here.
 //! - The error bodies, which deliberately stayed `json!` objects.
 //!
 //! # Two tests, two generated crates
@@ -333,18 +335,45 @@ async fn main() {
 //   - **the identity-late model** (`Note`): `id` is declared *second*. `NoteScanRef`
 //     is `{id, body, weight}` (identity-first) while `Note` is `{body, id, weight}`,
 //     so the wire must NOT be identity-first (gotcha 1, sharpest form).
+//
+//   Two coverage limits worth knowing before editing these scenarios. A
+//   `?sort=…&order=desc` request is NOT automatically a gotcha-3 (`__slot`) case:
+//   under a position-instead-of-slot mutation, `Churn`'s desc sort stayed GREEN
+//   because `seq = 1000 - i` makes descending order coincide with physical row
+//   order — only the ASCENDING sorts caught it. The discriminating shape needs
+//   sorted order != physical order != reverse-physical order. And gotcha 3 is
+//   detectable only on `Widget`: every field of `Note` and `Churn` is filterable,
+//   so their `PageRef` field set equals their `ScanRef`'s, their page-only gather
+//   reads no columns, and a slot mis-map is invisible for them.
 //   - **the churned model** (`Churn`): 3 live rows scattered across 503 physical
 //     ones, which puts the scan's `note` column below
 //     `SPARSE_OFFSETS_SPAN_FACTOR` density and sends `gather_buffered` down
 //     `gather_sparse` (`crates/storage-native/src/lib.rs:1448`). The driver asserts
-//     that density predicate rather than trusting the corpus to stay sparse.
+//     that density predicate — but note it MIRRORS the factor as a hardcoded 128, so
+//     it tracks the *corpus*, not the substrate: raising
+//     `SPARSE_OFFSETS_SPAN_FACTOR` would silently stop exercising the sparse arm
+//     while the assertion still passed. Also, both gather arms are byte-equivalent in
+//     both directions, so this is a correctness guard on the sparse *implementation*
+//     and a performance guard on the branch *decision* — it is not a byte guard on
+//     which arm ran.
 //
-// `Widget.payload` is stored with its object keys in NON-sorted order (`z` before
-// `a`, `y` before `b`) and must come out sorted, because today's `get(id)` path
-// round-trips it through `serde_json::Value` (a `BTreeMap`). A borrowed
-// `&str`/`RawValue` passthrough would emit the stored order and silently change the
-// bytes; the driver asserts both the sorted form and the absence of the stored one
-// (gotcha 2).
+// `Widget.payload` is WRITTEN as `json!({"z": 1, "a": {"y": 2, "b": 3}})` and must
+// come out sorted, because `get(id)` round-trips it through `serde_json::Value`
+// (a `BTreeMap` without `preserve_order`).
+//
+// **Read this before trusting the scenario: it does NOT guard gotcha 2's literal
+// fear, and it cannot.** `json!` builds a `Value` — i.e. a `BTreeMap` — so the
+// source order above is discarded *before* the value is ever stored. The bytes on
+// disk are therefore ALREADY SORTED, and a borrowed `&str`/`RawValue` passthrough
+// would emit those same sorted bytes and pass every check in this file. Storing
+// genuinely unsorted json bytes is not expressible through the typed create path,
+// which is why no scenario here does it.
+//
+// What the scenario DOES guard (verified RED by mutation): the grosser sibling
+// failures — json emitted as a *string*, or otherwise restructured. That is worth
+// keeping. The `!body.contains("\"payload\":{\"z\":1")` half is vacuous against a
+// read-side change and is retained only as a cheap regression tripwire in case the
+// write path ever starts preserving source order.
 const PAGE_SCHEMA: &str = r#"
 enum Tier { Free, Pro, Enterprise }
 
@@ -681,10 +710,10 @@ async fn main() {
         &format!(r#"{{"data":[{widget_b},{widget_a}],"total":2,"limit":50,"offset":0}}"#),
     );
     require(
-        "json object keys are normalized, not passed through in stored order",
+        "json is emitted as a sorted object, not a string or a restructured value",
         body.contains(r#""payload":{"a":{"b":3,"y":2},"z":1}"#)
             && !body.contains(r#""payload":{"z":1"#),
-        &format!("stored order was `z` then `a`; got: {body}"),
+        &format!("expected a sorted json object for `payload`; got: {body}"),
     );
 
     // --- Scenario 4: a filter that eliminates every row ---
