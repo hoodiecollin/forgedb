@@ -46,8 +46,8 @@ Before this the seven variant modules were declared unconditionally in `src/lib.
 the bench **library** depend on untracked files: a missing or stale `gen/<variant>/` broke *every*
 bench target, and nothing about `make bench-forgedb` suggested it depended on the matrix.
 
-`make bench-workload ARGS="--var-sweep"` is the second variant consumer (it measures against
-`churn_probe`); it lives on its own target, `make bench-workload-var`, which regenerates the
+The workload driver's `--var-sweep` mode is the second variant consumer (it measures against
+`churn_probe`), so it lives on its own target, `make bench-workload-var`, which regenerates the
 variants and sets the feature. Without the feature that mode exits with the command to use — it
 deliberately does **not** fall back to the default build, which would measure compaction-ON and
 report it as the sweep.
