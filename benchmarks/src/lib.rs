@@ -32,6 +32,35 @@
 #[path = "../gen/database.rs"]
 pub mod forgedb_generated;
 
+/// Re-exported at the crate ROOT because the generated `api.rs` opens with
+/// `use super::*;` and names dozens of distinct `super::` items (`super::Database`,
+/// `super::Post`, `super::PostScanRef`, `super::PostPageRef`, …). `include!` is barred:
+/// the generated file carries the INNER attribute `#![allow(dead_code,
+/// unused_imports)]`, and an inner attribute inside an inline `mod { }` is E0753 —
+/// `src/commands/init.rs` records the same bar and the same `mod database; use
+/// database::*;` fix. Gated with the module below so a plain `cargo bench` sees no
+/// glob at all.
+///
+/// A glob import LOSES to an explicit item, so a generated type colliding with one of
+/// this crate's own (`Dataset`, `SIZES`, `UserRow`, `id_for`, …) would silently resolve
+/// `api.rs`'s `super::` to the wrong thing. Zero collisions today; re-check after any
+/// change to `bench.forge`.
+#[cfg(feature = "router")]
+pub use forgedb_generated::*;
+
+/// The ForgeDB-GENERATED REST router (`benchmarks/gen/api.rs`) — #282's S3/S4 arms.
+///
+/// TRACKED, like `database.rs`, but **cfg-gated**: a third category neither section
+/// heading names. Section 1's rule is "tracked ⇒ unconditional"; section 1's *criterion*
+/// is "does declaring it make this library depend on something a plain `cargo bench`
+/// should not have to build?" — and this one does (axum, tokio, tower-http,
+/// utoipa-axum: +78 packages on the normal graph). The criterion wins over the heading.
+/// See `[[bench]] list_rest_bench`'s `required-features` and `make bench-deps-check`.
+#[cfg(feature = "router")]
+#[allow(warnings)]
+#[path = "../gen/api.rs"]
+pub mod forgedb_api;
+
 // ===========================================================================
 // SECTION 2 — config-matrix variants (`benchmarks/gen/<variant>/`). GITIGNORED,
 // so they exist only after `make bench-regen-matrix`, and are compiled ONLY
@@ -86,6 +115,13 @@ pub mod v_churn_probe;
 
 /// Row counts every scaling scenario sweeps (small / medium / large).
 pub const SIZES: [usize; 3] = [1_000, 100_000, 1_000_000];
+
+/// Row counts the #282 REST-list size sweep walks. Deliberately NOT `SIZES`, which is
+/// `[1_000, 100_000, 1_000_000]` — scenario 21's accepted grid is {1k, 10k, 100k}, and
+/// 10k is the core-grid size every one of the five engine suites already populates
+/// (`READ_POSTS = 10_000` in all of them). A million-row REST list sweep is a different
+/// experiment, not this one.
+pub const LIST_SIZES: [usize; 3] = [1_000, 10_000, 100_000];
 
 /// Distinct tags in the corpus, and how many each post links to (M2M fan-out).
 pub const N_TAGS: usize = 500;

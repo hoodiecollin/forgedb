@@ -19,6 +19,7 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
         bench-pglite bench-matrix bench-regen bench-regen-matrix bench-list-page \
+        bench-list bench-list-postgres bench-deps-check \
         bench-footprint bench-concurrency bench-workload bench-workload-var
 
 ## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
@@ -41,6 +42,31 @@ bench-forgedb:
 ## ceiling on the win — measurable without prototyping the buffered decode.
 bench-list-page:
 	cargo bench --manifest-path $(BENCH) --bench list_page_bench
+
+## #282 scenario 21: the REST list endpoint across five engines and four boundaries.
+## The ForgeDB S1-S4 ladder needs the generated router, hence --features router; the other
+## engines' S1/S2 arms live in their existing suites and are selected by the Criterion
+## positional filter, so this does NOT re-run insert/point-lookup/m2m.
+bench-list:
+	cargo bench --manifest-path $(BENCH) --features router --bench list_rest_bench
+	cargo bench --manifest-path $(BENCH) \
+		--bench sqlite_bench --bench redb_bench --bench duckdb_bench -- '/list_'
+
+## The Postgres half of scenario 21, in an ephemeral devbox cluster. PG cannot run
+## in-process, so its S1/S2 already carry socket transport the other four do not pay —
+## the honest ForgeDB-vs-Postgres comparison is S4. See docs/BENCHMARKS.md.
+bench-list-postgres:
+	devbox run -- benchmarks/scripts/pg_run.sh '/list_'
+
+## Section 1's gate criterion in benchmarks/src/lib.rs, made executable (#282 BDD-8):
+## `gen/api.rs`'s heavy deps must be OFF by default and ON under --features router.
+## Nothing else catches a regression here, because a slower build is not a failing build.
+bench-deps-check:
+	@! cargo tree --manifest-path $(BENCH) -e normal --prefix none | grep -q '^axum ' \
+	  || (echo "FAIL: axum is a normal dep without --features router"; exit 1)
+	@cargo tree --manifest-path $(BENCH) -e normal --features router --prefix none | grep -q '^axum ' \
+	  || (echo "FAIL: --features router does not pull axum"; exit 1)
+	@echo "ok: gen/api.rs deps are gated"
 
 ## Benchmark SQLite only.
 bench-sqlite:
@@ -104,10 +130,20 @@ bench-workload-var: bench-regen-matrix
 bench-matrix: bench-regen-matrix
 	cargo bench --manifest-path $(BENCH) --bench matrix_bench --features matrix
 
-## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
-## Run this after any codegen change so the bench links current generated output.
+## Re-emit BOTH tracked generated artifacts in benchmarks/gen/ from bench.forge through
+## the current CLI. Run this after any codegen change so the bench links current output.
+##
+## A loop over (generator, file) pairs rather than N hardcoded commands (#282): the
+## bench project now tracks `database.rs` AND `api.rs`, they come off two DIFFERENT
+## emitters (crates/codegen/src/rust.rs and .../api.rs), and a change touching only one
+## of them still has to re-emit through here. One hook, so a future regenerate-and-diff
+## guard (#285) has a single place to attach.
 bench-regen:
-	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen --force
+	@for g in rust api; do \
+		echo "regen $$g"; \
+		cargo run -q -- generate $$g --schema benchmarks/bench.forge \
+			--output benchmarks/gen --force || exit 1; \
+	done
 
 ## Re-emit every matrix config variant (benchmarks/gen/<variant>/database.rs) from
 ## bench.forge under its benchmarks/configs/<variant>.toml. Run after codegen changes.
