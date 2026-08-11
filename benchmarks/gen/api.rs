@@ -92,6 +92,27 @@ async fn list_user(
             (page, total)
         }
         None => {
+            let __keep_all: bool = __user_is_unfiltered(&params);
+            if __keep_all && qp.sort.is_none() {
+                return db
+                    .user
+                    .__with_fast_page(
+                        qp.pagination.offset,
+                        qp.pagination.limit,
+                        |__total: usize, __page: &[super::UserPageRef<'_>]| {
+                            (
+                                StatusCode::OK,
+                                Json(__ListEnvelope {
+                                    data: __page,
+                                    total: __total,
+                                    limit: qp.pagination.limit,
+                                    offset: qp.pagination.offset,
+                                }),
+                            )
+                                .into_response()
+                        },
+                    );
+            }
             let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("email") {
                 db.user.__rows_by_email(__v)
             } else {
@@ -101,7 +122,7 @@ async fn list_user(
                 .user
                 .__with_page(
                     __sel,
-                    |r| __user_scan_matches(r, &params),
+                    |r| __keep_all || __user_scan_matches(r, &params),
                     |__scan: &mut Vec<super::UserScanRef<'_>>| {
                         __user_scan_sort(__scan, &qp.sort);
                     },
@@ -329,6 +350,37 @@ fn user_apply_sort(
         rows.reverse();
     }
 }
+/// Is this request unfiltered — does NO query key name a filterable field
+/// of this model (#288)?
+///
+/// Hoisted out of the per-row loop by every caller, because it is a
+/// property of the query string and not of the row. `_scan_matches` can
+/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+/// while naming no filterable field at all — so an unfiltered request was
+/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+/// 850 µs request over 10k rows.
+///
+/// The question is POSITIVE — "does any key name a field of this model?" —
+/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+/// legally declare a field named `limit`, and for that model `?limit=3`
+/// genuinely is a filter.
+fn __user_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("name") {
+        return false;
+    }
+    if params.contains_key("email") {
+        return false;
+    }
+    if params.contains_key("created_at") {
+        return false;
+    }
+    true
+}
 /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
 /// a row is accepted or rejected before its strings are ever copied out
 /// of the buffered column.  Same per-field checks as `_event_matches`,
@@ -467,6 +519,27 @@ async fn list_post(
         }
         None => {
             if params.get("projection").is_none() {
+                let __keep_all: bool = __post_is_unfiltered(&params);
+                if __keep_all && qp.sort.is_none() {
+                    return db
+                        .post
+                        .__with_fast_page(
+                            qp.pagination.offset,
+                            qp.pagination.limit,
+                            |__total: usize, __page: &[super::PostPageRef<'_>]| {
+                                (
+                                    StatusCode::OK,
+                                    Json(__ListEnvelope {
+                                        data: __page,
+                                        total: __total,
+                                        limit: qp.pagination.limit,
+                                        offset: qp.pagination.offset,
+                                    }),
+                                )
+                                    .into_response()
+                            },
+                        );
+                }
                 let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("views") {
                     db.post.__rows_by_views(__v)
                 } else {
@@ -476,7 +549,7 @@ async fn list_post(
                     .post
                     .__with_page(
                         __sel,
-                        |r| __post_scan_matches(r, &params),
+                        |r| __keep_all || __post_scan_matches(r, &params),
                         |__scan: &mut Vec<super::PostScanRef<'_>>| {
                             __post_scan_sort(__scan, &qp.sort);
                         },
@@ -501,11 +574,12 @@ async fn list_post(
             } else {
                 None
             };
+            let __keep_all: bool = __post_is_unfiltered(&params);
             let (total, __page_ids) = db
                 .post
                 .__with_scan(
                     __sel,
-                    |r| __post_scan_matches(r, &params),
+                    |r| __keep_all || __post_scan_matches(r, &params),
                     |__scan: &mut Vec<super::PostScanRef<'_>>| {
                         __post_scan_sort(__scan, &qp.sort);
                         let __total = __scan.len();
@@ -792,6 +866,40 @@ fn post_apply_sort(
         rows.reverse();
     }
 }
+/// Is this request unfiltered — does NO query key name a filterable field
+/// of this model (#288)?
+///
+/// Hoisted out of the per-row loop by every caller, because it is a
+/// property of the query string and not of the row. `_scan_matches` can
+/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+/// while naming no filterable field at all — so an unfiltered request was
+/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+/// 850 µs request over 10k rows.
+///
+/// The question is POSITIVE — "does any key name a field of this model?" —
+/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+/// legally declare a field named `limit`, and for that model `?limit=3`
+/// genuinely is a filter.
+fn __post_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("title") {
+        return false;
+    }
+    if params.contains_key("views") {
+        return false;
+    }
+    if params.contains_key("published") {
+        return false;
+    }
+    if params.contains_key("created_at") {
+        return false;
+    }
+    true
+}
 /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
 /// a row is accepted or rejected before its strings are ever copied out
 /// of the buffered column.  Same per-field checks as `_event_matches`,
@@ -939,6 +1047,27 @@ async fn list_tag(
             (page, total)
         }
         None => {
+            let __keep_all: bool = __tag_is_unfiltered(&params);
+            if __keep_all && qp.sort.is_none() {
+                return db
+                    .tag
+                    .__with_fast_page(
+                        qp.pagination.offset,
+                        qp.pagination.limit,
+                        |__total: usize, __page: &[super::TagPageRef<'_>]| {
+                            (
+                                StatusCode::OK,
+                                Json(__ListEnvelope {
+                                    data: __page,
+                                    total: __total,
+                                    limit: qp.pagination.limit,
+                                    offset: qp.pagination.offset,
+                                }),
+                            )
+                                .into_response()
+                        },
+                    );
+            }
             let __sel: Option<Vec<usize>> = if let Some(__v) = params.get("name") {
                 db.tag.__rows_by_name(__v)
             } else {
@@ -948,7 +1077,7 @@ async fn list_tag(
                 .tag
                 .__with_page(
                     __sel,
-                    |r| __tag_scan_matches(r, &params),
+                    |r| __keep_all || __tag_scan_matches(r, &params),
                     |__scan: &mut Vec<super::TagScanRef<'_>>| {
                         __tag_scan_sort(__scan, &qp.sort);
                     },
@@ -1174,6 +1303,31 @@ fn tag_apply_sort(
         rows.reverse();
     }
 }
+/// Is this request unfiltered — does NO query key name a filterable field
+/// of this model (#288)?
+///
+/// Hoisted out of the per-row loop by every caller, because it is a
+/// property of the query string and not of the row. `_scan_matches` can
+/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+/// while naming no filterable field at all — so an unfiltered request was
+/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+/// 850 µs request over 10k rows.
+///
+/// The question is POSITIVE — "does any key name a field of this model?" —
+/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+/// legally declare a field named `limit`, and for that model `?limit=3`
+/// genuinely is a filter.
+fn __tag_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("name") {
+        return false;
+    }
+    true
+}
 /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
 /// a row is accepted or rejected before its strings are ever copied out
 /// of the buffered column.  Same per-field checks as `_event_matches`,
@@ -1292,6 +1446,27 @@ async fn list_metric(
         }
         None => {
             if params.get("projection").is_none() {
+                let __keep_all: bool = __metric_is_unfiltered(&params);
+                if __keep_all && qp.sort.is_none() {
+                    return db
+                        .metric
+                        .__with_fast_page(
+                            qp.pagination.offset,
+                            qp.pagination.limit,
+                            |__total: usize, __page: &[super::MetricPageRef<'_>]| {
+                                (
+                                    StatusCode::OK,
+                                    Json(__ListEnvelope {
+                                        data: __page,
+                                        total: __total,
+                                        limit: qp.pagination.limit,
+                                        offset: qp.pagination.offset,
+                                    }),
+                                )
+                                    .into_response()
+                            },
+                        );
+                }
                 let __sel: Option<Vec<usize>> = if let Some(__v) = params
                     .get("device_id")
                 {
@@ -1303,7 +1478,7 @@ async fn list_metric(
                     .metric
                     .__with_page(
                         __sel,
-                        |r| __metric_scan_matches(r, &params),
+                        |r| __keep_all || __metric_scan_matches(r, &params),
                         |__scan: &mut Vec<super::MetricScanRef<'_>>| {
                             __metric_scan_sort(__scan, &qp.sort);
                         },
@@ -1328,11 +1503,12 @@ async fn list_metric(
             } else {
                 None
             };
+            let __keep_all: bool = __metric_is_unfiltered(&params);
             let (total, __page_ids) = db
                 .metric
                 .__with_scan(
                     __sel,
-                    |r| __metric_scan_matches(r, &params),
+                    |r| __keep_all || __metric_scan_matches(r, &params),
                     |__scan: &mut Vec<super::MetricScanRef<'_>>| {
                         __metric_scan_sort(__scan, &qp.sort);
                         let __total = __scan.len();
@@ -1655,6 +1831,91 @@ fn metric_apply_sort(
     if sort.is_descending() {
         rows.reverse();
     }
+}
+/// Is this request unfiltered — does NO query key name a filterable field
+/// of this model (#288)?
+///
+/// Hoisted out of the per-row loop by every caller, because it is a
+/// property of the query string and not of the row. `_scan_matches` can
+/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+/// while naming no filterable field at all — so an unfiltered request was
+/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+/// 850 µs request over 10k rows.
+///
+/// The question is POSITIVE — "does any key name a field of this model?" —
+/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+/// legally declare a field named `limit`, and for that model `?limit=3`
+/// genuinely is a filter.
+fn __metric_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("recorded_at") {
+        return false;
+    }
+    if params.contains_key("device_id") {
+        return false;
+    }
+    if params.contains_key("sample_seq") {
+        return false;
+    }
+    if params.contains_key("region") {
+        return false;
+    }
+    if params.contains_key("cpu_pct") {
+        return false;
+    }
+    if params.contains_key("mem_pct") {
+        return false;
+    }
+    if params.contains_key("disk_pct") {
+        return false;
+    }
+    if params.contains_key("net_rx_bytes") {
+        return false;
+    }
+    if params.contains_key("net_tx_bytes") {
+        return false;
+    }
+    if params.contains_key("req_count") {
+        return false;
+    }
+    if params.contains_key("err_count") {
+        return false;
+    }
+    if params.contains_key("p50_micros") {
+        return false;
+    }
+    if params.contains_key("p95_micros") {
+        return false;
+    }
+    if params.contains_key("p99_micros") {
+        return false;
+    }
+    if params.contains_key("queue_depth") {
+        return false;
+    }
+    if params.contains_key("open_conns") {
+        return false;
+    }
+    if params.contains_key("gc_pause_micros") {
+        return false;
+    }
+    if params.contains_key("uptime_secs") {
+        return false;
+    }
+    if params.contains_key("temp_celsius") {
+        return false;
+    }
+    if params.contains_key("throttled") {
+        return false;
+    }
+    if params.contains_key("healthy") {
+        return false;
+    }
+    true
 }
 /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
 /// a row is accepted or rejected before its strings are ever copied out
@@ -1994,12 +2255,33 @@ async fn list_doc(
         }
         None => {
             if params.get("projection").is_none() {
+                let __keep_all: bool = __doc_is_unfiltered(&params);
+                if __keep_all && qp.sort.is_none() {
+                    return db
+                        .doc
+                        .__with_fast_page(
+                            qp.pagination.offset,
+                            qp.pagination.limit,
+                            |__total: usize, __page: &[super::DocPageRef<'_>]| {
+                                (
+                                    StatusCode::OK,
+                                    Json(__ListEnvelope {
+                                        data: __page,
+                                        total: __total,
+                                        limit: qp.pagination.limit,
+                                        offset: qp.pagination.offset,
+                                    }),
+                                )
+                                    .into_response()
+                            },
+                        );
+                }
                 let __sel: Option<Vec<usize>> = None;
                 return db
                     .doc
                     .__with_page(
                         __sel,
-                        |r| __doc_scan_matches(r, &params),
+                        |r| __keep_all || __doc_scan_matches(r, &params),
                         |__scan: &mut Vec<super::DocScanRef<'_>>| {
                             __doc_scan_sort(__scan, &qp.sort);
                         },
@@ -2020,11 +2302,12 @@ async fn list_doc(
                     );
             }
             let __sel: Option<Vec<usize>> = None;
+            let __keep_all: bool = __doc_is_unfiltered(&params);
             let (total, __page_ids) = db
                 .doc
                 .__with_scan(
                     __sel,
-                    |r| __doc_scan_matches(r, &params),
+                    |r| __keep_all || __doc_scan_matches(r, &params),
                     |__scan: &mut Vec<super::DocScanRef<'_>>| {
                         __doc_scan_sort(__scan, &qp.sort);
                         let __total = __scan.len();
@@ -2312,6 +2595,46 @@ fn doc_apply_sort(
     if sort.is_descending() {
         rows.reverse();
     }
+}
+/// Is this request unfiltered — does NO query key name a filterable field
+/// of this model (#288)?
+///
+/// Hoisted out of the per-row loop by every caller, because it is a
+/// property of the query string and not of the row. `_scan_matches` can
+/// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+/// while naming no filterable field at all — so an unfiltered request was
+/// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+/// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+/// 850 µs request over 10k rows.
+///
+/// The question is POSITIVE — "does any key name a field of this model?" —
+/// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+/// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+/// legally declare a field named `limit`, and for that model `?limit=3`
+/// genuinely is a filter.
+fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool {
+    if params.contains_key("id") {
+        return false;
+    }
+    if params.contains_key("seq") {
+        return false;
+    }
+    if params.contains_key("kind") {
+        return false;
+    }
+    if params.contains_key("body_a") {
+        return false;
+    }
+    if params.contains_key("body_b") {
+        return false;
+    }
+    if params.contains_key("body_c") {
+        return false;
+    }
+    if params.contains_key("body_d") {
+        return false;
+    }
+    true
 }
 /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
 /// a row is accepted or rejected before its strings are ever copied out
@@ -3273,6 +3596,7 @@ async fn handle_user_live_query(
     db: Arc<RwLock<super::Database>>,
     params: HashMap<String, String>,
 ) {
+    let __keep_all: bool = __user_is_unfiltered(&params);
     let mut rx = { db.read().await.changefeed.subscribe() };
     let mut members: HashMap<Uuid, super::User> = HashMap::new();
     {
@@ -3282,7 +3606,7 @@ async fn handle_user_live_query(
                 .user
                 .__with_scan(
                     None,
-                    |r| __user_scan_matches(r, &params),
+                    |r| __keep_all || __user_scan_matches(r, &params),
                     |__scan: &mut Vec<super::UserScanRef<'_>>| {
                         __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                     },
@@ -3311,7 +3635,7 @@ async fn handle_user_live_query(
                         .user
                         .__with_scan(
                             None,
-                            |r| __user_scan_matches(r, &params),
+                            |r| __keep_all || __user_scan_matches(r, &params),
                             |__scan: &mut Vec<super::UserScanRef<'_>>| {
                                 __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                             },
@@ -3380,6 +3704,7 @@ async fn handle_post_live_query(
     db: Arc<RwLock<super::Database>>,
     params: HashMap<String, String>,
 ) {
+    let __keep_all: bool = __post_is_unfiltered(&params);
     let mut rx = { db.read().await.changefeed.subscribe() };
     let mut members: HashMap<Uuid, super::Post> = HashMap::new();
     {
@@ -3389,7 +3714,7 @@ async fn handle_post_live_query(
                 .post
                 .__with_scan(
                     None,
-                    |r| __post_scan_matches(r, &params),
+                    |r| __keep_all || __post_scan_matches(r, &params),
                     |__scan: &mut Vec<super::PostScanRef<'_>>| {
                         __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                     },
@@ -3418,7 +3743,7 @@ async fn handle_post_live_query(
                         .post
                         .__with_scan(
                             None,
-                            |r| __post_scan_matches(r, &params),
+                            |r| __keep_all || __post_scan_matches(r, &params),
                             |__scan: &mut Vec<super::PostScanRef<'_>>| {
                                 __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                             },
@@ -3487,6 +3812,7 @@ async fn handle_tag_live_query(
     db: Arc<RwLock<super::Database>>,
     params: HashMap<String, String>,
 ) {
+    let __keep_all: bool = __tag_is_unfiltered(&params);
     let mut rx = { db.read().await.changefeed.subscribe() };
     let mut members: HashMap<Uuid, super::Tag> = HashMap::new();
     {
@@ -3496,7 +3822,7 @@ async fn handle_tag_live_query(
                 .tag
                 .__with_scan(
                     None,
-                    |r| __tag_scan_matches(r, &params),
+                    |r| __keep_all || __tag_scan_matches(r, &params),
                     |__scan: &mut Vec<super::TagScanRef<'_>>| {
                         __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                     },
@@ -3525,7 +3851,7 @@ async fn handle_tag_live_query(
                         .tag
                         .__with_scan(
                             None,
-                            |r| __tag_scan_matches(r, &params),
+                            |r| __keep_all || __tag_scan_matches(r, &params),
                             |__scan: &mut Vec<super::TagScanRef<'_>>| {
                                 __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                             },
@@ -3594,6 +3920,7 @@ async fn handle_metric_live_query(
     db: Arc<RwLock<super::Database>>,
     params: HashMap<String, String>,
 ) {
+    let __keep_all: bool = __metric_is_unfiltered(&params);
     let mut rx = { db.read().await.changefeed.subscribe() };
     let mut members: HashMap<Uuid, super::Metric> = HashMap::new();
     {
@@ -3603,7 +3930,7 @@ async fn handle_metric_live_query(
                 .metric
                 .__with_scan(
                     None,
-                    |r| __metric_scan_matches(r, &params),
+                    |r| __keep_all || __metric_scan_matches(r, &params),
                     |__scan: &mut Vec<super::MetricScanRef<'_>>| {
                         __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                     },
@@ -3634,7 +3961,7 @@ async fn handle_metric_live_query(
                         .metric
                         .__with_scan(
                             None,
-                            |r| __metric_scan_matches(r, &params),
+                            |r| __keep_all || __metric_scan_matches(r, &params),
                             |__scan: &mut Vec<super::MetricScanRef<'_>>| {
                                 __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                             },
@@ -3703,6 +4030,7 @@ async fn handle_doc_live_query(
     db: Arc<RwLock<super::Database>>,
     params: HashMap<String, String>,
 ) {
+    let __keep_all: bool = __doc_is_unfiltered(&params);
     let mut rx = { db.read().await.changefeed.subscribe() };
     let mut members: HashMap<Uuid, super::Doc> = HashMap::new();
     {
@@ -3712,7 +4040,7 @@ async fn handle_doc_live_query(
                 .doc
                 .__with_scan(
                     None,
-                    |r| __doc_scan_matches(r, &params),
+                    |r| __keep_all || __doc_scan_matches(r, &params),
                     |__scan: &mut Vec<super::DocScanRef<'_>>| {
                         __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                     },
@@ -3741,7 +4069,7 @@ async fn handle_doc_live_query(
                         .doc
                         .__with_scan(
                             None,
-                            |r| __doc_scan_matches(r, &params),
+                            |r| __keep_all || __doc_scan_matches(r, &params),
                             |__scan: &mut Vec<super::DocScanRef<'_>>| {
                                 __scan.iter().map(|r| r.id).collect::<Vec<_>>()
                             },
