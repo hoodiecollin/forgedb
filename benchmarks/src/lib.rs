@@ -4,6 +4,26 @@
 //! bench the *same* records, so their Criterion groups line up. See
 //! `docs/BENCHMARKS.md`.
 
+// ===========================================================================
+// SECTION 1 — the default generated project (`benchmarks/gen/`). TRACKED in git,
+// re-emitted by `make bench-regen`. Every declaration here is UNCONDITIONAL,
+// because the file it points at is committed and therefore present in a fresh
+// clone.
+//
+// The gate criterion for a NEW declaration is NOT merely "is the file tracked".
+// It is: **does declaring it make this library depend on something a plain
+// `cargo bench` should not have to build?** Gitignored-ness is one instance of
+// that (a missing file cannot compile at all — the #279 bug); a heavy dependency
+// tree is another, and it is the one that bites next. #282 adds the generated
+// `api.rs`, whose emitted `use` statements pull axum, tokio, utoipa-axum and
+// tower-http in as NORMAL deps of this lib (see `crates/codegen/src/api.rs` and
+// the scaffold pins in `src/commands/init.rs`) — so every bench target, even
+// `make bench-sqlite`, would start paying that compile cost. Tracked, but not
+// free: gate it behind its own feature and have only the targets that need the
+// router enable it. Do NOT copy a declaration out of section 2 either; its `cfg`
+// exists only because those files are gitignored.
+// ===========================================================================
+
 /// The ForgeDB-GENERATED database code (`benchmarks/gen/database.rs`), compiled
 /// as part of this crate so the bench links the real generated `Database` API.
 /// Regenerate with `make bench-regen` after any codegen change — this module
@@ -11,6 +31,17 @@
 #[allow(warnings)]
 #[path = "../gen/database.rs"]
 pub mod forgedb_generated;
+
+// ===========================================================================
+// SECTION 2 — config-matrix variants (`benchmarks/gen/<variant>/`). GITIGNORED,
+// so they exist only after `make bench-regen-matrix`, and are compiled ONLY
+// under `--features matrix` (#279). Declaring them unconditionally made the
+// bench LIBRARY depend on untracked files, which broke every bench target in a
+// clean clone — not just the matrix one. Anything linking a variant must state
+// that: `required-features = ["matrix"]` on the target, or a `cfg` at the use
+// site (`examples/workload/main.rs`, whose `--var-sweep` mode needs
+// `v_churn_probe`).
+// ===========================================================================
 
 /// Config-matrix variants (epic #126): the SAME `bench.forge` generated under a
 /// range of `forgedb.toml` configs, each a separate module, so the matrix bench
@@ -20,21 +51,27 @@ pub mod forgedb_generated;
 /// presence, thresholds, changefeed capacity) — the schema is identical.
 /// (Top-level modules, not nested under a `variants` module: `#[path]` for an
 /// inline nested module resolves through a `src/<mod>/` dir that does not exist.)
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/default/database.rs"]
 pub mod v_default;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/fsync_never/database.rs"]
 pub mod v_fsync_never;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/replication_on/database.rs"]
 pub mod v_replication_on;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/compaction_off/database.rs"]
 pub mod v_compaction_off;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/compaction_low/database.rs"]
 pub mod v_compaction_low;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/changefeed_small/database.rs"]
 pub mod v_changefeed_small;
@@ -42,6 +79,7 @@ pub mod v_changefeed_small;
 /// Compaction-off lifts the `1 + 4000/live_rows` auto-compaction ceiling so the
 /// amplification ladder can reach 8x/16x/32x at all; fsync-never keeps the preload
 /// affordable there. Read-path measurements only — see `configs/churn_probe.toml`.
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/churn_probe/database.rs"]
 pub mod v_churn_probe;
@@ -55,6 +93,17 @@ pub const TAGS_PER_POST: usize = 3;
 
 /// Base unix-seconds for `created_at`, so timestamps are stable across runs.
 const BASE_TS: i64 = 1_700_000_000;
+
+/// The engine-agnostic rows below keep `created_at` in unix **seconds** (see
+/// [`BASE_TS`]) because that is what SQLite / redb / DuckDB / PG store. ForgeDB's
+/// `Timestamp` is **microseconds** since #254 (`6106cc0` removed the
+/// `Timestamp::from_seconds` every bench source used to call), so the mapping into
+/// the generated types lives here exactly once — five bench sources converting
+/// independently is five chances to disagree about the unit, which would silently
+/// change what the cross-engine comparison is comparing.
+pub fn ts_from_seconds(secs: i64) -> forgedb_types::Timestamp {
+    forgedb_types::Timestamp::from_micros(secs * 1_000_000)
+}
 
 /// Engine-agnostic rows. Each engine maps these into its own types, so the bytes
 /// on disk differ only by the engine's encoding — never by the data.

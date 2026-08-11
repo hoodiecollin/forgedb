@@ -8,6 +8,15 @@ description = "Comparative benchmarks of ForgeDB's generated code vs. establishe
 [lib]
 path = "src/lib.rs"
 
+# The config-matrix variant modules (`gen/<variant>/database.rs`, epic #126) are
+# GITIGNORED — regenerable from `bench.forge` + `configs/*.toml`, never committed.
+# So they are compiled only behind this feature (#279): every target that links a
+# variant declares `required-features = ["matrix"]` (or cfg-gates its use), and a
+# clean clone therefore builds every OTHER target without generating anything.
+# Enable with `--features matrix` after `make bench-regen-matrix`.
+[features]
+matrix = []
+
 # Substrate the ForgeDB-generated `gen/database.rs` links against, path-patched to
 # the local crates (this is a detached project — see `[workspace]` below — so the
 # heavy bench deps never enter the root workspace build or test baseline).
@@ -62,9 +71,14 @@ harness = false
 name = "pg_bench"
 harness = false
 
+# Links all seven gitignored config variants, so it is the one bench target that
+# needs `make bench-regen-matrix` first. Cargo SKIPS it on a bare `cargo bench`
+# when the feature is off, and errors with the feature name if it is asked for by
+# name — either way the failure is at target selection, not 238 type errors.
 [[bench]]
 name = "matrix_bench"
 harness = false
+required-features = ["matrix"]
 
 # #226 kill gate: how much of a list request is the per-row page materialization.
 [[bench]]

@@ -323,11 +323,12 @@ model** (`bench.forge` ↔ `schema.sql`, a hand-verified 1:1 mapping).
     purpose** — the fixed-width and variable-width column reads are separate code paths with
     separate failure modes, and a model carrying both reports their sum:
     `ARGS="--scan-sweep"` over `Metric` (22 fixed columns, no string) isolates
-    `FixedColumn::export` and found a **step** (#221); `ARGS="--var-sweep"` over `Doc`
+    `FixedColumn::export` and found a **step** (#221); `make bench-workload-var` over `Doc`
     (4 string columns + 2 fixed) isolates `VariableColumn::gather_buffered` and found a
-    **slope** (#222). `--var-sweep` needs `make bench-regen-matrix` first — it runs against
-    the `churn_probe` variant, since the default build's auto-compaction ceiling leaves no
-    amplification range to establish a slope over.
+    **slope** (#222). The variable sweep is its own target rather than an `ARGS` mode because
+    it runs against the `churn_probe` variant — gitignored, so it needs `bench-regen-matrix`
+    and the `matrix` feature (#279) — since the default build's auto-compaction ceiling leaves
+    no amplification range to establish a slope over.
 
 Scenarios 1–19 share a blind spot that this one exists to close. Every one of them is a
 *single operation, timed in isolation, on a database shaped to make that operation easy to
@@ -444,7 +445,7 @@ not an engine deficit).
 
 Results from scenario 20. Corpora are smoke-sized — 1e3 preloaded rows for the mixed run
 (`make bench-workload`), 1e4 for the fixed-width scan sweep (`ARGS="--scan-sweep"`), 2e3 for the
-variable-width one (`ARGS="--var-sweep"`) — so treat magnitudes as directional. The *structural*
+variable-width one (`make bench-workload-var`) — so treat magnitudes as directional. The *structural*
 findings below do not depend on corpus size, and finding 2 gets stronger as the corpus grows.
 
 **Headline: both suspected read-path costs turned out to be implementation artifacts, and both are
@@ -567,7 +568,7 @@ step. So it needed its own subject and its own sweep.
 would be on `Post`), 4 string columns + 2 fixed, with `@projection(meta: seq, kind)` over the
 *fixed* columns only. That projection is the **in-run control**: it never touches a
 `VariableColumn`, so a slope in the narrow scan is attributable to the variable path rather than to
-machine state. Run via `make bench-workload ARGS="--var-sweep"`.
+machine state. Run via `make bench-workload-var`.
 
 **Method note — the ladder needs `compaction = false`.** Finding 2 caps amplification at
 `1 + 4000/live_rows`, which on a 10k-row corpus is a 1.0×–1.4× range: no lever arm to establish a

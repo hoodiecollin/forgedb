@@ -15,8 +15,7 @@
 //! change (each module compiling is itself a codegen guard).
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use forgedb_benchmarks::{dataset, UserRow};
-use forgedb_types::Timestamp;
+use forgedb_benchmarks::{dataset, ts_from_seconds};
 use uuid::Uuid;
 
 // A unique user record for a write-path iteration: id + email are made unique by
@@ -29,7 +28,7 @@ macro_rules! mk_user {
             id: Uuid::from_u128(0xF000_0000_0000_0000_0000_0000_0000_0000 + $i as u128),
             name: $row.name.clone(),
             email: format!("m{}@example.com", $i),
-            created_at: Timestamp::from_seconds($row.created_at),
+            created_at: ts_from_seconds($row.created_at),
             posts: (),
         }
     }};

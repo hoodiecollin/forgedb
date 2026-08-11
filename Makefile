@@ -18,14 +18,16 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
         website-rewrite website-rewrite-watch changelog roadmap \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
-        bench-pglite bench-matrix bench-regen bench-regen-matrix \
-        bench-footprint bench-concurrency bench-workload
+        bench-pglite bench-matrix bench-regen bench-regen-matrix bench-list-page \
+        bench-footprint bench-concurrency bench-workload bench-workload-var
 
 ## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
-## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), and the
-## JS/PGlite suite are separate targets below — a bare `cargo bench` would also try to
-## compile matrix_bench, whose gitignored variant modules only exist after
-## `make bench-regen-matrix`. See docs/BENCHMARKS.md.
+## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), the #226
+## list-page kill gate, and the JS/PGlite suite are separate targets below, so this
+## names its four benches instead of letting `cargo bench` select everything. The
+## matrix bench is no longer a reason to hand-list them: its gitignored variant modules
+## sit behind `--features matrix` (#279), so cargo SKIPS that target when the feature is
+## off rather than failing to compile the library. See docs/BENCHMARKS.md.
 bench:
 	cargo bench --manifest-path $(BENCH) \
 		--bench forgedb_bench --bench sqlite_bench --bench redb_bench --bench duckdb_bench
@@ -82,16 +84,25 @@ bench-concurrency:
 ##   make bench-workload ARGS="--full"         # full ladder (A = 1..32)
 ##   make bench-workload ARGS="--forgedb-only" # skip the comparison engines
 ##   make bench-workload ARGS="--scan-sweep"   # fixed-width scan path (Metric subject)
-##   make bench-workload ARGS="--var-sweep"    # variable-width scan path (Doc subject);
-##                                             # needs `make bench-regen-matrix` first,
-##                                             # it runs against the churn_probe variant
 ##   make bench-workload ARGS="--verify"       # driver self-checks
+## The variable-width scan path (--var-sweep) runs against the gitignored churn_probe
+## variant, so it has its own target below rather than an ARGS mode.
 bench-workload:
 	cargo run --manifest-path $(BENCH) --example workload --release -- $(ARGS)
 
+## Variable-width scan sweep (Doc subject): the one workload mode that links a config
+## variant (churn_probe — compaction off, so amplification has a lever arm). Regenerates
+## the variants and builds with `--features matrix`, which is what makes v_churn_probe
+## exist at all (#279). Add ARGS="--full" for the wider ladder.
+bench-workload-var: bench-regen-matrix
+	cargo run --manifest-path $(BENCH) --example workload --release --features matrix -- \
+		--var-sweep $(ARGS)
+
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
-bench-matrix:
-	cargo bench --manifest-path $(BENCH) --bench matrix_bench
+## Needs `make bench-regen-matrix` first — the variant modules are gitignored and only
+## compile under `--features matrix` (#279).
+bench-matrix: bench-regen-matrix
+	cargo bench --manifest-path $(BENCH) --bench matrix_bench --features matrix
 
 ## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
 ## Run this after any codegen change so the bench links current generated output.

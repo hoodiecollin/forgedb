@@ -11,7 +11,7 @@
 //! measure the storage path.
 
 use forgedb_benchmarks::forgedb_generated::{Database, Metric};
-use forgedb_types::Timestamp;
+use forgedb_benchmarks::ts_from_seconds;
 use uuid::Uuid;
 
 use crate::driver::{dir_size, OpOutcome, ScanKind, UpdateWidth, WorkloadTarget};
@@ -55,7 +55,7 @@ impl ForgeTarget {
         let m = key.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ g.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         Metric {
             id: metric_id(key),
-            recorded_at: Timestamp::from_seconds(1_700_000_000 + (key as i64 % 100_000)),
+            recorded_at: ts_from_seconds(1_700_000_000 + (key as i64 % 100_000)),
             device_id: key % 1024,
             sample_seq: g,
             region: (m % 16) as u32,
@@ -137,8 +137,14 @@ impl WorkloadTarget for ForgeTarget {
             // Declared `@projection(hot: cpu_pct, mem_pct)` → column-pruned buffered
             // scan → `FixedColumn::export`.
             ScanKind::Projection => self.db().metric.all_hot().len(),
-            // Internal narrow scan: id + every filterable/sortable column.
-            ScanKind::Narrow => self.db().metric.__scan_all().len(),
+            // Internal narrow scan: id + every filterable/sortable column. A SCOPE
+            // since #228 (`__with_scan`) — the per-row refs are still built eagerly
+            // from the bulk-loaded column buffers, so this is the same decode the
+            // owned `__scan_all()` used to measure, minus the row materialization.
+            ScanKind::Narrow => self
+                .db()
+                .metric
+                .__with_scan(None, |_| true, |scan| scan.len()),
         };
         OpOutcome::rows(n.min(limit) as u64)
     }
