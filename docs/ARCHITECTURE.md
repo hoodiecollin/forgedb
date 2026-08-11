@@ -226,9 +226,48 @@ pub fn __with_scan<R>(
 ) -> R
 ```
 
-The handler filters, sorts, counts and paginates *inside* `f`, and returns `(total, Vec<Id>)`; the
-page is then re-read through `get`, so only `limit` rows ever pay a full decode. Nothing borrowed
-crosses the boundary — the view's lifetime is higher-ranked, so `R` cannot name it.
+The handler filters, sorts, counts and paginates *inside* `f`, and returns `(total, Vec<Id>)`.
+Nothing borrowed crosses the boundary — the view's lifetime is higher-ranked, so `R` cannot name it.
+
+**The page is serialized inside the scope too, and does not go back through `get`.** Returning ids
+and re-reading them was still a full decode per returned row, so the default list arm is a second
+scope that keeps the page borrowed as well:
+
+```rust
+pub fn __with_page<R>(
+    &self,
+    sel:    Option<Vec<usize>>,
+    keep:   impl Fn(&<Model>ScanRef<'_>) -> bool,
+    sort:   impl FnOnce(&mut Vec<<Model>ScanRef<'_>>),
+    offset: usize,
+    limit:  usize,
+    f:      impl FnOnce(usize, &[<Model>PageRef<'_>]) -> R,   // (total, the page)
+) -> R
+```
+
+`<Model>PageRef` is the *wide* borrowed view — every stored column, still pointing into the
+buffers, with one-to-many relations left as unit placeholders exactly as they are on the record — so
+the response serializes straight out of them. The `__with_scan` + `get(id)` shape above is retained
+only where the page genuinely needs owned rows: `@projection` models and the live-query re-run.
+
+**The "is there any filter at all?" question is answered once per request, not once per row.** The
+generated matcher short-circuits only on an *empty* query map, and `?limit=50` — the default page
+size a client is told to send — makes the map non-empty without naming a single filterable field.
+So an unfiltered list request used to run one hash lookup per filterable field per scanned row, all
+of them guaranteed to miss: 502 µs on a 10,000-row table, 59% of the request, scaling with the
+*table* rather than the page. Codegen now emits `__<model>_is_unfiltered` from the **same** field
+iteration that builds the per-field checks, and the handler evaluates it once before the scan:
+
+```rust
+let __keep_all: bool = __post_is_unfiltered(&params);
+… __with_page(__sel, |r| __keep_all || __post_scan_matches(r, &params), …)
+```
+
+Deriving the predicate from that same iteration is what makes it impossible for the two to disagree
+about which names are filterable — and it is why the predicate is *positive* ("does any key name a
+filterable field of this model?") rather than a maintained list of reserved query keys. A model may
+legally declare a field named `limit`; for that model `?limit=3` genuinely is a filter, and an
+exclusion list would silently return unfiltered rows.
 
 That shape is what removes the copies rather than narrowing who pays them. `keep` running during
 decode means a **rejected** row never allocates a string. Keeping the sort and the page inside the
