@@ -7988,10 +7988,20 @@ impl RustGenerator {
                 pub #anchor: ::std::marker::PhantomData<&'a ()>,
             },
         };
+        // #226: the buffer slot the view was decoded at.  Not serialized — and
+        // that costs nothing to arrange, because this view has never derived
+        // `Serialize` (see the #224 note above): there is no serializer to skip it
+        // from, so a `#[serde(skip)]` here would not be a harmless no-op, it would
+        // fail to compile.
+        let slot_field = Self::scan_slot_field(&scan_fields);
         let ref_struct_tokens = quote! {
             #[doc = #ref_doc]
             #[derive(Debug, Clone)]
             pub struct #scan_ref_ident<'a> {
+                /// #226: the scan buffer slot this view was decoded at — the only
+                /// thing that survives the sort's reordering to say which physical
+                /// row it came from.  Internal; this view is not `Serialize`.
+                pub #slot_field: usize,
                 #(#ref_field_decls,)*
                 #ref_borrow_anchor
             }
@@ -8002,14 +8012,56 @@ impl RustGenerator {
         // the user, so it has nothing to filter against and nothing to keep inside
         // a scope).
         let buf_holder = format_ident!("__{}ScanBufs", model.name);
-        let with_scan_method =
-            Self::generate_scan_scope_method(schema, &scan_ref_ident, &buf_holder, &scan_fields, key_name);
+        let with_scan_method = Self::generate_scan_scope_method(
+            schema,
+            &scan_ref_ident,
+            &buf_holder,
+            &scan_fields,
+            key_name,
+            &slot_field,
+        );
 
         let methods = quote! {
             #with_scan_method
             #(#pushdown)*
         };
         (ref_struct_tokens, methods)
+    }
+
+    /// The name of the #226 buffer-slot field on a scan view.
+    ///
+    /// `__with_page` filters, sorts and paginates the scan views before it gathers
+    /// the page's remaining columns.  After the sort, position in the vector says
+    /// nothing about which physical row a view came from — the sort is exactly what
+    /// destroys that correspondence — so the slot the view was decoded at has to
+    /// travel *on* the view.  Recovering it from anything else (re-deriving from
+    /// the identity, re-scanning) would be a second source of truth for the same
+    /// mapping.
+    ///
+    /// The name is *derived* rather than fixed for the same reason
+    /// [`Self::scan_ref_anchor`]'s is: `.forge` field names are only required to be
+    /// snake_case, so `__slot: u32` is a legal field, and a hardcoded name would
+    /// emit the struct field twice.  Underscores are appended until the name is
+    /// free, and both emission sites take the result as a parameter rather than
+    /// re-deriving it, so they cannot disagree.
+    fn scan_slot_field(fields: &[&forgedb_parser::Field]) -> proc_macro2::Ident {
+        let mut name = String::from("__slot");
+        while fields.iter().any(|f| f.name == name) {
+            name.push('_');
+        }
+        format_ident!("{}", name)
+    }
+
+    /// The struct-literal initializer for the #226 slot field, given the name
+    /// [`Self::scan_slot_field`] derived and the `__slot` loop variable the decode
+    /// runs under.  Field-init shorthand when the two coincide (the universal case),
+    /// the explicit form when a `__slot` field in the schema forced a longer name.
+    fn slot_field_init(slot_field: &proc_macro2::Ident) -> TokenStream {
+        if slot_field == "__slot" {
+            quote! { #slot_field, }
+        } else {
+            quote! { #slot_field: __slot, }
+        }
     }
 
     /// The name of the #250 lifetime anchor for a scan view, or `None` when the
@@ -8109,6 +8161,7 @@ impl RustGenerator {
         holder: &proc_macro2::Ident,
         fields: &[&forgedb_parser::Field],
         key_name: Option<&str>,
+        slot_field: &proc_macro2::Ident,
     ) -> TokenStream {
         let mut buf_field_decls = Vec::new();
         let mut buf_inits = Vec::new();
@@ -8154,6 +8207,10 @@ impl RustGenerator {
             None => quote! {},
             Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
         };
+        // #226: the slot the view is being decoded at.  Field-init shorthand in the
+        // usual case; the long form only when a model declares its own `__slot`
+        // field and `scan_slot_field` had to pick a different name.
+        let slot_init = Self::slot_field_init(slot_field);
 
         quote! {
             /// Run `f` inside a narrow column scan (#160/#168/#224/#228) — the list
@@ -8221,6 +8278,7 @@ impl RustGenerator {
                 for __slot in 0..__n {
                     #(#buf_read_stmts)*
                     let __row_ref = #ref_ident {
+                        #slot_init
                         #(#buf_field_values,)*
                         #ref_borrow_init
                     };

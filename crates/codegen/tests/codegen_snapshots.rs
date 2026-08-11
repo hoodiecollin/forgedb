@@ -7411,8 +7411,15 @@ User {
     // every other filterable field keeps the owned record's exact type (that is
     // what lets ONE emitted filter compile against both views).
     assert!(
+        flat.contains("pub struct UserScanRef<'a> {"),
+        "UserScanRef is emitted.\nGot: {flat}"
+    );
+    // #226 put the internal buffer slot first, ahead of the field set; the doc
+    // comment on it sits between the two, so this asserts the field list from
+    // `__slot` on rather than from the opening brace.
+    assert!(
         flat.contains(
-            "pub struct UserScanRef<'a> { pub id: Uuid, pub email: &'a str, \
+            "pub __slot: usize, pub id: Uuid, pub email: &'a str, \
              pub bio: Option<&'a str>, pub age: u32, pub score: f64, }"
         ),
         "UserScanRef borrows strings and mirrors every other scan field type.\nGot: {flat}"
@@ -10102,7 +10109,7 @@ fn test_rust_generation_the_scan_view_holds_a_string_key_by_value() {
     let code = db_for("Airport {\n  id: string(3!)\n  city: string\n}\n");
     let f = flat(&code);
     assert!(
-        f.contains("pub struct AirportScanRef<'a> { pub id: InlineStr<3usize>"),
+        f.contains("pub __slot: usize, pub id: InlineStr<3usize>"),
         "the scan view's key is owned and Copy: {f:.400}"
     );
     assert!(
