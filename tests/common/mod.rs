@@ -126,6 +126,31 @@ pub fn generate_compile_run(tag: &str, schema: &str, driver: &str) -> (Output, P
     (out, proj)
 }
 
+/// Re-run the build over an already-built project and hand back its diagnostics.
+///
+/// `generate_compile_run` only asserts the build *succeeded*, so it drops stderr on
+/// the success path — and a warning is, by definition, on the success path. Some
+/// generated-code defects are visible ONLY as a warning in the user's crate: they
+/// compile, they behave correctly, and no snapshot diff shows them, because the
+/// warning is a property of the emitted code rather than of any value it produces.
+///
+/// The rebuild is fully cached, so this replays the recorded diagnostics rather
+/// than recompiling. Call it BEFORE `assert_driver_ok`, which removes the project.
+///
+/// Assert on a *targeted* substring, never on "no warnings at all": generated code
+/// carries pre-existing benign warnings (unused `record`/`rows` bindings in arms a
+/// given schema does not exercise), so a blanket deny would fail for reasons that
+/// have nothing to do with the property under test.
+pub fn build_warnings(proj: &Path) -> String {
+    let out = Command::new("cargo")
+        .args(["build", "--quiet"])
+        .current_dir(proj)
+        .env("CARGO_TARGET_DIR", proj.join("target"))
+        .output()
+        .expect("re-run cargo build to replay diagnostics");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
 /// Print the driver's output, assert it succeeded, and remove the project.
 pub fn assert_driver_ok(out: &Output, proj: &Path, what: &str) {
     let stdout = String::from_utf8_lossy(&out.stdout);
