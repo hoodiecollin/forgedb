@@ -11,6 +11,7 @@ or test baseline. Run everything from the repo root — never `cd` in here.
 ```bash
 make bench            # the no-setup embedded suites (ForgeDB + SQLite + redb + DuckDB)
 make bench-forgedb    # ForgeDB generated code only
+make bench-list-page  # #226 kill gate: scan / page-materialize / serialize split of a list
 make bench-sqlite     # SQLite only
 make bench-redb       # redb (pure-Rust embedded KV)
 make bench-duckdb     # DuckDB (embedded columnar; bundled C++ build, ~2.5 min first time)
@@ -21,13 +22,36 @@ make bench-concurrency# ForgeDB reader throughput under a live writer (#56-B, sc
 make bench-workload   # sustained MIXED r/c/u/d/scan under phased load (scenario 20, #218)
 make bench-regen      # re-emit gen/database.rs from bench.forge (after codegen changes)
 
-# Config matrix (epic #126): same scenarios across generated config variants.
+# Everything above works in a fresh clone with no generation step. The two targets below
+# are the exception — they link the gitignored config variants (see next section).
 make bench-regen-matrix   # regenerate gen/<variant>/ from configs/<variant>.toml (REQUIRED first)
-make bench-matrix         # run the write-path / churn / reopen scenarios across variants
+make bench-matrix         # write-path / churn / reopen scenarios across config variants (epic #126)
+make bench-workload-var   # the --var-sweep workload mode (runs regen-matrix for you)
 ```
 
-The matrix variant modules (`gen/<variant>/`) are **gitignored** (regenerable from
-`bench.forge` + `configs/*.toml`) — run `make bench-regen-matrix` before `make bench-matrix`.
+## The `matrix` feature (why two targets need a generation step)
+
+The config-matrix variant modules (`gen/<variant>/database.rs`) are **gitignored** — regenerable
+from `bench.forge` + `configs/*.toml`, so they are absent in a fresh clone. They are therefore
+compiled only behind a **default-off `matrix` cargo feature**, and `matrix_bench` declares
+`required-features = ["matrix"]`. Consequences, all of them intended (#279):
+
+- a bare `cargo bench` **skips** `matrix_bench` instead of failing — every other target builds
+  with nothing generated;
+- `make bench-matrix` passes `--features matrix`, so it needs `make bench-regen-matrix` first;
+- asking for the target by name without the feature gets a one-line cargo error naming the
+  feature, not a wall of errors from inside 14k lines of generated code.
+
+Before this the seven variant modules were declared unconditionally in `src/lib.rs`, which made
+the bench **library** depend on untracked files: a missing or stale `gen/<variant>/` broke *every*
+bench target, and nothing about `make bench-forgedb` suggested it depended on the matrix.
+
+`make bench-workload ARGS="--var-sweep"` is the second variant consumer (it measures against
+`churn_probe`); it lives on its own target, `make bench-workload-var`, which regenerates the
+variants and sets the feature. Without the feature that mode exits with the command to use — it
+deliberately does **not** fall back to the default build, which would measure compaction-ON and
+report it as the sweep.
+
 Config axes live in `benchmarks/configs/*.toml`; results + interpretation are in
 [`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md) under "Configuration matrix".
 
@@ -46,8 +70,10 @@ make bench-workload                       # quick smoke matrix (fsync-bound)
 make bench-workload ARGS="--full"         # full amplification ladder A = 1..32
 make bench-workload ARGS="--forgedb-only" # skip the comparison engines
 make bench-workload ARGS="--scan-sweep"   # scan path, FIXED-width subject (Metric)
-make bench-workload ARGS="--var-sweep"    # scan path, VARIABLE-width subject (Doc)
 make bench-workload ARGS="--verify"       # driver self-checks
+make bench-workload-var                   # scan path, VARIABLE-width subject (Doc); own
+                                          # target — needs the `matrix` feature + regen
+make bench-workload-var ARGS="--full"     # ... over the wider amplification ladder
 ```
 
 ### The two scan sweeps
@@ -68,7 +94,8 @@ acts as an **in-run control**, which is what makes a slope in the narrow scan at
 the variable path rather than to machine state.
 
 `--var-sweep` runs against the **`churn_probe`** generated variant (`compaction = false` +
-`fsync = "never"`), so it needs `make bench-regen-matrix` first. Compaction-off is required, not
+`fsync = "never"`), which is why it is its own target (`make bench-workload-var`): the variant is
+gitignored, so the mode is compiled only under `--features matrix`. Compaction-off is required, not
 convenient: the default build caps amplification at `1 + 4000/live_rows`, which on a 10k-row
 corpus is a 1.0×–1.4× range — no lever arm to establish a slope over. Fsync-never only affects
 the preload, and this mode measures reads.
@@ -108,13 +135,15 @@ Criterion writes HTML reports under `benchmarks/target/criterion/`.
 | `bench.forge` | The shared benchmark schema (source of truth for the data model). |
 | `schema.sql` | Hand-verified 1:1 SQL mapping of `bench.forge` (SQLite/PG DDL). |
 | `gen/database.rs` | **Generated** ForgeDB code — do not hand-edit; regenerate with `make bench-regen`. |
-| `src/lib.rs` | Shared seeded data generation + the generated module. |
+| `gen/<variant>/database.rs` | **Generated + gitignored** config variants (epic #126) — `make bench-regen-matrix`; compiled only under `--features matrix`. |
+| `src/lib.rs` | Shared seeded data generation + the generated modules (section 1 = tracked default project, section 2 = feature-gated variants). |
 | `benches/forgedb_bench.rs` | ForgeDB Criterion suite. |
 | `benches/sqlite_bench.rs` | SQLite Criterion suite. |
 | `benches/redb_bench.rs` | redb Criterion suite. |
 | `benches/duckdb_bench.rs` | DuckDB Criterion suite. |
 | `benches/pg_bench.rs` | PostgreSQL Criterion suite (needs a running cluster — `make bench-postgres`). |
-| `benches/matrix_bench.rs` | ForgeDB config-matrix Criterion suite (needs `make bench-regen-matrix`). |
+| `benches/matrix_bench.rs` | ForgeDB config-matrix Criterion suite. `required-features = ["matrix"]`; needs `make bench-regen-matrix`. |
+| `benches/list_page_bench.rs` | #226 kill gate: scan / page-materialize / serialize split of a list request (`make bench-list-page`). |
 | `examples/footprint.rs` | On-disk footprint report (all engines) + ForgeDB churn bloat (scenario 18). A size report, not a Criterion timing — an example so it can use the bench dev-deps. |
 | `examples/concurrency.rs` | ForgeDB reader-throughput-under-a-live-writer report (#56-B, scenario 16). |
 | `scripts/pg_run.sh` | Ephemeral-PostgreSQL lifecycle (initdb → start → bench → stop) for `make bench-postgres`. |
