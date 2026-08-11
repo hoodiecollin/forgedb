@@ -101,7 +101,7 @@ bench-workload-var: bench-regen-matrix
 ## Config-matrix bench (epic #126): same scenarios across generated config variants.
 ## Needs `make bench-regen-matrix` first — the variant modules are gitignored and only
 ## compile under `--features matrix` (#279).
-bench-matrix:
+bench-matrix: bench-regen-matrix
 	cargo bench --manifest-path $(BENCH) --bench matrix_bench --features matrix
 
 ## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.

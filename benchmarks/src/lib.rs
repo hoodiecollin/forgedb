@@ -8,11 +8,20 @@
 // SECTION 1 — the default generated project (`benchmarks/gen/`). TRACKED in git,
 // re-emitted by `make bench-regen`. Every declaration here is UNCONDITIONAL,
 // because the file it points at is committed and therefore present in a fresh
-// clone. A new generated artifact for the default project (e.g. the generated
-// `api.rs`) belongs in THIS half — add an ungated `#[path]` module beside
-// `forgedb_generated` and extend `make bench-regen` to emit it. Do NOT copy a
-// declaration out of section 2: its `cfg` exists only because those files are
-// gitignored.
+// clone.
+//
+// The gate criterion for a NEW declaration is NOT merely "is the file tracked".
+// It is: **does declaring it make this library depend on something a plain
+// `cargo bench` should not have to build?** Gitignored-ness is one instance of
+// that (a missing file cannot compile at all — the #279 bug); a heavy dependency
+// tree is another, and it is the one that bites next. #282 adds the generated
+// `api.rs`, whose emitted `use` statements pull axum, tokio, utoipa-axum and
+// tower-http in as NORMAL deps of this lib (see `crates/codegen/src/api.rs` and
+// the scaffold pins in `src/commands/init.rs`) — so every bench target, even
+// `make bench-sqlite`, would start paying that compile cost. Tracked, but not
+// free: gate it behind its own feature and have only the targets that need the
+// router enable it. Do NOT copy a declaration out of section 2 either; its `cfg`
+// exists only because those files are gitignored.
 // ===========================================================================
 
 /// The ForgeDB-GENERATED database code (`benchmarks/gen/database.rs`), compiled
