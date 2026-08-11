@@ -8350,6 +8350,12 @@ impl RustGenerator {
     /// no decl/init/read and a `default_for_unstored_field` value — the same arm
     /// `generate_row_read_body` takes, so a full record built here matches one built
     /// by `read_at` field for field.
+    ///
+    /// (`too_many_arguments`: every argument names a distinct axis of the emission
+    /// site — same reason `emit_probe` above carries the allow. Bundling them into a
+    /// struct would move the argument list, not shorten it, and the three call sites
+    /// share no subset of these values.)
+    #[allow(clippy::too_many_arguments)]
     fn buffered_gather_pieces(
         schema: &Schema,
         fields: &[&forgedb_parser::Field],
