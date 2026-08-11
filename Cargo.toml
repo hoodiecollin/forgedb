@@ -103,6 +103,12 @@ forgedb-migrations = { path = "crates/migrations", version = "0.3.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
+# Structural guards over generated source (#282 BDD-9). `prettyplease` breaks lines by
+# length, so the same emitted call renders `return db .post .__with_page(` in one schema
+# and unbroken in another — a literal needle matches nothing and the guard passes
+# vacuously. Already in the lockfile transitively, so this adds no package to the resolve;
+# dev-only, so `cargo install forgedb` never builds it.
+regex = "1.12"
 
 # The profile that 'dist' will build with
 [profile.dist]
