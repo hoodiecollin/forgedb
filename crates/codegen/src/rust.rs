@@ -8079,9 +8079,17 @@ impl RustGenerator {
             &slot_field,
         );
 
+        // #281: the unfiltered/unsorted twin of `__with_page`.  Spliced AFTER it, and
+        // that order is load-bearing: `test_rust_generation_page_rows_map_through_
+        // the_recorded_slot` scopes its negative to `__with_page`'s body by slicing to
+        // the next `pub fn`, and #281's page slice is the very string it forbids.
+        let with_fast_page_method =
+            Self::generate_fast_page_scope_method(schema, model, &scan_fields, key_name);
+
         let methods = quote! {
             #with_scan_method
             #with_page_method
+            #with_fast_page_method
             #(#pushdown)*
         };
         let structs = quote! {
@@ -8416,6 +8424,7 @@ impl RustGenerator {
     /// about what "the selection" is — they are the same scan, differing only in
     /// what they hand the caller.
     fn scan_row_selection() -> TokenStream {
+        let live = Self::live_row_selection_expr();
         quote! {
             let __rows: Vec<usize> = match sel {
                 // Index pushdown (#160 C).  No tombstone read: delete removes
@@ -8434,13 +8443,30 @@ impl RustGenerator {
                 // `id_to_row` repoints a deleted id at its tombstoned row
                 // (delete appends a tombstone, #66), so filter those out with
                 // one bulk tombstone read.
-                None => {
-                    let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
-                    __all.sort_unstable();
-                    self.tombstones.live_indices(&__all)
-                        .expect("Failed to read tombstone liveness")
-                }
+                None => #live
             };
+        }
+    }
+
+    /// "Every live row, ascending" — the selection with no `sel` to match on (#281).
+    ///
+    /// Split out of [`Self::scan_row_selection`]'s `None` arm when `__with_fast_page`
+    /// became a third site needing it.  `__with_fast_page` takes no `sel` at all (its
+    /// predicate holds only when nothing could have narrowed the rows), so it cannot
+    /// reuse the `match` — but it must not re-derive the arm either: the ascending
+    /// order is what makes `__rows[__start..__end]` the same window `__with_page`
+    /// selects, and a second definition that drifted would move rows silently.
+    ///
+    /// Emitted as a block expression so it splices into a match arm and into a `let`
+    /// unchanged.
+    fn live_row_selection_expr() -> TokenStream {
+        quote! {
+            {
+                let mut __all: Vec<usize> = self.id_to_row.values().copied().collect();
+                __all.sort_unstable();
+                self.tombstones.live_indices(&__all)
+                    .expect("Failed to read tombstone liveness")
+            }
         }
     }
 
@@ -8675,6 +8701,129 @@ impl RustGenerator {
                     #(#page_reads)*
                     __views.push(#page_ref_ident {
                         #(#page_view_values,)*
+                        #page_borrow_init
+                    });
+                }
+                f(__total, &__views)
+            }
+        }
+    }
+
+    /// Emit the **fast page scope** (#281) — the unfiltered, unsorted list read.
+    ///
+    /// `__with_page` earns its full-table gather by having to *look* at every row:
+    /// `keep` and `sort` are opaque closures, so the callee cannot know they are
+    /// trivial and must decode every live row into a `ScanRef` before it can say
+    /// which `limit` of them survive.  When the request names no filter and no sort
+    /// that work is entirely wasted — `keep` accepts everything, `sort` reorders
+    /// nothing, and `__refs[i].__slot == i`, so the page was knowable from the
+    /// selection alone before a single column was read.
+    ///
+    /// This method is that path: derive the live rows, slice the page out of them,
+    /// and run **one** gather bounded to the page's rows.  The caller decides it is
+    /// applicable (the generated handler's `__<model>_is_unfiltered(&params) &&
+    /// qp.sort.is_none()`), which is why there is no `sel`, no `keep` and no `sort`
+    /// here — none of the three can be non-trivial when this is reachable.  `sel` in
+    /// particular is `None` *by construction*: index pushdown runs only over fields
+    /// `is_filterable_field` admits, so a request that names no filterable field
+    /// resolves no index.
+    ///
+    /// **Two things make this NOT a second copy of `__with_page`'s page phase.**
+    /// The selection is [`Self::live_row_selection_expr`], shared with
+    /// `scan_row_selection`.  And there is no *weave*: `__with_page` interleaves
+    /// scan-view fields with page-gather fields by walking `model.fields`, whereas
+    /// one gather over `model.fields` yields declaration order directly —
+    /// [`Self::buffered_gather_pieces`] emits exactly one value per input field in
+    /// input order.  That removes the divergence axis rather than duplicating it.
+    ///
+    /// `borrowed = true` is load-bearing and is not a free choice: it is the only
+    /// value that reproduces `PageRef`'s *declared* field types across a single
+    /// all-column gather.  `borrowed` is read by exactly two arms of
+    /// [`Self::field_read_stmt`] — variable-string and inline-string.  No **non-scan**
+    /// variable-string field can exist (`String` is filterable, so it is always in the
+    /// scan set), and the only non-scan inline-string field is an FK to a
+    /// string-keyed model, for which `field_read_stmt` forces `as_key` and both flag
+    /// values materialize the same `InlineStr<N>`.  Passing `false` is a compile
+    /// error in the user's crate, not a wrong value.
+    fn generate_fast_page_scope_method(
+        schema: &Schema,
+        model: &forgedb_parser::Model,
+        scan_fields: &[&forgedb_parser::Field],
+        key_name: Option<&str>,
+    ) -> TokenStream {
+        let page_ref_ident = format_ident!("{}PageRef", model.name);
+        let holder = format_ident!("__{}FastPageBufs", model.name);
+
+        // ALL fields, in model declaration order — no complement, no interleave.
+        let all_fields: Vec<&forgedb_parser::Field> = model.fields.iter().collect();
+        let gather = Self::buffered_gather_pieces(
+            schema,
+            &all_fields,
+            &quote! { __bufs },
+            &quote! { __rows[__start..__end] },
+            &quote! { __pslot },
+            true,
+            key_name,
+            "Failed to bulk-load fast-page column",
+        );
+        let decls = &gather.decls;
+        let inits = &gather.inits;
+        let reads = &gather.reads;
+        let values = &gather.values;
+
+        // The same predicate `generate_page_ref_struct` uses, so the view is built
+        // with exactly the fields it declares.  It is a function of the SCAN set, not
+        // of `model.fields` — deciding it from the all-field gather here would
+        // disagree with the struct and fail to compile in the user's crate.
+        let page_borrow_init = match Self::page_ref_anchor(model, scan_fields, key_name) {
+            None => quote! {},
+            Some(anchor) => quote! { #anchor: ::std::marker::PhantomData, },
+        };
+        let live = Self::live_row_selection_expr();
+
+        quote! {
+            /// Run `f` over one fully-decoded page **without scanning the table**
+            /// (#281) — the unfiltered, unsorted list read.
+            ///
+            /// Only valid when no filter and no sort applies, which the caller
+            /// establishes; there is deliberately no way to express one here.  The
+            /// rows, the page window and `total` are identical to
+            /// `__with_page(None, |_| true, |_| {}, offset, limit, f)` — that
+            /// equality is a test obligation, not a comment (`page_identity_test`).
+            ///
+            /// `offset`/`limit` use the same clamping arithmetic as `__with_page`,
+            /// against the live row count.  The buffers are locals, so they outlive
+            /// `f`; only `f`'s return value escapes.
+            pub fn __with_fast_page<R>(
+                &self,
+                offset: usize,
+                limit: usize,
+                f: impl FnOnce(usize, &[#page_ref_ident<'_>]) -> R,
+            ) -> R {
+                let __rows: Vec<usize> = #live;
+                // With no `keep` and no `sort`, the post-filter view count IS the
+                // live row count, and the page is the same slice `__with_page`
+                // would have arrived at through `__refs[i].__slot == i`.
+                let __total = __rows.len();
+                let __start = offset.min(__total);
+                let __end = offset.saturating_add(limit).min(__total);
+
+                #[allow(non_camel_case_types)]
+                struct #holder {
+                    #(#decls,)*
+                }
+                // Bounded to the page.  An empty page is legitimate (`offset` past
+                // the end, or an empty table) and both column kinds return an empty
+                // buffer for an empty selection rather than erroring.
+                let __bufs = #holder {
+                    #(#inits,)*
+                };
+
+                let mut __views: Vec<#page_ref_ident<'_>> = Vec::with_capacity(__end - __start);
+                for __pslot in 0..(__end - __start) {
+                    #(#reads)*
+                    __views.push(#page_ref_ident {
+                        #(#values,)*
                         #page_borrow_init
                     });
                 }

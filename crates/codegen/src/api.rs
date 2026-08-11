@@ -352,6 +352,10 @@ impl ApiGenerator {
         let has_id = model.identity_field().is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
+        // #288: evaluated ONCE per request and read as a bool per row. See
+        // `generate_list_scan_helpers` for why the question is positive.
+        let is_unfiltered_fn =
+            format_ident!("__{}_is_unfiltered", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         // The live list source+filter+sort+page-materialize.  For an id-bearing
@@ -408,28 +412,59 @@ impl ApiGenerator {
         // path has no second read to fail — `data.len()` is now exactly
         // `min(limit, total - offset)`.  Not an observable change, and deliberately
         // not reintroduced.
+        // The response shape, bound once and spliced into BOTH page calls (#281).
+        // Two splices are two independent closures — it captures only the `Copy`
+        // pagination scalars — so there is no borrow interaction between them, and
+        // the envelope keeps exactly one definition.
+        let page_envelope_closure = quote! {
+            |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
+                (
+                    StatusCode::OK,
+                    Json(__ListEnvelope {
+                        data: __page,
+                        total: __total,
+                        limit: qp.pagination.limit,
+                        offset: qp.pagination.offset,
+                    }),
+                )
+                    .into_response()
+            }
+        };
         let page_scope_return = quote! {
+            // #288: loop-invariant, so it is answered before the scan rather than on
+            // every scanned row. `__keep_all || matches(..)` is exactly equivalent to
+            // `matches(..)` — when no key names a filterable field, every `params.get`
+            // inside `matches` misses and it returns true for every record — so this
+            // is a pure evaluation-order change with no observable behaviour.
+            let __keep_all: bool = #is_unfiltered_fn(&params);
+            // #281: with nothing to filter and nothing to sort, the page was knowable
+            // from the live row set alone — `keep` accepts everything, `sort` reorders
+            // nothing, so `__refs[i].__slot == i` and the scan's full-table gather
+            // decodes every row only to throw all but `limit` of them away. Take the
+            // page-bounded gather instead. Same rows, same order, same `total`, same
+            // bytes; that equality is guarded, not assumed.
+            //
+            // `__sel` is deliberately BELOW this: index pushdown resolves only fields
+            // `is_filterable_field` admits, so a request that names none resolves no
+            // index and `#row_selection` would be pure waste on this path. Placing the
+            // branch first makes that structural rather than a comment.
+            if __keep_all && qp.sort.is_none() {
+                return db.#storage_field.__with_fast_page(
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    #page_envelope_closure,
+                );
+            }
             let __sel: Option<Vec<usize>> = #row_selection;
             return db.#storage_field.__with_page(
                 __sel,
-                |r| #scan_matches_fn(r, &params),
+                |r| __keep_all || #scan_matches_fn(r, &params),
                 |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
                     #scan_sort_fn(__scan, &qp.sort);
                 },
                 qp.pagination.offset,
                 qp.pagination.limit,
-                |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
-                    (
-                        StatusCode::OK,
-                        Json(__ListEnvelope {
-                            data: __page,
-                            total: __total,
-                            limit: qp.pagination.limit,
-                            offset: qp.pagination.offset,
-                        }),
-                    )
-                        .into_response()
-                },
+                #page_envelope_closure,
             );
         };
         // The OWNED narrow path (#160/#228), kept verbatim for the one live caller
@@ -441,9 +476,11 @@ impl ApiGenerator {
             // on the borrowed view.  Only `(total, ids)` crosses the boundary —
             // no scan row is ever materialized, so the strings of the rows that
             // the page does not contain are never copied out of the buffer.
+            // #288: same hoist as the page scope — `?projection=` filters per row too.
+            let __keep_all: bool = #is_unfiltered_fn(&params);
             let (total, __page_ids) = db.#storage_field.__with_scan(
                 __sel,
-                |r| #scan_matches_fn(r, &params),
+                |r| __keep_all || #scan_matches_fn(r, &params),
                 |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
                     #scan_sort_fn(__scan, &qp.sort);
                     let __total = __scan.len();
@@ -876,14 +913,62 @@ impl ApiGenerator {
         // `_event_matches`, not a second predicate — same param keys, same parse,
         // same semantics.  Only the nullable-string comparison differs, because
         // `Option`'s `PartialEq` is homogeneous (see `generate_filter_check`).
-        let field_checks: Vec<_> = model
+        let filterable: Vec<_> = model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
+            .collect();
+        let field_checks: Vec<_> = filterable
+            .iter()
             .map(|f| Self::generate_filter_check(f, true))
             .collect();
+        // #288: the same iteration, asked the loop-INVARIANT question. Deriving both
+        // from one list is what makes it impossible for the predicate and the checks
+        // to disagree about which names are filterable — they key on the same
+        // `field.name`, so "no key names a filterable field" is exactly "every
+        // `params.get` below will miss".
+        let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
+        let unfiltered_checks: Vec<_> = filterable
+            .iter()
+            .map(|f| {
+                let fname_str = &f.name;
+                quote! { if params.contains_key(#fname_str) { return false; } }
+            })
+            .collect();
+        // A model with ZERO filterable fields is legal — a pure junction whose
+        // identity is a required FK has none (`is_filterable_field` is false for every
+        // relation and for `json`), yet the scan field set pushes the identity
+        // unconditionally. Its predicate is a body-less `true`, so the parameter would
+        // be unused: an `unused_variables` warning in the USER's crate, which
+        // `database.rs`'s `allow` header does not and should not cover.
+        let unfiltered_param = if unfiltered_checks.is_empty() {
+            format_ident!("_params")
+        } else {
+            format_ident!("params")
+        };
         let arms = Self::list_sort_arms(model);
         quote! {
+            /// Is this request unfiltered — does NO query key name a filterable field
+            /// of this model (#288)?
+            ///
+            /// Hoisted out of the per-row loop by every caller, because it is a
+            /// property of the query string and not of the row. `_scan_matches` can
+            /// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+            /// while naming no filterable field at all — so an unfiltered request was
+            /// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+            /// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+            /// 850 µs request over 10k rows.
+            ///
+            /// The question is POSITIVE — "does any key name a field of this model?" —
+            /// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+            /// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+            /// legally declare a field named `limit`, and for that model `?limit=3`
+            /// genuinely is a filter.
+            fn #is_unfiltered_fn(#unfiltered_param: &HashMap<String, String>) -> bool {
+                #(#unfiltered_checks)*
+                true
+            }
+
             /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
             /// a row is accepted or rejected before its strings are ever copied out
             /// of the buffered column.  Same per-field checks as `_event_matches`,
@@ -1418,6 +1503,11 @@ impl ApiGenerator {
         // #228: and a *matching* row no longer materializes either — the scope hands
         // back only ids, which are then read through `get`.
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        // #288: hoisted ONCE for the whole subscription, not per re-run and not per
+        // row. `params` is fixed for the life of the socket, so the question it
+        // answers cannot change — and this is the site where the per-row cost was
+        // paid repeatedly, on every changefeed event for the model.
+        let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let id_field = Self::id_field_ident(model);
         let id_type = Self::id_parse_type(schema, model);
@@ -1456,6 +1546,11 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 params: HashMap<String, String>,
             ) {
+                // #288: `params` is fixed for the life of this socket, so whether the
+                // query filters at all is answered once here rather than on every row
+                // of every re-run.
+                let __keep_all: bool = #is_unfiltered_fn(&params);
+
                 // Coarse change signal: take a feed receiver (Clone shares the
                 // channel), then release the DB lock.  We consult only event.model.
                 let mut rx = { db.read().await.changefeed.subscribe() };
@@ -1471,7 +1566,7 @@ impl ApiGenerator {
                         let g = db.read().await;
                         let __ids = g.#storage_field.__with_scan(
                             None,
-                            |r| #scan_matches_fn(r, &params),
+                            |r| __keep_all || #scan_matches_fn(r, &params),
                             |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
                                 __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
                             },
@@ -1506,7 +1601,7 @@ impl ApiGenerator {
                                 let g = db.read().await;
                                 let __ids = g.#storage_field.__with_scan(
                                     None,
-                                    |r| #scan_matches_fn(r, &params),
+                                    |r| __keep_all || #scan_matches_fn(r, &params),
                                     |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
                                         __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
                                     },

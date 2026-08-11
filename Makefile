@@ -338,6 +338,20 @@ cors-test:
 list-scan-test:
 	cargo test --test list_scan_test -- --ignored --nocapture
 
+.PHONY: page-identity-test
+
+## Page-construction-site identity (#281): #281 adds a SECOND place that builds a
+## `<Model>PageRef` — `__with_fast_page`, which skips the scan for an unfiltered,
+## unsorted request — and its whole contract is that it is indistinguishable from
+## `__with_page`. That is what makes it safe and what makes it hard to test: no wire
+## test can tell the two apart. So this compares them against EACH OTHER, byte for
+## byte, over a grid of (offset, limit) windows on a churned 1,000+-row corpus of
+## every field class. A frozen literal catches a change that moves both sites; only
+## this catches one that moves one. #[ignore]d out of the fast suite (compiles and
+## runs a crate).
+page-identity-test:
+	cargo test --test page_identity_test -- --ignored --nocapture
+
 .PHONY: auto-increment-test
 
 ## Integer auto-increment proof (#187): the `+u32`/`+u64` counter is a value handed

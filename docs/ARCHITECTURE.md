@@ -226,9 +226,91 @@ pub fn __with_scan<R>(
 ) -> R
 ```
 
-The handler filters, sorts, counts and paginates *inside* `f`, and returns `(total, Vec<Id>)`; the
-page is then re-read through `get`, so only `limit` rows ever pay a full decode. Nothing borrowed
-crosses the boundary — the view's lifetime is higher-ranked, so `R` cannot name it.
+The handler filters, sorts, counts and paginates *inside* `f`, and returns `(total, Vec<Id>)`.
+Nothing borrowed crosses the boundary — the view's lifetime is higher-ranked, so `R` cannot name it.
+
+**The page is serialized inside the scope too, and does not go back through `get`.** Returning ids
+and re-reading them was still a full decode per returned row, so the default list arm is a second
+scope that keeps the page borrowed as well:
+
+```rust
+pub fn __with_page<R>(
+    &self,
+    sel:    Option<Vec<usize>>,
+    keep:   impl Fn(&<Model>ScanRef<'_>) -> bool,
+    sort:   impl FnOnce(&mut Vec<<Model>ScanRef<'_>>),
+    offset: usize,
+    limit:  usize,
+    f:      impl FnOnce(usize, &[<Model>PageRef<'_>]) -> R,   // (total, the page)
+) -> R
+```
+
+`<Model>PageRef` is the *wide* borrowed view — every stored column, still pointing into the
+buffers, with one-to-many relations left as unit placeholders exactly as they are on the record — so
+the response serializes straight out of them. The `__with_scan` + `get(id)` shape above is retained
+only where the page genuinely needs owned rows: `@projection` models and the live-query re-run.
+
+**The "is there any filter at all?" question is answered once per request, not once per row.** The
+generated matcher short-circuits only on an *empty* query map, and `?limit=50` — the default page
+size a client is told to send — makes the map non-empty without naming a single filterable field.
+So an unfiltered list request used to run one hash lookup per filterable field per scanned row, all
+of them guaranteed to miss: 502 µs on a 10,000-row table, 59% of the request, scaling with the
+*table* rather than the page. Codegen now emits `__<model>_is_unfiltered` from the **same** field
+iteration that builds the per-field checks, and the handler evaluates it once before the scan:
+
+```rust
+let __keep_all: bool = __post_is_unfiltered(&params);
+… __with_page(__sel, |r| __keep_all || __post_scan_matches(r, &params), …)
+```
+
+Deriving the predicate from that same iteration is what makes it impossible for the two to disagree
+about which names are filterable — and it is why the predicate is *positive* ("does any key name a
+filterable field of this model?") rather than a maintained list of reserved query keys. A model may
+legally declare a field named `limit`; for that model `?limit=3` genuinely is a filter, and an
+exclusion list would silently return unfiltered rows.
+
+**And once that question has an answer, the unfiltered request stops scanning the table at all.**
+`keep` and `sort` are opaque closures, so `__with_page` cannot tell that they are trivial: it has
+to gather and decode every live row's scan columns before it knows which `limit` of them the page
+wants. But the *handler* knows, one line earlier — with no filter and no sort, the page is
+`__rows[offset .. offset + limit]` of the live row set and nothing else can change it. So it takes
+a third scope that skips the scan entirely:
+
+```rust
+pub fn __with_fast_page<R>(
+    &self,
+    offset: usize,
+    limit:  usize,
+    f:      impl FnOnce(usize, &[<Model>PageRef<'_>]) -> R,   // (total, the page)
+) -> R
+```
+
+No `sel`, no `keep`, no `sort` — a signature that *cannot* express a filtered request, which is
+what makes the specialization safe to reason about. One `gather_buffered` per column bounded to the
+page's rows, `total` from the live row count.
+
+Two structural notes, both deliberate:
+
+- The branch sits **above** the index-pushdown binding, not beside it. Pushdown resolves only
+  fields the filter predicate admits, so a request naming none of them resolves no index — placing
+  the branch first makes that unreachable rather than merely cheap.
+- It is **below** the `?as_of=` arm. A snapshot read is a different row set, and the fast page
+  reads the live one; hoisting the branch above the match would silently serve live data to a
+  client that asked for a watermark, which is a correctness trap rather than a slow path.
+
+The reason this was worth a third scope is that #226 had already removed almost everything else.
+After it, an unfiltered `GET /model?limit=50` over 10,000 rows was **97–99% phase A** — the request
+had become the scan, and the scan was gathering 10,000 rows to answer with 50. Measured in one
+paired run: 86% of that request removed on a four-`string` model, 64% on a model whose scan view is
+narrower, and 89% / 70% at `offset=10&limit=5`. The win scales with `1 − page/rows`, so at
+`limit=1000` on a 1,000-row table — where the page *is* the table — it is zero by construction, and
+measures as zero.
+
+What it does **not** touch is the selection itself — collecting the live row indices, sorting them,
+and dropping the dead ones is O(live rows) and still runs in full. That is now the floor of an
+unfiltered request, and it is a large fraction of what remains (≈70% of the post-#281 request at
+10,000 rows), dominated by the one sort that exists only because the id→row map is a `HashMap`.
+Tracked as its own follow-on (#289) rather than folded in here.
 
 That shape is what removes the copies rather than narrowing who pays them. `keep` running during
 decode means a **rejected** row never allocates a string. Keeping the sort and the page inside the

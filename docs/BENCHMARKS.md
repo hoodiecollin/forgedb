@@ -863,8 +863,18 @@ make bench-forgedb    # ForgeDB generated code only
 make bench-sqlite     # SQLite only
 make bench-footprint  # on-disk footprint (all engines) + ForgeDB churn bloat (scenario 18)
 make bench-concurrency# ForgeDB reader throughput under a live writer (scenario 16)
+make bench-list-page  # ForgeDB-only: the list request phase by phase (see below)
 make bench-regen      # re-emit benchmarks/gen/database.rs from bench.forge
 ```
+
+`bench-list-page` is the one suite here that is **not** cross-engine and does not
+implement a numbered scenario. It decomposes a single ForgeDB list request into its
+phases and measures the three code paths that can serve one — the pre-#226 path, the
+buffered page (#226), and the unfiltered fast page (#281) — as a paired A/B with an
+in-run control, since all three still exist in the same binary. Its method and its
+results live in the module docs at `benchmarks/benches/list_page_bench.rs`, deliberately
+next to the arms they describe rather than here, because reading a ratio without the arm
+definitions beside it is how a phase subtraction gets misquoted.
 
 All targets run from the repo root (they pass `--manifest-path benchmarks/Cargo.toml`);
 never `cd` into `benchmarks/`.

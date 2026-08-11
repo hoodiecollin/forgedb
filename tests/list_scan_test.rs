@@ -47,6 +47,41 @@
 //! unparseable-value fallback that must never miss a match, and pagination past the
 //! end.
 //!
+//! # #288 — the hoisted unfiltered predicate
+//!
+//! #288 moved the "is there any filter at all?" question out of the per-row loop.
+//! It is provably a pure evaluation-order change, so the whole case table above is
+//! already equivalence coverage for it: several cases carry non-filter keys with no
+//! filter (the arm that now short-circuits) and the rest take the fall-through.
+//!
+//! Three properties are structurally beyond the oracle, and are checked separately:
+//!
+//! - **H2** — `Gauge` declares a field literally named `limit`, so `?limit=3` is a
+//!   real filter for that model. This is what forces the predicate to be positive
+//!   ("does any key name a filterable field?") rather than a reserved-key exclusion
+//!   list, which would short-circuit here and quietly return unfiltered rows.
+//! - **H4** — `/api/post` and `/api/post?limit=50` must be byte-identical. Compared
+//!   as bytes, not as `(ids, total)`, so an envelope divergence cannot slip through.
+//! - **H5** — `Link` has zero filterable fields, so its predicate takes no checks
+//!   and its parameter must be `_params`. That defect compiles and behaves
+//!   correctly; it is visible only as a *warning* in the user's crate, so the test
+//!   reads build diagnostics via `common::build_warnings`.
+//!
+//! # #281 — the unfiltered fast page
+//!
+//! #281 gave the unfiltered, unsorted request its own construction site
+//! (`__with_fast_page`), which builds the page from a bounded gather rather than
+//! from a full-table scan the caller then windows. Two sites means the answer can
+//! now diverge, and the WINDOW is where it would: the fast site slices before
+//! gathering, so an off-by-one in `__start`/`__end` there is invisible to any test
+//! that only ever reads the whole set.
+//!
+//! The unfiltered cases at the end of the table close that. They matter *here*
+//! specifically because this oracle is independent — it recomputes the physical
+//! order from its own append-only mirror. `tests/page_identity_test.rs` compares the
+//! two sites against each other over a far larger corpus, which is the stronger
+//! check of agreement but no check at all of whether they agree on the right answer.
+//!
 //! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
 //! default suite. Run it explicitly:
 //!
@@ -78,13 +113,62 @@ Author {
   name: string
   posts: [Post]
 }
+
+// #288. `limit`/`offset`/`sort`/`order` are NOT lexer keywords — the keyword set is
+// exactly `struct` and `enum` — so a model may legally declare fields with those
+// names, and for THIS model `?limit=3` is a genuine filter. It is the case that
+// decides the shape of the hoisted predicate: a negative exclusion list of reserved
+// query keys would short-circuit here and silently return unfiltered rows.
+//
+// `limit` MUST NOT be indexed. An indexed field is resolved by the pushdown arm
+// before the keep closure ever runs, so the pushdown would produce the right answer
+// on its own and mask a broken predicate entirely — the guard would pass vacuously.
+// Leaving it unindexed forces the filter to run as a per-row residual, which is the
+// path #288 changes. (Verified: with `^u32` here, the exclusion-list mutation stays
+// GREEN; without it, the mutation goes RED.)
+Gauge {
+  id: +u32
+  limit: u32
+  offset: u32
+  sort: string
+  order: string
+}
+
+// #288. `Link` has ZERO filterable fields: its identity is a required FK (a
+// relation, not filterable) and `meta` is json (no total order). Its predicate is
+// therefore body-less, and its parameter is unused — which is a WARNING in the
+// user's crate, not an error, and `database.rs`'s blanket allow header does not
+// (and should not) cover `api.rs`.
+Doc {
+  id: +uuid
+  title: string
+  links: [Link]
+}
+
+Link {
+  id: *Doc
+  meta: json
+}
 "#;
 
 #[test]
 #[ignore = "compiles a generated crate; run with --ignored (see `make list-scan-test`)"]
 fn list_selection_matches_an_independent_oracle() {
     let (out, proj) = common::generate_compile_run("scandriver", SCHEMA, DRIVER);
+    // Captured before `assert_driver_ok`, which removes the project directory.
+    let warnings = common::build_warnings(&proj);
     common::assert_driver_ok(&out, &proj, "driver reported a list-selection mismatch");
+
+    // #288 H5. The `Link` model has no filterable fields, so its hoisted predicate
+    // takes no checks and its parameter must be named `_params`. Getting that wrong
+    // compiles and behaves correctly — it is observable ONLY as a warning in the
+    // user's crate, which is why this assertion reads build diagnostics rather than
+    // any value the driver produced.
+    assert!(
+        !warnings.contains("_is_unfiltered"),
+        "#288: the generated unfiltered-predicate helper warns in the user's crate \
+         (a zero-filterable model's parameter must be `_params`):\n{warnings}"
+    );
 }
 
 const DRIVER: &str = r##"mod database;
@@ -328,6 +412,20 @@ async fn main() {
         live.delete(&id);
     }
 
+    // #288 H2. Four gauges whose `limit` FIELD takes four distinct values. Exactly
+    // one holds 3, so `?limit=3` against this model must return that single row —
+    // and must NOT be read as "page size 3", which would return three rows.
+    for n in 0..4u32 {
+        db.create_gauge(Gauge {
+            id: 0, // `0` is the allocate sentinel for a `+u32` identity
+            limit: n,
+            offset: n * 10,
+            sort: format!("s-{n}"),
+            order: format!("o-{n}"),
+        })
+        .expect("create gauge");
+    }
+
     db.commit().expect("commit");
 
     let db = Arc::new(RwLock::new(db));
@@ -511,6 +609,60 @@ async fn main() {
             Some(500),
             0,
         ),
+        // --- #281: the UNFILTERED, UNSORTED page, WINDOWED ------------------------
+        //
+        // The one unfiltered case above (`/api/post`) reads the whole live set, so
+        // it pins the order but never exercises the window. These do both, and this
+        // is the file where they belong: the oracle recomputes the physical order
+        // from its own append-only mirror rather than comparing two readers, so it
+        // is the only place the ORDER of #281's page is checked against something
+        // that is not itself the implementation.
+        //
+        // That order is genuinely discriminating here. Updating 1, 5, 9 moves them
+        // to the tail and deleting 3, 7 punches holes, so the live physical order is
+        // [0, 2, 4, 6, 8, 10, 11, 1, 5, 9] — nothing like id order, insertion order,
+        // or any field's sort order. A window taken from the wrong sequence lands on
+        // different ids rather than the same ids differently arranged.
+        (
+            "#281 unsorted + limit — the window is cut from PHYSICAL order",
+            "/api/post?limit=3".to_string(),
+            vec![],
+            None,
+            Some(3),
+            0,
+        ),
+        (
+            "#281 unsorted + offset&limit — an interior window straddling the churn tail",
+            "/api/post?limit=3&offset=6".to_string(),
+            vec![],
+            None,
+            Some(3),
+            6,
+        ),
+        (
+            "#281 unsorted — a window running off the end clamps, it does not wrap",
+            "/api/post?limit=5&offset=9".to_string(),
+            vec![],
+            None,
+            Some(5),
+            9,
+        ),
+        (
+            "#281 unsorted — offset past the end is an empty page, total unchanged",
+            "/api/post?limit=5&offset=100".to_string(),
+            vec![],
+            None,
+            Some(5),
+            100,
+        ),
+        (
+            "#281 unsorted — limit larger than the live set",
+            "/api/post?limit=500".to_string(),
+            vec![],
+            None,
+            Some(500),
+            0,
+        ),
     ];
 
     for (label, uri, filters, sort, limit, offset) in &cases {
@@ -529,6 +681,54 @@ async fn main() {
             println!("    uri  {uri}");
             println!("    want total={} ids={:?}", want.1, want.0);
             println!("    got  total={} ids={:?}", got.1, got.0);
+            unsafe { FAILURES += 1 }
+        }
+    }
+
+    // ---- #288: the hoisted unfiltered predicate ----------------------------------
+    //
+    // The cases above already cover the hoist's equivalence for free — several carry
+    // non-filter keys (`?sort=`, `?limit=`) with no filter, which is exactly the arm
+    // that now short-circuits, and the filtered ones take the fall-through. The two
+    // checks below cover what the oracle structurally cannot.
+
+    // H4. `/api/post` and `/api/post?limit=50` differ ONLY in whether the params map
+    // is empty (50 is the default page size), so they must be byte-identical. That
+    // pair is the whole reason this issue exists: pre-hoist they returned the same
+    // bytes for 1.63x/2.44x different cost. Comparing bytes rather than (ids, total)
+    // also catches an envelope divergence the oracle would not see.
+    {
+        let (s_a, b_a) = call(router(), "/api/post").await;
+        let (s_b, b_b) = call(router(), "/api/post?limit=50").await;
+        if s_a == 200 && s_b == 200 && b_a == b_b {
+            println!("  ok   #288 H4 — /api/post == /api/post?limit=50, byte for byte");
+        } else {
+            println!("  FAIL #288 H4 — statuses {s_a}/{s_b}; bodies differ");
+            println!("    without  {b_a}");
+            println!("    with     {b_b}");
+            unsafe { FAILURES += 1 }
+        }
+    }
+
+    // H2. The decisive case for the predicate's SHAPE. `Gauge` declares a field
+    // literally named `limit`, so `?limit=3` names a filterable field of this model
+    // and must filter to the one row holding 3. A predicate built as a negative
+    // exclusion list of reserved query keys would short-circuit here and return all
+    // four rows — behaviourally wrong, and wrong in the silent direction.
+    {
+        let (status, body) = call(router(), "/api/gauge?limit=3").await;
+        // Parsed inline rather than via `observed`, which reads `id` as a string for
+        // the uuid-keyed `Post`; `Gauge`'s identity is a `+u32` and serializes as a
+        // JSON number.
+        let v: serde_json::Value = serde_json::from_str(&body).expect("envelope is json");
+        let rows = v["data"].as_array().map(|a| a.len()).unwrap_or(0);
+        let total = v["total"].as_u64().unwrap_or(u64::MAX);
+        let got_limit = v["data"][0]["limit"].as_u64();
+        if status == 200 && rows == 1 && total == 1 && got_limit == Some(3) {
+            println!("  ok   #288 H2 — ?limit=3 filters a model whose FIELD is `limit`");
+        } else {
+            println!("  FAIL #288 H2 — expected exactly 1 row (total=1, limit=3), got {rows} row(s) total={total} limit={got_limit:?}");
+            println!("    {status} {body}");
             unsafe { FAILURES += 1 }
         }
     }

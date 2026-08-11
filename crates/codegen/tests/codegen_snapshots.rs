@@ -690,9 +690,22 @@ User {
         "#160 C/#228: unique-indexed field resolves candidate rows");
     assert!(api_code.contains("db.user.__rows_by_status(__v)"),
         "#160 C: live list tries index pushdown");
+    // #281 moved the predicate ABOVE the selection, so the pushdown chain now runs
+    // straight into the page call again — its pre-#288 spelling. The two properties
+    // are asserted separately rather than as one literal, because they are two
+    // different claims and only one of them is #160's.
     assert!(
         api_flat.contains("} else { None }; return db .user .__with_page( __sel,"),
-        "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
+        "#160 C: a parse-failure falls back to the full scan (never misses a match), \
+         and the resolved selection feeds the page call directly.\nGot: {api_flat}"
+    );
+    assert!(
+        api_flat.contains(
+            "let __keep_all: bool = __user_is_unfiltered(&params); \
+             if __keep_all && qp.sort.is_none() {"
+        ),
+        "#288/#281: the predicate is hoisted out of the per-row loop AND gates the \
+         fast page, both before the selection is resolved.\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
     // pushdown field — it falls through to the narrow scan.
@@ -3539,8 +3552,9 @@ User {
     // #224: that matcher now runs on the BORROWED scan view, during the scan — the
     // "one predicate source" guarantee is unchanged; only the operand view is.
     assert!(
-        code.contains("|r| __user_scan_matches(r, &params)"),
-        "list filters the narrow scan via the generated closed-set matcher (no second parser)"
+        code.contains("|r| __keep_all || __user_scan_matches(r, &params)"),
+        "list filters the narrow scan via the generated closed-set matcher (no second \
+         parser); #288 short-circuits it on the hoisted bool, same matcher"
     );
     // The `?as_of` snapshot path keeps the full-record read + the same closed-set
     // filter (`user_event_matches`).
@@ -7537,19 +7551,22 @@ User {
     // The REST list source and BOTH live-query scans filter during the scan
     // instead of decoding everything and `retain`ing afterwards.
     assert!(
-        flat.contains("__with_scan( None, |r| __user_scan_matches(r, &params),"),
+        flat.contains("__with_scan( None, |r| __keep_all || __user_scan_matches(r, &params),"),
         "the live-query scans filter on the borrowed view inside the scope.\nGot: {flat}"
     );
     // All three call sites: the REST list source, the live-query initial scan, and
     // the live-query re-run.  Since #228 the pushdown fallback is no longer a fourth
     // *scan* — it is a `None` selection into the same one — so this is exact.
     assert!(
-        flat.matches("|r| __user_scan_matches(r, &params)").count() == 3,
-        "REST list + live-query init + live-query re-run, one scan each.\nGot: {flat}"
+        flat.matches("|r| __keep_all || __user_scan_matches(r, &params)").count() == 3,
+        "REST list + live-query init + live-query re-run, one scan each — and #288 hoists \
+         at every one of them, so the count pins the hoist's coverage too.\nGot: {flat}"
     );
     assert!(
-        !flat.contains(".retain(|r| __user_scan_matches(r, &params))"),
-        "no post-scan retain over decoded rows remains"
+        !flat.contains(".retain(|r| __user_scan_matches(r, &params))")
+            && !flat.contains(".retain(|r| __keep_all || __user_scan_matches(r, &params))"),
+        "no post-scan retain over decoded rows remains (both spellings — #288 changed the \
+         closure body, and a negative pinned to the old one alone would pass vacuously)"
     );
 
     // The comparison that made the borrowed view non-trivial: `Option`'s PartialEq is
@@ -10498,9 +10515,39 @@ fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
     );
     // The two things it must NOT be: the selection's own order, or the page slice's
     // position within it.
+    //
+    // **Scoped to `__with_page`'s own body, and that scoping is #281's doing.** This
+    // was a file-wide negative until #281 emitted `__with_fast_page`, whose page slice
+    // is literally `__rows[__start..__end]` — correct *there*, because with no `keep`
+    // and no `sort` a view's position IS its slot, and wrong *here* for exactly the
+    // reason the doc comment above gives. Rescoped rather than dodged by renaming
+    // #281's binding: the assertion's intent is about `__with_page`, and a rename
+    // would have kept the test green while deleting what it tests.
+    //
+    // The slice is bounded by the next `pub fn` AFTER the match, with the end of the
+    // string as the fallback — a following `pub fn` exists here only because
+    // `PAGE_REF_SRC`'s `Widget` happens to emit a pushdown resolver, which is a
+    // property of the fixture and not of the emitter.
+    let method_body = |name: &str| -> &str {
+        let start = f
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is emitted: {f}"));
+        let end = f[start + 1..]
+            .find("pub fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(f.len());
+        &f[start..end]
+    };
     assert!(
-        !f.contains("__rows[__start"),
+        !method_body("pub fn __with_page").contains("__rows[__start"),
         "not a slice of the selection: {f}"
+    );
+    // #281's mirror positive: in the FAST page, slicing the selection is the whole
+    // point, and the gather is bounded to that slice rather than to the table.
+    assert!(
+        method_body("pub fn __with_fast_page")
+            .contains("gather_buffered(&__rows[__start..__end])"),
+        "#281: the fast page gathers the page's rows, not the table's: {f}"
     );
     assert!(
         f.contains("let __row_ref = WidgetScanRef { __slot,"),
@@ -10579,5 +10626,184 @@ Post {
         f.matches("let __sel: Option<Vec<usize>> =").count(),
         2,
         "#226: each branch computes its own moved selection: {f}"
+    );
+}
+
+/// **#288 · H1** — the unfiltered-list predicate is emitted, and hoisted OUT of the
+/// per-row loop.
+///
+/// This is the **only** guard against under-firing, and the reason it has to be a
+/// codegen assertion rather than a wire test is the same property that makes the
+/// change safe: `__keep_all || matches(r, &params)` is *exactly* equivalent to
+/// `matches(r, &params)` for every input, because the predicate and the per-field
+/// checks are built from the same `filter(is_filterable_field)` iteration and key on
+/// the same `field.name`. A hoist that never fires is therefore invisible to every
+/// behaviour test in the tree — including a byte-exact one.
+///
+/// The load-bearing half is the ORDERING. Writing the call inside the closure
+/// (`|r| __post_is_unfiltered(&params) || ..`) is behaviourally identical and costs
+/// 100% of what the issue set out to remove, so only an ordering assertion catches it.
+#[test]
+fn test_api_generation_unfiltered_list_hoists_the_predicate() {
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  views: ^u64
+  published: bool
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    // 1. The helper exists, and asks the POSITIVE question — "does any key name a
+    //    filterable field of this model?" — rather than excluding reserved names.
+    assert!(
+        f.contains("fn __post_is_unfiltered(params: &HashMap<String, String>) -> bool"),
+        "#288: the per-model unfiltered predicate is emitted: {f}"
+    );
+    for field in ["id", "title", "views", "published"] {
+        assert!(
+            f.contains(&format!("if params.contains_key(\"{field}\") {{ return false; }}")),
+            "#288: the predicate derives `{field}` from the same iteration as the \
+             per-field checks, so the two cannot disagree about what is filterable: {f}"
+        );
+    }
+    // No exclusion list. A model may legally declare a field named `limit`, so a
+    // negative predicate would be wrong as well as unmaintainable (see H2).
+    assert!(
+        !f.contains("__post_is_unfiltered") || !f.contains("params.contains_key(\"as_of\")"),
+        "#288: the predicate must not carry a reserved-name exclusion list: {f}"
+    );
+
+    // 2. It is evaluated ONCE, outside the scan, and the closure only reads the bool.
+    assert!(
+        f.contains("let __keep_all: bool = __post_is_unfiltered(&params);"),
+        "#288: the predicate is hoisted to a binding, not called per row: {f}"
+    );
+    assert!(
+        f.contains("|r| __keep_all || __post_scan_matches(r, &params)"),
+        "#288: the per-row closure short-circuits on the hoisted bool: {f}"
+    );
+
+    // 3. ORDERING — the part a behaviour test cannot see. The binding is evaluated
+    //    before the scan is set up, not inside the per-row closure.
+    //
+    //    **#281 moved the binding above `__sel`** and this assertion moved with it.
+    //    #288 pinned `sel < keep < page`; #281's fast-path branch reads `__keep_all`
+    //    and returns before `#row_selection` is ever spliced, so the order is now
+    //    `keep < fast branch < sel < page`. What is preserved — and what this
+    //    assertion is actually for — is that the predicate is answered ONCE, ahead of
+    //    everything, rather than inside the `keep` closure. An assertion rewritten to
+    //    whatever the emitter happens to say would not be a guard.
+    //
+    //    `sel` anchors on the pushdown CALL, not on `let __sel`. That distinction is
+    //    load-bearing and was found by mutating: resolving the pushdown into an
+    //    earlier binding and merely rebinding it here (`let __sel = __sel_early;`)
+    //    leaves the binding in place, so a name-anchored assertion stays green while
+    //    the index probe has moved onto the fast path — the exact waste this ordering
+    //    exists to prevent. `views` is indexed for precisely this reason: with no
+    //    indexed field the emitted selection is the literal `None` and there is no
+    //    work whose position could be wrong.
+    let sel = f
+        .find("__rows_by_views(")
+        .expect("the index-pushdown selection expression");
+    assert_eq!(
+        f.matches("__rows_by_views(").count(),
+        1,
+        "#281: one pushdown site on the list path, so `sel` below is unambiguous: {f}"
+    );
+    let keep = f
+        .find("let __keep_all: bool =")
+        .expect("hoisted predicate binding");
+    let fast = f
+        .find("if __keep_all && qp.sort.is_none() {")
+        .expect("#281: fast-page branch");
+    let page = f.find("return db .post .__with_page(").expect("page call");
+    assert!(
+        keep < fast && fast < sel && sel < page,
+        "#288/#281: the predicate is answered first, gates the fast page, and only \
+         then does the scan path probe the index \
+         (keep={keep}, fast={fast}, sel={sel}, page={page}): {f}"
+    );
+}
+
+/// **#288 · H2 (codegen half)** — a model may legally declare a field named `limit`,
+/// and for that model `?limit=3` genuinely IS a filter.
+///
+/// This is the single case where the positive predicate and a negative
+/// exclusion-list predicate visibly differ — every other #288 scenario passes under
+/// both. `limit`/`offset`/`sort`/`order` are not lexer keywords (the keyword set is
+/// exactly `struct` and `enum`), so this schema is legal and a user can write it.
+#[test]
+fn test_api_generation_reserved_name_field_is_filterable() {
+    let src = r#"
+Gauge {
+  id: +uuid
+  limit: u32
+  offset: u32
+  sort: string
+  order: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    for field in ["limit", "offset", "sort", "order"] {
+        assert!(
+            f.contains(&format!("if params.contains_key(\"{field}\") {{ return false; }}")),
+            "#288: `{field}` is a declared filterable field here, so naming it in the \
+             query string must defeat the fast test: {f}"
+        );
+    }
+}
+
+/// **#288 · H5 (codegen half)** — a model with ZERO filterable fields is legal, and
+/// its predicate must not leave an unused parameter behind.
+///
+/// A pure junction whose identity is a required FK has no filterable field at all:
+/// `is_filterable_field` is `false` for every `Relation(..)` and for `json`, while
+/// the scan field set pushes the identity unconditionally. The emitted predicate is
+/// then a body-less `true`, and naming its parameter `params` would produce an
+/// `unused_variables` warning in the USER's crate — which no snapshot diff shows and
+/// no test in this repo can see, because `database.rs`'s `allow` header does not
+/// cover `api.rs`. H5's runtime half is what actually observes it; this pins the
+/// emitted spelling.
+#[test]
+fn test_api_generation_zero_filterable_model_has_no_unused_param() {
+    let src = r#"
+Doc {
+  id: +uuid
+  title: string
+}
+
+Tag {
+  id: +uuid
+  name: string
+}
+
+Link {
+  id: *Doc
+  other: *Tag
+  meta: json
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    assert!(
+        f.contains("fn __link_is_unfiltered(_params: &HashMap<String, String>) -> bool"),
+        "#288: a zero-filterable model names the parameter `_params`: {f}"
+    );
+    // ...and the models that DO have filterable fields still take the live one.
+    assert!(
+        f.contains("fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool"),
+        "#288: a model with filterable fields keeps the live parameter: {f}"
     );
 }

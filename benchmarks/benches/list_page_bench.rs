@@ -65,18 +65,95 @@
 //! where #224 wins nothing"), and because `sel = None` is what an ordinary
 //! `GET /api/doc?limit=50` sends.
 //!
+//! # #281 — the third path, and why phase A had to be split
+//!
+//! #226 left phase A whole because nothing it did could touch it. #281 can: with no
+//! filter and no sort, `keep` accepts every row and `sort` reorders nothing, so the
+//! page is knowable from the live row set alone and the full-table gather inside A is
+//! pure waste. `__with_fast_page` gathers only `__rows[offset..offset+limit]`.
+//!
+//! That makes A's internal split load-bearing for the first time:
+//!
+//! ```text
+//!   A_sel      collect the live row indices, sort them, drop the dead ones
+//!   A_gather   gather + decode EVERY live row's scan columns, build one ScanRef each
+//! ```
+//!
+//! #281 removes a fraction of `A_gather` and none of `A_sel`, so the ceiling is
+//! `A_gather × (1 − p/r)` where `r` is the live row count and `p = min(limit, r − offset)`
+//! is the page length — **not** `A` itself. Quoting `A` overstates the ceiling by
+//! whatever fraction of it is `A_sel`, and that fraction is not small: it is the one
+//! part of the request that is O(live rows) with no per-row column work to dilute it.
+//!
+//! `select_only` measures it in-run. It is `__with_fast_page(0, 0, ..)`: the selection
+//! runs in full, then the gather is handed an empty slice and the view loop never
+//! executes. It is named for what it measures and not for `A_sel` alone, because the
+//! empty gather cannot be subtracted from outside — the generated struct's columns are
+//! private, which is also why the standalone estimate made at Gate 2 was recorded as a
+//! pre-registration figure rather than a published one. Both column kinds return an
+//! empty buffer for an empty selection rather than erroring, so what it adds is a
+//! branch and an allocation of zero.
+//!
+//! # The `(offset, limit)` grid
+//!
+//! Offset is threaded through every arm rather than pinned at 0, and the grid carries
+//! `offset=10, limit=5` alongside the two page sizes #226 named. That point is not a
+//! rounding-out: `p/r` is what governs the win, so a small page is #281's BEST regime,
+//! while `limit=1000` on a 1,000-row table is `p = r` — the page is the whole table,
+//! the bounded gather gathers everything, and the ceiling is exactly zero. A grid that
+//! omitted either end would report the feature as uniformly good or uniformly marginal.
+//!
 //! # Reading the output
 //!
-//! Per `(rows, limit)`, six arms. Four are the pre-#226 path, two are the post-#226 one:
+//! Per `(rows, offset, limit)`, nine arms. Four are the pre-#226 path, two the
+//! post-#226 one, three the #281 one:
 //!
 //! | arm | phases | what it is |
 //! |---|---|---|
 //! | `full_path` | A+B+C | pre-#226 request, the in-run control |
-//! | `full_buffered` | A+B'+C' | post-#226 request |
-//! | `scan_only` | A | shared by both paths |
-//! | `page_buffered` | A+B' | the new scope, views forced live, not serialized |
-//! | `page_get` | B | what #226 removes — **the ceiling** |
+//! | `full_buffered` | A+B'+C' | post-#226 request — #281's control |
+//! | `scan_only` | A | shared by both of those |
+//! | `page_buffered` | A+B' | the #226 scope, views forced live, not serialized |
+//! | `page_get` | B | what #226 removes — #226's ceiling |
 //! | `serialize` | C | serde over `Vec<Model>` |
+//! | `select_only` | A_sel | the fast path's fixed cost — #281 removes NONE of it |
+//! | `fast_page` | A_sel+B'' | the #281 scope, views forced live |
+//! | `fast_buffered` | A_sel+B''+C' | the #281 request |
+//!
+//! - **#281 realized win** = `full_buffered − fast_buffered`; **#281 ceiling** =
+//!   `(scan_only − select_only) × (1 − p/r)`. Realized above ceiling means the arms are
+//!   not doing the same work, exactly as for #226.
+//! - `fast_buffered` and `full_buffered` must emit **byte-identical** bodies, asserted
+//!   once per point outside the timed loop. A win from a shorter response is no win.
+//!
+//! # What it measured (#281's gate, one paired run)
+//!
+//! At `rows=10000, offset=0, limit=50` — the gate's named point — `full_buffered` →
+//! `fast_buffered` was 1095.40 → 149.46 µs on `Doc` (86.4% of the request, 945.94 ±5.77)
+//! and 419.14 → 150.01 µs on `Post` (64.2%, 269.13 ±1.53). Nowhere near a noise floor,
+//! so the kill rule did not fire. `offset=10, limit=5` is stronger still (89.1% / 70.4%),
+//! and `rows=1000, limit=1000` — `p = r`, where the model predicts exactly zero — measured
+//! −0.64 ±3.05 µs and +2.55 ±0.88 µs: no win and no regression, as designed.
+//!
+//! Two caveats, both stated rather than rounded away:
+//!
+//! - `realized/ceiling` lands slightly **above** 100% at two points (102.9% and 100.2%,
+//!   both on `Doc`). That is the ceiling *model* under-counting, not unequal work: it is
+//!   built from `scan_only` (`__with_scan`), while the control runs `__with_page`, whose
+//!   phase A additionally stores `__slot`, maps `__page_rows`, and sets up a second
+//!   page-bounded gather — all of which `fast_buffered` also skips and none of which is
+//!   inside `A_gather`. The bodies are asserted byte-identical at every point, and the
+//!   102.9% point's ±38.38 band covers 100% on its own.
+//! - `select_only` came out at 8.2–8.3 µs (1k) and 102–105 µs (10k), against a
+//!   standalone replica of the same three operations measured at Gate 2 as 8.03 and
+//!   104.94 µs. The agreement is close, but the in-run figure is the one to quote: the
+//!   Gate 2 number was recorded as a pre-registration estimate precisely because it was
+//!   a replica rather than the generated code.
+//!
+//! It is also what makes #226 and #281 legible together: after #226, the unfiltered
+//! request was 97–99% phase A at 10k rows (`scan_only` 1066.40 of `full_buffered`
+//! 1080.90 at `offset=10, limit=5`). The compound effect of both, `full_path` →
+//! `fast_buffered`, is 9.67× on `Doc` and 3.95× on `Post` at the gate's point.
 //!
 //! They are registered in that order deliberately: Criterion measures arms in
 //! registration order, so each compared pair (`full_path`/`full_buffered`,
@@ -107,7 +184,6 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use forgedb_benchmarks::forgedb_generated::{
     Database, Doc, DocPageRef, DocScanRef, Post, PostPageRef, PostScanRef, User,
 };
-use forgedb_types::Timestamp;
 use uuid::Uuid;
 
 /// Per-field body length. 200 chars is a realistic description/body field and keeps
@@ -120,10 +196,18 @@ const BODY_LEN: usize = 200;
 /// survival) argued from one table size would be arguing from a coincidence.
 const ROWS: [usize; 2] = [1_000, 10_000];
 
-/// `DEFAULT_LIMIT` and `MAX_LIMIT` from `forgedb-query-params` — the two page sizes
-/// #226's gate names. (Not imported: the detached bench project deliberately does not
-/// depend on the substrate crate the generated `api.rs` links.)
-const LIMITS: [usize; 2] = [50, 1_000];
+/// The `(offset, limit)` grid.
+///
+/// The first two are `DEFAULT_LIMIT` and `MAX_LIMIT` from `forgedb-query-params` — the
+/// page sizes #226's gate named. (Not imported: the detached bench project deliberately
+/// does not depend on the substrate crate the generated `api.rs` links.)
+///
+/// The third is #281's, and it is the counter-regime rather than a third data point.
+/// #281's win scales with `1 − p/r`, so `(10, 5)` is close to its best case while
+/// `(0, 1000)` at `rows = 1000` is `p = r` — the page IS the table, the bounded gather
+/// gathers all of it, and the predicted win there is exactly zero. Reporting only the
+/// favourable end is how a feature gets shipped on a number that does not generalize.
+const POINTS: [(usize, usize); 3] = [(0, 50), (0, 1_000), (10, 5)];
 
 /// Deterministic ids so a rerun measures the same rows in the same order. `tag`
 /// separates the models' id spaces so nothing can alias across subjects.
@@ -209,15 +293,17 @@ fn populated_posts(n: usize) -> (Database, tempfile::TempDir) {
 /// inside the scan scope, with only `(total, ids)` crossing the closure boundary.
 /// `keep` is `|_| true` and the sort is a no-op, which is what an unfiltered,
 /// unsorted list request generates.
-fn doc_phase_a(db: &Database, limit: usize) -> (usize, Vec<Uuid>) {
+fn doc_phase_a(db: &Database, offset: usize, limit: usize) -> (usize, Vec<Uuid>) {
     db.doc.__with_scan(
         None,
         |_: &DocScanRef<'_>| true,
         |scan: &mut Vec<DocScanRef<'_>>| {
             let total = scan.len();
-            // `Pagination::apply` at offset 0 is `&items[0..end.min(len)]`.
-            let end = limit.min(scan.len());
-            let ids: Vec<Uuid> = scan[0..end].iter().map(|r| r.id).collect();
+            // `Pagination::apply`'s arithmetic: clamp both ends to the length, and
+            // saturate the addition so a large offset cannot overflow.
+            let start = offset.min(scan.len());
+            let end = offset.saturating_add(limit).min(scan.len());
+            let ids: Vec<Uuid> = scan[start..end].iter().map(|r| r.id).collect();
             (total, ids)
         },
     )
@@ -231,37 +317,43 @@ fn doc_phase_b(db: &Database, ids: &[Uuid]) -> Vec<Doc> {
 /// Phases A+B', post-#226: the same scan/filter/sort/paginate, then the page gather
 /// and one `DocPageRef` per page row. The fold is what keeps the view construction
 /// from being dead code — see the module docs.
-fn doc_page_buffered(db: &Database, limit: usize) -> (usize, usize) {
+fn doc_page_buffered(db: &Database, offset: usize, limit: usize) -> (usize, usize) {
     db.doc.__with_page(
         None,
         |_: &DocScanRef<'_>| true,
         |_: &mut Vec<DocScanRef<'_>>| {},
-        0,
+        offset,
         limit,
-        |total: usize, page: &[DocPageRef<'_>]| {
-            let mut sum = 0usize;
-            for r in page {
-                sum ^= r.id.as_u128() as usize;
-                sum ^= r.seq as usize;
-                sum ^= r.kind as usize;
-                sum ^= r.body_a.len();
-                sum ^= r.body_b.len();
-                sum ^= r.body_c.len();
-                sum ^= r.body_d.len();
-            }
-            (total, sum)
-        },
+        |total: usize, page: &[DocPageRef<'_>]| (total, doc_fold(page)),
     )
+}
+
+/// The checksum that keeps a page's view construction from being dead code. Shared by
+/// the #226 and #281 scope arms so the two are folded identically — a difference in
+/// what the fold reads would land in the subtraction between them and be read as a
+/// difference between the paths.
+fn doc_fold(page: &[DocPageRef<'_>]) -> usize {
+    let mut sum = 0usize;
+    for r in page {
+        sum ^= r.id.as_u128() as usize;
+        sum ^= r.seq as usize;
+        sum ^= r.kind as usize;
+        sum ^= r.body_a.len();
+        sum ^= r.body_b.len();
+        sum ^= r.body_c.len();
+        sum ^= r.body_d.len();
+    }
+    sum
 }
 
 /// Phases A+B'+C' — the whole post-#226 request path, exactly as the generated
 /// handler runs it: everything inside the scope, and only an owned value escapes.
-fn doc_full_buffered(db: &Database, limit: usize) -> (usize, String) {
+fn doc_full_buffered(db: &Database, offset: usize, limit: usize) -> (usize, String) {
     db.doc.__with_page(
         None,
         |_: &DocScanRef<'_>| true,
         |_: &mut Vec<DocScanRef<'_>>| {},
-        0,
+        offset,
         limit,
         |total: usize, page: &[DocPageRef<'_>]| {
             (total, serde_json::to_string(page).expect("serialize"))
@@ -269,14 +361,38 @@ fn doc_full_buffered(db: &Database, limit: usize) -> (usize, String) {
     )
 }
 
-fn post_phase_a(db: &Database, limit: usize) -> (usize, Vec<Uuid>) {
+/// A_sel — the fast path with an EMPTY page. The live-row selection runs in full; the
+/// gather is then handed a zero-length slice and the view loop never runs. See the
+/// module docs for why the empty gather is not subtracted out.
+fn doc_select_only(db: &Database) -> usize {
+    db.doc.__with_fast_page(0, 0, |total: usize, _| total)
+}
+
+/// Phases A_sel+B'' — the #281 scope, views forced live by the same fold.
+fn doc_fast_page(db: &Database, offset: usize, limit: usize) -> (usize, usize) {
+    db.doc
+        .__with_fast_page(offset, limit, |total: usize, page: &[DocPageRef<'_>]| {
+            (total, doc_fold(page))
+        })
+}
+
+/// Phases A_sel+B''+C' — the whole #281 request path.
+fn doc_fast_buffered(db: &Database, offset: usize, limit: usize) -> (usize, String) {
+    db.doc
+        .__with_fast_page(offset, limit, |total: usize, page: &[DocPageRef<'_>]| {
+            (total, serde_json::to_string(page).expect("serialize"))
+        })
+}
+
+fn post_phase_a(db: &Database, offset: usize, limit: usize) -> (usize, Vec<Uuid>) {
     db.post.__with_scan(
         None,
         |_: &PostScanRef<'_>| true,
         |scan: &mut Vec<PostScanRef<'_>>| {
             let total = scan.len();
-            let end = limit.min(scan.len());
-            let ids: Vec<Uuid> = scan[0..end].iter().map(|r| r.id).collect();
+            let start = offset.min(scan.len());
+            let end = offset.saturating_add(limit).min(scan.len());
+            let ids: Vec<Uuid> = scan[start..end].iter().map(|r| r.id).collect();
             (total, ids)
         },
     )
@@ -286,34 +402,37 @@ fn post_phase_b(db: &Database, ids: &[Uuid]) -> Vec<Post> {
     ids.iter().filter_map(|id| db.post.get(*id)).collect()
 }
 
-fn post_page_buffered(db: &Database, limit: usize) -> (usize, usize) {
+fn post_page_buffered(db: &Database, offset: usize, limit: usize) -> (usize, usize) {
     db.post.__with_page(
         None,
         |_: &PostScanRef<'_>| true,
         |_: &mut Vec<PostScanRef<'_>>| {},
-        0,
+        offset,
         limit,
-        |total: usize, page: &[PostPageRef<'_>]| {
-            let mut sum = 0usize;
-            for r in page {
-                sum ^= r.id.as_u128() as usize;
-                sum ^= r.title.len();
-                sum ^= r.views as usize;
-                sum ^= r.published as usize;
-                sum ^= r.author.as_u128() as usize;
-                sum ^= r.created_at.as_micros() as usize;
-            }
-            (total, sum)
-        },
+        |total: usize, page: &[PostPageRef<'_>]| (total, post_fold(page)),
     )
 }
 
-fn post_full_buffered(db: &Database, limit: usize) -> (usize, String) {
+/// `doc_fold`'s counterpart — see the note there on why both scope arms share it.
+fn post_fold(page: &[PostPageRef<'_>]) -> usize {
+    let mut sum = 0usize;
+    for r in page {
+        sum ^= r.id.as_u128() as usize;
+        sum ^= r.title.len();
+        sum ^= r.views as usize;
+        sum ^= r.published as usize;
+        sum ^= r.author.as_u128() as usize;
+        sum ^= r.created_at.as_micros() as usize;
+    }
+    sum
+}
+
+fn post_full_buffered(db: &Database, offset: usize, limit: usize) -> (usize, String) {
     db.post.__with_page(
         None,
         |_: &PostScanRef<'_>| true,
         |_: &mut Vec<PostScanRef<'_>>| {},
-        0,
+        offset,
         limit,
         |total: usize, page: &[PostPageRef<'_>]| {
             (total, serde_json::to_string(page).expect("serialize"))
@@ -321,26 +440,54 @@ fn post_full_buffered(db: &Database, limit: usize) -> (usize, String) {
     )
 }
 
+fn post_select_only(db: &Database) -> usize {
+    db.post.__with_fast_page(0, 0, |total: usize, _| total)
+}
+
+fn post_fast_page(db: &Database, offset: usize, limit: usize) -> (usize, usize) {
+    db.post
+        .__with_fast_page(offset, limit, |total: usize, page: &[PostPageRef<'_>]| {
+            (total, post_fold(page))
+        })
+}
+
+fn post_fast_buffered(db: &Database, offset: usize, limit: usize) -> (usize, String) {
+    db.post
+        .__with_fast_page(offset, limit, |total: usize, page: &[PostPageRef<'_>]| {
+            (total, serde_json::to_string(page).expect("serialize"))
+        })
+}
+
 fn bench_doc(c: &mut Criterion) {
     for rows in ROWS {
         let (db, _dir) = populated_docs(rows);
 
-        for limit in LIMITS {
-            let label = format!("rows={rows}/limit={limit}");
+        for (offset, limit) in POINTS {
+            let label = format!("rows={rows}/off={offset}/limit={limit}");
 
             // Precomputed inputs for the isolated phases, so B is not billed for A.
-            let (_, ids) = doc_phase_a(&db, limit);
+            let (_, ids) = doc_phase_a(&db, offset, limit);
             let page = doc_phase_b(&db, &ids);
 
-            // The bytes are the contract (`tests/api_wire_test.rs`), and the two arms
+            // The bytes are the contract (`tests/api_wire_test.rs`), and the arms
             // being compared here must be producing them — a "win" from a shorter
             // response body would be no win at all. Asserted once per point, outside
-            // the timed loop.
-            let (_, buffered_body) = doc_full_buffered(&db, limit);
+            // the timed loop, for BOTH the #226 and the #281 path against the same
+            // pre-#226 reference.
+            let (_, buffered_body) = doc_full_buffered(&db, offset, limit);
+            let reference = serde_json::to_string(&page).expect("serialize");
             assert_eq!(
-                buffered_body,
-                serde_json::to_string(&page).expect("serialize"),
+                buffered_body, reference,
                 "post-#226 page bytes diverged from the pre-#226 page at {label}"
+            );
+            let (fast_total, fast_body) = doc_fast_buffered(&db, offset, limit);
+            assert_eq!(
+                fast_body, reference,
+                "#281 fast page bytes diverged from the pre-#226 page at {label}"
+            );
+            assert_eq!(
+                fast_total, rows,
+                "#281 `total` must be the live row count, not the page length, at {label}"
             );
 
             let mut g = c.benchmark_group("forgedb/list_page");
@@ -351,38 +498,56 @@ fn bench_doc(c: &mut Criterion) {
             // The two halves of a comparison are then measured seconds apart rather
             // than minutes, which is what keeps the pairing honest when something
             // else on the machine is competing for cores.
-            g.bench_with_input(
-                BenchmarkId::new("full_path", &label),
-                &limit,
-                |b, &limit| {
-                    b.iter(|| {
-                        let (total, ids) = doc_phase_a(&db, limit);
-                        let page = doc_phase_b(&db, &ids);
-                        let body = serde_json::to_string(&page).expect("serialize");
-                        std::hint::black_box((total, body))
-                    });
-                },
-            );
+            g.bench_with_input(BenchmarkId::new("full_path", &label), &limit, |b, &limit| {
+                b.iter(|| {
+                    let (total, ids) = doc_phase_a(&db, offset, limit);
+                    let page = doc_phase_b(&db, &ids);
+                    let body = serde_json::to_string(&page).expect("serialize");
+                    std::hint::black_box((total, body))
+                });
+            });
 
             g.bench_with_input(
                 BenchmarkId::new("full_buffered", &label),
                 &limit,
                 |b, &limit| {
-                    b.iter(|| std::hint::black_box(doc_full_buffered(&db, limit)));
+                    b.iter(|| std::hint::black_box(doc_full_buffered(&db, offset, limit)));
+                },
+            );
+
+            // #281's control is `full_buffered`, not `full_path`: the branch is taken
+            // instead of the post-#226 scan path, so that is the arm it replaces.
+            // Registered immediately after it for the same adjacency reason.
+            g.bench_with_input(
+                BenchmarkId::new("fast_buffered", &label),
+                &limit,
+                |b, &limit| {
+                    b.iter(|| std::hint::black_box(doc_fast_buffered(&db, offset, limit)));
                 },
             );
 
             g.bench_with_input(BenchmarkId::new("scan_only", &label), &limit, |b, &limit| {
-                b.iter(|| std::hint::black_box(doc_phase_a(&db, limit)));
+                b.iter(|| std::hint::black_box(doc_phase_a(&db, offset, limit)));
             });
 
             g.bench_with_input(
                 BenchmarkId::new("page_buffered", &label),
                 &limit,
                 |b, &limit| {
-                    b.iter(|| std::hint::black_box(doc_page_buffered(&db, limit)));
+                    b.iter(|| std::hint::black_box(doc_page_buffered(&db, offset, limit)));
                 },
             );
+
+            g.bench_with_input(BenchmarkId::new("fast_page", &label), &limit, |b, &limit| {
+                b.iter(|| std::hint::black_box(doc_fast_page(&db, offset, limit)));
+            });
+
+            // `scan_only − select_only` is A_gather, the only phase #281 shrinks.
+            // Registered adjacent to `scan_only` for the same reason every other pair
+            // is: the two halves of a subtraction are measured back to back.
+            g.bench_with_input(BenchmarkId::new("select_only", &label), &limit, |b, _| {
+                b.iter(|| std::hint::black_box(doc_select_only(&db)));
+            });
 
             g.bench_with_input(BenchmarkId::new("page_get", &label), &ids, |b, ids| {
                 b.iter(|| std::hint::black_box(doc_phase_b(&db, ids)));
@@ -404,54 +569,75 @@ fn bench_post_fk(c: &mut Criterion) {
     for rows in ROWS {
         let (db, _dir) = populated_posts(rows);
 
-        for limit in LIMITS {
-            let label = format!("rows={rows}/limit={limit}");
+        for (offset, limit) in POINTS {
+            let label = format!("rows={rows}/off={offset}/limit={limit}");
 
-            let (_, ids) = post_phase_a(&db, limit);
+            let (_, ids) = post_phase_a(&db, offset, limit);
             let page = post_phase_b(&db, &ids);
 
-            let (_, buffered_body) = post_full_buffered(&db, limit);
+            let (_, buffered_body) = post_full_buffered(&db, offset, limit);
+            let reference = serde_json::to_string(&page).expect("serialize");
             assert_eq!(
-                buffered_body,
-                serde_json::to_string(&page).expect("serialize"),
+                buffered_body, reference,
                 "post-#226 page bytes diverged from the pre-#226 page at {label}"
+            );
+            let (fast_total, fast_body) = post_fast_buffered(&db, offset, limit);
+            assert_eq!(
+                fast_body, reference,
+                "#281 fast page bytes diverged from the pre-#226 page at {label}"
+            );
+            assert_eq!(
+                fast_total, rows,
+                "#281 `total` must be the live row count, not the page length, at {label}"
             );
 
             let mut g = c.benchmark_group("forgedb/list_page_fk");
 
-            g.bench_with_input(
-                BenchmarkId::new("full_path", &label),
-                &limit,
-                |b, &limit| {
-                    b.iter(|| {
-                        let (total, ids) = post_phase_a(&db, limit);
-                        let page = post_phase_b(&db, &ids);
-                        let body = serde_json::to_string(&page).expect("serialize");
-                        std::hint::black_box((total, body))
-                    });
-                },
-            );
+            g.bench_with_input(BenchmarkId::new("full_path", &label), &limit, |b, &limit| {
+                b.iter(|| {
+                    let (total, ids) = post_phase_a(&db, offset, limit);
+                    let page = post_phase_b(&db, &ids);
+                    let body = serde_json::to_string(&page).expect("serialize");
+                    std::hint::black_box((total, body))
+                });
+            });
 
-            // Same adjacency as `bench_doc` — see the comment there.
+            // Same adjacency as `bench_doc` — see the comments there.
             g.bench_with_input(
                 BenchmarkId::new("full_buffered", &label),
                 &limit,
                 |b, &limit| {
-                    b.iter(|| std::hint::black_box(post_full_buffered(&db, limit)));
+                    b.iter(|| std::hint::black_box(post_full_buffered(&db, offset, limit)));
+                },
+            );
+
+            g.bench_with_input(
+                BenchmarkId::new("fast_buffered", &label),
+                &limit,
+                |b, &limit| {
+                    b.iter(|| std::hint::black_box(post_fast_buffered(&db, offset, limit)));
                 },
             );
 
             g.bench_with_input(BenchmarkId::new("scan_only", &label), &limit, |b, &limit| {
-                b.iter(|| std::hint::black_box(post_phase_a(&db, limit)));
+                b.iter(|| std::hint::black_box(post_phase_a(&db, offset, limit)));
             });
 
             g.bench_with_input(
                 BenchmarkId::new("page_buffered", &label),
                 &limit,
                 |b, &limit| {
-                    b.iter(|| std::hint::black_box(post_page_buffered(&db, limit)));
+                    b.iter(|| std::hint::black_box(post_page_buffered(&db, offset, limit)));
                 },
             );
+
+            g.bench_with_input(BenchmarkId::new("fast_page", &label), &limit, |b, &limit| {
+                b.iter(|| std::hint::black_box(post_fast_page(&db, offset, limit)));
+            });
+
+            g.bench_with_input(BenchmarkId::new("select_only", &label), &limit, |b, _| {
+                b.iter(|| std::hint::black_box(post_select_only(&db)));
+            });
 
             g.bench_with_input(BenchmarkId::new("page_get", &label), &ids, |b, ids| {
                 b.iter(|| std::hint::black_box(post_phase_b(&db, ids)));
