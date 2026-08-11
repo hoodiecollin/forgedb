@@ -7,8 +7,10 @@
 //! argument for measuring ForgeDB's S1 at the borrowed page view rested on `R` being
 //! small relative to #226's win — an argument until this file made it a number.
 //!
-//! It is small: **10–15 µs, and O(1) in table size.** But getting there required a fifth
-//! rung, because the obvious subtraction measures something else entirely.
+//! It is small: **7–8 µs, and O(1) in table size.** But getting there required a fifth
+//! rung, because at the time of measuring, the obvious subtraction measured something
+//! else entirely — and the rung is retained now for a *different* reason than the one
+//! that introduced it. Both are below.
 //!
 //! # The boundaries — FIVE rungs, not four
 //!
@@ -16,29 +18,63 @@
 //!   S1   typed rows      the engine hands back its page, nothing serialized
 //!   S2   JSON bytes      + serialize that page to a bare JSON array
 //!   S3-0 router          + routing, extractors, envelope        <- GET /api/post
-//!   S3   + predicate     + the per-row scan predicate           <- GET /api/post?limit=50
+//!   S3   + predicate     + whatever the query string costs      <- GET /api/post?limit=50
 //!   S4   socket          + HTTP parse, connection handling, TCP
 //! ```
 //!
-//! **`S3 − S2` is NOT "routing + extractors + envelope", and that was this file's first
-//! finding.** The generated `__post_scan_matches` short-circuits on `params.is_empty()`;
-//! `?limit=50` makes the map non-empty without naming a single filterable field, so an
-//! *unfiltered* request runs six `HashMap` lookups per scanned row. Measured:
+//! ## Why the fifth rung exists, and why it stays
+//!
+//! **First measured at `d087574`, `S3 − S2` was NOT "routing + extractors + envelope".**
+//! The generated `__post_scan_matches` short-circuited on `params.is_empty()`; `?limit=50`
+//! makes the map non-empty **without naming a single filterable field**, so an *unfiltered*
+//! request ran six `HashMap` lookups **per scanned row**. That per-row term — `P` — was
+//! **97% of the subtraction at 10k rows**, so the accepted label was wrong by 34×. Isolating
+//! it needed a rung whose URI satisfies the short-circuit, and no hand-written copy of the
+//! generated predicate.
+//!
+//! **That finding is what filed #288**, which hoisted the predicate out of the per-row loop
+//! behind `__post_is_unfiltered(params)`. So the rung's original justification is *gone* —
+//! and the rung is kept anyway, because what it now measures is worth more than what it was
+//! built for. Post-#288 and post-#281, over `Post`, unfiltered, in one paired run:
 //!
 //! ```text
-//!   R = S3-0 − S2     10.15 µs (1k rows)    15.04 µs (10k rows)    O(1)
-//!   P = S3   − S3-0   49.67 µs (1k rows)   501.55 µs (10k rows)    ~50 ns/row
+//!            was (d087574)              is                       class
+//!   R = S3-0 − S2   10.15 / 15.04 µs    8.03 ±0.27 / 7.03 ±0.90 µs   O(1)
+//!   P = S3   − S3-0 49.67 / 501.55 µs   0.71 ±0.45 / 0.76 ±0.92 µs   O(1)
+//!                   ~50 ns/row          0.08 ns/row at 10k
 //! ```
 //!
-//! At 10k rows `S3 − S2` is **97% P and 3% R**. Per-row cost is 49.7 ns and 50.2 ns
-//! across a 10× table — identical, which is what proves it is the six lookups rather
-//! than anything else in the request.
+//! **#288 changed `P`'s complexity class, not merely its size** — 660× at the core grid
+//! point, and at 10k rows `P` is now *inside its own confidence band*. `S3 − S2` is
+//! 7.79 ±0.78 µs of which `P` is 9.8%, so **the accepted Gate 1 label is true again**.
 //!
-//! **P must never enter a cross-engine cell.** No SQL engine evaluates a per-row
+//! The rung therefore converts from an arithmetic necessity into a **standing O(1)
+//! assertion on #288's hoist**: it is the only instrument in this repo that measures that
+//! hoist's effect *at the request boundary* (the codegen guards prove the hoist is
+//! **emitted**; this proves it is **effective**). A regression shows up here as `P`
+//! reacquiring a slope in table size. Do not delete it to "simplify the ladder" now that
+//! the two terms are no longer comparable in size — a guard is most worth keeping exactly
+//! when it is reading zero.
+//!
+//! **`P` must never enter a cross-engine cell.** No SQL engine evaluates a per-row
 //! predicate for a query with no `WHERE`, so pairing S3 against another engine's S2 would
 //! malign ForgeDB for work that engine never did — the exact failure the fairness
 //! contract exists to name. The cross-engine headline is **S2**; S3-0 and S3 are
-//! ForgeDB-internal rungs.
+//! ForgeDB-internal rungs. That holds even now that `P` rounds to nothing: the rule is
+//! about what the term *is*, not how big it currently measures.
+//!
+//! # The S2 arm is the SHIPPED page method, and the retired one is kept beside it
+//!
+//! Post-#281 the handler's unfiltered, unsorted arm calls `__with_fast_page`, not
+//! `__with_page`. `s2_json_fast` is therefore the arm that mirrors the shipped request and
+//! `s2_json` is the **in-run control** — retained, not replaced, because the difference
+//! between them *is* #281's win as seen from the request boundary (19.13 ±0.40 µs at 1k,
+//! 180.99 ±2.00 µs at 10k) and a control measured in another run is not evidence here.
+//!
+//! **Computing `R` against the retired arm yields −173.96 µs at 10k — negative.** That is
+//! not noise and not a broken harness: it is the step-3 gate's own escape clause firing.
+//! A negative `R` on this shape means the bench arm is measuring a path the router no
+//! longer takes. The fix is to repoint the arm, never to relax the gate.
 //!
 //! Each delta is an **in-run paired subtraction** — both halves in one Criterion run over
 //! one dataset, registered adjacently so they are measured seconds apart rather than
@@ -64,7 +100,9 @@
 //!
 //! They answer different questions — that one is #226's phase-split attribution with
 //! its historical control, this one is the cross-engine boundary ladder — and this one
-//! needs the generated router, whose deps sit behind `--features router` (+78 packages).
+//! needs the generated router, whose deps sit behind `--features router` (**+81** packages,
+//! 41 → 122 on the library's normal-deps graph — measured, not the +78 the plan predicted;
+//! the three extra are the S4 client crates).
 //! `required-features` is a per-target gate, so co-locating them would make
 //! `make bench-forgedb` compile axum. Do NOT factor shared helpers between the two
 //! files: a shared module would drag the router deps into an unfeatured target and
@@ -156,6 +194,22 @@ fn s2_json(db: &Database, offset: usize, limit: usize) -> (usize, String) {
     )
 }
 
+/// **S2, the shipped form.** `__with_fast_page` is what the generated handler's
+/// unfiltered, unsorted arm calls post-#281, and #288's hoisted `__post_is_unfiltered`
+/// is what routes `?limit=50` into it. Same terminal closure, same bare array, same
+/// `<Model>PageRef` representation the fairness contract names — the difference from
+/// `s2_json` is entirely *which generated method* produced the view, which is why the
+/// retired arm is kept beside it as the in-run control rather than deleted.
+fn s2_json_fast(db: &Database, offset: usize, limit: usize) -> (usize, String) {
+    db.post.__with_fast_page(
+        offset,
+        limit,
+        |total: usize, page: &[PostPageRef<'_>]| {
+            (total, serde_json::to_string(page).expect("serialize"))
+        },
+    )
+}
+
 fn bench_calibration(c: &mut Criterion) {
     for rows in [1_000usize, 10_000usize] {
         bench_calibration_at(c, rows);
@@ -182,6 +236,15 @@ fn bench_calibration_at(c: &mut Criterion, core_rows: usize) {
         let (total, body) = s2_json(&guard, 0, CORE_LIMIT);
         assert_eq!(total, core_rows, "S2 total");
         assert!(body.starts_with('['), "S2 must serialize the BARE array");
+
+        // The retired arm and the shipped arm must describe the SAME page, byte for
+        // byte. This is what licenses reporting their difference as the cost of the
+        // method rather than as a difference in what was measured -- and it is the
+        // only assertion here that would catch `__with_fast_page` returning a
+        // differently-ordered or differently-bounded window than `__with_page`.
+        let (fast_total, fast_body) = s2_json_fast(&guard, 0, CORE_LIMIT);
+        assert_eq!(fast_total, total, "S2 fast/retired total");
+        assert_eq!(fast_body, body, "S2 fast/retired page bytes");
     }
     let routed = rt.block_on(async {
         let resp = router
@@ -213,6 +276,15 @@ fn bench_calibration_at(c: &mut Criterion, core_rows: usize) {
         b.iter(|| s2_json(&guard, 0, l));
     });
 
+    g.bench_with_input(
+        BenchmarkId::new("s2_json_fast", &label),
+        &CORE_LIMIT,
+        |b, &l| {
+            let guard = rt.block_on(state.read());
+            b.iter(|| s2_json_fast(&guard, 0, l));
+        },
+    );
+
     g.bench_with_input(BenchmarkId::new("s3_router", &label), &uri, |b, u| {
         b.iter(|| {
             rt.block_on(async {
@@ -235,16 +307,23 @@ fn bench_calibration_at(c: &mut Criterion, core_rows: usize) {
 
     // **S3-0** -- the SAME logical request with no query string at all, and a permanent
     // rung rather than a probe. `GET /api/post` and `GET /api/post?limit=50` return the
-    // same 50 rows (50 IS the default), but the generated `__post_scan_matches`
-    // short-circuits on `params.is_empty()`, which only the first URI satisfies. The
-    // second therefore runs six `params.get(..)` HashMap lookups PER SCANNED ROW.
+    // same 50 rows (50 IS the default), and post-#288 both take the hoisted unfiltered
+    // path: `__post_is_unfiltered` answers on `contains_key` over the model's filterable
+    // fields, and `limit` is not one of them.
     //
-    // This arm is what makes `R` measurable: without it, `S3 - S2` conflates the routing
-    // tax with a per-row engine cost 33x its size, and the published number for "routing
-    // + extractors + envelope" would be wrong by that factor. Measured on this file:
-    // `R = S3-0 - S2` is 10-15 us and O(1), while `P = S3 - S3-0` is ~50 ns/row.
-    // Do not remove it to "simplify the ladder"; it is the only in-run instrument that
-    // separates the two, and it needs no hand-written copy of the generated predicate.
+    // At `d087574` that was NOT true -- `__post_scan_matches` short-circuited on
+    // `params.is_empty()`, which only the first URI satisfies, so the second ran six
+    // `params.get(..)` lookups PER SCANNED ROW. This arm is what caught that (`P` was 97%
+    // of `S3 - S2` at 10k rows, making the published "routing + extractors + envelope"
+    // figure wrong by 34x) and it is what filed #288.
+    //
+    // Keep it. `P` is now 0.71/0.76 us -- O(1), and inside its own band at 10k -- so this
+    // arm no longer separates two comparable terms. What it does instead is assert, at the
+    // request boundary, that #288's hoist is still effective: a regression reappears as `P`
+    // reacquiring a slope in table size. The codegen guards prove the hoist is emitted;
+    // only this proves it works. A guard reading zero is not a guard worth deleting.
+    // It also needs no hand-written copy of the generated predicate, which is why it is
+    // an extra URI rather than an extra closure.
     g.bench_with_input(
         BenchmarkId::new("s3_router_noparams", &label),
         "/api/post",
