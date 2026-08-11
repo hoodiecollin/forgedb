@@ -4,6 +4,17 @@
 //! bench the *same* records, so their Criterion groups line up. See
 //! `docs/BENCHMARKS.md`.
 
+// ===========================================================================
+// SECTION 1 — the default generated project (`benchmarks/gen/`). TRACKED in git,
+// re-emitted by `make bench-regen`. Every declaration here is UNCONDITIONAL,
+// because the file it points at is committed and therefore present in a fresh
+// clone. A new generated artifact for the default project (e.g. the generated
+// `api.rs`) belongs in THIS half — add an ungated `#[path]` module beside
+// `forgedb_generated` and extend `make bench-regen` to emit it. Do NOT copy a
+// declaration out of section 2: its `cfg` exists only because those files are
+// gitignored.
+// ===========================================================================
+
 /// The ForgeDB-GENERATED database code (`benchmarks/gen/database.rs`), compiled
 /// as part of this crate so the bench links the real generated `Database` API.
 /// Regenerate with `make bench-regen` after any codegen change — this module
@@ -11,6 +22,17 @@
 #[allow(warnings)]
 #[path = "../gen/database.rs"]
 pub mod forgedb_generated;
+
+// ===========================================================================
+// SECTION 2 — config-matrix variants (`benchmarks/gen/<variant>/`). GITIGNORED,
+// so they exist only after `make bench-regen-matrix`, and are compiled ONLY
+// under `--features matrix` (#279). Declaring them unconditionally made the
+// bench LIBRARY depend on untracked files, which broke every bench target in a
+// clean clone — not just the matrix one. Anything linking a variant must state
+// that: `required-features = ["matrix"]` on the target, or a `cfg` at the use
+// site (`examples/workload/main.rs`, whose `--var-sweep` mode needs
+// `v_churn_probe`).
+// ===========================================================================
 
 /// Config-matrix variants (epic #126): the SAME `bench.forge` generated under a
 /// range of `forgedb.toml` configs, each a separate module, so the matrix bench
@@ -20,21 +42,27 @@ pub mod forgedb_generated;
 /// presence, thresholds, changefeed capacity) — the schema is identical.
 /// (Top-level modules, not nested under a `variants` module: `#[path]` for an
 /// inline nested module resolves through a `src/<mod>/` dir that does not exist.)
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/default/database.rs"]
 pub mod v_default;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/fsync_never/database.rs"]
 pub mod v_fsync_never;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/replication_on/database.rs"]
 pub mod v_replication_on;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/compaction_off/database.rs"]
 pub mod v_compaction_off;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/compaction_low/database.rs"]
 pub mod v_compaction_low;
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/changefeed_small/database.rs"]
 pub mod v_changefeed_small;
@@ -42,6 +70,7 @@ pub mod v_changefeed_small;
 /// Compaction-off lifts the `1 + 4000/live_rows` auto-compaction ceiling so the
 /// amplification ladder can reach 8x/16x/32x at all; fsync-never keeps the preload
 /// affordable there. Read-path measurements only — see `configs/churn_probe.toml`.
+#[cfg(feature = "matrix")]
 #[allow(warnings)]
 #[path = "../gen/churn_probe/database.rs"]
 pub mod v_churn_probe;
