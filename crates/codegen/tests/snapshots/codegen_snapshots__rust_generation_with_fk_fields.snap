@@ -1201,7 +1201,7 @@ impl AuthorStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(AuthorPageRef {
-                    id: __ref.id.clone(),
+                    id: __ref.id,
                     __borrow: ::std::marker::PhantomData,
                 });
         }
@@ -3062,8 +3062,8 @@ impl PostStorage {
             };
             __views
                 .push(PostPageRef {
-                    id: __ref.id.clone(),
-                    title: __ref.title.clone(),
+                    id: __ref.id,
+                    title: __ref.title,
                     author_id: author_id_value,
                     editor_id: editor_id_value,
                 });

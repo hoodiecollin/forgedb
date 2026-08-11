@@ -1533,9 +1533,9 @@ impl PlaceStorage {
             };
             __views
                 .push(PlacePageRef {
-                    id: __ref.id.clone(),
-                    name: __ref.name.clone(),
-                    description: __ref.description.clone(),
+                    id: __ref.id,
+                    name: __ref.name,
+                    description: __ref.description,
                     location: location_value,
                 });
         }

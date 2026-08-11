@@ -1798,9 +1798,9 @@ impl ProductStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(ProductPageRef {
-                    id: __ref.id.clone(),
-                    price: __ref.price.clone(),
-                    discount: __ref.discount.clone(),
+                    id: __ref.id,
+                    price: __ref.price,
+                    discount: __ref.discount,
                     __borrow: ::std::marker::PhantomData,
                 });
         }

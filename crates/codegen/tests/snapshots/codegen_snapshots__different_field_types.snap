@@ -1581,11 +1581,11 @@ impl ComplexModelStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(ComplexModelPageRef {
-                    id: __ref.id.clone(),
-                    count: __ref.count.clone(),
-                    price: __ref.price.clone(),
-                    active: __ref.active.clone(),
-                    created_at: __ref.created_at.clone(),
+                    id: __ref.id,
+                    count: __ref.count,
+                    price: __ref.price,
+                    active: __ref.active,
+                    created_at: __ref.created_at,
                     __borrow: ::std::marker::PhantomData,
                 });
         }

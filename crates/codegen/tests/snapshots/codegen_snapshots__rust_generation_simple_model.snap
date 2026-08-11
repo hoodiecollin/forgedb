@@ -1682,8 +1682,8 @@ impl UserStorage {
             };
             __views
                 .push(UserPageRef {
-                    id: __ref.id.clone(),
-                    email: __ref.email.clone(),
+                    id: __ref.id,
+                    email: __ref.email,
                     age: age_value,
                 });
         }

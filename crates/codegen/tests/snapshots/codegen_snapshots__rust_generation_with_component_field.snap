@@ -1271,8 +1271,8 @@ impl ProductStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(ProductPageRef {
-                    id: __ref.id.clone(),
-                    name: __ref.name.clone(),
+                    id: __ref.id,
+                    name: __ref.name,
                     reviews: (),
                     card: Default::default(),
                 });

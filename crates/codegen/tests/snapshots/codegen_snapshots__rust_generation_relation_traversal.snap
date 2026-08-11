@@ -1260,8 +1260,8 @@ impl UserStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(UserPageRef {
-                    id: __ref.id.clone(),
-                    name: __ref.name.clone(),
+                    id: __ref.id,
+                    name: __ref.name,
                     posts: (),
                 });
         }
@@ -3133,8 +3133,8 @@ impl PostStorage {
             };
             __views
                 .push(PostPageRef {
-                    id: __ref.id.clone(),
-                    title: __ref.title.clone(),
+                    id: __ref.id,
+                    title: __ref.title,
                     author: author_value,
                     editor: editor_value,
                     tags: (),
@@ -4417,8 +4417,8 @@ impl TagStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(TagPageRef {
-                    id: __ref.id.clone(),
-                    label: __ref.label.clone(),
+                    id: __ref.id,
+                    label: __ref.label,
                     posts: (),
                 });
         }

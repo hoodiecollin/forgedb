@@ -1766,10 +1766,10 @@ impl OrderStorage {
         for (__pslot, __ref) in __page.iter().enumerate() {
             __views
                 .push(OrderPageRef {
-                    id: __ref.id.clone(),
-                    label: __ref.label.clone(),
-                    status: __ref.status.clone(),
-                    prev_status: __ref.prev_status.clone(),
+                    id: __ref.id,
+                    label: __ref.label,
+                    status: __ref.status,
+                    prev_status: __ref.prev_status,
                 });
         }
         f(__total, &__views)

@@ -8547,12 +8547,23 @@ impl RustGenerator {
             .iter()
             .map(|f| {
                 if Self::page_field_from_scan(scan_fields, f) {
-                    // `clone()` is a copy for every scan-view type: `&'a str` (and
-                    // `Option<&'a str>`) clone as the reference, and every other scan
-                    // field is a by-value `Copy` scalar.  It is the borrow the page
-                    // view keeps, not a materialization.
+                    // Read the field out of the scan view by VALUE, with no
+                    // `.clone()`: every scan-view type is `Copy` — `&'a str` and
+                    // `Option<&'a str>` copy the reference (the `'a` lives in the
+                    // type, so the copy keeps the buffer borrow rather than
+                    // reborrowing from `__ref`), `InlineStr<N>` is `Copy` by
+                    // construction (#252), a generated enum derives `Copy`, and
+                    // everything else is a scalar or `[u8; N]`.
+                    //
+                    // `.clone()` here would be a no-op that rustc reports as
+                    // `noop_method_call` — 6 warnings in the user's own build for a
+                    // 5-model schema, and `database.rs`'s `allow` header does not
+                    // (and should not) cover it.  If a future scan-view type is ever
+                    // NOT `Copy`, this becomes a move out of a shared reference: a
+                    // compile error, which is the loud failure we want, not a
+                    // silently-materializing clone.
                     let fname = format_ident!("{}", f.name);
-                    quote! { #fname: __ref.#fname.clone() }
+                    quote! { #fname: __ref.#fname }
                 } else {
                     let v = page_value_by_name
                         .get(f.name.as_str())
