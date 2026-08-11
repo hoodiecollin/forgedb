@@ -126,6 +126,35 @@
 //! - `fast_buffered` and `full_buffered` must emit **byte-identical** bodies, asserted
 //!   once per point outside the timed loop. A win from a shorter response is no win.
 //!
+//! # What it measured (#281's gate, one paired run)
+//!
+//! At `rows=10000, offset=0, limit=50` — the gate's named point — `full_buffered` →
+//! `fast_buffered` was 1095.40 → 149.46 µs on `Doc` (86.4% of the request, 945.94 ±5.77)
+//! and 419.14 → 150.01 µs on `Post` (64.2%, 269.13 ±1.53). Nowhere near a noise floor,
+//! so the kill rule did not fire. `offset=10, limit=5` is stronger still (89.1% / 70.4%),
+//! and `rows=1000, limit=1000` — `p = r`, where the model predicts exactly zero — measured
+//! −0.64 ±3.05 µs and +2.55 ±0.88 µs: no win and no regression, as designed.
+//!
+//! Two caveats, both stated rather than rounded away:
+//!
+//! - `realized/ceiling` lands slightly **above** 100% at two points (102.9% and 100.2%,
+//!   both on `Doc`). That is the ceiling *model* under-counting, not unequal work: it is
+//!   built from `scan_only` (`__with_scan`), while the control runs `__with_page`, whose
+//!   phase A additionally stores `__slot`, maps `__page_rows`, and sets up a second
+//!   page-bounded gather — all of which `fast_buffered` also skips and none of which is
+//!   inside `A_gather`. The bodies are asserted byte-identical at every point, and the
+//!   102.9% point's ±38.38 band covers 100% on its own.
+//! - `select_only` came out at 8.2–8.3 µs (1k) and 102–105 µs (10k), against a
+//!   standalone replica of the same three operations measured at Gate 2 as 8.03 and
+//!   104.94 µs. The agreement is close, but the in-run figure is the one to quote: the
+//!   Gate 2 number was recorded as a pre-registration estimate precisely because it was
+//!   a replica rather than the generated code.
+//!
+//! It is also what makes #226 and #281 legible together: after #226, the unfiltered
+//! request was 97–99% phase A at 10k rows (`scan_only` 1066.40 of `full_buffered`
+//! 1080.90 at `offset=10, limit=5`). The compound effect of both, `full_path` →
+//! `fast_buffered`, is 9.67× on `Doc` and 3.95× on `Post` at the gate's point.
+//!
 //! They are registered in that order deliberately: Criterion measures arms in
 //! registration order, so each compared pair (`full_path`/`full_buffered`,
 //! `scan_only`/`page_buffered`) runs back to back rather than minutes apart.
