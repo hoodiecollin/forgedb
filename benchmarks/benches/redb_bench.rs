@@ -15,7 +15,10 @@
 //! relaxed, no per-commit fsync) — never mixing durability levels in one chart.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use forgedb_benchmarks::{dataset, id_for, Dataset};
+use forgedb_benchmarks::{
+    dataset, id_for, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
+    LIST_CORE_ROWS, LIST_LIMITS, LIST_SIZES,
+};
 use redb::{Database, Durability, MultimapTableDefinition, ReadableTable, TableDefinition};
 
 const READ_USERS: usize = 1_000;
@@ -327,5 +330,176 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
+
+// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
+//
+// S1 = the page's rows in the serializable host-language form this engine's shipped read
+// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
+// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
+//
+// **BDD-10 — redb has no `views` index, and this suite does NOT register the
+// `filtered_indexed` shape.** The other four suites do. Registering it here as a full
+// scan under the same benchmark ID would produce a cell that lines up perfectly in the
+// comparison table and means something entirely different: "redb's indexed lookup is
+// 400x slower" rather than "redb was not given an index for this column". An ABSENT cell
+// is loud and forces the reader to the note; a slow same-named cell is quiet and reads as
+// an engine result. The other shapes need no index in any engine, so they are unaffected.
+//
+// This is a property of THIS harness, not of redb: the corpus loader builds `EMAIL_IDX`
+// and `AUTHOR_IDX` because the scenarios that came before needed them. Adding a
+// `VIEWS_IDX` table is the fix; it changes the write-path numbers every other scenario in
+// this file reports, so it is out of #282's scope and stated rather than done.
+const REDB_LIST_SHAPES: [&str; 3] = ["unfiltered", "filtered_unindexed", "sorted"];
+
+type PostRec = (u64, i64, bool, [u8; 16], String);
+
+fn to_json_row(key: &[u8], rec: PostRec) -> PostJson {
+    let (views, created_at, published, author, title) = rec;
+    PostJson {
+        id: uuid_of(key.to_vec()),
+        title,
+        views,
+        published,
+        author: uuid::Uuid::from_bytes(author),
+        created_at: ts_from_seconds(created_at),
+        tags: (),
+    }
+}
+
+/// The page, materialized. redb is a B-tree KV with no query planner, so every shape is a
+/// `posts.iter()` walk — `unfiltered` can stop at `limit`, the filtered shape must keep
+/// walking until it has `limit` matches, and `sorted` must decode the whole table.
+fn redb_page(db: &Database, shape: &str, limit: usize) -> Vec<PostJson> {
+    let rtx = db.begin_read().unwrap();
+    let posts = rtx.open_table(POST).unwrap();
+
+    if shape == "sorted" {
+        let mut all: Vec<PostJson> = posts
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (k, v) = row.unwrap();
+                to_json_row(k.value(), unpack_post(v.value()))
+            })
+            .collect();
+        all.sort_unstable_by(|a, b| b.views.cmp(&a.views));
+        all.truncate(limit);
+        return all;
+    }
+
+    let want_published = shape == "filtered_unindexed";
+    let mut out = Vec::with_capacity(limit);
+    for row in posts.iter().unwrap() {
+        let (k, v) = row.unwrap();
+        let rec = unpack_post(v.value());
+        if want_published && !rec.2 {
+            continue;
+        }
+        out.push(to_json_row(k.value(), rec));
+        if out.len() == limit {
+            break;
+        }
+    }
+    out
+}
+
+fn bench_list(c: &mut Criterion) {
+    // The core grid: four shapes at the core point.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir.path().join("bench.redb"));
+        load(&db, &data);
+        let mut g = c.benchmark_group("redb/list_core");
+        for name in REDB_LIST_SHAPES {
+            let limit = LIST_CORE_LIMIT;
+            
+            let label = format!("{name}/rows={LIST_CORE_ROWS}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(redb_page(&db, name, limit).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = redb_page(&db, name, limit);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
+    // middle point — which is legal because this is a DIFFERENT group.
+    {
+        let mut g = c.benchmark_group("redb/list_unfiltered");
+        for rows in LIST_SIZES {
+            let data = dataset(READ_USERS, rows);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir.path().join("bench.redb"));
+        load(&db, &data);
+            let name = "unfiltered";
+            let limit = LIST_CORE_LIMIT;
+            
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            // BDD-3: every engine's page must hold the same number of rows at the same
+            // (rows, limit) point. A LIMIT that clamped differently would make the
+            // cross-engine comparison meaningless while every number looked plausible.
+            {
+                
+                let n = redb_page(&db, name, limit).len();
+                assert_eq!(n, limit.min(rows), "BDD-3: redb page held {n} for limit={limit} over {rows}");
+            }
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(redb_page(&db, name, limit).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = redb_page(&db, name, limit);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Limit sweep, unfiltered, at the core size.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_db(&dir.path().join("bench.redb"));
+        load(&db, &data);
+        let mut g = c.benchmark_group("redb/list_unfiltered_limits");
+        for limit in LIST_LIMITS {
+            let rows = LIST_CORE_ROWS;
+            let name = "unfiltered";
+            
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(redb_page(&db, name, limit).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = redb_page(&db, name, limit);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan, bench_list);
 criterion_main!(benches);
