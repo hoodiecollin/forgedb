@@ -100,9 +100,16 @@
 //!
 //! They answer different questions — that one is #226's phase-split attribution with
 //! its historical control, this one is the cross-engine boundary ladder — and this one
-//! needs the generated router, whose deps sit behind `--features router` (**+81** packages,
-//! 41 → 122 on the library's normal-deps graph — measured, not the +78 the plan predicted;
-//! the three extra are the S4 client crates).
+//! needs the generated router, whose deps sit behind `--features router` (**+78** packages,
+//! 41 → 119 on the library's normal-deps graph). Adding S4's three client crates —
+//! `hyper`, `hyper-util`, `http-body-util` — moved that number by ZERO, because `axum`
+//! already pulls all three; the feature gained three direct deps and no new packages.
+//! Re-derive rather than reason about it:
+//!
+//! ```bash
+//! cargo tree --manifest-path benchmarks/Cargo.toml -e normal --prefix none \
+//!   | awk 'NF{print $1}' | sort -u | wc -l          # and again with --features router
+//! ```
 //! `required-features` is a per-target gate, so co-locating them would make
 //! `make bench-forgedb` compile axum. Do NOT factor shared helpers between the two
 //! files: a shared module would drag the router deps into an unfeatured target and
@@ -124,27 +131,23 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
-/// The core grid point: `READ_POSTS` in every one of the five engine suites.
-const CORE_ROWS: usize = 10_000;
-
-/// `PAGE_DEFAULT_LIMIT` from the generated handler — what a bare `GET /api/post` sends.
-const CORE_LIMIT: usize = 50;
-
-/// The size sweep. **The load-bearing sweep**: ForgeDB's unfiltered line has a slope
-/// where every SQL engine's is flat, because the read is O(rows) in the *table* rather
-/// than O(rows) in the *page*. #281 removed the column-gather term and left the live-row
-/// selection term, so the slope survives while its cause changed — which is exactly why
-/// a single table size would hide the effect.
-const SIZES: [usize; 3] = [1_000, 10_000, 100_000];
-
-/// The limit sweep: `PAGE_DEFAULT_LIMIT` and `PAGE_MAX_LIMIT`. At `limit=1000` over
-/// 1,000 rows the page IS the table, so a page-bounded gather gathers everything — the
-/// regime where #281's win is exactly zero by construction.
-const LIMITS: [usize; 2] = [50, 1_000];
-
-/// A `views` value that exists in every corpus size, for the filtered-indexed shape.
-/// Chosen inside `SIZES[0]` so the same query is valid at every point in the sweep.
-const PROBE_VIEWS: u64 = 512;
+// The grid lives in `forgedb_benchmarks` (`LIST_*`, `list_grid`), not here — all five
+// engine suites read the same constants, because a grid that disagrees does not fail, it
+// silently compares a 10k page against a 100k one and reads as an engine difference.
+//
+// What each sweep is FOR:
+//   - size sweep: **the load-bearing one.** ForgeDB's unfiltered line has a slope where
+//     every SQL engine's is flat, because the read is O(rows) in the *table* rather than
+//     O(rows) in the *page*. #281 removed the column-gather term and left the live-row
+//     selection term, so the slope survives while its cause changed — which is exactly
+//     why a single table size would hide the effect.
+//   - limit sweep: at `limit=1000` over 1,000 rows the page IS the table, so a
+//     page-bounded gather gathers everything — the regime where #281's win is zero by
+//     construction.
+use forgedb_benchmarks::{
+    LIST_CORE_LIMIT as CORE_LIMIT, LIST_CORE_ROWS as CORE_ROWS, LIST_LIMITS as LIMITS,
+    LIST_PROBE_VIEWS as PROBE_VIEWS, LIST_SIZES as SIZES,
+};
 
 const AUTHOR: u8 = 7;
 const BASE_SECS: i64 = 1_700_000_000;
