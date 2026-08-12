@@ -14,19 +14,33 @@
 //! Durability: run at BOTH `synchronous_commit=on` (WAL fsync per commit — the
 //! durable tier) and `off` (relaxed, group-commit) — never mixed in one chart.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use forgedb_benchmarks::{dataset, id_for, Dataset};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use forgedb_benchmarks::{
+    dataset, id_for, list_sql, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
+    LIST_CORE_ROWS, LIST_LIMITS, LIST_SHAPES, LIST_SIZES,
+};
 use postgres::{Client, NoTls};
 
 const READ_USERS: usize = 1_000;
 const READ_POSTS: usize = 10_000;
 
 const SCHEMA: &str = r#"
+-- Index parity with `bench.forge` / `schema.sql` (#282 BDD-10). The contract stated at
+-- the top of schema.sql is "every ForgeDB index has a matching SQL index so index-probe
+-- scenarios compare like for like", and this DDL silently broke it for TWO of the five:
+-- `^views` on Post and `&name` on Tag. Both are ADDED here rather than worked around,
+-- because #282's `filtered_indexed` shape probes `views` directly -- an unindexed engine
+-- would have posted a full scan under a benchmark ID that reads as an index lookup.
+--
+-- This makes this suite's bulk-load and insert numbers SLOWER than previously published:
+-- it was paying for one fewer index than SQLite and ForgeDB. The old numbers were the
+-- unfair ones. Recorded in docs/BENCHMARKS.md rather than quietly re-baselined.
 DROP TABLE IF EXISTS post_tag_link, post, tag, "user";
 CREATE TABLE "user" (id BYTEA PRIMARY KEY, name TEXT, email TEXT UNIQUE, created_at BIGINT);
 CREATE TABLE post (id BYTEA PRIMARY KEY, title TEXT, views BIGINT, published BOOLEAN, author BYTEA, created_at BIGINT);
 CREATE INDEX post_author_idx ON post(author);
-CREATE TABLE tag (id BYTEA PRIMARY KEY, name TEXT);
+CREATE INDEX post_views_idx ON post(views);
+CREATE TABLE tag (id BYTEA PRIMARY KEY, name TEXT UNIQUE);
 CREATE TABLE post_tag_link (post_id BYTEA, tag_id BYTEA);
 CREATE INDEX ptl_post_idx ON post_tag_link(post_id);
 "#;
@@ -210,5 +224,136 @@ fn bench_reads(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_reads);
+
+// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
+//
+// S1 = the page's rows in the serializable host-language form this engine's shipped read
+// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
+// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
+//
+// **PostgreSQL's S1 already contains a protocol round-trip**, which no embedded engine's
+// S1 does. So the honest comparison for this suite is against ForgeDB's **S4** (the rung
+// over a real socket), NOT its S1/S2. Reading `pg/list/s1_rows` beside
+// `forgedb/list/s1_rows` compares "query + IPC + materialize" against "materialize" and
+// makes ForgeDB look ~2 orders better for a reason that is definitional rather than
+// measured. The rung exists precisely so this comparison has a correct partner; the
+// pairing rule is stated in docs/BENCHMARKS.md next to the table.
+
+fn pg_page(client: &mut Client, sql: &str) -> Vec<PostJson> {
+    client
+        .query(sql, &[])
+        .unwrap()
+        .into_iter()
+        .map(|r| PostJson {
+            id: uuid_of(r.get::<_, &[u8]>(0).to_vec()),
+            title: r.get(1),
+            views: r.get::<_, i64>(2) as u64,
+            published: r.get(3),
+            author: uuid_of(r.get::<_, &[u8]>(4).to_vec()),
+            created_at: ts_from_seconds(r.get(5)),
+            tags: (),
+        })
+        .collect()
+}
+
+fn bench_list(c: &mut Criterion) {
+    let Some(mut client) = connect() else {
+        skip_notice();
+        return;
+    };
+    // The core grid: four shapes at the core point.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        schema(&mut client);
+        load(&mut client, &data);
+        let mut g = c.benchmark_group("pg/list_core");
+        for (name, clause) in LIST_SHAPES {
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={LIST_CORE_ROWS}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(pg_page(&mut client, &sql).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = pg_page(&mut client, &sql);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
+    // middle point — which is legal because this is a DIFFERENT group.
+    {
+        let mut g = c.benchmark_group("pg/list_unfiltered");
+        for rows in LIST_SIZES {
+            let data = dataset(READ_USERS, rows);
+        schema(&mut client);
+        load(&mut client, &data);
+            let (name, clause) = ("unfiltered", "");
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            // BDD-3: every engine's page must hold the same number of rows at the same
+            // (rows, limit) point. A LIMIT that clamped differently would make the
+            // cross-engine comparison meaningless while every number looked plausible.
+            {
+                
+                let n = pg_page(&mut client, &sql).len();
+                assert_eq!(n, limit.min(rows), "BDD-3: pg page held {n} for limit={limit} over {rows}");
+            }
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(pg_page(&mut client, &sql).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = pg_page(&mut client, &sql);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Limit sweep, unfiltered, at the core size.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        schema(&mut client);
+        load(&mut client, &data);
+        let mut g = c.benchmark_group("pg/list_unfiltered_limits");
+        for limit in LIST_LIMITS {
+            let rows = LIST_CORE_ROWS;
+            let (name, clause) = ("unfiltered", "");
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                b.iter(|| {
+                    std::hint::black_box(pg_page(&mut client, &sql).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                b.iter(|| {
+                    let page = pg_page(&mut client, &sql);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_insert, bench_reads, bench_list);
 criterion_main!(benches);

@@ -4,7 +4,10 @@
 //! ForgeDB's `FsyncPolicy::Always`: WAL journal + `synchronous = FULL`.
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
-use forgedb_benchmarks::{dataset, id_for, Dataset};
+use forgedb_benchmarks::{
+    dataset, id_for, list_sql, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
+    LIST_CORE_ROWS, LIST_LIMITS, LIST_SHAPES, LIST_SIZES,
+};
 use rusqlite::{params, Connection};
 
 const READ_USERS: usize = 1_000;
@@ -290,5 +293,130 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
+
+/// Decode the page into `PostJson`. A cursor engine must COPY the strings ForgeDB's page
+/// view borrows out of its column buffer; that asymmetry is a property of the shipped read
+/// paths and is disclosed in docs/BENCHMARKS.md rather than engineered away.
+fn sqlite_page(stmt: &mut rusqlite::Statement<'_>) -> Vec<PostJson> {
+    stmt.query_map([], |r| {
+        Ok(PostJson {
+            id: uuid_of(r.get(0)?),
+            title: r.get(1)?,
+            views: r.get::<_, i64>(2)? as u64,
+            published: r.get::<_, i64>(3)? != 0,
+            author: uuid_of(r.get(4)?),
+            created_at: ts_from_seconds(r.get(5)?),
+            tags: (),
+        })
+    })
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
+}
+
+fn bench_list(c: &mut Criterion) {
+    // The core grid: four shapes at the core point.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = fresh_conn(&dir.path().join("bench.db"));
+        load(&mut conn, &data);
+        let mut g = c.benchmark_group("sqlite/list_core");
+        for (name, clause) in LIST_SHAPES {
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={LIST_CORE_ROWS}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(sqlite_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = sqlite_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
+    // middle point — which is legal because this is a DIFFERENT group.
+    {
+        let mut g = c.benchmark_group("sqlite/list_unfiltered");
+        for rows in LIST_SIZES {
+            let data = dataset(READ_USERS, rows);
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = fresh_conn(&dir.path().join("bench.db"));
+        load(&mut conn, &data);
+            let (name, clause) = ("unfiltered", "");
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            // BDD-3: every engine's page must hold the same number of rows at the same
+            // (rows, limit) point. A LIMIT that clamped differently would make the
+            // cross-engine comparison meaningless while every number looked plausible.
+            {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let n = sqlite_page(&mut stmt).len();
+                assert_eq!(n, limit.min(rows), "BDD-3: sqlite page held {n} for limit={limit} over {rows}");
+            }
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(sqlite_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = sqlite_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Limit sweep, unfiltered, at the core size.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = fresh_conn(&dir.path().join("bench.db"));
+        load(&mut conn, &data);
+        let mut g = c.benchmark_group("sqlite/list_unfiltered_limits");
+        for limit in LIST_LIMITS {
+            let rows = LIST_CORE_ROWS;
+            let (name, clause) = ("unfiltered", "");
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(sqlite_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = sqlite_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan, bench_list);
 criterion_main!(benches);

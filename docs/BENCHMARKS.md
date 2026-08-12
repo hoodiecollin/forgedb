@@ -365,6 +365,169 @@ scenario: it makes the update-*width* axis measurable (ForgeDB writes the whole 
 update, so the per-update cost scales with width — a 6-field model cannot show this), and its
 lack of a variable-width column isolates `export` from `gather_buffered`.
 
+### The REST list endpoint (scenario 21)
+
+21. **`GET /api/post` across five engines and four boundaries** — `make bench-list`
+    (+ `make bench-list-postgres`). Scenarios 1–20 measure engine primitives. This one
+    measures **the thing an application actually calls**: a paginated list request. It is the
+    only scenario where ForgeDB's answer includes generated routing, extractors and an
+    envelope, because in a generated application those are not overhead around the database —
+    they are part of it.
+
+**The ladder.** ForgeDB is measured at five points on the same request, so the cost of each
+boundary is a *subtraction* rather than an attribution:
+
+| Rung | What it measures |
+| --- | --- |
+| **S1** `s1_rows` | The page's rows in the serializable host-language form the engine's shipped read path produces. No serialization. |
+| **S2** `s2_json` | S1 + `serde_json` over the same page — the **bare array**, no envelope. |
+| **S3-0** `s3_router_noparams` | `GET /api/post` through the generated router. No query string at all. |
+| **S3** `s3_router` | `GET /api/post?limit=50&offset=0` — the same request with the query string the endpoint parses. |
+| **S4** `s4_socket` | S3 over a **real TCP socket** with a real HTTP client, on one reused connection. |
+
+Three deltas come out of it, and each answers a question no single number can:
+
+- **`R = S3-0 − S2`** — routing, extraction and the envelope. Should be O(1) in table size.
+- **`P = S3 − S3-0`** — what parsing and applying a query string costs. #288 hoisted the
+  "is there any filter at all?" question out of the per-row loop, which changed `P`'s
+  **complexity class**, not just its size.
+- **`S4 − S3`** — kernel + HTTP framing. This is the rung that makes the PostgreSQL
+  comparison honest (below).
+
+Only the four **query shapes** — unfiltered, filtered-unindexed (`?published=true`),
+filtered-indexed (`?views=N`), and sorted (`?sort=views&order=desc`) — are swept across all
+engines; the size sweep (1k / 10k / 100k rows) and limit sweep (50 / 1000) run unfiltered.
+
+**Sort spelling:** `?sort=views&order=desc`. The leading-minus form `?sort=-views` is **not
+parsed** — the endpoint answers `200` with the *unsorted* page. An arm carrying that spelling
+would measure the unfiltered page under a "sorted" label and never fail, which is why
+`tests/list_wire_parity_test.rs` compares every shape's bytes against the router.
+
+**The fairness contract.** Four rules, and the reasoning behind each is the reason to trust
+the numbers:
+
+1. **Compare S2 to S2, never S2 to S1.** Holding ForgeDB's JSON against another engine's
+    typed rows would charge us for serialization the others skip — the same class of mistake
+    as timing an `F_FULLFSYNC`-per-row write against a batched one (see *fsync-parity
+    findings*).
+2. **The same field set, in every engine.** `PostJson` in `benchmarks/src/lib.rs` is one
+    definition shared by all five suites, and its shape matches the generated `PostPageRef`.
+    It carries a `forgedb_types::Timestamp` even in the SQLite/redb/DuckDB/PG arms
+    deliberately: `created_at` is an RFC 3339 string on every ForgeDB wire surface, so an arm
+    emitting a bare integer would have a cheaper serde term for a reason that has nothing to
+    do with either engine.
+3. **The same page size at the same grid point**, asserted in every suite (untimed) rather
+    than assumed. A `LIMIT` clamping differently in one engine would make the comparison
+    meaningless while every number still looked plausible.
+4. **Row sets legitimately differ, and no `ORDER BY id` is added to hide it.** The unfiltered
+    shape has no sort *for anybody*. Adding one to make the engines return the same 50 rows
+    would silently convert it into the *sorted* shape and penalise the SQL engines for work
+    the scenario is not asking them to do. So `total` matches everywhere, but the specific 50
+    rows — and therefore the response bytes — may not.
+
+**PostgreSQL pairs with S4, not with S1/S2.** Its S1 *already contains a protocol
+round-trip*, which no embedded engine's S1 does. Reading `pg/list_core/s1_rows` beside
+`forgedb/list_core/s1_rows` compares "query + IPC + materialize" against "materialize" and
+makes ForgeDB look two orders better for a reason that is definitional rather than measured.
+The S4 rung exists so this comparison has a correct partner.
+
+**Disclosed asymmetry in S1.** S1 is "the shipped form", and the shipped forms genuinely
+differ: ForgeDB's page view *borrows* its strings out of the column buffer, while a cursor
+engine's `query_map` must copy them into an owned struct. That is a real property of the two
+read paths, not a harness artifact — it is reported here rather than engineered away, and it
+is why the cross-engine headline is **S2**, where both sides have paid for the same bytes.
+
+**redb does not register the `filtered_indexed` shape at all.** It has no `views` index in
+this harness, so that cell would be a full scan. Publishing it under the same benchmark ID as
+the other four engines' index probes would produce a row that lines up perfectly in the table
+and means something entirely different — "redb's indexed lookup is 400× slower" rather than
+"redb was not given an index for this column". An **absent** cell is loud and forces the
+reader here; a slow same-named cell is quiet and reads as an engine result. Adding a
+`VIEWS_IDX` table would change every write number in that suite, so it is stated rather than
+done.
+
+**Correction to previously published DuckDB and PostgreSQL write numbers.** `schema.sql`'s
+stated contract is that every ForgeDB index has a matching SQL index. Both of those suites'
+inline DDL silently broke it for `^views` and `&name`. Both indexes are now present, which
+makes their insert and bulk-load numbers **slower** than previously published — they were
+paying for one fewer index than SQLite and ForgeDB, so the older numbers were the unfair ones.
+
+#### Scenario 21 results (first run — 2026-08-11, macOS Apple Silicon)
+
+Four quiet-gated Criterion runs (`make bench-list` + `make bench-list-postgres`) taken in one
+window, 1-min load average < 2.5 at the start of each. The three deltas are **in-run paired
+subtractions** — both terms come from the same run over the same corpus — so machine state
+largely cancels in them. The cross-engine table is necessarily *cross-run* and should be read
+as order-of-magnitude, not to the last digit.
+
+**The ladder, at the core point (10k rows, `limit=50`, unfiltered).** `±` is the 95% CI
+half-width; delta intervals are combined in quadrature.
+
+| Rung | time | note |
+| --- | --- | --- |
+| S1 typed rows, `__with_fast_page` | 125.25 ±0.58 µs | the path the handler takes for this shape |
+| S2 bare JSON, `__with_fast_page` | 146.61 ±0.71 µs | |
+| S3-0 router, no query string | 160.15 ±0.48 µs | |
+| S3 router + `?limit=50&offset=0` | 161.65 ±0.62 µs | |
+| S4 over a real socket | 198.14 ±1.22 µs | one reused connection |
+| *(S1 / S2 via `__with_page`)* | *300.76 / 321.51 µs* | *the path the other three shapes take* |
+
+| delta | value | share |
+| --- | --- | --- |
+| **`R` = S3-0 − S2** | **13.54 ±0.86 µs** | 8.5% of S3-0 |
+| **`P` = S3 − S3-0** | **1.50 ±0.78 µs** | 0.9% of S3 |
+| `S3 − S2` | 15.04 ±0.94 µs | 9.3% of S3 |
+| **`S4 − S3`** | **36.49 ±1.37 µs** | 18.4% of S4 |
+
+**Conclusion 1 — the generated HTTP layer is not the cost.** Routing, extraction and the
+envelope are **9.3% of the served request**, and parsing the query string is **0.9%** — small
+enough to be within a factor of two of its own interval, which is #288's hoist showing up at
+the request boundary. The remaining ~90% is the read. So "it's the framework" is measurably
+not the answer, and the fifth rung earns its keep: the kernel and HTTP framing (`S4 − S3`) cost
+**2.4× more than everything the generated router does**.
+
+**Conclusion 2 — the unfiltered list read is O(table), and that is the finding.** Every SQL
+engine's line is flat across a 100× corpus. ForgeDB's is not:
+
+| engine, S2 unfiltered | 1k rows | 10k | 100k | slope |
+| --- | --- | --- | --- | --- |
+| **forgedb** | **50.56 µs** | **142.96 µs** | **1359.60 µs** | **26.9× over 100× rows** |
+| sqlite | 31.85 | 31.97 | 31.93 | 1.0× |
+| redb | 25.38 | 25.54 | 25.52 | 1.0× |
+| duckdb | 258.60 | 267.32 | 286.52 | 1.1× |
+| pg | 94.93 | 95.33 | 94.50 | 1.0× |
+
+At 1k rows ForgeDB is 1.6× slower than SQLite; at 100k it is **42.6×** slower. #226 removed the
+page-materialization term and #281 removed the column-gather term, but the *live-row selection*
+term is O(table) and now dominates — it is tracked as **#289** (the live set lives in a
+`HashMap`, so every list read sorts the whole thing). A single grid point would have reported
+this as "ForgeDB is somewhat slower"; the sweep is what makes it a complexity claim.
+
+**The four shapes at the core point** (S2, µs — lower is better):
+
+| shape | forgedb | sqlite | redb | duckdb | pg |
+| --- | --- | --- | --- | --- | --- |
+| unfiltered | 146.61 | 31.94 | 25.48 | 269.79 | 95.91 |
+| filtered_unindexed | 593.06 | 33.05 | 28.71 | 308.23 | 100.32 |
+| filtered_indexed | **3.78** | 1.11 | n/a\* | 146.79 | 61.39 |
+| sorted | 344.70 | 37.53 | 1394.30 | 445.27 | 106.08 |
+
+\* redb registers no arm for this shape — see above.
+
+Reading it honestly: **the index probe is where the generated code wins** (3.78 µs — 39× faster
+than DuckDB, 16× faster than Postgres, and the one cell where being a compiled O(1) hash probe
+rather than a planned query shows). Everything that touches the whole table loses, and
+`filtered_unindexed` is the worst cell in the whole table for us at 593 µs — *worse than our own
+unfiltered page*, because the per-row predicate runs over a full scan. redb's `sorted` cell
+(1394 µs) is the only number worse than any of ours, and it is worse for the same reason: no
+index, so it decodes and sorts the entire table.
+
+**Deps are gated.** ForgeDB's rungs need the generated router, whose crates (axum, tokio,
+tower-http, utoipa-axum: +78 packages, 41 → 119 on the bench library's normal-deps graph) sit
+behind `--features router`, so `make bench-sqlite` does not compile them. `make
+bench-deps-check` asserts both directions of that gate — a slower build is not a failing
+build, so nothing else would catch a regression.
+
 ## Methodology guardrails
 
 - **In-process for everyone possible** — SQLite/DuckDB/redb linked in-process; PG over a
@@ -864,7 +1027,19 @@ make bench-sqlite     # SQLite only
 make bench-footprint  # on-disk footprint (all engines) + ForgeDB churn bloat (scenario 18)
 make bench-concurrency# ForgeDB reader throughput under a live writer (scenario 16)
 make bench-list-page  # ForgeDB-only: the list request phase by phase (see below)
+make bench-list       # scenario 21: the REST list endpoint, all engines but Postgres
+make bench-list-postgres  # scenario 21's Postgres half, in an ephemeral devbox cluster
+make bench-deps-check # assert the router deps are gated OFF by default
 make bench-regen      # re-emit benchmarks/gen/database.rs from bench.forge
+```
+
+Two guards belong to scenario 21 and are `cargo test`, not benchmarks — a benchmark whose
+harness is only checked by running the benchmark has no guard for the window where the
+emitter changes and nobody re-runs it:
+
+```bash
+make list-wire-test   # the S1/S2 arms' hand-written mirror vs. the real router, byte for byte
+cargo test --test list_fastpath_tripwire_test   # every emitted page method has a bench arm
 ```
 
 `bench-list-page` is the one suite here that is **not** cross-engine and does not

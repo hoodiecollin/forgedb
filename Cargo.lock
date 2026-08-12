@@ -1325,6 +1325,7 @@ dependencies = [
  "forgedb-wal",
  "forgedb-watcher",
  "insta",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

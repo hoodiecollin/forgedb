@@ -14,19 +14,33 @@
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use duckdb::{params, Connection};
-use forgedb_benchmarks::{dataset, id_for, Dataset};
+use forgedb_benchmarks::{
+    dataset, id_for, list_sql, ts_from_seconds, uuid_of, Dataset, PostJson, LIST_CORE_LIMIT,
+    LIST_CORE_ROWS, LIST_LIMITS, LIST_SHAPES, LIST_SIZES,
+};
 
 const READ_USERS: usize = 1_000;
 const READ_POSTS: usize = 10_000;
 
-const SCHEMA: &str = "
+const SCHEMA: &str = r#"
+-- Index parity with `bench.forge` / `schema.sql` (#282 BDD-10). The contract stated at
+-- the top of schema.sql is "every ForgeDB index has a matching SQL index so index-probe
+-- scenarios compare like for like", and this DDL silently broke it for TWO of the five:
+-- `^views` on Post and `&name` on Tag. Both are ADDED here rather than worked around,
+-- because #282's `filtered_indexed` shape probes `views` directly -- an unindexed engine
+-- would have posted a full scan under a benchmark ID that reads as an index lookup.
+--
+-- This makes this suite's bulk-load and insert numbers SLOWER than previously published:
+-- it was paying for one fewer index than SQLite and ForgeDB. The old numbers were the
+-- unfair ones. Recorded in docs/BENCHMARKS.md rather than quietly re-baselined.
 CREATE TABLE user (id BLOB PRIMARY KEY, name VARCHAR, email VARCHAR UNIQUE, created_at BIGINT);
 CREATE TABLE post (id BLOB PRIMARY KEY, title VARCHAR, views UBIGINT, published BOOLEAN, author BLOB, created_at BIGINT);
 CREATE INDEX post_author_idx ON post(author);
-CREATE TABLE tag (id BLOB PRIMARY KEY, name VARCHAR);
+CREATE INDEX post_views_idx ON post(views);
+CREATE TABLE tag (id BLOB PRIMARY KEY, name VARCHAR UNIQUE);
 CREATE TABLE post_tag_link (post_id BLOB, tag_id BLOB);
 CREATE INDEX ptl_post_idx ON post_tag_link(post_id);
-";
+"#;
 
 fn fresh_conn(path: &std::path::Path) -> Connection {
     let conn = Connection::open(path).expect("open duckdb");
@@ -275,5 +289,139 @@ fn bench_scan(c: &mut Criterion) {
         });
 }
 
-criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan);
+
+// --- Scenario 21 (#282): the REST list endpoint, S1 and S2 -------------------
+//
+// S1 = the page's rows in the serializable host-language form this engine's shipped read
+// path produces; S2 = the JSON array over the same field set, so `S2 - S1` is the same
+// added work in every suite. See `PostJson` and docs/BENCHMARKS.md.
+//
+// DuckDB is the interesting arm here: like ForgeDB it is columnar, so a 50-row page is a
+// vectorized engine being asked to do the one thing it is not built for. Its `filtered_indexed`
+// cell is now honest -- `post_views_idx` exists as of this issue (see SCHEMA).
+
+/// Decode the page into `PostJson`. DuckDB hands BLOBs back as `Vec<u8>` and UBIGINT as
+/// `u64`, so this is the same materialization the other SQL suites do.
+fn duck_page(stmt: &mut duckdb::Statement<'_>) -> Vec<PostJson> {
+    stmt.query_map([], |r| {
+        Ok(PostJson {
+            id: uuid_of(r.get(0)?),
+            title: r.get(1)?,
+            views: r.get(2)?,
+            published: r.get(3)?,
+            author: uuid_of(r.get(4)?),
+            created_at: ts_from_seconds(r.get(5)?),
+            tags: (),
+        })
+    })
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
+}
+
+fn bench_list(c: &mut Criterion) {
+    // The core grid: four shapes at the core point.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_conn(&dir.path().join("bench.duckdb"));
+        load(&conn, &data);
+        let mut g = c.benchmark_group("duckdb/list_core");
+        for (name, clause) in LIST_SHAPES {
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={LIST_CORE_ROWS}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(duck_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = duck_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Size sweep, unfiltered. The core point recurs here on purpose — it is the sweep's
+    // middle point — which is legal because this is a DIFFERENT group.
+    {
+        let mut g = c.benchmark_group("duckdb/list_unfiltered");
+        for rows in LIST_SIZES {
+            let data = dataset(READ_USERS, rows);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_conn(&dir.path().join("bench.duckdb"));
+        load(&conn, &data);
+            let (name, clause) = ("unfiltered", "");
+            let limit = LIST_CORE_LIMIT;
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            // BDD-3: every engine's page must hold the same number of rows at the same
+            // (rows, limit) point. A LIMIT that clamped differently would make the
+            // cross-engine comparison meaningless while every number looked plausible.
+            {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                let n = duck_page(&mut stmt).len();
+                assert_eq!(n, limit.min(rows), "BDD-3: duckdb page held {n} for limit={limit} over {rows}");
+            }
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(duck_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = duck_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+
+    // Limit sweep, unfiltered, at the core size.
+    {
+        let data = dataset(READ_USERS, LIST_CORE_ROWS);
+        let dir = tempfile::tempdir().unwrap();
+        let conn = fresh_conn(&dir.path().join("bench.duckdb"));
+        load(&conn, &data);
+        let mut g = c.benchmark_group("duckdb/list_unfiltered_limits");
+        for limit in LIST_LIMITS {
+            let rows = LIST_CORE_ROWS;
+            let (name, clause) = ("unfiltered", "");
+            let sql = list_sql(clause, limit, 0);
+            let label = format!("{name}/rows={rows}/limit={limit}");
+
+            g.bench_function(BenchmarkId::new("s1_rows", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    std::hint::black_box(duck_page(&mut stmt).len())
+                });
+            });
+
+            g.bench_function(BenchmarkId::new("s2_json", &label), |b| {
+                let mut stmt = conn.prepare(&sql).unwrap();
+                b.iter(|| {
+                    let page = duck_page(&mut stmt);
+                std::hint::black_box(serde_json::to_string(&page).unwrap().len())
+                });
+            });
+        }
+        g.finish();
+    }
+}
+
+criterion_group!(benches, bench_insert, bench_bulk_load, bench_reads, bench_scan, bench_list);
 criterion_main!(benches);

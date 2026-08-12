@@ -17,6 +17,20 @@ path = "src/lib.rs"
 [features]
 matrix = []
 
+# #282: the generated REST router (`gen/api.rs`) and the crates its emitted `use`
+# statements pull in. OFF by default. Section 1's gate criterion in src/lib.rs names
+# this case by number: `gen/api.rs` is TRACKED, but declaring it unconditionally would
+# make EVERY bench target — `make bench-sqlite` included — compile axum, tokio,
+# tower-http and utoipa-axum. Measured: +78 packages on the library's normal graph
+# (41 -> 119, ~2.9x). Tracked is not the same as free; `[[bench]] list_rest_bench`
+# carries the matching `required-features`, and `make bench-deps-check` asserts both
+# directions of this gate.
+router = [
+  "dep:axum", "dep:tokio", "dep:tower", "dep:tower-http", "dep:utoipa-axum",
+  "dep:forgedb-auth", "dep:forgedb-query-params",
+  "dep:hyper", "dep:hyper-util", "dep:http-body-util",
+]
+
 # Substrate the ForgeDB-generated `gen/database.rs` links against, path-patched to
 # the local crates (this is a detached project — see `[workspace]` below — so the
 # heavy bench deps never enter the root workspace build or test baseline).
@@ -32,6 +46,26 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 utoipa = { version = "5", features = ["uuid"] }
 uuid = { version = "1", features = ["v4"] }
+
+# #282 `router` feature only — what the generated `gen/api.rs` links, plus the three
+# S4 client crates. All `optional = true`: see the feature comment above.
+#
+# `forgedb-auth` takes DEFAULT features, NOT `jwks-http`. The `forgedb init` scaffold
+# pins `features = ["jwks-http"]` (src/commands/init.rs) for runtime convenience, but
+# the generated `api.rs` references only `forgedb_auth::Authenticator` and
+# `forgedb_auth::axum_mw::require_tenant` — neither needs the HTTP JWKS fetcher. The
+# in-tree proof is tests/common/mod.rs, whose `fn dep()` emits no `features` key and
+# whose generated crates boot a real router. Dropping it saves 37 packages.
+axum                 = { version = "0.8", features = ["ws"],            optional = true }
+tokio                = { version = "1",   features = ["full"],          optional = true }
+tower                = { version = "0.5", features = ["util"],          optional = true }
+tower-http           = { version = "0.6", features = ["trace", "cors"], optional = true }
+utoipa-axum          = { version = "0.2",                               optional = true }
+forgedb-auth         = { path = "../crates/auth",         optional = true }
+forgedb-query-params = { path = "../crates/query-params", optional = true }
+hyper                = { version = "1",   features = ["client", "http1"], optional = true }
+hyper-util           = { version = "0.1", features = ["tokio"],           optional = true }
+http-body-util       = { version = "0.1",                                 optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -84,6 +118,14 @@ required-features = ["matrix"]
 [[bench]]
 name = "list_page_bench"
 harness = false
+
+# #282 scenario 21: the generated REST list endpoint measured at four boundaries
+# (typed rows -> JSON bytes -> router -> socket). Needs `gen/api.rs`, hence the
+# feature gate — see `[features] router` above.
+[[bench]]
+name = "list_rest_bench"
+harness = false
+required-features = ["router"]
 
 # Detached from the root workspace on purpose: keeps SQLite (and later DuckDB / PG
 # client libs) out of `cargo build --workspace` and the test baseline.
