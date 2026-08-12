@@ -541,11 +541,6 @@ of truth.
    left open after its tag freezes the derived cycle and blocks legitimate next-cycle work.
    (Portable form: `ai-pm-playbook` PLAYBOOK §5.3, rules PM008/PM009.)
 
-   **Transition note (delete once v0.4.0 is tagged):** `main` currently carries the v0.4.0 gap —
-   `develop` was created from it mid-cycle rather than rewinding pushed history. So the reclose is
-   expected RED on `main` until #241 closes, and the model is fully in force from v0.5.0. Do not
-   "fix" this by force-pushing `main`.
-
 3. **Codegen is compile-tested, not just snapshot-tested.** The `insta` snapshots compare
    generated code as *strings* — a snapshot pass does **not** mean the output compiles. When you
    change a generator, generate for a real multi-model schema and `cargo check` the emitted crate
