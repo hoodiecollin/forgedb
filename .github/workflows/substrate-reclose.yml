@@ -73,9 +73,6 @@ jobs:
       # Toolchain comes from rust-toolchain.toml (channel 1.96).
       - uses: Swatinem/rust-cache@v2
 
-      - name: Add the wasm32 target (for the browser read-replica scaffold)
-        run: rustup target add wasm32-unknown-unknown
-
       - name: Build the forgedb CLI
         run: cargo build --release --bin forgedb
 
@@ -187,6 +184,20 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$APP"
+
+          # Add the target HERE, from inside the app, not as a top-level step.
+          # The checkout pins 1.96 via rust-toolchain.toml while the scaffolds —
+          # being outside it — build with the runner's default toolchain (1.97 at
+          # time of writing). `rustup target add` run in the checkout installs
+          # wasm32 std for 1.96 only, and this step then fails with "can't find
+          # crate for `core`" while the add step reports success. Running it from
+          # the app dir makes rustup resolve the same toolchain cargo will.
+          #
+          # The toolchain split is not a defect to paper over: an installed user
+          # has their own toolchain, not our pin, so building the scaffolds with
+          # the default is the more faithful reclose.
+          rustup target add wasm32-unknown-unknown
+
           "$FORGEDB" generate browser --replica
           grep '^forgedb-' generated/replica/Cargo.toml
           # The only step that resolves the storage facade's wasm arm
