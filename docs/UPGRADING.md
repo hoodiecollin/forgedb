@@ -1,0 +1,158 @@
+# Upgrading ForgeDB
+
+What a release requires you to *do*, as opposed to what changed in it. The
+[CHANGELOG](../CHANGELOG.md) is the mechanical record of every shipped commit; this file
+is the short list of actions — a data-directory migration, a schema edit, a client change
+— without which an upgrade breaks something.
+
+Only releases that need action appear here. Newest first. If a version is absent, it was
+drop-in: rebuild and go.
+
+Version policy is [`SEMVER.md`](SEMVER.md); pre-1.0, a **minor** bump is where breaks land.
+
+---
+
+## 0.4.0
+
+Three of these need action before the app starts, and one changes validation behavior
+without stopping anything. In rough order of how much they can cost you:
+
+### 1. Every existing data directory must be migrated (engine generation 1 → 2)
+
+v0.4.0 is the first release to carry an **engine byte-format generation**, and it sets it
+to `2`. Timestamps used to be stored as seconds and are now stored as **microseconds**
+(`#254`), so the same eight bytes mean a different instant under the new code.
+
+The generated `open()` refuses such a directory rather than mis-decoding it:
+
+```
+ForgeDB: data dir at <path>/post/manifest.json was written by engine format
+generation 1, but this binary is generation 2 — ForgeDB's on-disk format changed,
+your schema did not.  Run `forgedb migrate engine --src <dir> --dest <new-dir>`
+with the app STOPPED; do NOT open it with mismatched code.
+```
+
+**This applies to every data directory, not only ones with timestamp fields.** The guard
+compares a single manifest counter and has no opinion about your schema, so a directory
+whose models contain no `timestamp` at all is refused just the same. Nothing is silently
+mis-read either way — the failure is a panic at open, before the first request.
+
+Any directory written by v0.3.x or earlier is generation 1: the field did not exist then,
+and it defaults to `1` when absent.
+
+```bash
+# with the app STOPPED
+forgedb migrate engine --src ./data --dest ./data-gen2
+```
+
+- `--dest` **must not already exist** (or must be empty). It is materialized, not
+  written into.
+- `--src` is **left untouched** — it is your rollback. Nothing migrates in place.
+- The hop is a *generated* crate (default `migrations/engine`), built with
+  `cargo build --release` as part of the command. It is generated rather than
+  schema-blind on purpose: a nullable, arrayed, or struct-nested timestamp is an opaque
+  fixed-byte blob that no schema-agnostic column pass can find, and 81 of the 247
+  timestamp fields in the example corpus are nullable.
+- Re-running against an already-migrated directory is a no-op, and migrating *backwards*
+  (a directory stamped newer than your CLI) is refused with a message telling you to
+  upgrade the CLI instead.
+
+Then point the regenerated app at the destination.
+
+This counter is orthogonal to the app's own schema-migration serial: `migrate up` replays
+*your* `migrations/` lineage, `migrate engine` replays *ForgeDB's* generations. An engine
+bump changes no `.forge` and produces no lineage hop, which is why `migrate up` would run
+nothing here. See [`MIGRATIONS.md`](MIGRATIONS.md).
+
+### 2. `@length(N)` changed meaning — and it does not stop the build
+
+This is the one to read even if you skip the rest, because a schema that still parses can
+start rejecting data that used to be valid.
+
+| written | v0.3.x | v0.4.0 |
+|---|---|---|
+| `@length(20)` | at most 20 characters | **exactly** 20 characters |
+| `@length(1, 20)` | min 1, max 20 | unchanged |
+
+The single-argument form was ambiguous on sight and got the less common reading, and a
+min-only bound was inexpressible (`@length(1)` meant *max* 1, the opposite of the intent).
+`@length` now takes named arguments — `@length(min: 3)`, `@length(max: 200)`,
+`@length(min: 3, max: 64)` — in any combination (`#235`).
+
+The old spelling still parses and **warns**, naming the remedy:
+
+```
+`@length(200)` now means an EXACT length of 200; it previously meant a maximum of
+200. Write `@length(max: 200)` to keep the old meaning, or `@length(200)`
+deliberately to require exactly 200.
+```
+
+A warning does not fail generation. Left unchanged, `title: string @length(200)` starts
+rejecting every title that is not exactly 200 characters with a 422 — so grep your schemas
+for single-argument `@length` and rewrite it to `@length(max: N)`.
+
+The pair form says nothing and needs no change.
+
+### 3. Every model now needs an identity field (fatal)
+
+A model with no identity field is a **parse error**, not a convention (`#248`). Identity is
+either a field literally named `id`, or the first `+` auto-generate field; `id` wins by
+name wherever both are present. Convention remains `id: +uuid`.
+
+The admitted identity types are `uuid`, `u32`/`u64`/`i32`/`i64`, `timestamp(s|ms|us)`,
+`string(N)`/`string(N!)`, and a required FK (`*Model`) that resolves to one of those. A
+model keyed on anything else gets one positioned error naming the field and the allowed
+set. Full rules: [`SCHEMA.md`](SCHEMA.md).
+
+### 4. Timestamps are RFC 3339 strings on every wire surface
+
+A `timestamp` serializes as an **RFC 3339 string** (`"2026-08-11T12:00:00Z"`) rather than a
+number, everywhere serde is involved: REST JSON, the TypeScript SDK, the Rust / Python / Go
+SDKs, OpenAPI (`format: date-time`), and REST filter query parameters (`#254`).
+
+Clients that read or write timestamps as epoch numbers must be updated. Two things
+deliberately did *not* change: index keys stay the stored number, so ordering stays
+numeric; and storage is always `i64` microseconds regardless of the declared precision.
+
+`timestamp` also now declares its precision — `timestamp(s|ms|us)`, bare meaning `ms`,
+no `ns`. The declared unit is the quantum a written value is floored to. An instant outside
+RFC 3339's `0000`–`9999` range is a 422.
+
+### 5. `char(N)` is now `bytes(N)` (warns)
+
+`char(N)` was a false friend — SQL's `CHAR(N)` is fixed-length *text*, while this type is
+raw fixed-size bytes with no UTF-8 guarantee and no text semantics. It is spelled
+`bytes(N)` (`#233`). The old spelling still parses and warns that it will be removed in the
+next major version.
+
+`bytes` is a *contextual* keyword, so a field already named `bytes` keeps working.
+
+### 6. Rust API changes (only if you depend on the substrate crates directly)
+
+Generated code is regenerated and needs nothing. These matter only if your own code links
+the published crates:
+
+| crate | change |
+|---|---|
+| `forgedb-types` | `Timestamp::from_seconds` / `as_seconds` **removed** — the unit is microseconds now. Added: `Display`, `FromStr`, `floor_to_micros`, `is_rfc3339_representable`, and `InlineStr<BYTES>` |
+| `forgedb-storage*` | `Manifest` gains `engine_version`, and its schema serial is now the field `schema_version` (the on-disk key stays `format_version`). A dead second `schema_version` key is gone. Public struct literals stop compiling |
+| `forgedb-backup` | `ModelMeta` mirrors the manifest, so it takes the same two changes. `BackupMetadata.schema_version` now reports the app's real migration serial instead of a hardcoded `1` |
+| `forgedb-migrations` | `MigrationLineage::current_format_version` → `current_schema_version`, and the free function likewise — the counter is the *app's* serial, and the name `format_version` now belongs to the engine counter |
+
+On-disk, both new manifest counters are `#[serde(default)]`: a manifest written by an older
+binary still deserializes. The Rust break is about struct literals, not bytes — which is
+why generation 1 → 2 needs a *value* migration (step 1) and not a layout one.
+
+---
+
+## Earlier releases
+
+**0.3.2, 0.3.1, 0.3.0 and 0.2.1** were drop-in — no data migration, no schema edit, no client
+change.
+
+**0.2.0** was the first public release, so there is nothing to upgrade *from*. It is marked
+breaking because `forgedb-wal` dropped its structured/transaction API in favor of the opaque `Raw`
+record path; that only ever affected code linking the crate directly during pre-release
+development.
+
+See the [CHANGELOG](../CHANGELOG.md) for the full per-release detail.

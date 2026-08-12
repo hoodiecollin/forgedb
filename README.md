@@ -174,6 +174,7 @@ The full docs — with an ecosystem toggle for TypeScript / Python / Rust / Go �
 **Operating**
 - [Deployment](./docs/DEPLOYMENT.md) — containers, env config, ops routes, multi-tenancy, JWT
 - [Migrations](./docs/MIGRATIONS.md) — how schema changes affect data at rest
+- [Upgrading](./docs/UPGRADING.md) — what each release requires you to *do*, newest first
 - [Versioning & Stability](./docs/SEMVER.md) — the compatibility policy across surfaces
 - [Benchmarks](./docs/BENCHMARKS.md) — measured performance + methodology
 
