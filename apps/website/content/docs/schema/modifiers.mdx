@@ -48,7 +48,7 @@ for me". Any other value is honoured verbatim **and** advances the counter past 
 restoring a backup or importing existing rows does not collide on the next insert.
 </Callout>
 
-<Callout type="info" title="Integer sequences are monotonic, not gapless">
+<Callout type="note" title="Integer sequences are monotonic, not gapless">
 A rolled-back transaction — or an attempt the multi-process commit coordinator rejects — burns
 its number. `+u32`/`+u64` guarantee values that are **unique and increasing**, not contiguous.
 This is the same contract Postgres and MySQL offer; do not use the id as a count.
@@ -57,7 +57,7 @@ The sequence also refuses to wrap: a `+u32` that reaches `u32::MAX` fails the cr
 than rolling back to `0` and colliding with every id already issued.
 </Callout>
 
-<Callout type="info" title="Every integer-auto shape is safe across writer processes">
+<Callout type="note" title="Every integer-auto shape is safe across writer processes">
 The counter lives in each writer process, so two processes coordinated through
 `forgedb coordinate` can allocate the same number. What makes that *detected* instead of
 silent is the write-set the coordinator compares — and every shape puts a claim there: the
