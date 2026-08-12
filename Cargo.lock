@@ -1307,7 +1307,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forgedb"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-codegen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "forgedb-parser",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-lsp-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "forgedb-parser",
  "forgedb-validation",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "forgedb-watcher"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "crossbeam-channel",
  "forgedb-codegen",

@@ -28,11 +28,24 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 # One section per release. Keep-a-Changelog headings (`## [x.y.z] - date`) so
 # cargo-dist can locate the matching section and the website parser can split on
 # them. Issue refs are linked by a preprocessor below.
+#
+# The upgrade pointer sits INSIDE the version section, not in the header above.
+# cargo-dist extracts only the matching version section for the GitHub Release
+# body, so a line in the header reaches CHANGELOG.md and the website but never
+# reaches the release notes — which is the one place an upgrading user is
+# actually looking. It renders only for releases that carry a breaking commit,
+# and it points at a file rather than restating the steps, because a changelog
+# generated from commit subjects has nowhere to put a remedy: every subject says
+# what changed, none can say what to do about it.
 body = """
 {% if version %}\
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
 ## [Unreleased]
+{% endif %}\
+{% if commits | filter(attribute="breaking", value=true) | length > 0 %}
+> **Breaking release — upgrading needs action.** Required migration steps are in
+> [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
 {% endif %}\
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | striptags | trim | upper_first }}
