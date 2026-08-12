@@ -6,21 +6,116 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
-## [0.3.2] - 2026-08-06
+## [0.4.0] - 2026-08-12
+
+> **Breaking release — upgrading needs action.** Required migration steps are in
+> [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
+
+### Breaking changes
+
+- **types:** **breaking:** Timestamp is microseconds, and its wire form is RFC 3339
+- **storage:** **breaking:** Two orthogonal version counters on the manifest
+- **breaking:** Rename the schema serial, and bake an engine generation beside it
+- **parser:** **breaking:** Timestamp declares its precision
+- **codegen:** **breaking:** Every generated wire form is the RFC 3339 string
+- **codegen:** **breaking:** Allocate a +timestamp identity, and floor what is written
+
+### Features
+
+- **parser:** Warn that &/^ on the identity field has no effect ([#258](https://github.com/hoodiecollin/forgedb/issues/258))
+- **storage:** Carry per-field allocation high-water marks in the manifest
+- **parser:** Reject integer autos that are not conflict-visible
+- **codegen:** Allocate +u32/+u64 at create, seeded by scan and a persisted floor
+- **codegen:** Emit a sequence claim key for bare integer autos
+- **parser:** Accept a bare non-unique integer auto
+- **storage:** Borrow a fixed column's slot instead of copying it ([#238](https://github.com/hoodiecollin/forgedb/issues/238))
+- **parser:** `string(N)` and `string(N!)` parse to a fixed-width inline type ([#238](https://github.com/hoodiecollin/forgedb/issues/238))
+- **codegen:** Generate the inline string column, end to end ([#238](https://github.com/hoodiecollin/forgedb/issues/238))
+- **validation:** The semantic rules for `string(N)` ([#238](https://github.com/hoodiecollin/forgedb/issues/238))
+- **codegen:** Resolve a foreign key to its target's identity type
+- **codegen:** Every surface keys a relation on the target's own id
+- **codegen:** A junction keys each endpoint on its own identity
+- **parser:** Report an identity cycle, an inherited key width, and an unholdable junction key
+- **parser:** A +timestamp identity must be named `id` and declared `us`
+- **codegen:** Generate the engine-format migration hop
+- **cli:** Forgedb migrate engine
+- **types:** InlineStr<BYTES>, a Copy fixed-capacity string key
+- **parser:** A string identity carries a declared width, and no @utf8
+- **codegen:** A string identity generates an InlineStr<N> key
+- **codegen:** An identity is checked against the URL alphabet at write
+- **parser:** One identity predicate, and one key-type predicate, on the AST
+- **parser:** The identity type allow-list, landing once
+- **codegen:** Reconnect the coordinator client in both error arms ([#274](https://github.com/hoodiecollin/forgedb/issues/274))
+- **codegen:** Emit a CorsLayer and check WebSocket origins ([#140](https://github.com/hoodiecollin/forgedb/issues/140))
+- **cli:** Wire FORGEDB_CORS_ORIGINS through the generated scaffold ([#140](https://github.com/hoodiecollin/forgedb/issues/140))
+- **codegen:** Carry the buffer slot on the scan view ([#226](https://github.com/hoodiecollin/forgedb/issues/226))
+- **codegen:** Emit the borrowed full-record page view ([#226](https://github.com/hoodiecollin/forgedb/issues/226))
+- **codegen:** Emit the __with_page scan-and-page scope ([#226](https://github.com/hoodiecollin/forgedb/issues/226))
 
 ### Bug Fixes
 
+- **codegen:** Enforce &/^ on non-identity auto fields ([#258](https://github.com/hoodiecollin/forgedb/issues/258))
+- **codegen:** Persist the auto-increment floor before compaction destroys the rows
+- **codegen:** Parenthesize the junction frame's slot before try_into
+- **codegen:** `id` wins the identity by name, not by declaration order
+- **codegen:** The REST id parse resolves the identity type, not `_ => Uuid`
+- **codegen:** The browser replica parses a string key
+- **codegen:** An FK to a string key is an inline-string column everywhere
+- **docs:** Two schema examples in SCHEMA.md that never parsed
+- **coordinator:** Couple the client's I/O deadline to the grant wait ([#274](https://github.com/hoodiecollin/forgedb/issues/274))
+- **codegen:** Read the page view's scan fields by value, not by no-op clone ([#226](https://github.com/hoodiecollin/forgedb/issues/226))
+
+### Performance
+
+- **codegen:** Serialize the live list page from the scan buffers ([#226](https://github.com/hoodiecollin/forgedb/issues/226))
+- **codegen:** Hoist the unfiltered-list predicate out of the per-row loop
+- **codegen:** Emit __with_fast_page, the unfiltered list read
+- **codegen:** Route the unfiltered, unsorted list through the fast page
+## [0.3.2] - 2026-08-06
+
+### Features
+
+- **storage:** Add BufferedVariableColumn::read_str for borrowed slot reads ([#224](https://github.com/hoodiecollin/forgedb/issues/224))
+- **codegen:** Decode the narrow scan into a borrowed row view ([#224](https://github.com/hoodiecollin/forgedb/issues/224))
+- **validation:** Add a Severity axis to ValidationError ([#237](https://github.com/hoodiecollin/forgedb/issues/237))
+- **parser:** Add a warning channel alongside recovery diagnostics ([#237](https://github.com/hoodiecollin/forgedb/issues/237))
+- **lsp:** Publish diagnostics at their compiler severity ([#237](https://github.com/hoodiecollin/forgedb/issues/237))
+- **cli:** Partition diagnostics by severity instead of failing on any ([#237](https://github.com/hoodiecollin/forgedb/issues/237))
+- **storage-native:** Additive append_tagged on VariableColumn ([#231](https://github.com/hoodiecollin/forgedb/issues/231))
+- **storage-web:** The append_tagged arena twin ([#231](https://github.com/hoodiecollin/forgedb/issues/231))
+- **parser:** Rename char(n) to bytes(n), warn on the old spelling ([#233](https://github.com/hoodiecollin/forgedb/issues/233))
+- **parser:** Named `min:`/`max:` arguments for @length ([#235](https://github.com/hoodiecollin/forgedb/issues/235))
+- **codegen:** Emit a distinct check per @length spelling ([#235](https://github.com/hoodiecollin/forgedb/issues/235))
+- **parser:** Accept negative, fractional, and exclusive numeric bounds ([#239](https://github.com/hoodiecollin/forgedb/issues/239))
+- **parser:** Reject bound shapes a numeric domain cannot mean ([#239](https://github.com/hoodiecollin/forgedb/issues/239))
+- **codegen:** Emit exact decimal and exclusive numeric bounds ([#239](https://github.com/hoodiecollin/forgedb/issues/239))
+
+### Bug Fixes
+
+- **validation:** Reject a model with no identity field ([#248](https://github.com/hoodiecollin/forgedb/issues/248))
+- **codegen:** Anchor the ScanRef lifetime for a view with no borrowed field ([#250](https://github.com/hoodiecollin/forgedb/issues/250))
+- **codegen:** Serde for arrays past the N = 32 ceiling ([#243](https://github.com/hoodiecollin/forgedb/issues/243))
+- **lsp,inspector:** Teach the tools the named @length form ([#235](https://github.com/hoodiecollin/forgedb/issues/235))
+- **codegen:** Key f64 indexes by an IEEE 754 total order ([#242](https://github.com/hoodiecollin/forgedb/issues/242))
+- **codegen:** Compare @min/@max in the field's own numeric domain ([#239](https://github.com/hoodiecollin/forgedb/issues/239))
 - **codegen:** Identify a staged &unique claim by its model, not field alone ([#257](https://github.com/hoodiecollin/forgedb/issues/257))
 - **codegen:** Name the model in every ValidationError ([#257](https://github.com/hoodiecollin/forgedb/issues/257))
 
+### Performance
+
+- **codegen:** Filter the list and live-query scans on the borrowed view ([#224](https://github.com/hoodiecollin/forgedb/issues/224))
+- **codegen:** Write nullable string/json tags without allocating ([#231](https://github.com/hoodiecollin/forgedb/issues/231))
+- **codegen:** Emit index keys monomorphically per field type ([#230](https://github.com/hoodiecollin/forgedb/issues/230))
+- **codegen:** Serialize REST reads from their types, not a Value tree ([#229](https://github.com/hoodiecollin/forgedb/issues/229))
+- **storage-native:** Gather a sparse selection per row, not by span ([#228](https://github.com/hoodiecollin/forgedb/issues/228))
+- **codegen:** Make the narrow scan a scope, and never materialize a row ([#228](https://github.com/hoodiecollin/forgedb/issues/228))
 ## [0.3.1] - 2026-08-01
 
 ### Performance
 
 - **storage:** Map the spanned region in FixedColumn::gather ([#221](https://github.com/hoodiecollin/forgedb/issues/221))
 - **storage:** Bound and map the spanned region in VariableColumn::gather_buffered ([#222](https://github.com/hoodiecollin/forgedb/issues/222))
-
-## [0.3.0] - 2026-07-30
+## [0.3.0] - 2026-07-31
 
 ### Features
 
@@ -34,14 +129,14 @@ and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVE
 - **coordinator:** Configurable turn-timeout ([#144](https://github.com/hoodiecollin/forgedb/issues/144)) + max-frame ([#145](https://github.com/hoodiecollin/forgedb/issues/145))
 - **auth:** JWKS-over-HTTP fetch + refresh + key rotation ([#81](https://github.com/hoodiecollin/forgedb/issues/81))
 
-## [0.2.1] - 2026-07-30
-
 ### Bug Fixes
 
-- **parser:** Add missing Decimal arm to FieldType::size_in_bytes ([#189](https://github.com/hoodiecollin/forgedb/issues/189))
 - **init:** Refuse to start unauthenticated when FORGEDB_JWKS_URL is set ([#195](https://github.com/hoodiecollin/forgedb/issues/195))
-
+- **parser:** Add missing Decimal arm to FieldType::size_in_bytes ([#189](https://github.com/hoodiecollin/forgedb/issues/189))
 ## [0.2.0] - 2026-07-28
+
+> **Breaking release — upgrading needs action.** Required migration steps are in
+> [docs/UPGRADING.md](https://github.com/hoodiecollin/forgedb/blob/main/docs/UPGRADING.md).
 
 ### Breaking changes
 
