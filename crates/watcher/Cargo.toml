@@ -1,6 +1,6 @@
 [package]
 name = "forgedb-watcher"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
 license = "MIT OR Apache-2.0"
 description = "File watcher and schema regenerator for ForgeDB"
@@ -11,6 +11,6 @@ categories = ["database", "filesystem"]
 [dependencies]
 notify = "8.2"
 crossbeam-channel = "0.5"
-forgedb-codegen = { path = "../codegen", version = "0.3.0" }
+forgedb-codegen = { path = "../codegen", version = "0.4.0" }
 forgedb-parser = { path = "../parser", version = "0.4.0" }
 tracing = "0.1"
