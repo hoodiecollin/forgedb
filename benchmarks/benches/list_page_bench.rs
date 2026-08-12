@@ -103,6 +103,26 @@
 //! the bounded gather gathers everything, and the ceiling is exactly zero. A grid that
 //! omitted either end would report the feature as uniformly good or uniformly marginal.
 //!
+//! # Not to be confused with `list_rest_bench.rs` (#282, scenario 21)
+//!
+//! Both files time a list request; they answer questions that are almost opposites, and
+//! quoting one's number for the other's question is the failure this paragraph exists to
+//! prevent.
+//!
+//! - **This file is ForgeDB-only, historical, and below the router.** Three code paths that
+//!   all still exist in one binary (pre-#226, #226, #281), measured as a paired A/B with an
+//!   in-run control. Its subject is *attribution* — which phase costs what, and how much of
+//!   the ceiling a change realized. There is no HTTP anywhere in it.
+//! - **`list_rest_bench.rs` is cross-engine, current, and spans the router.** Five engines on
+//!   the shipped request, with ForgeDB measured at five rungs from typed rows up to a real
+//!   TCP socket, so routing and the query string can be priced by subtraction. Its subject is
+//!   *comparison*.
+//!
+//! Concretely: this file's `fast_buffered` arm and that file's `s1_rows_fast` arm both drive
+//! `__with_fast_page`, so their absolute numbers are comparable — but a ratio taken here is a
+//! share of a *phase*, and a ratio taken there is a share of a *request*. They are not
+//! interchangeable, and the denominators differ by the whole envelope.
+//!
 //! # Reading the output
 //!
 //! Per `(rows, offset, limit)`, nine arms. Four are the pre-#226 path, two the
