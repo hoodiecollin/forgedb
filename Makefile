@@ -338,6 +338,20 @@ cors-test:
 list-scan-test:
 	cargo test --test list_scan_test -- --ignored --nocapture
 
+.PHONY: list-wire-test
+
+## Benchmark-harness fidelity (#282 BDD-1/BDD-5): scenario 21's S1/S2 arms call the
+## generated page scope directly and supply the filter, comparator and index selection BY
+## HAND, mirroring what the handler derives from a query string. A mirror that admits a row
+## the handler rejects makes the whole ladder's subtractions meaningless while every arm
+## still runs and every number still looks plausible. This rebuilds the envelope both ways
+## over a freshly generated crate and compares the bytes, for all four shapes.
+##
+## The bench asserts the same thing in-run, which is stronger — but only when someone runs
+## the bench, and no baseline or CI job does. Also #[ignore]d out of the fast suite.
+list-wire-test:
+	cargo test --test list_wire_parity_test -- --ignored --nocapture
+
 .PHONY: page-identity-test
 
 ## Page-construction-site identity (#281): #281 adds a SECOND place that builds a
