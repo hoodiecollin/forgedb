@@ -690,5 +690,125 @@ fn bench_limit_sweep(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_core, bench_size_sweep, bench_limit_sweep);
+/// **S4** — the same request over a real TCP socket.
+///
+/// One keep-alive connection, established **outside** the timing loop and reused. That is
+/// a methodology decision, not a convenience: connection setup is a per-*client* cost, not
+/// a per-*request* one, and billing it to every request would inflate S4 systematically.
+/// If setup cost is itself interesting it gets its own arm rather than contaminating this.
+///
+/// **BDD-6 is executable rather than asserted in prose**, via axum's own
+/// `ListenerExt::tap_io`: the server counts accepts, and after the timed arms have run the
+/// count must still be 1. Without that, "we reuse the connection" is a claim about code
+/// nobody re-reads, and a regression to connect-per-request would show up only as an
+/// unexplained S4 that everyone assumes is just TCP being slow.
+struct SocketArm {
+    sender: hyper::client::conn::http1::SendRequest<http_body_util::Empty<hyper::body::Bytes>>,
+    accepts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn bind_socket(fx: &Fixture) -> SocketArm {
+    use axum::serve::ListenerExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fx.rt.block_on(async {
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let listener = listener.tap_io(move |_io| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let router = fx.router.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve");
+        });
+
+        // The ONE connection. Handshaking here rather than inside `b.iter` is the whole
+        // point of the arm.
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to the bench server");
+        let (sender, conn) = hyper::client::conn::http1::handshake(
+            hyper_util::rt::TokioIo::new(stream),
+        )
+        .await
+        .expect("http1 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        SocketArm { sender, accepts }
+    })
+}
+
+impl SocketArm {
+    fn get(&mut self, rt: &tokio::runtime::Runtime, uri: &str) -> hyper::body::Bytes {
+        use http_body_util::BodyExt;
+        rt.block_on(async {
+            let req = hyper::Request::builder()
+                .uri(uri)
+                // Origin-form request, so HTTP/1.1 needs Host set explicitly.
+                .header(hyper::header::HOST, "localhost")
+                .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+                .expect("build request");
+            let resp = self.sender.send_request(req).await.expect("socket request");
+            assert_eq!(resp.status().as_u16(), 200, "S4 status for {uri}");
+            resp.into_body().collect().await.expect("collect").to_bytes()
+        })
+    }
+}
+
+/// S4 at the core point, mirroring S3's four shapes so `S4 - S3` is an in-run paired
+/// subtraction per shape rather than one aggregate number.
+fn bench_socket(c: &mut Criterion) {
+    use std::sync::atomic::Ordering;
+
+    let fx = fixture(CORE_ROWS);
+    let mut arm = bind_socket(&fx);
+
+    let mut g = c.benchmark_group("forgedb/list_socket");
+    for shape in [
+        Shape::Unfiltered,
+        Shape::FilteredUnindexed,
+        Shape::FilteredIndexed,
+        Shape::Sorted,
+    ] {
+        let uri = shape.uri(0, CORE_LIMIT);
+        let label = format!("{}/rows={}/limit={CORE_LIMIT}", shape.label(), fx.rows);
+
+        // Untimed: the socket and the in-process router must return the same bytes. This
+        // is what makes `S4 - S3` a transport measurement rather than a comparison of two
+        // different responses.
+        let over_socket = arm.get(&fx.rt, &uri);
+        let (status, in_process) = fx.get(&uri);
+        assert_eq!(status, 200, "{}: oneshot status", shape.label());
+        assert_eq!(
+            std::str::from_utf8(&over_socket).expect("utf8"),
+            in_process.as_str(),
+            "{}: the socket and the oneshot router disagree at {uri}",
+            shape.label()
+        );
+
+        g.bench_with_input(BenchmarkId::new("s4_socket", &label), &uri, |b, u| {
+            b.iter(|| arm.get(&fx.rt, u));
+        });
+    }
+    g.finish();
+
+    // BDD-6. Every timed iteration above went through the connection opened in
+    // `bind_socket`; a connect-per-request regression lands here.
+    let accepted = arm.accepts.load(Ordering::Relaxed);
+    assert_eq!(
+        accepted, 1,
+        "BDD-6: S4 must reuse ONE keep-alive connection -- {accepted} were accepted, so \
+         connection setup is being billed to every request and every S4 number is inflated"
+    );
+}
+
+criterion_group!(benches, bench_core, bench_size_sweep, bench_limit_sweep, bench_socket);
 criterion_main!(benches);
