@@ -112,9 +112,45 @@ curl -sL "https://static.crates.io/crates/$C/$C-$V.crate" | tar xz
 diff -rq "$C-$V/src" "crates/<dir>/src"
 ```
 
-Every crate that reports a difference needs a publish; every crate that reports none must **not**
-be republished. (Reconciling the v0.4.0 gap this way found six drifted crates where a
-version-number comparison found one.)
+Every crate that reports a difference needs a publish. (Reconciling the v0.4.0 gap this way found
+six drifted crates where a version-number comparison found one.)
+
+### …but a clean `src/` diff does NOT mean "no publish"
+
+The converse of the rule above is false, and it fails silently. A crate whose only change is a
+**dependency version requirement** has a byte-identical `src/`, so the diff reports it clean while
+it still must publish — its *manifest* is what changed, and cargo rewrites `Cargo.toml` at publish
+time, which is why you cannot simply diff that too.
+
+Two crates in this workspace are permanently this shape:
+
+- **`forgedb-storage`** — a pure `cfg` re-export facade. Its entire content is two backend pins, so
+  a backend bump changes the crate completely while touching no source line.
+- **`forgedb-watcher`** — pins `forgedb-codegen`, and drives the generators directly.
+
+The watcher case shows why "it still compiles" is not reassurance. Leave its pin behind and a
+registry resolution hands the root CLI `forgedb-codegen 0.4.0` while handing watcher
+`forgedb-codegen 0.3.0` — two semver-incompatible copies. It **builds**, because no codegen type
+crosses watcher's public boundary, and `forgedb dev`'s watch path then quietly regenerates with the
+previous cycle's generators, rejecting syntax the non-watch path accepts.
+
+So run a **second, independent check** beside the source diff: sweep every intra-workspace
+`forgedb-*` requirement against the depended-on crate's in-tree version and require that the caret
+range admits it.
+
+```bash
+# every intra-workspace pin, next to the version it must admit
+grep -Hn 'forgedb-[a-z-]* *= *{.*version' Cargo.toml crates/*/Cargo.toml
+grep -H  '^version' crates/*/Cargo.toml
+```
+
+A stale pin is invisible to everything local: the workspace build passes (path deps shadow the
+registry), and so does `cargo publish --dry-run`. It fails only for someone resolving from
+crates.io — every installed user, and nobody in this repo.
+
+**The rule to apply: when you republish a crate, tighten its dependents' pins to the new version
+and republish those dependents too.** A dependent still pinning the old version is the same
+stale-source hazard, one level out.
 
 ### Check for a breaking change before choosing the bump
 
