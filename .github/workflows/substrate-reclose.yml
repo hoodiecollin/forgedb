@@ -23,14 +23,31 @@
 # releasable, so this is where the gate belongs. The release order it enforces:
 # publish the substrate -> merge develop -> main -> tag.
 #
-# TRANSITION (v0.4.0 only): `develop` was cut from `main` mid-cycle rather than
-# rewinding pushed history, so `main` currently carries the v0.4.0 gap and this
-# workflow is EXPECTED TO FAIL there until #241 closes. Do not mark it a required
-# check, and do not "fix" it by force-pushing `main` — it goes required once
-# v0.4.0 is published and tagged.
+# WHY ALL SIX SCAFFOLDS, NOT JUST THE SERVER
 #
-# Deliberately generates `all` (not just `rust`): api.rs pulls in query-params and
-# auth, so a gap in any of the substrate crates the scaffold pins surfaces here.
+# `generate all` is one of six emitters that write a `Cargo.toml` pinning substrate
+# crates, and each pins a DIFFERENT set. Checking only the server app left five
+# scaffolds unverified, and the gaps they can hide are not hypothetical:
+#
+#   * `replica` is the only scaffold that resolves `forgedb-storage` on `wasm32`,
+#     where the facade re-exports `forgedb-storage-web` instead of the native
+#     backend. A web-backend publish gap is invisible to every other scaffold.
+#   * `transform` and `ffi` pin `forgedb-coordinator`, which the replica cfg-gates
+#     out entirely.
+#   * `napi`/`pyo3` compile the same `database.rs` behind a different binding
+#     surface, so a substrate signature change lands on them first.
+#
+# Each is a separate step so a failure names the scaffold instead of "the build".
+#
+# WHY `cargo check` FOR SOME OF THEM
+#
+# `napi` and `pyo3` are extension-module `cdylib`s: their link step resolves host
+# symbols supplied by Node or libpython at load time, which is `napi build` /
+# `maturin`'s job and not this workflow's question. Linking them here would test
+# the CI runner's Python headers, not the registry. `cargo check` answers exactly
+# what the reclose asks — do the pins resolve, and does the generated code compile
+# against the published API — and gives up almost nothing, because an unpublished
+# Rust API fails at name/trait resolution, long before any linker runs.
 name: Substrate reclose
 
 on:
@@ -59,7 +76,7 @@ jobs:
       - name: Build the forgedb CLI
         run: cargo build --release --bin forgedb
 
-      - name: Reclose — scaffold, generate, and build against crates.io
+      - name: Scaffold a project outside the checkout
         shell: bash
         env:
           FORGEDB: ${{ github.workspace }}/target/release/forgedb
@@ -74,7 +91,7 @@ jobs:
           cd app
 
           # A schema wide enough that the generated code touches the substrate
-          # surface the scaffold pins — relations, an enum, an index, a
+          # surface the scaffolds pin — relations, an enum, an index, a
           # projection, json/decimal/optional columns.
           cat > schema.forge <<'SCHEMA'
           enum Status { Draft, Published, Archived }
@@ -102,11 +119,142 @@ jobs:
           SCHEMA
 
           "$FORGEDB" validate
-          "$FORGEDB" generate all
 
-          # The moment of truth. A gap shows up as an unresolved name or a
-          # missing method on a registry-resolved substrate crate.
+          # Hand the app path and a SHARED target dir to the steps below. Sharing
+          # it is what keeps six scaffolds affordable: the substrate compiles once
+          # per target triple instead of once per scaffold. It deliberately does
+          # NOT point at the checkout's `target/`, which rust-cache owns.
+          echo "APP=$WORK/app" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$WORK/shared-target" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------------
+      # One step per scaffold. Each prints the pins it is about to resolve, so a
+      # failing log shows the requirement next to the resolution that rejected it.
+      # ---------------------------------------------------------------------
+
+      - name: 1/6 server app — generate all
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate all
+          grep '^forgedb-' Cargo.toml
           cargo build
+
+      - name: 2/6 ffi — generate ffi
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate ffi
+          grep '^forgedb-' generated/ffi/Cargo.toml
+          cargo build --manifest-path generated/ffi/Cargo.toml
+
+      - name: 3/6 napi — generate node --runtime
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate node --runtime
+          grep '^forgedb-' generated/napi/Cargo.toml
+          # cargo check, not build — see "WHY `cargo check`" in the header.
+          cargo check --manifest-path generated/napi/Cargo.toml
+
+      - name: 4/6 pyo3 — generate python --runtime
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          "$FORGEDB" generate python --runtime
+          grep '^forgedb-' generated/pyo3/Cargo.toml
+          cargo check --manifest-path generated/pyo3/Cargo.toml
+
+      - name: 5/6 browser read-replica — generate browser --replica (wasm32)
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+
+          # Add the target HERE, from inside the app, not as a top-level step.
+          # The checkout pins 1.96 via rust-toolchain.toml while the scaffolds —
+          # being outside it — build with the runner's default toolchain (1.97 at
+          # time of writing). `rustup target add` run in the checkout installs
+          # wasm32 std for 1.96 only, and this step then fails with "can't find
+          # crate for `core`" while the add step reports success. Running it from
+          # the app dir makes rustup resolve the same toolchain cargo will.
+          #
+          # The toolchain split is not a defect to paper over: an installed user
+          # has their own toolchain, not our pin, so building the scaffolds with
+          # the default is the more faithful reclose.
+          rustup target add wasm32-unknown-unknown
+
+          "$FORGEDB" generate browser --replica
+          grep '^forgedb-' generated/replica/Cargo.toml
+          # The only step that resolves the storage facade's wasm arm
+          # (forgedb-storage -> forgedb-storage-web). A gap there is invisible
+          # to every native scaffold above.
+          cargo check --manifest-path generated/replica/Cargo.toml \
+            --target wasm32-unknown-unknown
+
+      - name: 6/6 transform — migrate build over a real lineage
+        shell: bash
+        env:
+          FORGEDB: ${{ github.workspace }}/target/release/forgedb
+        run: |
+          set -euxo pipefail
+          cd "$APP"
+          # `migrate build` hardcodes <output>/target/release/forgedb-transform
+          # and does not honour CARGO_TARGET_DIR, so the shared target dir has to
+          # come off for this one step or the binary lands somewhere the CLI will
+          # not look. Unsetting it also makes this step run the exact command an
+          # operator runs.
+          unset CARGO_TARGET_DIR
+
+          # The transformer replays a RECORDED lineage and refuses a synthesized
+          # jump, so a v1 -> v2 hop has to exist before it can be built: record
+          # the baseline snapshot, change the schema, record the hop.
+          "$FORGEDB" migrate create --auto baseline
+          perl -pi -e 's/^  summary: string\?$/  summary: string?\n  subtitle: string?/' schema.forge
+          grep -n 'subtitle' schema.forge
+          "$FORGEDB" migrate create --auto add-subtitle
+          "$FORGEDB" migrate status
+
+          # `migrate build` is the operator path: it emits the transformer to
+          # migrations/transform AND compiles it release. (Plain `generate
+          # transform` defaults its output to ./generated, where it would
+          # overwrite the app's own manifest.)
+          "$FORGEDB" migrate build --from 1 --to 2
+          grep '^forgedb-' migrations/transform/Cargo.toml
+          test -x migrations/transform/target/release/forgedb-transform
+
+      - name: No path dependency may have leaked into any resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Belt and braces: the scaffolds live outside the checkout, so a
+          # `path+file://` source in a lockfile would mean a scaffold emitted a
+          # path dep and the whole check proved nothing.
+          fail=0
+          while IFS= read -r lock; do
+            if grep -q 'path+file' "$lock"; then
+              echo "FAIL: $lock resolved a path dependency"
+              grep -B2 'path+file' "$lock"
+              fail=1
+            else
+              echo "ok: $lock"
+            fi
+          done < <(find "$APP" -name Cargo.lock -not -path '*/shared-target/*' | sort)
+          exit "$fail"
 
       - name: Report open release gates
         # Informational: names anything still blocking the next tag. Never fails
