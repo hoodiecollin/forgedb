@@ -601,8 +601,14 @@ fn verify_pushdown(fx: &Fixture) {
 /// Registration order is the pairing: each arm sits next to the one it is subtracted
 /// from, so the two halves of a delta are measured seconds apart rather than minutes.
 fn register_unfiltered(g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>, fx: &Fixture, limit: usize) {
-    let label = format!("rows={}/limit={limit}", fx.rows);
     let shape = Shape::Unfiltered;
+    // The shape name is in the label even though this function only ever registers the
+    // unfiltered shape, because the OTHER four suites emit
+    // `<engine>/list_unfiltered/s2_json/unfiltered/rows=N/limit=L` and a cross-engine
+    // comparison is done by matching benchmark IDs. Dropping the segment here produced a
+    // sweep table with a ForgeDB column of blanks — the arms had all run, and the
+    // comparison silently had nothing to compare.
+    let label = format!("{}/rows={}/limit={limit}", shape.label(), fx.rows);
 
     g.bench_with_input(BenchmarkId::new("s1_rows", &label), &limit, |b, &l| {
         let guard = fx.rt.block_on(fx.state.read());
@@ -661,6 +667,34 @@ fn bench_core(c: &mut Criterion) {
             let guard = fx.rt.block_on(fx.state.read());
             b.iter(|| s2_json(&guard, s, 0, CORE_LIMIT));
         });
+
+        // The unfiltered shape gets the `__with_fast_page` arms too, and **these are the
+        // ForgeDB cells the cross-engine table must quote for it.**
+        //
+        // `s1_rows`/`s2_json` above drive `__with_page`, which is what the handler calls for
+        // three of the four shapes — but NOT for this one. Post-#281 an unfiltered, unsorted
+        // request takes `__with_fast_page`, and the difference is not a rounding error: the
+        // first measured run had `s2_json` at 324 µs against `s3_router` at 161 µs, i.e. the
+        // full router beating the arm that is supposed to be a strict subset of it. That
+        // reads as a broken harness and is actually two different code paths. Publishing the
+        // 324 µs figure in the cross-engine table would have understated ForgeDB by ~2x
+        // against SQLite and redb, in a table whose whole purpose is that comparison.
+        if shape == Shape::Unfiltered {
+            g.bench_function(BenchmarkId::new("s1_rows_fast", &label), |b| {
+                let guard = fx.rt.block_on(fx.state.read());
+                b.iter(|| s1_rows_fast(&guard, 0, CORE_LIMIT));
+            });
+            g.bench_function(BenchmarkId::new("s2_json_fast", &label), |b| {
+                let guard = fx.rt.block_on(fx.state.read());
+                b.iter(|| s2_json_fast(&guard, 0, CORE_LIMIT));
+            });
+            g.bench_with_input(
+                BenchmarkId::new("s3_router_noparams", &label),
+                "/api/post",
+                |b, u| b.iter(|| fx.get(u)),
+            );
+        }
+
         let uri = shape.uri(0, CORE_LIMIT);
         g.bench_with_input(BenchmarkId::new("s3_router", &label), &uri, |b, u| {
             b.iter(|| fx.get(u));
@@ -759,6 +793,20 @@ impl SocketArm {
                 .header(hyper::header::HOST, "localhost")
                 .body(http_body_util::Empty::<hyper::body::Bytes>::new())
                 .expect("build request");
+            // `send_request` does NOT wait for the connection to be usable — it fails with
+            // `Canceled("connection was not ready")` if the dispatcher is still mid-cycle.
+            // Awaiting the body above does not make it idle: `block_on` returns the instant
+            // the response future resolves, which can be before the connection task is
+            // polled again. So a tight loop races it and eventually loses — this arm ran
+            // fine for ~20k requests in the first two shapes and died in the third, on the
+            // point where Criterion raised the iteration count to 121k.
+            //
+            // Reconnecting on failure would be the wrong fix twice over: it would hide a
+            // real broken connection, and it would silently defeat BDD-6 (one accept for
+            // the whole group) while leaving the assertion technically passing until the
+            // very end. `ready()` is also what a real client does, so it belongs inside the
+            // timed region rather than around it.
+            self.sender.ready().await.expect("connection ready");
             let resp = self.sender.send_request(req).await.expect("socket request");
             assert_eq!(resp.status().as_u16(), 200, "S4 status for {uri}");
             resp.into_body().collect().await.expect("collect").to_bytes()

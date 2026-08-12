@@ -452,6 +452,76 @@ inline DDL silently broke it for `^views` and `&name`. Both indexes are now pres
 makes their insert and bulk-load numbers **slower** than previously published — they were
 paying for one fewer index than SQLite and ForgeDB, so the older numbers were the unfair ones.
 
+#### Scenario 21 results (first run — 2026-08-11, macOS Apple Silicon)
+
+Four quiet-gated Criterion runs (`make bench-list` + `make bench-list-postgres`) taken in one
+window, 1-min load average < 2.5 at the start of each. The three deltas are **in-run paired
+subtractions** — both terms come from the same run over the same corpus — so machine state
+largely cancels in them. The cross-engine table is necessarily *cross-run* and should be read
+as order-of-magnitude, not to the last digit.
+
+**The ladder, at the core point (10k rows, `limit=50`, unfiltered).** `±` is the 95% CI
+half-width; delta intervals are combined in quadrature.
+
+| Rung | time | note |
+| --- | --- | --- |
+| S1 typed rows, `__with_fast_page` | 125.25 ±0.58 µs | the path the handler takes for this shape |
+| S2 bare JSON, `__with_fast_page` | 146.61 ±0.71 µs | |
+| S3-0 router, no query string | 160.15 ±0.48 µs | |
+| S3 router + `?limit=50&offset=0` | 161.65 ±0.62 µs | |
+| S4 over a real socket | 198.14 ±1.22 µs | one reused connection |
+| *(S1 / S2 via `__with_page`)* | *300.76 / 321.51 µs* | *the path the other three shapes take* |
+
+| delta | value | share |
+| --- | --- | --- |
+| **`R` = S3-0 − S2** | **13.54 ±0.86 µs** | 8.5% of S3-0 |
+| **`P` = S3 − S3-0** | **1.50 ±0.78 µs** | 0.9% of S3 |
+| `S3 − S2` | 15.04 ±0.94 µs | 9.3% of S3 |
+| **`S4 − S3`** | **36.49 ±1.37 µs** | 18.4% of S4 |
+
+**Conclusion 1 — the generated HTTP layer is not the cost.** Routing, extraction and the
+envelope are **9.3% of the served request**, and parsing the query string is **0.9%** — small
+enough to be within a factor of two of its own interval, which is #288's hoist showing up at
+the request boundary. The remaining ~90% is the read. So "it's the framework" is measurably
+not the answer, and the fifth rung earns its keep: the kernel and HTTP framing (`S4 − S3`) cost
+**2.4× more than everything the generated router does**.
+
+**Conclusion 2 — the unfiltered list read is O(table), and that is the finding.** Every SQL
+engine's line is flat across a 100× corpus. ForgeDB's is not:
+
+| engine, S2 unfiltered | 1k rows | 10k | 100k | slope |
+| --- | --- | --- | --- | --- |
+| **forgedb** | **50.56 µs** | **142.96 µs** | **1359.60 µs** | **26.9× over 100× rows** |
+| sqlite | 31.85 | 31.97 | 31.93 | 1.0× |
+| redb | 25.38 | 25.54 | 25.52 | 1.0× |
+| duckdb | 258.60 | 267.32 | 286.52 | 1.1× |
+| pg | 94.93 | 95.33 | 94.50 | 1.0× |
+
+At 1k rows ForgeDB is 1.6× slower than SQLite; at 100k it is **42.6×** slower. #226 removed the
+page-materialization term and #281 removed the column-gather term, but the *live-row selection*
+term is O(table) and now dominates — it is tracked as **#289** (the live set lives in a
+`HashMap`, so every list read sorts the whole thing). A single grid point would have reported
+this as "ForgeDB is somewhat slower"; the sweep is what makes it a complexity claim.
+
+**The four shapes at the core point** (S2, µs — lower is better):
+
+| shape | forgedb | sqlite | redb | duckdb | pg |
+| --- | --- | --- | --- | --- | --- |
+| unfiltered | 146.61 | 31.94 | 25.48 | 269.79 | 95.91 |
+| filtered_unindexed | 593.06 | 33.05 | 28.71 | 308.23 | 100.32 |
+| filtered_indexed | **3.78** | 1.11 | n/a\* | 146.79 | 61.39 |
+| sorted | 344.70 | 37.53 | 1394.30 | 445.27 | 106.08 |
+
+\* redb registers no arm for this shape — see above.
+
+Reading it honestly: **the index probe is where the generated code wins** (3.78 µs — 39× faster
+than DuckDB, 16× faster than Postgres, and the one cell where being a compiled O(1) hash probe
+rather than a planned query shows). Everything that touches the whole table loses, and
+`filtered_unindexed` is the worst cell in the whole table for us at 593 µs — *worse than our own
+unfiltered page*, because the per-row predicate runs over a full scan. redb's `sorted` cell
+(1394 µs) is the only number worse than any of ours, and it is worse for the same reason: no
+index, so it decodes and sorts the entire table.
+
 **Deps are gated.** ForgeDB's rungs need the generated router, whose crates (axum, tokio,
 tower-http, utoipa-axum: +78 packages, 41 → 119 on the bench library's normal-deps graph) sit
 behind `--features router`, so `make bench-sqlite` does not compile them. `make
