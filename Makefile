@@ -201,11 +201,15 @@ website-typecheck:
 	cd $(WEBSITE) && $(BUN) run typecheck
 
 ## Regenerate the root CHANGELOG.md from conventional commits (git-cliff, cliff.toml).
-## Run at release time AFTER tagging so the new `v*` tag becomes its own section;
-## cargo-dist reads this file for the GitHub Release body and the website renders it
-## at /changelog. Needs git-cliff on PATH (`brew install git-cliff`).
+## Run at release time BEFORE tagging, with VERSION set: the tag must point AT the
+## `chore(release)` commit that carries the changelog, because cargo-dist builds the
+## GitHub Release body from the section in the TAGGED tree. Passing `--tag` is what
+## lets the not-yet-created version head its own section instead of `[Unreleased]`.
+## The website renders the same file at /changelog.
+## Needs git-cliff on PATH (`brew install git-cliff`).
+##   make changelog VERSION=v0.4.0
 changelog:
-	git-cliff --config cliff.toml --output CHANGELOG.md
+	git-cliff --config cliff.toml $(if $(VERSION),--tag $(VERSION),) --output CHANGELOG.md
 	@echo "✓ CHANGELOG.md regenerated — review the diff before committing."
 
 ## Rebuild the website's roadmap snapshot (apps/website/public/roadmap.json) from
