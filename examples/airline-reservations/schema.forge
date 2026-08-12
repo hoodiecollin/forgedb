@@ -6,9 +6,12 @@
 // Provenance: Synthetic (modeled after the standard airline reservation design pattern)
 
 Airport {
-  id: +uuid
-  // IATA 3-letter code, e.g. "SFO" — unique, fixed-size char(3)
-  iata_code: ^&char(3)
+  // The IATA 3-letter code, e.g. "SFO", IS the airport's identity — there is no
+  // surrogate uuid beside it. Text, so `string`; exactly three characters, so
+  // the inline fixed-width spelling `string(3!)`. As a key it is a `Copy`
+  // 3-byte value rather than a heap `String`, `/airports/SFO` addresses the row
+  // literally, and the two FKs below are 3-byte columns instead of 16-byte ones.
+  id: string(3!)
   name: string
   city: string
   country: string

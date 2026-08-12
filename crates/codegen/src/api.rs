@@ -1,5 +1,6 @@
 //! REST API server code generator
 
+use crate::rust::RustGenerator;
 use crate::{GenConfig, GeneratedCode, Result};
 use forgedb_parser::Schema;
 use proc_macro2::TokenStream;
@@ -57,6 +58,7 @@ impl ApiGenerator {
         tokens.extend(header);
 
         // Imports
+        let inline_str_import = RustGenerator::inline_str_import(schema);
         let imports = quote! {
             #![allow(dead_code, unused_imports)]
 
@@ -74,7 +76,11 @@ impl ApiGenerator {
                 routing::{delete, get, post, put},
                 Router,
             };
-            use forgedb_types::Uuid;
+            // #254: a `+timestamp` identity is a legal primary key, so the path
+            // param can be a `Timestamp` — it round-trips through a URL segment as
+            // RFC 3339 by construction (res 3).
+            #inline_str_import
+            use forgedb_types::{Timestamp, Uuid};
             use serde_json::json;
             use std::collections::HashMap;
             use std::sync::Arc;
@@ -126,7 +132,7 @@ impl ApiGenerator {
 
         // Generate handler functions for each model
         for model in &schema.models {
-            let handler_tokens = Self::generate_handlers(model)?;
+            let handler_tokens = Self::generate_handlers(schema, model)?;
             tokens.extend(handler_tokens);
         }
 
@@ -140,7 +146,7 @@ impl ApiGenerator {
         // B): reuses the per-model closed-set filter defined above, so it must be
         // emitted after the subscription handlers.
         for model in &schema.models {
-            tokens.extend(Self::generate_live_query(model));
+            tokens.extend(Self::generate_live_query(schema, model));
         }
 
         // Generate the durable replication WS endpoint (#82 Direction C): a single
@@ -176,33 +182,31 @@ impl ApiGenerator {
     /// identity type).  UUID PKs parse as `Uuid`; integer PKs as `u64` / `u32` /
     /// `i64` / `i32` so the generated `get` handler passes the right key type to
     /// storage.
-    fn id_parse_type(model: &forgedb_parser::Model) -> TokenStream {
-        match model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
-            Some(f) => match &f.field_type {
-                forgedb_parser::FieldType::U32 => quote! { u32 },
-                forgedb_parser::FieldType::U64 => quote! { u64 },
-                forgedb_parser::FieldType::I32 => quote! { i32 },
-                forgedb_parser::FieldType::I64 => quote! { i64 },
-                forgedb_parser::FieldType::Uuid => quote! { Uuid },
-                _ => quote! { Uuid },
-            },
-            None => quote! { Uuid },
-        }
+    fn id_parse_type(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
+        // #252 closed the `_ => quote! { Uuid }` fall-through this used to end in
+        // — by DELETING the duplicate match, not by adding one more arm.
+        //
+        // The fall-through had been here since 9a54319 (2026-07-06) and made every
+        // non-integer, non-uuid identity generate an `api.rs` that does not
+        // compile: a bare `string` identity produced 32 errors of one class. It
+        // was also blind to a relation identity (`id: *Customer` matched `_`), so
+        // an integer-keyed parent's child parsed its own path segment as a uuid.
+        // Both are the `is_uuid_pk` shape #265 named: a generator that falls
+        // through instead of failing turns a compile error into a silent hole.
+        //
+        // The path segment must parse into exactly the type storage is keyed on,
+        // so there is no second definition of that type to keep in step —
+        // `RustGenerator::id_type_tokens` is it. Every type it yields carries
+        // `FromStr` (`Uuid`, the integers, `Timestamp` via #254's RFC 3339 parse,
+        // `InlineStr<N>` via #252), which is what axum's `Path<T>` extracts with.
+        RustGenerator::id_type_tokens(schema, model)
     }
 
     /// The field identifier used as a model's identity (`id`, or the first
     /// auto-generate field).  Used by the live-query handler (#62 Direction B) to
     /// key result-set membership by id.  Falls back to `id`.
     fn id_field_ident(model: &forgedb_parser::Model) -> proc_macro2::Ident {
-        match model
-            .fields
-            .iter()
-            .find(|f| f.name == "id" || f.auto_generate)
-        {
+        match model.identity_field() {
             Some(f) => format_ident!("{}", f.name),
             None => format_ident!("id"),
         }
@@ -314,9 +318,9 @@ impl ApiGenerator {
         (get_block, list_block)
     }
 
-    fn generate_handlers(model: &forgedb_parser::Model) -> Result<TokenStream> {
+    fn generate_handlers(schema: &Schema, model: &forgedb_parser::Model) -> Result<TokenStream> {
         let model_name = format_ident!("{}", model.name);
-        let id_type = Self::id_parse_type(model);
+        let id_type = Self::id_parse_type(schema, model);
         let storage_field = format_ident!("{}", Self::to_snake_case(&model.name));
         let (proj_get_block, proj_list_block) =
             Self::generate_projection_rest(model, &storage_field, &id_type);
@@ -345,84 +349,193 @@ impl ApiGenerator {
         let sort_fn = format_ident!("{}_apply_sort", Self::to_snake_case(&model.name));
         let filter_fn = format_ident!("{}_event_matches", Self::to_snake_case(&model.name));
         // #160: narrow scan filter/sort for the live list path (id-bearing models).
-        let has_id = crate::rust::RustGenerator::identity_field(model).is_some();
+        let has_id = model.identity_field().is_some();
         let id_field = Self::id_field_ident(model);
         let scan_matches_fn = format_ident!("__{}_scan_matches", Self::to_snake_case(&model.name));
-        let scan_matches_ref_fn =
-            format_ident!("__{}_scan_matches_ref", Self::to_snake_case(&model.name));
+        // #288: evaluated ONCE per request and read as a bool per row. See
+        // `generate_list_scan_helpers` for why the question is positive.
+        let is_unfiltered_fn =
+            format_ident!("__{}_is_unfiltered", Self::to_snake_case(&model.name));
         let scan_sort_fn = format_ident!("__{}_scan_sort", Self::to_snake_case(&model.name));
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         // The live list source+filter+sort+page-materialize.  For an id-bearing
-        // model this is the #160 narrow path: filter/sort a scan record (only the
-        // filterable/sortable columns), then full-materialize ONLY the page.  A
+        // model this is the #160 narrow path: filter/sort a narrow scan view (only
+        // the filterable/sortable columns), then full-materialize ONLY the page.  A
         // model with no id keeps the original full `all()` scan (it has no
         // `id_to_row`-driven narrow scan and cannot be mutated anyway).
-        // #160 (C): index pushdown — if the filter names an eligible indexed field,
-        // resolve candidates from that field's index (O(matches)) instead of
-        // scanning every row; else scan all narrow rows.  A parse failure falls
-        // back to the full scan (`unwrap_or_else`), so a match is never missed.
         //
-        // #224: the full-scan arms filter on the BORROWED scan view
-        // (`__scan_all_filtered`), so a row the filter rejects never allocates its
-        // strings — previously every live row was decoded into owned `String`s and
-        // then `retain`ed away.  The pushdown arm still filters owned rows: it
-        // resolves O(matches) candidates through the index and reads them
-        // individually (`__scan_row_at`), so there is no buffered span to borrow
-        // from and nothing to save.
+        // #160 (C): index pushdown — if the filter names an eligible indexed field,
+        // resolve candidate rows from that field's index (O(matches)) instead of
+        // scanning every row.  `__rows_by_*` returns `None` when the value does not
+        // parse, which falls through to the full scan, so a match is never missed.
+        //
+        // #228: the pushdown now selects *rows*, not rows-and-decode, so both paths
+        // go through the one scan scope and the pushdown arm gets the borrowed view
+        // (#224) it previously could not have — it read its candidates positionally
+        // and so held no buffered span to borrow from.
         let pushdown_fields = crate::rust::RustGenerator::scan_pushdown_fields(model);
-        let scan_source = if pushdown_fields.is_empty() {
-            quote! {
-                db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-            }
+        let row_selection = if pushdown_fields.is_empty() {
+            quote! { None }
         } else {
             let branches = pushdown_fields.iter().map(|f| {
                 let fname = &f.name;
-                let scan_by = format_ident!("__scan_by_{}", f.name);
+                let rows_by = format_ident!("__rows_by_{}", f.name);
                 quote! {
                     if let Some(__v) = params.get(#fname) {
-                        match db.#storage_field.#scan_by(__v) {
-                            Some(mut __c) => {
-                                __c.retain(|r| #scan_matches_fn(r, &params));
-                                __c
-                            }
-                            None => db.#storage_field
-                                .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params)),
-                        }
+                        db.#storage_field.#rows_by(__v)
                     }
                 }
             });
-            quote! {
-                #(#branches else)* {
-                    db.#storage_field.__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                }
+            quote! { #(#branches else)* { None } }
+        };
+        let page_ref_ident = format_ident!("{}PageRef", model.name);
+        // #226: the live, non-projected page — the whole list read, done inside the
+        // scan scope and returned as an already-serialized `Response`.
+        //
+        // Returning the response from inside the closure is what dissolves the
+        // higher-ranked-lifetime constraint the naive shape hits: the page views
+        // borrow the scan's buffers, so nothing that names their lifetime can leave
+        // the scope, but `Json(envelope).into_response()` produces an OWNED
+        // `Response`.  `__ListEnvelope` (`api.rs`, above) is already generic over the
+        // row type and holds `&'a [T]`, so it takes `&[PageRef<'_>]` unchanged — no
+        // `RawValue`, no string assembly, no envelope change.
+        //
+        // Replaces `__with_scan` + `__page_ids.filter_map(get)`, which re-read every
+        // page row through one positional `pread` per column — rows the scan had
+        // already decoded and dropped.  Measured at ~6.4 µs/row against the buffered
+        // scan's ~0.11 µs/row, i.e. 21.8% of the request at (10k rows, limit 50) and
+        // 91.8% at (1k rows, limit 1000).
+        //
+        // NOTE on the lost `filter_map` skip: `get(*__id)` returned `Option`, so a
+        // row deleted between the scan and the re-read was silently dropped from the
+        // page.  Under the read lock held here that is unreachable, and the buffered
+        // path has no second read to fail — `data.len()` is now exactly
+        // `min(limit, total - offset)`.  Not an observable change, and deliberately
+        // not reintroduced.
+        // The response shape, bound once and spliced into BOTH page calls (#281).
+        // Two splices are two independent closures — it captures only the `Copy`
+        // pagination scalars — so there is no borrow interaction between them, and
+        // the envelope keeps exactly one definition.
+        let page_envelope_closure = quote! {
+            |__total: usize, __page: &[super::#page_ref_ident<'_>]| {
+                (
+                    StatusCode::OK,
+                    Json(__ListEnvelope {
+                        data: __page,
+                        total: __total,
+                        limit: qp.pagination.limit,
+                        offset: qp.pagination.offset,
+                    }),
+                )
+                    .into_response()
             }
         };
-        let live_list_block = if has_id {
-            quote! {
-                let mut __scan_rows = #scan_source;
-                #scan_sort_fn(&mut __scan_rows, &qp.sort);
-                let total = __scan_rows.len();
-                let __page_ids: Vec<_> = qp.pagination
-                    .apply(&__scan_rows)
-                    .iter()
-                    .map(|r| r.#id_field)
-                    .collect();
-                // Full-materialize only the paginated page (or 404-skip a row that
-                // was deleted between the scan and here — the read lock makes that
-                // impossible, but `filter_map` is the honest primitive).
-                let page: Vec<super::#model_name> = __page_ids
-                    .iter()
-                    .filter_map(|__id| db.#storage_field.get(*__id))
-                    .collect();
+        let page_scope_return = quote! {
+            // #288: loop-invariant, so it is answered before the scan rather than on
+            // every scanned row. `__keep_all || matches(..)` is exactly equivalent to
+            // `matches(..)` — when no key names a filterable field, every `params.get`
+            // inside `matches` misses and it returns true for every record — so this
+            // is a pure evaluation-order change with no observable behaviour.
+            let __keep_all: bool = #is_unfiltered_fn(&params);
+            // #281: with nothing to filter and nothing to sort, the page was knowable
+            // from the live row set alone — `keep` accepts everything, `sort` reorders
+            // nothing, so `__refs[i].__slot == i` and the scan's full-table gather
+            // decodes every row only to throw all but `limit` of them away. Take the
+            // page-bounded gather instead. Same rows, same order, same `total`, same
+            // bytes; that equality is guarded, not assumed.
+            //
+            // `__sel` is deliberately BELOW this: index pushdown resolves only fields
+            // `is_filterable_field` admits, so a request that names none resolves no
+            // index and `#row_selection` would be pure waste on this path. Placing the
+            // branch first makes that structural rather than a comment.
+            if __keep_all && qp.sort.is_none() {
+                return db.#storage_field.__with_fast_page(
+                    qp.pagination.offset,
+                    qp.pagination.limit,
+                    #page_envelope_closure,
+                );
             }
-        } else {
+            let __sel: Option<Vec<usize>> = #row_selection;
+            return db.#storage_field.__with_page(
+                __sel,
+                |r| __keep_all || #scan_matches_fn(r, &params),
+                |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                    #scan_sort_fn(__scan, &qp.sort);
+                },
+                qp.pagination.offset,
+                qp.pagination.limit,
+                #page_envelope_closure,
+            );
+        };
+        // The OWNED narrow path (#160/#228), kept verbatim for the one live caller
+        // that still needs `Vec<Model>`: the `?projection=` arms field-copy the page
+        // rows into the projection struct, so they cannot take a borrowed view.
+        let owned_narrow_block = quote! {
+            let __sel: Option<Vec<usize>> = #row_selection;
+            // #228: filter, sort, count and page all run INSIDE the scan scope,
+            // on the borrowed view.  Only `(total, ids)` crosses the boundary —
+            // no scan row is ever materialized, so the strings of the rows that
+            // the page does not contain are never copied out of the buffer.
+            // #288: same hoist as the page scope — `?projection=` filters per row too.
+            let __keep_all: bool = #is_unfiltered_fn(&params);
+            let (total, __page_ids) = db.#storage_field.__with_scan(
+                __sel,
+                |r| __keep_all || #scan_matches_fn(r, &params),
+                |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                    #scan_sort_fn(__scan, &qp.sort);
+                    let __total = __scan.len();
+                    let __ids: Vec<_> = qp.pagination
+                        .apply(__scan)
+                        .iter()
+                        .map(|r| r.#id_field)
+                        .collect();
+                    (__total, __ids)
+                },
+            );
+            // Full-materialize only the paginated page (or 404-skip a row that
+            // was deleted between the scan and here — the read lock makes that
+            // impossible, but `filter_map` is the honest primitive).
+            let page: Vec<super::#model_name> = __page_ids
+                .iter()
+                .filter_map(|__id| db.#storage_field.get(*__id))
+                .collect();
+        };
+        // The `None` (live) arm of the `as_of` match, as a whole expression.
+        //
+        // Three shapes, and which one is emitted is a property of the model, not a
+        // runtime branch — a model with no `@projection` has no owned caller left, so
+        // emitting the owned block for it would be dead code AFTER a `return`, i.e. an
+        // `unreachable_code` warning in the user's crate.
+        let live_list_arm = if !has_id {
+            // No identity ⇒ no `id_to_row`, so no narrow scan and no page scope
+            // either.  Unchanged full `all()` path.
             quote! {
-                let mut rows: Vec<super::#model_name> = db.#storage_field.all()
-                    .into_iter()
-                    .filter(|r| #filter_fn(r, &params))
-                    .collect();
-                #sort_fn(&mut rows, &qp.sort);
-                let total = rows.len();
-                let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                {
+                    let mut rows: Vec<super::#model_name> = db.#storage_field.all()
+                        .into_iter()
+                        .filter(|r| #filter_fn(r, &params))
+                        .collect();
+                    #sort_fn(&mut rows, &qp.sort);
+                    let total = rows.len();
+                    let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
+                    (page, total)
+                }
+            }
+        } else if model.projections.is_empty() {
+            // The common case: the borrowed page is the only live path, and this arm
+            // diverges (`!` coerces to the match's `(Vec<Model>, usize)`).
+            quote! { { #page_scope_return } }
+        } else {
+            // `?projection=` needs owned rows to field-copy from, so it keeps the
+            // #160/#228 path; everything else takes the borrowed page.
+            quote! {
+                {
+                    if params.get("projection").is_none() {
+                        #page_scope_return
+                    }
+                    #owned_narrow_block
+                    (page, total)
+                }
             }
         };
 
@@ -493,10 +606,15 @@ impl ApiGenerator {
                     None => None,
                 };
                 let db = db.read().await;
-                // Materialize `page` (Vec<Model>) + `total`.  Two paths:
-                //  - live (no `as_of`): the #160 narrow path — filter/sort a scan
-                //    record (only filterable/sortable columns), full-materialize
-                //    ONLY the paginated page.
+                // Materialize `page` (Vec<Model>) + `total`.  Paths:
+                //  - live (no `as_of`), no `?projection=`: #226 — filter/sort the
+                //    #228 borrowed scan, then serialize the page's rows straight out
+                //    of a second buffered gather.  Returns the finished `Response`
+                //    from inside the scan scope; nothing is materialized at all.
+                //  - live with `?projection=`: the #160 narrow path — filter/sort a
+                //    scan record (only filterable/sortable columns), full-materialize
+                //    ONLY the paginated page, because the projection arms field-copy
+                //    owned rows.
                 //  - `as_of` snapshot: the original full-record path over
                 //    `all_at(&Snapshot)` (a rarer inspector read; #159 already made
                 //    its newest-version resolution sub-linear).
@@ -513,10 +631,7 @@ impl ApiGenerator {
                         let page: Vec<super::#model_name> = qp.pagination.apply(&rows).to_vec();
                         (page, total)
                     }
-                    None => {
-                        #live_list_block
-                        (page, total)
-                    }
+                    None => #live_list_arm,
                 };
                 #proj_list_block
                 // #229: borrow the page into the envelope — no intermediate
@@ -772,44 +887,96 @@ impl ApiGenerator {
     }
 
     /// #160: the narrow list helpers — `__<model>_scan_matches` and
-    /// `__<model>_scan_sort` over the internal `<Model>ScanRow` (id +
+    /// `__<model>_scan_sort` over the internal borrowed `<Model>ScanRef` (id +
     /// filterable/sortable columns).  Emitted from the SAME `generate_filter_check`
     /// per-field checks and `list_sort_arms` as the full-record `_event_matches` /
     /// `_apply_sort`, so filtering + ordering are byte-identical — only the operand
     /// type is narrower.  Lets the list endpoint filter/sort without decoding every
     /// column, then full-materialize only the paginated page.  Empty for a model
     /// with no id field (no list to optimize).
+    ///
+    /// #228 deleted the owned twin of both.  #224 had introduced a second,
+    /// borrowed-operand filter alongside the owned one because the index-pushdown
+    /// arm still worked on owned rows; unifying that arm on the scan scope left the
+    /// owned filter with no caller, and the sort's operand became the borrowed view.
+    /// Neither is a semantic change — `&str` and `Option<&str>` are both `Ord`, so
+    /// the emitted arms are unchanged.
     fn generate_list_scan_helpers(model: &forgedb_parser::Model) -> TokenStream {
-        if crate::rust::RustGenerator::identity_field(model).is_none() {
+        if model.identity_field().is_none() {
             return quote! {};
         }
-        let scan_ident = format_ident!("{}ScanRow", model.name);
         let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let snake = Self::to_snake_case(&model.name);
         let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
-        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
         let scan_sort_fn = format_ident!("__{}_scan_sort", snake);
-        let field_checks: Vec<_> = model
+        // #224: the borrowed-view filter comes from the SAME emitter as
+        // `_event_matches`, not a second predicate — same param keys, same parse,
+        // same semantics.  Only the nullable-string comparison differs, because
+        // `Option`'s `PartialEq` is homogeneous (see `generate_filter_check`).
+        let filterable: Vec<_> = model
             .fields
             .iter()
             .filter(|f| Self::is_filterable_field(&f.field_type))
-            .map(|f| Self::generate_filter_check(f, false))
             .collect();
-        // #224: the borrowed-view filter comes from the SAME emitter, not a second
-        // predicate — same param keys, same parse, same semantics.  Only the
-        // nullable-string comparison differs, because `Option`'s `PartialEq` is
-        // homogeneous (see `generate_filter_check`).
-        let field_checks_ref: Vec<_> = model
-            .fields
+        let field_checks: Vec<_> = filterable
             .iter()
-            .filter(|f| Self::is_filterable_field(&f.field_type))
             .map(|f| Self::generate_filter_check(f, true))
             .collect();
+        // #288: the same iteration, asked the loop-INVARIANT question. Deriving both
+        // from one list is what makes it impossible for the predicate and the checks
+        // to disagree about which names are filterable — they key on the same
+        // `field.name`, so "no key names a filterable field" is exactly "every
+        // `params.get` below will miss".
+        let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
+        let unfiltered_checks: Vec<_> = filterable
+            .iter()
+            .map(|f| {
+                let fname_str = &f.name;
+                quote! { if params.contains_key(#fname_str) { return false; } }
+            })
+            .collect();
+        // A model with ZERO filterable fields is legal — a pure junction whose
+        // identity is a required FK has none (`is_filterable_field` is false for every
+        // relation and for `json`), yet the scan field set pushes the identity
+        // unconditionally. Its predicate is a body-less `true`, so the parameter would
+        // be unused: an `unused_variables` warning in the USER's crate, which
+        // `database.rs`'s `allow` header does not and should not cover.
+        let unfiltered_param = if unfiltered_checks.is_empty() {
+            format_ident!("_params")
+        } else {
+            format_ident!("params")
+        };
         let arms = Self::list_sort_arms(model);
         quote! {
-            /// Narrow closed-set filter over the scan record (#160) — same per-field
-            /// checks as `_event_matches`, only the operand type is narrower.
-            fn #scan_matches_fn(record: &super::#scan_ident, params: &HashMap<String, String>) -> bool {
+            /// Is this request unfiltered — does NO query key name a filterable field
+            /// of this model (#288)?
+            ///
+            /// Hoisted out of the per-row loop by every caller, because it is a
+            /// property of the query string and not of the row. `_scan_matches` can
+            /// only short-circuit on `params.is_empty()`, and `?limit=50` defeats that
+            /// while naming no filterable field at all — so an unfiltered request was
+            /// running one `HashMap` lookup per filterable field per SCANNED ROW, all
+            /// of them guaranteed to miss. Measured at ~50 ns/row, i.e. 502 µs of a
+            /// 850 µs request over 10k rows.
+            ///
+            /// The question is POSITIVE — "does any key name a field of this model?" —
+            /// deliberately. A negative exclusion list (`limit`/`offset`/`sort`/
+            /// `order`/`as_of`) would need maintaining, and would be wrong: a model may
+            /// legally declare a field named `limit`, and for that model `?limit=3`
+            /// genuinely is a filter.
+            fn #is_unfiltered_fn(#unfiltered_param: &HashMap<String, String>) -> bool {
+                #(#unfiltered_checks)*
+                true
+            }
+
+            /// Narrow closed-set filter over the BORROWED scan view (#160/#224), so
+            /// a row is accepted or rejected before its strings are ever copied out
+            /// of the buffered column.  Same per-field checks as `_event_matches`,
+            /// only the operand type is narrower.
+            fn #scan_matches_fn(
+                record: &super::#scan_ref_ident<'_>,
+                params: &HashMap<String, String>,
+            ) -> bool {
                 if params.is_empty() {
                     return true;
                 }
@@ -817,25 +984,12 @@ impl ApiGenerator {
                 true
             }
 
-            /// The same filter over the BORROWED scan view (#224), so a row can be
-            /// accepted or rejected before its strings are ever copied out of the
-            /// buffered column.  Emitted from the identical per-field checks as
-            /// the owned filter above — one predicate, two operand views.
-            fn #scan_matches_ref_fn(
-                record: &super::#scan_ref_ident<'_>,
-                params: &HashMap<String, String>,
-            ) -> bool {
-                if params.is_empty() {
-                    return true;
-                }
-                #(#field_checks_ref)*
-                true
-            }
-
-            /// Narrow list sort over the scan record (#160) — same arms as
-            /// `_apply_sort`.
+            /// Narrow list sort over the borrowed scan view (#160/#228) — same arms
+            /// as `_apply_sort`.  Runs inside the scan scope, on views that borrow
+            /// the buffered columns: `&str` and `Option<&str>` are `Ord`, so
+            /// comparing them is comparing the buffer's bytes in place.
             fn #scan_sort_fn(
-                rows: &mut Vec<super::#scan_ident>,
+                rows: &mut Vec<super::#scan_ref_ident<'_>>,
                 sort: &Option<forgedb_query_params::Sort>,
             ) {
                 let Some(sort) = sort.as_ref() else { return; };
@@ -876,15 +1030,18 @@ impl ApiGenerator {
             | FieldType::F64
             | FieldType::Bool
             | FieldType::Uuid
-            | FieldType::Timestamp
+            | FieldType::Timestamp(_)
             | FieldType::String
+            // #238: an inline `string(N)` is a `String` in the record — same
+            // `Ord`, same comparisons, same wire form. Only its storage differs.
+            | FieldType::StringN { .. }
             // decimal is `Ord`, so it is filterable + sortable (sort uses the
             // `Ord::cmp` branch, not float `partial_cmp`).
             | FieldType::Decimal
             // enum derives `Ord`, so it is filterable + sortable via `Ord::cmp`
             // (sort orders by declaration order — the variant discriminant).
             | FieldType::Enum(_)
-            | FieldType::Char(_) => true,
+            | FieldType::Bytes(_) => true,
             FieldType::Nullable(inner) => Self::is_filterable_field(inner),
             _ => false,
         }
@@ -927,7 +1084,7 @@ impl ApiGenerator {
         // char(N) is a fixed `[u8; N]`: compare the param's bytes, zero-padded to
         // N (a param longer than N can never match).  Handled inline because it
         // parses into a buffer rather than a single `T`.
-        if let FieldType::Char(n) = base {
+        if let FieldType::Bytes(n) = base {
             let cmp = if nullable {
                 quote! { record.#fname == Some(__buf) }
             } else {
@@ -957,11 +1114,15 @@ impl ApiGenerator {
             FieldType::I64 => quote! { want.parse::<i64>().ok() },
             FieldType::F64 => quote! { want.parse::<f64>().ok() },
             FieldType::Bool => quote! { want.parse::<bool>().ok() },
-            FieldType::String => quote! { Some(want.clone()) },
+            FieldType::String | FieldType::StringN { .. } => quote! { Some(want.clone()) },
             FieldType::Uuid => quote! { want.parse::<Uuid>().ok() },
             FieldType::Decimal => quote! { want.parse::<rust_decimal::Decimal>().ok() },
-            FieldType::Timestamp => {
-                quote! { want.parse::<i64>().ok().map(forgedb_types::Timestamp::from_seconds) }
+            // #254: the wire form is RFC 3339, so a filter param is parsed the same
+            // way the body is.  Parsing a bare integer here would have silently
+            // meant *seconds* while storage moved to micros — a filter that
+            // matched nothing rather than failing.
+            FieldType::Timestamp(_) => {
+                quote! { want.parse::<forgedb_types::Timestamp>().ok() }
             }
             FieldType::Enum(name) => {
                 let en = format_ident!("{}", name);
@@ -978,7 +1139,7 @@ impl ApiGenerator {
         };
 
         let cmp = if nullable {
-            if borrowed && matches!(base, FieldType::String) {
+            if borrowed && matches!(base, FieldType::String | FieldType::StringN { .. }) {
                 quote! { record.#fname == Some(__w.as_str()) }
             } else {
                 quote! { record.#fname == Some(__w) }
@@ -1124,9 +1285,18 @@ impl ApiGenerator {
             #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| #handle_fn(socket, db, params))
             }
 
@@ -1201,9 +1371,18 @@ impl ApiGenerator {
             /// of the retained log).  Tenant-scoped by the router's auth guard.
             async fn __replicate(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| __handle_replicate(socket, db, params))
             }
 
@@ -1281,7 +1460,7 @@ impl ApiGenerator {
     /// Generate the live-query WebSocket handler for a model (#62 Direction B).
     ///
     /// A stateful, removal-aware result-set subscription.  On connect it runs a
-    /// **generated closed-set query** — the narrow `db.<model>.__scan_all()`
+    /// **generated closed-set query** — the narrow `db.<model>.__with_scan(..)`
     /// filtered by the generated per-model `__<model>_scan_matches` closed-set
     /// filter (the SAME per-field checks as `<model>_event_matches` / the REST
     /// `list` endpoint, only the operand is the narrow scan row — NO second
@@ -1303,7 +1482,7 @@ impl ApiGenerator {
     /// that match the filter (not every column of every row) — but a broad filter
     /// still materializes its whole matching set.  `Updated` detection uses a typed
     /// per-field comparison (`<model>_record_changed`, #84).
-    fn generate_live_query(model: &forgedb_parser::Model) -> TokenStream {
+    fn generate_live_query(schema: &Schema, model: &forgedb_parser::Model) -> TokenStream {
         let model_name = format_ident!("{}", model.name);
         let delta_name = format_ident!("{}LiveDelta", model.name);
         let snake = Self::to_snake_case(&model.name);
@@ -1314,21 +1493,29 @@ impl ApiGenerator {
         // `generate_subscription` — reused here so there is one change-detection
         // body per model, never a second (stringify) path.
         let changed_fn = format_ident!("{}_record_changed", snake);
-        // #160: the narrow closed-set filter over `<Model>ScanRow` (id +
-        // filterable columns), co-emitted with the list path. The live-query
+        // #160: the narrow closed-set filter over the borrowed `<Model>ScanRef` (id
+        // + filterable columns), co-emitted with the list path. The live-query
         // re-evaluation filters the CHEAP narrow scan and full-materializes only
         // the matching rows, instead of full-decoding every column of every row.
         // #224: it filters the BORROWED scan view, so a re-run rejects non-matching
         // rows before their strings are copied — the re-run happens on every change
         // to the model, so this is the hottest of the three call sites.
-        let scan_matches_ref_fn = format_ident!("__{}_scan_matches_ref", snake);
+        // #228: and a *matching* row no longer materializes either — the scope hands
+        // back only ids, which are then read through `get`.
+        let scan_matches_fn = format_ident!("__{}_scan_matches", snake);
+        // #288: hoisted ONCE for the whole subscription, not per re-run and not per
+        // row. `params` is fixed for the life of the socket, so the question it
+        // answers cannot change — and this is the site where the per-row cost was
+        // paid repeatedly, on every changefeed event for the model.
+        let is_unfiltered_fn = format_ident!("__{}_is_unfiltered", snake);
+        let scan_ref_ident = format_ident!("{}ScanRef", model.name);
         let id_field = Self::id_field_ident(model);
-        let id_type = Self::id_parse_type(model);
+        let id_type = Self::id_parse_type(schema, model);
         let model_name_str = &model.name;
 
         let subscribe_doc = format!(
             "Live-query WebSocket subscription for `{}` (#62 Direction B). Runs the \
-             generated closed-set query (narrow `__scan_all` + `__{}_scan_matches`, \
+             generated closed-set query (narrow `__with_scan` + `__{}_scan_matches`, \
              materializing only matches — #160), streams an initial \
              `{}LiveDelta::Init`, then pushes removal-aware `Added` / `Updated` / \
              `Removed` deltas as the matching set changes.",
@@ -1339,9 +1526,18 @@ impl ApiGenerator {
             #[doc = #subscribe_doc]
             async fn #subscribe_fn(
                 Query(params): Query<HashMap<String, String>>,
+                headers: axum::http::HeaderMap,
+                axum::Extension(allowed): axum::Extension<AllowedOrigins>,
                 ws: WebSocketUpgrade,
                 State(db): State<Arc<RwLock<super::Database>>>,
             ) -> Response {
+                // #140: browsers neither preflight a WebSocket handshake nor
+                // apply CORS to it, so the CorsLayer does not cover this route —
+                // the handler has to check `Origin` itself. Refuse before
+                // `on_upgrade`, so a disallowed page never gets a socket.
+                if !allowed.permits(__origin_of(&headers)) {
+                    return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+                }
                 ws.on_upgrade(move |socket| #handle_fn(socket, db, params))
             }
 
@@ -1350,6 +1546,11 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 params: HashMap<String, String>,
             ) {
+                // #288: `params` is fixed for the life of this socket, so whether the
+                // query filters at all is answered once here rather than on every row
+                // of every re-run.
+                let __keep_all: bool = #is_unfiltered_fn(&params);
+
                 // Coarse change signal: take a feed receiver (Clone shares the
                 // channel), then release the DB lock.  We consult only event.model.
                 let mut rx = { db.read().await.changefeed.subscribe() };
@@ -1363,10 +1564,15 @@ impl ApiGenerator {
                 {
                     let rows: Vec<super::#model_name> = {
                         let g = db.read().await;
-                        g.#storage_field
-                            .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                            .into_iter()
-                            .filter_map(|r| g.#storage_field.get(r.#id_field))
+                        let __ids = g.#storage_field.__with_scan(
+                            None,
+                            |r| __keep_all || #scan_matches_fn(r, &params),
+                            |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                                __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
+                            },
+                        );
+                        __ids.into_iter()
+                            .filter_map(|__id| g.#storage_field.get(__id))
                             .collect()
                     };
                     for r in &rows {
@@ -1393,10 +1599,15 @@ impl ApiGenerator {
                             // narrow scan + filter, full-materialize only matches).
                             let current: Vec<super::#model_name> = {
                                 let g = db.read().await;
-                                g.#storage_field
-                                    .__scan_all_filtered(|r| #scan_matches_ref_fn(r, &params))
-                                    .into_iter()
-                                    .filter_map(|r| g.#storage_field.get(r.#id_field))
+                                let __ids = g.#storage_field.__with_scan(
+                                    None,
+                                    |r| __keep_all || #scan_matches_fn(r, &params),
+                                    |__scan: &mut Vec<super::#scan_ref_ident<'_>>| {
+                                        __scan.iter().map(|r| r.#id_field).collect::<Vec<_>>()
+                                    },
+                                );
+                                __ids.into_iter()
+                                    .filter_map(|__id| g.#storage_field.get(__id))
                                     .collect()
                             };
 
@@ -1677,10 +1888,173 @@ impl ApiGenerator {
             /// server-side half of Phase 5 observability; the scaffold
             /// `main.rs` installs the subscriber.
             pub fn create_router(db: Arc<RwLock<super::Database>>) -> Router {
-                __data_routes()
+                create_router_with_options(db, HttpOptions::default())
+            }
+
+            /// Process-start HTTP options (#140, epic #126 Tier C).
+            ///
+            /// Deployment identity, never baked at generate time: the same generated
+            /// binary is promoted to localhost, staging, and production with
+            /// different allowed origins, so baking them would make one build
+            /// undeployable to two environments.
+            #[derive(Debug, Clone, Default)]
+            pub struct HttpOptions {
+                /// Origins allowed to call this API cross-origin.
+                ///
+                /// `None` — the default — emits **no** `CorsLayer` and applies **no**
+                /// WebSocket origin check, which is byte-identical to the behavior
+                /// before #140. `None` is not the same as `Some(vec![])`: an empty
+                /// `CorsLayer` still answers preflight `OPTIONS` with 200, whereas
+                /// these routes answer 405.
+                pub allowed_origins: Option<Vec<String>>,
+            }
+
+            /// Parse a comma-separated origin list, as read from
+            /// `FORGEDB_CORS_ORIGINS`.
+            ///
+            /// Empty or all-whitespace input is `Ok(None)` — "not configured", not an
+            /// error. Entries are trimmed. Returns `Err` for an entry that is not a
+            /// valid header value, and for `*` mixed with explicit origins: that
+            /// combination has two defensible readings and picking one silently is a
+            /// security-relevant coin flip.
+            pub fn parse_origins(raw: &str) -> Result<Option<Vec<String>>, String> {
+                let parts: Vec<String> = raw
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                if parts.is_empty() {
+                    return Ok(None);
+                }
+                let wildcards = parts.iter().filter(|p| p.as_str() == "*").count();
+                if wildcards > 0 && parts.len() > 1 {
+                    return Err(
+                        "`*` cannot be combined with explicit origins — use either a \
+                         single `*` or an explicit list"
+                            .to_string(),
+                    );
+                }
+                for p in &parts {
+                    if axum::http::HeaderValue::from_str(p).is_err() {
+                        return Err(format!("`{p}` is not a valid origin header value"));
+                    }
+                }
+                Ok(Some(parts))
+            }
+
+            /// The origin allow-list as the WebSocket handlers see it.
+            ///
+            /// Always present in request extensions — `AllowedOrigins(None)` when
+            /// unconfigured — so the handlers can take it unconditionally and the
+            /// "unconfigured means accept" branch lives in exactly one place.
+            #[derive(Debug, Clone)]
+            pub struct AllowedOrigins(pub Option<Arc<Vec<String>>>);
+
+            impl AllowedOrigins {
+                /// Whether a handshake carrying `origin` may proceed.
+                ///
+                /// Unconfigured accepts everything (today's behavior, preserved). An
+                /// absent `Origin` header is accepted even when configured: native
+                /// `/replicate` followers, CLI tools and tests send none, rejecting
+                /// them would break them, and it buys nothing — an attacker who
+                /// controls the client controls the header. Origin checking defends
+                /// the *browser* threat model, where the browser sets the header and
+                /// the page cannot forge it.
+                pub fn permits(&self, origin: Option<&str>) -> bool {
+                    match (&self.0, origin) {
+                        (None, _) => true,
+                        (Some(_), None) => true,
+                        (Some(list), Some(o)) => {
+                            list.iter().any(|a| a == "*" || a == o)
+                        }
+                    }
+                }
+            }
+
+            /// Read the `Origin` header, if the request carries a valid one.
+            fn __origin_of(headers: &axum::http::HeaderMap) -> Option<&str> {
+                headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())
+            }
+
+            /// Build the CORS layer for `origins`, or `None` when unconfigured.
+            ///
+            /// Methods are exactly the set the generated router registers; there is no
+            /// `PATCH` route. Headers are `content-type` (JSON bodies) and
+            /// `authorization` (bearer tokens when auth is on).
+            ///
+            /// **No `allow_credentials`.** ForgeDB auth is a bearer token in a header,
+            /// not a cookie, so credentials mode is unnecessary — and because nothing
+            /// is auto-attached by the browser, an explicit `*` does not create a CSRF
+            /// vector here. It also avoids tower-http's wildcard-plus-credentials
+            /// conflict. Anyone later adding cookie auth must revisit this.
+            fn __cors_layer(origins: &Option<Arc<Vec<String>>>) -> Option<tower_http::cors::CorsLayer> {
+                let list = origins.as_ref()?;
+                let methods = [
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::PUT,
+                    axum::http::Method::DELETE,
+                ];
+                let headers = [
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ];
+                let layer = tower_http::cors::CorsLayer::new()
+                    .allow_methods(methods)
+                    .allow_headers(headers);
+                if list.iter().any(|o| o == "*") {
+                    return Some(layer.allow_origin(tower_http::cors::Any));
+                }
+                let parsed: Vec<axum::http::HeaderValue> = list
+                    .iter()
+                    .filter_map(|o| axum::http::HeaderValue::from_str(o).ok())
+                    .collect();
+                Some(layer.allow_origin(parsed))
+            }
+
+            /// Apply the origin-dependent layers to an otherwise-finished router.
+            ///
+            /// The `Extension` is applied unconditionally so the WS handlers can take
+            /// it without an optional extractor; the `CorsLayer` only when configured,
+            /// because an empty one would change `OPTIONS` from 405 to 200 for every
+            /// existing deployment.
+            ///
+            /// Layer order is inverted from reading order — a layer applied later
+            /// wraps outer — so this runs **after** the `TraceLayer`, putting CORS
+            /// outermost. That is load-bearing: browsers send preflight `OPTIONS`
+            /// without an `Authorization` header, so a CORS layer inside the tenant
+            /// guard would have its preflight rejected 401 and the browser would
+            /// report an opaque CORS failure. Outermost also means error responses
+            /// (401/403/422) carry the CORS headers the browser needs in order to let
+            /// the page read the status.
+            fn __apply_origin_layers(router: Router<Arc<RwLock<super::Database>>>, opts: HttpOptions)
+                -> Router<Arc<RwLock<super::Database>>>
+            {
+                let origins = opts.allowed_origins.map(Arc::new);
+                let cors = __cors_layer(&origins);
+                let router = router.layer(axum::Extension(AllowedOrigins(origins)));
+                match cors {
+                    Some(layer) => router.layer(layer),
+                    None => router,
+                }
+            }
+
+            /// Create the API router with process-start [`HttpOptions`] (#140).
+            ///
+            /// `create_router` is this with the defaults, kept as a separate function
+            /// with its original signature because the scaffold writes `src/main.rs`
+            /// **once** at `forgedb init` and never regenerates it — changing the
+            /// arity of the existing constructors would break every existing project
+            /// the next time it ran `forgedb generate`.
+            pub fn create_router_with_options(
+                db: Arc<RwLock<super::Database>>,
+                opts: HttpOptions,
+            ) -> Router {
+                let router = __data_routes()
                     .merge(__ops_routes())
-                    .layer(tower_http::trace::TraceLayer::new_for_http())
-                    .with_state(db)
+                    .layer(tower_http::trace::TraceLayer::new_for_http());
+                __apply_origin_layers(router, opts).with_state(db)
             }
 
             /// Create the API router with the tenant-auth guard layered over the
@@ -1705,14 +2079,27 @@ impl ApiGenerator {
                 db: Arc<RwLock<super::Database>>,
                 auth: Arc<forgedb_auth::Authenticator>,
             ) -> Router {
+                create_router_with_auth_and_options(db, auth, HttpOptions::default())
+            }
+
+            /// The tenant-auth router with process-start [`HttpOptions`] (#140).
+            ///
+            /// The CORS layer is applied **outside** the tenant guard — see
+            /// `__apply_origin_layers` for why that placement is load-bearing rather
+            /// than incidental.
+            pub fn create_router_with_auth_and_options(
+                db: Arc<RwLock<super::Database>>,
+                auth: Arc<forgedb_auth::Authenticator>,
+                opts: HttpOptions,
+            ) -> Router {
                 let guarded = __data_routes().layer(axum::middleware::from_fn_with_state(
                     auth,
                     forgedb_auth::axum_mw::require_tenant,
                 ));
-                guarded
+                let router = guarded
                     .merge(__ops_routes())
-                    .layer(tower_http::trace::TraceLayer::new_for_http())
-                    .with_state(db)
+                    .layer(tower_http::trace::TraceLayer::new_for_http());
+                __apply_origin_layers(router, opts).with_state(db)
             }
         };
 

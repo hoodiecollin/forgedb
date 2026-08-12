@@ -20,14 +20,19 @@ origin→destination version range — not a runtime interpreter reading your sc
 
 ## The version interlock
 
-Every generated app bakes in an `EXPECTED_FORMAT_VERSION`, derived from your migration
-lineage. On open it reads one opaque integer (`format_version`) from each data dir manifest
-and **refuses a mismatch** rather than mis-decoding stale bytes. This is fail-fast by design:
-a regenerated app will not silently read a not-yet-migrated dir, and the transformer will not
-apply the wrong range to a dir. The version is the only cross-schema handshake — it never
+Every generated app bakes in an `EXPECTED_SCHEMA_VERSION`, derived from your migration
+lineage. On open it reads one opaque integer (on-disk key `format_version`) from each data dir
+manifest and **refuses a mismatch** rather than mis-decoding stale bytes. This is fail-fast by
+design: a regenerated app will not silently read a not-yet-migrated dir, and the transformer will
+not apply the wrong range to a dir. The version is the only cross-schema handshake — it never
 reads column names or types to "self-heal".
 
 A fresh database baselines at `format_version = 1`; each recorded migration bumps it by one.
+
+**There are two counters, and they are orthogonal.** The one above is *the app's* schema-migration
+serial. Beside it sits `engine_version`, *ForgeDB's* own byte-format generation — see
+[the engine-format hop](#the-other-axis--forgedb-changed-not-your-schema) below. Everything in the
+next two sections is about the app's serial.
 
 ---
 
@@ -79,7 +84,7 @@ forgedb migrate create "qty to string" --auto --schema schema.forge
 #    receives each row as JSON AFTER the automatic (rename/drop/additive) ops and
 #    returns it reshaped for the next version. Fill in every TODO.
 
-# 3. Regenerate your app (its EXPECTED_FORMAT_VERSION advances to the new version):
+# 3. Regenerate your app (its EXPECTED_SCHEMA_VERSION advances to the new version):
 forgedb generate
 
 # 4. With the app STOPPED, migrate the data in one step:
@@ -136,6 +141,49 @@ or across many tenants.
 
 ---
 
+## The other axis — ForgeDB changed, not your schema
+
+Everything above replays *your* `migrations/` lineage. A second, orthogonal counter tracks
+**ForgeDB's own on-disk byte-format generation** (`engine_version`), and it is owned by the
+released version line rather than by your app.
+
+The distinction is the whole point, because the two failures have different remedies:
+
+| mismatch | what happened | remedy |
+|---|---|---|
+| `format_version` (schema serial) | *your schema* changed since the dir was written | `forgedb migrate up` — replay your lineage |
+| `engine_version` | *ForgeDB* changed its byte format; your schema is fine | `forgedb migrate engine` |
+
+Conflating them would send you to regenerate a schema that is already correct. An engine bump
+changes no `.forge`, so it produces no lineage hop at all — `forgedb migrate up` would run nothing.
+
+```bash
+# with the app STOPPED
+forgedb migrate engine --src ./data --dest ./data-gen2
+```
+
+- `--dest` **must not already exist** (or must be empty) — it is materialized, not written into.
+- `--src` is **left untouched**; it is your rollback. Nothing migrates in place.
+- The hop crate is generated (default `migrations/engine`) and built with `cargo build --release`
+  as part of the command. Generated, not schema-blind, on purpose: a nullable, arrayed, or
+  struct-nested timestamp is an opaque fixed-byte blob no schema-agnostic column pass can find.
+- Already at the current generation → no-op. Stamped *newer* than your CLI → refused, telling you
+  to upgrade the CLI rather than migrate backwards.
+
+Generations are assigned in merge order, not at design time, so two format changes in one cycle
+cannot both claim the same number:
+
+| gen | change |
+|---|---|
+| 1 | baseline — every dir written before the counter existed |
+| 2 | timestamp values are microseconds, not seconds (#254, v0.4.0) |
+
+The guard compares one integer and has no opinion about your schema, so **every** dir at an older
+generation is refused — including one whose models contain no `timestamp` at all. Per-release
+upgrade steps live in [UPGRADING.md](UPGRADING.md).
+
+---
+
 ## Command reference
 
 | Command | Purpose |
@@ -148,6 +196,7 @@ or across many tenants.
 | `forgedb migrate build --from F --to T [--output <dir>]` | (Lower-level) generate + compile the transformer only. |
 | `forgedb migrate run --src <data> --dest <migrated> [--bin-dir <dir>]` | (Lower-level) run an already-built transformer. |
 | `forgedb generate transform --from F --to T` | (Lower-level) emit the transformer crate without compiling. |
+| `forgedb migrate engine --src <data> --dest <new-dir>` | Carry a dir across a ForgeDB **engine** byte-format generation (orthogonal to the schema serial). |
 
 ---
 

@@ -14,7 +14,7 @@ A compact HR org-chart and geographic hierarchy — the introductory ForgeDB exa
 | Model | Description |
 |---|---|
 | `Region` | Top of the geographic hierarchy (e.g. Americas, Europe) |
-| `Country` | Country within a region; natural key `country_code` char(2) |
+| `Country` | Country within a region; natural key `country_code` |
 | `Location` | Physical site within a country (street address, city) |
 | `Job` | Job title with salary band (`min_salary`/`max_salary` as i64 cents) |
 | `Department` | Org unit at a location; optional `manager` FK to Employee |

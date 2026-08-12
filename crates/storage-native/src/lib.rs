@@ -68,6 +68,7 @@
 //!
 //! let manifest = Manifest {
 //!     schema_version: 1,
+//!     engine_version: 1,
 //!     row_count: 42,
 //!     columns: vec![
 //!         ColumnMetadata { name: "id".to_string(), column_type: ColumnType::U64, column_index: 0, ..Default::default() },
@@ -76,8 +77,8 @@
 //!     wal_enabled: false,
 //!     last_checkpoint: 0,
 //!     compaction_epoch: 0,
-//!     format_version: 1,
 //!     row_anchor: None,
+//!     auto_sequences: Default::default(),
 //! };
 //! manifest.save_to(&PathBuf::from("./mydb/manifest.json"))?;
 //! let reopened = Manifest::load_from(&PathBuf::from("./mydb/manifest.json"))?;
@@ -191,16 +192,58 @@ fn device_barrier(file: &File) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Default `format_version` for manifests written before the field existed.
+/// Default schema serial for manifests written before the field existed.
 /// Old on-disk manifests deserialize as v1 (the original layout), not v0.
-fn default_format_version() -> u32 {
+fn default_schema_version() -> u32 {
+    1
+}
+
+/// Default engine generation for every manifest written before #254 added the
+/// field: generation 1, the baseline. This is what makes the counter additive
+/// rather than a second format break.
+fn default_engine_version() -> u32 {
     1
 }
 
 /// Manifest stores metadata about the database
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// The **app's** schema-migration serial: how many migrations from its own
+    /// `migrations/` lineage have been applied. Derived by
+    /// `MigrationLineage::current_schema_version`, baked into generated code as
+    /// `EXPECTED_SCHEMA_VERSION`, and compared by the generated `open()` guard,
+    /// which refuses a dir whose schema is not the one this binary was generated
+    /// from (#74 Phase 1). Lineage-sourced, never hand-edited.
+    ///
+    /// **The on-disk key stays `format_version` (#254).** Only the Rust name
+    /// changed, because the old one described the engine rather than the app.
+    /// A *different* vestigial `schema_version` key — hardcoded to `1` at every
+    /// write site, never incremented, never compared — used to occupy this name
+    /// on disk; it is deleted, and serde's unknown-key tolerance is what lets a
+    /// manifest still carrying it deserialize. Reading the wrong one of those two
+    /// is not a subtle bug: it would compare the open-guard against a constant.
+    #[serde(rename = "format_version", default = "default_schema_version")]
     pub schema_version: u32,
+    /// ForgeDB's own **engine byte-format generation** (#254) — owned by the
+    /// released version line, not by the app. It covers both value
+    /// reinterpretation and physical layout, which is why it is not
+    /// `layout_version`.
+    ///
+    /// Orthogonal to `schema_version` above: a schema mismatch means *the app's
+    /// schema changed* and is fixed by the app's migration bin; an engine
+    /// mismatch means *ForgeDB changed* and is fixed by `forgedb migrate engine`.
+    /// Conflating them would send a user to regenerate a schema that is correct.
+    ///
+    /// Generations are assigned at merge order, not at design time — two format
+    /// changes in one cycle would otherwise both claim the same number and
+    /// whichever landed second would silently redefine the other's meaning.
+    ///
+    /// | gen | change |
+    /// |---|---|
+    /// | 1 | baseline — everything written before this field existed |
+    /// | 2 | timestamp values are microseconds, not seconds (#254) |
+    #[serde(default = "default_engine_version")]
+    pub engine_version: u32,
     pub row_count: usize,
     pub columns: Vec<ColumnMetadata>,
     #[serde(default)]
@@ -215,8 +258,6 @@ pub struct Manifest {
     pub compaction_epoch: u64,
     /// On-disk layout format version, so a schema-blind reader (backup #57,
     /// inspector #63) can refuse mismatched bytes instead of misreading them.
-    #[serde(default = "default_format_version")]
-    pub format_version: u32,
     /// Which file's length authoritatively counts committed rows, and how many
     /// bytes it spends per row. For a model this is `tombstones.bin` (1 byte/row,
     /// appended last per insert); for an M2M junction it is `fixed/right.bin`
@@ -226,6 +267,26 @@ pub struct Manifest {
     /// legacy manifests ⇒ fall back to `tombstones.bin`.
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
+    /// Per-field allocation high-water marks, as an **opaque** `name -> highest
+    /// value handed out` map (#187).
+    ///
+    /// The substrate neither parses these keys nor branches on them: it stores
+    /// and returns strings and integers. Which fields appear, what the numbers
+    /// mean, and every read and write of them belong to generated code — the
+    /// same class of layout metadata as `compaction_epoch`.
+    ///
+    /// It exists because a rescan alone cannot survive compaction: compaction
+    /// physically drops dead rows, so a post-compaction reopen derives a *lower*
+    /// maximum than was actually issued and hands the same value out twice. The
+    /// contract is a **floor, not a source of truth** — a reader takes
+    /// `max(persisted, scanned)`, so a crash that loses the tip falls back to the
+    /// scan, which is always safe. That is what buys durability without an fsync
+    /// per allocation.
+    ///
+    /// `BTreeMap` (not `HashMap`) so the serialized JSON is byte-stable across
+    /// writes. Additive (`#[serde(default)]`) for on-disk back-compat.
+    #[serde(default)]
+    pub auto_sequences: std::collections::BTreeMap<String, u64>,
 }
 
 /// Physical descriptor of the file whose length counts committed rows.
@@ -534,6 +595,44 @@ impl BufferedFixedColumn {
     /// fixed-array / nullable / optional-FK columns decoded via `read_unaligned`).
     pub fn read_bytes(&self, slot: usize) -> io::Result<Vec<u8>> {
         Ok(self.slot_bytes(slot)?.to_vec())
+    }
+
+    /// The whole `value_size`-wide slot at `slot`, **borrowed** (#238).
+    ///
+    /// The zero-copy counterpart of [`Self::read_bytes`], which is exactly this
+    /// plus a `.to_vec()`; both stay, because a caller that wants an owned buffer
+    /// should not have to write the copy itself.
+    ///
+    /// Borrowing is sound here and nowhere else on the fixed path: this type owns
+    /// its bytes (a gathered `Vec` or an `Mmap` alias of the dense prefix), so the
+    /// `&self` lifetime is the buffer's. [`FixedColumn`] and [`FixedColumnReader`]
+    /// read through the file on every access and have nothing to lend — the same
+    /// split that put [`BufferedVariableColumn::read_str`] on the buffered tier
+    /// only (#224).
+    pub fn read_slice(&self, slot: usize) -> io::Result<&[u8]> {
+        self.slot_bytes(slot)
+    }
+
+    /// The whole `value_size`-wide slot at `slot` as UTF-8, **borrowed** (#238).
+    ///
+    /// For a column where the slot *is* the value and carries no framing:
+    /// `string(N!)` (#238 res 6 — exactly N ASCII characters, therefore exactly N
+    /// bytes, therefore no length prefix), and any other fixed UTF-8 payload.
+    ///
+    /// It deliberately does **not** understand a length prefix. Which slots carry
+    /// one, and how wide it is, is #238's per-declaration layout choice; teaching
+    /// it to a schema-agnostic crate would move generated knowledge into the
+    /// substrate. Prefixed slots read through [`Self::read_slice`] and decode in
+    /// generated code.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the slot is out of range; `InvalidData` if the slot's
+    /// bytes are not valid UTF-8 — same contract as
+    /// [`BufferedVariableColumn::read_str`].
+    pub fn read_str(&self, slot: usize) -> io::Result<&str> {
+        std::str::from_utf8(self.slot_bytes(slot)?)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -1041,9 +1140,12 @@ pub struct BufferedVariableColumn {
     /// enough to be worth mapping, an owned copy otherwise (#222).
     data: ColumnExport,
     /// File offset `data` starts at, so the absolute offsets in `slots` can be
-    /// rebased onto it. Zero when the whole region is buffered.
+    /// rebased onto it. Zero when the whole region is buffered, and zero on the
+    /// sparse path (#228), where `data` is packed and `slots` already index into it.
     base: u64,
-    // (absolute offset in the data FILE, byte length) per slot, in selection order.
+    // (offset, byte length) per slot, in selection order. The offset is absolute in
+    // the data FILE on the spanned path and relative to `data` on the packed sparse
+    // path — `base` is what reconciles them, so `read_str` needs no branch.
     slots: Vec<(u64, u64)>,
 }
 
@@ -1110,6 +1212,27 @@ impl BufferedVariableColumn {
 /// the span from being paid for — untouched pages are never faulted in. Conservative
 /// rather than tuned; the shape of the win does not depend on the exact crossover.
 const VAR_MMAP_MIN_BYTES: usize = 64 * 1024;
+
+/// Selection sparsity at which [`VariableColumn::gather_buffered`] reads each
+/// offsets entry on its own instead of the whole spanned slice (#228).
+///
+/// The spanned read is one syscall for `span_rows * 16` bytes; the per-index read
+/// is `n` syscalls of 16 bytes. The former wins while the selection is dense, and
+/// loses badly once it is not: a two-row selection at opposite ends of a 20 000-row
+/// column read 320 KB of offsets per column to use 32 bytes of it.
+///
+/// That shape is not hypothetical — it is what an index-pushdown candidate set
+/// looks like. Since #228 unified the pushdown arm on the buffered scan, a handful
+/// of scattered candidates reach here directly, and before this branch existed the
+/// pushdown measured **5x slower** than the per-row positional decode it replaced.
+///
+/// The crossover is where `n` syscalls cost what the spanned read costs, which on
+/// a warm page cache lands near `span_rows ≈ 190n`. `128` sits just under that:
+/// conservative toward the spanned read (better locality, and it is the path the
+/// dense common case takes), while still catching every sparse case by a wide
+/// margin. The exact value is not load-bearing — the two costs differ by orders of
+/// magnitude on either side of it, not by a few percent.
+const SPARSE_OFFSETS_SPAN_FACTOR: usize = 128;
 
 pub struct VariableColumn {
     data_file: File,
@@ -1282,6 +1405,15 @@ impl VariableColumn {
     /// the live set is. Append-only helps here: an updated row is re-appended at
     /// the tail, so churn tends to concentrate live rows rather than scatter them.
     ///
+    /// # Sparse selections (#228)
+    ///
+    /// Bounding to the span is the wrong trade when the selection is a handful of
+    /// rows scattered across the column — the offsets read is then almost entirely
+    /// rows nobody asked for. Below [`SPARSE_OFFSETS_SPAN_FACTOR`] density the
+    /// offsets are read per index instead. This mirrors what
+    /// [`FixedColumn::gather`] already does via `GATHER_MMAP_MIN_ROWS`; the data
+    /// region still maps by span, which costs address space rather than I/O.
+    ///
     /// # Errors
     ///
     /// `InvalidInput` if any index is `>= self.len()`; other errors come from the
@@ -1307,6 +1439,14 @@ impl VariableColumn {
             }
             lo = lo.min(index);
             hi = hi.max(index);
+        }
+
+        // A few rows scattered across the column: bounding to the span would read
+        // almost entirely rows nobody asked for, and map a data region orders of
+        // magnitude larger than the bytes wanted.  Gather them individually
+        // instead (#228 — see `SPARSE_OFFSETS_SPAN_FACTOR`).
+        if hi + 1 - lo > indices.len().saturating_mul(SPARSE_OFFSETS_SPAN_FACTOR) {
+            return self.gather_sparse(indices);
         }
 
         // Only the spanned slice of the offsets index (16 bytes/row), not all
@@ -1361,6 +1501,50 @@ impl VariableColumn {
         };
 
         Ok(BufferedVariableColumn { data, base: data_lo, slots })
+    }
+
+    /// The sparse-selection arm of [`gather_buffered`](Self::gather_buffered)
+    /// (#228): read each selected row's offsets entry and bytes individually, into
+    /// one **packed** buffer holding only the rows asked for.
+    ///
+    /// The spanned arm is the right shape when the selection covers most of its
+    /// span — one bounded offsets read, and a data region whose dead versions cost
+    /// address space rather than I/O because only addressed pages fault in. It is
+    /// the wrong shape when a handful of rows are scattered across the whole
+    /// column: the offsets read is then almost all rows nobody wants, and the
+    /// mapping's setup and teardown are paid in full to reach a few hundred bytes.
+    ///
+    /// That case is not hypothetical — it is what an index-pushdown candidate set
+    /// looks like, and since #228 those reach here directly instead of being
+    /// decoded per row. Measured on a 20 000-row column, two rows at opposite ends
+    /// cost 5x the per-row positional decode this replaced; packing them brings it
+    /// back to parity, while every denser selection keeps the spanned arm's win.
+    ///
+    /// The packed buffer means `slots` here hold **offsets into `data`**, not
+    /// absolute file offsets, with `base` 0 — the one place that distinction
+    /// exists. `read_str` computes `offset - base` either way, so it needs no
+    /// branch and cannot tell the two apart.
+    fn gather_sparse(&self, indices: &[usize]) -> io::Result<BufferedVariableColumn> {
+        let mut slots = Vec::with_capacity(indices.len());
+        let mut data: Vec<u8> = Vec::new();
+        let mut entry = [0u8; 16];
+        for &index in indices {
+            self.offsets_file
+                .read_exact_at(&mut entry, (index * 16) as u64)?;
+            let offset = u64::from_le_bytes(entry[..8].try_into().unwrap());
+            let length = u64::from_le_bytes(entry[8..].try_into().unwrap());
+            let start = data.len();
+            data.resize(start + length as usize, 0);
+            if length > 0 {
+                self.data_file.read_exact_at(&mut data[start..], offset)?;
+            }
+            slots.push((start as u64, length));
+        }
+        Ok(BufferedVariableColumn {
+            data: ColumnExport::Owned(data),
+            base: 0,
+            slots,
+        })
     }
 
     /// Flush all pending writes to disk (fsync both data and offsets files).

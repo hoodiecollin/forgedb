@@ -94,9 +94,9 @@ impl RustSdkGenerator {
 
         // Models + create-input + projection structs.
         for model in &schema.models {
-            Self::push_model_struct(&mut c, model);
-            Self::push_create_struct(&mut c, model);
-            Self::push_projection_structs(&mut c, model);
+            Self::push_model_struct(schema, &mut c, model);
+            Self::push_create_struct(schema, &mut c, model);
+            Self::push_projection_structs(schema, &mut c, model);
         }
 
         c.push_str(Self::shared_types());
@@ -104,7 +104,7 @@ impl RustSdkGenerator {
         c
     }
 
-    fn push_model_struct(c: &mut String, model: &Model) {
+    fn push_model_struct(schema: &Schema, c: &mut String, model: &Model) {
         c.push_str(&format!(
             "/// `{name}` — mirrors the wire shape of the generated model.\n\
              #[derive(Debug, Clone, Serialize, Deserialize)]\n\
@@ -112,12 +112,12 @@ impl RustSdkGenerator {
             name = model.name
         ));
         for field in &model.fields {
-            c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(field)));
+            c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(schema, field)));
         }
         c.push_str("}\n\n");
     }
 
-    fn push_create_struct(c: &mut String, model: &Model) {
+    fn push_create_struct(schema: &Schema, c: &mut String, model: &Model) {
         c.push_str(&format!(
             "/// Input to `create_{snake}` — a `{name}` without the fields the server\n\
              /// synthesizes (`+uuid`/`+timestamp` autos).\n\
@@ -127,12 +127,12 @@ impl RustSdkGenerator {
             name = model.name
         ));
         for field in RustGenerator::creatable_fields(model) {
-            c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(field)));
+            c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(schema, field)));
         }
         c.push_str("}\n\n");
     }
 
-    fn push_projection_structs(c: &mut String, model: &Model) {
+    fn push_projection_structs(schema: &Schema, c: &mut String, model: &Model) {
         for proj in &model.projections {
             let ty = format!(
                 "{}{}",
@@ -147,7 +147,7 @@ impl RustSdkGenerator {
                 model = model.name
             ));
             for field in RustGenerator::projected_field_set(model, proj) {
-                c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(field)));
+                c.push_str(&format!("    pub {}: {},\n", field.name, Self::map_type(schema, field)));
             }
             c.push_str("}\n\n");
         }
@@ -411,8 +411,8 @@ impl ForgeDbClient {
     /// `char(N)`, fixed arrays, inline structs, and virtual one-to-many / M2M
     /// relations, which the server serializes as `null`) maps to
     /// `serde_json::Value` — the honest analogue of the TS SDK's `unknown`/`any`.
-    fn map_type(field: &Field) -> String {
-        let (opaque, base) = Self::base_type(&field.field_type);
+    fn map_type(schema: &Schema, field: &Field) -> String {
+        let (opaque, base) = Self::base_type(schema, &field.field_type);
         if opaque {
             // `serde_json::Value` already holds `null`, so nullability needs no
             // extra wrapper.
@@ -425,22 +425,31 @@ impl ForgeDbClient {
     }
 
     /// `(is_opaque, base_type)` for a field type, unwrapping `Nullable`.
-    fn base_type(ft: &FieldType) -> (bool, String) {
+    fn base_type(schema: &Schema, ft: &FieldType) -> (bool, String) {
         match ft {
             FieldType::U32 => (false, "u32".into()),
             FieldType::U64 => (false, "u64".into()),
             FieldType::I32 => (false, "i32".into()),
             FieldType::I64 => (false, "i64".into()),
             FieldType::F64 => (false, "f64".into()),
-            FieldType::Timestamp => (false, "i64".into()),
+            // #254: RFC 3339 string on the wire.
+            FieldType::Timestamp(_) => (false, "String".into()),
             FieldType::Bool => (false, "bool".into()),
-            FieldType::String | FieldType::Uuid => (false, "String".into()),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                (false, "String".into())
+            }
             // decimal rides the wire as a precision-preserving JSON string.
             FieldType::Decimal => (false, "String".into()),
             FieldType::Enum(name) => (false, name.clone()),
-            FieldType::Relation(RelationType::RequiredReference(_))
-            | FieldType::Relation(RelationType::OptionalReference(_)) => (false, "String".into()),
-            FieldType::Nullable(inner) => Self::base_type(inner),
+            // #266: an FK carries the TARGET's identity value on the wire, so
+            // it deserializes as the target's key type. Typing every FK `String`
+            // made a `u64`-keyed parent's children unparseable — the server
+            // sends a JSON number.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::base_type(schema, &RustGenerator::resolved_type(schema, ft)),
+            FieldType::Nullable(inner) => Self::base_type(schema, inner),
             // Opaque bucket — same class as the TS SDK's `unknown`/`any`.
             _ => (true, "serde_json::Value".into()),
         }

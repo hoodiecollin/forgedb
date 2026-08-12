@@ -12,14 +12,26 @@ use std::path::Path;
 
 use crate::store;
 
-fn default_format_version() -> u32 {
+fn default_schema_version() -> u32 {
+    1
+}
+
+fn default_engine_version() -> u32 {
     1
 }
 
 /// Physical-layout metadata (see the native crate's `Manifest` for the full doc).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// The app's schema-migration serial. **On-disk key stays `format_version`**
+    /// (#254) — only the Rust name changed; the vestigial `schema_version` key
+    /// that used to occupy this name is deleted and merely tolerated on read.
+    #[serde(rename = "format_version", default = "default_schema_version")]
     pub schema_version: u32,
+    /// ForgeDB's engine byte-format generation (#254), orthogonal to the serial
+    /// above and owned by the release line rather than the app. Baselines at 1.
+    #[serde(default = "default_engine_version")]
+    pub engine_version: u32,
     pub row_count: usize,
     pub columns: Vec<ColumnMetadata>,
     #[serde(default)]
@@ -28,10 +40,24 @@ pub struct Manifest {
     pub last_checkpoint: u64,
     #[serde(default)]
     pub compaction_epoch: u64,
-    #[serde(default = "default_format_version")]
-    pub format_version: u32,
     #[serde(default)]
     pub row_anchor: Option<RowAnchor>,
+    /// Per-field allocation high-water marks (#187) — opaque `name -> highest
+    /// value handed out`.
+    ///
+    /// **This backend neither parses these keys nor branches on them**, and must
+    /// not start: it stores and returns strings and integers. Which fields
+    /// appear, what the numbers mean, and every read and write of them belong to
+    /// generated code. The invariant is restated here rather than delegated
+    /// because `forgedb-storage-web` is separately published and separately
+    /// edited — the rule has to be in front of whoever changes *this* file. The
+    /// native crate's `Manifest::auto_sequences` carries the full rationale.
+    ///
+    /// The browser replica is read-only today and never allocates, but the field
+    /// must exist so a follower round-trips a writer's manifest without dropping
+    /// it (and so `forgedb_storage::Manifest` stays one shape across targets).
+    #[serde(default)]
+    pub auto_sequences: std::collections::BTreeMap<String, u64>,
 }
 
 impl Manifest {

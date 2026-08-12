@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1524" height="720" viewBox="0 0 1524 720" font-family="ui-sans-serif, -apple-system, Helvetica, Arial, sans-serif">
+<rect width="1524" height="720" fill="#ffffff"/>
+<text x="30" y="34" font-size="21" font-weight="700" fill="#111">Experiment #261 — summary</text>
+<text x="30" y="57" font-size="13" fill="#555">Left: the lowest inline share at which the inline layout reads faster than the idealized pointer baseline. Right: bytes on disk relative to pointer storage.</text>
+<text x="30" y="94" font-size="14" font-weight="650" fill="#222">Crossover — inline 4N+4 (as #238 declares it)</text>
+<text x="30" y="112" font-size="11.5" fill="#777">lowest % of rows inline at which it beats the pointer baseline by &gt;2%; “never” = loses at every mix</text>
+<text x="284" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">just_over</text>
+<text x="284" y="148" font-size="10" fill="#999" text-anchor="middle">1–2×N</text>
+<text x="412" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">larger</text>
+<text x="412" y="148" font-size="10" fill="#999" text-anchor="middle">3–5×N</text>
+<text x="540" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">very_large</text>
+<text x="540" y="148" font-size="10" fill="#999" text-anchor="middle">24–40×N</text>
+<text x="668" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">massive</text>
+<text x="668" y="148" font-size="10" fill="#999" text-anchor="middle">192–320×N</text>
+<text x="212" y="182" font-size="12" fill="#333" text-anchor="end">N=4 <tspan fill="#999">tiny</tspan></text>
+<rect x="222" y="160" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="284" y="182" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="350" y="160" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="182" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="160" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="540" y="182" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="606" y="160" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="182" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="222" font-size="12" fill="#333" text-anchor="end">N=16 <tspan fill="#999">small</tspan></text>
+<rect x="222" y="200" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="284" y="222" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="350" y="200" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="222" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="200" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="222" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="200" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="222" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="262" font-size="12" fill="#333" text-anchor="end">N=64 <tspan fill="#999">modest</tspan></text>
+<rect x="222" y="240" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="262" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="240" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="262" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="240" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="262" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="240" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="262" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="302" font-size="12" fill="#333" text-anchor="end">N=256 <tspan fill="#999">large</tspan></text>
+<rect x="222" y="280" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="302" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="280" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="302" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="280" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="302" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="280" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="668" y="302" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<text x="212" y="342" font-size="12" fill="#333" text-anchor="end">N=1024 <tspan fill="#999">huge</tspan></text>
+<rect x="222" y="320" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="342" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="320" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="342" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="320" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="342" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="320" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="342" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="792" y="94" font-size="14" font-weight="650" fill="#222">Storage — inline 4N+4 bytes on disk ÷ pointer</text>
+<text x="792" y="112" font-size="11.5" fill="#777">at a 50% mix; &gt;1 means the inline layout stores more</text>
+<text x="1046" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">just_over</text>
+<text x="1046" y="148" font-size="10" fill="#999" text-anchor="middle">1–2×N</text>
+<text x="1174" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">larger</text>
+<text x="1174" y="148" font-size="10" fill="#999" text-anchor="middle">3–5×N</text>
+<text x="1302" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">very_large</text>
+<text x="1302" y="148" font-size="10" fill="#999" text-anchor="middle">24–40×N</text>
+<text x="1430" y="134" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">massive</text>
+<text x="1430" y="148" font-size="10" fill="#999" text-anchor="middle">192–320×N</text>
+<text x="974" y="182" font-size="12" fill="#333" text-anchor="end">N=4 <tspan fill="#999">tiny</tspan></text>
+<rect x="984" y="160" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1046" y="182" font-size="12" font-weight="600" fill="#222" text-anchor="middle">0.99×</text>
+<rect x="1112" y="160" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1174" y="182" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.05×</text>
+<rect x="1240" y="160" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1302" y="182" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.13×</text>
+<rect x="1368" y="160" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1430" y="182" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.02×</text>
+<text x="974" y="222" font-size="12" fill="#333" text-anchor="end">N=16 <tspan fill="#999">small</tspan></text>
+<rect x="984" y="200" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1046" y="222" font-size="12" font-weight="600" fill="#222" text-anchor="middle">2.11×</text>
+<rect x="1112" y="200" width="124" height="36" fill="#fdf3d8" stroke="#fff" stroke-width="1"/>
+<text x="1174" y="222" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.70×</text>
+<rect x="1240" y="200" width="124" height="36" fill="#fdf3d8" stroke="#fff" stroke-width="1"/>
+<text x="1302" y="222" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.20×</text>
+<rect x="1368" y="200" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1430" y="222" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.03×</text>
+<text x="974" y="262" font-size="12" fill="#333" text-anchor="end">N=64 <tspan fill="#999">modest</tspan></text>
+<rect x="984" y="240" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1046" y="262" font-size="12" font-weight="600" fill="#222" text-anchor="middle">3.24×</text>
+<rect x="1112" y="240" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1174" y="262" font-size="12" font-weight="600" fill="#222" text-anchor="middle">2.09×</text>
+<rect x="1240" y="240" width="124" height="36" fill="#fdf3d8" stroke="#fff" stroke-width="1"/>
+<text x="1302" y="262" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.22×</text>
+<rect x="1368" y="240" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1430" y="262" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.03×</text>
+<text x="974" y="302" font-size="12" fill="#333" text-anchor="end">N=256 <tspan fill="#999">large</tspan></text>
+<rect x="984" y="280" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1046" y="302" font-size="12" font-weight="600" fill="#222" text-anchor="middle">3.77×</text>
+<rect x="1112" y="280" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1174" y="302" font-size="12" font-weight="600" fill="#222" text-anchor="middle">2.23×</text>
+<rect x="1240" y="280" width="124" height="36" fill="#fdf3d8" stroke="#fff" stroke-width="1"/>
+<text x="1302" y="302" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.23×</text>
+<rect x="1368" y="280" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1430" y="302" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.03×</text>
+<text x="974" y="342" font-size="12" fill="#333" text-anchor="end">N=1024 <tspan fill="#999">huge</tspan></text>
+<rect x="984" y="320" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1046" y="342" font-size="12" font-weight="600" fill="#222" text-anchor="middle">3.93×</text>
+<rect x="1112" y="320" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="1174" y="342" font-size="12" font-weight="600" fill="#222" text-anchor="middle">2.26×</text>
+<rect x="1240" y="320" width="124" height="36" fill="#fdf3d8" stroke="#fff" stroke-width="1"/>
+<text x="1302" y="342" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.23×</text>
+<rect x="1368" y="320" width="124" height="36" fill="#dff0d8" stroke="#fff" stroke-width="1"/>
+<text x="1430" y="342" font-size="12" font-weight="600" fill="#222" text-anchor="middle">1.03×</text>
+<text x="30" y="408" font-size="14" font-weight="650" fill="#222">Crossover — inline N+4 (if N counted bytes, not chars)</text>
+<text x="30" y="426" font-size="11.5" fill="#777">the same mechanism without the 4× worst-case-UTF-8 slot reservation</text>
+<text x="284" y="448" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">just_over</text>
+<text x="284" y="462" font-size="10" fill="#999" text-anchor="middle">1–2×N</text>
+<text x="412" y="448" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">larger</text>
+<text x="412" y="462" font-size="10" fill="#999" text-anchor="middle">3–5×N</text>
+<text x="540" y="448" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">very_large</text>
+<text x="540" y="462" font-size="10" fill="#999" text-anchor="middle">24–40×N</text>
+<text x="668" y="448" font-size="11.5" font-weight="600" fill="#444" text-anchor="middle">massive</text>
+<text x="668" y="462" font-size="10" fill="#999" text-anchor="middle">192–320×N</text>
+<text x="212" y="496" font-size="12" fill="#333" text-anchor="end">N=4 <tspan fill="#999">tiny</tspan></text>
+<rect x="222" y="474" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="284" y="496" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="350" y="474" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="412" y="496" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="478" y="474" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="540" y="496" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="606" y="474" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="496" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="536" font-size="12" fill="#333" text-anchor="end">N=16 <tspan fill="#999">small</tspan></text>
+<rect x="222" y="514" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="284" y="536" font-size="12" font-weight="600" fill="#7a5b13" text-anchor="middle">99%</text>
+<rect x="350" y="514" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="412" y="536" font-size="12" font-weight="600" fill="#7a5b13" text-anchor="middle">99%</text>
+<rect x="478" y="514" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="540" y="536" font-size="12" font-weight="600" fill="#7a5b13" text-anchor="middle">99%</text>
+<rect x="606" y="514" width="124" height="36" fill="#fbeee0" stroke="#fff" stroke-width="1"/>
+<text x="668" y="536" font-size="12" font-weight="600" fill="#7a5b13" text-anchor="middle">99%</text>
+<text x="212" y="576" font-size="12" fill="#333" text-anchor="end">N=64 <tspan fill="#999">modest</tspan></text>
+<rect x="222" y="554" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="576" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="554" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="576" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="554" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="540" y="576" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<rect x="606" y="554" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="576" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="616" font-size="12" fill="#333" text-anchor="end">N=256 <tspan fill="#999">large</tspan></text>
+<rect x="222" y="594" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="616" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="594" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="616" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="594" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="616" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="594" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="616" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="212" y="656" font-size="12" fill="#333" text-anchor="end">N=1024 <tspan fill="#999">huge</tspan></text>
+<rect x="222" y="634" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="284" y="656" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="350" y="634" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="412" y="656" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="478" y="634" width="124" height="36" fill="#f6d5d3" stroke="#fff" stroke-width="1"/>
+<text x="540" y="656" font-size="12" font-weight="600" fill="#8b1a17" text-anchor="middle">never</text>
+<rect x="606" y="634" width="124" height="36" fill="#eeeeee" stroke="#fff" stroke-width="1"/>
+<text x="668" y="656" font-size="12" font-weight="600" fill="#555" text-anchor="middle">tie</text>
+<text x="792" y="408" font-size="14" font-weight="650" fill="#222">Step vs slope — N=16, overflow 3–5×N, 50% inline</text>
+<text x="792" y="426" font-size="11.5" fill="#777">flat with row count ⇒ the cost is a per-row slope, not a per-scan step that amortizes</text>
+<rect x="792" y="464" width="420" height="200" fill="#fafafa" stroke="#e3e3e3"/>
+<line x1="792" y1="614" x2="1212" y2="614" stroke="#ececec"/>
+<text x="786" y="618" font-size="10" fill="#888" text-anchor="end">21.1</text>
+<line x1="792" y1="564" x2="1212" y2="564" stroke="#ececec"/>
+<text x="786" y="568" font-size="10" fill="#888" text-anchor="end">42.2</text>
+<line x1="792" y1="514" x2="1212" y2="514" stroke="#ececec"/>
+<text x="786" y="518" font-size="10" fill="#888" text-anchor="end">63.3</text>
+<line x1="792" y1="464" x2="1212" y2="464" stroke="#ececec"/>
+<text x="786" y="468" font-size="10" fill="#888" text-anchor="end">84.4</text>
+<text x="792" y="680" font-size="10" fill="#888" text-anchor="middle">1k</text>
+<text x="932" y="680" font-size="10" fill="#888" text-anchor="middle">10k</text>
+<text x="1072" y="680" font-size="10" fill="#888" text-anchor="middle">100k</text>
+<text x="1212" y="680" font-size="10" fill="#888" text-anchor="middle">1M</text>
+<text x="1002" y="696" font-size="10.5" fill="#777" text-anchor="middle">rows scanned</text>
+<polyline points="792,532.121298270552 932,607.6645344705046 1072,623.3441601516229 1212,622.465610045013" fill="none" stroke="#1f77b4" stroke-width="2.1" />
+<polyline points="792,606.6486614546316 932,600.2513622364369 1072,608.5204690831556 1212,605.7910447761194" fill="none" stroke="#7fb8db" stroke-width="2.1" stroke-dasharray="4 3"/>
+<polyline points="792,492.7325278370055 932,594.3186448708836 1072,615.1529732290926 1212,613.537728026534" fill="none" stroke="#2ca02c" stroke-width="2.1" />
+<polyline points="792,485.42857142857144 932,600.8732527837005 1072,617.2979862591803 1212,614.2206230751007" fill="none" stroke="#d62728" stroke-width="2.1" />
+<line x1="792" y1="714" x2="814" y2="714" stroke="#1f77b4" stroke-width="2.5" />
+<text x="820" y="718" font-size="11" fill="#333">pointer (idealized)</text>
+<line x1="945.8" y1="714" x2="967.8" y2="714" stroke="#7fb8db" stroke-width="2.5" stroke-dasharray="4 3"/>
+<text x="973.8" y="718" font-size="11" fill="#333">pointer (shipping)</text>
+<line x1="1093.4" y1="714" x2="1115.4" y2="714" stroke="#2ca02c" stroke-width="2.5" />
+<text x="1121.4" y="718" font-size="11" fill="#333">inline N+4</text>
+<line x1="1191.4" y1="714" x2="1213.4" y2="714" stroke="#d62728" stroke-width="2.5" />
+<text x="1219.4" y="718" font-size="11" fill="#333">inline 4N+4</text>
+</svg>

@@ -18,14 +18,17 @@ BENCH_VARIANTS := default fsync_never replication_on compaction_off compaction_l
         website-rewrite website-rewrite-watch changelog roadmap \
         extension-install extension-build extension-typecheck extension-package \
         bench bench-forgedb bench-sqlite bench-redb bench-duckdb bench-postgres \
-        bench-pglite bench-matrix bench-regen bench-regen-matrix \
-        bench-footprint bench-concurrency bench-workload
+        bench-pglite bench-matrix bench-regen bench-regen-matrix bench-list-page \
+        bench-list bench-list-postgres bench-deps-check \
+        bench-footprint bench-concurrency bench-workload bench-workload-var
 
 ## Run the embedded comparison suites that need no setup (ForgeDB + SQLite + redb +
-## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), and the
-## JS/PGlite suite are separate targets below — a bare `cargo bench` would also try to
-## compile matrix_bench, whose gitignored variant modules only exist after
-## `make bench-regen-matrix`. See docs/BENCHMARKS.md.
+## DuckDB). PostgreSQL (needs a cluster), the config matrix (needs regen), the #226
+## list-page kill gate, and the JS/PGlite suite are separate targets below, so this
+## names its four benches instead of letting `cargo bench` select everything. The
+## matrix bench is no longer a reason to hand-list them: its gitignored variant modules
+## sit behind `--features matrix` (#279), so cargo SKIPS that target when the feature is
+## off rather than failing to compile the library. See docs/BENCHMARKS.md.
 bench:
 	cargo bench --manifest-path $(BENCH) \
 		--bench forgedb_bench --bench sqlite_bench --bench redb_bench --bench duckdb_bench
@@ -33,6 +36,37 @@ bench:
 ## Benchmark the ForgeDB generated code only.
 bench-forgedb:
 	cargo bench --manifest-path $(BENCH) --bench forgedb_bench
+
+## #226 kill gate: split a list request into scan / page-materialize / serialize and
+## report the page-materialize share. #226 can only remove that share, so it is a hard
+## ceiling on the win — measurable without prototyping the buffered decode.
+bench-list-page:
+	cargo bench --manifest-path $(BENCH) --bench list_page_bench
+
+## #282 scenario 21: the REST list endpoint across five engines and four boundaries.
+## The ForgeDB S1-S4 ladder needs the generated router, hence --features router; the other
+## engines' S1/S2 arms live in their existing suites and are selected by the Criterion
+## positional filter, so this does NOT re-run insert/point-lookup/m2m.
+bench-list:
+	cargo bench --manifest-path $(BENCH) --features router --bench list_rest_bench
+	cargo bench --manifest-path $(BENCH) \
+		--bench sqlite_bench --bench redb_bench --bench duckdb_bench -- '/list_'
+
+## The Postgres half of scenario 21, in an ephemeral devbox cluster. PG cannot run
+## in-process, so its S1/S2 already carry socket transport the other four do not pay —
+## the honest ForgeDB-vs-Postgres comparison is S4. See docs/BENCHMARKS.md.
+bench-list-postgres:
+	devbox run -- benchmarks/scripts/pg_run.sh '/list_'
+
+## Section 1's gate criterion in benchmarks/src/lib.rs, made executable (#282 BDD-8):
+## `gen/api.rs`'s heavy deps must be OFF by default and ON under --features router.
+## Nothing else catches a regression here, because a slower build is not a failing build.
+bench-deps-check:
+	@! cargo tree --manifest-path $(BENCH) -e normal --prefix none | grep -q '^axum ' \
+	  || (echo "FAIL: axum is a normal dep without --features router"; exit 1)
+	@cargo tree --manifest-path $(BENCH) -e normal --features router --prefix none | grep -q '^axum ' \
+	  || (echo "FAIL: --features router does not pull axum"; exit 1)
+	@echo "ok: gen/api.rs deps are gated"
 
 ## Benchmark SQLite only.
 bench-sqlite:
@@ -76,21 +110,40 @@ bench-concurrency:
 ##   make bench-workload ARGS="--full"         # full ladder (A = 1..32)
 ##   make bench-workload ARGS="--forgedb-only" # skip the comparison engines
 ##   make bench-workload ARGS="--scan-sweep"   # fixed-width scan path (Metric subject)
-##   make bench-workload ARGS="--var-sweep"    # variable-width scan path (Doc subject);
-##                                             # needs `make bench-regen-matrix` first,
-##                                             # it runs against the churn_probe variant
 ##   make bench-workload ARGS="--verify"       # driver self-checks
+## The variable-width scan path (--var-sweep) runs against the gitignored churn_probe
+## variant, so it has its own target below rather than an ARGS mode.
 bench-workload:
 	cargo run --manifest-path $(BENCH) --example workload --release -- $(ARGS)
 
-## Config-matrix bench (epic #126): same scenarios across generated config variants.
-bench-matrix:
-	cargo bench --manifest-path $(BENCH) --bench matrix_bench
+## Variable-width scan sweep (Doc subject): the one workload mode that links a config
+## variant (churn_probe — compaction off, so amplification has a lever arm). Regenerates
+## the variants and builds with `--features matrix`, which is what makes v_churn_probe
+## exist at all (#279). Add ARGS="--full" for the wider ladder.
+bench-workload-var: bench-regen-matrix
+	cargo run --manifest-path $(BENCH) --example workload --release --features matrix -- \
+		--var-sweep $(ARGS)
 
-## Re-emit benchmarks/gen/database.rs from bench.forge through the current CLI.
-## Run this after any codegen change so the bench links current generated output.
+## Config-matrix bench (epic #126): same scenarios across generated config variants.
+## Needs `make bench-regen-matrix` first — the variant modules are gitignored and only
+## compile under `--features matrix` (#279).
+bench-matrix: bench-regen-matrix
+	cargo bench --manifest-path $(BENCH) --bench matrix_bench --features matrix
+
+## Re-emit BOTH tracked generated artifacts in benchmarks/gen/ from bench.forge through
+## the current CLI. Run this after any codegen change so the bench links current output.
+##
+## A loop over (generator, file) pairs rather than N hardcoded commands (#282): the
+## bench project now tracks `database.rs` AND `api.rs`, they come off two DIFFERENT
+## emitters (crates/codegen/src/rust.rs and .../api.rs), and a change touching only one
+## of them still has to re-emit through here. One hook, so a future regenerate-and-diff
+## guard (#285) has a single place to attach.
 bench-regen:
-	cargo run -- generate rust --schema benchmarks/bench.forge --output benchmarks/gen --force
+	@for g in rust api; do \
+		echo "regen $$g"; \
+		cargo run -q -- generate $$g --schema benchmarks/bench.forge \
+			--output benchmarks/gen --force || exit 1; \
+	done
 
 ## Re-emit every matrix config variant (benchmarks/gen/<variant>/database.rs) from
 ## bench.forge under its benchmarks/configs/<variant>.toml. Run after codegen changes.
@@ -220,16 +273,154 @@ crash-test:
 ## Index-key parity proof (#230): generate a model carrying every indexable type,
 ## compile it, and assert the monomorphic key emission is byte-identical to the
 ## `serde_json::Value` form it replaced — plus a round-trip through the real
-## generated `find_by_*`. Also #[ignore]d out of the fast suite (compiles a crate).
+## generated `find_by_*`. `f64` is the one exception: its legacy key was broken and
+## was replaced (#242), so it is asserted against its own contract, not against
+## legacy. Also #[ignore]d out of the fast suite (compiles a crate).
 index-key-parity:
 	cargo test --test index_key_parity_test -- --ignored --nocapture
+
+.PHONY: oversized-array-test
+
+## Oversized-array proof (#243): serde implements `[T; N]` only to N = 32, so a
+## `bytes(64)` or `[u32; 40]` field made the derive on the generated struct fail to
+## resolve and the whole crate failed to compile. Generates every shape past the
+## ceiling (plus an under-ceiling twin for each), compiles it, and round-trips the
+## wire form. Also #[ignore]d out of the fast suite (compiles a crate).
+oversized-array-test:
+	cargo test --test oversized_array_test -- --ignored --nocapture
+
+.PHONY: f64-index-key
+
+## f64 total-order key proof (#242): a non-finite `f64` keyed into the NULL bucket
+## (`serde_json::Number::from_f64` returns `None`), so NaN/±Inf were indistinguishable
+## from an unset optional — and `^f64` got no ordered index at all, since `f64: !Ord`.
+## Generates every f64 index shape (hash, nullable, unique, composite component),
+## compiles it, and asserts the IEEE 754 total-order encoding both separates the
+## non-finites and orders them. Also #[ignore]d out of the fast suite (compiles a crate).
+f64-index-key:
+	cargo test --test f64_index_key_test -- --ignored --nocapture
 
 .PHONY: api-wire-test
 
 ## REST wire-format proof (#229): generate + compile a real API, boot the generated
 ## router in-process, and assert the exact response bytes of every read path —
 ## envelope key order, record key order, projections, and the error bodies. Guards
-## the list path against silent wire changes from #226/#228. Also #[ignore]d out of
-## the fast suite (compiles a crate).
+## the list path against silent wire changes from #226/#228. Two tests, so two
+## generated crates: #229's baseline, plus #226's list-page guard over a schema
+## carrying a nullable string / decimal / enum / timestamp / bytes(N) / [T; N] /
+## inline struct / required FK / virtual [Model], a model whose identity field is
+## declared SECOND, and a churned model whose live rows are sparse enough to send
+## `gather_buffered` down `gather_sparse`. Also #[ignore]d out of the fast suite.
 api-wire-test:
 	cargo test --test api_wire_test -- --ignored --nocapture
+
+.PHONY: cors-test
+
+## Cross-origin proof (#140): generate + compile a real API and drive each router
+## variant through tower::oneshot. Three of #140's decisions are invisible to a
+## snapshot — that an unconfigured router still answers OPTIONS with 405 (omitting
+## the layer is NOT the same as emitting an empty one), that a preflight carrying no
+## Authorization header is answered 200 rather than 401 (the layer must sit outside
+## the tenant guard), and that a WebSocket handshake from a disallowed origin is
+## refused 403 (browsers neither preflight nor CORS-enforce a handshake). Also
+## #[ignore]d out of the fast suite (compiles a crate).
+cors-test:
+	cargo test --test cors_test -- --ignored --nocapture
+
+.PHONY: list-scan-test
+
+## List-selection proof (#228): boot the generated router over a CHURNED corpus
+## (updates leaving dead versions, deletes leaving holes) and check the ids + `total`
+## of ~20 filter/sort/pagination combinations against an independently computed
+## oracle. A snapshot compares emitted strings and cannot prove ordering, tie
+## behaviour, or which rows survive a filter — this can. Also #[ignore]d out of the
+## fast suite (compiles a crate).
+list-scan-test:
+	cargo test --test list_scan_test -- --ignored --nocapture
+
+.PHONY: list-wire-test
+
+## Benchmark-harness fidelity (#282 BDD-1/BDD-5): scenario 21's S1/S2 arms call the
+## generated page scope directly and supply the filter, comparator and index selection BY
+## HAND, mirroring what the handler derives from a query string. A mirror that admits a row
+## the handler rejects makes the whole ladder's subtractions meaningless while every arm
+## still runs and every number still looks plausible. This rebuilds the envelope both ways
+## over a freshly generated crate and compares the bytes, for all four shapes.
+##
+## The bench asserts the same thing in-run, which is stronger — but only when someone runs
+## the bench, and no baseline or CI job does. Also #[ignore]d out of the fast suite.
+list-wire-test:
+	cargo test --test list_wire_parity_test -- --ignored --nocapture
+
+.PHONY: page-identity-test
+
+## Page-construction-site identity (#281): #281 adds a SECOND place that builds a
+## `<Model>PageRef` — `__with_fast_page`, which skips the scan for an unfiltered,
+## unsorted request — and its whole contract is that it is indistinguishable from
+## `__with_page`. That is what makes it safe and what makes it hard to test: no wire
+## test can tell the two apart. So this compares them against EACH OTHER, byte for
+## byte, over a grid of (offset, limit) windows on a churned 1,000+-row corpus of
+## every field class. A frozen literal catches a change that moves both sites; only
+## this catches one that moves one. #[ignore]d out of the fast suite (compiles and
+## runs a crate).
+page-identity-test:
+	cargo test --test page_identity_test -- --ignored --nocapture
+
+.PHONY: auto-increment-test
+
+## Integer auto-increment proof (#187): the `+u32`/`+u64` counter is a value handed
+## out over time — across a compaction, a reopen, a rollback, threads, and separate
+## processes — so every property it promises is a property of what generated code
+## DOES, which a snapshot cannot see. Covers monotonicity, the `0` sentinel, the
+## deliberate gap on rollback, restart safety, the compaction high-water mark (the
+## one that fails silently), overflow refusal, Tier-2 concurrency, and the Tier-3
+## multi-process case that makes RFC #187's identity-or-`&unique` rule meaningful.
+## Also #[ignore]d out of the fast suite (compiles a crate; the second spawns
+## `forgedb coordinate` plus two writer processes).
+auto-increment-test:
+	cargo test --test auto_increment_test -- --ignored --nocapture
+	cargo test --test auto_increment_coordinated_test -- --ignored --nocapture
+	cargo test --test sequence_claim_test -- --ignored --nocapture
+
+.PHONY: scripts-typecheck
+
+## Typecheck the root-level repo tooling in scripts/. The scripts run under bun with no
+## install step; the deps are types only, so this is the one thing that needs them.
+scripts-typecheck:
+	@$(BUN) install --cwd scripts
+	@(cd scripts && $(BUN) x tsc --noEmit)
+
+.PHONY: cycle-scope
+
+## Cycle-scope gate: does this work belong in the release cycle currently in flight?
+## `develop` carries ONE cycle at a time, so work milestoned for a later version must wait
+## on its own branch. The cycle is derived (lowest open v* milestone), never configured.
+##
+##   make cycle-scope ISSUE=245        before merging a branch locally into develop
+##   make cycle-scope ISSUE=233,245    several at once
+##   make cycle-scope PR=250           what CI runs on PRs targeting develop
+##
+## Portable form: ai-pm-playbook §5.3 (PM008/PM009).
+cycle-scope:
+ifdef PR
+	@$(BUN) scripts/check-cycle-scope.ts --pr $(PR)
+else ifdef ISSUE
+	@$(BUN) scripts/check-cycle-scope.ts --issue $(ISSUE)
+else
+	@echo "usage: make cycle-scope ISSUE=<n[,n...]>   (or PR=<n>)"; exit 2
+endif
+
+.PHONY: experiment-261
+
+## Experiment #261 — inline `string(N)` slot vs pointer indirection, the gate on
+## #238's soft form. Runs the full capacity x overflow-length x mix grid, then
+## renders the SVG figures and rasterizes them. Detached crate: it measures the
+## storage substrate directly and must not pull in benchmarks/'s comparative-DB
+## deps. See benchmarks/experiments/261/README.md; the verdict lives on the issue.
+experiment-261:
+	@(cd benchmarks/experiments/261 && \
+	  mkdir -p results && \
+	  cargo run --release -- target/data > results/raw.json && \
+	  $(BUN) plot.ts && \
+	  $(BUN) svg2png.ts results/grid.svg results/grid.png && \
+	  $(BUN) svg2png.ts results/summary.svg results/summary.png)

@@ -1,0 +1,3 @@
+# Build output and the multi-gigabyte column files the grid materializes per
+# config. `results/` IS tracked — the measurements and figures are the point.
+/target/

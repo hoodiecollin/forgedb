@@ -75,7 +75,7 @@ Install the CLI however your stack prefers — a shell one-liner, Homebrew, npm/
 
 ### Query capability
 
-- Scalar, foreign-key, and composite (`@index(a,b)`) indexes are **hash exact-match** — they answer `field = value` and `a = ? AND b = ?`. Ordered-eligible fields (`u32`/`u64`/`i32`/`i64`/`timestamp`/`decimal`) additionally answer range and top-N queries via `find_by_<field>_range(min, max, descending, limit)`. Still deferred: prefix search, `f64`/nullable ordered indexes, the snapshot (`_at`) ordered form, and many-to-many junction lookups (still linear scans).
+- Scalar, foreign-key, and composite (`@index(a,b)`) indexes are **hash exact-match** — they answer `field = value` and `a = ? AND b = ?`. Ordered-eligible fields (`u32`/`u64`/`i32`/`i64`/`f64`/`timestamp`/`decimal`) additionally answer range and top-N queries via `find_by_<field>_range(min, max, descending, limit)`. Still deferred: prefix search, nullable ordered indexes, the snapshot (`_at`) ordered form, and many-to-many junction lookups (still linear scans).
 
 ### Operations
 

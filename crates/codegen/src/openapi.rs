@@ -16,7 +16,7 @@
 //! engine. It reads the compile-time schema and emits a tailored document; it
 //! ships nothing that interprets a schema at runtime.
 
-use crate::{GeneratedCode, Result};
+use crate::{GeneratedCode, Result, RustGenerator};
 use forgedb_parser::{FieldType, Model, RelationType, Schema, Struct};
 use serde_json::{json, Map, Value};
 
@@ -50,7 +50,7 @@ impl OpenApiGenerator {
         // Component schemas: one per model, plus one per inline struct a model
         // field may `$ref`.
         for st in &schema.structs {
-            schemas.insert(st.name.clone(), Self::struct_schema(st));
+            schemas.insert(st.name.clone(), Self::struct_schema(schema, st));
         }
         // One string-enum component schema per declared enum (#enum): a field of
         // that type `$ref`s it, exactly like a struct.
@@ -58,7 +58,7 @@ impl OpenApiGenerator {
             schemas.insert(en.name.clone(), Self::enum_schema(en));
         }
         for model in &schema.models {
-            schemas.insert(model.name.clone(), Self::model_schema(model));
+            schemas.insert(model.name.clone(), Self::model_schema(schema, model));
         }
 
         json!({
@@ -187,13 +187,13 @@ impl OpenApiGenerator {
     }
 
     /// Component schema for a model: the stored/serialized scalar and FK fields.
-    fn model_schema(model: &Model) -> Value {
-        Self::object_schema(&model.name, &model.fields)
+    fn model_schema(schema: &Schema, model: &Model) -> Value {
+        Self::object_schema(schema, &model.name, &model.fields)
     }
 
     /// Component schema for an inline struct (all fields are fixed-size scalars).
-    fn struct_schema(st: &Struct) -> Value {
-        Self::object_schema(&st.name, &st.fields)
+    fn struct_schema(schema: &Schema, st: &Struct) -> Value {
+        Self::object_schema(schema, &st.name, &st.fields)
     }
 
     /// Component schema for a declared enum (#enum): a string with the closed set
@@ -215,15 +215,15 @@ impl OpenApiGenerator {
     /// carry no data payload (one-to-many / many-to-many collections and
     /// component references — they serialize to `null` and are never part of a
     /// create/replace body). Non-nullable fields are marked `required`.
-    fn object_schema(name: &str, fields: &[forgedb_parser::Field]) -> Value {
+    fn object_schema(schema: &Schema, name: &str, fields: &[forgedb_parser::Field]) -> Value {
         let mut properties = Map::new();
         let mut required: Vec<Value> = Vec::new();
 
         for field in fields {
-            let Some(schema) = Self::field_schema(&field.field_type) else {
+            let Some(prop) = Self::field_schema(schema, &field.field_type) else {
                 continue; // virtual / component field — not represented in the body
             };
-            properties.insert(field.name.clone(), schema);
+            properties.insert(field.name.clone(), prop);
             if !field.is_nullable() {
                 required.push(Value::String(field.name.clone()));
             }
@@ -244,7 +244,7 @@ impl OpenApiGenerator {
 
     /// Map a field type to its OpenAPI schema, or `None` for virtual fields that
     /// have no serialized data value.
-    fn field_schema(field_type: &FieldType) -> Option<Value> {
+    fn field_schema(schema: &Schema, field_type: &FieldType) -> Option<Value> {
         Some(match field_type {
             FieldType::U32 => json!({ "type": "integer", "format": "int32", "minimum": 0 }),
             FieldType::U64 => json!({ "type": "integer", "format": "int64", "minimum": 0 }),
@@ -253,20 +253,38 @@ impl OpenApiGenerator {
             FieldType::F64 => json!({ "type": "number", "format": "double" }),
             FieldType::Bool => json!({ "type": "boolean" }),
             FieldType::String => json!({ "type": "string" }),
+            // #238: an inline `string(N)` is a *string* on the wire — its fixed
+            // slot is a storage fact, invisible to a client. The width is the
+            // one thing worth publishing, and it is a CHARACTER count, which is
+            // exactly what OpenAPI's `maxLength` means. The exact form pins
+            // `minLength` to the same number.
+            FieldType::StringN { chars, exact } => {
+                let n = *chars as u64;
+                if *exact {
+                    json!({ "type": "string", "minLength": n, "maxLength": n })
+                } else {
+                    json!({ "type": "string", "maxLength": n })
+                }
+            }
             // `json` accepts any JSON value. In JSON Schema 2020-12 an empty
             // schema validates everything; keep a description for readability.
             FieldType::Json => json!({ "description": "Arbitrary JSON value" }),
             // decimal serializes as a precision-preserving JSON string.
             FieldType::Decimal => json!({ "type": "string", "format": "decimal" }),
             FieldType::Uuid => json!({ "type": "string", "format": "uuid" }),
-            FieldType::Timestamp => json!({
-                "type": "integer",
-                "format": "int64",
-                "description": "Unix timestamp"
+            // #254: RFC 3339 on the wire — a strictly better contract than
+            // `format: int64`, and one every OpenAPI client already understands.
+            FieldType::Timestamp(p) => json!({
+                "type": "string",
+                "format": "date-time",
+                "description": format!(
+                    "RFC 3339 instant, declared precision `{}` (stored as microseconds)",
+                    p.key()
+                )
             }),
             // char(N) serializes as an N-byte array (`[u8; N]`), so it is a
             // fixed-length array of bytes on the wire, not a string.
-            FieldType::Char(n) => json!({
+            FieldType::Bytes(n) => json!({
                 "type": "array",
                 "items": { "type": "integer", "minimum": 0, "maximum": 255 },
                 "minItems": *n,
@@ -274,7 +292,7 @@ impl OpenApiGenerator {
                 "description": format!("Fixed {}-byte array", n)
             }),
             FieldType::FixedArray(inner, n) => {
-                let items = Self::field_schema(inner)?;
+                let items = Self::field_schema(schema, inner)?;
                 json!({
                     "type": "array",
                     "items": items,
@@ -294,21 +312,39 @@ impl OpenApiGenerator {
                 })
             }
             FieldType::Nullable(inner) => {
-                let mut schema = Self::field_schema(inner)?;
-                Self::make_nullable(&mut schema);
-                schema
+                let mut inner_schema = Self::field_schema(schema, inner)?;
+                Self::make_nullable(&mut inner_schema);
+                inner_schema
             }
+            // #266: an FK serializes as the TARGET's identity value, so its
+            // schema is the target key's schema.  Describing every FK as
+            // `{"type":"string","format":"uuid"}` was not merely unhelpful for a
+            // `u64` key — the server sends a JSON number, so the document lied.
             FieldType::Relation(rel) => match rel {
-                RelationType::RequiredReference(target) => json!({
-                    "type": "string",
-                    "format": "uuid",
-                    "description": format!("Foreign key → {}", target)
-                }),
-                RelationType::OptionalReference(target) => json!({
-                    "type": ["string", "null"],
-                    "format": "uuid",
-                    "description": format!("Foreign key → {}", target)
-                }),
+                RelationType::RequiredReference(target)
+                | RelationType::OptionalReference(target) => {
+                    let optional = matches!(rel, RelationType::OptionalReference(_));
+                    // An unresolvable target is a validation error; fall back to
+                    // the pre-#266 shape rather than dropping the property.
+                    let key = RustGenerator::fk_backing_type(schema, field_type)
+                        .unwrap_or(FieldType::Uuid);
+                    // Optionality is applied here, so the key is unwrapped first.
+                    let key = match key {
+                        FieldType::Nullable(inner) => *inner,
+                        k => k,
+                    };
+                    let mut fk = Self::field_schema(schema, &key)?;
+                    if optional {
+                        Self::make_nullable(&mut fk);
+                    }
+                    if let Some(obj) = fk.as_object_mut() {
+                        obj.insert(
+                            "description".to_string(),
+                            Value::String(format!("Foreign key → {}", target)),
+                        );
+                    }
+                    fk
+                }
                 // Virtual collections have no scalar body value.
                 RelationType::OneToMany(_) | RelationType::ManyToMany(_) => return None,
             },

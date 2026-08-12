@@ -275,6 +275,31 @@ enum MigrateCommands {
         bin_dir: Option<std::path::PathBuf>,
     },
 
+    /// Migrate a data dir across a ForgeDB **byte-format generation** (#254).
+    ///
+    /// Orthogonal to the schema-version transformer: `migrate up` replays the
+    /// app's own `migrations/` lineage, this replays ForgeDB's engine
+    /// generations.  An engine bump changes no `.forge`, so it produces no
+    /// lineage hop and `migrate up` would run nothing.  The app must be STOPPED.
+    Engine {
+        /// Source data directory (at the old engine generation)
+        #[arg(long)]
+        src: std::path::PathBuf,
+
+        /// Destination directory to materialize (must not exist / be empty)
+        #[arg(long)]
+        dest: std::path::PathBuf,
+
+        /// Schema file (default: auto-discovered).  The SAME schema is baked on
+        /// both sides — an engine bump changes no `.forge`.
+        #[arg(long)]
+        schema: Option<std::path::PathBuf>,
+
+        /// Where to emit + build the hop crate (default: migrations/engine)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
+    },
+
     /// One-CLI migration: build the transformer + run it over a data dir (or every
     /// tenant dir under --tenant-root).  The app must be STOPPED.  #74 Phase 4.
     Up {
@@ -591,6 +616,17 @@ fn run(cli: Cli) -> Result<()> {
                     bin_dir,
                 })
             }
+            MigrateCommands::Engine {
+                src,
+                dest,
+                schema,
+                output,
+            } => commands::migrate::engine(commands::migrate::MigrateEngineOptions {
+                src,
+                dest,
+                schema,
+                output,
+            }),
             MigrateCommands::Up {
                 from,
                 to,

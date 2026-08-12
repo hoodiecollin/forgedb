@@ -254,15 +254,16 @@ or a dangling foreign key returns **409**.
 
 <Callout type="note" title="Create contract">
 Both the Rust `db.create_<model>` path and the REST `POST /api/<model>` that routes through
-it **auto-generate `+uuid` and `+timestamp` fields**: omit `id`/`created_at` from the JSON
-body (or send a nil/zero value) and the server fills them. You still send the concrete
-scalar fields plus virtual relation fields as `null` (e.g. `"posts":null`). The generated TS
-SDK's `<Model>Create` type omits `id` (server-assigned).
+it **auto-generate every `+` field** — `uuid`, `timestamp`, and integer `u32`/`u64`: omit
+`id`/`created_at` from the JSON body (or send a nil/zero/`0` value) and the server fills them.
+You still send the concrete scalar fields plus virtual relation fields as `null` (e.g.
+`"posts":null`).
 
-Two honest caveats: integer `+u32`/`+u64` keys are **not** yet auto-incremented, so a create
-must supply them; and beyond `id`, the SDK's typed `Create` body still lists the other `+`
-fields for now ([#187](https://github.com/hoodiecollin/forgedb/issues/187),
-[#188](https://github.com/hoodiecollin/forgedb/issues/188)).
+One honest caveat: the generated **TypeScript** SDK computes its `<Model>Create` type as
+`Omit<Model, 'id'>` — keyed on the literal name `id` rather than on what the server actually
+synthesizes. So it still lists the other `+` fields, and it drops `id` even for a model whose
+identity is not server-assigned. The Rust, Python, and Go SDKs derive the create shape
+correctly ([#259](https://github.com/hoodiecollin/forgedb/issues/259)).
 </Callout>
 
 Full route set per model: `GET /api/<model>` (list, with `?limit&offset&sort&<field>=`),

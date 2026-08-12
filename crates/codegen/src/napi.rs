@@ -244,7 +244,7 @@ impl NapiGenerator {
         schema
             .models
             .iter()
-            .filter(|m| m.fields.iter().any(|f| f.name == "id" || f.auto_generate))
+            .filter(|m| m.has_identity())
     }
 
     /// Whether a field type is a virtual relation (no stored column).
@@ -273,7 +273,7 @@ impl NapiGenerator {
     /// * Nullable/optional → `Option<inner_napi_type>`
     ///
     /// Returns `None` for virtual relation fields (no stored column → excluded).
-    fn napi_field_type(field_type: &forgedb_parser::FieldType) -> Option<TokenStream> {
+    fn napi_field_type(schema: &Schema, field_type: &forgedb_parser::FieldType) -> Option<TokenStream> {
         use forgedb_parser::{FieldType, RelationType};
         match field_type {
             // Virtual relation fields carry no stored value.
@@ -290,15 +290,19 @@ impl NapiGenerator {
             FieldType::F64 => Some(quote! { f64 }),
             FieldType::Bool => Some(quote! { bool }),
 
-            // String-typed fields.
-            FieldType::String => Some(quote! { String }),
+            // String-typed fields. #238: an inline `string(N)` is a `String` in
+            // the generated record and a string on every wire.
+            FieldType::String | FieldType::StringN { .. } => Some(quote! { String }),
 
             // uuid serializes as a hyphenated string in serde.
             FieldType::Uuid => Some(quote! { String }),
 
-            // timestamp (`forgedb_types::Timestamp` newtype over i64) serializes
-            // as i64 in serde.
-            FieldType::Timestamp => Some(quote! { i64 }),
+            // timestamp serializes as an RFC 3339 string since #254.  This has
+            // to track serde, not the in-memory representation: the async ops
+            // return raw `serde_json::Value`, so a typed struct that disagreed
+            // would give the same field two shapes depending on which method
+            // was called.
+            FieldType::Timestamp(_) => Some(quote! { String }),
 
             // decimal serializes as a string (serde-with-str feature).
             FieldType::Decimal => Some(quote! { String }),
@@ -311,11 +315,11 @@ impl NapiGenerator {
 
             // char(N) is [u8; N] in the generated struct; serde serializes as an
             // array of u8 integers; napi maps Vec<u8> to a JS Buffer.
-            FieldType::Char(_) => Some(quote! { Vec<u8> }),
+            FieldType::Bytes(_) => Some(quote! { Vec<u8> }),
 
             // FixedArray — map element type recursively.
             FieldType::FixedArray(inner, _) => {
-                let inner_ty = Self::napi_field_type(inner)?;
+                let inner_ty = Self::napi_field_type(schema, inner)?;
                 Some(quote! { Vec<#inner_ty> })
             }
 
@@ -326,15 +330,16 @@ impl NapiGenerator {
                 Some(quote! { serde_json::Value })
             }
 
-            // FK scalars: both store a UUID → String (matching serde's uuid output).
-            FieldType::Relation(RelationType::RequiredReference(_)) => Some(quote! { String }),
-            FieldType::Relation(RelationType::OptionalReference(_)) => {
-                Some(quote! { Option<String> })
-            }
+            // #266: an FK surfaces with the SAME JS type as the target's own
+            // `id`. Hardcoding `String` compiled for a `u64` key and shipped an
+            // object whose `post` was `"42"` beside a `Post.id` of `42`.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::napi_field_type(schema, &RustGenerator::resolved_type(schema, field_type)),
 
             // Nullable wraps the inner mapped type.
             FieldType::Nullable(inner) => {
-                let inner_ty = Self::napi_field_type(inner)?;
+                let inner_ty = Self::napi_field_type(schema, inner)?;
                 Some(quote! { Option<#inner_ty> })
             }
 
@@ -345,7 +350,7 @@ impl NapiGenerator {
 
     /// Generate the conversion expression from a `database::<Model>` field
     /// (`source.#field_name`) to the corresponding napi object field value.
-    fn napi_field_conv(
+    fn napi_field_conv(schema: &Schema, 
         field_type: &forgedb_parser::FieldType,
         field_name: &proc_macro2::Ident,
     ) -> TokenStream {
@@ -364,14 +369,16 @@ impl NapiGenerator {
             // counts; the serde path also truncates via JSON number).
             FieldType::U64 => quote! { __src.#field_name as i64 },
 
-            // String — clone (String → String).
-            FieldType::String => quote! { __src.#field_name.clone() },
+            // String — clone (String → String). `string(N)` too (#238).
+            FieldType::String | FieldType::StringN { .. } => {
+                quote! { __src.#field_name.clone() }
+            }
 
             // uuid → hyphenated string (matches serde's `Serialize for Uuid`).
             FieldType::Uuid => quote! { __src.#field_name.to_string() },
 
-            // timestamp → i64 (the `Timestamp` newtype wraps i64; `From<Timestamp> for i64`).
-            FieldType::Timestamp => quote! { i64::from(__src.#field_name) },
+            // timestamp → its RFC 3339 rendering (#254), matching serde.
+            FieldType::Timestamp(_) => quote! { __src.#field_name.to_string() },
 
             // decimal → string (matches serde-with-str).
             FieldType::Decimal => quote! { __src.#field_name.to_string() },
@@ -385,7 +392,7 @@ impl NapiGenerator {
             FieldType::Json => quote! { __src.#field_name.clone() },
 
             // char(N): [u8; N] → Vec<u8>.
-            FieldType::Char(_) => quote! { __src.#field_name.to_vec() },
+            FieldType::Bytes(_) => quote! { __src.#field_name.to_vec() },
 
             // FixedArray: [T; N] → Vec<napi_type(T)>.
             FieldType::FixedArray(inner, _) => {
@@ -398,15 +405,15 @@ impl NapiGenerator {
                 quote! { serde_json::to_value(&__src.#field_name).unwrap_or_default() }
             }
 
-            // Required FK (Uuid) → hyphenated string.
-            FieldType::Relation(RelationType::RequiredReference(_)) => {
-                quote! { __src.#field_name.to_string() }
-            }
-
-            // Optional FK (Option<Uuid>) → Option<String>.
-            FieldType::Relation(RelationType::OptionalReference(_)) => {
-                quote! { __src.#field_name.map(|__u| __u.to_string()) }
-            }
+            // #266: convert through the target key's own arm, so the FK and the
+            // target's `id` can never disagree.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::napi_field_conv(
+                schema,
+                &RustGenerator::resolved_type(schema, field_type),
+                field_name,
+            ),
 
             // Nullable(inner) → Option<inner_conv>.
             FieldType::Nullable(inner) => {
@@ -426,13 +433,15 @@ impl NapiGenerator {
     ) -> TokenStream {
         use forgedb_parser::FieldType;
         match inner {
-            FieldType::String => quote! { __src.#field_name.clone() },
+            FieldType::String | FieldType::StringN { .. } => {
+                quote! { __src.#field_name.clone() }
+            }
             FieldType::U32 | FieldType::I32 | FieldType::I64 | FieldType::F64 | FieldType::Bool => {
                 quote! { __src.#field_name }
             }
             FieldType::U64 => quote! { __src.#field_name.map(|__v| __v as i64) },
             FieldType::Uuid => quote! { __src.#field_name.map(|__u| __u.to_string()) },
-            FieldType::Timestamp => quote! { __src.#field_name.map(|__t| i64::from(__t)) },
+            FieldType::Timestamp(_) => quote! { __src.#field_name.map(|__t| __t.to_string()) },
             FieldType::Decimal => quote! { __src.#field_name.map(|__d| __d.to_string()) },
             FieldType::Enum(_) => {
                 quote! {
@@ -443,7 +452,7 @@ impl NapiGenerator {
                 }
             }
             FieldType::Json => quote! { __src.#field_name.clone() },
-            FieldType::Char(_) => quote! { __src.#field_name.map(|__b| __b.to_vec()) },
+            FieldType::Bytes(_) => quote! { __src.#field_name.map(|__b| __b.to_vec()) },
             FieldType::StructType(_) | FieldType::OptionalStructType(_) => {
                 quote! { __src.#field_name.as_ref().map(|__s| serde_json::to_value(__s).unwrap_or_default()) }
             }
@@ -485,7 +494,7 @@ impl NapiGenerator {
                     .filter(|f| !Self::is_virtual_relation(&f.field_type))
                     .filter_map(|f| {
                         let fname = format_ident!("{}", f.name);
-                        let ty = Self::napi_field_type(&f.field_type)?;
+                        let ty = Self::napi_field_type(schema, &f.field_type)?;
                         // Pin the JS key to the exact `.forge` field name. Without this,
                         // `#[napi(object)]` camelCases multi-word fields (`view_count` ->
                         // `viewCount`), which would diverge from the serde snake_case wire
@@ -505,8 +514,8 @@ impl NapiGenerator {
                     .filter(|f| !Self::is_virtual_relation(&f.field_type))
                     .filter_map(|f| {
                         let fname = format_ident!("{}", f.name);
-                        let _ = Self::napi_field_type(&f.field_type)?; // skip excluded
-                        let conv = Self::napi_field_conv(&f.field_type, &fname);
+                        let _ = Self::napi_field_type(schema, &f.field_type)?; // skip excluded
+                        let conv = Self::napi_field_conv(schema, &f.field_type, &fname);
                         Some(quote! { #fname: #conv })
                     })
                     .collect();
@@ -546,7 +555,7 @@ impl NapiGenerator {
                 let model_ident = format_ident!("{}", model.name);
                 let napi_ident = format_ident!("Napi{}", model.name);
                 let storage = format_ident!("{}", snake);
-                let id_ty = RustGenerator::id_type_tokens(model);
+                let id_ty = RustGenerator::id_type_tokens(schema, model);
 
                 let create_fn = format_ident!("create_{}", snake);
                 let update_fn = format_ident!("update_{}", snake);
@@ -756,8 +765,8 @@ impl NapiGenerator {
         // --- A. Forward FK getters (`*Target` / `?Target`) --------------------
         for model in &schema.models {
             let model_snake = RustGenerator::to_snake_case(&model.name);
-            let model_has_id = model.fields.iter().any(|f| f.name == "id" || f.auto_generate);
-            let source_id_ty = RustGenerator::id_type_tokens(model);
+            let model_has_id = model.has_identity();
+            let source_id_ty = RustGenerator::id_type_tokens(schema, model);
             let storage = format_ident!("{}", model_snake);
             for field in &model.fields {
                 let target_name = match &field.field_type {
@@ -768,9 +777,6 @@ impl NapiGenerator {
                 let Some(target) = schema.find_model(target_name) else {
                     continue;
                 };
-                if !RustGenerator::is_uuid_pk(target) {
-                    continue;
-                }
                 let method_name = format!("{model_snake}_{}", field.name);
                 if !seen.insert(method_name.clone()) {
                     continue;
@@ -819,9 +825,6 @@ impl NapiGenerator {
             let Some(parent) = schema.find_model(&p.parent_model) else {
                 continue;
             };
-            if !RustGenerator::is_uuid_pk(parent) {
-                continue;
-            }
             let ambiguous = group_counts
                 .get(&(p.parent_model.clone(), p.parent_field.clone()))
                 .is_some_and(|&c| c > 1);
@@ -843,6 +846,8 @@ impl NapiGenerator {
             };
             let method_ident = format_ident!("{}", method_name);
             let napi_child = format_ident!("Napi{}", child.name);
+            // #266: the id arrives as the PARENT's own key type.
+            let parent_id_ty = RustGenerator::id_type_tokens(schema, parent);
             let doc = format!(
                 "All `{}` whose `{}` references the given `{}` id.",
                 p.child_model, p.child_field, p.parent_model
@@ -851,7 +856,7 @@ impl NapiGenerator {
                 #[doc = #doc]
                 #[napi]
                 pub fn #method_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_child>> {
-                    let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
+                    let id: #parent_id_ty = env.from_js_value(id).map_err(to_napi_err)?;
                     let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#method_ident(id))) {
                         Ok(rows) => rows,
                         Err(p) => return Err(panic_to_napi_err(p)),
@@ -865,6 +870,8 @@ impl NapiGenerator {
         for m in RustGenerator::valid_m2m(schema) {
             let snake1 = RustGenerator::to_snake_case(&m.model1);
             let snake2 = RustGenerator::to_snake_case(&m.model2);
+            // #266: each junction endpoint decodes as its OWN identity type.
+            let (lk, rk) = RustGenerator::junction_key_idents(schema, &m);
 
             // link_<a>_<b>
             let link_name = format!("link_{snake1}_{snake2}");
@@ -875,8 +882,8 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #link_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<()> {
-                        let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
-                        let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
+                        let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
+                        let right: #rk = env.from_js_value(right).map_err(to_napi_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.write().#link_ident(left, right))) {
                             Ok(()) => Ok(()),
                             Err(p) => Err(panic_to_napi_err(p)),
@@ -894,8 +901,8 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #unlink_ident(&self, env: Env, left: JsUnknown, right: JsUnknown) -> Result<bool> {
-                        let left: Uuid = env.from_js_value(left).map_err(to_napi_err)?;
-                        let right: Uuid = env.from_js_value(right).map_err(to_napi_err)?;
+                        let left: #lk = env.from_js_value(left).map_err(to_napi_err)?;
+                        let right: #rk = env.from_js_value(right).map_err(to_napi_err)?;
                         match catch_unwind(AssertUnwindSafe(|| self.write().#unlink_ident(left, right))) {
                             Ok(removed) => Ok(removed),
                             Err(p) => Err(panic_to_napi_err(p)),
@@ -914,7 +921,7 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #fwd_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_b>> {
-                        let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
+                        let id: #lk = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#fwd_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
@@ -934,7 +941,7 @@ impl NapiGenerator {
                     #[doc = #doc]
                     #[napi]
                     pub fn #rev_ident(&self, env: Env, id: JsUnknown) -> Result<Vec<#napi_a>> {
-                        let id: Uuid = env.from_js_value(id).map_err(to_napi_err)?;
+                        let id: #rk = env.from_js_value(id).map_err(to_napi_err)?;
                         let rows = match catch_unwind(AssertUnwindSafe(|| self.read().#rev_ident(id))) {
                             Ok(rows) => rows,
                             Err(p) => return Err(panic_to_napi_err(p)),
@@ -969,7 +976,7 @@ impl NapiGenerator {
             let snake = RustGenerator::to_snake_case(&model.name);
             let storage = format_ident!("{}", snake);
             for field in &model.fields {
-                let Some(fmt) = RustGenerator::arrow_export_format(&field.field_type) else {
+                let Some(fmt) = RustGenerator::arrow_export_format(schema, &field.field_type) else {
                     continue;
                 };
                 let method_ident = format_ident!("{}_{}_arrow", snake, field.name);
@@ -1036,15 +1043,14 @@ name = "forgedb"
 crate-type = ["cdylib"]
 
 [dependencies]
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"
 forgedb-txn = "0.1"
 forgedb-coordinator = "0.2"
 forgedb-query-params = "0.1"
-forgedb-auth = "0.1"
 regex = "1"
 rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
 serde = {{ version = "1", features = ["derive"] }}

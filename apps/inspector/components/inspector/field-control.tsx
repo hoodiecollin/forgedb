@@ -42,7 +42,7 @@ const SCALAR_NULLABLE = new Set([
   "int",
   "bigint",
   "float",
-  "char",
+  "bytes",
   "ts",
 ]);
 
@@ -191,7 +191,7 @@ export function FieldControl({
             />
           ) : null}
 
-          {c === "char" ? (
+          {c === "bytes" ? (
             <div className="relative">
               <Input
                 value={val(field.value)}

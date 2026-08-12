@@ -222,15 +222,15 @@ The root `forgedb` crate is now published **with** that `lsp` feature (2026-07-2
   `query-params` (#90) is now **wired**: a schema-agnostic query-string parser (URL → generic
   `Filter`/`Sort`/`Pagination`) that the generated `api.rs` list endpoint links against — it interprets no
   schema (all field-aware filter/sort is generated per-model), so it is class-1 substrate the generated code
-  links against, like `changefeed`/`auth`. Generated code requires it; **published 0.1.0 (2026-07-10)**.
+  links against, like `changefeed`/`auth`. Generated code requires it, and it is published.
   `backup` (#57) is a **class-1 substrate** peer to `compaction`: lock-free full-snapshot
   create/restore over a data dir as opaque bytes (reads per-model `manifest.json` + column
   files, never the `.forge` schema).
   `changefeed` (#62 Direction A) is a **class-1 substrate** the *generated code links against*
   (like `storage`/`wal`, not like the internal-only crates above): a field-blind
-  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. **Published
-  0.1.0 (2026-07-07)**; the scaffold pins `forgedb-changefeed = "0.1"`. It never decodes a field;
-  generated code routes by model name and materializes typed events.
+  `tokio::sync::broadcast` of `ChangeEvent { model: &'static str, row_index, kind }`. Published; the
+  scaffold pins it by major (derive both numbers — see the *Workspace layout* note). It never decodes
+  a field; generated code routes by model name and materializes typed events.
 
 Deeper docs live in `docs/` (`ARCHITECTURE.md`, `PUBLIC_CRATES.md`,
 `DEVELOPMENT.md`, `PUBLISHING.md`, `CONTRIBUTING.md`).
@@ -256,21 +256,64 @@ Codegen uses `quote!`/`prettyplease` for Rust output and is snapshot-tested with
 
 ## Schema language quick reference
 
-Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case.
-Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — but only
-`uuid`/`timestamp` are actually synthesized on create; integer `+u32`/`+u64` parse+mark but are
-NOT auto-incremented, RFC #187), `&`
+Naming is **parser-enforced (fatal)**: models/structs PascalCase, fields snake_case. Every model
+must also have an **identity field** — named `id`, or any `+` auto-generate field — which is
+likewise fatal (#248); convention is `id: +uuid`. `id` wins by **name** over a `+` field declared
+above it (#254 — the single-pass `find` this used to be silently mis-keyed a model whose stamp
+came first). Both halves of "what is the identity" now have exactly ONE definition, on the AST
+(#251): `Model::identity_field` picks the field (`id` by name, else the first `+`) — it was
+open-coded 31× across 8 files — and `FieldType::is_identity_key` names the admitted **type**
+allow-list: `uuid`, `u32`/`u64`/`i32`/`i64`, `timestamp(s|ms|us)` (incl. `+timestamp`, `id`-only),
+`string(N)`/`string(N!)`, plus a required FK `*Model` (admitted by resolving through, #266).
+Anything else is ONE positioned error naming the field + the allowed set: bare `string`, `bytes(N)`,
+`f64`, `bool`, `decimal`, `json`, enum, struct, `[T; N]`, any nullable incl. `?Model`, `[Model]`.
+The m2m endpoint rule is not a second check — `is_junction_key` **delegates** to `is_identity_key`,
+and #252's two `string` rows were folded into the allow-list rather than placed beside it (one
+mistake, one diagnostic). `tests/identity_predicate_test.rs` greps the tree and fails the build if
+either predicate is open-coded again.
+Modifiers (prefix, before the type): `+` auto-generate (u32/u64/uuid/timestamp only — all four
+are synthesized on create; integer `+u32`/`+u64` allocate from a per-field counter seeded by an
+ungated reopen scan and floored by `Manifest.auto_sequences`, #187. Every shape is valid — a
+cross-process double-allocation is a detected conflict via one of three opaque write-set key
+classes: `b"r"` (identity), `b"u"` (`&unique`), `b"s"` (a bare integer auto, #260). `0` is the
+allocate sentinel, so it cannot be inserted explicitly), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
-FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid/timestamp`, `char(N)` — **there is no
-`text`**. `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
+FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid`, `timestamp` / `timestamp(s|ms|us)`
+(#254 — an instant; storage is ALWAYS `i64` **microseconds**, the declared key is the *quantum*
+a written value is floored to and an allocated identity advances by; bare = `ms`; no `ns`. Wire
+form is the **RFC 3339 string** on every serde surface — JSON, TS SDK, OpenAPI `date-time`, the
+three REST SDKs, REST filter params — but NOT the index key, which stays the stored number so the
+order stays numeric. An instant outside RFC 3339's `0000`–`9999` is a 422. `id: +timestamp(us)` is
+a legal identity: it must be named `id` (148/148 corpus `+timestamp` fields are stamps) and must be
+`us` (uniqueness comes from the monotonic allocator `next = max(now, last+1)`, never from the
+clock, and a coarser quantum runs the counter further ahead of the wall clock). The engine's own
+byte-format generation is `Manifest.engine_version`, orthogonal to the app's `schema_version`
+(on-disk key `format_version`); `forgedb migrate engine` carries a dir across it with a
+**generated** hop crate — a schema-blind column pass cannot see the 81/247 corpus timestamp fields
+that are nullable), `bytes(N)` (raw fixed-size bytes,
+NOT text; `char(N)` is the deprecated spelling and warns — #233; `bytes` is a *contextual*
+keyword, so it is still usable as a field name) — **there is no
+`text`**. `string(N)` / `string(N!)` (#238) are the same `String` on every wire as bare `string`, but occupy a
+fixed row slot instead of the variable column: N counts **characters**, `!` means *exactly* N (bare = at most),
+1..=255, ASCII at one byte/char unless the field carries `@utf8` (four) — a non-ASCII value without it is a 422.
+There is no overflow path (experiment #261 measured inline-or-overflow losing 198/200). Length directives are
+refused on it (the width IS the bound); `@min`/`@length(min:)` survive on the non-exact form only; above 64 chars
+it warns and still generates. Not embeddable in a `struct`/`[T; N]` (the Rust value is a heap `String`). **In a KEY
+position it is a `forgedb_types::InlineStr<N>` instead — `Copy`, one byte/char, serde as a plain string (#252):** an
+identity (`id: string(26!)`), an FK that resolves to one, and a junction endpoint. A key's value must be RFC 3986
+`pchar` minus `%` (so the URL path segment is byte-identical to the key) and non-empty, both enforced at write (422);
+`@utf8` on an identity is a schema error, and a bare `string` identity is refused (a key cannot be variable-width and
+stay `Copy`). `json` (→ `serde_json::Value`, rides the variable-length string column; NOT indexable/filterable/
 sortable — no total order); `decimal` (→ `rust_decimal::Decimal`, exact fixed-point on the 16-byte column, string
 serde, IS indexable/sortable via a scale-invariant normalized key — `decimal(p,s)` precision/scale deferred). Enums:
 top-level `enum Name { A, B, C }` (PascalCase name + variants), referenced by bare name — 1-byte discriminant column,
 serialized as the variant-name string, filterable/sortable (declaration order)/indexable. Relations: `[Model]`
 one-to-many, `*Model` required FK, `?Model` optional FK, bidirectional `[..]`/`[..]` = many-to-many; `[type; N]`
 fixed array; inline `struct` (fixed-size fields only — no string/relations inside). Directives — **the validating
-ones are `@min @max @length @email @url @pattern`/`@regex`, all ENFORCED** (violation → 422; `@length` counts
-**chars**, not bytes; `@pattern` is a per-field `LazyLock<Regex>`, #104). **Semantic-only markers** (parsed, carried,
+ones are `@min @max @length @email @url @pattern`/`@regex` `@utf8`, all ENFORCED** (violation → 422; `@length` counts
+**chars**, not bytes, and takes named args — `@length(min: a, max: b)`, either alone, or positional `(a, b)`;
+single-arg `@length(n)` means **exactly** n, NOT a maximum (#235); `@pattern` is a per-field `LazyLock<Regex>`,
+#104). **Semantic-only markers** (parsed, carried,
 never checked at write): `@default @index @computed @fulltext @materialized` — for a real index use the `^`
 modifier. Per-directive truth table: `docs/SCHEMA.md`. **`@on_delete(restrict|cascade|set_null)`
 ENFORCED** (relation-FK field; default `restrict` refuses deleting a referenced parent → 409, `cascade` recursive,
@@ -468,6 +511,35 @@ of truth.
    Getting this backwards publishes documentation for an API nobody can call — worse than no page,
    because it makes the docs a liar in the exact moment someone is trusting them. Pair feature docs
    with the feature.
+
+   **There is exactly ONE `develop`, and its name never contains a version.** No `v0.5-develop`
+   beside a `v0.4-develop`. crates.io has one version line per crate and the gap is defined against
+   what is *currently published*, so two cycle branches carrying unpublished substrate changes
+   cannot both be measured — whichever publishes first silently redefines the other's gap. And the
+   milestone already encodes *when*; a version in the branch name is a second scheduling axis,
+   which is the parallel-decomposition anti-pattern. Version-agnostic also means self-advancing:
+   tagging a release turns `develop` into the next cycle with no rename and no workflow edit.
+
+   So what keeps next-cycle work off `develop` is **the milestone, not the branch**:
+
+   > A PR targeting `develop` may not close an issue milestoned later than the cycle in flight
+   > (**derived**: the lowest open `v*` milestone — never configured, never written down).
+
+   A **deny-list on future milestones**, not an allow-list on the current one — so chores, CI fixes
+   and typo PRs close no issue and pass silently, correctly: work with no issue cannot be
+   next-cycle work. `.github/workflows/cycle-scope.yml` gates PRs into `develop`; since most work
+   here merges locally, run it yourself before merging a branch back:
+
+   ```bash
+   make cycle-scope ISSUE=245        # what the branch closes
+   make cycle-scope PR=250           # or a PR, as CI does
+   ```
+
+   Blocked means *early*, not wrong: keep the branch, let the cycle ship, rebase, land it. The only
+   other correct response is that the issue was mis-scheduled — move the milestone rather than
+   merging past it. **This makes closing the milestone part of the release ritual**: a milestone
+   left open after its tag freezes the derived cycle and blocks legitimate next-cycle work.
+   (Portable form: `ai-pm-playbook` PLAYBOOK §5.3, rules PM008/PM009.)
 
    **Transition note (delete once v0.4.0 is tagged):** `main` currently carries the v0.4.0 gap —
    `develop` was created from it mid-cycle rather than rewinding pushed history. So the reclose is

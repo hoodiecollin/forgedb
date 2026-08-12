@@ -30,7 +30,8 @@ Status {
   content: string @fulltext
   visibility: string @default(public)
   sensitive: bool @default(false)
-  language: char(2)?
+  // BCP 47 primary subtag, e.g. "en" — text, so `string`
+  language: string? @length(2, 2)
   uri: string? @url
   in_reply_to: ?Status
   reply_count: u32 @default(0)

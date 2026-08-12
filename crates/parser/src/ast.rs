@@ -6,7 +6,41 @@ use forgedb_validation::Position;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstraintParam {
     Number(i64),
+    /// A fractional numeric literal, carried as its **verbatim source lexeme**
+    /// (e.g. `"0.01"`, `"-273.15"`) — #239.
+    ///
+    /// Not an `f64`. Rounding into binary float here would happen before the
+    /// target field type is known, which is inherent for an `f64` field but
+    /// defeats the entire point of `decimal` — the type that exists precisely
+    /// because `0.01` has no exact binary representation. Consumers convert
+    /// against the known type: exact `Decimal` for a `decimal` field, correctly
+    /// rounded `f64` for an `f64` field, and an error on an integer field.
+    Fractional(String),
     String(String),
+    /// A named argument, `name: value` (#235) — as in `@length(min: 3, max: 64)`.
+    ///
+    /// The value is boxed rather than fixed to `i64` so a future value kind (a
+    /// float, for the fractional numeric bounds of #239) composes here without a
+    /// second grammar pass over the parameter loop.
+    Named {
+        name: String,
+        value: Box<ConstraintParam>,
+    },
+    /// An exclusive bound written with a comparison operator — `@min(>0)` /
+    /// `@max(<1)` (#239).
+    ///
+    /// Only meaningful on a continuous domain: on integers `>0` and `>=1` denote
+    /// the same set, so validation rejects the operator form there rather than
+    /// admitting a second spelling that buys no expressiveness.
+    ///
+    /// The operator is recorded rather than collapsed to "exclusive" so a
+    /// nonsensical pairing (`@min(<5)`) is rejected instead of being silently
+    /// read as an exclusive minimum.
+    Exclusive {
+        /// `true` for `>`, `false` for `<`.
+        greater: bool,
+        value: Box<ConstraintParam>,
+    },
 }
 
 /// Constraint directive (e.g., @min(10), @email)
@@ -52,6 +86,79 @@ pub struct Projection {
     pub fields: Vec<String>,
 }
 
+/// The declared precision of a `timestamp` field (#254).
+///
+/// It is NOT the storage unit — every timestamp persists as `i64` microseconds,
+/// because a per-field unit would make a `Timestamp` value unit-ambiguous at
+/// runtime and cost either a fatter value (a layout change) or a
+/// `Timestamp<const U>` (generated signature churn everywhere).
+///
+/// What it governs is the **quantum**: a user-supplied value is floored to it on
+/// write, and an allocated `+timestamp` identity advances by one unit of it. So
+/// it buys semantic *fidelity*, not correctness — under a burst of N rows in one
+/// tick the allocator runs N units ahead of the wall clock, and recovery time is
+/// proportional to the unit. That is the whole argument for the `us` floor on an
+/// allocated identity: the same million-row import that lands rows ~17 minutes
+/// in the future at `ms` lands them 1 second ahead at `us`.
+///
+/// `ns` is not offerable: the keys are bounded by the microsecond storage unit,
+/// and `i64` nanoseconds would cap the type at 1678–2262.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampPrecision {
+    /// `timestamp(s)` — whole seconds.
+    Seconds,
+    /// `timestamp(ms)` — milliseconds. **The default**, so a bare `timestamp`
+    /// is `timestamp(ms)`: making it a property of the type rather than a rule
+    /// the parser has to remember means no site can disagree about it.
+    #[default]
+    Millis,
+    /// `timestamp(us)` — microseconds, the storage unit itself. The only
+    /// precision an allocated `+timestamp` identity may declare.
+    Micros,
+}
+
+impl TimestampPrecision {
+    /// The spelling that parses back to this precision.
+    pub fn key(&self) -> &'static str {
+        match self {
+            TimestampPrecision::Seconds => "s",
+            TimestampPrecision::Millis => "ms",
+            TimestampPrecision::Micros => "us",
+        }
+    }
+
+    /// This precision's quantum, in microseconds — what a written value is
+    /// floored to, and what an allocated identity advances by.
+    pub fn quantum_micros(&self) -> i64 {
+        match self {
+            TimestampPrecision::Seconds => 1_000_000,
+            TimestampPrecision::Millis => 1_000,
+            TimestampPrecision::Micros => 1,
+        }
+    }
+
+    /// The singular English noun for this quantum, for diagnostics that have to
+    /// read as a sentence (`"one millisecond at a time"`) rather than as a key.
+    pub fn unit_noun(&self) -> &'static str {
+        match self {
+            TimestampPrecision::Seconds => "second",
+            TimestampPrecision::Millis => "millisecond",
+            TimestampPrecision::Micros => "microsecond",
+        }
+    }
+
+    /// Parse a declared precision key. `None` for anything else, including `ns`
+    /// (bounded out by the microsecond storage unit).
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "s" => Some(TimestampPrecision::Seconds),
+            "ms" => Some(TimestampPrecision::Millis),
+            "us" => Some(TimestampPrecision::Micros),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     U32,
@@ -62,7 +169,21 @@ pub enum FieldType {
     Bool,
     String,
     Uuid,
-    Timestamp,
+    /// An instant, `timestamp` or `timestamp(s|ms|us)` (#254).
+    ///
+    /// The declared precision is carried **in the variant** rather than hung off
+    /// [`Field`], for two reasons that are not stylistic: an array's inner type
+    /// is a `FieldType` (so `[timestamp(us); 4]` is otherwise inexpressible), and
+    /// [`FieldType::Nullable`] wraps a `FieldType` (so `timestamp(us)?` would
+    /// otherwise lose its precision). Carrying it here also makes the sweep a
+    /// compiler-enforced audit: every site that matched a bare `Timestamp` has to
+    /// say what it does about precision, and the failure mode this issue guards
+    /// against is silent.
+    ///
+    /// Storage is always microseconds regardless of the declared key; the
+    /// precision is the **allocation quantum** and the guarantee about what is
+    /// stored, not a second on-disk unit. See [`TimestampPrecision`].
+    Timestamp(TimestampPrecision),
     /// JSON value stored as its serialized bytes in a variable-length column,
     /// typed `serde_json::Value` in generated Rust (#json). Rides the same
     /// variable-column storage path as `String`.
@@ -82,7 +203,41 @@ pub enum FieldType {
     /// stays a `StructType` and is caught by struct-reference validation.
     Enum(String),
     // Fixed-size types (Sprint 8)
-    Char(usize),                       // Fixed-size character array: char(N)
+    /// Fixed-size **byte** array: `bytes(N)` → `[u8; N]`.
+    ///
+    /// There is no UTF-8 guarantee, no length tracking, and no text semantics
+    /// anywhere in the pipeline — on the wire it is an array of integers. The
+    /// deprecated spelling `char(N)` (#233) parses to this same variant and warns;
+    /// `char` was a false friend, since SQL's `CHAR(N)` is fixed-length *text*.
+    Bytes(usize),
+    /// `string(N)` / `string(N!)` — a fixed-width **inline string** column (#238).
+    ///
+    /// The value lives in the row's own slot of a `FixedColumn` rather than
+    /// behind an `(offset, length)` pair in a `VariableColumn`, which is what
+    /// makes a scan of it read one contiguous run instead of chasing pointers.
+    /// Bare [`FieldType::String`] is untouched and still variable-width.
+    ///
+    /// `chars` is N, the **character** count (res 3) — not a byte count, and
+    /// consistent with `@length`, which also counts characters. One byte per
+    /// character by default, four under `@utf8` (res 4/5); the physical slot
+    /// width is therefore a function of the declaration *and* that directive, and
+    /// is computed in codegen, never here.
+    ///
+    /// `chars` is a `u8` rather than a `usize` on purpose: res 7 caps N at 255,
+    /// and carrying the cap in the type makes an over-wide N unrepresentable
+    /// instead of merely rejected. The check happens exactly once, where the
+    /// parser reads the literal — there is no downstream site that has to
+    /// remember it.
+    ///
+    /// `exact` is the `!` (res 2): at-most-N when `false`, exactly-N when `true`.
+    /// The exact form is the narrow one — every value is exactly N characters, so
+    /// under the default alphabet it is exactly N bytes and the slot carries no
+    /// length prefix at all.
+    ///
+    /// There is no overflow. A value exceeding N is a write error (res 1);
+    /// experiment #261 measured the inline-or-overflow alternative losing in 198
+    /// of 200 configurations.
+    StringN { chars: u8, exact: bool },
     FixedArray(Box<FieldType>, usize), // Fixed array: [type; count]
     StructType(String),                // Reference to a struct by name
     OptionalStructType(String),        // Optional struct reference
@@ -383,13 +538,17 @@ impl FieldType {
             FieldType::I64 => "i64".to_string(),
             FieldType::F64 => "f64".to_string(),
             FieldType::Bool => "bool".to_string(),
-            FieldType::String => "String".to_string(),
+            // #238: an inline `string(N)` presents as an ordinary `String` in the
+            // generated struct and on every wire. Only its *storage* differs —
+            // a fixed slot instead of an (offset, length) pair — and the scan path
+            // borrows out of that slot rather than allocating.
+            FieldType::String | FieldType::StringN { .. } => "String".to_string(),
             FieldType::Json => "serde_json::Value".to_string(),
             FieldType::Decimal => "rust_decimal::Decimal".to_string(),
             FieldType::Enum(name) => name.clone(),
             FieldType::Uuid => "uuid::Uuid".to_string(),
-            FieldType::Timestamp => "i64".to_string(),
-            FieldType::Char(size) => format!("[u8; {}]", size),
+            FieldType::Timestamp(_) => "i64".to_string(),
+            FieldType::Bytes(size) => format!("[u8; {}]", size),
             FieldType::FixedArray(inner_type, count) => {
                 format!("[{}; {}]", inner_type.to_rust_type(), count)
             }
@@ -419,12 +578,74 @@ impl FieldType {
     pub fn is_auto_generatable(&self) -> bool {
         matches!(
             self,
-            FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp
+            FieldType::U32 | FieldType::U64 | FieldType::Uuid | FieldType::Timestamp(_)
         )
     }
 
     pub fn is_relation(&self) -> bool {
         matches!(self, FieldType::Relation(_))
+    }
+
+    /// May a value of this type be a model's key (#251)?
+    ///
+    /// This is the **scalar** half of the identity allow-list — the set a key
+    /// ultimately resolves to. (A `*Model` identity is admitted too, but it is not
+    /// a scalar: its key is the target's, resolved transitively by #266, and the
+    /// terminal type is one of these.)
+    ///
+    /// Three properties are needed, and only enumeration gets all three right:
+    ///
+    /// - **fixed width**, because the key sits in a `FixedColumn` slot and in a
+    ///   fixed-width replication frame — which is what bars a bare `string`;
+    /// - **`Copy`**, because the generated code passes a key by value repeatedly
+    ///   (`get`, `delete`, relation resolution, the delta enum) — a `String` there
+    ///   is 31 move/borrow errors in a single model;
+    /// - **`Hash + Eq`**, because `id_to_row` is a `HashMap` keyed on it — which is
+    ///   what bars `f64` despite its being `Copy` and fixed-width.
+    ///
+    /// `bool` satisfies all three and is still excluded: two rows exhaust the key
+    /// space. `bytes(N)` satisfies all three and is excluded on **modelling**
+    /// grounds — the identifiers that motivate a non-uuid key (ULIDs, nanoids,
+    /// prefixed vendor keys, ISINs) are text, and text is `string(N)`. Both are
+    /// why this is an allow-list rather than a `Copy + Eq` rule; admitting either
+    /// later is a non-breaking widening.
+    ///
+    /// This lives on the AST rather than in the generator because BOTH sides need
+    /// it and they cannot see each other: `forgedb-codegen` filters on it, and the
+    /// parser's validator reports a schema outside it as an error. If those two
+    /// ever disagree, generated code silently loses a capability — exactly the
+    /// failure #265/#266 exists to remove.
+    pub fn is_identity_key(&self) -> bool {
+        matches!(
+            self,
+            FieldType::Uuid
+                | FieldType::U32
+                | FieldType::U64
+                | FieldType::I32
+                | FieldType::I64
+                | FieldType::Timestamp(_)
+                | FieldType::StringN { .. }
+        )
+    }
+
+    /// May a model whose identity is this type be an endpoint of a many-to-many
+    /// junction (#266)?
+    ///
+    /// **Identical to [`FieldType::is_identity_key`], and that is load-bearing
+    /// rather than a coincidence.** The junction stores each endpoint's id in a
+    /// fixed-width column, indexes it in a `HashMap`, and frames it in a
+    /// fixed-width replication record; a model's own `id_to_row` map wants the
+    /// same three properties for the same reasons. Two sets that must coincide are
+    /// one set, so this delegates instead of re-listing — if they were ever
+    /// allowed to drift, either a junction silently vanishes (#266's original
+    /// defect) or one bad identity earns two diagnostics pointing at two different
+    /// fixes (#251's fold).
+    ///
+    /// Kept as its own name because the *question* differs, and the generator's
+    /// junction code should read as asking the junction's question. Codegen calls
+    /// this one; the validator's allow-list calls the other.
+    pub fn is_junction_key(&self) -> bool {
+        self.is_identity_key()
     }
 
     /// Check if this type is fixed-size (Sprint 8)
@@ -437,15 +658,23 @@ impl FieldType {
             | FieldType::F64
             | FieldType::Bool
             | FieldType::Uuid
-            | FieldType::Timestamp
+            | FieldType::Timestamp(_)
             | FieldType::Decimal // exact decimal is a fixed 16-byte column, like Uuid
             | FieldType::Enum(_) // enum is a fixed 1-byte discriminant column
-            | FieldType::Char(_) => true,
+            | FieldType::Bytes(_) => true,
             FieldType::FixedArray(inner, _) => inner.is_fixed_size(),
             FieldType::StructType(_) => true, // Structs must be fixed-size
             FieldType::OptionalStructType(_) => true, // Optional struct still fixed-size (uses discriminant)
             FieldType::Nullable(inner) => inner.is_fixed_size(),
             FieldType::String => false,
+            // #238: `string(N)` occupies a fixed-width *column slot*, but this
+            // predicate asks a different question — may the type be embedded in an
+            // inline `struct` (and, transitively, a `[T; N]`)? Those are stored by
+            // transmuting the Rust value's bytes, and the Rust value here is a
+            // heap `String`; embedding one would persist a pointer. So: no. The
+            // codegen-side `is_fixed_size_type`, which decides column layout, says
+            // yes — the two predicates are deliberately different questions.
+            FieldType::StringN { .. } => false,
             FieldType::Json => false, // JSON is a variable-length column, like String
             FieldType::Relation(_) => false, // Relations are virtual or variable
             FieldType::Component(_) => false, // Components are virtual
@@ -474,12 +703,12 @@ impl FieldType {
     pub fn size_in_bytes(&self, schema: &Schema) -> usize {
         match self {
             FieldType::U32 | FieldType::I32 => 4,
-            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp(_) => 8,
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16,
             FieldType::Decimal => 16, // exact decimal is a fixed 16-byte column, like Uuid (#189)
-            FieldType::Char(size) => *size,
+            FieldType::Bytes(size) => *size,
             FieldType::FixedArray(inner, count) => inner.size_in_bytes(schema) * count,
             FieldType::StructType(name) => {
                 if let Some(struct_def) = schema.find_struct(name) {
@@ -506,11 +735,11 @@ impl FieldType {
     pub fn alignment(&self, schema: &Schema) -> usize {
         match self {
             FieldType::U32 | FieldType::I32 => 4,
-            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp => 8,
+            FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Timestamp(_) => 8,
             FieldType::Bool => 1,
             FieldType::Enum(_) => 1, // 1-byte u8 discriminant
             FieldType::Uuid => 16, // UUID is typically 16-byte aligned
-            FieldType::Char(_) => 1,
+            FieldType::Bytes(_) => 1,
             FieldType::FixedArray(inner, _) => inner.alignment(schema),
             FieldType::StructType(name) => {
                 if let Some(struct_def) = schema.find_struct(name) {
@@ -531,7 +760,24 @@ impl FieldType {
         }
     }
 
-    /// Determine if this type supports range queries (ordered)
+    /// Whether an indexed field of this type also gets an **ordered** index
+    /// (#169) — i.e. a `find_by_<field>_range` method — rather than exact-match
+    /// lookup only.
+    ///
+    /// This is not a free-standing opinion about the type: it must agree with
+    /// `RustGenerator::ordered_key_type`, which is what actually decides whether
+    /// the ordered `BTreeMap` is emitted. The answer here reaches users as
+    /// migration prose ("Add BTree index on 'Product.price'") via
+    /// `Field::index_type`, so a disagreement is a visible lie about what was
+    /// generated. `f64` was listed here while codegen excluded it, and `decimal`
+    /// was omitted while codegen included it — both directions wrong (#242).
+    /// The two are now pinned together by a drift guard in the codegen crate.
+    ///
+    /// `f64` is included: it has no `Ord`, but the ordered index keys it by its
+    /// total-order `u64` encoding (#242), so it does answer range queries.
+    ///
+    /// `Nullable` falls through to `false` on purpose: `ordered_key_type` returns
+    /// `None` for any nullable field regardless of its inner type.
     pub fn supports_range_queries(&self) -> bool {
         matches!(
             self,
@@ -540,7 +786,8 @@ impl FieldType {
                 | FieldType::I32
                 | FieldType::I64
                 | FieldType::F64
-                | FieldType::Timestamp
+                | FieldType::Timestamp(_)
+                | FieldType::Decimal
         )
     }
 
@@ -590,6 +837,62 @@ impl Struct {
             .map(|f| f.field_type.alignment(schema))
             .max()
             .unwrap_or(1)
+    }
+}
+
+impl Model {
+    /// **The** identity field: a field named `id`, or any `+` auto-generate field
+    /// (#248 makes one of the two mandatory).
+    ///
+    /// # `id` wins by name, then by `+`
+    ///
+    /// Written as a two-pass search rather than one
+    /// `find(|f| f.name == "id" || f.auto_generate)`, because the single-pass form
+    /// tests both conditions at each field in **declaration order** and so returns
+    /// whichever comes first — a `+` field above `id` beats `id` itself. With a
+    /// key-shaped `+` type that result compiles and runs:
+    ///
+    /// ```forge
+    /// Event { seq: +u64  id: u32  note: string }
+    /// ```
+    ///
+    /// keys the database on `seq` while naming the generated parameter `id`, so
+    /// `/events/{id}` takes a sequence number and every relation pointing at this
+    /// model points at the wrong column (#251 shape 4). It is the only shape in
+    /// that issue that ships a *working* binary with the wrong key, and a primary
+    /// key cannot be changed later without an on-disk format change.
+    ///
+    /// # Why this lives on the AST
+    ///
+    /// It was open-coded 31 times across 8 files, and a partial fix is worse than
+    /// none: if the validator selects a different field than the generator keys
+    /// on, the guard checks a field the database does not have. Both
+    /// `crates/parser` (validation) and every `crates/codegen` backend need it and
+    /// they cannot see each other — codegen depends on parser, not the reverse —
+    /// so the one definition has to be here. `tests/identity_predicate_test.rs`
+    /// asserts no copy comes back.
+    ///
+    /// Note what this deliberately does **not** do: it does not filter by type.
+    /// Whether the chosen field *can* serve as a key is the allow-list's question
+    /// (`validate.rs::check_identity_types`), and answering it here would make a
+    /// bad identity silently become "no identity" — a diagnostic pointing at the
+    /// model when the offending token is on a field.
+    pub fn identity_field(&self) -> Option<&Field> {
+        self.fields
+            .iter()
+            .find(|f| f.name == "id")
+            .or_else(|| self.fields.iter().find(|f| f.auto_generate))
+    }
+
+    /// Whether the model has an identity field at all (#248).
+    ///
+    /// Derived from [`Model::identity_field`] rather than open-coded, so the
+    /// existence test and the selection can never disagree. (They agree for any
+    /// *ordering* — a model has an identity under first-match iff it has one
+    /// under precedence — but only sharing the definition keeps that true when
+    /// the rule changes.)
+    pub fn has_identity(&self) -> bool {
+        self.identity_field().is_some()
     }
 }
 

@@ -18,7 +18,7 @@ Self-hosted Git service with repositories, issue tracking, pull requests, and or
 | `Issue` | index_num (indexed), title, is_closed, is_pull | `repo: *Repository`, `poster: *User`, `milestone: ?Milestone`; O2M Comment; M2M Label |
 | `PullRequest` | head_branch, base_branch, has_merged, status | `issue: *Issue` (1:1 extension), `head_repo: *Repository`, `base_repo: *Repository` (two FKs to same model) |
 | `Comment` | content | `issue: *Issue`, `poster: *User`; composite @index(issue, created_at) |
-| `Label` | name, color (char(7)) | `repo: *Repository`; M2M issues↔Issue |
+| `Label` | name, color (`string`, exactly 7 chars) | `repo: *Repository`; M2M issues↔Issue |
 | `Milestone` | title, is_closed, due_at | `repo: *Repository`; O2M Issue |
 
 ## Key relationships
@@ -36,7 +36,8 @@ Self-hosted Git service with repositories, issue tracking, pull requests, and or
 - `?Repository` self-referential optional FK (`fork_parent`)
 - Explicit join model with payload (`OrgMember` role, `Star` created_at)
 - Two FKs to the same model in one model (`PullRequest.head_repo` + `base_repo`)
-- `char(7)` fixed-size byte field for hex color codes
+- `string @length(7, 7)` for hex color codes — text, so `string` rather than `bytes(7)`
+- `bytes(20)?` on `PullRequest.merge_commit_sha` — a git object id is genuinely 20 raw bytes, which is what `bytes(N)` is for
 - Bidirectional M2M auto-detection (`Issue` ↔ `Label`, `Team` ↔ `User`)
 - `?Organization` optional FK on `Repository`
 - Composite `@index` on FK fields (`@index(user, org)`, `@index(issue, created_at)`)

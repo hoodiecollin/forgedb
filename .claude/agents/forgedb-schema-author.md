@@ -14,6 +14,7 @@ ForgeDB is an **application database GENERATOR**, not SQL and not a runtime ORM.
 ## Hard grammar rules (the parser enforces these — violations are FATAL parse errors)
 
 Naming (enforced by `validate_field_name`/`validate_model_name`, fatal):
+- **Every model MUST have an identity field** — `id: +uuid` by convention. A model without one is a fatal validation error, not a lint.
 - **Models and structs: PascalCase** (`User`, `BlogPost`, `OrderLineItem`).
 - **Fields: snake_case** — ALWAYS, including component-reference fields (`profile_card`, not `profileCard`). Non-snake_case fields will NOT parse.
 
@@ -23,7 +24,7 @@ Field syntax: `field_name: [PREFIX_MODIFIERS]type [@directive ...]`
 - `+` (auto-generate) is valid **only** on `u32`, `u64`, `uuid`, `timestamp`. Never on string/bool/f64/i32/i64.
 
 Scalar types (the COMPLETE list — nothing else exists):
-`u32`, `u64`, `i32`, `i64`, `f64`, `bool`, `string`, `uuid`, `timestamp`, `char(N)` (fixed-size byte array, parentheses required).
+`u32`, `u64`, `i32`, `i64`, `f64`, `bool`, `string`, `uuid`, `timestamp`, `bytes(N)` (fixed-size **byte** array, parentheses required — NOT a text type; `char(N)` is the deprecated spelling and warns).
 - There is **no `text`, `varchar`, `decimal`, `date`, `datetime`, `json`, or `enum` type.** Model money as `i64` (minor units, e.g. cents) or `f64`; dates/datetimes as `timestamp`; enums as a `string` (optionally with `@pattern`) or a small lookup model; JSON blobs don't exist — model the structure explicitly.
 
 Relations:
@@ -39,7 +40,7 @@ Directives (parsed; most are recorded but semantic-only, so use them to document
 - Model-level (place on their own line inside the block): `@soft_delete`, and composite index `@index(field_a, field_b, ...)` (**must list ≥2 existing fields**).
 
 Structs (optional): `struct Name { ... }` then use as `field: Name` / `field: Name?`.
-- Structs may contain **ONLY fixed-size types** (`char(N)`, numerics, `bool`, `uuid`, `timestamp`). **No `string`, no relations, no nested variable-length data inside a struct.** For an address with variable text, use `char(N)` fields or model it as a separate `Model`, not a struct.
+- Structs may contain **ONLY fixed-size types** (`bytes(N)`, numerics, `bool`, `uuid`, `timestamp`). **No `string`, no relations, no nested variable-length data inside a struct.** This rules out text entirely — `bytes(N)` is raw bytes, not a short-string type, so an address or any other free text must live on the `Model` (or a related one), never in a struct.
 
 Fixed arrays: `field: [type; N]` (fixed-size element types only).
 

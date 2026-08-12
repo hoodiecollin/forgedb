@@ -9,7 +9,7 @@ use tempfile::TempDir;
 /// Write a minimal `manifest.json` with the given row_count into `model_dir`.
 fn write_manifest(model_dir: &std::path::Path, row_count: usize) {
     let manifest = format!(
-        r#"{{"schema_version":1,"row_count":{},"columns":[],"wal_enabled":false,"last_checkpoint":0}}"#,
+        r#"{{"format_version":1,"row_count":{},"columns":[],"wal_enabled":false,"last_checkpoint":0}}"#,
         row_count
     );
     fs::write(model_dir.join("manifest.json"), manifest).unwrap();

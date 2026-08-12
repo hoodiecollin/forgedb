@@ -48,7 +48,7 @@ pub struct TransformCrate {
     pub sources: Vec<(String, String)>,
 }
 
-/// One version's schema in the range, paired with its serial `format_version`.
+/// One version's schema in the range, paired with its schema serial.
 pub struct VersionSchema<'a> {
     pub version: u32,
     pub schema: &'a Schema,
@@ -96,7 +96,7 @@ pub struct ModelOp {
 /// are addressed by id via `all()`/`insert`). Non-id models (pure value tables) are
 /// out of scope for the transformer, exactly as they are for the mutation surface.
 fn is_transactable(model: &Model) -> bool {
-    model.fields.iter().any(|f| f.name == "id" || f.auto_generate)
+    model.has_identity()
 }
 
 /// Generates the offline transformer crate.
@@ -138,10 +138,10 @@ impl TransformGenerator {
         let mut sources = Vec::new();
 
         // One generated module per version in the range — each the full typed
-        // database for that version, baked with its own `EXPECTED_FORMAT_VERSION`
+        // database for that version, baked with its own `EXPECTED_SCHEMA_VERSION`
         // so its open-guard enforces the version interlock (C5/C11).
         for vs in &plan.versions {
-            let code = RustGenerator::generate_with_format_version(vs.schema, vs.version)?.code;
+            let code = RustGenerator::generate_with_schema_version(vs.schema, vs.version)?.code;
             sources.push((format!("src/v{}.rs", vs.version), code));
         }
 
@@ -452,8 +452,8 @@ path = "src/main.rs"
 # The same schema-agnostic substrate the generated app links, and nothing that
 # interprets a schema (the identity red line: no schema at runtime, no migration
 # engine — the version modules are baked-in generated typed code).
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-compaction = "0.1"

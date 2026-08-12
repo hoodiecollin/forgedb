@@ -121,7 +121,9 @@
 //! - **Floating Point**: `f64`
 //! - **Decimal**: `decimal` (exact fixed-point)
 //! - **Boolean**: `bool`
-//! - **String**: `string`, `char(N)` (fixed-size)
+//! - **String**: `string`
+//! - **Bytes**: `bytes(N)` (fixed-size byte array; `char(N)` is the deprecated
+//!   spelling and warns)
 //! - **JSON**: `json`
 //! - **UUID**: `uuid`
 //! - **Timestamp**: `timestamp`
@@ -177,7 +179,7 @@ pub mod validate;
 // Re-export main types for convenience
 pub use ast::{
     ComponentProtocol, ComponentReference, Constraint, ConstraintParam, EnumDef, Field, FieldType,
-    Model, Projection, RelationType, Schema, Struct,
+    Model, Projection, RelationType, Schema, Struct, TimestampPrecision,
 };
 pub use lexer::{Lexer, Token};
 pub use parser::{ParsedSchema, Parser};

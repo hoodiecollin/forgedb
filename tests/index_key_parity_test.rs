@@ -1,5 +1,7 @@
 //! Index-key parity: the monomorphic emission (#230) must produce **byte-identical**
-//! keys to the `serde_json::Value` match it replaced, for every indexable type.
+//! keys to the `serde_json::Value` match it replaced, for every indexable type
+//! except `f64`, whose legacy key was itself broken and was replaced (#242 — see
+//! below).
 //!
 //! # Why this test exists in this form
 //!
@@ -21,6 +23,33 @@
 //!
 //! Link 2's mirror could drift from what is actually emitted; link 1 is what stops
 //! that. If you change `RustGenerator::index_key_body`, both must move together.
+//!
+//! # The `bytes(64)` fields (#243)
+//!
+//! `s_hash` / `o_hash` are here to be *compiled*, not just keyed. serde implements
+//! `Serialize`/`Deserialize` for `[T; N]` only up to N = 32, so before #243 a
+//! `bytes(64)` field made the derive on the model struct fail to resolve and the
+//! whole generated crate failed to build — indexed or not. This test compiles the
+//! generated crate, so carrying an oversized field is what proves the ceiling is
+//! gone; a string-level snapshot cannot.
+//!
+//! Their keys cannot be compared against `legacy` — that function *is* `to_value`,
+//! and it does not accept `[u8; 64]`. That absence is the bug, not a gap in the
+//! test. Instead the emitted form is anchored at N = 32, the last width serde can
+//! serialize, and the widths past it are asserted to continue the same rendering.
+//!
+//! # The `f64` fields (#242) — a deliberate break with legacy
+//!
+//! `f64` is the one type whose key is no longer byte-identical to the legacy form,
+//! and the break is the whole point. `legacy` runs through `serde_json`, which has
+//! no representation for a non-finite: `to_value` maps NaN and ±Inf to
+//! `Value::Null`, so they took the `\u{0}` arm and became indistinguishable from an
+//! unset optional. Reproducing that faithfully is reproducing the bug.
+//!
+//! So `f64` is asserted against its own contract instead — distinctness of the
+//! non-finites, `-0.0`/`0.0` and NaN-payload folding, and the total order the
+//! ordered index depends on. The observable end of it (probes and ranges over a
+//! real generated database) is `tests/f64_index_key_test.rs`.
 //!
 //! Plus an end-to-end pass: every indexed field is round-tripped through the **real**
 //! generated `find_by_*`, which is the observable contract regardless of key bytes.
@@ -69,7 +98,8 @@ const SCHEMA: &str = r#"enum Status { Draft, Published, Archived }
 Kitchen {
   id: +uuid
   s_name: &string
-  s_code: ^char(8)
+  s_code: ^bytes(8)
+  s_hash: ^bytes(64)
   n_u32: ^u32
   n_u64: ^u64
   n_i32: ^i32
@@ -82,7 +112,8 @@ Kitchen {
   e_status: ^Status
 
   o_name: ^string?
-  o_code: ^char(8)?
+  o_code: ^bytes(8)?
+  o_hash: ^bytes(64)?
   o_u32: ^u32?
   o_f64: ^f64?
   o_flag: ^bool?
@@ -104,7 +135,7 @@ Owner {
 
 #[test]
 #[ignore = "compiles a generated crate; run with --ignored (see `make index-key-parity`)"]
-fn monomorphic_index_keys_match_the_serde_json_form_byte_for_byte() {
+fn monomorphic_index_keys_match_the_legacy_form_except_where_it_was_broken() {
     let proj = std::env::temp_dir().join(format!("forgedb-ikparity-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&proj);
     std::fs::create_dir_all(&proj).unwrap();
@@ -255,17 +286,25 @@ fn m_bool(v: &bool) -> String {
     k.push_str(if *v { "true" } else { "false" });
     k
 }
-fn m_f64(v: &f64) -> String {
-    match serde_json::Number::from_f64(*v) {
-        Some(n) => {
-            let mut k = String::from('\u{2}');
-            let _ = write!(k, "{}", n);
-            k
-        }
-        None => String::from('\u{0}'),
-    }
+/// Mirrors the generated `__forgedb_f64_key` (#242).
+fn f64_key(v: f64) -> u64 {
+    let v = if v == 0.0 {
+        0.0
+    } else if v.is_nan() {
+        f64::NAN
+    } else {
+        v
+    };
+    let bits = v.to_bits();
+    let mask = ((bits as i64 >> 63) as u64) | 0x8000_0000_0000_0000;
+    bits ^ mask
 }
-fn m_char<const N: usize>(v: &[u8; N]) -> String {
+fn m_f64(v: &f64) -> String {
+    let mut k = String::from('\u{2}');
+    let _ = write!(k, "{}", f64_key(*v));
+    k
+}
+fn m_bytes<const N: usize>(v: &[u8; N]) -> String {
     let mut k = String::from('\u{2}');
     k.push('[');
     for (i, b) in v.iter().enumerate() {
@@ -335,21 +374,74 @@ fn parity() {
         let t = Timestamp::from_seconds(v);
         check("timestamp", m_timestamp(&t), legacy(&t));
     }
-    // The float arm is why `Display` cannot be used: 1.0 renders "1" but JSON
-    // gives "1.0", and 1e300 renders "1e300" but JSON gives "1e+300".
-    for v in [0.0f64, -0.0, 1.0, 1.5, -2.25, 1e300, 1e-300, f64::MIN, f64::MAX] {
-        check("f64", m_f64(&v), legacy(&v));
+    // --- f64: NOT compared against legacy (#242) ---------------------------
+    // See the module docs. `legacy` maps every non-finite to Value::Null and so
+    // into the null bucket; that is the defect, not a baseline. The contract is
+    // asserted directly.
+    //
+    // 1. Nothing keys into the null bucket. An f64 field is either absent (handled
+    //    by the Option wrapper) or has a value — never "present but unrepresentable".
+    let floats = [
+        0.0f64, -0.0, 1.0, -1.0, 1.5, -2.25, 1e300, 1e-300,
+        f64::MIN, f64::MAX, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+    ];
+    for v in floats {
+        assert_ne!(m_f64(&v), "\u{0}", "{v} must not key into the null bucket");
     }
-    // NaN / infinities: serde maps them to Value::Null, so they key into the
-    // SAME bucket as None. Pre-existing behavior, deliberately preserved.
-    for (name, v) in [("nan", f64::NAN), ("inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)] {
-        check(&format!("f64-{name}"), m_f64(&v), legacy(&v));
-        assert_eq!(m_f64(&v), "\u{0}", "{name} must land in the null bucket");
+    // 2. The non-finites are three distinct points, distinct from every finite one.
+    for (an, a) in [("nan", f64::NAN), ("inf", f64::INFINITY), ("-inf", f64::NEG_INFINITY)] {
+        for (bn, b) in [("1.0", 1.0f64), ("0.0", 0.0), ("max", f64::MAX), ("min", f64::MIN)] {
+            assert_ne!(m_f64(&a), m_f64(&b), "{an} must not collide with {bn}");
+        }
     }
-    // char(N) is [u8; N] -> a JSON array, not a string.
+    assert_ne!(m_f64(&f64::INFINITY), m_f64(&f64::NEG_INFINITY), "+Inf vs -Inf");
+    assert_ne!(m_f64(&f64::INFINITY), m_f64(&f64::NAN), "+Inf vs NaN");
+    // 3. Values that compare EQUAL key equal: -0.0 == 0.0, and all NaNs fold.
+    check("f64-negzero-folds", m_f64(&-0.0), m_f64(&0.0));
+    let other_nan = f64::from_bits(0xfff8_0000_0000_0001);
+    assert!(other_nan.is_nan());
+    check("f64-nan-payload-folds", m_f64(&other_nan), m_f64(&f64::NAN));
+    // 4. The encoding is a TOTAL ORDER — this is what lets the ordered index
+    //    (#169) key a BTreeMap on an f64 at all.
+    let ordered = [f64::NEG_INFINITY, f64::MIN, -2.25, -1.0, -0.0, 0.0, 1e-300, 1.0, f64::MAX, f64::INFINITY];
+    for w in ordered.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if a == b {
+            check("f64-order-eq", f64_key(a).to_string(), f64_key(b).to_string());
+        } else if f64_key(a) < f64_key(b) {
+            println!("ok    f64-order              {a} < {b}");
+        } else {
+            println!("FAIL  f64-order              {a} !< {b}");
+            unsafe { FAILURES += 1 };
+        }
+    }
+    // NaN sorts above every number, which is what keeps it out of a finite range.
+    if f64_key(f64::NAN) > f64_key(f64::INFINITY) {
+        println!("ok    f64-order              NaN > +Inf");
+    } else {
+        println!("FAIL  f64-order              NaN !> +Inf");
+        unsafe { FAILURES += 1 };
+    }
+    // bytes(N) is [u8; N] -> a JSON array, not a string.
     let code: [u8; 8] = *b"hello\0\0\0";
-    check("char8", m_char(&code), legacy(&code));
-    check("char8-zero", m_char(&[0u8; 8]), legacy(&[0u8; 8]));
+    check("bytes8", m_bytes(&code), legacy(&code));
+    check("bytes8-zero", m_bytes(&[0u8; 8]), legacy(&[0u8; 8]));
+
+    // --- past serde's array ceiling (#243) --------------------------------
+    // N = 32 is the last width `legacy` can even be called at, so it is the anchor:
+    // the emitted form agrees with the legacy form exactly there...
+    let at32: [u8; 32] = [171; 32];
+    check("bytes32-anchor", m_bytes(&at32), legacy(&at32));
+    // ...and every width past it continues the same rendering, element by element.
+    // This is what makes the generated `__forgedb_big_bytes` wire-continuous with
+    // serde's own impl instead of merely plausible.
+    let at33: [u8; 33] = [171; 33];
+    let grown = format!("{},171]", m_bytes(&at32).trim_end_matches(']'));
+    check("bytes33-continues-32", m_bytes(&at33), grown);
+    let at64: [u8; 64] = [171; 64];
+    check("bytes64-elements", format!("{}", m_bytes(&at64).matches(',').count()), "63".to_string());
+    check("opt-bytes64", m_opt(&Some(at64), m_bytes), m_bytes(&at64));
+    check("opt-bytes64-none", m_opt(&None::<[u8; 64]>, m_bytes), "\u{0}".to_string());
 
     // --- nullable ---------------------------------------------------------
     check("opt-none", m_opt(&Option::<String>::None, |s: &String| m_string(s)), legacy(&Option::<String>::None));
@@ -372,12 +464,23 @@ fn parity() {
     let ou = Some(Uuid::new_v4());
     check("opt-uuid", m_opt(&ou, m_uuid), legacy(&ou));
     check("opt-uuid-none", m_opt(&None::<Uuid>, m_uuid), legacy(&None::<Uuid>));
+    // f64 diverges from legacy (#242), so the Option wrapper is checked against the
+    // inner key rather than against `legacy` — the wrapper is what is under test
+    // here, and it is unchanged.
     let of = Some(1.0f64);
-    check("opt-f64", m_opt(&of, m_f64), legacy(&of));
+    check("opt-f64", m_opt(&of, m_f64), m_f64(&1.0));
+    check("opt-f64-none", m_opt(&None::<f64>, m_f64), "\u{0}".to_string());
+    // The bucket a NaN row lands in must not be the unset bucket — the #242
+    // collision, in the same shape as the #102 one asserted above.
+    assert_ne!(
+        m_opt(&Some(f64::NAN), m_f64),
+        m_opt(&None::<f64>, m_f64),
+        "Some(NaN) must not collide with None"
+    );
     let ost = Some(Status::Published);
     check("opt-enum", m_opt(&ost, m_status), legacy(&ost));
     let oc = Some(code);
-    check("opt-char8", m_opt(&oc, m_char), legacy(&oc));
+    check("opt-bytes8", m_opt(&oc, m_bytes), legacy(&oc));
 }
 
 /// The observable contract, through the real generated index paths.
@@ -392,6 +495,7 @@ fn roundtrip(dir: std::path::PathBuf) {
         id: Uuid::nil(),
         s_name: name.to_string(),
         s_code: *b"hello\0\0\0",
+        s_hash: [171u8; 64],
         n_u32: 7,
         n_u64: u64::MAX,
         n_i32: -5,
@@ -404,6 +508,7 @@ fn roundtrip(dir: std::path::PathBuf) {
         e_status: Status::Published,
         o_name: None,
         o_code: None,
+        o_hash: None,
         o_u32: None,
         o_f64: None,
         o_flag: None,
@@ -438,6 +543,10 @@ fn roundtrip(dir: std::path::PathBuf) {
     };
     hit("s_name", db.kitchen.find_by_s_name("unset"), id_unset);
     hit("s_code", db.kitchen.find_by_s_code(*b"hello\0\0\0"), id_unset);
+    // #243: the same path at a width serde cannot derive for. Reaching this line at
+    // all means the generated crate compiled with an oversized `bytes(N)` field.
+    hit("s_hash", db.kitchen.find_by_s_hash([171u8; 64]), id_unset);
+    hit("o_hash(None)", db.kitchen.find_by_o_hash(None), id_unset);
     hit("n_u32", db.kitchen.find_by_n_u32(7), id_unset);
     hit("n_u64", db.kitchen.find_by_n_u64(u64::MAX), id_unset);
     hit("n_i32", db.kitchen.find_by_n_i32(-5), id_unset);

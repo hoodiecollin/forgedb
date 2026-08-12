@@ -171,6 +171,7 @@ fn test_manifest_roundtrip() {
 
     let manifest = Manifest {
         schema_version: 1,
+        engine_version: 1,
         row_count: 42,
         columns: vec![
             ColumnMetadata {
@@ -189,8 +190,8 @@ fn test_manifest_roundtrip() {
         wal_enabled: false,
         last_checkpoint: 0,
         compaction_epoch: 0,
-        format_version: 1,
         row_anchor: None,
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&path).unwrap();
 
@@ -1514,6 +1515,73 @@ fn test_buffered_variable_column_mapped_path_matches_per_row_reads() {
 }
 
 #[test]
+fn test_buffered_variable_column_sparse_offsets_path_matches_spanned() {
+    // #228: below `SPARSE_OFFSETS_SPAN_FACTOR` density, `gather_buffered` reads each
+    // offsets entry on its own rather than the whole spanned slice — a two-row
+    // selection at opposite ends of a large column was reading hundreds of KB of
+    // offsets to use 32 bytes of it, which made the index-pushdown arm SLOWER than
+    // the per-row positional decode it replaced.
+    //
+    // The branch is a pure performance choice, so the guard is that it is invisible:
+    // both paths must produce byte-identical slots for the same selection. The
+    // selections below are chosen to land deliberately on each side of the threshold
+    // and right at it, since a density branch that is wrong at its own boundary is
+    // exactly the bug this could introduce.
+    let temp_dir = std::env::temp_dir().join("forgedb_test_buffered_var_sparse");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col =
+        VariableColumn::new(temp_dir.join("v_data.bin"), temp_dir.join("v_offsets.bin")).unwrap();
+
+    let n = 5000usize;
+    for i in 0..n {
+        if i % 41 == 0 {
+            col.append_string("").unwrap();
+        } else {
+            col.append_string(&format!("row-{i}-{}", "z".repeat(180)))
+                .unwrap();
+        }
+    }
+
+    let check = |label: &str, idx: &[usize]| {
+        let buf = col.gather_buffered(idx).unwrap();
+        assert_eq!(buf.len(), idx.len(), "{label}: slot count");
+        for (slot, &i) in idx.iter().enumerate() {
+            assert_eq!(
+                buf.read_str(slot).unwrap(),
+                col.read_string(i).unwrap(),
+                "{label}: slot {slot} (row {i})"
+            );
+        }
+    };
+
+    // Maximally sparse: two rows at opposite ends. This is the case that regressed.
+    check("two rows, full span", &[3, n - 2]);
+    // One row in the middle — span of 1, so it takes the spanned path trivially.
+    check("single row", &[n / 2]);
+    // A scattered pushdown-shaped candidate set.
+    check("20 scattered", &(0..20).map(|i| i * (n / 20)).collect::<Vec<_>>());
+    // Dense enough to stay on the spanned read (span/n well under the factor).
+    check("dense run", &(1000..1400).collect::<Vec<_>>());
+    // Straddling the threshold from both sides: with 8 indices the branch flips at a
+    // span of 8*128 = 1024 rows, so these two differ only in which path they take.
+    check("just dense", &(0..8).map(|i| i * 100).collect::<Vec<_>>());
+    check("just sparse", &(0..8).map(|i| i * 200).collect::<Vec<_>>());
+    // Order is positional on both paths, including reversed and duplicated.
+    check("reversed sparse", &(0..10).rev().map(|i| i * 450).collect::<Vec<_>>());
+    check("duplicates", &[n - 1, 0, n - 1, 0]);
+    // Empty strings inside a sparse selection: a zero-length data span still decodes.
+    check("sparse empties", &(0..n).filter(|i| i % 41 == 0).step_by(30).collect::<Vec<_>>());
+
+    // Bounds are still checked before any read, on either path.
+    assert!(col.gather_buffered(&[0, n]).is_err());
+    assert!(col.gather_buffered(&[n - 1, n + 5]).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+#[test]
 fn test_buffered_variable_read_str_matches_read_string() {
     // #224: `read_str` borrows out of the buffered span instead of allocating a
     // `String` per slot.  It is the decode both paths now share — `read_string` is
@@ -1823,4 +1891,90 @@ fn test_append_tagged_survives_reopen() {
     assert_eq!(col.read_string(2).unwrap(), "\u{1}after");
 
     fs::remove_dir_all(&dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// #238: the borrowed read on the fixed path.
+//
+// `BufferedFixedColumn` owns its bytes (a `Vec` or an `Mmap` alias), so a
+// `&self` borrow of a slot is sound by construction — the same property that let
+// #224 add `BufferedVariableColumn::read_str`.  Until #238 the only whole-slot
+// read on this type was `read_bytes`, which allocates a `Vec` per row per scan.
+// A `string(N)` column routed through it would have been SLOWER than the
+// `VariableColumn` it replaces, which is the one outcome #238 exists to avoid.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn buffered_fixed_column_read_slice_borrows_the_slot() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_slice");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 4).unwrap();
+    for v in [b"aaaa", b"bbbb", b"cccc", b"dddd"] {
+        col.append_bytes(v).unwrap();
+    }
+
+    // Dense prefix: the mmap-alias path.
+    let buf = col.gather_buffered(&[0, 1, 2, 3]).unwrap();
+    for slot in 0..4usize {
+        // Byte-for-byte the same answer `read_bytes` gives, without the `Vec`.
+        assert_eq!(buf.read_slice(slot).unwrap(), &buf.read_bytes(slot).unwrap()[..]);
+    }
+    assert_eq!(buf.read_slice(0).unwrap(), b"aaaa");
+    assert_eq!(buf.read_slice(3).unwrap(), b"dddd");
+
+    // Reordered: the gathered-copy path. Slots follow the selection order.
+    let buf = col.gather_buffered(&[3, 0]).unwrap();
+    assert_eq!(buf.read_slice(0).unwrap(), b"dddd");
+    assert_eq!(buf.read_slice(1).unwrap(), b"aaaa");
+
+    // Out of range mirrors every other reader on this type.
+    assert!(buf.read_slice(2).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+/// `read_str` is the whole slot as UTF-8 — the complete read for a column where
+/// the slot IS the value and carries no framing (`string(N!)`, #238 res 6).
+/// It deliberately does NOT understand a length prefix: that is #238's layout
+/// choice and belongs to generated code, not to a schema-agnostic crate.
+#[test]
+fn buffered_fixed_column_read_str_is_the_whole_slot() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_str");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 3).unwrap();
+    for v in [b"USD", b"EUR", b"JPY"] {
+        col.append_bytes(v).unwrap();
+    }
+
+    let buf = col.gather_buffered(&[0, 1, 2]).unwrap();
+    assert_eq!(buf.read_str(0).unwrap(), "USD");
+    assert_eq!(buf.read_str(1).unwrap(), "EUR");
+    assert_eq!(buf.read_str(2).unwrap(), "JPY");
+    assert!(buf.read_str(3).is_err());
+
+    fs::remove_dir_all(&temp_dir).unwrap();
+}
+
+/// Invalid UTF-8 in the slot is `InvalidData`, not a panic and not silent
+/// replacement — same contract as `BufferedVariableColumn::read_str`.
+#[test]
+fn buffered_fixed_column_read_str_rejects_invalid_utf8() {
+    let temp_dir = std::env::temp_dir().join("forgedb_test_bf_read_str_bad");
+    let _ = fs::remove_dir_all(&temp_dir);
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let mut col = FixedColumn::new(temp_dir.join("s.bin"), 2).unwrap();
+    col.append_bytes(&[0xff, 0xfe]).unwrap();
+
+    let buf = col.gather_buffered(&[0]).unwrap();
+    let err = buf.read_str(0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    // The raw bytes are still reachable through `read_slice`.
+    assert_eq!(buf.read_slice(0).unwrap(), &[0xff, 0xfe]);
+
+    fs::remove_dir_all(&temp_dir).unwrap();
 }

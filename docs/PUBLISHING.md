@@ -85,6 +85,7 @@ forgedb-validation
 forgedb-parser              # → validation
 forgedb-codegen             # → parser
 forgedb-watcher             # → codegen, parser
+forgedb-lsp-server          # → parser, validation
 forgedb-migrations
 forgedb-backup              # → storage
 
@@ -94,6 +95,86 @@ forgedb                     # → parser, codegen, watcher, migrations, compacti
 
 In practice you only publish the crates that changed this cycle, plus any whose `version =`
 pin you bumped as a consequence.
+
+### Do not decide "what changed" by comparing version numbers
+
+The dangerous state is **an in-tree crate whose version equals the published version but whose
+source does not**. Nothing local detects it: the workspace builds fine, because path deps shadow
+the registry. It only surfaces for a user, as generated code that will not compile against
+crates.io.
+
+Comparing `grep '^version' crates/*/Cargo.toml` to `cargo search` cannot see this — the numbers
+match, which is precisely the bug. Diff against the published artifact instead:
+
+```bash
+# for each crate, fetch what is actually on crates.io and diff the source
+curl -sL "https://static.crates.io/crates/$C/$C-$V.crate" | tar xz
+diff -rq "$C-$V/src" "crates/<dir>/src"
+```
+
+Every crate that reports a difference needs a publish. (Reconciling the v0.4.0 gap this way found
+six drifted crates where a version-number comparison found one.)
+
+### …but a clean `src/` diff does NOT mean "no publish"
+
+The converse of the rule above is false, and it fails silently. A crate whose only change is a
+**dependency version requirement** has a byte-identical `src/`, so the diff reports it clean while
+it still must publish — its *manifest* is what changed, and cargo rewrites `Cargo.toml` at publish
+time, which is why you cannot simply diff that too.
+
+Two crates in this workspace are permanently this shape:
+
+- **`forgedb-storage`** — a pure `cfg` re-export facade. Its entire content is two backend pins, so
+  a backend bump changes the crate completely while touching no source line.
+- **`forgedb-watcher`** — pins `forgedb-codegen`, and drives the generators directly.
+
+The watcher case shows why "it still compiles" is not reassurance. Leave its pin behind and a
+registry resolution hands the root CLI `forgedb-codegen 0.4.0` while handing watcher
+`forgedb-codegen 0.3.0` — two semver-incompatible copies. It **builds**, because no codegen type
+crosses watcher's public boundary, and `forgedb dev`'s watch path then quietly regenerates with the
+previous cycle's generators, rejecting syntax the non-watch path accepts.
+
+So run a **second, independent check** beside the source diff: sweep every intra-workspace
+`forgedb-*` requirement against the depended-on crate's in-tree version and require that the caret
+range admits it.
+
+```bash
+# every intra-workspace pin, next to the version it must admit
+grep -Hn 'forgedb-[a-z-]* *= *{.*version' Cargo.toml crates/*/Cargo.toml
+grep -H  '^version' crates/*/Cargo.toml
+```
+
+A stale pin is invisible to everything local: the workspace build passes (path deps shadow the
+registry), and so does `cargo publish --dry-run`. It fails only for someone resolving from
+crates.io — every installed user, and nobody in this repo.
+
+**The rule to apply: when you republish a crate, tighten its dependents' pins to the new version
+and republish those dependents too.** A dependent still pinning the old version is the same
+stale-source hazard, one level out.
+
+### Check for a breaking change before choosing the bump
+
+A crate that is only *additive* takes a patch/minor bump. A crate that removed or changed a
+public item needs the pre-1.0 **minor** position bumped (`0.2.x → 0.3.0`), and getting this wrong
+breaks the *already-released* CLI rather than anything you are about to ship:
+
+> Publishing a renamed enum variant as `forgedb-parser 0.2.2` would have been resolved by the
+> caret requirements inside the published `forgedb 0.3.1`, `forgedb-codegen 0.2.2` and
+> `forgedb-lsp-server 0.1.0` — all of which still referenced the old name. `cargo install forgedb`
+> would have started failing for every user, from a publish that touched none of their crates.
+
+Two questions decide it:
+
+1. **Did any public item change or disappear?** Diff the published `src/` (above) and look for
+   removed/renamed `pub` items, new public struct fields (breaks literal construction), or new
+   enum variants on a non-`#[non_exhaustive]` enum.
+2. **Does a dependent leak the changed type in *its* public API?** If so the major propagates.
+   `forgedb-codegen` takes `&forgedb_parser::Schema` in `generate()`, so a parser major forces a
+   codegen major; `forgedb-watcher` and `forgedb-lsp-server` expose no parser type, so they took
+   patch bumps in the same cascade.
+
+Before publishing, confirm the blast radius by grepping the *published* sources of every
+downstream crate for the item you changed — not the working tree, which has already moved on.
 
 ---
 

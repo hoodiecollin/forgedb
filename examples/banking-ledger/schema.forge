@@ -22,8 +22,8 @@ Account {
   kind: string @length(1, 20)
   // balance in minor currency units (cents)
   balance: i64
-  // ISO 4217 currency code stored as fixed 3 bytes, e.g. "USD"
-  currency: char(3)
+  // ISO 4217 currency code, e.g. "USD" — text, so `string` with an exact length
+  currency: string @length(3, 3)
   opened_at: +timestamp
   closed_at: timestamp?
   owners: [AccountOwner]

@@ -31,7 +31,7 @@ Blog/CMS platform with paid membership tiers, subscriptions, and RBAC for staff 
 - `@soft_delete` on `Post` (deleted posts become invisible without hard deletion)
 - Three independent bidirectional M2M pairs in one schema
 - Money as `i64` (minor currency units, e.g. cents) on `Tier` and `Subscription`
-- `char(3)` and `char(3)?` for ISO 4217 currency codes (fixed-size, nullable variant)
+- `string @length(3, 3)` and `string? @length(3, 3)` for ISO 4217 currency codes (required and nullable variants) — currency codes are text
 - `@index(status, published_at)` composite index for post feed queries
 - `@index(member, status)` for subscription lookups
 - `@default` with identifier literals (`draft`, `active`, `monthly`, `public`, `paid`, `free`)

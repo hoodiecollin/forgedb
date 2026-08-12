@@ -8,8 +8,9 @@ use forgedb_codegen::{
     RustSdkGenerator, TransformGenerator, TransformPlan, TypeScriptGenerator, VersionSchema,
     WasmGenerator,
 };
+use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
 use forgedb_parser::ast::{ComponentProtocol, ComponentReference, IndexType, RelationInclusion};
-use forgedb_parser::{Field, FieldType, Model, RelationType, Schema};
+use forgedb_parser::{Field, FieldType, Model, RelationType, Schema, TimestampPrecision};
 
 /// Helper to create a simple test schema with one model
 fn simple_user_schema() -> Schema {
@@ -167,7 +168,7 @@ fn test_rust_generation_auto_generate_synthesis() {
             name: "Event".to_string(),
             fields: vec![
                 auto_field("id", FieldType::Uuid),
-                auto_field("created_at", FieldType::Timestamp),
+                auto_field("created_at", FieldType::Timestamp(TimestampPrecision::Millis)),
             ],
             composite_indexes: vec![],
             projections: Vec::new(),
@@ -310,6 +311,133 @@ fn test_api_generation_tenant_auth_router() {
     assert!(code.contains("auth: Arc<forgedb_auth::Authenticator>"));
     assert!(code.contains("forgedb_auth::axum_mw::require_tenant"));
     assert!(code.contains("axum::middleware::from_fn_with_state"));
+}
+
+/// #140 — the CORS surface, and the two existing constructors kept intact.
+///
+/// The arity of `create_router` / `create_router_with_auth` is load-bearing beyond
+/// style: `src/main.rs` is written **once** by `forgedb init` and is never
+/// regenerated, so a project that has been running for a year still calls the
+/// two-and-three-argument forms. Adding a parameter would break every existing
+/// project the next time it ran `forgedb generate` — which is why the origin list
+/// arrives through *new* functions rather than through the old ones.
+#[test]
+fn test_api_generation_cors_surface_is_additive() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // The pre-#140 entry points, unchanged.
+    assert!(code.contains("pub fn create_router("), "create_router keeps its arity");
+    assert!(
+        code.contains("pub fn create_router_with_auth("),
+        "create_router_with_auth keeps its arity"
+    );
+    // The new ones.
+    assert!(code.contains("pub fn create_router_with_options("));
+    assert!(code.contains("pub fn create_router_with_auth_and_options("));
+    assert!(code.contains("pub struct HttpOptions"));
+    assert!(code.contains("pub fn parse_origins("));
+    assert!(code.contains("pub struct AllowedOrigins"));
+}
+
+/// #140 — the CORS layer is configured for exactly what this API serves, and never
+/// with credentials.
+///
+/// `PATCH` is deliberately absent: the generator imports
+/// `routing::{delete, get, post, put}` and emits no `patch` route anywhere, so
+/// allowing it would advertise a method that 405s.
+///
+/// `allow_credentials` is asserted **absent** rather than left to a comment. Nothing
+/// is auto-attached by the browser for bearer-token auth, so an explicit `*` origin
+/// creates no CSRF vector here — but that reasoning collapses the moment cookie auth
+/// is introduced, and tower-http also rejects wildcard-plus-credentials at runtime.
+/// This assertion is what makes that a decision someone has to consciously revisit.
+#[test]
+fn test_api_generation_cors_allows_only_what_is_served() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    for m in ["Method::GET", "Method::POST", "Method::PUT", "Method::DELETE"] {
+        assert!(code.contains(m), "CORS must allow {m}");
+    }
+    assert!(
+        !code.contains("Method::PATCH"),
+        "no PATCH route is generated, so CORS must not advertise it"
+    );
+    assert!(code.contains("header::CONTENT_TYPE"));
+    assert!(code.contains("header::AUTHORIZATION"));
+    // Matched with the open paren, i.e. the *call*: doc comments are part of the
+    // emitted code, and the generator's own comment explains why credentials mode is
+    // off. A bare-word check would trip on that explanation.
+    assert!(
+        !code.contains("allow_credentials("),
+        "ForgeDB auth is a bearer header, not a cookie — credentials mode must stay \
+         off, or the `*` origin becomes unsafe and tower-http rejects the combination"
+    );
+}
+
+/// #140 — the layer is applied conditionally and the extension unconditionally.
+///
+/// These are opposite decisions for one reason each, and both are easy to "tidy" into
+/// the wrong shape. An empty `CorsLayer` still answers preflight `OPTIONS` with 200
+/// while the generated routes answer 405, so emitting one unconditionally would
+/// change observable behavior for every existing deployment. The `Extension`, by
+/// contrast, has no response behavior at all, and applying it always is what lets the
+/// WS handlers take `Extension<AllowedOrigins>` outright instead of depending on
+/// axum 0.8's `Option<T>` extractor contract.
+#[test]
+fn test_api_generation_cors_layer_is_conditional() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("match cors"),
+        "the CorsLayer must be applied only when origins are configured"
+    );
+    assert!(
+        code.contains("layer(axum::Extension(AllowedOrigins("),
+        "the AllowedOrigins extension must be applied unconditionally"
+    );
+    // Layer order: a layer applied later wraps outer, so CORS must be added after
+    // TraceLayer to end up outermost — outside the tenant guard, which is what
+    // lets a token-less preflight through.
+    let trace = code.find("TraceLayer::new_for_http()").expect("trace layer emitted");
+    let apply = code.find("__apply_origin_layers(router").expect("origin layers applied");
+    assert!(
+        trace < apply,
+        "the origin layers must be applied AFTER TraceLayer so CORS ends up outermost"
+    );
+}
+
+/// #140 — every WebSocket upgrade handler checks `Origin` before upgrading.
+///
+/// This is the half that would otherwise be silently missing: a `CorsLayer` leaves
+/// `/subscribe`, `/live-query` and `/replicate` reachable from any origin, because
+/// browsers neither preflight a handshake nor apply CORS to one. Shipping "wire
+/// origins" without this would read as done when it is half done.
+///
+/// Asserted as a count, not a presence check — with three handlers, covering two of
+/// them is the realistic failure, and a presence check passes on two.
+#[test]
+fn test_api_generation_ws_handlers_check_origin() {
+    let schema = multi_model_schema();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    let extensions = code.matches("Extension<AllowedOrigins>").count();
+    assert!(
+        extensions >= 3,
+        "all three WS upgrade handlers (/subscribe, /live-query, /replicate) must \
+         take the allow-list; found {extensions}"
+    );
+    let checks = code.matches("allowed.permits(__origin_of(&headers))").count();
+    assert!(
+        checks >= 3,
+        "all three WS upgrade handlers must gate on the origin; found {checks}"
+    );
+    assert!(
+        code.contains("StatusCode::FORBIDDEN"),
+        "a disallowed origin must be refused, not merely logged"
+    );
 }
 
 #[test]
@@ -471,85 +599,150 @@ User {
     let db_code = RustGenerator::generate(&schema).unwrap().code;
     let api_code = ApiGenerator::generate(&schema).unwrap().code;
 
-    // database.rs: an internal narrow scan record + reads, NOT a wire type
-    // (no Serialize/ToSchema derive).
-    assert!(db_code.contains("pub struct UserScanRow"), "#160: narrow scan struct emitted");
-    assert!(db_code.contains("fn __scan_row_at(&self, row_index: usize) -> Option<UserScanRow>"),
-        "#160: narrow row decoder");
-    assert!(db_code.contains("pub fn __scan_all(&self) -> Vec<UserScanRow>"),
-        "#160: narrow scan of live rows");
-    // The scan record carries filterable columns but NOT the model's derives.
-    let scan_struct = &db_code[db_code.find("pub struct UserScanRow").unwrap()..];
+    // database.rs: an internal narrow scan view + a scope to read it in, NOT a wire
+    // type (no Serialize/ToSchema derive).  #228 deleted the OWNED scan record and
+    // its per-row decoder: nothing the scan decodes leaves the scope any more, so
+    // there is nothing to own.
+    assert!(db_code.contains("pub struct UserScanRef<'a>"), "#160/#224: narrow scan view emitted");
+    assert!(!db_code.contains("UserScanRow"),
+        "#228: the owned scan record is gone — the scope is the only scan surface");
+    assert!(!db_code.contains("fn __scan_row_at("),
+        "#228: the per-row narrow decoder is gone with its only caller");
+    assert!(!db_code.contains("to_owned_row"),
+        "#228: nothing materializes a scan row");
+    // The scan view carries filterable columns but NOT the model's derives.
+    let scan_struct = &db_code[db_code.find("pub struct UserScanRef<'a>").unwrap()..];
     let scan_struct = &scan_struct[..scan_struct.find('}').unwrap()];
     assert!(scan_struct.contains("status") && scan_struct.contains("age"),
-        "#160: scan record carries filterable fields");
+        "#160: scan view carries filterable fields");
 
     // api.rs: narrow filter/sort helpers, and the live list uses them + materializes
     // only the page ids (never `all()` on the live path).
     assert!(api_code.contains("fn __user_scan_matches("), "#160: narrow filter helper");
     assert!(api_code.contains("fn __user_scan_sort("), "#160: narrow sort helper");
-    // #224 moved the filter INTO the scan (`__scan_all_filtered`), so a rejected
-    // row never allocates its strings — the #160 guarantee is unchanged: the live
-    // list still sources from the narrow scan, never `all()`.
+    assert!(!api_code.contains("__user_scan_matches_ref"),
+        "#228: one scan filter, not an owned/borrowed pair — the owned operand is gone");
+    // prettyplease wraps the scan call and its callback across lines; collapse
+    // whitespace so the assertions track the shape, not the formatting.
+    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    // #224 moved the filter INTO the scan, so a rejected row never allocates its
+    // strings; #228 moved the sort/count/page in too, so a SURVIVING row does not
+    // either.  The #160 guarantee is unchanged: the live list still sources from the
+    // narrow scan, never `all()`.
     assert!(
-        api_code.contains("db.user.__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
-        "#160/#224: live list scans narrowly, filtering during the scan"
+        api_flat.contains("db .user .__with_page("),
+        "#160/#224/#228/#226: live list scans narrowly, inside the page scope.\nGot: {api_flat}"
     );
-    assert!(api_code.contains("__user_scan_matches_ref(r, &params)"), "#160: live list filters narrow");
-    assert!(api_code.contains(".filter_map(|__id| db.user.get(*__id))"),
-        "#160: only the paginated page is full-materialized");
+    assert!(api_code.contains("__user_scan_matches(r, &params)"), "#160: live list filters narrow");
+    // #226: the page is no longer full-materialized at all.  `User` declares no
+    // `@projection`, so there is no owned caller left and the second read through
+    // `get(id)` — one positional `pread` per column, on rows the scan had already
+    // decoded — is GONE.  This also drops `filter_map`'s silent skip of a row that
+    // vanished between the scan and the re-read: under the read lock held here that
+    // was unreachable, and the buffered path has no second read to fail, so
+    // `data.len()` is now exactly `min(limit, total - offset)`.  Deliberately not
+    // reintroduced — asserting the lenient shape here would re-enter it by the back
+    // door.
+    assert!(!api_flat.contains(".filter_map(|__id| db.user.get(*__id))"),
+        "#226: no second positional read of the page\nGot: {api_flat}");
+    assert!(!api_flat.contains("db .user .__with_scan("),
+        "#226: the owned narrow path is gone for a model with no @projection\nGot: {api_flat}");
     // The as_of branch keeps the full-record path (unchanged correctness).
     assert!(api_code.contains("all_at(&forgedb_storage::Snapshot::new(__w))"),
         "#160: as_of retains the full snapshot read");
-
-    // #160 (C): index pushdown — an eligible indexed field's list filter resolves
-    // candidates from that field's index instead of scanning every row.
-    assert!(db_code.contains("pub fn __scan_by_status(&self, value: &str) -> Option<Vec<UserScanRow>>"),
-        "#160 C: indexed field gets a pushdown scan");
-    assert!(db_code.contains("pub fn __scan_by_email(&self, value: &str) -> Option<Vec<UserScanRow>>"),
-        "#160 C: unique-indexed field gets a pushdown scan");
-    assert!(api_code.contains("db.user.__scan_by_status(__v)"),
-        "#160 C: live list tries index pushdown");
-    // prettyplease wraps the fallback arm across lines; collapse whitespace so the
-    // assertion tracks the shape, not the formatting.
-    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    // #228 put sort/count/pagination inside the scope so only `(total, ids)` escaped;
+    // #226 keeps them inside and stops anything escaping at all.  The `sort` callback
+    // is now sort-ONLY — `__with_page` owns the count and the `Pagination::apply`
+    // arithmetic, because it needs the paged slice to drive the second gather.
     assert!(
         api_flat.contains(
-            "None => { db.user .__scan_all_filtered(|r| __user_scan_matches_ref("
+            "|__scan: &mut Vec<super::UserScanRef<'_>>| { __user_scan_sort(__scan, &qp.sort); }"
         ),
-        "#160 C: a parse-failure falls back to the full scan (never misses a match).\nGot: {api_flat}"
+        "#226: the scan callback sorts and nothing else.\nGot: {api_flat}"
+    );
+    // ...and the value that leaves the scope is an already-serialized OWNED
+    // `Response`.  This is the whole trick: the page views borrow the scan's buffers,
+    // so nothing naming their lifetime can escape a higher-ranked scope — but
+    // `Json(envelope).into_response()` names none of it.  `__ListEnvelope` takes
+    // `&[PageRef<'_>]` unchanged (it is already generic + borrowing, #229), so there
+    // is no `RawValue` and no hand-assembled JSON anywhere on this path.
+    assert!(
+        api_flat.contains(
+            "|__total: usize, __page: &[super::UserPageRef<'_>]| { ( StatusCode::OK, \
+             Json(__ListEnvelope { data: __page, total: __total, limit: qp.pagination.limit, \
+             offset: qp.pagination.offset, }), ) .into_response() }"
+        ),
+        "#226: the page serializes from the buffers; only an owned Response escapes.\nGot: {api_flat}"
+    );
+    assert!(
+        api_flat.contains("return db .user .__with_page("),
+        "#226: the handler returns from inside the scope.\nGot: {api_flat}"
+    );
+
+    // #160 (C): index pushdown — an eligible indexed field's list filter resolves
+    // candidate ROWS from that field's index instead of scanning every row.  #228
+    // reduced this to row resolution: the decode is the scan scope's, so the
+    // pushdown arm now gets the borrowed view it could never have while it read its
+    // candidates positionally.
+    assert!(db_code.contains("pub fn __rows_by_status(&self, value: &str) -> Option<Vec<usize>>"),
+        "#160 C/#228: indexed field resolves candidate rows");
+    assert!(db_code.contains("pub fn __rows_by_email(&self, value: &str) -> Option<Vec<usize>>"),
+        "#160 C/#228: unique-indexed field resolves candidate rows");
+    assert!(api_code.contains("db.user.__rows_by_status(__v)"),
+        "#160 C: live list tries index pushdown");
+    // #281 moved the predicate ABOVE the selection, so the pushdown chain now runs
+    // straight into the page call again — its pre-#288 spelling. The two properties
+    // are asserted separately rather than as one literal, because they are two
+    // different claims and only one of them is #160's.
+    assert!(
+        api_flat.contains("} else { None }; return db .user .__with_page( __sel,"),
+        "#160 C: a parse-failure falls back to the full scan (never misses a match), \
+         and the resolved selection feeds the page call directly.\nGot: {api_flat}"
+    );
+    assert!(
+        api_flat.contains(
+            "let __keep_all: bool = __user_is_unfiltered(&params); \
+             if __keep_all && qp.sort.is_none() {"
+        ),
+        "#288/#281: the predicate is hoisted out of the per-row loop AND gates the \
+         fast page, both before the selection is resolved.\nGot: {api_flat}"
     );
     // `region` is only in a COMPOSITE index (no single-field index), so it is NOT a
     // pushdown field — it falls through to the narrow scan.
-    assert!(!db_code.contains("fn __scan_by_region("),
+    assert!(!db_code.contains("fn __rows_by_region("),
         "#160 C: a composite-only field is not a single-field pushdown");
 
-    // #168: `__scan_all` bulk-loads each scan column once and decodes from memory
+    // #168: the scan bulk-loads each scan column once and decodes from memory
     // (physical row order + `gather_buffered`) instead of a per-row read syscall
     // storm.  A churn-free selection is the dense prefix, so `export` aliases the
     // column via mmap; deleted rows are excluded by one bulk tombstone read.
-    // #224: `__scan_all` is now the unfiltered alias; the buffered body lives in
-    // `__scan_all_filtered`, which is what these #168 guarantees describe.
-    let scan_all = &db_code[db_code.find("pub fn __scan_all_filtered").unwrap()..];
-    let scan_all = &scan_all[..scan_all.find("fn __scan_by_").unwrap_or(scan_all.len())];
-    assert!(scan_all.contains("struct __UserScanBufs"),
+    let scan = &db_code[db_code.find("pub fn __with_scan<R>").unwrap()..];
+    let scan = &scan[..scan.find("fn __rows_by_").unwrap_or(scan.len())];
+    let scan_flat: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(scan.contains("struct __UserScanBufs"),
         "#168: local buffered-column holder emitted");
-    assert!(scan_all.contains(".gather_buffered(&__rows)"),
+    assert!(scan.contains(".gather_buffered(&__rows)"),
         "#168: each scan column is bulk-loaded once");
-    assert!(scan_all.contains("forgedb_storage::BufferedFixedColumn"),
+    assert!(scan.contains("forgedb_storage::BufferedFixedColumn"),
         "#168: fixed scan columns use the buffered fixed reader");
-    assert!(scan_all.contains("forgedb_storage::BufferedVariableColumn"),
+    assert!(scan.contains("forgedb_storage::BufferedVariableColumn"),
         "#168: string scan columns use the buffered variable reader");
-    assert!(scan_all.contains("tombstones") && scan_all.contains(".live_indices(&__rows)"),
-        "#168: deleted rows excluded by one bulk tombstone read");
-    assert!(scan_all.contains("__rows.sort_unstable()"),
+    assert!(scan_flat.contains("self.tombstones .live_indices(&__all)"),
+        "#168: deleted rows excluded by one bulk tombstone read.\nGot: {scan_flat}");
+    assert!(scan.contains("__all.sort_unstable()"),
         "#168: live rows iterated in physical (ascending) order");
+    // #228: an index-pushdown selection is sorted too — `gather_buffered` bounds its
+    // reads to [min, max], so ascending order keeps the spanned read tight.  It is
+    // NOT tombstone-filtered: delete removes the id from every secondary index, so a
+    // candidate resolved through one is live by construction.
+    assert!(scan_flat.contains("Some(mut __c) => { __c.sort_unstable(); __c }"),
+        "#228: a pushdown selection is sorted for span locality.\nGot: {scan_flat}");
     // The buffered loop decodes by SLOT via the reused field_read_stmt bodies —
     // never a per-row positional read against `self.<col>` inside the scan loop.
-    assert!(scan_all.contains("for __slot in 0..__n"),
+    assert!(scan.contains("for __slot in 0..__n"),
         "#168: buffered decode iterates slots");
-    assert!(!scan_all.contains("self.__scan_row_at"),
-        "#168: __scan_all no longer calls the per-row decoder in its loop");
+    assert!(scan.contains("f(&mut __refs)"),
+        "#228: the scope hands the borrowed views to the caller's callback");
 }
 
 #[test]
@@ -592,13 +785,27 @@ Metric {
     assert!(db_code.contains("views_index"), "#169: hash index kept alongside (parallel, not replace)");
     assert!(db_code.contains("pub fn find_by_views"), "#169: exact-match probe still emitted");
 
-    // Ineligible: string / nullable-i64 / f64 get NO ordered index or range method.
+    // f64 IS ordered (#242), but uniquely: the map is keyed by the encoded u64
+    // while the caller still passes an f64. Both halves are asserted, because
+    // getting only the first right would compile and be unusable.
+    assert!(db_code.contains("ratio_ordered"), "#242: f64 gets an ordered index");
+    assert!(db_code.contains("pub fn find_by_ratio_range"), "#242: f64 range method");
+    let ratio_range = &db_code[db_code.find("fn find_by_ratio_range").unwrap()..];
+    let ratio_range = &ratio_range[..ratio_range.find("__out\n").unwrap_or(ratio_range.len().min(1200))];
+    assert!(
+        ratio_range.contains("min : Option < f64 >") || ratio_range.contains("min: Option<f64>"),
+        "#242: the caller passes an f64 bound, never the encoded u64: {ratio_range}"
+    );
+    assert!(
+        ratio_range.contains("__forgedb_f64_key"),
+        "#242: the bound is encoded on the way in, so it is comparable to the stored key"
+    );
+
+    // Ineligible: string / nullable-i64 get NO ordered index or range method.
     assert!(!db_code.contains("name_ordered"), "#169: string is exact-match only");
     assert!(!db_code.contains("find_by_name_range"), "#169: no range on a string index");
     assert!(!db_code.contains("score_ordered"), "#169: nullable ordered field deferred");
     assert!(!db_code.contains("find_by_score_range"), "#169: no range on a nullable field");
-    assert!(!db_code.contains("ratio_ordered"), "#169: f64 excluded (no clean total order)");
-    assert!(!db_code.contains("find_by_ratio_range"), "#169: no range on f64");
 }
 
 #[test]
@@ -670,7 +877,7 @@ fn test_different_field_types() {
                 },
                 Field { position: None,
                     name: "created_at".to_string(),
-                    field_type: FieldType::Timestamp,
+                    field_type: FieldType::Timestamp(TimestampPrecision::Millis),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -704,7 +911,7 @@ fn complex_types_schema() -> Schema {
                 fields: vec![
                     Field { position: None,
                         name: "street".to_string(),
-                        field_type: FieldType::Char(100),
+                        field_type: FieldType::Bytes(100),
                         auto_generate: false,
                         unique: false,
                         indexed: false,
@@ -716,7 +923,7 @@ fn complex_types_schema() -> Schema {
                     },
                     Field { position: None,
                         name: "city".to_string(),
-                        field_type: FieldType::Char(50),
+                        field_type: FieldType::Bytes(50),
                         auto_generate: false,
                         unique: false,
                         indexed: false,
@@ -776,7 +983,7 @@ fn complex_types_schema() -> Schema {
                 },
                 Field { position: None,
                     name: "name".to_string(),
-                    field_type: FieldType::Char(200),
+                    field_type: FieldType::Bytes(200),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -812,7 +1019,7 @@ fn complex_types_schema() -> Schema {
                 },
                 Field { position: None,
                     name: "tags".to_string(),
-                    field_type: FieldType::FixedArray(Box::new(FieldType::Char(20)), 5),
+                    field_type: FieldType::FixedArray(Box::new(FieldType::Bytes(20)), 5),
                     auto_generate: false,
                     unique: false,
                     indexed: false,
@@ -2177,8 +2384,8 @@ Tag {
 #[test]
 fn test_rust_generation_version_guard() {
     // Format-version guard (#74 Phase 1): the generated app, on open, compares the
-    // manifest's stamped `format_version` against a codegen-baked
-    // `EXPECTED_FORMAT_VERSION` and FAIL-FAST refuses a stale data dir — it never
+    // manifest's stamped schema serial against a codegen-baked
+    // `EXPECTED_SCHEMA_VERSION` and FAIL-FAST refuses a stale data dir — it never
     // reshapes/self-heals (red line DV-6).  This turns a silent byte mis-decode of
     // a dir written under an old schema into a clear refusal pointing at the
     // migration bin.
@@ -2201,15 +2408,15 @@ Tag {
 
     // An opaque, codegen-baked expected version constant is emitted.
     assert!(
-        code.contains("const EXPECTED_FORMAT_VERSION: u32 = 1"),
+        code.contains("const EXPECTED_SCHEMA_VERSION: u32 = 1"),
         "generated app bakes in the version it expects"
     );
 
     // The guard reads exactly the one opaque integer and compares it — it must NOT
     // inspect column names/types to decide anything (DV-6: refuse, don't adapt).
     assert!(
-        code.contains("__m.format_version != EXPECTED_FORMAT_VERSION"),
-        "open compares the manifest format_version against the expected version"
+        code.contains("__m.schema_version != EXPECTED_SCHEMA_VERSION"),
+        "open compares the manifest schema serial against the expected version"
     );
     assert!(
         code.contains("but this binary expects v"),
@@ -2226,7 +2433,7 @@ Tag {
     );
 
     // Identity: the guard branch must not read column shape to self-heal — the ONLY
-    // manifest field it touches in the guard is `format_version`.  (It must never
+    // manifest field it touches in the guard is the schema serial.  (It must never
     // resolve a decoder from column names/types the way a schema engine would.)
     assert!(
         !code.contains("__m.columns") && !code.contains("m.column_type"),
@@ -2234,26 +2441,26 @@ Tag {
     );
 
     // #74 Phase 2: the baked version is LINEAGE-SOURCED, not hardcoded — the CLI
-    // threads `MigrationLineage::current_format_version` via
-    // `generate_with_format_version`.  A schema with no lineage baselines to 1
+    // threads `MigrationLineage::current_schema_version` via
+    // `generate_with_schema_version`.  A schema with no lineage baselines to 1
     // (the default `generate`); a lineage at version N bakes N.
-    let code_v7 = RustGenerator::generate_with_format_version(&schema, 7)
+    let code_v7 = RustGenerator::generate_with_schema_version(&schema, 7)
         .unwrap()
         .code;
     assert!(
-        code_v7.contains("const EXPECTED_FORMAT_VERSION: u32 = 7"),
+        code_v7.contains("const EXPECTED_SCHEMA_VERSION: u32 = 7"),
         "the expected version is threaded from the migration lineage, not hardcoded"
     );
 }
 
 #[test]
-fn test_rust_generation_manifest_preserves_format_version() {
+fn test_rust_generation_manifest_preserves_schema_version() {
     // Version writer preservation (#74 Phase 1 prerequisite): `write_manifest`
     // runs on EVERY open, so it must load any existing manifest and carry its
-    // `format_version` forward (exactly as it already does for `compaction_epoch`)
+    // the schema serial forward (exactly as it already does for `compaction_epoch`)
     // — otherwise a reopen would clobber a migration's version bump back to the
     // baseline and silently defeat the open-time guard.  A fresh dir (no manifest)
-    // is stamped with `EXPECTED_FORMAT_VERSION`.
+    // is stamped with `EXPECTED_SCHEMA_VERSION`.
     let src = r#"
 User {
   id: +uuid
@@ -2267,19 +2474,19 @@ User {
     // The manifest is written with a preserved-or-baseline version, NOT a hardcoded
     // constant that would clobber a bumped version on reopen.
     assert!(
-        code.contains("let __format_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
-            && code.contains(".map(|m| m.format_version)")
-            && code.contains(".unwrap_or(EXPECTED_FORMAT_VERSION)"),
-        "write_manifest preserves an existing format_version, baselining a fresh dir"
+        code.contains("let __schema_version = forgedb_storage::Manifest::load_from(&__manifest_abs)")
+            && code.contains(".map(|m| m.schema_version)")
+            && code.contains(".unwrap_or(EXPECTED_SCHEMA_VERSION)"),
+        "write_manifest preserves an existing schema_version, baselining a fresh dir"
     );
     assert!(
-        code.contains("format_version: __format_version"),
+        code.contains("schema_version: __schema_version"),
         "the manifest is stamped with the preserved-or-baseline version"
     );
     // The old clobbering hardcode is gone.
     assert!(
-        !code.contains("format_version: 1,"),
-        "no hardcoded format_version left to clobber a bumped version on reopen"
+        !code.contains("schema_version: 1,"),
+        "no hardcoded schema version left to clobber a bumped version on reopen"
     );
 }
 
@@ -2621,6 +2828,157 @@ Post {
     assert!(code.contains("if let Some(__fk) = record.reviewer"),
         "optional FK reviewer checked only when set");
     assert!(code.contains("ValidationError::DanglingReference"), "dangling FK rejected");
+}
+
+#[test]
+fn test_rust_generation_numeric_bounds_per_domain() {
+    // #239: `@min`/`@max` compare in a domain that represents both the value and
+    // the bound exactly. Three defects motivated this, all in one code path:
+    //
+    //  1. `decimal` was absent from `is_numeric_type`, and because both arms are
+    //     gated on that predicate a bound on the exact-money type emitted NO check
+    //     — parsed, carried through the AST, silently enforcing nothing.
+    //  2. The compare ran through `(*__v as f64)`, which `decimal` cannot even do
+    //     (it is a struct, not a primitive) — so (1) could not be fixed by adding a
+    //     match arm alone.
+    //  3. That same f64 cast rounds a 64-bit integer past the 53-bit mantissa, so
+    //     `qty: u64 @min(9007199254740993)` ACCEPTED 9007199254740992 — a value
+    //     below the declared minimum.
+    let src = r#"
+Product {
+  id: +uuid
+  price: decimal @min(1) @max(1000000)
+  discount: ?decimal @min(0)
+  qty: u64 @min(9007199254740993)
+  ratio: f64 @max(1)
+  age: ?i32 @min(0)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat = code.replace([' ', '\n'], "");
+
+    // (1) + (2): decimal bounds are enforced, compared as Decimal — never via f64.
+    assert!(
+        flat.contains("(*__v)<rust_decimal::Decimal::from(1i64)"),
+        "decimal @min compares in the decimal domain"
+    );
+    assert!(
+        flat.contains("(*__v)>rust_decimal::Decimal::from(1000000i64)"),
+        "decimal @max compares in the decimal domain"
+    );
+    // A nullable decimal must get the same treatment, inside its `Some` guard.
+    assert!(
+        flat.contains("(*__v)<rust_decimal::Decimal::from(0i64)"),
+        "nullable decimal @min is enforced too"
+    );
+
+    // (3): integer bounds promote to i128, which holds all of u64/i64 losslessly.
+    assert!(
+        flat.contains("(*__vasi128)<(9007199254740993i64asi128)"),
+        "u64 @min compares as i128, not f64"
+    );
+    assert!(
+        flat.contains("(*__vasi128)<(0i64asi128)"),
+        "nullable i32 @min compares as i128"
+    );
+
+    // f64 fields keep the float compare — their own domain IS binary float, so
+    // there is nothing more exact to promote to.
+    assert!(
+        flat.contains("(*__vasf64)>(1i64asf64)"),
+        "f64 @max stays in the f64 domain"
+    );
+
+    // The lossy form must be gone for every non-f64 numeric field. `ratio` is the
+    // only field allowed to produce an `as f64` compare.
+    assert_eq!(
+        flat.matches("(*__vasf64)").count(),
+        1,
+        "only the f64 field compares through f64"
+    );
+
+    // All four bounded fields actually emit a rule, i.e. none silently vanished.
+    for field in ["price", "discount", "qty", "ratio", "age"] {
+        assert!(
+            code.contains(&format!("field: \"{field}\"")),
+            "{field} emits a constraint check"
+        );
+    }
+}
+
+#[test]
+fn test_rust_generation_fractional_and_exclusive_bounds() {
+    // #239 gaps 1, 2 and 4: fractional bounds, exclusive bounds, and negative
+    // bounds. The load-bearing assertion is the `decimal` one — the literal is
+    // reconstructed as mantissa+scale, so `0.01` is the exact Decimal 1e-2 and
+    // never passes through a binary float, which is the entire reason the lexeme
+    // is carried from the lexer instead of being parsed to f64 there.
+    let src = r#"
+Product {
+  id: +uuid
+  price: decimal @min(0.01) @max(99999.99)
+  fee: decimal @min(>0.00)
+  rate: f64 @min(>0) @max(<1)
+  temp: f64 @min(-273.15)
+  celsius: i32 @min(-273)
+  opt: ?decimal @min(0.05)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat = code.replace([' ', '\n'], "");
+
+    // Exact decimal reconstruction: 0.01 → 1e-2, 99999.99 → 9999999e-2.
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(1i128,2u32)"),
+        "0.01 is built exactly as mantissa 1, scale 2"
+    );
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(9999999i128,2u32)"),
+        "99999.99 is built exactly"
+    );
+    assert!(
+        flat.contains("rust_decimal::Decimal::from_i128_with_scale(5i128,2u32)"),
+        "a nullable decimal bound is built exactly too"
+    );
+    // No decimal bound may be routed through a float literal.
+    assert!(
+        !flat.contains("Decimal::from_str") && !flat.contains("0.01f64"),
+        "a decimal bound never passes through a parse or an f64 literal"
+    );
+
+    // Exclusive bounds flip the rejecting comparison: `@min(>n)` rejects `v <= n`.
+    assert!(
+        flat.contains("(*__v)<=rust_decimal::Decimal::from_i128_with_scale(0i128,2u32)"),
+        "@min(>0.00) rejects values <= the bound"
+    );
+    assert!(
+        flat.contains("(*__vasf64)<=(0i64asf64)"),
+        "@min(>0) is exclusive"
+    );
+    assert!(
+        flat.contains("(*__vasf64)>=(1i64asf64)"),
+        "@max(<1) is exclusive"
+    );
+
+    // A fractional f64 bound rounds only into the field's own domain.
+    assert!(flat.contains("(*__vasf64)<-273.15f64"), "f64 fractional bound");
+
+    // Negative bounds (gap 4) reach codegen at all.
+    assert!(
+        flat.contains("(*__vasi128)<(-273i64asi128)"),
+        "negative integer bound"
+    );
+
+    // Messages quote the author's own spelling, including exclusivity and the
+    // trailing zero, rather than a re-rendered float.
+    assert!(code.contains(r#""must be >= 0.01""#), "inclusive message");
+    assert!(code.contains(r#""must be > 0.00""#), "exclusive message");
+    assert!(code.contains(r#""must be < 1""#), "exclusive max message");
+    assert!(code.contains(r#""must be >= -273.15""#), "negative message");
 }
 
 #[test]
@@ -3194,8 +3552,9 @@ User {
     // #224: that matcher now runs on the BORROWED scan view, during the scan — the
     // "one predicate source" guarantee is unchanged; only the operand view is.
     assert!(
-        code.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
-        "list filters the narrow scan via the generated closed-set matcher (no second parser)"
+        code.contains("|r| __keep_all || __user_scan_matches(r, &params)"),
+        "list filters the narrow scan via the generated closed-set matcher (no second \
+         parser); #288 short-circuits it on the hoisted bool, same matcher"
     );
     // The `?as_of` snapshot path keeps the full-record read + the same closed-set
     // filter (`user_event_matches`).
@@ -3780,8 +4139,20 @@ Tag {
     assert!(flat.contains("\"Post\"=>"), "model tag arm present");
     assert!(flat.contains("\"post_tag_link\"=>"), "junction tag arm present");
     // The junction arm re-links from the opaque 32-byte pair, no field decode.
+    // #266 made the decode per-endpoint (each side is its own key type), so the
+    // pair is bound first and passed positionally; for this uuid/uuid junction
+    // the framed width is still 32 and each half is still `Uuid::from_bytes`.
     assert!(
-        flat.contains("self.post_tag_link.link(Uuid::from_bytes(__l),Uuid::from_bytes(__r))"),
+        flat.contains("ifev.bytes.len()==32{"),
+        "the junction frame is still the two endpoint widths"
+    );
+    assert!(
+        flat.contains("__b.copy_from_slice(&ev.bytes[0..16]);Uuid::from_bytes(__b)")
+            && flat.contains("__b.copy_from_slice(&ev.bytes[16..32]);Uuid::from_bytes(__b)"),
+        "each half of the opaque pair decodes as that endpoint's key"
+    );
+    assert!(
+        flat.contains("self.post_tag_link.link(__l,__r)"),
         "junction frames re-link from the opaque left++right pair"
     );
 
@@ -5263,8 +5634,10 @@ Widget {
         "i32 filter parses the param to i32"
     );
     assert!(
-        code.contains("forgedb_types::Timestamp::from_seconds"),
-        "timestamp filter parses seconds into Timestamp"
+        code.contains("want.parse::<forgedb_types::Timestamp>()"),
+        "#254: a timestamp filter parses the RFC 3339 wire form, the same form the \
+         body uses — parsing a bare integer here would have silently meant SECONDS \
+         against microsecond storage, matching nothing instead of failing"
     );
     // (The generic path may wrap across lines in the formatted output, so match
     // the pieces rather than one contiguous span.)
@@ -5873,6 +6246,132 @@ Gadget {
     );
 }
 
+/// Whether `code` mentions `ident` as a whole identifier rather than as a
+/// substring of a longer one. `"ref_id_index".contains("id_index")` is true, so a
+/// plain `contains` cannot assert that `id_index` was *not* generated.
+fn mentions_ident(code: &str, ident: &str) -> bool {
+    let boundary = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    code.match_indices(ident).any(|(i, _)| {
+        boundary(code[..i].chars().next_back())
+            && boundary(code[i + ident.len()..].chars().next())
+    })
+}
+
+#[test]
+fn test_rust_generation_modifiers_on_non_identity_auto_fields() {
+    // #258: `&` / `^` on a NON-identity auto (`+`) field used to be silently
+    // dropped — `indexed_fields` excluded every `auto_generate` field, so no index
+    // was built and, for `&`, no uniqueness was enforced at all.  This affected
+    // `+uuid` / `+timestamp`, which synthesize today, so it was a live bug rather
+    // than one gated on #187.
+    let src = r#"
+Event {
+  id: +uuid
+  created_at: ^+timestamp
+  ref_id: &+uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `^` builds the index it asked for.
+    assert!(
+        mentions_ident(&code, "created_at_index"),
+        "`^` on a non-identity auto field must build an index (#258)"
+    );
+    // `&` builds the index AND the uniqueness check that rejects a duplicate.
+    assert!(
+        mentions_ident(&code, "ref_id_index"),
+        "`&` on a non-identity auto field must build an index (#258)"
+    );
+    // Flattened: prettyplease wraps the multi-field variant across lines and adds
+    // a trailing comma, so match the field list rather than a formatted literal.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::Unique{model:\"Event\",field:\"ref_id\""),
+        "`&` on a non-identity auto field must enforce uniqueness (#258)"
+    );
+
+    // The identity field keeps its exclusion: `id_to_row` already enforces it, so
+    // a second index would be redundant.  This half of the old behavior is
+    // correct and must not regress.
+    assert!(
+        !mentions_ident(&code, "id_index"),
+        "the identity field must NOT get a redundant secondary index (#258)"
+    );
+}
+
+#[test]
+fn test_rust_generation_identity_modifiers_stay_redundant() {
+    // #258 companion: the identity is excluded because it IS the identity, not
+    // because it is auto-generated.  Both spellings of identity — a field named
+    // `id`, and a differently-named `+` field standing in as the identity — build
+    // no secondary index even when marked `&` / `^`.  (Schema validation warns and
+    // suggests dropping the modifier; see the parser-side guard.)
+    let src = r#"
+Widget {
+  id: &+uuid
+  name: string
+}
+
+Gadget {
+  code: ^+u64
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !mentions_ident(&code, "id_index"),
+        "`&` on an `id`-named identity stays redundant (#258)"
+    );
+    assert!(
+        !mentions_ident(&code, "code_index"),
+        "`^` on a `+`-field identity stays redundant (#258)"
+    );
+}
+
+#[test]
+fn test_rust_generation_single_and_composite_index_agree_on_auto_fields() {
+    // #258: composite indexes never applied the auto-field exclusion, so before
+    // the fix the SAME field was indexable via `@index(a, b)` but not via `^`.
+    // That asymmetry is what proved the exclusion was an oversight rather than a
+    // design choice, so guard the two paths against diverging again.
+    let composite = r#"
+Event {
+  id: +uuid
+  created_at: +timestamp
+  name: string
+  @index(created_at, name)
+}
+"#;
+    let single = r#"
+Event {
+  id: +uuid
+  created_at: ^+timestamp
+  name: string
+}
+"#;
+    let emit = |src: &str| {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        RustGenerator::generate(&schema).unwrap().code
+    };
+
+    assert!(
+        mentions_ident(&emit(composite), "created_at_name_index"),
+        "a composite index over an auto field is built (pre-existing behavior)"
+    );
+    assert!(
+        mentions_ident(&emit(single), "created_at_index"),
+        "a single index over the same auto field must also be built (#258)"
+    );
+}
+
 #[test]
 fn test_rust_generation_txn_commit_journal() {
     // MVCC Tier 1 (#83, M1b): the atomic multi-model commit journal.  Commit fsyncs
@@ -6330,6 +6829,67 @@ User {
     assert!(
         !coord_manifest.contains("forgedb-storage"),
         "G3 (T3-8): forgedb-coordinator must have NO forgedb-storage* dependency"
+    );
+}
+
+/// #274 — both coordinator error arms must drop the connection before returning.
+///
+/// A failed `request_turn` or `committed` leaves the coordinator's reply **in
+/// flight**; it will still be written onto that socket. Without a reconnect the
+/// *next* transaction reads it as its own answer, and a stale `Grant` read that way
+/// makes the generated data plane write columns for a turn the coordinator has
+/// already reclaimed — reported as `Ok`, because the resulting `Error` on
+/// `Committed` lands in the `eprintln!` arm.
+///
+/// The substrate poisons the connection so that misread is impossible, but poison
+/// alone would strand the process: `Arc<CoordinatorClient>` is built once in
+/// `CoordinatedDatabase::connect` and never rebuilt, so every later write would fail
+/// until the app reconstructed the whole database. The `reconnect()` calls asserted
+/// here are what make the poisoning recoverable, and they live in **generated** code
+/// on purpose — beside the `Busy` retry budget, which is where this project keeps
+/// recovery policy rather than in the substrate.
+///
+/// Guarded structurally rather than by snapshot because a snapshot accepts a
+/// deletion here as readily as an addition.
+#[test]
+fn test_rust_generation_coordinator_errors_reconnect() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let reconnects = code.matches("__coord.reconnect()").count();
+    assert_eq!(
+        reconnects, 2,
+        "expected exactly two `__coord.reconnect()` calls — one in the request_turn \
+         error arm, one in the Committed ack error arm; found {reconnects}"
+    );
+
+    // The request_turn arm: reconnect must precede the return, or the connection is
+    // handed to the next transaction still desynchronized.
+    let req_arm = code
+        .find("__coord.reconnect()")
+        .expect("first reconnect present");
+    let io_return = code[req_arm..]
+        .find("TxError::Io")
+        .expect("the request_turn arm still returns TxError::Io");
+    assert!(
+        io_return < 400,
+        "the first reconnect() must sit in the request_turn error arm, immediately \
+         before its `return Err(TxError::Io(..))`"
+    );
+
+    // The Committed arm keeps returning Ok — the commit really is durable (columns +
+    // WAL are fsynced before `Committed` is sent), so a missing ack must not turn a
+    // successful commit into a reported failure.
+    assert!(
+        code.contains("coordinator: Committed ack error"),
+        "the Committed ack arm keeps its diagnostic and does not become fatal"
     );
 }
 
@@ -6865,10 +7425,16 @@ fn test_python_sdk_generation_snapshot() {
 
 #[test]
 fn test_rust_generation_borrowed_scan_view() {
-    // #224: the narrow scan decodes each live row into a BORROWED view first and
-    // materializes an owned row only for the ones a predicate keeps.  Before this,
-    // every live row's strings were allocated and copied out of the buffered span,
-    // then most of them were thrown away by the list handler's `retain`.
+    // #224: the narrow scan decodes each live row into a BORROWED view whose strings
+    // point straight at the buffered span.  Before this, every live row's strings
+    // were allocated and copied out of that span, then most of them were thrown away
+    // by the list handler's `retain`.
+    //
+    // #228: and the borrowed view is now the ONLY scan view.  The owned twin existed
+    // solely because the scan handed its rows back to the caller, so the borrows had
+    // to be broken before the buffers dropped — and on an unfiltered list every row
+    // was a survivor, so every row still paid the copy.  Making the scan a scope
+    // removes the reason for the copy rather than narrowing who pays it.
     let src = r#"
 User {
   id: +uuid
@@ -6887,8 +7453,15 @@ User {
     // every other filterable field keeps the owned record's exact type (that is
     // what lets ONE emitted filter compile against both views).
     assert!(
+        flat.contains("pub struct UserScanRef<'a> {"),
+        "UserScanRef is emitted.\nGot: {flat}"
+    );
+    // #226 put the internal buffer slot first, ahead of the field set; the doc
+    // comment on it sits between the two, so this asserts the field list from
+    // `__slot` on rather than from the opening brace.
+    assert!(
         flat.contains(
-            "pub struct UserScanRef<'a> { pub id: Uuid, pub email: &'a str, \
+            "pub __slot: usize, pub id: Uuid, pub email: &'a str, \
              pub bio: Option<&'a str>, pub age: u32, pub score: f64, }"
         ),
         "UserScanRef borrows strings and mirrors every other scan field type.\nGot: {flat}"
@@ -6912,30 +7485,35 @@ User {
         "nullable string borrows past the presence tag instead of copying"
     );
 
-    // The owned per-row decode (`read_at`, the index-pushdown `__scan_row_at`) is
-    // untouched — it still allocates, because its callers need owned records.
+    // The full-record positional decode (`read_at`, which the page materialization
+    // goes through) is untouched — it still allocates, because its callers need
+    // owned records.  Only `limit` rows reach it.
     assert!(
         flat.contains(".email_col .read_string(row_index)"),
         "the positional read path keeps the owned decode"
     );
 
-    // Filtered scan + the unfiltered alias that delegates to it: one buffered-scan
-    // body, not two.
+    // #228: one scan entry point, and it is a SCOPE.  `keep` runs during decode so a
+    // rejected row is never pushed (that is #224's win, preserved); `f` runs while
+    // the buffers are alive, and only what it returns escapes.
     assert!(
         flat.contains(
-            "pub fn __scan_all_filtered( &self, keep: impl Fn(&UserScanRef<'_>) -> bool, ) \
-             -> Vec<UserScanRow>"
+            "pub fn __with_scan<R>( &self, sel: Option<Vec<usize>>, \
+             keep: impl Fn(&UserScanRef<'_>) -> bool, \
+             f: impl FnOnce(&mut Vec<UserScanRef<'_>>) -> R, ) -> R"
         ),
-        "__scan_all_filtered takes a predicate over the borrowed view.\nGot: {flat}"
+        "__with_scan is the scan scope: a selection, a predicate, and a callback.\nGot: {flat}"
     );
+    // Survivors are collected as BORROWED views — no owned row, no `to_owned_row`.
     assert!(
-        flat.contains("pub fn __scan_all(&self) -> Vec<UserScanRow> { self.__scan_all_filtered(|_| true) }"),
-        "__scan_all delegates to the filtered scan.\nGot: {flat}"
+        flat.contains("if keep(&__row_ref) { __refs.push(__row_ref); }"),
+        "survivors stay borrowed inside the scope.\nGot: {flat}"
     );
-    // Materialization happens once per SURVIVOR, inside the keep branch.
+    // The scope's return is the callback's return, so nothing borrowed can leak: the
+    // view's lifetime is higher-ranked, which is what makes `R` unable to name it.
     assert!(
-        flat.contains("if keep(&__row_ref) { rows.push(__row_ref.to_owned_row()); }"),
-        "only rows the predicate keeps are materialized.\nGot: {flat}"
+        flat.contains("f(&mut __refs) }"),
+        "the scope returns only what the callback returns.\nGot: {flat}"
     );
 }
 
@@ -6956,54 +7534,55 @@ User {
     let code = ApiGenerator::generate(&schema).unwrap().code;
     let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // Both filters exist and are emitted from the same per-field checks.
-    assert!(code.contains("fn __user_scan_matches("), "owned scan filter still emitted");
-    assert!(code.contains("fn __user_scan_matches_ref("), "borrowed scan filter emitted");
+    // #228: exactly ONE scan filter, over the borrowed view.  #224 had emitted a
+    // second, owned-operand copy for the index-pushdown arm, which was the only
+    // caller that held no buffered span; unifying that arm on the scan scope left it
+    // with none.
+    assert!(code.contains("fn __user_scan_matches("), "scan filter emitted");
+    assert!(!code.contains("__user_scan_matches_ref"), "the owned-operand twin is gone");
+    assert!(
+        flat.contains(
+            "fn __user_scan_matches( record: &super::UserScanRef<'_>, \
+             params: &HashMap<String, String>, ) -> bool"
+        ),
+        "the one scan filter takes the borrowed view.\nGot: {flat}"
+    );
 
     // The REST list source and BOTH live-query scans filter during the scan
     // instead of decoding everything and `retain`ing afterwards.
     assert!(
-        flat.contains("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))"),
-        "scan source filters on the borrowed view.\nGot: {flat}"
+        flat.contains("__with_scan( None, |r| __keep_all || __user_scan_matches(r, &params),"),
+        "the live-query scans filter on the borrowed view inside the scope.\nGot: {flat}"
     );
-    // At least the three call sites: the REST list source, the live-query initial
-    // scan, and the live-query re-run.  (An indexed model emits one more per
-    // pushdown branch — the fallback when the param does not parse — so this is a
-    // floor, not an exact count.)
+    // All three call sites: the REST list source, the live-query initial scan, and
+    // the live-query re-run.  Since #228 the pushdown fallback is no longer a fourth
+    // *scan* — it is a `None` selection into the same one — so this is exact.
     assert!(
-        flat.matches("__scan_all_filtered(|r| __user_scan_matches_ref(r, &params))").count() >= 3,
-        "REST list + live-query init + live-query re-run all filter during the scan.\nGot: {flat}"
+        flat.matches("|r| __keep_all || __user_scan_matches(r, &params)").count() == 3,
+        "REST list + live-query init + live-query re-run, one scan each — and #288 hoists \
+         at every one of them, so the count pins the hoist's coverage too.\nGot: {flat}"
     );
     assert!(
-        !flat.contains("__scan_rows.retain(|r| __user_scan_matches(r, &params));"),
-        "the post-scan retain over every decoded row is gone"
-    );
-    // The index-pushdown arm still filters OWNED rows: it resolves O(matches)
-    // candidates through the secondary index and reads them individually, so there
-    // is no buffered span to borrow from.
-    assert!(
-        flat.contains("__c.retain(|r| __user_scan_matches(r, &params));"),
-        "the pushdown candidate set keeps the owned filter.\nGot: {flat}"
+        !flat.contains(".retain(|r| __user_scan_matches(r, &params))")
+            && !flat.contains(".retain(|r| __keep_all || __user_scan_matches(r, &params))"),
+        "no post-scan retain over decoded rows remains (both spellings — #288 changed the \
+         closure body, and a negative pinned to the old one alone would pass vacuously)"
     );
 
-    // The ONE comparison that has to differ: `Option`'s PartialEq is homogeneous,
-    // so a nullable string on the borrowed view must borrow the parsed param too.
-    // Every other check is byte-identical between the two filters.
-    let owned = &code[code.find("fn __user_scan_matches(").unwrap()
-        ..code.find("fn __user_scan_matches_ref(").unwrap()];
-    let borrowed = &code[code.find("fn __user_scan_matches_ref(").unwrap()..];
+    // The comparison that made the borrowed view non-trivial: `Option`'s PartialEq is
+    // homogeneous, so there is no `Option<&str> == Option<String>` and a nullable
+    // string has to compare against a BORROWED param.  Non-nullable strings need no
+    // adjustment — std has `&str: PartialEq<String>`.  That asymmetry is not obvious
+    // from either type, so it stays pinned even though the owned twin it used to be
+    // contrasted against is gone.
+    let matcher = &code[code.find("fn __user_scan_matches(").unwrap()..];
     assert!(
-        owned.contains("record.bio == Some(__w)"),
-        "owned filter compares Option<String> directly"
+        matcher.contains("record.bio == Some(__w.as_str())"),
+        "nullable string compares Option<&str> against a borrowed param.\nGot: {matcher}"
     );
     assert!(
-        borrowed.contains("record.bio == Some(__w.as_str())"),
-        "borrowed filter compares Option<&str> against a borrowed param"
-    );
-    // Non-nullable strings need no adjustment — std has `&str: PartialEq<String>`.
-    assert!(
-        owned.contains("record.email == __w") && borrowed.contains("record.email == __w"),
-        "non-nullable string comparison is identical in both views"
+        matcher.contains("record.email == __w"),
+        "non-nullable string compares &str against the owned param directly"
     );
 }
 
@@ -7022,7 +7601,7 @@ enum Status { Draft, Published }
 Kitchen {
   id: +uuid
   s_name: &string
-  s_code: ^char(8)
+  s_code: ^bytes(8)
   n_u32: ^u32
   n_f64: ^f64
   b_flag: ^bool
@@ -7085,30 +7664,48 @@ Owner {
         "integer keys write digits straight in"
     );
     assert!(
-        flat.contains(r#"write!(__k,"{}",__v.as_seconds())"#),
-        "timestamp is #[serde(transparent)] over i64 — its key is the bare number"
+        flat.contains(r#"write!(__k,"{}",__v.as_micros())"#),
+        "#254: the INDEX key stays the bare stored number and stays in the numeric \
+         class — the RFC 3339 change is the wire form only, and keying on the \
+         string would silently reorder every timestamp index lexicographically"
     );
     assert!(
         flat.contains(r#"__k.push_str(if*__v{"true"}else{"false"});"#),
         "bool keys are a literal, not a formatted value"
     );
-    // Floats KEEP the JSON number formatter: Display renders 1.0 as "1" and 1e300
-    // as "1e300", where JSON gives "1.0" and "1e+300".
+    // Floats key off their total-order u64 encoding (#242), NOT any float
+    // rendering. JSON has no form for a non-finite, which is why the old
+    // `serde_json::Number::from_f64` path returned None for NaN/±Inf and dropped
+    // them into the null bucket.
     assert!(
-        flat.contains("matchserde_json::Number::from_f64(*__v)"),
-        "f64 keys must use the JSON float formatter, not Display (#230)"
+        flat.contains(r#"write!(__k,"{}",__forgedb_f64_key(*__v))"#),
+        "f64 keys must be the total-order encoding (#242)"
     );
-    // `from_f64` returning None is exactly the NaN/Inf case that used to arrive as
-    // `Value::Null`; it must still land in the null bucket.
     assert!(
-        flat.contains(r"None=>String::from('\u{0}'),"),
-        "non-finite floats keep keying into the null bucket"
+        !flat.contains("serde_json::Number::from_f64"),
+        "the from_f64 path is the #242 defect — it must be gone entirely"
     );
-    // char(N) is [u8; N] — serde renders it as a JSON array, so the key is
+    // The helper the arm calls, with both canonicalizations — without them the
+    // encoding is a faithful bijection over bit patterns, which is wrong for the
+    // two cases where distinct patterns are equal values: -0.0 == 0.0, and every
+    // NaN payload.
+    assert!(
+        flat.contains("fn__forgedb_f64_key(__v:f64)->u64"),
+        "the total-order key helper must be emitted"
+    );
+    assert!(
+        flat.contains("let__v=if__v==0.0{0.0}elseif__v.is_nan(){f64::NAN}else{__v};"),
+        "-0.0 and NaN payloads must be canonicalized before encoding"
+    );
+    assert!(
+        flat.contains("let__mask=((__bitsasi64>>63)asu64)|0x8000_0000_0000_0000;"),
+        "the sign-extended mask is what makes the encoding order-preserving"
+    );
+    // bytes(N) is [u8; N] — serde renders it as a JSON array, so the key is
     // `\u{2}[104,101,...]`, the non-string arm.
     assert!(
         flat.contains(r#"__k.push('[');for(__i,__b)in__v.iter().enumerate()"#),
-        "char(N) keys render the JSON array form"
+        "bytes(N) keys render the JSON array form"
     );
 
     // --- nullable ---------------------------------------------------------
@@ -7129,5 +7726,3084 @@ Owner {
     assert!(
         flat.contains(r"match&(record.editor){Some(__v)=>{letmut__buf=[0u8;36];"),
         "an optional FK keys through the Option arm, not as a bare Uuid (#230)"
+    );
+}
+
+/// #235: `@length` takes named `min:`/`max:` arguments, and single-arg `@length(N)`
+/// now means an EXACT length.
+///
+/// Five spellings, five distinct emitted checks. The single-arg change is the one
+/// that matters most here: it used to emit `> N` and now emits `!= N`, a narrowing
+/// that no other layer would catch — the schema still parses and the crate still
+/// compiles, so this assertion and the parser's warning are the whole safety net.
+#[test]
+fn test_rust_generation_length_named_args() {
+    let src = r#"
+Doc {
+  id: +uuid
+  floor: string @length(min: 3)
+  ceiling: string @length(max: 20)
+  both: string @length(min: 3, max: 64)
+  positional: string @length(3, 5)
+  exact: string @length(7)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    // min only — a floor with no ceiling, which was inexpressible before #235.
+    assert!(
+        flat.contains("if__v.chars().count()<3i64asusize"),
+        "`@length(min: 3)` emits a floor check.\nGot: {code}"
+    );
+    assert!(
+        !flat.contains(r#""floor",message:"lengthmustbe<=3""#),
+        "`@length(min: 3)` must NOT be read as a maximum"
+    );
+
+    // max only — the new spelling for what `@length(20)` used to mean.
+    assert!(
+        flat.contains("if__v.chars().count()>20i64asusize"),
+        "`@length(max: 20)` emits a ceiling check"
+    );
+
+    // Both, named and positional, emit the same range check.
+    assert!(
+        flat.contains("__len<3i64asusize||__len>64i64asusize"),
+        "`@length(min: 3, max: 64)` emits a range check"
+    );
+    assert!(
+        flat.contains("__len<3i64asusize||__len>5i64asusize"),
+        "`@length(3, 5)` is unchanged — still min, max"
+    );
+
+    // The breaking one: exactly N, not at most N.
+    assert!(
+        flat.contains("if__v.chars().count()!=7i64asusize"),
+        "`@length(7)` now emits an EQUALITY check (#235)"
+    );
+    assert!(
+        !flat.contains("if__v.chars().count()>7i64asusize"),
+        "`@length(7)` must no longer emit the old `> 7` maximum check"
+    );
+
+    // The messages are what a 422 body shows, so they have to say which rule
+    // rejected the value rather than all reading "length must be ...".
+    for msg in [
+        "lengthmustbe>=3",
+        "lengthmustbe<=20",
+        "lengthmustbebetween3and64",
+        "lengthmustbebetween3and5",
+        "lengthmustbeexactly7",
+    ] {
+        assert!(
+            flat.contains(msg),
+            "each spelling reports its own rule — missing {msg}"
+        );
+    }
+}
+
+/// #243: an array past serde's `[T; N]` ceiling (N = 32) must still generate code
+/// that compiles.
+///
+/// serde implements `Serialize`/`Deserialize` for arrays only up to N = 32, so a
+/// `bytes(64)` or `[u32; 40]` field made the `#[derive(Serialize, Deserialize)]` on
+/// the generated type fail to resolve — an entire crate that did not compile. It was
+/// never only an *index* problem: a plain, unindexed field broke it just the same,
+/// because the derive is on the struct.
+///
+/// Three shapes reach it and nothing else can, because nested fixed arrays do not
+/// parse. Each gets its own helper, and an inline `struct` is a second emission site
+/// that broke independently of the model one.
+///
+/// This test pins the two halves that could silently regress: that oversized fields
+/// get the attribute, and that fields serde can already handle do **not** — crossing
+/// the boundary must not rewrite output for every existing schema.
+///
+/// That the result *compiles* is proven by `tests/oversized_array_test.rs`, which
+/// builds a generated crate carrying every shape; a string assertion cannot.
+#[test]
+fn test_rust_generation_oversized_bytes_serde() {
+    let src = r#"
+struct Fp {
+  digest: bytes(64)
+  small: bytes(8)
+  wide: [u32; 40]
+}
+
+Doc {
+  id: +uuid
+  plain: bytes(64)
+  fingerprint: ^bytes(64)
+  opt_hash: bytes(48)?
+  boundary: bytes(32)
+  past: bytes(33)
+  small: ^bytes(8)
+  fp: Fp
+  arr_big: [bytes(64); 2]
+  arr_small: [bytes(8); 2]
+  many: [u32; 40]
+  few: [u32; 4]
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    for module in ["mod__forgedb_big_bytes", "mod__forgedb_big_array"] {
+        assert!(
+            flat.contains(module),
+            "`{module}` must be emitted when a field needs it.\nGot: {code}"
+        );
+    }
+
+    // Past the ceiling: each shape points at its own helper.
+    for (field, path) in [
+        ("plain", "__forgedb_big_bytes"),
+        ("fingerprint", "__forgedb_big_bytes"),
+        ("past", "__forgedb_big_bytes"),
+        ("opt_hash", "__forgedb_big_bytes::option"),
+        ("arr_big", "__forgedb_big_bytes::array"),
+        ("many", "__forgedb_big_array"),
+        // The inline struct: a second field-emission site (`generate_struct`), which
+        // carries the same derive and so broke the same way.
+        ("digest", "__forgedb_big_bytes"),
+        ("wide", "__forgedb_big_array"),
+    ] {
+        let decl = format!(r#"#[serde(with="{path}")]pub{field}:"#);
+        assert!(
+            flat.contains(&decl),
+            "`{field}` is past serde's array ceiling and must use `{path}`"
+        );
+    }
+    // utoipa stops at 32 for the same reason serde does, so the schema type is
+    // declared rather than derived.
+    for schema_ty in [
+        "#[schema(value_type=Vec<u8>)]",
+        "#[schema(value_type=Vec<Vec<u8>>)]",
+        "#[schema(value_type=Option<Vec<u8>>)]",
+    ] {
+        assert!(
+            flat.contains(schema_ty),
+            "utoipa cannot describe the oversized array either — expected {schema_ty}"
+        );
+    }
+
+    // At or under the ceiling: serde's own impl applies and nothing changes. This is
+    // the half that keeps the fix from churning every existing schema's output.
+    // Asserted as "no attribute at all", by pinning the field to the end of the
+    // preceding one — a window-of-N-chars search would just find the *previous*
+    // field's attribute.
+    for field in ["boundary", "small", "few", "arr_small"] {
+        let decl = format!("pub{field}:[");
+        let at = flat
+            .find(&decl)
+            .unwrap_or_else(|| panic!("`{field}` must exist"));
+        let preceding = flat[..at].chars().next_back().unwrap();
+        assert!(
+            matches!(preceding, ',' | '{'),
+            "`{field}` is within serde's array ceiling and must carry no attribute, \
+             but is preceded by {preceding:?}"
+        );
+    }
+}
+
+/// #243: the helper modules are emitted ONLY when a field needs them.
+///
+/// Generated code is tailored to the schema — a schema that never crosses the
+/// ceiling must not carry the machinery, and its output must stay byte-identical to
+/// what it produced before the fix. This is what kept every existing snapshot from
+/// being rewritten.
+#[test]
+fn test_rust_generation_no_big_array_serde_when_unneeded() {
+    let src = r#"
+struct Fp {
+  small: bytes(8)
+}
+
+Doc {
+  id: +uuid
+  code: ^bytes(32)
+  arr: [bytes(32); 32]
+  nums: [u32; 32]
+  fp: Fp
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // Exactly at the ceiling in every position — serde covers all of it.
+    assert!(
+        !code.contains("__forgedb_big_bytes") && !code.contains("__forgedb_big_array"),
+        "a schema that stays within serde's array ceiling must carry no helper.\nGot: {code}"
+    );
+}
+
+/// #242: the f64 total-order key helper is emitted on demand, like the oversized
+/// array serde above. Generated code is tailored to its schema — a schema that
+/// indexes no `f64` must not carry the machinery, and its output must be
+/// byte-identical to what it produced before #242.
+#[test]
+fn test_rust_generation_no_f64_key_when_unneeded() {
+    let src = r#"
+Reading {
+  id: +uuid
+  label: ^string
+  raw: f64
+  pair: f64?
+  count: ^u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `raw` and `pair` are f64 but UNINDEXED, so no key is ever derived for them.
+    // Gating on "the schema mentions f64" rather than "the schema indexes f64"
+    // would emit a dead helper here.
+    assert!(
+        !code.contains("__forgedb_f64_key"),
+        "an unindexed f64 needs no key helper.\nGot: {code}"
+    );
+}
+
+/// #242: the gate must count composite components too. A composite key is built
+/// from each component's `index_key_expr`, so an f64 component reaches the same
+/// encoding — missing it would emit a call to a function that was never generated,
+/// and the generated crate would not compile.
+#[test]
+fn test_rust_generation_f64_key_emitted_for_a_composite_component_only() {
+    let src = r#"
+Sample {
+  id: +uuid
+  bucket: ^string
+  score: f64
+
+  @index(bucket, score)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `score` carries no `^` of its own — its only index membership is the
+    // composite.
+    assert!(
+        code.contains("fn __forgedb_f64_key"),
+        "an f64 reachable only as a composite component still needs the helper.\nGot: {code}"
+    );
+}
+
+/// #233: `char(N)` is a *spelling*, not a distinct type — the deprecated form must
+/// emit byte-identical code across every generator, in every type position.
+///
+/// This is the guarantee that makes the deprecation safe to ship: a user who does
+/// nothing gets exactly the database they had, and a user who runs the suggested
+/// fix gets exactly the same one. It cannot be a snapshot test, because the point
+/// is the *relationship* between two schemas rather than either one's content.
+#[test]
+fn test_generation_char_and_bytes_are_byte_identical() {
+    // Every position `parse_type` handles separately: bare, postfix-nullable,
+    // prefix-nullable, inside a fixed array, and behind index/unique modifiers.
+    let deprecated = r#"
+Thing {
+  id: +uuid
+  code: char(3)
+  opt: char(2)?
+  pre: ?char(4)
+  arr: [char(8); 2]
+  key: ^&char(5)
+  name: string
+}
+"#;
+    let canonical = deprecated.replace("char(", "bytes(");
+
+    let parse = |src: &str| {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        (schema, parser.take_warnings())
+    };
+
+    let (dep_schema, dep_warnings) = parse(deprecated);
+    let (can_schema, can_warnings) = parse(&canonical);
+
+    assert_eq!(
+        dep_warnings.len(),
+        5,
+        "one deprecation per `char` occurrence, including inside `[...]` and behind `^&`"
+    );
+    assert!(
+        can_warnings.is_empty(),
+        "the canonical spelling is silent: {can_warnings:?}"
+    );
+
+    // Every generator, not just the Rust one — the rename touches the type mapping
+    // in each of them, so each is a place the two spellings could diverge.
+    assert_eq!(
+        RustGenerator::generate(&dep_schema).unwrap().code,
+        RustGenerator::generate(&can_schema).unwrap().code,
+        "database.rs"
+    );
+    assert_eq!(
+        ApiGenerator::generate(&dep_schema).unwrap().code,
+        ApiGenerator::generate(&can_schema).unwrap().code,
+        "api.rs"
+    );
+    assert_eq!(
+        TypeScriptGenerator::generate(&dep_schema).unwrap().code,
+        TypeScriptGenerator::generate(&can_schema).unwrap().code,
+        "types.ts"
+    );
+}
+
+/// #250: every `<Model>ScanRef<'a>` must actually use its lifetime, or the emitted
+/// crate does not compile (`error[E0392]: lifetime parameter 'a is never used`).
+///
+/// The lifetime exists so `string` scan fields can borrow out of the buffered
+/// column span. A model whose every scannable field is fixed-size has nothing to
+/// attach it to — and that is not an exotic shape: it is the ordinary pure
+/// join/link row (identity, timestamps, foreign keys, no string), which is what
+/// `Star` is in `examples/code-hosting`.
+///
+/// The defect shipped from #160/#224 because the snapshot tests compare generated
+/// code as *strings* and never compile it, and every schema used in a manual
+/// compile-check happened to give each model a string field. So the durable guard
+/// is not "assert the struct looks right" — it is **a fixture that carries a
+/// string-free model at all**, which is what `Link` is below.
+#[test]
+fn test_rust_generation_scan_ref_lifetime_is_always_anchored() {
+    let schema_src = r#"
+Owner {
+  id: +uuid
+  name: string
+}
+
+Link {
+  id: +uuid
+  created_at: +timestamp
+  owner: *Owner
+  weight: u32
+}
+"#;
+    let schema = forgedb_parser::Parser::new(schema_src)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // `Link` has no `string`, so nothing in its view borrows: the anchor carries
+    // the lifetime.
+    let link = extract_struct(&code, "pub struct LinkScanRef<'a>");
+    assert!(
+        link.contains("PhantomData<&'a ()>"),
+        "a scan view with no borrowing field must anchor 'a, else E0392:\n{link}"
+    );
+
+    // `Owner.name` borrows, so the anchor would be redundant — and emitting it
+    // unconditionally would churn every existing snapshot. Pin that it does not.
+    let owner = extract_struct(&code, "pub struct OwnerScanRef<'a>");
+    assert!(
+        owner.contains("&'a str"),
+        "expected the borrowed string field:\n{owner}"
+    );
+    assert!(
+        !owner.contains("PhantomData"),
+        "a view that already borrows needs no anchor:\n{owner}"
+    );
+}
+
+/// Slice out a function body by its signature prefix, brace-balanced.
+///
+/// Unlike [`extract_struct`], a method body nests braces freely, so stopping at
+/// the first `}` would cut it off inside the first block and quietly make any
+/// ordering assertion vacuous.
+fn extract_fn<'a>(code: &'a str, sig: &str) -> &'a str {
+    let start = code
+        .find(sig)
+        .unwrap_or_else(|| panic!("`{sig}` not found in generated code"));
+    let rest = &code[start..];
+    let open = rest.find('{').expect("function has no body");
+    let mut depth = 0usize;
+    for (i, c) in rest[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &rest[..open + i + 1];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated function body for `{sig}`");
+}
+
+/// Slice out a struct body by its declaration line, for the assertions above.
+fn extract_struct<'a>(code: &'a str, decl: &str) -> &'a str {
+    let start = code
+        .find(decl)
+        .unwrap_or_else(|| panic!("`{decl}` not found in generated code"));
+    let rest = &code[start..];
+    let end = rest.find('}').expect("unterminated struct") + 1;
+    &rest[..end]
+}
+
+/// #250: the anchor's name is derived, not fixed, because `.forge` field names are
+/// only required to be snake_case — `__borrow: u32` parses and validates today.
+/// On a string-free model a hardcoded anchor would land beside it and emit the
+/// field twice (`error[E0124]: field `__borrow` is already declared`).
+#[test]
+fn test_rust_generation_scan_ref_anchor_avoids_a_field_name_collision() {
+    let schema = forgedb_parser::Parser::new(
+        r#"
+Collide {
+  id: +uuid
+  __borrow: u32
+  __borrow_: u32
+}
+"#,
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let view = extract_struct(&code, "pub struct CollideScanRef<'a>");
+
+    // Both obvious names are taken, so the anchor steps past them.
+    assert!(
+        view.contains("pub __borrow__: ::std::marker::PhantomData<&'a ()>"),
+        "anchor should skip every taken name:\n{view}"
+    );
+    assert_eq!(
+        view.matches("__borrow:").count(),
+        1,
+        "the user's own field must appear exactly once:\n{view}"
+    );
+}
+
+// ---- #187: `+u32` / `+u64` auto-increment ---------------------------------
+//
+// The design (RFC #187, Gates 1+2 accepted): one monotonic in-memory counter per
+// auto-integer field, seeded by the scans that already run, floored by a
+// high-water mark persisted in `Manifest.auto_sequences`. `0` is the allocate
+// sentinel; an explicitly supplied value advances the counter via `fetch_max`;
+// a rolled-back transaction burns its number (monotonic and unique, not
+// contiguous).
+//
+// Assertions here are identifier-precise (`mentions_ident`) per the #258 lesson:
+// a bare `contains` cannot tell `__autoseq_id` from `__autoseq_ident`.
+//
+// The counter is `__autoseq_<field>`, NOT `__seq_<field>`: the generated Tier-2 /
+// Tier-3 commit path already binds locals named `__seq`, `__seq_arc` and
+// `__seq_start`, so a model with a field named `arc` or `start` would emit a
+// counter whose name reads as one of those. Nothing would fail to compile — it
+// would just be indistinguishable in the emitted source, including to the
+// "emits no counter" guard below.
+
+/// The counter must be allocated from at **all three** create surfaces —
+/// `Database::create_*`, `TxHandle::create_*`, and `ConcurrentTxHandle::create_*`.
+/// The third is the one that would be missed: it is generated in a separate
+/// function from the other two, and its prepare closure runs with no write lock,
+/// which is exactly the path where a missing allocation silently yields `0`.
+#[test]
+fn test_rust_generation_integer_auto_allocates_at_every_create_surface() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "__autoseq_id"),
+        "an integer auto gets a counter field on the storage struct (#187)"
+    );
+    assert_eq!(
+        code.matches("__alloc_id()").count(),
+        3,
+        "all three create surfaces allocate — Database, TxHandle, and \
+         ConcurrentTxHandle (#187)"
+    );
+}
+
+/// A *non-identity* integer auto carrying `&` puts allocation and the #258
+/// uniqueness enforcement on the same field, so they must coexist. Guarded together
+/// because the two features touch adjacent generated code and either could
+/// plausibly be written to replace the other. (#187 once *required* the `&` here;
+/// since #260 it is a choice, which makes the coexistence no less load-bearing.)
+#[test]
+fn test_rust_generation_non_identity_integer_auto_allocates_and_stays_unique() {
+    let src = r#"
+Invoice {
+  id: +uuid
+  number: &+u64
+  total: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "__autoseq_number"),
+        "a non-identity integer auto gets its own counter (#187)"
+    );
+    assert_eq!(
+        code.matches("__alloc_number()").count(),
+        3,
+        "allocated at every create surface, identity or not (#187)"
+    );
+    // #258: `&` on a non-identity auto still builds the index and enforces it.
+    assert!(
+        mentions_ident(&code, "number_index"),
+        "`&` still builds its index (#258 must not regress under #187)"
+    );
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::Unique{model:\"Invoice\",field:\"number\""),
+        "`&` still enforces uniqueness (#258 must not regress under #187)"
+    );
+    // The identity is a uuid here, so it must NOT have grown a counter.
+    assert!(
+        !mentions_ident(&code, "__autoseq_id"),
+        "a `+uuid` identity allocates from randomness, not a counter (#187)"
+    );
+}
+
+/// The counter is writer state. A `*StorageReader` is a read-only snapshot handle
+/// (#56-B) and must not carry one — a reader holding a counter would read as a
+/// second allocator and invites a future change to allocate through it.
+#[test]
+fn test_rust_generation_reader_carries_no_sequence_counter() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: ^string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let reader = extract_struct(&code, "pub struct TicketStorageReader");
+    assert!(
+        !reader.contains("__autoseq_"),
+        "a read-only reader must carry no allocator state (#187):\n{reader}"
+    );
+    // Control: the writer does carry it, so the assertion above is not vacuous.
+    let storage = extract_struct(&code, "pub struct TicketStorage");
+    assert!(
+        storage.contains("__autoseq_id"),
+        "the writer is where the counter lives (#187):\n{storage}"
+    );
+}
+
+/// The floor must reach disk **before** the destructive rewrite, not only after.
+///
+/// `compact_model_keeping` physically drops the dead rows, and for every value
+/// allocated since process open those rows are the only remaining record that the
+/// value was issued (the manifest is written at open and at compaction, never in
+/// between). Persist only afterwards and a crash in that window leaves the reopen
+/// scan deriving a lower maximum and re-issuing the difference — the one case a
+/// rescan cannot recover from, which is the entire reason the floor exists.
+///
+/// `tests/auto_increment_test.rs` proves the behaviour by running it; this pins
+/// the *ordering* in the emitted source, because the two orderings produce an
+/// identical final state on the success path and diverge only across a crash.
+#[test]
+fn test_rust_generation_autoseq_floor_persists_before_compaction() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let compact = extract_fn(&code, "pub fn compact");
+    let write = compact
+        .find("write_manifest")
+        .expect("compact() must persist the floor");
+    let destroy = compact
+        .find("compact_model_keeping")
+        .expect("compact() must call the byte GC");
+    assert!(
+        write < destroy,
+        "the auto-increment floor must be persisted BEFORE compact_model_keeping \
+         destroys the rows that are its only other evidence (#187):\n{compact}"
+    );
+    // And the failure is a refusal, not a warning: compaction is always safe to
+    // retry later, whereas re-issuing an id escapes through the replication log,
+    // backups, and any URL holding the value.
+    assert!(
+        compact[..destroy].contains("return;"),
+        "a floor that cannot be persisted must ABORT the compaction, not proceed \
+         (#187):\n{compact}"
+    );
+}
+
+/// #260: a **bare** integer auto — neither the model's identity nor `&unique` —
+/// claims its allocated value in the opaque write-set via a third key class.
+///
+/// This is the entire feature. Without the claim, two coordinated writers that
+/// derive the same next value both commit and neither notices, which is why #187
+/// refused the shape outright rather than shipping it unprotected.
+///
+/// All three write-set builders must emit it. They are separate code paths —
+/// `TxHandle::__write_set` (`db.transaction()`), `transaction_concurrent`, and
+/// `transaction_coordinated` — and missing one leaves a silent hole on that path
+/// alone, which no single-path test would catch.
+#[test]
+fn test_rust_generation_bare_integer_auto_claims_its_value() {
+    let src = r#"
+Ticket {
+  id: +uuid
+  seq: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("staged_sequence_keys"),
+        "a bare integer auto needs a staging buffer for its claims (#260)"
+    );
+    // The claim must be keyed off the record's final value, so it covers an
+    // explicitly-supplied value too (#187 decision 5 lets one through, and an
+    // explicit 7 racing an allocated 7 is the same collision).
+    assert!(
+        code.contains("staged_sequence_keys.insert"),
+        "the allocated value must actually be staged, not just buffered (#260)"
+    );
+
+    let claims = code.matches("b\"s\"").count();
+    assert!(
+        claims >= 3,
+        "all THREE write-set builders must emit the sequence claim — \
+         __write_set, transaction_concurrent, transaction_coordinated — \
+         found {claims} (#260)"
+    );
+    assert!(
+        extract_fn(&code, "pub fn __write_set").contains("b\"s\""),
+        "the Tier-1/2 db.transaction() path must claim (#260)"
+    );
+}
+
+/// The zero-churn guard for #260: an integer auto that is already conflict-visible
+/// — the identity, or `&unique` — must emit **no** sequence-claim machinery.
+///
+/// Load-bearing for two reasons. It keeps the new key class off every schema that
+/// was legal before #260 (the identity contributes a row key and `&unique` a
+/// unique-claim key, so a third claim would be redundant work on every insert).
+/// And because the staging buffer lives on the schema-level `TxHandle` /
+/// `ConcurrentTxHandle` — not per model — an ungated field would appear in every
+/// generated crate and diff every snapshot in this file for a feature the schema
+/// does not use.
+#[test]
+fn test_rust_generation_conflict_visible_autos_emit_no_sequence_claim() {
+    for src in [
+        // identity integer auto — already contributes the row key
+        "Ticket {\n  id: +u64\n  title: string\n}\n",
+        // non-identity but unique — already contributes the unique-claim key
+        "Ticket {\n  id: +uuid\n  seq: &+u64\n  title: string\n}\n",
+    ] {
+        let mut parser = forgedb_parser::Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        let code = RustGenerator::generate(&schema).unwrap().code;
+
+        assert!(
+            !code.contains("staged_sequence_keys"),
+            "{src:?} is already conflict-visible; a sequence claim would be dead \
+             weight, and the field would churn every snapshot (#260)"
+        );
+        assert!(
+            !code.contains("b\"s\""),
+            "{src:?} must emit no sequence claim key (#260)"
+        );
+    }
+}
+
+/// The no-regression guard for the whole existing corpus: a model whose only autos
+/// are `+uuid` / `+timestamp` must emit **no** counter machinery at all. Every
+/// schema in `examples/` except `iot-sensors` is this shape, so a leak here would
+/// change output repo-wide.
+#[test]
+fn test_rust_generation_non_integer_autos_emit_no_counter() {
+    let src = r#"
+Event {
+  id: +uuid
+  created_at: +timestamp
+  ref_id: &+uuid
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !code.contains("__autoseq_"),
+        "no counter field for a model with no integer auto (#187)"
+    );
+    assert!(
+        !code.contains("__alloc_"),
+        "no allocation call for a model with no integer auto (#187)"
+    );
+    // NOT asserted: the absence of `SequenceExhausted`. `ValidationError` is a
+    // fixed-shape enum emitted once per schema — every variant is always present,
+    // whether or not any field can produce it. What must be absent is the
+    // machinery above that would *raise* it.
+}
+
+/// The M2M junction writes its own `Manifest` literal, separate from the model
+/// one, and it is compile-forced by `Manifest` having no `Default` — so it must be
+/// updated in the same pass. Pinned because "it compiles" is the only feedback that
+/// site otherwise gives.
+///
+/// The fixture keeps a third model because the assertion needs an integer auto
+/// *somewhere*: the junction itself has no fields of its own — only the two
+/// endpoint ids — so its sequence map is empty no matter what the endpoints are
+/// keyed on (#266 widened `valid_m2m` past the old uuid-PK-only gate, so the
+/// endpoints may now carry integer autos themselves). `Ticket` supplies a model
+/// that does allocate, which is what makes the junction's empty map a real
+/// assertion rather than a description of a schema where nothing allocates
+/// anywhere.
+#[test]
+fn test_rust_generation_junction_manifest_carries_empty_sequence_map() {
+    let src = r#"
+Student {
+  id: +uuid
+  courses: [Course]
+}
+
+Course {
+  id: +uuid
+  students: [Student]
+}
+
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("auto_sequences:Default::default()")
+            || flat.contains("auto_sequences:std::collections::BTreeMap::new()"),
+        "the junction manifest takes an empty sequence map — a junction has no \
+         fields, so it can have no auto-integer field (#187)"
+    );
+    // `Ticket` DOES carry a real map, so the emptiness above is specific to the
+    // junction rather than the feature quietly emitting nothing anywhere.
+    assert!(
+        mentions_ident(&code, "__autoseq_id"),
+        "a model with an integer auto still allocates alongside the junction (#187)"
+    );
+}
+
+/// The create contract widens: an integer auto becomes server-synthesized, so it
+/// gains `#[serde(default)]` and drops out of the create input — the same
+/// treatment `+uuid` already gets. This is what stops a REST create that omits an
+/// integer id from 422-ing.
+///
+/// Note this fixes the #188 *class* only for the generators that ask
+/// `is_server_synthesized`. The TS SDK and the OpenAPI `required` list compute the
+/// create shape by guessing and stay wrong until #259 — deliberately out of scope
+/// here, and asserted nowhere in this test.
+#[test]
+fn test_rust_generation_integer_auto_is_server_synthesized() {
+    let src = r#"
+Ticket {
+  id: +u64
+  title: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    let model = extract_struct(&code, "pub struct Ticket");
+    assert!(
+        model.contains("#[serde(default)]"),
+        "an integer auto may be omitted from a create body, so it needs a serde \
+         default exactly as `+uuid` does (#187/#188):\n{model}"
+    );
+}
+
+/// Overflow is an error, never a wrap. A `+u32` that wraps past `u32::MAX` would
+/// re-issue `0` — which is also the allocate sentinel — and then collide with
+/// every id already handed out.
+#[test]
+fn test_rust_generation_integer_auto_guards_overflow() {
+    let src = r#"
+Small {
+  id: +u32
+  name: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        mentions_ident(&code, "SequenceExhausted"),
+        "a `+u32` counter must refuse to wrap (#187)"
+    );
+    assert!(
+        code.contains("u32::MAX"),
+        "the guard is against the field's own width, not u64's (#187)"
+    );
+}
+
+// ===========================================================================
+// #238 — `string(N)` / `string(N!)`: fixed-width inline string columns.
+//
+// These are LAYOUT guards, and they exist because every failure mode in this
+// area produces working, wrong code rather than a build error. `rust.rs` has
+// three fall-throughs a missing `StringN` arm would land in — `_ => 8` for the
+// column width, `_ => String` for the field type, and a `FixedBytes(size)` that
+// is only as right as the width arm above it. An 8-byte stride silently
+// truncates every value and the generated crate compiles clean.
+//
+// So each of these asserts the emitted *width*, not merely that it generated.
+// ===========================================================================
+
+/// Generate `database.rs` for a one-model schema.
+fn db_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    RustGenerator::generate(&schema).unwrap().code
+}
+
+/// The `FixedColumn::new(...)` initializer for one field's column, whitespace
+/// collapsed so assertions track the shape rather than prettyplease's wrapping.
+fn column_init(code: &str, field: &str) -> String {
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let needle = format!("{field}_col: FixedColumn::new(");
+    let at = flat.find(&needle).unwrap_or_else(|| {
+        panic!("no FixedColumn init for `{field}` — it did not get a fixed column at all")
+    });
+    let tail = &flat[at..];
+    tail[..tail.find(") .expect").unwrap_or(tail.len().min(200))].to_string()
+}
+
+/// Res 6: the exact form is exactly N bytes, with no length prefix — the
+/// narrowest of the three shapes, and byte-identical in construction to
+/// `bytes(N)`.
+#[test]
+fn test_rust_generation_string_n_exact_stride_is_n() {
+    let code = db_for("Doc {\n  id: +uuid\n  currency: string(3!)\n}\n");
+    let init = column_init(&code, "currency");
+    assert!(
+        init.contains("3usize"),
+        "`string(3!)` is a 3-byte slot, not the `_ => 8` fall-through: {init}"
+    );
+    assert!(!init.contains("8usize"), "a fall-through width would be 8: {init}");
+}
+
+/// Res 6's derived prefix width, asserted from both sides of the 1→2 byte
+/// boundary. A flat one-byte prefix cannot work under `@utf8`: 64 characters at
+/// four bytes each is 256, which does not fit in a byte.
+#[test]
+fn test_rust_generation_string_n_slot_widths() {
+    for (decl, field, want) in [
+        // default alphabet: one byte per character, one prefix byte
+        ("string(32)", "sku", 33usize),
+        ("string(255)", "wide", 256),
+        ("string(26!)", "key", 26),
+        // @utf8: four bytes per character; prefix crosses to two bytes when the
+        // payload passes 255, i.e. at N = 64
+        ("string(63) @utf8", "just_under", 63 * 4 + 1),
+        ("string(64) @utf8", "just_over", 64 * 4 + 2),
+        // the exact form still carries a prefix under @utf8 — exactly N
+        // *characters* is still a variable N..4N *bytes*
+        ("string(4!) @utf8", "quad", 4 * 4 + 1),
+    ] {
+        let src = format!("Doc {{\n  id: +uuid\n  {field}: {decl}\n}}\n");
+        let init = column_init(&db_for(&src), field);
+        assert!(
+            init.contains(&format!("{want}usize")),
+            "`{decl}` must emit a {want}-byte slot, got: {init}"
+        );
+    }
+}
+
+/// A nullable inline string prepends a one-byte presence tag, so `None` and
+/// `Some("")` round-trip distinctly — the same encoding every other nullable
+/// column on this path uses.
+#[test]
+fn test_rust_generation_string_n_nullable_adds_a_presence_byte() {
+    let code = db_for("Doc {\n  id: +uuid\n  note: string(10)?\n}\n");
+    let init = column_init(&code, "note");
+    assert!(
+        init.contains("12usize"),
+        "`string(10)?` is 1 (present) + 10 (payload) + 1 (prefix) = 12: {init}"
+    );
+}
+
+/// The finding-2 guard. `string(N)` must NOT be classified as a variable column;
+/// if it were, every other scenario here would still pass and the type would
+/// have silently become the thing it was invented to replace.
+#[test]
+fn test_rust_generation_string_n_is_not_a_variable_column() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n  body: string\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("sku_col: FixedColumn"),
+        "`string(32)` gets a FixedColumn"
+    );
+    assert!(
+        !flat.contains("sku_col: VariableColumn"),
+        "`string(32)` must never get a VariableColumn"
+    );
+    // The bare `string` beside it is untouched (res 10).
+    assert!(
+        flat.contains("body_col: VariableColumn"),
+        "bare `string` still gets a VariableColumn"
+    );
+    // ...and it does not ride the variable codec either.
+    assert!(
+        !flat.contains("self.sku_col.append_string"),
+        "`string(32)` must not be appended through the variable-string codec"
+    );
+}
+
+/// The manifest records a *physical* width. `ColumnType::String` would claim the
+/// variable layout and mislead every schema-blind reader (backup, inspector).
+#[test]
+fn test_rust_generation_string_n_manifest_is_fixed_bytes() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let at = flat.find("\"sku\"").expect("sku appears in the manifest writer");
+    let window = &flat[at..(at + 300).min(flat.len())];
+    assert!(
+        window.contains("ColumnType::FixedBytes(33usize)"),
+        "manifest column type is FixedBytes(33): {window}"
+    );
+}
+
+/// The finding-1 guard, at the codegen layer: the scan decodes a `string(N)` by
+/// BORROWING the slot, never by allocating a `Vec` per row. `read_bytes` is what
+/// every other fixed column uses, and it is what this must not use — the
+/// difference is invisible to a snapshot and inverts the issue's entire result.
+#[test]
+fn test_rust_generation_string_n_scan_borrows_the_slot() {
+    let code = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n  sku: string(32)\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The exact form: the slot IS the value, so the substrate can do the whole
+    // read (`read_str`), no prefix decode at all.
+    assert!(
+        flat.contains("key_col .read_str"),
+        "`string(26!)` reads the whole slot as UTF-8: {flat}"
+    );
+    // The at-most form: borrow the slot, decode the prefix in generated code.
+    assert!(
+        flat.contains("sku_col .read_slice"),
+        "`string(32)` borrows the slot rather than copying it"
+    );
+
+    // The borrow is what the SCAN does. `get`/`all` still materialize a `String`
+    // and read through `read_bytes` like every other fixed column — a borrow is
+    // not available there, because the live column reads through the file on
+    // every access and has nothing to lend. So scope the absence to the scan
+    // scope's body rather than to the whole file.
+    let scan = &code[code.find("pub fn __with_scan").expect("the scan scope is emitted")..];
+    let scan: String = scan.split_whitespace().collect::<Vec<_>>().join(" ");
+    let scan = &scan[..scan.find("pub fn ").map(|i| i + 7).unwrap_or(scan.len())];
+    assert!(
+        !scan.contains("read_bytes"),
+        "a per-row `Vec` on the scan path is the one outcome #238 exists to avoid: {scan}"
+    );
+}
+
+/// Res 6, asserted as an *absence*: the exact form has no prefix to decode. A
+/// present-but-unused prefix is merely slower rather than wrong, so nothing else
+/// here would catch it.
+#[test]
+fn test_rust_generation_string_n_exact_has_no_prefix_decode() {
+    let exact = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n}\n");
+    let inexact = db_for("Doc {\n  id: +uuid\n  key: string(26)\n}\n");
+    assert!(
+        inexact.contains("__forgedb_inline_len"),
+        "the at-most form decodes a length prefix"
+    );
+    assert!(
+        !exact.contains("__forgedb_inline_len"),
+        "the exact form has no prefix, so there is nothing to decode"
+    );
+}
+
+/// Two properties of the packed slot that every other assertion here is blind
+/// to, because both are about the *bytes written* rather than the shape of the
+/// code. Added after a mutation run: breaking either one left the whole suite
+/// green.
+///
+///  1. The length prefix records a **byte** count. A character count reads back
+///     a truncated value for any multi-byte `@utf8` field, and recovering the
+///     byte end from a character count would mean walking the UTF-8 on every
+///     row — the per-row cost #238 exists to avoid.
+///  2. The slot's unused tail is **zero**. Nothing correctness-critical needs
+///     it (the prefix bounds the read), but it is what makes a column file
+///     byte-reproducible for the same logical content, which is what lets a
+///     diff of two data dirs mean anything.
+#[test]
+fn test_rust_generation_string_n_prefix_is_bytes_and_the_tail_is_zeroed() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n  tag: string(8) @utf8\n}\n");
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        flat.contains("let __n = __b.len().min("),
+        "the prefix is written from the value's BYTE length: {flat}"
+    );
+    assert!(
+        !flat.contains("chars().count().min("),
+        "a character count in the prefix truncates every multi-byte value"
+    );
+    assert!(
+        flat.contains("let mut __buf = [0u8;"),
+        "the packing buffer is zero-filled, so the unused tail is deterministic"
+    );
+}
+
+/// Res 4: the ASCII restriction is a *value* constraint — enforced on every
+/// write, like `@pattern`, not a validation-time-only check. And it runs FIRST,
+/// because it is the only check that can make a later one report a cause that is
+/// not the real one (a `@pattern` failure over a non-ASCII value).
+#[test]
+fn test_rust_generation_string_n_ascii_check_runs_before_the_directives() {
+    let code = db_for(
+        "Doc {\n  id: +uuid\n  code: string(8) @pattern(\"^[a-z]+$\") @length(min: 2)\n}\n",
+    );
+    let flat: String = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ascii = flat.find("rule: \"ascii\"").expect("an ascii rule is emitted");
+    let pattern = flat.find("rule: \"pattern\"").expect("the @pattern check survives");
+    let length = flat.find("rule: \"length\"").expect("the @length check survives");
+    assert!(ascii < pattern, "ASCII is checked before @pattern");
+    assert!(ascii < length, "ASCII is checked before @length");
+    // ...and the message points at the way out.
+    assert!(flat.contains("@utf8"), "the ascii diagnostic names the opt-in");
+}
+
+/// `@utf8` removes the ASCII check — that is the whole of what it does to the
+/// write path.
+#[test]
+fn test_rust_generation_utf8_drops_the_ascii_check() {
+    let code = db_for("Doc {\n  id: +uuid\n  title: string(8) @utf8\n}\n");
+    assert!(
+        !code.contains("\"ascii\""),
+        "@utf8 opts out of the one-byte-per-character alphabet"
+    );
+}
+
+/// Res 1 + res 2: the width bound is enforced at write, in characters, and the
+/// exact form rejects a short value as well as a long one.
+#[test]
+fn test_rust_generation_string_n_enforces_the_character_bound() {
+    let at_most = db_for("Doc {\n  id: +uuid\n  sku: string(32)\n}\n");
+    let flat: String = at_most.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("chars().count()"),
+        "the bound counts characters, not bytes (res 3)"
+    );
+    assert!(flat.contains("rule: \"string_n\""), "a width violation is its own rule");
+
+    let exact = db_for("Doc {\n  id: +uuid\n  key: string(26!)\n}\n");
+    let eflat: String = exact.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        eflat.contains("!= 26usize"),
+        "the exact form rejects any length but N: {eflat}"
+    );
+}
+
+/// `string(N)` is `Ord`, so it joins the same filterable/sortable class as bare
+/// `string`, and its index key is the `\u{1}` string class — the SAME key the
+/// same content would produce in a bare `string` column, so widening a column
+/// later keeps its index semantics.
+#[test]
+fn test_api_generation_string_n_is_filterable_and_indexed_as_a_string() {
+    let src = "Doc {\n  id: +uuid\n  sku: ^string(32)\n}\n";
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let db_code = RustGenerator::generate(&schema).unwrap().code;
+    let api_code = ApiGenerator::generate(&schema).unwrap().code;
+
+    assert!(db_code.contains("sku_index"), "an `^string(N)` field is indexed");
+    assert!(
+        db_code.contains("find_by_sku"),
+        "and gets the generated probe"
+    );
+    assert!(
+        db_code.contains("'\\u{1}'"),
+        "the index key is the string class, like a bare `string`"
+    );
+    let api_flat: String = api_code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        api_flat.contains("\"sku\""),
+        "the REST filter admits the column"
+    );
+}
+
+/// The wire is a string, everywhere. The fixed slot is a storage fact; a client
+/// must not be able to tell.
+#[test]
+fn test_generation_string_n_is_a_string_on_every_wire() {
+    let src = "Doc {\n  id: +uuid\n  sku: string(32)\n  key: string(26!)\n}\n";
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let ts = TypeScriptGenerator::generate(&schema).unwrap().code;
+    assert!(ts.contains("sku: string"), "TS: a string\n{ts}");
+
+    let openapi = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&openapi).unwrap();
+    let props = &spec["components"]["schemas"]["Doc"]["properties"];
+    assert_eq!(props["sku"]["type"], "string");
+    assert_eq!(props["sku"]["maxLength"], 32);
+    assert!(props["sku"].get("minLength").is_none(), "at-most has no floor");
+    assert_eq!(props["key"]["minLength"], 26, "the exact form pins both");
+    assert_eq!(props["key"]["maxLength"], 26);
+
+    for (label, code) in [
+        ("rust-sdk", RustSdkGenerator::generate(&schema).unwrap().code),
+        ("python-sdk", PythonSdkGenerator::generate(&schema).unwrap().code),
+        ("go-sdk", GoSdkGenerator::generate(&schema).unwrap().code),
+        ("go", GoGenerator::generate(&schema).unwrap().code),
+    ] {
+        assert!(
+            !code.contains("StringN") && !code.contains("string_n"),
+            "{label} leaked the storage spelling onto the wire"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #266: a foreign key's type and column width follow the TARGET model's
+// identity type.  Before this, `map_field_type_ident` typed every FK scalar
+// `Uuid` and `RustGenerator::is_uuid_pk` skipped every non-UUID-keyed target at
+// 21 sites — silently dropping referential integrity, `@on_delete`, forward
+// traversal, reverse getters, eager load, and M2M junctions.  It compiled, ran,
+// and warned about nothing.
+//
+// The invariant these scenarios pin:
+//
+//   An FK column is physically identical to the column the target's identity
+//   field itself occupies.
+//
+// Fixtures are inline: all 18 corpus schemas are UUID-keyed and are the
+// zero-churn control (scenario 1) — they must stay untouched.
+// ---------------------------------------------------------------------------
+
+/// A `u64`-keyed parent with a one-to-many back-reference, a required FK child,
+/// an optional FK child field, and a self-FK.  The workhorse fixture for the
+/// widening scenarios.
+const U64_PARENT_SRC: &str = r#"
+Post {
+  id: +u64
+  title: string
+  comments: [Comment]
+}
+
+Comment {
+  id: +uuid
+  body: string
+  post: *Post
+  reply_to: ?Comment
+}
+"#;
+
+/// **Scenario 1 (the control).** For a UUID-keyed target the resolution returns
+/// `FieldType::Uuid`, and every helper's `Uuid` arm is byte-for-byte what its FK
+/// arm hardcoded — so nothing about a conventional schema moves.  The operative
+/// proof is procedural (the whole snapshot suite accepts nothing); this pins the
+/// four physical facts that would have to change first if it were not true.
+///
+/// If this is red, resolution 5's "not a format break" claim is void.
+#[test]
+fn test_rust_generation_fk_to_a_uuid_key_is_byte_identical() {
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  comments: [Comment]
+}
+
+Comment {
+  id: +uuid
+  post: *Post
+  editor: ?Post
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub post: Uuid"), "FK record field stays `Uuid`");
+    assert!(
+        code.contains("comment/fixed/uuid_1.bin"),
+        "FK column keeps the `uuid` file-path label — a rename reads as an empty database"
+    );
+    assert!(code.contains("16usize"), "FK column keeps its 16-byte width");
+    assert!(
+        code.contains("forgedb_storage::ColumnType::Uuid"),
+        "FK manifest entry keeps `ColumnType::Uuid`"
+    );
+    assert!(code.contains("append_uuid"), "FK write path keeps `append_uuid`");
+    assert!(
+        code.contains("size_of::<Option<Uuid>>()"),
+        "the optional FK keeps `Option<Uuid>` sizing"
+    );
+}
+
+/// **Scenario 2.** The width, the Rust type, the file-path label and the
+/// manifest `ColumnType` all follow the target's identity.  Today the column is
+/// 16 bytes of `Uuid` that nothing can ever populate with a matching value.
+#[test]
+fn test_rust_generation_fk_follows_a_u64_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub post: u64"),
+        "the FK scalar is typed as the target's key, not `Uuid`"
+    );
+    assert!(
+        code.contains("comment/fixed/u64_"),
+        "the FK column file is labelled by the resolved type — a wrong label \
+         renames the column file, which reads as a fresh empty database"
+    );
+    // `Comment.id` is `+uuid`, so a `uuid` column legitimately exists on the
+    // model — what must be gone is the FK's own one.  `post` is field index 2.
+    assert!(
+        !code.contains("comment/fixed/uuid_2.bin"),
+        "the FK no longer occupies a `uuid`-labelled column"
+    );
+    assert!(
+        code.contains("forgedb_storage::ColumnType::U64"),
+        "the manifest entry is the target key's ColumnType"
+    );
+    assert!(code.contains("append_u64"), "the FK write path uses the u64 accessor");
+    assert!(
+        !code.contains("record.post.as_bytes()"),
+        "the FK is no longer written through the uuid byte path"
+    );
+}
+
+/// **Scenario 3.** Every relation capability `is_uuid_pk` was silently skipping
+/// is emitted.  Asserted as *presence*: absence was the bug, and absence is what
+/// a regression looks like.
+#[test]
+fn test_rust_generation_u64_key_gets_the_whole_relation_surface() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub fn comment_post(&self, record: &Comment) -> Option<Post>"),
+        "forward traversal getter"
+    );
+    assert!(
+        code.contains("pub fn post_comments(&self, id: u64) -> Vec<Comment>"),
+        "reverse collection getter, keyed by the parent's own id type"
+    );
+    assert!(
+        code.contains("pub struct CommentWithRelations"),
+        "eager-load struct"
+    );
+    assert!(
+        code.contains("pub fn comment_with_relations(&self, id: Uuid) -> Option<CommentWithRelations>"),
+        "eager-load getter"
+    );
+    assert!(
+        code.contains("self.comment.find_by_post(id)"),
+        "the reverse getter probes the child's FK index rather than scanning (#100)"
+    );
+}
+
+/// **Scenario 4.** Deleting a referenced `Post` is refused.  Today it succeeds
+/// and orphans every child — the delete wrapper is a bare delegate for a
+/// non-UUID key.
+#[test]
+fn test_rust_generation_non_uuid_parent_delete_is_referentially_checked() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub fn delete_post(&mut self, id: u64)"),
+        "the delete wrapper takes the parent's own key type"
+    );
+    assert!(
+        code.contains("pub fn delete_post_cascade") || code.contains("fn delete_post_cascade"),
+        "the depth-bounded cascade worker is emitted for a u64-keyed parent"
+    );
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("ValidationError::ReferencedByChildren{model:\"Comment\",field:\"post\",}"),
+        "default `restrict` refuses the delete (409) instead of orphaning the child"
+    );
+}
+
+/// **Scenario 5.** `@on_delete(cascade)` and `@on_delete(set_null)` both fire
+/// against a `u64`-keyed parent.
+#[test]
+fn test_rust_generation_on_delete_policies_fire_for_a_u64_parent() {
+    let src = r#"
+Post {
+  id: +u64
+  title: string
+  comments: [Comment]
+  drafts: [Draft]
+}
+
+Comment {
+  id: +uuid
+  post: *Post @on_delete(cascade)
+}
+
+Draft {
+  id: +uuid
+  post: ?Post @on_delete(set_null)
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("self.delete_comment_cascade(__c.id,__depth+1)?"),
+        "cascade recurses into the referencing child"
+    );
+    assert!(
+        flat.contains("__c.post=None;"),
+        "set_null nulls the optional FK on the referencing child"
+    );
+    assert!(
+        flat.contains("self.draft.find_by_post(Some(id))"),
+        "the set_null child probe passes the parent key wrapped in Some"
+    );
+}
+
+/// **Scenario 6.** The generated prose asserted the false premise for the whole
+/// life of the bug.  A doc comment that lies is what made this invisible
+/// (`silent-capability-holes-in-codegen`), so its absence is a scenario.
+#[test]
+fn test_rust_generation_delete_doc_does_not_deny_a_referencing_model() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        !code.contains("no model references it via a foreign key"),
+        "the delete wrapper claimed nothing references a u64-keyed model, in a \
+         schema where `Comment.post` does"
+    );
+    assert!(
+        !code.contains("integer-keyed"),
+        "an integer key is no longer a second-class FK target, so nothing calls \
+         it out as one"
+    );
+}
+
+/// **Scenario 7 (resolution 1).** `Order { id: *Customer }` — an identity that is
+/// itself a foreign key.  Everything about the emitted key is already `Uuid`, yet
+/// this shape passed `is_uuid_pk` nowhere, so it lost the relation surface for a
+/// reason that was never true.
+#[test]
+fn test_rust_generation_identity_that_is_itself_an_fk_resolves_through() {
+    let src = r#"
+Customer {
+  id: +uuid
+  name: string
+  orders: [Order]
+}
+
+Order {
+  id: *Customer
+  total: i64
+  lines: [Line]
+}
+
+Line {
+  id: +uuid
+  order: *Order
+  qty: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub id: Uuid"), "the FK identity resolves to Uuid");
+    assert!(
+        code.contains("pub order: Uuid"),
+        "an FK pointing AT the FK-keyed model resolves through the chain"
+    );
+    assert!(
+        code.contains("pub fn line_order(&self, record: &Line) -> Option<Order>"),
+        "the chain-keyed model is an ordinary FK target"
+    );
+    assert!(
+        code.contains("pub fn customer_orders(&self, id: Uuid) -> Vec<Order>"),
+        "and an ordinary FK source"
+    );
+}
+
+/// **Scenario 9.** The OpenAPI document described every FK as
+/// `{"type":"string","format":"uuid"}`.  For a `u64`-keyed target that is not
+/// merely unhelpful, it is wrong: the server serializes a JSON number.
+#[test]
+fn test_api_generation_openapi_fk_follows_the_target_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let doc = OpenApiGenerator::generate(&schema).unwrap().code;
+    let spec: serde_json::Value = serde_json::from_str(&doc).unwrap();
+
+    let post = &spec["components"]["schemas"]["Comment"]["properties"]["post"];
+    assert_eq!(post["type"], "integer", "an FK to a u64 key is an integer: {post}");
+    assert_eq!(post["format"], "int64", "{post}");
+
+    // The control: an FK to a uuid-keyed target is unchanged.
+    let reply = &spec["components"]["schemas"]["Comment"]["properties"]["reply_to"];
+    assert_eq!(reply["format"], "uuid", "a uuid-keyed FK target is untouched: {reply}");
+}
+
+/// **Scenario 10.** The three REST SDKs deserialize the FK; a `u64` arriving as a
+/// JSON number into a `String`/`str`/`string` field is a client that cannot parse
+/// its own server's response.
+#[test]
+fn test_sdk_generation_fk_follows_the_target_key() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+
+    let rust = RustSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        rust.contains("pub post: u64"),
+        "rust-sdk types the FK as the target key:\n{rust}"
+    );
+
+    let python = PythonSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        python.contains("post: int"),
+        "python-sdk types the FK as the target key:\n{python}"
+    );
+
+    let go = GoSdkGenerator::generate(&schema).unwrap().code;
+    assert!(
+        go.contains("Post uint64"),
+        "go-sdk types the FK as the target key:\n{go}"
+    );
+}
+
+/// **Scenario 11.** The three in-process bindings compile either way — they
+/// `.to_string()` the FK — so the defect is silent: the FK surfaces as `"42"`
+/// while the target's own `id` surfaces as `42` on the very same object.
+///
+/// Asserted as an EQUALITY between the two mappings rather than against a
+/// literal, so it cannot rot when a key type is added.
+#[test]
+fn test_bindings_fk_type_equals_the_targets_own_id_type() {
+    let mut parser = forgedb_parser::Parser::new(U64_PARENT_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+
+    // Go binding: the struct field for `Comment.post` must be spelled the same
+    // as `Post.id`'s own field.
+    let go = GoGenerator::generate(&schema).unwrap().code;
+    let field_type = |decl: &str, name: &str| {
+        let body = &go[go.find(decl).unwrap_or_else(|| panic!("`{decl}` in the Go binding"))..];
+        body.lines()
+            .take_while(|l| !l.starts_with('}'))
+            .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+            .map(|l| l.split_whitespace().nth(1).unwrap().to_string())
+            .unwrap_or_else(|| panic!("field `{name}` in `{decl}`"))
+    };
+    let post_id = field_type("type Post struct {", "Id");
+    let comment_fk = field_type("type Comment struct {", "Post");
+    assert_eq!(
+        comment_fk, post_id,
+        "the Go FK field and the target's own id field must have one type"
+    );
+
+    // NAPI + PyO3: the FK must not be stringified when the key is not a uuid.
+    let napi = NapiGenerator::generate(&schema).unwrap().code;
+    assert!(
+        !napi.contains("record.post.to_string()"),
+        "napi stringifies a u64 FK while `Post.id` surfaces as a number"
+    );
+    let pyo3 = PyO3Generator::generate(&schema).unwrap().code;
+    assert!(
+        !pyo3.contains("record.post.to_string()"),
+        "pyo3 stringifies a u64 FK while `Post.id` surfaces as a number"
+    );
+}
+
+/// A mixed-key many-to-many: `Student` is `u64`-keyed, `Course` is `uuid`-keyed.
+/// `valid_m2m` excludes this pair entirely today.
+///
+/// `detect_many_to_many_relations` names the pair `(Course, Student)` — the
+/// junction's LEFT endpoint is the uuid-keyed `Course` and its RIGHT is the
+/// u64-keyed `Student`, which is why the assertions below read 16 then 8.
+const MIXED_M2M_SRC: &str = r#"
+Student {
+  id: +u64
+  name: string
+  courses: [Course]
+}
+
+Course {
+  id: +uuid
+  title: string
+  students: [Student]
+}
+"#;
+
+/// **Scenario 12.** `valid_m2m` admits a mixed-key pair, and the junction's two
+/// columns are the two endpoints' own widths — not a hardcoded 16/16.
+#[test]
+fn test_rust_generation_junction_admits_a_mixed_key_pair() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(code.contains("pub struct CourseStudentLink"), "the junction exists at all");
+    assert!(
+        flat.contains("root.join(\"course_student_link/fixed/left.bin\"),16usize,"),
+        "the left column is the uuid endpoint's width"
+    );
+    assert!(
+        flat.contains("root.join(\"course_student_link/fixed/right.bin\"),8usize,"),
+        "the right column is the u64 endpoint's width"
+    );
+    assert!(
+        flat.contains("pubfnlink_course_student(&mutself,left:Uuid,right:u64)"),
+        "the link helper takes each endpoint's own key type"
+    );
+    assert!(
+        flat.contains("left_index:std::collections::HashMap<Uuid,Vec<u64>>")
+            && flat.contains("right_index:std::collections::HashMap<u64,Vec<Uuid>>"),
+        "the traversal indexes key on the endpoint types (#154)"
+    );
+}
+
+/// **Scenario 13.** `link` / `unlink` / `pairs` and the rehydration pass all run
+/// over the endpoint key types — the five places the junction hardcoded the UUID
+/// pair, none of which greps for `is_uuid_pk`.
+#[test]
+fn test_rust_generation_junction_round_trip_is_key_typed() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("self.left_col.append_uuid(*left.as_bytes())"),
+        "link appends the left endpoint through its own accessor"
+    );
+    assert!(
+        flat.contains("self.right_col.append_u64(right)"),
+        "...and the right one through its own"
+    );
+    assert!(
+        flat.contains("pubfnpairs(&self)->Vec<(Uuid,u64)>"),
+        "pairs() yields the endpoint key types"
+    );
+    assert!(
+        flat.contains("self.right_col.read_u64(i)"),
+        "the rehydration/latest-wins pass reads the right endpoint as u64"
+    );
+    assert!(
+        flat.contains("pubfnrights_of(&self,left:Uuid)->Vec<u64>")
+            && flat.contains("pubfnlefts_of(&self,right:u64)->Vec<Uuid>"),
+        "the traversal probes are key-typed"
+    );
+    assert!(
+        flat.contains("pubfncourse_students(&self,id:Uuid)->Vec<Student>")
+            && flat.contains("pubfnstudent_courses(&self,id:u64)->Vec<Course>"),
+        "the Database-level M2M getters take each side's own key"
+    );
+}
+
+/// **Scenario 14.** The replication follower frames a junction link as an opaque
+/// byte pair.  Its width is `left + right`, and the literal `32` is the single
+/// thing most likely to survive a careless edit.
+#[test]
+fn test_rust_generation_junction_replay_frame_is_the_endpoint_widths() {
+    let mut parser = forgedb_parser::Parser::new(MIXED_M2M_SRC).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        flat.contains("ev.bytes.len()==24"),
+        "the replay arm accepts a 16 + 8 frame"
+    );
+    assert!(
+        !flat.contains("ev.bytes.len()==32"),
+        "...and no longer a 32-byte one for this junction"
+    );
+    assert!(
+        flat.contains("Vec::with_capacity(24)"),
+        "the broker record reserves the same width it writes"
+    );
+    assert!(
+        flat.contains("right.to_le_bytes()"),
+        "an integer endpoint is framed little-endian, matching its column"
+    );
+    assert!(
+        flat.contains("<u64>::from_le_bytes((&ev.bytes[16..24])"),
+        "...and the follower decodes that slot back at the right offset"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #254 — a timestamp identity is a real key: FKs follow it, junctions hold it
+// ---------------------------------------------------------------------------
+
+/// **#254 x #266.** An FK whose target is keyed on `+timestamp(us)` resolves to
+/// `Timestamp` — the type/width/label/ColumnType chain #266 built has to carry a
+/// key type that no identity could have before this issue.
+///
+/// The failure this pins is not a compile error: `map_field_type_ident` would
+/// fall back to `Uuid`, and the FK column would be 16 bytes that nothing can
+/// ever populate with a matching value.
+#[test]
+fn test_rust_generation_fk_follows_a_timestamp_key() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  label: string
+  samples: [Sample]
+}
+
+Sample {
+  id: +u64
+  tick: *Tick @on_delete(cascade)
+  reading: f64
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(
+        code.contains("pub tick: Timestamp"),
+        "the FK scalar follows the target's timestamp identity, not `Uuid`"
+    );
+    assert!(
+        code.contains("sample/fixed/timestamp_1.bin"),
+        "the FK column file is labelled by the resolved type"
+    );
+    assert!(
+        !code.contains("sample/fixed/uuid_1.bin"),
+        "the FK no longer occupies a `uuid`-labelled column"
+    );
+    assert!(
+        code.contains("forgedb_storage::ColumnType::Timestamp"),
+        "the manifest entry is the target key's ColumnType"
+    );
+    assert!(
+        code.contains("append_timestamp(i64::from(record.tick))"),
+        "the FK write path uses the timestamp accessor"
+    );
+    // The relation surface #266 unblocked is present for this key too — absence
+    // was the bug class, so presence is what a regression would remove.
+    assert!(
+        code.contains("pub fn sample_tick(&self, record: &Sample) -> Option<Tick>"),
+        "forward traversal over a timestamp FK"
+    );
+    assert!(
+        code.contains("pub fn tick_samples(&self, id: Timestamp) -> Vec<Sample>"),
+        "reverse getter keyed on the timestamp identity"
+    );
+    assert!(
+        code.contains("pub fn find_by_tick(&self, value: Timestamp)"),
+        "the FK lookup index is keyed on the resolved type"
+    );
+    assert!(
+        code.contains("pub fn delete_tick(&mut self, id: Timestamp)"),
+        "@on_delete(cascade) is wired over a timestamp-keyed parent"
+    );
+}
+
+/// **#254 x #266.** A many-to-many junction stores each endpoint's id in a
+/// fixed-width, hashable column — `FieldType::is_junction_key` already admits
+/// `FieldType::Timestamp(_)`, and the `(_)` absorbs the precision parameter this
+/// issue added, so #254 widens nothing here. This proves it by generation rather
+/// than by reading the predicate: the junction exists, and it is keyed on
+/// `Timestamp` on the timestamp side.
+#[test]
+fn test_rust_generation_timestamp_key_is_a_junction_endpoint() {
+    let src = r#"
+Tick {
+  id: +timestamp(us)
+  tags: [Tag]
+}
+
+Tag {
+  id: +uuid
+  name: string
+  ticks: [Tick]
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    // The parser's own junction floor must not reject it either — if the
+    // validator and `junction_key_type` ever disagree, the relation silently
+    // vanishes again, which is exactly the failure #266 exists to remove.
+    assert!(
+        forgedb_parser::validate_schema(&schema).is_empty(),
+        "a timestamp-keyed model is a legal junction endpoint"
+    );
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    assert!(code.contains("pub struct TagTickLink"), "the junction is generated");
+    assert!(
+        code.contains("pub fn link_tag_tick(&mut self, left: Uuid, right: Timestamp)"),
+        "the junction links a uuid endpoint to a timestamp endpoint"
+    );
+    assert!(
+        code.contains("left_index: std::collections::HashMap<Uuid, Vec<Timestamp>>")
+            && code.contains("right_index: std::collections::HashMap<Timestamp, Vec<Uuid>>"),
+        "the traversal indexes are keyed on each endpoint's own key type"
+    );
+    assert!(
+        code.contains(".append_timestamp(i64::from(right))"),
+        "the junction's timestamp column uses the timestamp accessor"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #254 — the engine-format migration hop, and the two-arm open guard
+// ---------------------------------------------------------------------------
+
+/// A schema whose timestamps sit in every position a schema-blind column pass
+/// cannot see: bare, nullable, inside a fixed array, and inside a struct.
+fn engine_hop_schema() -> Schema {
+    let src = r#"
+struct Window {
+  opened_at: timestamp(s)
+  closed_at: timestamp(us)
+}
+
+Reading {
+  id: +uuid
+  taken_at: timestamp(ms)
+  maybe_at: ?timestamp(s)
+  marks: [timestamp(s); 3]
+  window: Window
+  label: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    parser.parse().unwrap()
+}
+
+/// The engine hop reaches EVERY timestamp leaf, not only the bare ones.
+///
+/// This is the guard for the finding the plan's `verify` pass turned up: only a
+/// bare `FieldType::Timestamp` becomes `ColumnType::Timestamp`, so a schema-blind
+/// column pass would silently skip the nullable / arrayed / struct-nested ones —
+/// 81 of 247 timestamp fields in the example corpus are nullable. A migration
+/// that skips a third of the data compiles and runs perfectly.
+#[test]
+fn test_engine_generation_reaches_every_timestamp_leaf() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 1,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let code = EngineMigrationGenerator::generate_main_code(&plan).unwrap().code;
+
+    // The bare field.
+    assert!(
+        code.contains(r#"__rescale(__row.taken_at, "Reading", "taken_at")"#),
+        "a bare timestamp is rescaled: {code}"
+    );
+    // The nullable field — reached through the `Option`, not skipped.
+    assert!(
+        code.contains("if let Some(__ts_opt) = &mut __row.maybe_at"),
+        "a NULLABLE timestamp is reached (the shape the schema-blind pass misses): {code}"
+    );
+    // The array — element-wise.
+    assert!(
+        code.contains("for __ts_elem in __row.marks.iter_mut()"),
+        "every array element is rescaled: {code}"
+    );
+    // The struct — by field path, with the dotted name in the diagnostic.
+    let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains(r#""Reading","window.opened_at""#)
+            && flat.contains(r#""Reading","window.closed_at""#),
+        "struct-nested timestamps are rescaled and named by path: {code}"
+    );
+    // The non-timestamp field is left alone.
+    assert!(
+        !code.contains("__row.label ="),
+        "a string field is not touched: {code}"
+    );
+    // Overflow is detected, not wrapped: a stored second count past ~year 9999
+    // would otherwise become a nonsensical instant, silently.
+    assert!(
+        code.contains("checked_mul(1000000)"),
+        "the multiply is checked: {code}"
+    );
+    // Two modules of the SAME schema — the version interlock comes for free.
+    assert!(
+        code.contains("mod e1;") && code.contains("mod e2;"),
+        "both engine generations are embedded: {code}"
+    );
+    assert!(
+        code.contains("e1::Database::open_at") && code.contains("e2::Database::open_at"),
+        "the reader half is e1 and the writer half is e2: {code}"
+    );
+}
+
+/// The two embedded modules differ ONLY in the baked engine generation. If they
+/// differed in the schema serial too, each module's own open-guard would refuse
+/// the dir the other half just wrote.
+#[test]
+fn test_engine_generation_bakes_one_schema_two_generations() {
+    let schema = engine_hop_schema();
+    let plan = EngineHopPlan {
+        schema: &schema,
+        schema_version: 7,
+        from_engine: 1,
+        to_engine: 2,
+    };
+    let out = EngineMigrationGenerator::generate(&plan, "forgedb-engine-migrate").unwrap();
+    let e1 = &out.sources.iter().find(|(p, _)| p == "src/e1.rs").expect("e1").1;
+    let e2 = &out.sources.iter().find(|(p, _)| p == "src/e2.rs").expect("e2").1;
+
+    assert!(e1.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e2.contains("EXPECTED_SCHEMA_VERSION: u32 = 7"));
+    assert!(e1.contains("EXPECTED_ENGINE_VERSION: u32 = 1"));
+    assert!(e2.contains("EXPECTED_ENGINE_VERSION: u32 = 2"));
+}
+
+/// A generation pair the generator does not know is REFUSED, not silently given
+/// the seconds→micros multiply. A wrong rescale corrupts exactly the data the
+/// migration claims to carry, and it corrupts it irreversibly.
+#[test]
+fn test_engine_generation_refuses_an_unknown_hop() {
+    let schema = engine_hop_schema();
+    for (from, to) in [(2u32, 3u32), (1, 3), (2, 1)] {
+        let plan = EngineHopPlan {
+            schema: &schema,
+            schema_version: 1,
+            from_engine: from,
+            to_engine: to,
+        };
+        let err = match EngineMigrationGenerator::generate(&plan, "x") {
+            Err(e) => e,
+            Ok(_) => panic!("only 1 -> 2 exists, but {from} -> {to} generated"),
+        };
+        assert!(
+            err.to_string().contains("the only hop is 1 → 2"),
+            "and it says which hop DOES exist: {err}"
+        );
+    }
+}
+
+/// The open guard's two arms describe two different situations with two
+/// different remedies, and must never collapse into one message: sending a user
+/// to the app's migration bin when ForgeDB's format changed would tell them to
+/// regenerate a schema that is already correct.
+#[test]
+fn test_rust_generation_open_guard_has_two_distinct_arms() {
+    let schema = engine_hop_schema();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+    // prettyplease wraps the panic strings across source lines, so match the
+    // flattened form — dropping the line-continuation backslashes too, which is
+    // what makes a wrapped message one contiguous span again.
+    let flat: String = code
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\\')
+        .collect();
+
+    assert!(
+        flat.contains("isatschemaversionv"),
+        "the schema arm names the app's serial: {code}"
+    );
+    assert!(
+        flat.contains("waswrittenbyengineformatgeneration"),
+        "the engine arm names ForgeDB's generation: {code}"
+    );
+    assert!(
+        flat.contains("forgedbmigrateengine--src<dir>--dest<new-dir>"),
+        "and points at the engine command, NOT the app's transformer: {code}"
+    );
+    assert!(
+        flat.contains("yourschemadidnot"),
+        "and says explicitly which of the two things changed: {code}"
+    );
+    assert!(
+        flat.contains("engine_version:EXPECTED_ENGINE_VERSION"),
+        "a written manifest stamps the generation this binary speaks: {code}"
+    );
+}
+
+// ===========================================================================
+// #252 — `string(N)` / `string(N!)` identities, backed by a `Copy` `InlineStr`.
+//
+// Every failure mode here is a *silent* one, which is why each scenario asserts
+// a literal rather than "it generated". `map_field_type_ident` falls through to
+// `String`, `api.rs::id_parse_type` falls through to `Uuid`, and
+// `wasm.rs::pk_parse_opt` falls through to `Uuid::parse_str` — a missing arm in
+// any of the three produces a handler that parses the wrong type rather than a
+// build error. That is #265's `is_uuid_pk` shape, three more times.
+// ===========================================================================
+
+/// `api.rs` for a schema source.
+fn api_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    ApiGenerator::generate(&schema).unwrap().code
+}
+
+/// The wasm read-replica's `replica.rs` for a schema source.
+fn wasm_for(src: &str) -> String {
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    WasmGenerator::generate(&schema).unwrap().code
+}
+
+fn flat(code: &str) -> String {
+    code.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **Scenario 16.** The key type is `InlineStr<N>`, with N in **bytes** and the
+/// mapping the identity function.
+///
+/// The explicit guard against the withdrawn `4N` sizing: the previous Gate 1 was
+/// written against #238's inline-or-overflow design and sized `InlineStr<104>`
+/// for a 26-character key. #261 measured that design losing, #238 withdrew it,
+/// and one byte per character plus res 3's `@utf8` ban make the width exactly N.
+/// A `4N` key would still *compile*, which is why this asserts the literal.
+#[test]
+fn test_rust_generation_string_identity_is_inline_str_at_n_bytes() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("InlineStr<26usize>"),
+        "a 26-character key is `InlineStr<26>`: {f:.400}"
+    );
+    assert!(
+        !f.contains("InlineStr<104usize>"),
+        "NOT the withdrawn 4N sizing"
+    );
+    // Both spellings map to the same width — `string(N!)`'s dead `len` is the
+    // price of one key type rather than two (res 2).
+    let atmost = flat(&db_for("Doc {\n  id: string(26)\n  title: string\n}\n"));
+    assert!(
+        atmost.contains("InlineStr<26usize>"),
+        "`string(26)` keys the same width as `string(26!)`"
+    );
+}
+
+/// A **non**-identity `string(N)` stays a plain `String`.
+///
+/// The corollary of res 7 and #238's decision 5: `InlineStr` exists because a key
+/// is passed by value, and a column that is never a key has no such requirement.
+/// Widening the mapping to every inline string would change the public struct
+/// type of a feature that shipped in this same cycle, and — decisively — could
+/// not be expressed: `map_field_type_ident` sees a `FieldType`, not a `Field`, so
+/// it cannot see `@utf8` and cannot compute the `4N` width a non-identity column
+/// needs.
+#[test]
+fn test_rust_generation_a_non_key_inline_string_is_still_a_string() {
+    let code = db_for("Doc {\n  id: +uuid\n  sku: string(26!)\n  tag: string(8) @utf8\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub sku: String"),
+        "a non-identity inline string is a `String`: {f:.400}"
+    );
+    assert!(
+        !f.contains("InlineStr"),
+        "and no key type appears anywhere in a uuid-keyed schema"
+    );
+}
+
+/// **Scenario 19.** The in-memory identity maps are keyed on the key type, and
+/// the create handler renders the key as text.
+///
+/// `id_to_row` / `id_versions` are `HashMap`s, which is why `InlineStr` hashes on
+/// its text (#252 res 8): a key type whose `Eq` and `Hash` disagreed would
+/// produce lookup misses rather than a build error.
+#[test]
+fn test_rust_generation_string_key_reaches_the_identity_maps() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<InlineStr<26usize>, usize>>"),
+        "the row index is keyed on the key type: {f:.600}"
+    );
+    assert!(
+        f.contains("id_versions: std::sync::Arc<HashMap<InlineStr<26usize>, Vec<usize>>>"),
+        "and so is the version index"
+    );
+    assert!(
+        f.contains("pub id: InlineStr<26usize>"),
+        "and the model struct's own field agrees with them"
+    );
+}
+
+/// **Scenario 20.** Wherever the key type lands in a `utoipa::ToSchema` context
+/// it is annotated as a `String`.
+///
+/// `InlineStr` does not implement `ToSchema` — the same situation `Timestamp` and
+/// `Decimal` are already in — so without the annotation the generated crate does
+/// not compile at all. The live-query delta enum is the site most easily missed:
+/// #254's compile check found it as a third, unrouted `Timestamp` site after the
+/// model struct and the projection structs were both already handled.
+#[test]
+fn test_rust_generation_string_key_is_annotated_for_utoipa() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("#[schema(value_type = String)] pub id: InlineStr<26usize>"),
+        "the model struct's key is documented as the string it serializes to: {f:.600}"
+    );
+    let at = f.find("Removed {").expect("the live-delta enum has a Removed variant");
+    let window = &f[at.saturating_sub(120)..(at + 120).min(f.len())];
+    assert!(
+        window.contains("#[schema(value_type = String)]"),
+        "and so is the delta enum's: {window}"
+    );
+}
+
+/// **Scenario 21.** A `string(N)` identity's index key is the same `\u{1}` string
+/// class a bare `string` of the same content produces.
+///
+/// The class byte is what keeps a string key from colliding with a numeric one in
+/// the same index. Moving a key into a different class silently reorders every
+/// range scan, and no test that reads back through the same index can tell.
+#[test]
+fn test_rust_generation_string_key_stays_in_the_string_index_class() {
+    let code = db_for(
+        "Doc {\n  id: string(26!)\n  code: &string(8!)\n  slug: &string\n}\n",
+    );
+    let f = flat(&code);
+    assert!(
+        f.contains(r#"write!(__k, "\u{1}{}", __v)"#) || f.contains(r#"\u{1}"#),
+        "the inline key rides the string class: {f:.400}"
+    );
+    assert!(
+        !f.contains(r#"write!(__k, "\u{2}{}", __v)"#) || f.contains(r#"\u{2}"#),
+        "and not the numeric one"
+    );
+}
+
+/// **Scenario 17.** The REST path parameter parses as the key type, not as a
+/// `Uuid`.
+///
+/// `ApiGenerator::id_parse_type` has ended in `_ => quote! { Uuid }` since
+/// 9a54319 (2026-07-06), so *every* non-integer, non-uuid identity has generated
+/// an `api.rs` that does not compile — a bare `string` identity produces 32
+/// errors of one class on an unmodified tree. #266 handed this forward
+/// deliberately rather than write a test that could not fail; this is that test.
+#[test]
+fn test_api_generation_string_key_path_param_is_the_key_type() {
+    // Gate 2 and #266's handoff both spell this `Sku { code: string(26) }`. That
+    // model has no identity at all — #248 requires a field named `id` or a `+`
+    // auto — so it cannot parse, let alone generate. Same class of unwriteable
+    // fixture as #266's own scenario 17.
+    let code = api_for("Sku {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    // The segment arrives as a `String` and is parsed in the handler (so a bad
+    // key is a 400 with a message rather than axum's own rejection), which is
+    // why `FromStr` on `InlineStr` is load-bearing and nothing is generated for
+    // the extraction itself.
+    assert!(
+        f.contains("id.parse::<InlineStr<26usize>>()"),
+        "the path segment parses into the key type: {f:.800}"
+    );
+    assert!(
+        !f.contains("id.parse::<Uuid>()"),
+        "and never falls through to Uuid for a string-keyed model"
+    );
+}
+
+/// The fall-through itself is gone, not merely shadowed.
+///
+/// A `_ => Uuid` arm left in place would keep every future key type silently
+/// wrong. This asserts the *shape*: a required-FK identity pointing at an
+/// integer-keyed parent must parse as that integer, which the raw-`FieldType`
+/// match could never do because it never resolved the relation.
+#[test]
+fn test_api_generation_id_parse_type_resolves_a_relation_identity() {
+    let code = api_for(
+        "Customer {\n  id: +u64\n  name: string\n}\n\nAccount {\n  id: *Customer\n  label: string\n}\n",
+    );
+    let f = flat(&code);
+    assert!(
+        f.contains("id.parse::<u64>()"),
+        "an FK identity parses as the far end of the chain: {f:.800}"
+    );
+    assert!(
+        !f.contains("id.parse::<Uuid>()"),
+        "the old raw-FieldType match sent BOTH models' segments to Uuid: {f:.800}"
+    );
+}
+
+/// **Scenario 18.** The browser read-replica parses a string key as itself.
+///
+/// The arm most likely to be forgotten: the replica is not in the default build,
+/// so nothing else in the suite exercises it. `pk_parse_opt` falls through to
+/// `Uuid::parse_str(&id).ok()`, which returns `None` for every well-formed string
+/// key — a replica that silently resolves nothing.
+#[test]
+fn test_wasm_generation_replica_parses_a_string_key() {
+    let code = wasm_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("<InlineStr<26usize>>::try_from(id.as_str()).ok()"),
+        "the replica parses the key as the key type: {f:.800}"
+    );
+    assert!(
+        !f.contains("Uuid::parse_str(&id).ok()"),
+        "and never as a uuid"
+    );
+}
+
+/// **Scenarios 12 / 14 / 15.** The generated write path carries the identity's
+/// three value rules, and the alphabet check names the offending character and
+/// its position.
+///
+/// Res 4 (URL-path-safe), res 5 (non-empty) and #238's ASCII restriction — which
+/// for a *key* is unconditional, because res 3 removes the `@utf8` escape. All
+/// three are generated rather than substrate (res 7): they apply because the
+/// field is an identity, which `InlineStr` cannot know.
+#[test]
+fn test_rust_generation_string_key_carries_its_value_rules() {
+    let code = db_for("Doc {\n  id: string(26!)\n  title: string\n}\n");
+    let f = flat(&code);
+
+    assert!(
+        f.contains(r#"rule: "identity_alphabet""#),
+        "the path-segment alphabet is checked: {f:.600}"
+    );
+    assert!(
+        f.contains(r#"rule: "identity_empty""#),
+        "and the empty key is refused"
+    );
+    // The diagnostic names the character AND its position — a key rejected with
+    // "invalid character" and nothing else is unactionable when the value came
+    // out of somebody else's system.
+    let at = f
+        .find(r#"rule: "identity_alphabet""#)
+        .expect("the alphabet rule is emitted");
+    let window = &f[at..(at + 400).min(f.len())];
+    assert!(
+        window.contains("__c") && window.contains("__i"),
+        "the message names the character and its byte offset: {window}"
+    );
+}
+
+/// **Scenario 13.** The alphabet is `pchar` minus `%`, not the tighter
+/// *unreserved* set.
+///
+/// The guard against silently tightening: `@` and `:` are sub-delims/`pchar` and
+/// must be admitted, because `user@example.com` as a natural key is exactly the
+/// ingestion scenario this issue exists for — and because #254's `+timestamp(us)`
+/// key already renders `:` into its own path segment, so tightening here would
+/// give the two identity types two different path rules.
+#[test]
+fn test_rust_generation_string_key_alphabet_is_pchar_minus_percent() {
+    let code = db_for("Doc {\n  id: string(64)\n  title: string\n}\n");
+    let f = flat(&code);
+    let at = f
+        .find("__forgedb_identity_char_ok")
+        .expect("the alphabet predicate is emitted as a named helper");
+    let window = &f[at..(at + 900).min(f.len())];
+    // `'` is emitted escaped (`'\''`), so it is checked by its escaped spelling.
+    for admitted in ["'@'", "':'", "'!'", "'$'", "'&'", r"'\''", "'('", "')'", "'*'", "'+'",
+                     "','", "';'", "'='", "'-'", "'.'", "'_'", "'~'"] {
+        assert!(
+            window.contains(admitted),
+            "{admitted} is a pchar and must be admitted: {window}"
+        );
+    }
+    // ...and the alphanumerics come from the predicate rather than a list.
+    assert!(
+        window.contains("is_ascii_alphanumeric"),
+        "letters and digits are admitted by predicate: {window}"
+    );
+    for rejected in ["'%'", "'/'", "'?'", "'#'", "'['", "']'"] {
+        assert!(
+            !window.contains(rejected),
+            "{rejected} must NOT be admitted — `%` in particular, so the segment is \
+             byte-identical to the key: {window}"
+        );
+    }
+}
+
+/// **Scenario 11.** A `string(N)`-keyed model is an ordinary foreign-key target:
+/// the full relation surface generates, at the parent's key width.
+///
+/// Res 9, which is the resolution that constrained shipping. The failure this
+/// guards is a *clean build with the relation surface silently absent* — which is
+/// what #265 found and #266 fixed for integer keys. Asserting presence is the
+/// point.
+#[test]
+fn test_rust_generation_string_keyed_target_keeps_the_relation_surface() {
+    let code = db_for(
+        "Airport {\n  id: string(3!)\n  city: string\n  flights: [Flight]\n}\n\n\
+         Flight {\n  id: +uuid\n  origin: *Airport\n  alt: ?Airport\n}\n",
+    );
+    let f = flat(&code);
+
+    // The FK column is the parent's key type, at the parent's width.
+    assert!(
+        f.contains("pub origin: InlineStr<3usize>"),
+        "a required FK to a string-keyed parent is the parent's key: {f:.600}"
+    );
+    assert!(
+        f.contains("pub alt: Option<InlineStr<3usize>>"),
+        "and an optional FK is the same key, wrapped"
+    );
+    // ...and the column is physically identical to the parent's identity column.
+    assert!(
+        flat(&column_init(&code, "origin")).contains("3usize"),
+        "the FK column is the identity column's width"
+    );
+
+    // Referential integrity, both delete modes, traversal and the reverse getter.
+    assert!(f.contains("fn flight_origin"), "forward traversal exists");
+    assert!(f.contains("fn flight_alt"), "and so does the optional one");
+    assert!(
+        f.contains("fn airport_flights_by_origin"),
+        "the reverse collection getter exists"
+    );
+    assert!(
+        f.contains("fn flight_with_relations"),
+        "and the eager load"
+    );
+    assert!(
+        f.contains("fn delete_airport"),
+        "the parent's delete wrapper exists"
+    );
+    assert!(
+        f.contains("if self.airport.get(record.origin).is_none()"),
+        "referential integrity resolves the FK through the parent's own `get`, \
+         which only type-checks if the FK and the key agree: {f:.600}"
+    );
+    assert!(
+        f.contains("ValidationError::DanglingReference"),
+        "and refuses a dangling reference"
+    );
+}
+
+/// The M2M half of scenario 11 — #266's Gate 2 handoff 1.
+///
+/// #266 parameterized the junction on its two endpoint key types, but kept a
+/// *physical floor* (`FieldType::is_junction_key`): fixed-width, hashable and
+/// totally equatable, because the key sits in a `FixedColumn`, in a `HashMap`,
+/// and in a fixed-width replication frame. `string(N)` satisfies all three — it
+/// is a fixed slot and `InlineStr` is `Copy + Hash + Eq` — so the predicate
+/// widens by one arm and the junction picks it up.
+#[test]
+fn test_rust_generation_string_key_is_a_junction_endpoint() {
+    let code = db_for(
+        "Isin {\n  id: string(12!)\n  name: string\n  funds: [Fund]\n}\n\n\
+         Fund {\n  id: +uuid\n  label: string\n  holdings: [Isin]\n}\n",
+    );
+    let f = flat(&code);
+
+    assert!(
+        f.contains("fn link_fund_isin") || f.contains("fn link_isin_fund"),
+        "the junction generates rather than silently vanishing: {f:.600}"
+    );
+    // The junction column is the endpoint's own key width, not a blanket 16.
+    assert!(
+        f.contains("FixedColumn::new") && f.contains("12usize"),
+        "the string endpoint's junction column is 12 bytes wide"
+    );
+    // The traversal index is keyed on the key types, which is what needs
+    // `Copy + Hash + Eq`.
+    assert!(
+        f.contains("HashMap<Uuid, Vec<InlineStr<12usize>>>")
+            || f.contains("HashMap<InlineStr<12usize>, Vec<Uuid>>"),
+        "the in-memory traversal index keys on the endpoint key types: {f:.600}"
+    );
+}
+
+/// The validator and the generator must agree about which key types a junction
+/// admits, because they cannot see each other: `FieldType::is_junction_key` on
+/// the AST is the single predicate, and if the two sides drifted a relation would
+/// silently vanish again — the exact failure #266 exists to remove.
+#[test]
+fn test_string_key_is_admitted_by_the_shared_junction_predicate() {
+    assert!(
+        FieldType::StringN {
+            chars: 12,
+            exact: true
+        }
+        .is_junction_key(),
+        "the exact spelling is a junction key"
+    );
+    assert!(
+        FieldType::StringN {
+            chars: 32,
+            exact: false
+        }
+        .is_junction_key(),
+        "and so is the at-most spelling — both occupy a fixed slot"
+    );
+    assert!(
+        !FieldType::String.is_junction_key(),
+        "a bare `string` is variable-width and still cannot be one"
+    );
+}
+
+/// The five breaks the compile-and-run check found that no snapshot could
+/// (#252). Every one of them was a *green* snapshot suite over generated code
+/// that did not compile — the exact reason CLAUDE.md makes compiling the output
+/// a separate discipline from snapshotting it.
+///
+/// They share one root cause worth stating once: the inline-string branches were
+/// gated on the DECLARED field type, and an FK's declared type is a relation. So
+/// every one of them is a place where an FK to a string-keyed model had to be
+/// recognized as the inline-string column it physically is.
+#[test]
+fn test_rust_generation_a_string_fk_is_an_inline_string_column() {
+    let code = db_for(
+        "Airport {\n  id: string(3!)\n  city: string\n  flights: [Flight]\n}\n\n\
+         Flight {\n  id: +uuid\n  origin: *Airport\n  alt: ?Airport\n}\n",
+    );
+    let f = flat(&code);
+
+    // 1. The column methods. `type_name` maps `StringN` to `inline_string` so
+    //    the column FILE reads honestly (#238) — which means composing a method
+    //    name from it names a method that does not exist. The FK must reach the
+    //    pack/unpack path instead, exactly as a declared `string(N)` does.
+    assert!(
+        !f.contains("append_inline_string") && !f.contains("read_inline_string"),
+        "no column method is named after the inline-string label: {f:.400}"
+    );
+
+    // 2. The transmute path is the one a nullable FK fell into, and it would
+    //    have persisted the Rust `Option<InlineStr>` layout rather than the
+    //    column's `[tag, payload]` framing.
+    assert!(
+        f.contains("let mut __buf = [0u8; 4usize]"),
+        "a nullable string FK packs a tagged slot, not a transmuted Option: {f:.400}"
+    );
+
+    // 3. `#[schema(value_type = String)]` on the FK, not just on the identity —
+    //    `InlineStr` implements no `ToSchema`, so the derive does not resolve.
+    let flight = f
+        .split("pub struct Flight {")
+        .nth(1)
+        .expect("the Flight struct")
+        .split('}')
+        .next()
+        .expect("its body")
+        .to_string();
+    assert!(
+        flight.contains("#[schema(value_type = String)] pub origin:"),
+        "the required FK is annotated, not only the identity: {flight}"
+    );
+    assert!(
+        flight.contains("#[schema(value_type = Option<String>)] pub alt:"),
+        "and the optional one documents an optional string: {flight}"
+    );
+
+    // 4. The cascade/reverse-getter probe takes `&str` (an index probe over a
+    //    string-semantic column does, deliberately), but these call sites hold
+    //    the key by value.
+    assert!(
+        f.contains("self.flight.find_by_origin(&id)"),
+        "the cascade borrows the key for the probe: {f:.400}"
+    );
+    assert!(
+        f.contains("self.flight.find_by_alt(Some(&id))"),
+        "and so does the optional one"
+    );
+}
+
+/// A `string(N)` key is the one string-semantic field the scan view does NOT
+/// borrow (#252). The scan *scope* (#228) returns a vector of ids that outlives
+/// the buffers they were decoded from, so a borrowed key cannot escape it —
+/// and `InlineStr<N>` being `Copy` means holding it by value costs the scan
+/// nothing, since not allocating was the only thing the borrow ever bought.
+#[test]
+fn test_rust_generation_the_scan_view_holds_a_string_key_by_value() {
+    let code = db_for("Airport {\n  id: string(3!)\n  city: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub __slot: usize, pub id: InlineStr<3usize>"),
+        "the scan view's key is owned and Copy: {f:.400}"
+    );
+    assert!(
+        f.contains("pub city: &'a str"),
+        "while an ordinary string column still borrows"
+    );
+
+    // ...and with the key no longer borrowing, a model whose ONLY string-
+    // semantic field is its key borrows nothing at all, so #250's lifetime
+    // anchor is needed again. Without it: `error[E0392]: lifetime parameter
+    // 'a is never used`.
+    let bare = flat(&db_for("Tag {\n  id: string(8!)\n  weight: u32\n}\n"));
+    assert!(
+        bare.contains("PhantomData<&'a ()>"),
+        "a key-only string model re-anchors 'a: {bare:.400}"
+    );
+}
+
+// ---- #251: the identity allow-list, one predicate, and the precedence fix ----
+
+/// **Scenario 9 — shape 4, the silent mis-key, at the generator.**
+///
+/// ```forge
+/// Event { seq: +u64  id: u32  note: string }
+/// ```
+///
+/// Under the old first-match predicate this **compiles and runs**: the database
+/// is keyed on `seq` while the generated parameter is *named* `id`, so
+/// `/events/{id}` takes a sequence number and every relation pointing here points
+/// at the wrong column. It is the only shape in #251 that produces a working
+/// binary with the wrong key — which is why it is a v0.4.0 item rather than a
+/// deferred cleanup, since changing a model's primary key later is an on-disk
+/// format change for anyone who shipped it.
+///
+/// #254 fixed the four picking sites; #251 makes them one definition. The guard
+/// belongs here, on this issue, because this is its defining defect.
+#[test]
+fn test_rust_generation_an_id_field_wins_over_an_auto_declared_above_it() {
+    let code = db_for("Event {\n  seq: +u64\n  id: u32\n  note: string\n}\n");
+    let f = flat(&code);
+    assert!(
+        f.contains("pub fn get(&self, id: u32)"),
+        "the key is the `id` field, not the `+u64` above it: {f:.400}"
+    );
+    assert!(
+        !f.contains("pub fn get(&self, id: u64)"),
+        "and emphatically not the sequence: {f:.400}"
+    );
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<u32, usize>>"),
+        "the identity map is keyed on `id`: {f:.400}"
+    );
+
+    // Declaration order must not matter — the same schema written the other way
+    // round generates byte-identical code.
+    let other = db_for("Event {\n  id: u32\n  seq: +u64\n  note: string\n}\n");
+    assert_eq!(
+        flat(&other).contains("pub fn get(&self, id: u32)"),
+        true,
+        "precedence, not position"
+    );
+}
+
+/// The same precedence, in **every** generator that picks an identity. This is
+/// the assertion the 37-site sweep exists for: before it, `validate.rs` could
+/// select one field while `rust.rs` keyed on another, and the guard would then be
+/// checking a field the database does not use.
+#[test]
+fn test_generators_agree_on_which_field_is_the_identity() {
+    let src = "Event {\n  seq: +u64\n  id: u32\n  note: string\n}\n";
+
+    let api = flat(&api_for(src));
+    assert!(
+        api.contains("id.parse::<u32>()"),
+        "the REST path segment parses the `id` field's type: {api:.400}"
+    );
+    assert!(
+        !api.contains("id.parse::<u64>()"),
+        "not the sequence's: {api:.400}"
+    );
+
+    let wasm = flat(&wasm_for(src));
+    assert!(
+        wasm.contains("id.parse::<u32>()"),
+        "the browser replica agrees: {wasm:.400}"
+    );
+    assert!(!wasm.contains("id.parse::<u64>()"), "{wasm:.400}");
+}
+
+/// A model whose identity is an auto under a **different** name keeps working —
+/// `code: +uuid` with no `id` field is the #248 spelling the corpus uses, and
+/// precedence must not quietly demote it. An allow-list that rejects too much is
+/// as broken as one that rejects too little, and this failure is the quieter one.
+#[test]
+fn test_rust_generation_an_auto_under_another_name_is_still_the_identity() {
+    let f = flat(&db_for("Token {\n  code: +uuid\n  label: string\n}\n"));
+    assert!(
+        f.contains("pub fn get(&self, id: Uuid)"),
+        "the auto field serves as identity: {f:.400}"
+    );
+    assert!(
+        f.contains("id_to_row: std::sync::Arc<HashMap<Uuid, usize>>"),
+        "{f:.400}"
+    );
+}
+
+// ---- #226: the borrowed full-record page view ----
+
+/// The schema #226's generator guards are written against — the same shape
+/// `tests/api_wire_test.rs`'s `PAGE_SCHEMA` uses, and for the same reasons.
+///
+/// `Widget.serial` is declared **after** every field the scan set excludes
+/// (`scores`, `dims`, `owner`, `parts`, `payload`), which is the maximal
+/// divergence between declaration order and `scan_field_set` order — a `PageRef`
+/// built by appending the excluded fields to the scan set emits
+/// `…checksum, serial, scores, dims, owner, payload` where the model emits
+/// `…checksum, scores, dims, owner, parts, payload, serial`. On a model whose
+/// filterable fields happen to be declared last, both constructions agree and the
+/// guard proves nothing.
+///
+/// `Note` declares its identity **second**, which is the only shape that catches
+/// an identity-first page view: `scan_field_set` pushes the identity field first
+/// unconditionally, so `NoteScanRef` really is `{ id, body, weight }` against a
+/// model of `{ body, id, weight }`.
+const PAGE_REF_SRC: &str = r#"
+enum Tier { Free, Pro, Enterprise }
+
+struct Dims {
+  w: u32
+  h: u32
+}
+
+Widget {
+  id: +uuid
+  label: string?
+  price: decimal
+  tier: ^Tier
+  made_at: timestamp(ms)
+  checksum: bytes(4)
+  scores: [i32; 3]
+  dims: Dims
+  owner: *Maker
+  parts: [Part]
+  payload: json
+  serial: ^u32
+}
+
+Maker {
+  id: +uuid
+  name: string
+  widgets: [Widget]
+}
+
+Part {
+  id: +uuid
+  name: string
+  widget: *Widget
+}
+
+Note {
+  body: string
+  id: +uuid
+  weight: ^u32
+}
+"#;
+
+/// **#226 gotcha 1 — JSON key order is the wire contract.**
+///
+/// `serde_json` emits struct fields in declaration order, so `<Model>PageRef`'s
+/// field order *is* the bytes on the socket. It must be `model.fields` order, NOT
+/// `scan_field_set` order (identity first, then the filterable columns) with the
+/// remaining fields appended: those two are semantically equal and byte-different,
+/// and a `Value`-comparing test cannot tell them apart.
+#[test]
+fn test_rust_generation_page_ref_field_order() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The divergence this guard exists for, made explicit: the scan view is
+    // identity-first-then-filterable and stops at `serial`...
+    assert!(
+        f.contains(
+            "pub struct WidgetScanRef<'a> { /// #226: the scan buffer slot this view \
+             was decoded at — the only /// thing that survives the sort's reordering \
+             to say which physical /// row it came from. Internal; this view is not \
+             `Serialize`. pub __slot: usize, pub id: Uuid, pub label: Option<&'a str>, \
+             pub price: rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, \
+             pub checksum: [u8; 4usize], pub serial: u32, }"
+        ),
+        "the scan view is identity-first, filterable-only: {f}"
+    );
+    // ...while the page view is the model's own declaration order, in full.
+    assert!(
+        f.contains(
+            "pub struct WidgetPageRef<'a> { pub id: Uuid, pub label: Option<&'a str>, \
+             #[serde(with = \"rust_decimal::serde::str\")] pub price: \
+             rust_decimal::Decimal, pub tier: Tier, pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "the page view is model declaration order, every field: {f}"
+    );
+    // The model it has to serialize identically to, for the same field list.
+    assert!(
+        f.contains(
+            "pub struct Widget { #[serde(default)] pub id: Uuid, pub label: \
+             Option<String>, #[schema(value_type = String)] #[serde(with = \
+             \"rust_decimal::serde::str\")] pub price: rust_decimal::Decimal, pub \
+             tier: Tier, #[schema(value_type = String)] pub made_at: Timestamp, pub \
+             checksum: [u8; 4usize], pub scores: [i32; 3usize], pub dims: Dims, pub \
+             owner: Uuid, pub parts: (), pub payload: serde_json::Value, pub serial: \
+             u32, }"
+        ),
+        "and the model's order is what it is being held to: {f}"
+    );
+
+    // Identity declared SECOND — the only shape that catches an identity-first
+    // page view. The scan view really does reorder here, so this is not a
+    // hypothetical.
+    assert!(
+        f.contains("pub struct NotePageRef<'a> { pub body: &'a str, pub id: Uuid, pub weight: u32, }"),
+        "an identity declared second stays second on the wire: {f}"
+    );
+    assert!(
+        f.contains("pub id: Uuid, pub body: &'a str, pub weight: u32, }"),
+        "while the scan view for the same model IS identity-first: {f}"
+    );
+
+    // The page view is a distinct type, not `ScanRef` with `Serialize` bolted on
+    // (#224's decision that the scan view is never a wire type stands).
+    assert!(
+        f.contains("#[derive(Debug, Clone)] pub struct WidgetScanRef<'a>"),
+        "the scan view still derives neither Serialize nor ToSchema: {f}"
+    );
+    assert!(
+        f.contains("#[derive(serde::Serialize)] pub struct WidgetPageRef<'a>"),
+        "and the page view derives Serialize only — no Deserialize, no ToSchema: {f}"
+    );
+}
+
+/// **#226 gotcha 2 — `json` must not go through the borrowed path.**
+///
+/// Today's page read is `get(id)` → a positional `read_string` → `from_str` into a
+/// `serde_json::Value`, and `Value`'s map is a `BTreeMap`, so that round-trip
+/// *normalizes* a stored object's key order. A borrowed `&str` / `RawValue`
+/// passthrough would emit the **stored** order instead and silently change the bytes
+/// of every json field in every list response. The win #226 measured does not depend
+/// on json at all, so the correct move is to leave it alone.
+///
+/// Two things make that concrete, and both are asserted here:
+///
+/// - `json` is not filterable (`ApiGenerator::is_filterable_field`), so it is never
+///   in `scan_field_set` and can only reach the page view through the page gather.
+/// - the page gather runs `field_read_stmt` with `borrowed = false`, so json decodes
+///   through `read_string` + `from_str` — the identical statement `read_at` emits,
+///   receiver and index aside.
+///
+/// The negative assertion is the load-bearing one: `read_str` (the borrowed
+/// accessor #224 added) must appear nowhere near the payload column.
+#[test]
+fn test_rust_generation_page_ref_excludes_json_from_buffers() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    // The page view holds an OWNED `serde_json::Value`, not a borrowed `&'a str`.
+    assert!(
+        f.contains("pub payload: serde_json::Value,"),
+        "json is an owned Value on the page view: {f}"
+    );
+    assert!(
+        !f.contains("pub payload: &'a str") && !f.contains("pub payload: Option<&'a str>"),
+        "and never a borrowed passthrough: {f}"
+    );
+
+    // It is gathered by the PAGE buffers (bounded to the page's physical rows),
+    // never by the scan buffers — it is not filterable, so it is not in the scan set.
+    // NOTE on the spacing in every needle below: `flat` collapses whitespace runs
+    // to one space, and prettyplease breaks method chains across lines, so the
+    // emitted text really is `self .payload_col .gather_buffered(..)`. Writing the
+    // unspaced form makes a POSITIVE assertion fail loudly — and a NEGATIVE one pass
+    // vacuously, which is the dangerous half.
+    assert!(
+        f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__page_rows) \
+             .expect(\"Failed to bulk-load page column\")"
+        ),
+        "json is gathered over the page's rows: {f}"
+    );
+    assert!(
+        !f.contains(
+            "payload_col: self .payload_col .gather_buffered(&__rows) \
+             .expect(\"Failed to bulk-load scan column\")"
+        ),
+        "json never enters the full-table scan gather: {f}"
+    );
+
+    // The decode is the `Value` round-trip, and it is the SAME statement `read_at`
+    // emits — receiver and index aside. That equality is what makes the bytes
+    // identical rather than merely similar.
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = __page_bufs .payload_col .read_string(__pslot) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "the page decodes json through read_string + from_str: {f}"
+    );
+    assert!(
+        f.contains(
+            "let payload_value = { let raw = self .payload_col .read_string(row_index) \
+             .expect(\"Failed to read string\"); serde_json::from_str(&raw)\
+             .expect(\"Failed to deserialize json\") };"
+        ),
+        "which is exactly what read_at does: {f}"
+    );
+    assert!(
+        !f.contains("payload_col .read_str(") && !f.contains("payload_col.read_str("),
+        "the borrowed accessor is never used for json: {f}"
+    );
+
+    // The complement, stated positively: the page gather holds exactly the delta
+    // Gate 2 named — FK, json, [T; N], inline struct — and nothing the scan already
+    // decoded. `parts` (a virtual `[Model]`) has no column at all and is defaulted.
+    assert!(
+        f.contains(
+            "struct __WidgetPageBufs { scores_col: forgedb_storage::BufferedFixedColumn, \
+             dims_col: forgedb_storage::BufferedFixedColumn, \
+             owner_col: forgedb_storage::BufferedFixedColumn, \
+             payload_col: forgedb_storage::BufferedVariableColumn, } let __page_bufs"
+        ),
+        "the page gather is exactly the scan set's complement: {f}"
+    );
+    assert!(
+        f.contains("parts: (),"),
+        "a virtual relation is defaulted, not gathered: {f}"
+    );
+    // A model whose every field IS in the scan set gathers nothing for the page.
+    assert!(
+        f.contains("struct __MakerPageBufs {} let __page_bufs = __MakerPageBufs {};"),
+        "and an all-scan model's page gather is empty: {f}"
+    );
+}
+
+/// **#226 gotcha 3 — the sort destroys the ref-to-row correspondence.**
+///
+/// Views are built by buffer slot, then `keep` filters and `sort` reorders. After
+/// that, a view's index in the vector says nothing about the physical row it came
+/// from, so the page's second gather must map back through the slot recorded on the
+/// view. Mapping by position instead yields a page of *real rows in the wrong order*
+/// — every value valid, `total` correct, and only a byte-exact ordered assertion
+/// (`tests/api_wire_test.rs`, the `?sort=…&order=desc` scenarios) catches it.
+#[test]
+fn test_rust_generation_page_rows_map_through_the_recorded_slot() {
+    let f = flat(&db_for(PAGE_REF_SRC));
+
+    assert!(
+        f.contains("let __page_rows: Vec<usize> = __page .iter() .map(|__r| __rows[__r.__slot]) .collect();"),
+        "the page's physical rows come from the ref's recorded slot: {f}"
+    );
+    // The two things it must NOT be: the selection's own order, or the page slice's
+    // position within it.
+    //
+    // **Scoped to `__with_page`'s own body, and that scoping is #281's doing.** This
+    // was a file-wide negative until #281 emitted `__with_fast_page`, whose page slice
+    // is literally `__rows[__start..__end]` — correct *there*, because with no `keep`
+    // and no `sort` a view's position IS its slot, and wrong *here* for exactly the
+    // reason the doc comment above gives. Rescoped rather than dodged by renaming
+    // #281's binding: the assertion's intent is about `__with_page`, and a rename
+    // would have kept the test green while deleting what it tests.
+    //
+    // The slice is bounded by the next `pub fn` AFTER the match, with the end of the
+    // string as the fallback — a following `pub fn` exists here only because
+    // `PAGE_REF_SRC`'s `Widget` happens to emit a pushdown resolver, which is a
+    // property of the fixture and not of the emitter.
+    let method_body = |name: &str| -> &str {
+        let start = f
+            .find(name)
+            .unwrap_or_else(|| panic!("{name} is emitted: {f}"));
+        let end = f[start + 1..]
+            .find("pub fn ")
+            .map(|i| start + 1 + i)
+            .unwrap_or(f.len());
+        &f[start..end]
+    };
+    assert!(
+        !method_body("pub fn __with_page").contains("__rows[__start"),
+        "not a slice of the selection: {f}"
+    );
+    // #281's mirror positive: in the FAST page, slicing the selection is the whole
+    // point, and the gather is bounded to that slice rather than to the table.
+    assert!(
+        method_body("pub fn __with_fast_page")
+            .contains("gather_buffered(&__rows[__start..__end])"),
+        "#281: the fast page gathers the page's rows, not the table's: {f}"
+    );
+    assert!(
+        f.contains("let __row_ref = WidgetScanRef { __slot,"),
+        "and the slot is recorded at decode time, before any reordering: {f}"
+    );
+
+    // Pagination is applied inside the scope, with `Pagination::apply`'s arithmetic
+    // (both ends clamped, the addition saturating) against the post-sort count.
+    assert!(
+        f.contains(
+            "let __total = __refs.len(); sort(&mut __refs); let __start = offset.min(__total); \
+             let __end = offset.saturating_add(limit).min(__total); \
+             let __page = &__refs[__start..__end];"
+        ),
+        "total is counted before the page is sliced, and the slice clamps both ends: {f}"
+    );
+}
+
+/// #226: a model that declares a `@projection` keeps the OWNED narrow path — but
+/// only for `?projection=` requests.
+///
+/// This is the one branch #226's Gate 2 did not anticipate ("repoint the
+/// `live_list_block` site" reads as a single substitution).  It cannot be a single
+/// substitution: `generate_projection_rest`'s list arms field-copy the page rows
+/// into the projection struct (`page.iter().map(|r| PostCard { title: r.title.clone(),
+/// .. })`), so they need `Vec<Post>`, which a borrowed view cannot supply.
+///
+/// The guard is deliberately two-sided, because BOTH failure modes are silent:
+/// keeping only the owned path would make #226 a no-op for every model with a
+/// projection (a perf regression that no test would notice), and keeping only the
+/// borrowed path would not compile — which is loud, but only if some test compiles
+/// a projected schema, and `insta` compares strings.
+#[test]
+fn test_api_generation_projection_model_keeps_an_owned_page() {
+    let src = r#"
+Post {
+  @projection(card: title, views)
+  id: +uuid
+  title: string
+  body: string
+  views: u32
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f: String = api.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The borrowed page is still the default — it is guarded on the ABSENCE of the
+    // parameter, so a new projection-shaped feature cannot silently opt every
+    // request back onto the owned path.
+    assert!(
+        f.contains("if params.get(\"projection\").is_none() {"),
+        "#226: the borrowed page is guarded on there being no ?projection=: {f}"
+    );
+    assert!(
+        f.contains("return db .post .__with_page("),
+        "#226: a projected model still takes the page scope when unprojected: {f}"
+    );
+    // ...and the owned path survives for the projection arms to consume.
+    assert!(
+        f.contains("db .post .__with_scan("),
+        "#226: ?projection= keeps the #160/#228 owned narrow path: {f}"
+    );
+    assert!(
+        f.contains(".filter_map(|__id| db.post.get(*__id))"),
+        "#226: the owned path still full-materializes only the page: {f}"
+    );
+    assert!(
+        f.contains("let __data: Vec<super::PostCard> = page .iter() .map(|r| super::PostCard {"),
+        "the projection arm field-copies the OWNED page — the reason it survives: {f}"
+    );
+    // Both `__sel` computations are inside their own branch: `Option<Vec<usize>>` is
+    // moved into the callee, so one shared binding could not feed both.
+    assert_eq!(
+        f.matches("let __sel: Option<Vec<usize>> =").count(),
+        2,
+        "#226: each branch computes its own moved selection: {f}"
+    );
+}
+
+/// **#288 · H1** — the unfiltered-list predicate is emitted, and hoisted OUT of the
+/// per-row loop.
+///
+/// This is the **only** guard against under-firing, and the reason it has to be a
+/// codegen assertion rather than a wire test is the same property that makes the
+/// change safe: `__keep_all || matches(r, &params)` is *exactly* equivalent to
+/// `matches(r, &params)` for every input, because the predicate and the per-field
+/// checks are built from the same `filter(is_filterable_field)` iteration and key on
+/// the same `field.name`. A hoist that never fires is therefore invisible to every
+/// behaviour test in the tree — including a byte-exact one.
+///
+/// The load-bearing half is the ORDERING. Writing the call inside the closure
+/// (`|r| __post_is_unfiltered(&params) || ..`) is behaviourally identical and costs
+/// 100% of what the issue set out to remove, so only an ordering assertion catches it.
+#[test]
+fn test_api_generation_unfiltered_list_hoists_the_predicate() {
+    let src = r#"
+Post {
+  id: +uuid
+  title: string
+  views: ^u64
+  published: bool
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    // 1. The helper exists, and asks the POSITIVE question — "does any key name a
+    //    filterable field of this model?" — rather than excluding reserved names.
+    assert!(
+        f.contains("fn __post_is_unfiltered(params: &HashMap<String, String>) -> bool"),
+        "#288: the per-model unfiltered predicate is emitted: {f}"
+    );
+    for field in ["id", "title", "views", "published"] {
+        assert!(
+            f.contains(&format!("if params.contains_key(\"{field}\") {{ return false; }}")),
+            "#288: the predicate derives `{field}` from the same iteration as the \
+             per-field checks, so the two cannot disagree about what is filterable: {f}"
+        );
+    }
+    // No exclusion list. A model may legally declare a field named `limit`, so a
+    // negative predicate would be wrong as well as unmaintainable (see H2).
+    assert!(
+        !f.contains("__post_is_unfiltered") || !f.contains("params.contains_key(\"as_of\")"),
+        "#288: the predicate must not carry a reserved-name exclusion list: {f}"
+    );
+
+    // 2. It is evaluated ONCE, outside the scan, and the closure only reads the bool.
+    assert!(
+        f.contains("let __keep_all: bool = __post_is_unfiltered(&params);"),
+        "#288: the predicate is hoisted to a binding, not called per row: {f}"
+    );
+    assert!(
+        f.contains("|r| __keep_all || __post_scan_matches(r, &params)"),
+        "#288: the per-row closure short-circuits on the hoisted bool: {f}"
+    );
+
+    // 3. ORDERING — the part a behaviour test cannot see. The binding is evaluated
+    //    before the scan is set up, not inside the per-row closure.
+    //
+    //    **#281 moved the binding above `__sel`** and this assertion moved with it.
+    //    #288 pinned `sel < keep < page`; #281's fast-path branch reads `__keep_all`
+    //    and returns before `#row_selection` is ever spliced, so the order is now
+    //    `keep < fast branch < sel < page`. What is preserved — and what this
+    //    assertion is actually for — is that the predicate is answered ONCE, ahead of
+    //    everything, rather than inside the `keep` closure. An assertion rewritten to
+    //    whatever the emitter happens to say would not be a guard.
+    //
+    //    `sel` anchors on the pushdown CALL, not on `let __sel`. That distinction is
+    //    load-bearing and was found by mutating: resolving the pushdown into an
+    //    earlier binding and merely rebinding it here (`let __sel = __sel_early;`)
+    //    leaves the binding in place, so a name-anchored assertion stays green while
+    //    the index probe has moved onto the fast path — the exact waste this ordering
+    //    exists to prevent. `views` is indexed for precisely this reason: with no
+    //    indexed field the emitted selection is the literal `None` and there is no
+    //    work whose position could be wrong.
+    let sel = f
+        .find("__rows_by_views(")
+        .expect("the index-pushdown selection expression");
+    assert_eq!(
+        f.matches("__rows_by_views(").count(),
+        1,
+        "#281: one pushdown site on the list path, so `sel` below is unambiguous: {f}"
+    );
+    let keep = f
+        .find("let __keep_all: bool =")
+        .expect("hoisted predicate binding");
+    let fast = f
+        .find("if __keep_all && qp.sort.is_none() {")
+        .expect("#281: fast-page branch");
+    let page = f.find("return db .post .__with_page(").expect("page call");
+    assert!(
+        keep < fast && fast < sel && sel < page,
+        "#288/#281: the predicate is answered first, gates the fast page, and only \
+         then does the scan path probe the index \
+         (keep={keep}, fast={fast}, sel={sel}, page={page}): {f}"
+    );
+}
+
+/// **#288 · H2 (codegen half)** — a model may legally declare a field named `limit`,
+/// and for that model `?limit=3` genuinely IS a filter.
+///
+/// This is the single case where the positive predicate and a negative
+/// exclusion-list predicate visibly differ — every other #288 scenario passes under
+/// both. `limit`/`offset`/`sort`/`order` are not lexer keywords (the keyword set is
+/// exactly `struct` and `enum`), so this schema is legal and a user can write it.
+#[test]
+fn test_api_generation_reserved_name_field_is_filterable() {
+    let src = r#"
+Gauge {
+  id: +uuid
+  limit: u32
+  offset: u32
+  sort: string
+  order: string
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    for field in ["limit", "offset", "sort", "order"] {
+        assert!(
+            f.contains(&format!("if params.contains_key(\"{field}\") {{ return false; }}")),
+            "#288: `{field}` is a declared filterable field here, so naming it in the \
+             query string must defeat the fast test: {f}"
+        );
+    }
+}
+
+/// **#288 · H5 (codegen half)** — a model with ZERO filterable fields is legal, and
+/// its predicate must not leave an unused parameter behind.
+///
+/// A pure junction whose identity is a required FK has no filterable field at all:
+/// `is_filterable_field` is `false` for every `Relation(..)` and for `json`, while
+/// the scan field set pushes the identity unconditionally. The emitted predicate is
+/// then a body-less `true`, and naming its parameter `params` would produce an
+/// `unused_variables` warning in the USER's crate — which no snapshot diff shows and
+/// no test in this repo can see, because `database.rs`'s `allow` header does not
+/// cover `api.rs`. H5's runtime half is what actually observes it; this pins the
+/// emitted spelling.
+#[test]
+fn test_api_generation_zero_filterable_model_has_no_unused_param() {
+    let src = r#"
+Doc {
+  id: +uuid
+  title: string
+}
+
+Tag {
+  id: +uuid
+  name: string
+}
+
+Link {
+  id: *Doc
+  other: *Tag
+  meta: json
+}
+"#;
+    let mut parser = forgedb_parser::Parser::new(src).unwrap();
+    let schema = parser.parse().unwrap();
+    let api = ApiGenerator::generate(&schema).unwrap().code;
+    let f = flat(&api);
+
+    assert!(
+        f.contains("fn __link_is_unfiltered(_params: &HashMap<String, String>) -> bool"),
+        "#288: a zero-filterable model names the parameter `_params`: {f}"
+    );
+    // ...and the models that DO have filterable fields still take the live one.
+    assert!(
+        f.contains("fn __doc_is_unfiltered(params: &HashMap<String, String>) -> bool"),
+        "#288: a model with filterable fields keeps the live parameter: {f}"
     );
 }

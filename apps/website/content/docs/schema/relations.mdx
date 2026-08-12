@@ -16,16 +16,20 @@ and eager-load).
 | `?Model` | optional FK | May reference one record, or none |
 | `[..]` / `[..]` | many-to-many | Two models each list the other |
 
-<Callout type="warning" title="Traversal is UUID-keyed only">
-Foreign keys are always stored as `uuid`, so relation traversal is generated only between
-**UUID-keyed** models. A model with an integer primary key can still be defined, but FK
-targets pointing at it are skipped.
+<Callout title="A foreign key follows its target's identity">
+There is no separate FK type. An FK column is **physically identical to the column the
+target's identity field itself occupies** — `author: *User` is a 16-byte uuid column when
+`User { id: +uuid }`, an 8-byte `u64` column when `User { id: +u64 }`, and a 3-byte inline
+string when `Airport { id: string(3!) }`. Every relation
+capability (forward getters, reverse getters, eager load, referential integrity,
+`@on_delete`, many-to-many) is generated for whatever key the target has.
 </Callout>
 
 ## Required foreign key — `*Model`
 
-`*Model` is a required, non-null reference. It generates a scalar FK column
-(`author: *User` → an `author_id: uuid` column) and a forward getter.
+`*Model` is a required, non-null reference. It generates a scalar FK column of the
+target's key type (`author: *User` → an `author_id` column that is a uuid, a `u64`, … —
+whatever `User`'s identity is) and a forward getter.
 
 ```forge
 Post {
@@ -40,7 +44,8 @@ rejected (HTTP 409 dangling reference).
 
 ## Optional foreign key — `?Model`
 
-`?Model` is a nullable reference — the FK column is `Option<uuid>`.
+`?Model` is a nullable reference — the FK column is the nullable form of the target's key
+(`Option<Uuid>`, `Option<u64>`, …).
 
 ```forge
 Post {
@@ -98,6 +103,13 @@ db.tag_posts(tag_id);    // -> Vec<Post>
 
 `link` / `unlink` maintain the junction; `post_tags` / `tag_posts` traverse it.
 
+Each junction column is that endpoint's own key width, so a **mixed pair** works — a
+`+u64`-keyed model may be linked to a `+uuid`-keyed one. A junction stores each endpoint's
+id in a fixed-width, hashable column, which is the same thing being an identity already
+requires. So any legal [identity](/docs/schema/models-and-fields/#the-identity-field) is a
+legal endpoint, and there is no second rule to check here. An endpoint keyed on a `*Model`
+foreign key resolves through to the terminal key type.
+
 ## Fixed-size arrays — `[type; N]`
 
 A fixed-length array of a **fixed-size** element type (a scalar or a struct). The count is
@@ -105,13 +117,14 @@ a numeric literal.
 
 ```forge
 Product {
-  scores: [u32; 10]         // exactly 10 ints
-  thumbnails: [char(255); 5] // 5 fixed-size byte arrays
+  scores: [u32; 10]            // exactly 10 ints
+  layer_digests: [bytes(32); 5] // 5 SHA-256 digests
 }
 ```
 
-Because the element must be fixed-size, `[string; N]` is invalid — use `char(N)` for
-fixed-width text inside an array.
+Because the element must be fixed-size, `[string; N]` is invalid — and `bytes(N)` is not a
+substitute, since it stores raw bytes rather than text. There is no way to put text in a
+fixed array; model a list of strings as a related model.
 
 ## Inline structs
 
@@ -119,22 +132,25 @@ A [struct](/docs/schema/overview/) is a reusable embedded value type. It is inli
 the model that references it — not stored as its own table.
 
 ```forge
-struct Address {
-  street: char(100)
-  city: char(50)
-  zip: char(10)
+struct Dimensions {
+  length_mm: u32
+  width_mm: u32
+  height_mm: u32
 }
 
-User {
+Product {
   id: +uuid
-  address: Address?     // optional embedded struct
+  name: string          // text lives on the model, not in the struct
+  packed: Dimensions?   // optional embedded struct
 }
 ```
 
-<Callout type="warning" title="Structs are fixed-size only">
+<Callout type="warning" title="Structs are fixed-size only — which rules out text">
 A struct may contain **only fixed-size** fields. `string`, relations, and nested
-variable-length types are rejected inside a struct — use `char(N)` for text. Reference a
-struct required (`address: Address`) or optional (`address: Address?`).
+variable-length types are rejected inside a struct, and `bytes(N)` is not a workaround —
+it stores raw bytes, not text. So there is no way to embed an address, a name, or any free
+text in a struct; put it on the model, or on a related model. Reference a struct required
+(`packed: Dimensions`) or optional (`packed: Dimensions?`).
 </Callout>
 
 ## Generated traversal

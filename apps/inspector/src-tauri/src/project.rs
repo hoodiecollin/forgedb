@@ -61,15 +61,15 @@ pub struct StructDto {
 pub struct FieldDto {
     pub name: String,
     /// Normalized type discriminant: one of `u32 u64 i32 i64 f64 bool string uuid
-    /// timestamp char fixed_array struct required_ref optional_ref one_to_many
+    /// timestamp bytes fixed_array struct required_ref optional_ref one_to_many
     /// many_to_many component`.
     pub kind: String,
     pub auto: bool,
     pub unique: bool,
     pub indexed: bool,
     pub nullable: bool,
-    /// `char(N)` length.
-    pub char_len: Option<usize>,
+    /// `bytes(N)` length.
+    pub bytes_len: Option<usize>,
     /// `[T; N]` fixed-array length.
     pub array_len: Option<usize>,
     pub fulltext: bool,
@@ -232,7 +232,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         other => (other, false),
     };
 
-    let mut char_len = None;
+    let mut bytes_len = None;
     let mut array_len = None;
     let mut rel_target = None;
     let mut struct_name = None;
@@ -245,14 +245,17 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         FieldType::I64 => "i64",
         FieldType::F64 => "f64",
         FieldType::Bool => "bool",
-        FieldType::String => "string",
+        // #238: an inline `string(N)` reports as a string — the inspector shows
+        // logical shape, and the fixed slot is a storage fact the manifest
+        // already carries as a `FixedBytes(width)` column.
+        FieldType::String | FieldType::StringN { .. } => "string",
         FieldType::Json => "json",
         FieldType::Decimal => "decimal",
         FieldType::Uuid => "uuid",
-        FieldType::Timestamp => "timestamp",
-        FieldType::Char(n) => {
-            char_len = Some(*n);
-            "char"
+        FieldType::Timestamp(_) => "timestamp",
+        FieldType::Bytes(n) => {
+            bytes_len = Some(*n);
+            "bytes"
         }
         FieldType::FixedArray(_, n) => {
             array_len = Some(*n);
@@ -303,7 +306,7 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
         unique: f.unique,
         indexed: f.indexed,
         nullable,
-        char_len,
+        bytes_len,
         array_len,
         fulltext: f.fulltext_indexed,
         computed: f.is_computed,
@@ -314,16 +317,30 @@ fn field_dto(f: &AstField, owner: &str, m2m_fields: &HashSet<(String, String)>) 
     }
 }
 
+/// Render one directive argument for display, in the spelling it was written in —
+/// a named argument reads `min: 3`, not a bare `3` (#235), so the inspector shows
+/// the same thing the schema says.
+fn render_param(p: &ConstraintParam) -> String {
+    match p {
+        ConstraintParam::Number(n) => n.to_string(),
+        // The verbatim lexeme (#239), so `@min(0.10)` displays as written rather
+        // than re-rendered from a float as `0.1`.
+        ConstraintParam::Fractional(s) => s.clone(),
+        ConstraintParam::String(s) => s.clone(),
+        ConstraintParam::Named { name, value } => format!("{name}: {}", render_param(value)),
+        ConstraintParam::Exclusive { greater, value } => {
+            format!("{}{}", if *greater { '>' } else { '<' }, render_param(value))
+        }
+    }
+}
+
 fn directive_dto(c: &Constraint) -> DirectiveDto {
     DirectiveDto {
         name: c.name.clone(),
         params: c
             .params
             .iter()
-            .map(|p| match p {
-                ConstraintParam::Number(n) => n.to_string(),
-                ConstraintParam::String(s) => s.clone(),
-            })
+            .map(|p| render_param(p))
             .collect(),
     }
 }
@@ -356,7 +373,7 @@ mod tests {
                 age: i32? @min(0) @max(120)
                 org: *Org
                 bio: string? @length(0, 280)
-                login_code: char(8)
+                login_code: bytes(8)
             }
             "#,
         );
@@ -385,8 +402,8 @@ mod tests {
         assert_eq!(org.rel_target.as_deref(), Some("Org"));
 
         let code = user.fields.iter().find(|f| f.name == "login_code").unwrap();
-        assert_eq!(code.kind, "char");
-        assert_eq!(code.char_len, Some(8));
+        assert_eq!(code.kind, "bytes");
+        assert_eq!(code.bytes_len, Some(8));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

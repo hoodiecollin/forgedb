@@ -18,11 +18,13 @@ inline structs) see [relations](/docs/schema/relations/); for closed value sets 
 | `f64` | `f64` | `number` | fixed 8-byte column | ✅ (filter/sort; ordered index deferred) |
 | `bool` | `bool` | `boolean` | fixed 1-byte column | ✅ |
 | `string` | `String` | `string` | variable-length column | ✅ |
+| `string(N)` | `String` | `string` | fixed N-character slot in the row | ✅ |
+| `string(N!)` | `String` | `string` | fixed N-character slot, exact length | ✅ |
 | `json` | `serde_json::Value` | `unknown` | variable-length column (serialized JSON) | ❌ |
 | `decimal` | `rust_decimal::Decimal` | `string` | fixed 16-byte column | ✅ |
 | `uuid` | `uuid::Uuid` | `string` | fixed 16-byte column | ✅ |
-| `timestamp` | `i64` | `number` | fixed 8-byte column | ✅ |
-| `char(N)` | `[u8; N]` | `string` | fixed N-byte column | ✅ |
+| `timestamp`, `timestamp(s\|ms\|us)` | `Timestamp` | `string` (RFC 3339) | fixed 8-byte column | ✅ |
+| `bytes(N)` | `[u8; N]` | `any` | fixed N-byte column | ✅ |
 
 <Callout type="warning" title="There is no `text` type">
 Older docs mention a `text` type. It does **not** exist — use `string` for all
@@ -44,21 +46,191 @@ Variable-length UTF-8 text, stored on the variable-length column. Indexable, fil
 and sortable. A hash index on a string is **exact-match only** (see
 [indexes](/docs/schema/indexes-and-projections/)).
 
-## `char(N)`
+## `string(N)` — fixed-width inline strings
+
+A bare `string` stores a 16-byte `(offset, length)` pair in the row and keeps the bytes
+elsewhere, so every read costs a second lookup and a copy. `string(N)` instead reserves a
+**fixed slot in the row itself**, and the value is read by slicing the row's own bytes — no
+second lookup, and on the list/filter path no allocation at all.
+
+```forge
+Account {
+  id:       +uuid
+  code:     &string(12)      // at most 12 characters, unique
+  currency: ^string(3!)      // exactly 3 — an ISO 4217 code
+  label:    string(24)?      // nullable
+  bio:      string           // still variable-length; nothing changed here
+}
+```
+
+`N` counts **characters**, not bytes — the same unit `@length` uses — and must be between
+1 and 255. Bare `string(N)` is a maximum; the `!` suffix makes it an exact length. Both are
+enforced on every insert and update (violation → `422`), not only when the schema is
+validated.
+
+On every wire it is an ordinary string: `String` in Rust, `string` in TypeScript, a JSON
+string, and `{"type": "string", "maxLength": N}` in OpenAPI. A client cannot tell the two
+spellings apart. It is filterable, sortable, and indexable exactly like `string`.
+
+<Callout type="warning" title="Inline strings are ASCII unless you opt in">
+One byte per character is what keeps the slot small enough to be worth having, so a
+non-ASCII character is rejected with a `422`. Add [`@utf8`](/docs/schema/directives/) to
+widen the reservation to four bytes per character. `@utf8` on a bare `string` — or on
+anything that is not an inline string — is a schema error, because there is nothing there
+to widen.
+</Callout>
+
+The width in the type is already the length bound, so the length **directives do not
+apply**: `@max`, `@length(max: n)`, `@length(n)`, and the max component of `@length(a, b)`
+are schema errors on `string(N)` — declare the width you mean instead. `@min` and
+`@length(min: n)` still work, since a floor is something the type does not say. On the
+exact form `string(N!)` the length is fully determined, so every length directive is an
+error. A bare `string` keeps all of them.
+
+<Callout type="note" title="Wide slots stop paying for themselves">
+Above 64 characters the parser warns and still generates. A [measured
+experiment](https://github.com/hoodiecollin/forgedb/issues/261) compared a fixed slot
+against pointer storage across 200 configurations: the slot wins while it is small and
+loses once it is wide. Past that point prefer `string`, unless the value has to be a
+fixed-width key.
+</Callout>
+
+One thing it cannot do. It cannot live inside an [inline
+struct](/docs/schema/relations/#inline-structs) or a fixed array — those store their fields
+as the Rust value's bytes, and the Rust value here is a heap `String`, so embedding one
+would persist a pointer; use `bytes(N)` there.
+
+### `string(N)` as an identity
+
+Both spellings are legal identities, so a model can key on the identifier it already has
+rather than carrying a `uuid` beside it:
+
+```forge
+Airport {
+  id:   string(3!)          // exactly 3 — an IATA code
+  city: string
+}
+```
+
+A key is the one place an inline string stops being a `String`. In a key position — the
+identity, a foreign key that resolves to one, a many-to-many junction endpoint — the Rust
+type is `forgedb_types::InlineStr<N>`: a `Copy`, fixed-capacity string, so it sits in the
+row index and in a junction map the way every other key type does. On the wire nothing
+changes: it is still a JSON string, still `string` in TypeScript. An ordinary `string(N)`
+**column** is untouched and stays a `String`.
+
+<Callout type="warning" title="A key has to survive a URL">
+A key's value is checked on every write (violation → `422`) against RFC 3986 `pchar`
+**minus** `%` — `A-Z a-z 0-9 - . _ ~ ! $ & ' ( ) * + , ; = : @` — and must be non-empty.
+Excluding `%` buys the strong version of the property: the path segment is byte-identical
+to the key, so `GET /airports/SFO` is literally the row's address, with no escaping in
+between. `:` and `@` are `pchar` without being *unreserved*, which is what makes
+`urn:isbn:0451450523` and `user@example.com` usable as keys.
+</Callout>
+
+A bare `string` identity is refused — a key has to be fixed-width to be `Copy`, so the
+width belongs in the type. It is one row of the
+[identity type list](/docs/schema/models-and-fields/#the-identity-field), and it keeps its
+own message: declare a width, rather than pick a different type.
+[`@utf8`](/docs/schema/directives/) on an identity is a schema error too: the alphabet
+above is a strict subset of ASCII, so widening the slot would reserve four bytes per
+character to hold characters the write path rejects.
+
+A string-keyed model is an ordinary [relation](/docs/schema/relations/) target — foreign
+keys, `@on_delete` in all three modes, traversal, eager loading, and many-to-many all work
+as they do for a `uuid`-keyed model. Do watch the width: the identity map holds
+`InlineStr<N>` per row in memory, and every foreign key pointing at the model carries the
+same `N` bytes on every child row, so a wide key costs more than a wide column does.
+
+## `bytes(N)`
 
 A fixed-size byte array of exactly `N` bytes (`[u8; N]` in Rust). Being fixed-width, it can
 live inside a [struct](/docs/schema/relations/#inline-structs) — where `string` cannot.
-Requires the parenthesized size: `code: char(8)`.
+Requires the parenthesized size: `digest: bytes(32)`.
+
+<Callout type="warning" title="`bytes(N)` is not a string type">
+It holds raw bytes: no UTF-8 guarantee, no length tracking, no text semantics. On the wire
+it is a JSON **array of integers**, so `"USD"` in a `bytes(3)` arrives as `[85, 83, 68]`.
+Reach for it only for genuinely binary fixed-width data — a git object id, a digest, a
+fixed-width protocol field. For text of any kind, including short fixed-length codes like
+ISO currency or IATA airport codes, use [`string(N!)`](#stringn--fixed-width-inline-strings) —
+text on the wire, length-checked on every write, and still stored in a fixed slot.
+</Callout>
+
+`bytes` is a *contextual* keyword rather than a reserved word: it only means the type in
+type position followed by `(`, so a field may still be named `bytes`.
+
+### `char(N)` is deprecated
+
+`char(N)` is the old spelling of this type. It still parses and produces byte-identical
+code, but emits a deprecation warning — `forgedb validate` and `forgedb generate` both
+report it and still exit `0` — and it is removed at the next major version. The name was a
+false friend: SQL's `CHAR(N)` is fixed-length *text*, while this type has never been
+anything but bytes.
 
 ## `uuid`
 
-A universally unique identifier, stored on a fixed 16-byte column. Foreign-key columns are
-always `uuid`, which is why relation traversal is only generated between UUID-keyed models.
+A universally unique identifier, stored on a fixed 16-byte column. It is the conventional
+identity type (`id: +uuid`), but not a requirement: a foreign key takes whatever type its
+target's identity is, so an integer-keyed model gets the full relation surface too.
 
 ## `timestamp`
 
-A Unix timestamp stored as an `i64`. Auto-generatable with `+` (fills the current time on
-insert).
+An **instant** — not a wall-clock time and not a date. There is no timezone, and `Z` is the
+only offset ever emitted.
+
+```forge
+Trade {
+  id:         +timestamp(us)   // an allocated key, microsecond-precise
+  filled_at:  timestamp(ms)
+  settled_on: timestamp(s)
+  created_at: +timestamp       // a stamp — bare, so milliseconds
+}
+```
+
+Storage is **always microseconds**, on a fixed 8-byte column. The declared key does not
+change what is on disk — it is the **quantum**: a value you supply is *floored* to it on
+write, and an allocated `+timestamp` identity advances by one unit of it. A bare `timestamp`
+is `timestamp(ms)`.
+
+`ns` is not offerable: microseconds is the storage unit, and `i64` nanoseconds would cap the
+type at 1678–2262.
+
+### The wire form is RFC 3339
+
+```json
+{ "created_at": "2026-03-31T23:33:20.123456Z" }
+```
+
+Six fractional digits, always `Z`. That is the form in JSON bodies, the TypeScript SDK
+(`string`), the OpenAPI document (`{"type":"string","format":"date-time"}`), the Rust /
+Python / Go REST clients, and the REST filter parameters — every surface that goes through
+serde. It is **not** the index key, which stays the stored number so a timestamp index keeps
+numeric order rather than lexicographic order.
+
+<Callout type="warning" title="An instant RFC 3339 cannot name is a 422">
+`i64` microseconds reaches ±292 000 years, but RFC 3339 names only years `0000`–`9999`. A
+value outside that window is *storable* and not *serializable* — a row that could be written
+and would then fail on every read — so the write path refuses it instead.
+</Callout>
+
+### `+timestamp` as an identity
+
+An auto-generate timestamp is a legal primary key, with two rules:
+
+1. **It must be named `id`.** Under any other name a `+timestamp` is a stamp — `created_at`,
+   `seen_at` — and inferring a primary key from one would silently mis-key the model.
+2. **It must be declared `us`.** `id: +timestamp` and `id: +timestamp(ms)` are rejected.
+
+Rule 2 exists because **precision does not make a key unique — monotonic allocation does.**
+The allocator is `next = max(now, last + 1)`, so a burst of inserts inside one clock tick
+still yields distinct, strictly increasing keys — but it does so by running the counter
+*ahead* of the wall clock, and recovery time is proportional to the declared unit. A
+million-row import lands rows about 17 minutes in the future at `ms`, and one second ahead at
+`us`.
+
+A timestamp key survives a URL path segment by construction: RFC 3339 contains no reserved
+URL character.
 
 ## `json`
 

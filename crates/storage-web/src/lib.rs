@@ -225,6 +225,7 @@ mod tests {
         store::clear();
         let m = Manifest {
             schema_version: 1,
+            engine_version: 1,
             row_count: 3,
             columns: vec![ColumnMetadata {
                 name: "id".into(),
@@ -237,11 +238,11 @@ mod tests {
             wal_enabled: false,
             last_checkpoint: 0,
             compaction_epoch: 0,
-            format_version: 1,
             row_anchor: Some(RowAnchor {
                 relative_path: "tombstones.bin".into(),
                 bytes_per_row: 1,
             }),
+            auto_sequences: Default::default(),
         };
         m.save_to(&p("m/manifest.json")).unwrap();
         let back = Manifest::load_from(&p("m/manifest.json")).unwrap();

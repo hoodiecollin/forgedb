@@ -57,6 +57,7 @@ fn build_model_dir(root: &Path, committed: usize, uncommitted_extra: usize) {
 
     let manifest = Manifest {
         schema_version: 1,
+        engine_version: 1,
         row_count: committed,
         columns: vec![
             ColumnMetadata {
@@ -79,11 +80,11 @@ fn build_model_dir(root: &Path, committed: usize, uncommitted_extra: usize) {
         wal_enabled: false,
         last_checkpoint: 0,
         compaction_epoch: 3,
-        format_version: 1,
         row_anchor: Some(RowAnchor {
             relative_path: "tombstones.bin".into(),
             bytes_per_row: 1,
         }),
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&dir.join("manifest.json")).unwrap();
 }
@@ -165,6 +166,7 @@ fn grow_model_dir(root: &Path, committed: usize, epoch: u64) {
 
     let manifest = Manifest {
         schema_version: 1,
+        engine_version: 1,
         row_count: committed,
         columns: vec![
             ColumnMetadata {
@@ -187,11 +189,11 @@ fn grow_model_dir(root: &Path, committed: usize, epoch: u64) {
         wal_enabled: false,
         last_checkpoint: 0,
         compaction_epoch: epoch,
-        format_version: 1,
         row_anchor: Some(RowAnchor {
             relative_path: "tombstones.bin".into(),
             bytes_per_row: 1,
         }),
+        auto_sequences: Default::default(),
     };
     manifest.save_to(&dir.join("manifest.json")).unwrap();
 }

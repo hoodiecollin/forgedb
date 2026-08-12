@@ -277,6 +277,15 @@ pub struct WorkloadConfig {
     /// amplification separates "reads too many rows" from "reads too many bytes" —
     /// a distinction that simply does not exist for fixed-width columns, where
     /// `value_size` is pinned by the type.
+    ///
+    /// Set but never read, in **both** builds: the `Doc` targets take their payload
+    /// width through `ForgeDocTarget::new(payload)` rather than off the config, so
+    /// nothing consumes this field and nothing prints it. Pre-existing (since #218);
+    /// surfaced here only because the workload example did not compile at all until
+    /// #279 repaired its `Timestamp` / scan-scope call sites. Kept rather than
+    /// deleted because it documents an axis of the sweep the driver is built around —
+    /// wiring the targets to read it is a driver change, not a build fix.
+    #[allow(dead_code)]
     pub payload_bytes: usize,
 }
 

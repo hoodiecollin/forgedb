@@ -257,7 +257,7 @@ fn test_migration_lineage_expands_range() {
 
     // Empty lineage → baseline version 1, next span 1→2.
     let empty = MigrationLineage::load(&dir).unwrap();
-    assert_eq!(empty.current_format_version(), BASELINE_FORMAT_VERSION);
+    assert_eq!(empty.current_schema_version(), BASELINE_SCHEMA_VERSION);
     assert_eq!(empty.next_version_span(), (1, 2));
 
     // Record three contiguous hops: v1→2, v2→3, v3→4.
@@ -280,7 +280,7 @@ fn test_migration_lineage_expands_range() {
 
     let lineage = MigrationLineage::load(&dir).unwrap();
     // Current version is the highest to_version; next span continues the chain.
-    assert_eq!(lineage.current_format_version(), 4);
+    assert_eq!(lineage.current_schema_version(), 4);
     assert_eq!(lineage.next_version_span(), (4, 5));
 
     // Full range expands to all three hops in version order.

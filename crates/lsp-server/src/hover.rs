@@ -114,12 +114,13 @@ fn get_type_info(type_name: &str) -> Option<String> {
         "u64" => "**u64** — Unsigned 64-bit integer\n\nRange: 0 to 18,446,744,073,709,551,615. Auto-incrementable with `+`.",
         "i32" => "**i32** — Signed 32-bit integer\n\nRange: -2,147,483,648 to 2,147,483,647.",
         "i64" => "**i64** — Signed 64-bit integer\n\nRange: -9.2e18 to 9.2e18.",
-        "f64" => "**f64** — 64-bit floating point\n\nDouble-precision IEEE 754. Not indexable.",
+        "f64" => "**f64** — 64-bit floating point\n\nDouble-precision IEEE 754. Indexable/filterable/sortable: the index key is a total-order encoding, so `-Inf`, `+Inf` and `NaN` are each distinct (and `NaN` sorts last), and `-0.0` shares a bucket with `0.0`. For exact money/quantity use `decimal` — binary floats do not represent `0.1`.",
         "decimal" => "**decimal** — Exact fixed-point decimal\n\n`rust_decimal::Decimal` in a fixed 16-byte column, serialized as a string. Indexable/sortable (scale-invariant key). Money/quantity.",
         "json" => "**json** — Arbitrary JSON value\n\n`serde_json::Value`, stored in a variable-length column. NOT indexable/filterable/sortable (no total order).",
         "uuid" => "**uuid** — UUID v4\n\n128-bit identifier (16-byte column). Auto-generatable with `+`.",
         "timestamp" => "**timestamp** — Unix timestamp\n\nStored as i64 (seconds since epoch). Auto-generatable with `+`.",
-        "char" => "**char(n)** — Fixed-length string\n\nExactly n bytes in a fixed column. Example: `char(100)`.",
+        "bytes" => "**bytes(n)** — Fixed-size byte array\n\nExactly n raw bytes in a fixed column (`[u8; n]`), serialized as a JSON array of integers. No UTF-8 guarantee and no text semantics — for text use `string`. Example: `bytes(20)` for a git object id.",
+        "char" => "**char(n)** — ⚠️ Deprecated spelling of `bytes(n)`\n\nUse `bytes(n)` instead. Identical storage and generated code; the name was a false friend, since SQL's `CHAR(N)` is fixed-length *text* while this type stores raw bytes. If the field holds text, use `string`.",
         _ => return None,
     };
     Some(s.to_string())
@@ -129,10 +130,10 @@ fn get_directive_info(directive_name: &str) -> Option<String> {
     let s = match directive_name {
         "email" => "**@email** — Email validation\n\n```\nemail: &string @email\n```",
         "url" => "**@url** — URL validation\n\n```\nwebsite: string? @url\n```",
-        "min" => "**@min(value)** — Minimum value or length\n\n```\nage: u32 @min(0)\n```",
-        "max" => "**@max(value)** — Maximum value or length\n\n```\nage: u32 @max(150)\n```",
+        "min" => "**@min(n)** — Minimum numeric value (ENFORCED)\n\nRejects smaller values at runtime (422). Applies to `u32`/`u64`/`i32`/`i64`/`f64`/`decimal` — *not* a string length, use `@length`.\n\n- `@min(n)` — at least n (inclusive)\n- `@min(>n)` — strictly greater than n (`f64`/`decimal` only)\n\nBounds may be negative and fractional. Each field type compares in its own domain, so a `decimal` bound stays exact.\n\n```\nage: u32 @min(13)\nprice: decimal @min(0.01)\nrate: f64 @min(>0)\n```",
+        "max" => "**@max(n)** — Maximum numeric value (ENFORCED)\n\nRejects larger values at runtime (422). Applies to `u32`/`u64`/`i32`/`i64`/`f64`/`decimal` — *not* a string length, use `@length`.\n\n- `@max(n)` — at most n (inclusive)\n- `@max(<n)` — strictly less than n (`f64`/`decimal` only)\n\nBounds may be negative and fractional. Each field type compares in its own domain, so a `decimal` bound stays exact.\n\n```\nage: u32 @max(150)\nprice: decimal @max(99999.99)\nrate: f64 @max(<1)\n```",
         "pattern" | "regex" => "**@pattern(\"…\")** — Regex validation (ENFORCED)\n\nRejects non-matching values at runtime (422). `@regex` is an alias.\n\n```\nphone: string @pattern(\"^\\\\+?[1-9]\\\\d{1,14}$\")\n```",
-        "length" => "**@length(n)** — String length\n\n```\nzipcode: string @length(5)\n```",
+        "length" => "**@length(…)** — String length in characters (ENFORCED)\n\nRejects out-of-range values at runtime (422).\n\n- `@length(min: n)` — at least n\n- `@length(max: n)` — at most n\n- `@length(min: a, max: b)` / `@length(a, b)` — between a and b\n- `@length(n)` — **exactly** n\n\n```\nslug: string @length(min: 3, max: 64)\nzipcode: string @length(5)\n```",
         "index" => "**@index(a, b, …)** — Composite index (model level)\n\n```\n@index(user, created_at)\n```",
         "on_delete" => "**@on_delete(action)** — Foreign-key on-delete behavior (ENFORCED)\n\n- `restrict` (default) — refuse deleting a referenced parent (409)\n- `cascade` — recursively delete children\n- `set_null` — null the FK (optional FKs only)\n\n```\nauthor: *User @on_delete(cascade)\n```",
         "fulltext" => "**@fulltext** — Full-text marker (semantic-only)\n\nRecorded on the field; no full-text engine is generated today.",
@@ -172,9 +173,14 @@ fn format_field_type(field_type: &FieldType) -> String {
         FieldType::Decimal => "decimal".to_string(),
         FieldType::Json => "json".to_string(),
         FieldType::Uuid => "uuid".to_string(),
-        FieldType::Timestamp => "timestamp".to_string(),
+        FieldType::Timestamp(_) => "timestamp".to_string(),
         FieldType::Enum(name) => name.clone(),
-        FieldType::Char(n) => format!("char({n})"),
+        FieldType::Bytes(n) => format!("bytes({n})"),
+        // #238: render the declaration back verbatim, `!` and all — the width and
+        // its exactness are the whole point of hovering an inline string.
+        FieldType::StringN { chars, exact } => {
+            format!("string({chars}{})", if *exact { "!" } else { "" })
+        }
         FieldType::FixedArray(inner, size) => format!("[{}; {}]", format_field_type(inner), size),
         FieldType::StructType(name) => name.clone(),
         FieldType::OptionalStructType(name) => format!("{name}?"),

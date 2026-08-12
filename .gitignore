@@ -26,6 +26,8 @@ generated_*/
 # The VS Code extension is a real tracked app — carve its manifest back in.
 !apps/vscode-forgedb/package.json
 !apps/vscode-forgedb/**/package.json
+# Root-level repo tooling (CI gates, maintenance tasks) is tracked too.
+!scripts/package.json
 # Inspector build artifacts (Next static export + Tauri target + codegen)
 apps/inspector/.next/
 apps/inspector/out/

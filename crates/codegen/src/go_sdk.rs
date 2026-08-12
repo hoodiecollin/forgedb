@@ -75,9 +75,9 @@ impl GoSdkGenerator {
 
         // Models + create-input + projection structs.
         for model in &schema.models {
-            Self::push_model_struct(&mut c, model);
-            Self::push_create_struct(&mut c, model);
-            Self::push_projection_structs(&mut c, model);
+            Self::push_model_struct(schema, &mut c, model);
+            Self::push_create_struct(schema, &mut c, model);
+            Self::push_projection_structs(schema, &mut c, model);
         }
 
         c.push_str(SHARED_TYPES);
@@ -85,19 +85,19 @@ impl GoSdkGenerator {
         c
     }
 
-    fn push_model_struct(c: &mut String, model: &Model) {
+    fn push_model_struct(schema: &Schema, c: &mut String, model: &Model) {
         c.push_str(&format!(
             "// {name} mirrors the wire shape of the generated model.\n\
              type {name} struct {{\n",
             name = model.name
         ));
         for field in &model.fields {
-            c.push_str(&Self::struct_field(field));
+            c.push_str(&Self::struct_field(schema, field));
         }
         c.push_str("}\n\n");
     }
 
-    fn push_create_struct(c: &mut String, model: &Model) {
+    fn push_create_struct(schema: &Schema, c: &mut String, model: &Model) {
         c.push_str(&format!(
             "// {name}Create is the input to CreateX — a {name} without the fields the\n\
              // server synthesizes (+uuid/+timestamp autos).\n\
@@ -105,12 +105,12 @@ impl GoSdkGenerator {
             name = model.name
         ));
         for field in RustGenerator::creatable_fields(model) {
-            c.push_str(&Self::struct_field(field));
+            c.push_str(&Self::struct_field(schema, field));
         }
         c.push_str("}\n\n");
     }
 
-    fn push_projection_structs(c: &mut String, model: &Model) {
+    fn push_projection_structs(schema: &Schema, c: &mut String, model: &Model) {
         for proj in &model.projections {
             let ty = format!(
                 "{}{}",
@@ -124,18 +124,18 @@ impl GoSdkGenerator {
                 model = model.name
             ));
             for field in RustGenerator::projected_field_set(model, proj) {
-                c.push_str(&Self::struct_field(field));
+                c.push_str(&Self::struct_field(schema, field));
             }
             c.push_str("}\n\n");
         }
     }
 
     /// One Go struct field line: `Exported Type `json:"snake_name"``.
-    fn struct_field(field: &Field) -> String {
+    fn struct_field(schema: &Schema, field: &Field) -> String {
         format!(
             "\t{} {} `json:\"{}\"`\n",
             pascal(&field.name),
-            Self::go_type(field),
+            Self::go_type(schema, field),
             field.name
         )
     }
@@ -271,8 +271,8 @@ impl GoSdkGenerator {
     /// `char(N)`, fixed arrays, inline structs, and virtual one-to-many / M2M
     /// relations, which the server serializes as `null`) maps to
     /// `json.RawMessage` — the honest analogue of the TS SDK's `unknown`/`any`.
-    fn go_type(field: &Field) -> String {
-        let (opaque, base) = Self::base_type(&field.field_type);
+    fn go_type(schema: &Schema, field: &Field) -> String {
+        let (opaque, base) = Self::base_type(schema, &field.field_type);
         if opaque {
             // json.RawMessage already carries `null`, so no pointer wrapper.
             "json.RawMessage".to_string()
@@ -283,21 +283,27 @@ impl GoSdkGenerator {
         }
     }
 
-    fn base_type(ft: &FieldType) -> (bool, String) {
+    fn base_type(schema: &Schema, ft: &FieldType) -> (bool, String) {
         match ft {
             FieldType::U32 => (false, "uint32".into()),
             FieldType::U64 => (false, "uint64".into()),
             FieldType::I32 => (false, "int32".into()),
             FieldType::I64 => (false, "int64".into()),
             FieldType::F64 => (false, "float64".into()),
-            FieldType::Timestamp => (false, "int64".into()),
+            // #254: RFC 3339 string on the wire.
+            FieldType::Timestamp(_) => (false, "string".into()),
             FieldType::Bool => (false, "bool".into()),
-            FieldType::String | FieldType::Uuid => (false, "string".into()),
+            // #238: an inline `string(N)` is a string on the wire.
+            FieldType::String | FieldType::StringN { .. } | FieldType::Uuid => {
+                (false, "string".into())
+            }
             FieldType::Decimal => (false, "string".into()),
             FieldType::Enum(name) => (false, name.clone()),
-            FieldType::Relation(RelationType::RequiredReference(_))
-            | FieldType::Relation(RelationType::OptionalReference(_)) => (false, "string".into()),
-            FieldType::Nullable(inner) => Self::base_type(inner),
+            // #266: an FK carries the target's identity value on the wire.
+            FieldType::Relation(
+                RelationType::RequiredReference(_) | RelationType::OptionalReference(_),
+            ) => Self::base_type(schema, &RustGenerator::resolved_type(schema, ft)),
+            FieldType::Nullable(inner) => Self::base_type(schema, inner),
             _ => (true, "json.RawMessage".into()),
         }
     }

@@ -1,0 +1,69 @@
+# Cycle-scope gate — "does this PR belong in the release cycle currently in flight?"
+#
+# ForgeDB holds the publish gap off `main` with a single integration branch (CLAUDE.md → the
+# branch model). There is exactly ONE `develop` and its name never contains a version, which is
+# deliberate: a `v0.5-develop` alongside a `v0.4-develop` would encode the schedule a second time,
+# competing with the milestone that already carries it — and the publish gap is defined against a
+# single crates.io version line, so two cycle branches carrying unpublished substrate changes
+# cannot both be measured.
+#
+# So the thing that keeps next-cycle work off `develop` is not the branch name. It is this:
+#
+#   A PR targeting `develop` may not close an issue milestoned later than the cycle in flight.
+#
+# A DENY-LIST on future milestones, not an allow-list on the current one. That shape is why it
+# needs no escape hatches: a chore, a CI fix, or a typo PR closes no issue and passes silently,
+# and correctly so — work with no issue cannot be next-cycle work, because next-cycle work is
+# *defined* by carrying that milestone.
+#
+# The cycle in flight is DERIVED (lowest open `v*` milestone), never configured here. Nothing to
+# update when a release ships, and it advances on its own: when v0.4.0's milestone closes, v0.5.0
+# becomes the cycle and v0.5 PRs start passing the same instant `develop` legitimately becomes
+# v0.5's cycle. That is also its one prerequisite — CLOSING THE MILESTONE IS PART OF THE RELEASE
+# RITUAL. A milestone left open after its tag freezes this gate and starts blocking legitimate
+# next-cycle work; it fails loudly rather than silently, which is the right direction.
+#
+# Portable form: ai-pm-playbook PLAYBOOK §5.3, rules PM008/PM009. Once that package is published
+# this job should collapse to `npx ai-pm-playbook scope-check ${{ ... }}`; until then
+# scripts/check-cycle-scope.ts is the local transcription and the playbook stays canonical.
+#
+# NOTE ON REACH: most work here merges locally under the branch-per-scope auto-merge rhythm, so
+# this PR-triggered job will not see it. `make cycle-scope ISSUE=<n>` is the same check for that
+# path — run it before merging a branch into `develop`.
+name: Cycle scope
+
+on:
+  pull_request:
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to check
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  scope:
+    name: PR closes only current-cycle work
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The gate script itself runs with no install step — the deps are types only. Typecheck it
+      # here so a break in the gate surfaces as a gate failure rather than as a silent pass.
+      - name: Typecheck repo tooling
+        run: make scripts-typecheck
+
+      - name: Cycle-scope gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: bun scripts/check-cycle-scope.ts --pr "$PR"

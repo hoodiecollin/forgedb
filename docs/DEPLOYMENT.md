@@ -26,6 +26,60 @@ stop or `Ctrl-C` never severs a connection mid-write.
 | `FORGEDB_TENANT` | *(unset)* | tenant this process serves → opens `<FORGEDB_DATA>/<tenant>` |
 | `RUST_LOG` | `info` | log level filter (`tracing-subscriber` env-filter) |
 | `FORGEDB_LOG_FORMAT` | *(text)* | set `json` for machine-parseable log lines |
+| `FORGEDB_CORS_ORIGINS` | *(unset)* | comma-separated origins allowed to call this API cross-origin |
+
+## Cross-origin access (CORS)
+
+**Set `FORGEDB_CORS_ORIGINS` whenever the browser page and the API are not on the
+same origin.** The generated TypeScript SDK is `fetch`-based against a `baseUrl` you
+supply, which is exactly that deployment shape — and without CORS response headers
+the browser blocks the call and reports it as an opaque console error, with nothing
+on the server side to explain why.
+
+```bash
+FORGEDB_CORS_ORIGINS=https://app.example,https://staging.app.example
+FORGEDB_CORS_ORIGINS='*'      # a deliberately public API
+```
+
+Unset is closed: **no CORS layer is applied at all**, which is not the same as an
+empty one — an empty layer would answer preflight `OPTIONS` with 200, whereas these
+routes answer 405. That distinction is why the default is byte-identical to a server
+built before this knob existed.
+
+What it allows when set: methods `GET`, `POST`, `PUT`, `DELETE` (the generated router
+registers no `PATCH` route), and the request headers `content-type` and
+`authorization`. **Credentials mode is deliberately off** — ForgeDB auth is a bearer
+token in a header, not a cookie, so nothing is auto-attached by the browser and `*`
+creates no CSRF vector here. If you put cookie-based auth in front of the API, revisit
+this.
+
+The layer is applied **outside** the JWT guard, so a browser preflight — which carries
+no `Authorization` header — is answered rather than rejected 401, and error responses
+(401/403/422) still carry the CORS headers the page needs in order to read the status.
+
+An unparseable value **refuses to start**, rather than serving with CORS silently
+shut: the failure would otherwise surface to a developer as "the browser is blocking
+me" with no server-side signal. `*` combined with explicit origins is rejected for the
+same reason — it has two defensible readings.
+
+### WebSocket routes use the same list, but the default differs
+
+Browsers neither preflight a WebSocket handshake nor apply CORS to one, so
+`/subscribe/<model>`, `/live-query/<model>` and `/replicate` check the `Origin` header
+themselves — against the **same** `FORGEDB_CORS_ORIGINS` list.
+
+Note the deliberate asymmetry with unset config: HTTP is effectively closed
+cross-origin because the *browser* blocks it, while a WebSocket handshake is **open**
+because nothing enforces it. Tightening the WS default to closed would break existing
+deployments, so it stays open until you set the variable.
+
+When the list *is* set, a handshake carrying a disallowed `Origin` is refused **403
+before the upgrade**. A handshake carrying **no** `Origin` is accepted: native
+`/replicate` followers, CLI tools and tests send none, and rejecting them buys nothing
+— an attacker who controls the client controls the header. Origin checking defends the
+browser threat model, where the browser sets the header and the page cannot forge it.
+It is not a substitute for the JWT guard, which proves *who* is calling rather than
+*which page* is calling — a token-bearing page on a hostile origin passes auth.
 
 **JWT tenant guard** (verify-only — ForgeDB verifies tokens your IdP issues, it
 never issues them). Enabled when `FORGEDB_JWT_PUBKEY` is set:

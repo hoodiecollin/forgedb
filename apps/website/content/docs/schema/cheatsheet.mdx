@@ -13,19 +13,32 @@ A compact lookup for the whole `.forge` language. Follow the links for the full 
 | `f64` | `f64` | `number` | filter/sort (no ordered index) |
 | `bool` | `bool` | `boolean` | ✅ |
 | `string` | `String` | `string` | ✅ (exact-match) |
-| `char(N)` | `[u8; N]` | `string` | ✅ (fixed-size; struct-safe) |
+| `string(N)` `string(N!)` | `String` (`InlineStr<N>` as a key) | `string` | ✅ — fixed N-**character** slot in the row; `!` = exactly N, bare = at most. ASCII unless `@utf8`. Legal as an identity: `Copy` key, RFC 3986 `pchar` minus `%`, non-empty, no `@utf8` |
+| `bytes(N)` | `[u8; N]` | `any` | ✅ (raw bytes, **not** text; struct-safe) |
 | `uuid` | `Uuid` | `string` | ✅ |
-| `timestamp` | `i64` | `number` | ✅ |
+| `timestamp`, `timestamp(s\|ms\|us)` | `Timestamp` | `string` (RFC 3339) | ✅ |
 | `decimal` | `Decimal` | `string` | ✅ (normalized key) |
 | `json` | `serde_json::Value` | `unknown` | ❌ |
 
 No `text` type. See [scalar types](/docs/schema/scalar-types/).
 
+## Identity
+
+Every model needs one: a field named `id`, else the first `+` field. `id` wins by name
+even over a `+` field declared above it. Legal types, and nothing else:
+
+`uuid` · `u32` `u64` `i32` `i64` · `timestamp(s|ms|us)` (`+timestamp` only when named `id`,
+only at `us`) · `string(N)` `string(N!)` · `*Model` (resolves to the target's key)
+
+Anything else — bare `string`, `bytes(N)`, `f64`, `bool`, `decimal`, `json`, an enum, a
+struct, an array, any nullable including `?Model` — is a validation error naming the field.
+See [the identity field](/docs/schema/models-and-fields/#the-identity-field).
+
 ## Modifiers
 
 | Sigil | Position | Meaning | Notes |
 |-------|----------|---------|-------|
-| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — `uuid`/`timestamp` fill on create; integer `+u32`/`+u64` is a marker, **not yet** auto-incremented ([#187](https://github.com/hoodiecollin/forgedb/issues/187)) |
+| `+` | prefix | auto-generate | `u32`/`u64`/`uuid`/`timestamp` only — all fill on create when omitted. Integer autos are monotonic, **not gapless**, and cannot take an explicit `0`; any shape (identity, `&`, `^`, or bare) is valid. A `+timestamp` is a *stamp* unless it is named `id`, and `id: +timestamp` must be declared `us` |
 | `&` | prefix | unique (enforced) | any type; also indexes |
 | `^` | prefix | indexed | any indexable type |
 | `?` | postfix (or prefix) | nullable | any type |
@@ -44,7 +57,7 @@ Combine freely: `id: +uuid`, `email: ^&string`, `bio: string?`, `external: +uuid
 | `[type; N]` | fixed-size array (fixed-size element) |
 | `StructName` / `StructName?` | inline struct (fixed-size fields only) |
 
-Traversal is UUID-keyed-target only. See [relations](/docs/schema/relations/).
+A foreign key takes its target's identity type. See [relations](/docs/schema/relations/).
 
 ## Enums
 
@@ -59,7 +72,11 @@ filterable / sortable (declaration order) / indexable. See [enums](/docs/schema/
 ## Directives
 
 **Enforced:** `@min` `@max` `@length` `@email` `@url` `@pattern`/`@regex` (→ 422),
+`@utf8` (inline `string(N)` only — without it a non-ASCII value is 422),
 `@on_delete(restrict|cascade|set_null)` (→ 409 / cascade / null).
+
+On an inline `string(N)` the width **is** the length bound, so `@max` and the upper-bound
+spellings of `@length` are schema errors there; `@min`/`@length(min:)` still apply.
 
 **Semantic-only markers:** `@default` `@computed` `@fulltext` `@materialized`
 `@relations(*|fields)` (component-only).
@@ -106,6 +123,8 @@ User {
 Order {
   id: +uuid
   status: ^OrderStatus
+  reference: &string(12!)          // fixed-width inline string, exactly 12 chars
+  currency: ^string(3!)
   total: decimal @min(0)
   placed_at: +timestamp
   customer: *User @on_delete(cascade)

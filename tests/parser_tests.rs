@@ -51,6 +51,7 @@ fn test_parse_field_without_symbols() {
     let input = r#"
 User {
   name: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -104,13 +105,15 @@ fn test_parse_multiple_unique_fields() {
 User {
   email: &string
   username: &string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    assert_eq!(model.fields.len(), 2);
+    // 3 fields: the two unique ones under test, plus the mandatory identity (#248).
+    assert_eq!(model.fields.len(), 3);
     assert!(model.fields[0].unique);
     assert!(model.fields[1].unique);
 }
@@ -151,6 +154,7 @@ Model {
   field7: string
   field8: uuid
   field9: timestamp
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -165,7 +169,10 @@ Model {
     assert_eq!(model.fields[5].field_type, FieldType::Bool);
     assert_eq!(model.fields[6].field_type, FieldType::String);
     assert_eq!(model.fields[7].field_type, FieldType::Uuid);
-    assert_eq!(model.fields[8].field_type, FieldType::Timestamp);
+    assert_eq!(
+        model.fields[8].field_type,
+        FieldType::Timestamp(TimestampPrecision::Millis)
+    );
 }
 
 #[test]
@@ -194,6 +201,7 @@ User {
 
 User {
   email: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -222,8 +230,13 @@ User {
 
 #[test]
 fn test_parse_timestamp_with_auto_generate() {
+    // The `id` is load-bearing, not decoration: since #254 a `+timestamp` is
+    // identity-eligible only when it is named `id`, so a model whose ONLY field
+    // is an auto timestamp is now rejected — it would silently acquire a
+    // timestamp primary key.
     let input = r#"
 User {
+  id: +uuid
   created_at: +timestamp
 }
 "#;
@@ -231,8 +244,11 @@ User {
     let schema = parser.parse().unwrap();
 
     let model = &schema.models[0];
-    let field = &model.fields[0];
-    assert_eq!(field.field_type, FieldType::Timestamp);
+    let field = &model.fields[1];
+    assert_eq!(
+        field.field_type,
+        FieldType::Timestamp(TimestampPrecision::Millis)
+    );
     assert!(field.auto_generate);
 }
 
@@ -284,6 +300,7 @@ fn test_validation_field_name_snake_case() {
     let input = r#"
 User {
   UserName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -314,6 +331,7 @@ fn test_validation_can_be_disabled() {
     let input = r#"
 user_model {
   UserName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new_with_validation(input, false).unwrap();
@@ -363,6 +381,7 @@ fn test_validation_single_char_names() {
     let input = r#"
 A {
   x: u32
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -390,6 +409,7 @@ fn test_validation_numbers_in_names() {
 User123 {
   field_123: u32
   abc_456_def: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -419,6 +439,7 @@ fn test_validation_camel_case_field() {
     let input = r#"
 User {
   userName: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -434,6 +455,7 @@ fn test_validation_screaming_snake_case_field() {
     let input = r#"
 User {
   USER_NAME: string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -487,6 +509,7 @@ fn test_parse_indexed_symbol_order() {
 User {
   email1: ^&string
   email2: &^string
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -689,6 +712,7 @@ fn test_parse_constraint_simple() {
     let input = r#"
 User {
   email: string @email
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -705,6 +729,7 @@ fn test_parse_constraint_with_number_param() {
     let input = r#"
 User {
   age: u32 @min(0) @max(150)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -727,6 +752,7 @@ fn test_parse_constraint_multiple() {
     let input = r#"
 User {
   password: string @min(8) @private
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -743,6 +769,7 @@ fn test_parse_constraint_with_symbols() {
     let input = r#"
 User {
   email: ^&string @email @unique
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -795,6 +822,7 @@ fn test_parse_constraint_empty_params() {
     let input = r#"
 User {
   email: string @email()
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -875,6 +903,7 @@ fn test_parse_constraint_with_pattern() {
     let input = r#"
 User {
   phone: string @pattern(phone_regex)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -896,22 +925,163 @@ User {
 
 #[test]
 fn test_parse_constraint_negative_number() {
-    // Test that negative numbers in constraints fail gracefully
-    // Current implementation doesn't support negative numbers in lexer
+    // #239 gap 4: `-` never entered the lexer's number path, so a signed field
+    // could carry only a non-negative bound and `@min(-273)` — the textbook
+    // lower bound — failed to lex. This test previously asserted that failure
+    // and documented it as a known limitation; it now pins the fix.
     let input = r#"
 Temperature {
-  celsius: i32 @min(-273)
+  id: +uuid
+  celsius: i32 @min(-273) @max(1000)
+}
+"#;
+    let mut parser = Parser::new(input).expect("negative bounds lex");
+    let schema = parser.parse().expect("negative bounds parse");
+    let field = &schema.models[0].fields[1];
+    assert_eq!(field.constraints[0].params[0], ConstraintParam::Number(-273));
+    assert_eq!(field.constraints[1].params[0], ConstraintParam::Number(1000));
+}
+
+#[test]
+fn test_parse_bare_dash_is_still_an_error() {
+    // `-` starts a number only when a digit follows. A stray dash must keep
+    // failing loudly rather than being absorbed by the numeric path.
+    let input = r#"
+Temperature {
+  id: +uuid
+  celsius: i32 @min(-)
 }
 "#;
     let result = Parser::new(input);
+    assert!(result.is_err(), "a bare '-' is not a numeric literal");
+}
 
-    // Lexer should fail on the '-' character (not a valid token)
-    // This test documents the current limitation
-    assert!(result.is_err());
-    if let Err(e) = result {
-        // Should fail during lexing, not parsing
-        assert!(e.contains("Unexpected character") || e.contains("Expected"));
+#[test]
+fn test_parse_fractional_bound_keeps_the_verbatim_lexeme() {
+    // #239: the literal is carried as source text, not parsed to f64. `0.10` must
+    // survive as written — re-rendering it from a float would print `0.1`, and on
+    // a `decimal` field the round trip would lose exactness entirely.
+    let input = r#"
+Product {
+  id: +uuid
+  price: decimal @min(0.01) @max(99999.99)
+  ratio: f64 @min(-273.15)
+  padded: decimal @min(0.10)
+}
+"#;
+    let mut parser = Parser::new(input).expect("fractional bounds lex");
+    let schema = parser.parse().expect("fractional bounds parse");
+    let fields = &schema.models[0].fields;
+    assert_eq!(
+        fields[1].constraints[0].params[0],
+        ConstraintParam::Fractional("0.01".to_string())
+    );
+    assert_eq!(
+        fields[1].constraints[1].params[0],
+        ConstraintParam::Fractional("99999.99".to_string())
+    );
+    assert_eq!(
+        fields[2].constraints[0].params[0],
+        ConstraintParam::Fractional("-273.15".to_string())
+    );
+    assert_eq!(
+        fields[3].constraints[0].params[0],
+        ConstraintParam::Fractional("0.10".to_string()),
+        "trailing zero is preserved, not normalized away"
+    );
+}
+
+#[test]
+fn test_parse_exclusive_bound_operators() {
+    // #239: `@min(>0)` / `@max(<1)` on a continuous domain, where there is no
+    // inclusive spelling for "strictly greater than zero".
+    let input = r#"
+Rate {
+  id: +uuid
+  value: f64 @min(>0) @max(<1)
+  price: decimal @min(>0.00)
+}
+"#;
+    let mut parser = Parser::new(input).expect("exclusive bounds lex");
+    let schema = parser.parse().expect("exclusive bounds parse");
+    let fields = &schema.models[0].fields;
+    assert_eq!(
+        fields[1].constraints[0].params[0],
+        ConstraintParam::Exclusive {
+            greater: true,
+            value: Box::new(ConstraintParam::Number(0)),
+        }
+    );
+    assert_eq!(
+        fields[1].constraints[1].params[0],
+        ConstraintParam::Exclusive {
+            greater: false,
+            value: Box::new(ConstraintParam::Number(1)),
+        }
+    );
+    assert_eq!(
+        fields[2].constraints[0].params[0],
+        ConstraintParam::Exclusive {
+            greater: true,
+            value: Box::new(ConstraintParam::Fractional("0.00".to_string())),
+        }
+    );
+}
+
+#[test]
+fn test_reject_fractional_and_exclusive_bounds_on_integer_fields() {
+    // #239 decisions: on a discrete domain a fractional bound is always a
+    // confusion, and `>0` ≡ `>=1` adds a spelling without adding expressiveness.
+    // Both are errors, not warnings — a warning-only path lets the schema ship.
+    for (src, want) in [
+        ("age: u32 @min(0.5)", "cannot be fractional"),
+        ("age: u32 @min(>0)", "redundant"),
+        ("age: i64 @max(<10)", "redundant"),
+    ] {
+        let input = format!("Person {{\n  id: +uuid\n  {src}\n}}\n");
+        let err = match Parser::new(&input) {
+            Ok(mut p) => p.parse().err(),
+            Err(e) => Some(e),
+        };
+        let err = err.unwrap_or_else(|| panic!("`{src}` should be rejected"));
+        assert!(
+            err.contains(want),
+            "`{src}` should mention {want:?}, got: {err}"
+        );
     }
+}
+
+#[test]
+fn test_reject_mismatched_exclusive_operator() {
+    // `@min(<5)` is not "exclusive with the direction ignored" — it is a mistake.
+    let input = r#"
+Rate {
+  id: +uuid
+  value: f64 @min(<5)
+}
+"#;
+    let err = match Parser::new(input) {
+        Ok(mut p) => p.parse().err(),
+        Err(e) => Some(e),
+    };
+    let err = err.expect("@min(<5) should be rejected");
+    assert!(err.contains("takes '>'"), "got: {err}");
+}
+
+#[test]
+fn test_reject_unrepresentable_decimal_bound() {
+    // Codegen builds the bound with `Decimal::from_i128_with_scale`, which PANICS
+    // out of range. Rejecting it here turns a generator crash into a diagnostic.
+    let input = format!(
+        "Product {{\n  id: +uuid\n  price: decimal @min(0.{})\n}}\n",
+        "1".repeat(29)
+    );
+    let err = match Parser::new(&input) {
+        Ok(mut p) => p.parse().err(),
+        Err(e) => Some(e),
+    };
+    let err = err.expect("a 29-digit scale should be rejected");
+    assert!(err.contains("at most 28"), "got: {err}");
 }
 
 #[test]
@@ -919,6 +1089,7 @@ fn test_parse_multiple_constraints_same_type() {
     let input = r#"
 User {
   name: string @min(2) @max(50)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -932,14 +1103,20 @@ User {
     assert!(field.constraints.iter().any(|c| c.name == "max"));
 }
 
+/// `index_type` must report BTree for exactly the types codegen gives an ordered
+/// index to (`RustGenerator::ordered_key_type`) — it is stringified into the
+/// migration plan a user reads, so a mismatch claims an index that was never
+/// generated. `decimal` is included (scale-invariant normalized key) and so is
+/// `f64`, which has no `Ord` but is keyed by its total-order encoding (#242).
 #[test]
 fn test_parse_btree_index_type_for_ordered_types() {
     let input = r#"
 Product {
   id: +uuid
-  price: ^f64
   stock: ^u32
   created_at: ^timestamp
+  cost: ^decimal
+  score: ^f64
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -947,11 +1124,14 @@ Product {
 
     let model = &schema.models[0];
     // Check that ordered types get BTree index type
-    assert_eq!(model.fields[1].index_type, IndexType::BTree); // price: f64
-    assert_eq!(model.fields[2].index_type, IndexType::BTree); // stock: u32
-    assert_eq!(model.fields[3].index_type, IndexType::BTree); // created_at: timestamp
+    assert_eq!(model.fields[1].index_type, IndexType::BTree); // stock: u32
+    assert_eq!(model.fields[2].index_type, IndexType::BTree); // created_at: timestamp
+    assert_eq!(model.fields[3].index_type, IndexType::BTree); // cost: decimal
+    assert_eq!(model.fields[4].index_type, IndexType::BTree); // score: f64
 }
 
+/// The counterpart: types with no total order report Hash — they are exact-match
+/// only, with no `find_by_*_range`.
 #[test]
 fn test_parse_hash_index_type_for_unordered_types() {
     let input = r#"
@@ -959,6 +1139,7 @@ User {
   id: +uuid
   email: ^string
   active: ^bool
+  avatar: ^uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();
@@ -968,6 +1149,23 @@ User {
     // Check that unordered types get Hash index type
     assert_eq!(model.fields[1].index_type, IndexType::Hash); // email: string
     assert_eq!(model.fields[2].index_type, IndexType::Hash); // active: bool
+    assert_eq!(model.fields[3].index_type, IndexType::Hash); // avatar: uuid
+}
+
+/// A nullable ordered-eligible field is Hash, not BTree: `ordered_key_type`
+/// returns `None` for any nullable field, so no ordered index is generated.
+#[test]
+fn test_parse_hash_index_type_for_nullable_ordered_type() {
+    let input = r#"
+Reading {
+  id: +uuid
+  taken_at: ^timestamp?
+}
+"#;
+    let mut parser = Parser::new(input).unwrap();
+    let schema = parser.parse().unwrap();
+
+    assert_eq!(schema.models[0].fields[1].index_type, IndexType::Hash);
 }
 
 #[test]
@@ -976,6 +1174,7 @@ fn test_constraint_helper_methods() {
 User {
   email: string @email
   age: u32 @min(0) @max(150)
+  id: +uuid
 }
 "#;
     let mut parser = Parser::new(input).unwrap();

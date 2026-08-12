@@ -2,45 +2,47 @@ use forgedb_types::*;
 
 #[test]
 fn test_timestamp_creation() {
-    let ts = Timestamp::from_seconds(1234567890);
-    assert_eq!(ts.as_seconds(), 1234567890);
+    let ts = Timestamp::from_micros(1234567890);
+    assert_eq!(ts.as_micros(), 1234567890);
 }
 
 #[test]
 fn test_timestamp_now() {
     let now = Timestamp::now();
-    assert!(now.as_seconds() > 0);
+    assert!(now.as_micros() > 0);
     // Should be reasonably recent (after year 2020)
-    assert!(now.as_seconds() > 1577836800);
+    assert!(now.as_micros() > 1577836800);
 }
 
 #[test]
 fn test_timestamp_from_i64() {
     let ts: Timestamp = 1234567890_i64.into();
-    assert_eq!(ts.as_seconds(), 1234567890);
+    assert_eq!(ts.as_micros(), 1234567890);
 }
 
 #[test]
 fn test_timestamp_to_i64() {
-    let ts = Timestamp::from_seconds(1234567890);
-    let seconds: i64 = ts.into();
-    assert_eq!(seconds, 1234567890);
+    let ts = Timestamp::from_micros(1234567890);
+    let micros: i64 = ts.into();
+    assert_eq!(micros, 1234567890);
 }
 
 #[test]
 fn test_timestamp_ordering() {
-    let ts1 = Timestamp::from_seconds(100);
-    let ts2 = Timestamp::from_seconds(200);
+    let ts1 = Timestamp::from_micros(100);
+    let ts2 = Timestamp::from_micros(200);
     assert!(ts1 < ts2);
     assert!(ts2 > ts1);
-    assert_eq!(ts1, Timestamp::from_seconds(100));
+    assert_eq!(ts1, Timestamp::from_micros(100));
 }
 
 #[test]
 fn test_timestamp_serialization() {
-    let ts = Timestamp::from_seconds(1234567890);
+    let ts = Timestamp::from_micros(1234567890);
     let json = serde_json::to_string(&ts).unwrap();
-    assert_eq!(json, "1234567890");
+    // #254: the JSON form is the RFC 3339 string, not the bare number. The break
+    // is deliberately loud — a number would silently start meaning micros.
+    assert_eq!(json, "\"1970-01-01T00:20:34.567890Z\"");
 
     let deserialized: Timestamp = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized, ts);
@@ -92,7 +94,7 @@ fn test_value_uuid() {
 
 #[test]
 fn test_value_timestamp() {
-    let ts = Timestamp::from_seconds(1234567890);
+    let ts = Timestamp::from_micros(1234567890);
     let val = Value::Timestamp(ts);
     assert_eq!(val.type_name(), "timestamp");
 }
@@ -142,7 +144,7 @@ fn test_value_from_uuid() {
 
 #[test]
 fn test_value_from_timestamp() {
-    let ts = Timestamp::from_seconds(1234567890);
+    let ts = Timestamp::from_micros(1234567890);
     let val: Value = ts.into();
     assert_eq!(val, Value::Timestamp(ts));
 }
@@ -184,7 +186,7 @@ fn test_value_equality() {
     let uuid = Uuid::new_v4();
     assert_eq!(Value::Uuid(uuid), Value::Uuid(uuid));
 
-    let ts = Timestamp::from_seconds(1234567890);
+    let ts = Timestamp::from_micros(1234567890);
     assert_eq!(Value::Timestamp(ts), Value::Timestamp(ts));
 }
 
@@ -250,9 +252,9 @@ fn test_timestamp_hash() {
     use std::collections::HashSet;
 
     let mut set = HashSet::new();
-    let ts1 = Timestamp::from_seconds(100);
-    let ts2 = Timestamp::from_seconds(200);
-    let ts3 = Timestamp::from_seconds(100);
+    let ts1 = Timestamp::from_micros(100);
+    let ts2 = Timestamp::from_micros(200);
+    let ts3 = Timestamp::from_micros(100);
 
     set.insert(ts1);
     set.insert(ts2);

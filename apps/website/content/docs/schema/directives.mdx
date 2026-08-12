@@ -27,12 +27,13 @@ The generated code checks these and rejects a bad write.
 
 | Directive | Args | Applies to | Effect |
 |-----------|------|-----------|--------|
-| `@min` | `(number)` | numeric | Value must be ≥ the minimum, else **422** |
-| `@max` | `(number)` | numeric | Value must be ≤ the maximum, else **422**. *Not* a string-length check — use `@length` for strings |
+| `@min` | `(n)` or `(>n)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≥ the minimum, else **422**. `>n` makes it exclusive |
+| `@max` | `(n)` or `(<n)` | `u32` `u64` `i32` `i64` `f64` `decimal` | Value must be ≤ the maximum, else **422**. `<n` makes it exclusive. *Not* a string-length check — use `@length` for strings |
 | `@length` | `(count)` or `(min, max)` | `string` | String length must be in range, else **422** |
 | `@email` | none | `string` | Must be a valid email, else **422** |
 | `@url` | none | `string` | Must be a valid URL, else **422** |
 | `@pattern` / `@regex` | `(regex)` | `string` | Value must match the regex, else **422** |
+| `@utf8` | none | `string(N)` only, never an identity | Widen the inline slot to four bytes per character; without it a non-ASCII value is **422** |
 | `@on_delete` | `(restrict\|cascade\|set_null)` | FK field | On-delete referential policy |
 
 ### Field constraints — `@min` `@max` `@length` `@email` `@url`
@@ -40,6 +41,26 @@ The generated code checks these and rejects a bad write.
 The generated `validate_<model>` enforces these at the top of `insert`/`update`; a
 violation is a field-constraint error (HTTP **422**). A nullable field is validated only
 when `Some`.
+
+Each numeric bound is compared in its field's own domain, so a `decimal` bound stays
+exact and a 64-bit integer bound never rounds. A bound written as `0.01` on a `decimal`
+field is the exact value one cent — it never round-trips through a binary float.
+
+Bounds may be negative (`@min(-273)`) and fractional (`@min(0.01)`).
+
+```forge
+Product {
+  price: decimal @min(0.01)      // at least one cent, exactly
+  rate: f64 @min(>0) @max(<1)    // strictly between zero and one
+  celsius: i32 @min(-273)
+}
+```
+
+The exclusive forms `>n` and `<n` apply to **continuous** types only (`f64`,
+`decimal`). On an integer field `>0` and `>=1` are the same set, so the operator adds
+a spelling without adding meaning and is rejected — write the inclusive bound instead.
+A fractional bound on an integer field is likewise an error rather than a silent
+truncation.
 
 ```forge
 User {
@@ -61,6 +82,35 @@ User {
   handle: string @pattern("^[a-z0-9_]{3,20}$")
 }
 ```
+
+### `@utf8`
+
+Only meaningful on an [inline `string(N)`](/docs/schema/scalar-types/#stringn--fixed-width-inline-strings).
+That type reserves one byte per character, so a non-ASCII value is rejected with a **422**;
+`@utf8` widens the reservation to four bytes per character and changes nothing else. `N`
+still counts characters either way.
+
+```forge
+Article {
+  id: +uuid
+  slug: string(64)              // ASCII only
+  title: string(60) @utf8       // any Unicode, four bytes reserved per character
+}
+```
+
+`@utf8` on a bare `string` — or on any non-string field — is a schema error rather than a
+no-op: a bare `string` is already UTF-8 and lives in the variable-length column, so there is
+nothing there to widen, and silently accepting it would read as "this field is now
+multi-byte".
+
+It is also a schema error on a model's [identity](/docs/schema/scalar-types/#stringn-as-an-identity).
+A key's value is restricted to the characters that survive a URL path segment unescaped,
+which is a strict subset of ASCII — so widening the slot would reserve four bytes per
+character to hold characters the write path rejects anyway.
+
+Note that the length directives go the other way on an inline string: the width in the type
+is already the bound, so `@max` and the upper-bound spellings of `@length` are schema errors
+there. See [scalar types](/docs/schema/scalar-types/#stringn--fixed-width-inline-strings).
 
 ### `@on_delete`
 
@@ -98,7 +148,7 @@ Use them to document intent; do not rely on them for integrity.
 `@default`, `@computed`, `@fulltext`, and `@materialized` are parsed and preserved but have
 no runtime effect yet — for example `@default(0)` does not populate a value; the caller
 must still supply one. The enforced set is the table above (`@min`/`@max`/`@length`/
-`@email`/`@url`, `@pattern`/`@regex`, and `@on_delete`).
+`@email`/`@url`, `@pattern`/`@regex`, `@utf8`, and `@on_delete`).
 </Callout>
 
 ## Model-level directives

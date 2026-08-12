@@ -25,38 +25,31 @@
 //!
 //! - Envelope key order: `data`, `total`, `limit`, `offset`.
 //! - Record key order: schema declaration order, `id` first.
-//! - That a `json` field's *own* keys are still normalized (sorted) — that payload
-//!   is a `serde_json::Value` either way, so #229 did not touch it.
+//! - That a `json` field is emitted as a sorted *object* — not a string, not
+//!   restructured. NOTE this does not prove a borrowed passthrough would be caught:
+//!   the fixture is built with `json!`, so its bytes are sorted before storage. See
+//!   the comment above `PAGE_SCHEMA` for why that is not fixable from here.
 //! - The error bodies, which deliberately stayed `json!` objects.
 //!
-//! It compiles a generated crate, so it is `#[ignore]`d out of the fast hermetic
-//! default suite. Run it explicitly:
+//! # Two tests, two generated crates
+//!
+//! - `rest_read_paths_emit_the_frozen_wire_bytes` — #229's baseline over
+//!   `SCHEMA` (`Post`/`Author`): envelope order, record order, projections, the
+//!   error bodies, and the `?as_of=` arm.
+//! - `list_page_emits_the_frozen_wire_bytes` — #226's guard over `PAGE_SCHEMA`,
+//!   which carries the field classes and declaration orders that `SCHEMA` cannot
+//!   express. See the block comment above `PAGE_SCHEMA` for why it is a second
+//!   schema rather than more fields on `Post`.
+//!
+//! Each compiles its own generated crate, so this file is `#[ignore]`d out of the
+//! fast hermetic default suite. Run it explicitly:
 //!
 //! ```bash
 //! make api-wire-test         # or:
 //! cargo test --test api_wire_test -- --ignored --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-/// Repo root — `CARGO_MANIFEST_DIR` is the crate this test compiles under.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Path dep line for a workspace substrate crate.
-fn dep(name: &str, crate_dir: &str) -> String {
-    let path = repo_root().join("crates").join(crate_dir);
-    format!("{name} = {{ path = {:?} }}\n", path.to_string_lossy())
-}
-
-fn write(path: &Path, contents: &str) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).unwrap();
-    }
-    std::fs::write(path, contents).unwrap();
-}
+mod common;
 
 /// Every field class that reaches the wire: string (with escapes), optional,
 /// integer, float, enum, json, required FK, optional FK — plus a projection, so
@@ -88,74 +81,8 @@ Author {
 #[test]
 #[ignore = "compiles a generated crate; run with --ignored (see `make api-wire-test`)"]
 fn rest_read_paths_emit_the_frozen_wire_bytes() {
-    let proj = std::env::temp_dir().join(format!("forgedb-apiwire-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&proj);
-    std::fs::create_dir_all(&proj).unwrap();
-
-    write(&proj.join("schema.forge"), SCHEMA);
-    let forgedb = env!("CARGO_BIN_EXE_forgedb");
-    let gen_status = Command::new(forgedb)
-        .args(["generate", "all", "--output", "src", "--schema", "schema.forge"])
-        .current_dir(&proj)
-        .status()
-        .expect("run forgedb generate");
-    assert!(gen_status.success(), "forgedb generate all failed");
-
-    let mut cargo_toml = String::from(
-        "[package]\nname = \"wiredriver\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\n",
-    );
-    for (n, d) in [
-        ("forgedb-storage", "storage"),
-        ("forgedb-types", "types"),
-        ("forgedb-changefeed", "changefeed"),
-        ("forgedb-wal", "wal"),
-        ("forgedb-auth", "auth"),
-        ("forgedb-query-params", "query-params"),
-        ("forgedb-compaction", "compaction"),
-        ("forgedb-txn", "txn"),
-        ("forgedb-coordinator", "coordinator"),
-    ] {
-        cargo_toml.push_str(&dep(n, d));
-    }
-    cargo_toml.push_str("serde = { version = \"1\", features = [\"derive\"] }\n");
-    cargo_toml.push_str("serde_json = \"1\"\n");
-    cargo_toml.push_str("regex = \"1\"\n");
-    cargo_toml.push_str("rust_decimal = { version = \"1\", features = [\"serde-with-str\"] }\n");
-    cargo_toml.push_str("utoipa = { version = \"5\", features = [\"uuid\"] }\n");
-    cargo_toml.push_str("utoipa-axum = \"0.2\"\n");
-    cargo_toml.push_str("axum = { version = \"0.8\", features = [\"ws\"] }\n");
-    cargo_toml.push_str("tokio = { version = \"1\", features = [\"full\"] }\n");
-    cargo_toml.push_str("tower = { version = \"0.5\", features = [\"util\"] }\n");
-    cargo_toml.push_str("tower-http = { version = \"0.6\", features = [\"trace\"] }\n");
-    cargo_toml.push_str("\n[workspace]\n");
-    write(&proj.join("Cargo.toml"), &cargo_toml);
-
-    // `generate all` writes database.rs / api.rs into src/; the driver is the
-    // crate root that mounts them, exactly as the `forgedb init` scaffold does.
-    write(&proj.join("src/main.rs"), DRIVER);
-
-    let target = proj.join("target");
-    let build = Command::new("cargo")
-        .args(["build", "--quiet"])
-        .current_dir(&proj)
-        .env("CARGO_TARGET_DIR", &target)
-        .status()
-        .expect("run cargo build");
-    assert!(build.success(), "driver failed to compile");
-
-    let out = Command::new(target.join("debug/wiredriver"))
-        .arg(proj.join("data"))
-        .output()
-        .expect("run driver");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    println!("{stdout}");
-    assert!(
-        out.status.success(),
-        "driver reported a wire-format mismatch:\n{stdout}\n{stderr}"
-    );
-
-    let _ = std::fs::remove_dir_all(&proj);
+    let (out, proj) = common::generate_compile_run("wiredriver", SCHEMA, DRIVER);
+    common::assert_driver_ok(&out, &proj, "driver reported a wire-format mismatch");
 }
 
 /// The driver: seeds two rows with **fixed** UUIDs (the bytes have to be
@@ -378,5 +305,721 @@ async fn main() {
         std::process::exit(1);
     }
     println!("all REST wire-format checks passed");
+}
+"##;
+
+// ---------------------------------------------------------------------------
+// #226 — the list page's frozen bytes
+// ---------------------------------------------------------------------------
+//
+// #226 replaces the list handler's page materialization (`page_ids` →
+// `filter_map(get)` → `Vec<Model>` → serde) with a buffered gather serialized
+// through a generated `<Model>PageRef<'a>`. Its success contract is **byte
+// identity**, so this is a guard written *before* the change and expected GREEN
+// against today's handler — a RED scenario here is a bug in the scenario.
+//
+// It is a second test rather than more requests on `SCHEMA` above, because three
+// of the nine scenarios need shapes `Post`/`Author` cannot express, and rewriting
+// `SCHEMA` would rewrite #229's frozen baseline at the same time:
+//
+//   - **the wide model** (`Widget`): a nullable `string`, a `decimal`, an enum, a
+//     `timestamp`, a `bytes(N)`, a `[T; N]`, an inline `struct`, a required FK and
+//     a virtual `[Model]`. `WidgetScanRef` holds only
+//     `{id, label, price, tier, made_at, checksum, serial}` — `scores`, `dims`,
+//     `owner`, `parts` and `payload` are outside `scan_field_set`, and `serial` is
+//     declared *after* all of them. So building `PageRef` by appending the excluded
+//     fields to the scan set emits `…checksum,serial,scores,dims,owner,payload`
+//     where `Widget` emits `…checksum,scores,dims,owner,parts,payload,serial`:
+//     semantically equal, byte-different, invisible to any `Value`-comparing
+//     assertion (gotcha 1).
+//   - **the identity-late model** (`Note`): `id` is declared *second*. `NoteScanRef`
+//     is `{id, body, weight}` (identity-first) while `Note` is `{body, id, weight}`,
+//     so the wire must NOT be identity-first (gotcha 1, sharpest form).
+//
+//   Two coverage limits worth knowing before editing these scenarios. A
+//   `?sort=…&order=desc` request is NOT automatically a gotcha-3 (`__slot`) case:
+//   under a position-instead-of-slot mutation, `Churn`'s desc sort stayed GREEN
+//   because `seq = 1000 - i` makes descending order coincide with physical row
+//   order — only the ASCENDING sorts caught it. The discriminating shape needs
+//   sorted order != physical order != reverse-physical order. And gotcha 3 is
+//   detectable only on `Widget`: every field of `Note` and `Churn` is filterable,
+//   so their `PageRef` field set equals their `ScanRef`'s, their page-only gather
+//   reads no columns, and a slot mis-map is invisible for them.
+//   - **the churned model** (`Churn`): 3 live rows scattered across 503 physical
+//     ones, which puts the scan's `note` column below
+//     `SPARSE_OFFSETS_SPAN_FACTOR` density and sends `gather_buffered` down
+//     `gather_sparse` (`crates/storage-native/src/lib.rs:1448`). The driver asserts
+//     that density predicate — but note it MIRRORS the factor as a hardcoded 128, so
+//     it tracks the *corpus*, not the substrate: raising
+//     `SPARSE_OFFSETS_SPAN_FACTOR` would silently stop exercising the sparse arm
+//     while the assertion still passed. Also, both gather arms are byte-equivalent in
+//     both directions, so this is a correctness guard on the sparse *implementation*
+//     and a performance guard on the branch *decision* — it is not a byte guard on
+//     which arm ran.
+//
+// `Widget.payload` is WRITTEN as `json!({"z": 1, "a": {"y": 2, "b": 3}})` and must
+// come out sorted, because `get(id)` round-trips it through `serde_json::Value`
+// (a `BTreeMap` without `preserve_order`).
+//
+// **Read this before trusting the scenario: it does NOT guard gotcha 2's literal
+// fear, and it cannot.** `json!` builds a `Value` — i.e. a `BTreeMap` — so the
+// source order above is discarded *before* the value is ever stored. The bytes on
+// disk are therefore ALREADY SORTED, and a borrowed `&str`/`RawValue` passthrough
+// would emit those same sorted bytes and pass every check in this file. Storing
+// genuinely unsorted json bytes is not expressible through the typed create path,
+// which is why no scenario here does it.
+//
+// What the scenario DOES guard (verified RED by mutation): the grosser sibling
+// failures — json emitted as a *string*, or otherwise restructured. That is worth
+// keeping. The `!body.contains("\"payload\":{\"z\":1")` half is vacuous against a
+// read-side change and is retained only as a cheap regression tripwire in case the
+// write path ever starts preserving source order.
+const PAGE_SCHEMA: &str = r#"
+enum Tier { Free, Pro, Enterprise }
+
+struct Dims {
+  w: u32
+  h: u32
+}
+
+Widget {
+  id: +uuid
+  label: string?
+  price: decimal
+  tier: ^Tier
+  made_at: timestamp(ms)
+  checksum: bytes(4)
+  scores: [i32; 3]
+  dims: Dims
+  owner: *Maker
+  parts: [Part]
+  payload: json
+  serial: ^u32
+}
+
+Maker {
+  id: +uuid
+  name: string
+  widgets: [Widget]
+}
+
+Part {
+  id: +uuid
+  name: string
+  widget: *Widget
+}
+
+Note {
+  body: string
+  id: +uuid
+  weight: ^u32
+}
+
+Churn {
+  id: +uuid
+  note: string
+  seq: ^u32
+}
+
+// #281 (S9). `Item.vendor` is the ONE field class whose `borrowed` flag genuinely
+// flips between the two page construction sites: it is non-scan (a relation is never
+// filterable, so it is not in the scan set) AND inline-string, so the read path moves
+// between the owned and the borrowed arm of `field_read_stmt`. Nothing else in this
+// schema has that shape — `Widget.owner` is a uuid-keyed FK.
+//
+// A frozen literal here, in addition to `page_identity_test`'s site-vs-site grid,
+// because the two catch different failures: the grid catches a change that moves ONE
+// site, a literal catches one that moves BOTH.
+Vendor {
+  id: string(4!)
+  name: string
+  items: [Item]
+}
+
+Item {
+  id: +uuid
+  sku: string
+  vendor: *Vendor
+}
+
+// #281 (S11). `limit`/`offset`/`sort`/`order` are not lexer keywords, so a model may
+// legally declare them as fields — and for THIS model `?limit=1` really is a filter.
+// It is the single case where the positive predicate ("does any key name a filterable
+// field of this model?") and a negative reserved-key exclusion list visibly differ:
+// under the negative form the fast path fires and returns the unfiltered page.
+//
+// None of them is indexed, deliberately. An indexed field resolves through the
+// pushdown arm before any per-row work, which would produce the right answer on its
+// own and mask a broken predicate entirely.
+Gauge {
+  id: +uuid
+  limit: u32
+  offset: u32
+  sort: string
+  order: string
+}
+"#;
+
+#[test]
+#[ignore = "compiles a generated crate; run with --ignored (see `make api-wire-test`)"]
+fn list_page_emits_the_frozen_wire_bytes() {
+    let (out, proj) = common::generate_compile_run("wirepage", PAGE_SCHEMA, PAGE_DRIVER);
+    common::assert_driver_ok(&out, &proj, "driver reported a list-page wire mismatch");
+}
+
+/// The driver. Seeds fixed UUIDs and fixed field values (the bytes have to be
+/// deterministic), churns one `Churn` row 500 times to scatter the live set, then
+/// drives the generated router through `tower::oneshot`.
+///
+/// Three assertions are NOT about response bytes and exist so a scenario cannot
+/// silently stop exercising what it names: the sparse-density predicate, and that
+/// the pushdown resolver returns `Some` for the two `?serial=` requests.
+const PAGE_DRIVER: &str = r##"mod database;
+use database::*;
+
+mod api;
+
+use axum::body::Body;
+use axum::http::Request;
+use forgedb_types::{Timestamp, Uuid};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tower::ServiceExt;
+
+const MAKER: &str = "11111111-1111-1111-1111-111111111111";
+const WIDGET_A: &str = "22222222-2222-2222-2222-222222222222";
+const WIDGET_B: &str = "33333333-3333-3333-3333-333333333333";
+const PART: &str = "44444444-4444-4444-4444-444444444444";
+const NOTE_A: &str = "55555555-5555-5555-5555-555555555555";
+const NOTE_B: &str = "66666666-6666-6666-6666-666666666666";
+const CHURN_0: &str = "77777777-0000-0000-0000-000000000000";
+const CHURN_1: &str = "77777777-1111-1111-1111-111111111111";
+const CHURN_2: &str = "77777777-2222-2222-2222-222222222222";
+const ITEM_A: &str = "88888888-0000-0000-0000-000000000000";
+const ITEM_B: &str = "88888888-1111-1111-1111-111111111111";
+const GAUGE_A: &str = "99999999-0000-0000-0000-000000000000";
+const GAUGE_B: &str = "99999999-1111-1111-1111-111111111111";
+
+/// Superseding versions appended to `CHURN_2`. Each `update` appends a physical
+/// row, so the live set ends up `{0, 1, 2 + CHURN_UPDATES}` — a span of
+/// `3 + CHURN_UPDATES` over 3 rows, which is below
+/// `SPARSE_OFFSETS_SPAN_FACTOR` (128) density with room to spare. `sparse_ok`
+/// below asserts that rather than trusting this constant.
+const CHURN_UPDATES: usize = 500;
+
+/// Mirrors `SPARSE_OFFSETS_SPAN_FACTOR` in `crates/storage-native/src/lib.rs`.
+/// If the substrate constant moves, this assertion is what says so.
+const SPARSE_SPAN_FACTOR: usize = 128;
+
+static mut FAILURES: u32 = 0;
+
+fn check(uri: &str, got: (u16, String), want_status: u16, want_body: &str) {
+    let (status, body) = got;
+    if status == want_status && body == want_body {
+        println!("  ok   {status} {uri}");
+        return;
+    }
+    println!("  FAIL {uri}");
+    println!("    want {want_status}  {want_body}");
+    println!("    got  {status}  {body}");
+    unsafe { FAILURES += 1 }
+}
+
+/// A non-byte assertion: that a scenario is still exercising the branch it names.
+fn require(what: &str, cond: bool, detail: &str) {
+    if cond {
+        println!("  ok   {what}");
+        return;
+    }
+    println!("  FAIL {what}");
+    println!("    {detail}");
+    unsafe { FAILURES += 1 }
+}
+
+async fn call(router: axum::Router, uri: &str) -> (u16, String) {
+    let resp = router
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .expect("router call");
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (status, String::from_utf8(bytes.to_vec()).expect("utf8 body"))
+}
+
+fn uuid(s: &str) -> Uuid {
+    s.parse().expect("parse uuid")
+}
+
+fn dec(s: &str) -> rust_decimal::Decimal {
+    s.parse().expect("parse decimal")
+}
+
+fn ts(s: &str) -> Timestamp {
+    Timestamp::from_rfc3339(s).expect("parse timestamp")
+}
+
+#[tokio::main]
+async fn main() {
+    let dir = std::path::PathBuf::from(std::env::args().nth(1).expect("data dir arg"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = Database::open_at(dir.clone());
+
+    db.create_maker(Maker {
+        id: uuid(MAKER),
+        name: "Ada".to_string(),
+        widgets: (),
+    })
+    .expect("create maker");
+
+    // Row A: the null optional, a scale-bearing decimal, the first enum variant,
+    // a positive instant, high/low bytes, a negative array element, and a json
+    // object whose OWN keys (and nested keys) are out of sorted order.
+    db.create_widget(Widget {
+        id: uuid(WIDGET_A),
+        label: None,
+        price: dec("10.50"),
+        tier: Tier::Free,
+        made_at: ts("2026-01-02T03:04:05.678Z"),
+        checksum: [0, 1, 254, 255],
+        scores: [-1, 0, 7],
+        dims: Dims { w: 3, h: 4 },
+        owner: uuid(MAKER),
+        parts: (),
+        payload: serde_json::json!({ "z": 1, "a": { "y": 2, "b": 3 } }),
+        serial: 1,
+    })
+    .expect("create widget a");
+
+    // Row B: the populated optional carrying escape-sensitive text, a negative
+    // sub-unit decimal, the last enum variant, a pre-2000 instant, and a null json.
+    db.create_widget(Widget {
+        id: uuid(WIDGET_B),
+        label: Some("quote \" tab \t ✓".to_string()),
+        price: dec("-0.001"),
+        tier: Tier::Enterprise,
+        made_at: ts("1999-12-31T23:59:59.999Z"),
+        checksum: [9, 9, 9, 9],
+        scores: [2, 3, 4],
+        dims: Dims { w: 0, h: 65535 },
+        owner: uuid(MAKER),
+        parts: (),
+        payload: serde_json::Value::Null,
+        serial: 2,
+    })
+    .expect("create widget b");
+
+    // Makes `Widget.parts` a populated one-to-many rather than a vacuous one.
+    db.create_part(Part {
+        id: uuid(PART),
+        name: "bolt".to_string(),
+        widget: uuid(WIDGET_A),
+    })
+    .expect("create part");
+
+    db.create_note(Note {
+        body: "first".to_string(),
+        id: uuid(NOTE_A),
+        weight: 1,
+    })
+    .expect("create note a");
+    db.create_note(Note {
+        body: "second".to_string(),
+        id: uuid(NOTE_B),
+        weight: 2,
+    })
+    .expect("create note b");
+
+    for (id, note, seq) in [
+        (CHURN_0, "c-zero", 10u32),
+        (CHURN_1, "c-one", 20),
+        (CHURN_2, "c-two", 30),
+    ] {
+        db.create_churn(Churn {
+            id: uuid(id),
+            note: note.to_string(),
+            seq,
+        })
+        .expect("create churn");
+    }
+    // #281 S9. One vendor, two items: `Item.vendor` is the non-scan inline-string FK
+    // whose `borrowed` flag flips between the two page construction sites.
+    db.create_vendor(Vendor {
+        id: forgedb_types::InlineStr::try_from("acme").expect("vendor key is 4 chars"),
+        name: "Acme".to_string(),
+        items: (),
+    })
+    .expect("create vendor");
+    for (id, sku) in [(ITEM_A, "sku-a"), (ITEM_B, "sku-b")] {
+        db.create_item(Item {
+            id: uuid(id),
+            sku: sku.to_string(),
+            vendor: forgedb_types::InlineStr::try_from("acme").expect("vendor key"),
+        })
+        .expect("create item");
+    }
+
+    // #281 S11. TWO gauges, and the `>= 2` is load-bearing: with a single row the
+    // negative-form predicate would take the fast path and return that same row with
+    // `total: 1` — byte-identical to the filtered answer, so the scenario would stay
+    // green under its own discriminating mutation. A second, non-matching row makes
+    // the mutation change both `total` and the `data` array.
+    for (id, lim) in [(GAUGE_A, 1u32), (GAUGE_B, 7)] {
+        db.create_gauge(Gauge {
+            id: uuid(id),
+            limit: lim,
+            offset: 0,
+            sort: "none".to_string(),
+            order: "asc".to_string(),
+        })
+        .expect("create gauge");
+    }
+
+    // Same values every time: the churn is about *physical row placement*, so the
+    // wire bytes must not move with it.
+    for _ in 0..CHURN_UPDATES {
+        db.update_churn(
+            uuid(CHURN_2),
+            Churn {
+                id: uuid(CHURN_2),
+                note: "c-two".to_string(),
+                seq: 30,
+            },
+        )
+        .expect("update churn");
+    }
+
+    db.commit().expect("commit");
+
+    // ---- branch-reached assertions, taken before `db` is shared ----
+    //
+    // Scenario 6 claims the page's rows are scattered enough for
+    // `VariableColumn::gather_buffered` to take `gather_sparse`. That is a density
+    // predicate over the physical row indices, so assert the predicate itself —
+    // a corpus that quietly stopped being sparse would leave the scenario passing
+    // while exercising the dense path.
+    let churn_live = db.churn.export_live_indices();
+    let churn_span = churn_live.iter().max().unwrap() + 1 - churn_live.iter().min().unwrap();
+    require(
+        "churn selection is below gather_sparse density",
+        churn_span > churn_live.len() * SPARSE_SPAN_FACTOR,
+        &format!(
+            "live rows {churn_live:?} span {churn_span} over {} rows; need span > {}",
+            churn_live.len(),
+            churn_live.len() * SPARSE_SPAN_FACTOR
+        ),
+    );
+
+    // Scenario 8 claims `?serial=` takes the #160 pushdown arm (`sel = Some(..)`).
+    // `__rows_by_serial` is exactly what the generated handler calls to build it.
+    require(
+        "?serial=1 resolves through the index pushdown",
+        db.widget.__rows_by_serial("1").is_some(),
+        "expected Some(candidate rows) — a None falls through to the full scan",
+    );
+    // Scenario 4's pushdown half: a parseable value with no matches yields an
+    // EMPTY candidate set, so the gather runs on `&[]` (gotcha 7).
+    require(
+        "?serial=999 resolves to an empty pushdown selection",
+        db.widget.__rows_by_serial("999") == Some(Vec::new()),
+        "expected Some([]) — the empty-selection gather is what this covers",
+    );
+
+    // `as_of` is an opaque row-count watermark; at the live row count the snapshot
+    // read must return exactly what the live read does (scenario 9).
+    let widget_rows = db.widget.row_count();
+
+    let db = Arc::new(RwLock::new(db));
+    let router = || api::create_router(db.clone());
+
+    // Declaration order, NOT identity-first and NOT scan-set order: `scores`,
+    // `dims`, `owner`, `parts` and `payload` all sit between `checksum` and
+    // `serial`, and `parts` (a virtual `[Model]`, `()` in the record) is `null`.
+    let widget_a = concat!(
+        r#"{"id":"22222222-2222-2222-2222-222222222222","label":null,"price":"10.50","#,
+        r#""tier":"Free","made_at":"2026-01-02T03:04:05.678000Z","#,
+        r#""checksum":[0,1,254,255],"scores":[-1,0,7],"dims":{"w":3,"h":4},"#,
+        r#""owner":"11111111-1111-1111-1111-111111111111","parts":null,"#,
+        r#""payload":{"a":{"b":3,"y":2},"z":1},"serial":1}"#
+    );
+    let widget_b = concat!(
+        r#"{"id":"33333333-3333-3333-3333-333333333333","#,
+        r#""label":"quote \" tab \t ✓","price":"-0.001","#,
+        r#""tier":"Enterprise","made_at":"1999-12-31T23:59:59.999000Z","#,
+        r#""checksum":[9,9,9,9],"scores":[2,3,4],"dims":{"w":0,"h":65535},"#,
+        r#""owner":"11111111-1111-1111-1111-111111111111","parts":null,"#,
+        r#""payload":null,"serial":2}"#
+    );
+    // `id` is declared SECOND in `Note`, and the wire follows the declaration.
+    let note_a = r#"{"body":"first","id":"55555555-5555-5555-5555-555555555555","weight":1}"#;
+    let note_b = r#"{"body":"second","id":"66666666-6666-6666-6666-666666666666","weight":2}"#;
+    let churn_0 = r#"{"id":"77777777-0000-0000-0000-000000000000","note":"c-zero","seq":10}"#;
+    let churn_1 = r#"{"id":"77777777-1111-1111-1111-111111111111","note":"c-one","seq":20}"#;
+    let churn_2 = r#"{"id":"77777777-2222-2222-2222-222222222222","note":"c-two","seq":30}"#;
+
+    // --- Scenario 1: the wide model, every field class, key order included ---
+    let uri = "/api/widget?sort=serial";
+    let live_page = format!(r#"{{"data":[{widget_a},{widget_b}],"total":2,"limit":50,"offset":0}}"#);
+    check(uri, call(router(), uri).await, 200, &live_page);
+
+    // --- Scenario 2: identity field declared SECOND — no identity-first reorder ---
+    let uri = "/api/note?sort=weight";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{note_a},{note_b}],"total":2,"limit":50,"offset":0}}"#),
+    );
+
+    // --- Scenario 3: a json object stored with non-sorted keys ---
+    // Today's path is `read the stored text` → `from_str` → `Value` (BTreeMap) →
+    // re-serialize, which SORTS. `sort=made_at` is a non-pushdown sort, so this is
+    // a different arm from scenario 1's.
+    let uri = "/api/widget?sort=made_at";
+    let (status, body) = call(router(), uri).await;
+    check(
+        uri,
+        (status, body.clone()),
+        200,
+        &format!(r#"{{"data":[{widget_b},{widget_a}],"total":2,"limit":50,"offset":0}}"#),
+    );
+    require(
+        "json is emitted as a sorted object, not a string or a restructured value",
+        body.contains(r#""payload":{"a":{"b":3,"y":2},"z":1}"#)
+            && !body.contains(r#""payload":{"z":1"#),
+        &format!("expected a sorted json object for `payload`; got: {body}"),
+    );
+
+    // --- Scenario 4: a filter that eliminates every row ---
+    // Pushdown half: `Some([])` → the gather runs on an empty selection.
+    let uri = "/api/widget?serial=999";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        r#"{"data":[],"total":0,"limit":50,"offset":0}"#,
+    );
+    // Full-scan half: `sel = None`, every row decoded and rejected by `keep`.
+    let uri = "/api/widget?label=nope";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        r#"{"data":[],"total":0,"limit":50,"offset":0}"#,
+    );
+
+    // --- Scenario 5: offset beyond total — empty page, TRUE total ---
+    let uri = "/api/widget?sort=serial&offset=5";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        r#"{"data":[],"total":2,"limit":50,"offset":5}"#,
+    );
+
+    // --- Scenario 6: rows scattered across a churned table (gather_sparse) ---
+    let uri = "/api/churn?sort=seq";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(
+            r#"{{"data":[{churn_0},{churn_1},{churn_2}],"total":3,"limit":50,"offset":0}}"#
+        ),
+    );
+    // Pushdown over the same churned table: one candidate, far from row 0.
+    let uri = "/api/churn?seq=30";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_2}],"total":1,"limit":50,"offset":0}}"#),
+    );
+
+    // --- Scenario 7: descending sort — row ORDER unchanged ---
+    // The refs are built by buffer slot, then filtered, then reordered; after that
+    // a ref's position says nothing about its physical row. A `__slot`-to-row
+    // mis-mapping returns real rows in the wrong order, which no assertion on
+    // `total` catches — only the exact body does.
+    let uri = "/api/widget?sort=serial&order=desc";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_b},{widget_a}],"total":2,"limit":50,"offset":0}}"#),
+    );
+    // Sort then TRUNCATE: the surviving row is the one the sort moved to the front,
+    // so a mis-mapping shows up as the wrong single row rather than a wrong order.
+    let uri = "/api/widget?sort=serial&order=desc&limit=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_b}],"total":2,"limit":1,"offset":0}}"#),
+    );
+    // The hardest shape: descending sort + a mid-page slice over the SPARSE
+    // selection, where slot order, physical order and sorted order all differ.
+    let uri = "/api/churn?sort=seq&order=desc&limit=2&offset=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_1},{churn_0}],"total":3,"limit":2,"offset":1}}"#),
+    );
+
+    // --- Scenario 8: the #160 index-pushdown arm (`sel = Some(..)`) ---
+    let uri = "/api/widget?serial=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_a}],"total":1,"limit":50,"offset":0}}"#),
+    );
+    // The enum-keyed index is a second pushdown-eligible column.
+    let uri = "/api/widget?tier=Enterprise";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{widget_b}],"total":1,"limit":50,"offset":0}}"#),
+    );
+
+    // --- Scenario 9: `?as_of=` — the snapshot branch is a DIFFERENT arm ---
+    // Asserted against `live_page` itself, so "unchanged" means unchanged from the
+    // live read, not merely unchanged from a literal copied beside it.
+    let uri = &format!("/api/widget?as_of={widget_rows}&sort=serial");
+    check(uri, call(router(), uri).await, 200, &live_page);
+
+    // --- W1 (#281): the UNFILTERED, UNSORTED page — the fast path ---
+    //
+    // Every URI above carries `?sort=` or a field filter, so before this block the
+    // fast path was invisible to the byte guard: it could have been emitted, never
+    // taken, and every assertion here would still pass. These are the requests that
+    // reach it.
+    //
+    // Byte-identical to the sorted reads above, and that equality is the assertion
+    // rather than a fresh literal: `widget_a` is created before `widget_b` and
+    // `note_a` before `note_b`, so on this fixture physical order coincides with
+    // serial/weight order. That is convenient and it is also the caveat — these
+    // three URIs pin the BYTES and the WINDOW, not the ordering. Ordering is pinned
+    // where it can actually be discriminated: `tests/list_scan_test.rs` recomputes
+    // the physical order of a churned corpus independently, and
+    // `tests/page_identity_test.rs` compares the two construction sites over a
+    // 1,000-row corpus whose updates and deletes genuinely scramble it.
+    let uri = "/api/widget";
+    check(uri, call(router(), uri).await, 200, &live_page);
+    let uri = "/api/note";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{note_a},{note_b}],"total":2,"limit":50,"offset":0}}"#),
+    );
+    let uri = "/api/churn";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_0},{churn_1},{churn_2}],"total":3,"limit":50,"offset":0}}"#),
+    );
+
+    // The fast path's own pagination arithmetic. `offset` past the end and `limit`
+    // shorter than the page are where the clamping lives, and neither is expressible
+    // through any sorted URI above.
+    let uri = "/api/widget?limit=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        // `total` is the live-row count, NOT the page length — the envelope's
+        // pagination fields describe the window, `total` describes the set it is a
+        // window onto. A fast path that returned `__page.len()` here would look
+        // right on every unpaginated URI above.
+        &format!(r#"{{"data":[{widget_a}],"total":2,"limit":1,"offset":0}}"#),
+    );
+    let uri = "/api/widget?offset=5";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        r#"{"data":[],"total":2,"limit":50,"offset":5}"#,
+    );
+    let uri = "/api/churn?limit=2&offset=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_1},{churn_2}],"total":3,"limit":2,"offset":1}}"#),
+    );
+
+    // `?projection=` on a model that declares NO `@projection`. `#proj_list_block` is
+    // empty for such a model, so `projection` is an ordinary unknown key naming no
+    // filterable field: the predicate holds and the fast path is taken. Asserted
+    // against the bare URI's own answer, so "unchanged" means unchanged from the
+    // request it must equal. If a future change makes `projection` a predicate term,
+    // this silently starts returning the scan path's envelope with no compile error.
+    let uri = "/api/widget?projection=card";
+    check(uri, call(router(), uri).await, 200, &live_page);
+
+    // #281 S9: the non-scan, inline-string FK. `Item.vendor` is decoded through a
+    // different arm of `field_read_stmt` on the fast path than on the scan path, so
+    // a frozen literal is what says the two arms produce the same bytes.
+    let item_a = format!(r#"{{"id":"{ITEM_A}","sku":"sku-a","vendor":"acme"}}"#);
+    let item_b = format!(r#"{{"id":"{ITEM_B}","sku":"sku-b","vendor":"acme"}}"#);
+    let uri = "/api/item";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{item_a},{item_b}],"total":2,"limit":50,"offset":0}}"#),
+    );
+
+    // --- W2 (#281): `?as_of=` is a DIFFERENT arm, and the watermark must cut below
+    // the create count or the scenario cannot discriminate ---
+    //
+    // Scenario 9 above asserts the snapshot page EQUALS the live page, which is the
+    // right assertion there and is exactly why it cannot catch a fast-path branch
+    // hoisted above `match __as_of`: both sides would be the live page. `Churn` does
+    // not fix that by itself — it is churned with IDENTICAL values by construction,
+    // so at any watermark at or after the three creates the snapshot read is
+    // byte-identical to the live read. `as_of=2` cuts below the third create, so the
+    // two pages differ in ROW COUNT, and a hoist returns 3 rows where 2 are expected.
+    let uri = "/api/churn?as_of=2";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{churn_0},{churn_1}],"total":2,"limit":50,"offset":0}}"#),
+    );
+
+    // --- W3 (#281 S11): a model that legally declares `limit`/`offset`/`sort`/`order`
+    // as FIELDS — the only scenario separating the two predicate forms ---
+    //
+    // Every other scenario in this file passes under both the positive predicate
+    // ("does any key name a filterable field of this model?") and a negative
+    // reserved-key exclusion list. Here they differ: `?limit=1` names a real field of
+    // `Gauge`, so the filter must apply. Under the negative form the name is excluded,
+    // the fast path fires, and BOTH gauges come back.
+    //
+    // `?limit=1` is simultaneously a filter (set 1) and the page limit (set 3), and
+    // both behaviours are asserted — the row is filtered to `limit == 1` AND the
+    // envelope's `limit` is 1. Asserting only one documents half of what it proves.
+    let gauge_a =
+        format!(r#"{{"id":"{GAUGE_A}","limit":1,"offset":0,"sort":"none","order":"asc"}}"#);
+    let uri = "/api/gauge?limit=1";
+    check(
+        uri,
+        call(router(), uri).await,
+        200,
+        &format!(r#"{{"data":[{gauge_a}],"total":1,"limit":1,"offset":0}}"#),
+    );
+
+    let failures = unsafe { FAILURES };
+    if failures > 0 {
+        eprintln!("{failures} list-page wire mismatch(es)");
+        std::process::exit(1);
+    }
+    println!("all list-page wire-format checks passed");
 }
 "##;

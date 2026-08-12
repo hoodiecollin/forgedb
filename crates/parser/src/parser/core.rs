@@ -1,6 +1,7 @@
 use crate::ast::{
     ComponentProtocol, ComponentReference, CompositeIndex, Constraint, ConstraintParam, EnumDef,
     Field, FieldType, Model, Projection, RelationInclusion, RelationType, Schema, Struct,
+    TimestampPrecision,
 };
 use crate::lexer::{Lexer, Token, TokenWithPos};
 use forgedb_validation::{Position, ValidationError};
@@ -244,6 +245,170 @@ impl Parser {
         }
     }
 
+    /// The token after the cursor.
+    fn peek_token(&self) -> &Token {
+        self.tokens.get(self.position + 1).unwrap_or(&Token::Eof)
+    }
+
+    /// Is the cursor sitting on the contextual `bytes` type keyword (#233)?
+    ///
+    /// `bytes` is deliberately **not** a reserved word. Adding one would be a
+    /// larger break than the rename it serves: `bytes` is an ordinary noun for a
+    /// size, and reserving it turns `bytes: i32?` — a real column in the
+    /// Chinook-derived `music-store` example — into a parse error on a *minor*
+    /// version bump. So it lexes as [`Token::Ident`] and only means the type in
+    /// type position followed by `(`, the same lookahead trick the `tsx://` /
+    /// `jsx://` / `api://` component protocols already use.
+    ///
+    /// (The other type keywords — `string`, `timestamp`, `decimal`, … — *are*
+    /// reserved and cannot be field names. That is pre-existing and tracked
+    /// separately; this rename does not add to the problem.)
+    fn at_bytes_type(&self) -> bool {
+        matches!(self.current_token(), Token::Ident(name) if name == "bytes")
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `bytes ( N )` / `char ( N )` and return [`FieldType::Bytes`].
+    ///
+    /// The cursor must be on the type keyword. Emits the #233 deprecation warning
+    /// when the source spelling was `char`.
+    fn parse_bytes_type(&mut self) -> Result<FieldType, String> {
+        let deprecated = matches!(self.current_token(), Token::TypeCharDeprecated);
+        // Anchor the diagnostic at the keyword, not wherever the size parse ends.
+        let keyword_position = self.get_current_position();
+        let keyword = if deprecated { "char" } else { "bytes" };
+        self.advance();
+        self.expect(Token::LParen)?;
+        let size = match self.current_token() {
+            Token::Number(n) => *n as usize,
+            _ => {
+                return Err(format!(
+                    "Expected size after '{}(', found {:?}",
+                    keyword,
+                    self.current_token()
+                ))
+            }
+        };
+        self.advance();
+        self.expect(Token::RParen)?;
+        if deprecated {
+            self.warn(
+                format!(
+                    "`char({size})` is deprecated and will be removed in the next major version. \
+                     The type stores raw bytes — there is no UTF-8 guarantee and no text \
+                     semantics, unlike SQL's CHAR(N), which is fixed-length text. If this field \
+                     holds text, use `string` instead."
+                ),
+                keyword_position,
+                Some(format!("bytes({size})")),
+            );
+        }
+        Ok(FieldType::Bytes(size))
+    }
+
+    /// Is the cursor sitting on a **parameterized** `string`, i.e. `string (`?
+    ///
+    /// Unlike `bytes` (#233), `string` is a reserved word and already lexes as
+    /// [`Token::TypeString`], so this is not a contextual-keyword dance — there is
+    /// no field named `string` to protect and no corpus hazard. The lookahead is
+    /// only here to split `string` from `string(N)`: bare `string` must keep
+    /// meaning exactly what it meant (#238 res 10).
+    fn at_parameterized_string(&self) -> bool {
+        matches!(self.current_token(), Token::TypeString)
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `string ( N )` / `string ( N ! )` and return
+    /// [`FieldType::StringN`] (#238). The cursor must be on `string`.
+    ///
+    /// Res 7's `1 ≤ N ≤ 255` is enforced *here*, at the one place the literal is
+    /// read, because the AST carries N as a `u8` — every later site is handed a
+    /// width that cannot violate the cap rather than one it has to re-check.
+    fn parse_string_type(&mut self) -> Result<FieldType, String> {
+        // Anchor the diagnostic at the keyword, not wherever the width parse ends.
+        let keyword_position = self.get_current_position();
+        self.advance();
+        self.expect(Token::LParen)?;
+        let raw = match self.current_token() {
+            Token::Number(n) => *n,
+            _ => {
+                return Err(format!(
+                    "Expected a character count after 'string(', found {:?}",
+                    self.current_token()
+                ))
+            }
+        };
+        let chars = u8::try_from(raw).ok().filter(|n| *n >= 1).ok_or_else(|| {
+            let at = keyword_position
+                .map(|p| format!(" at line {}, column {}", p.line, p.column))
+                .unwrap_or_default();
+            format!(
+                "Inline string width must be between 1 and 255 characters, found {raw}{at}. \
+                 For an unbounded value use bare `string`."
+            )
+        })?;
+        self.advance();
+        // The `!` lives inside the parens, bound to the width — the width and its
+        // exactness are one fact about the column, so they are written as one.
+        let exact = if matches!(self.current_token(), Token::Bang) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        self.expect(Token::RParen)?;
+        Ok(FieldType::StringN { chars, exact })
+    }
+
+    /// Is the cursor sitting on a **parameterized** `timestamp`, i.e.
+    /// `timestamp (`?
+    ///
+    /// Same shape as [`Self::at_parameterized_string`] (#238) and for the same
+    /// reason: `timestamp` is a reserved word, so this is not a
+    /// contextual-keyword dance — the lookahead only splits `timestamp` from
+    /// `timestamp(<key>)` so the bare spelling keeps parsing where it always did.
+    fn at_parameterized_timestamp(&self) -> bool {
+        matches!(self.current_token(), Token::TypeTimestamp)
+            && matches!(self.peek_token(), Token::LParen)
+    }
+
+    /// Consume `timestamp ( s | ms | us )` and return [`FieldType::Timestamp`]
+    /// carrying the declared precision (#254). The cursor must be on
+    /// `timestamp`.
+    ///
+    /// The key arrives as a [`Token::Ident`] — none of `s`/`ms`/`us` is a
+    /// keyword, and none of them should become one. The closed set is validated
+    /// here, at the one place the lexeme is read, so no later site is ever handed
+    /// a precision the type system cannot express.
+    ///
+    /// This deliberately mirrors [`Self::parse_string_type`] rather than sharing
+    /// a helper with it: the two argument grammars have nothing in common (a
+    /// bounded integer versus a closed set of unit identifiers), so a shared
+    /// helper would be a parameter bag, not an abstraction.
+    fn parse_timestamp_type(&mut self) -> Result<FieldType, String> {
+        // Anchor the diagnostic at the keyword, not wherever the key parse ends.
+        let keyword_position = self.get_current_position();
+        self.advance();
+        self.expect(Token::LParen)?;
+        let key = match self.current_token() {
+            Token::Ident(name) => name.clone(),
+            other => format!("{other:?}"),
+        };
+        let precision = TimestampPrecision::from_key(&key).ok_or_else(|| {
+            let at = keyword_position
+                .map(|p| format!(" at line {}, column {}", p.line, p.column))
+                .unwrap_or_default();
+            format!(
+                "Unknown timestamp precision `{key}`{at}. The precisions are `s`, `ms` and \
+                 `us`; a bare `timestamp` means `timestamp(ms)`. Nanoseconds are not \
+                 offerable — the on-disk unit is microseconds."
+            )
+        })?;
+        self.advance();
+        self.expect(Token::RParen)?;
+        Ok(FieldType::Timestamp(precision))
+    }
+
     fn skip_newlines(&mut self) {
         while matches!(self.current_token(), Token::Newline) {
             self.advance();
@@ -304,7 +469,9 @@ impl Parser {
         // Expect @
         self.expect(Token::At)?;
 
-        // Parse constraint name
+        // Parse constraint name.  Anchor any diagnostic at the directive name, not
+        // wherever the parameter list happens to end (#235).
+        let constraint_position = self.get_current_position();
         let name = match self.current_token() {
             Token::Ident(s) => s.clone(),
             _ => {
@@ -329,9 +496,65 @@ impl Parser {
                         constraint = constraint.with_param(ConstraintParam::Number(*n));
                         self.advance();
                     }
-                    Token::Ident(s) => {
-                        constraint = constraint.with_param(ConstraintParam::String(s.clone()));
+                    Token::Fractional(s) => {
+                        constraint =
+                            constraint.with_param(ConstraintParam::Fractional(s.clone()));
                         self.advance();
+                    }
+                    // `>n` / `<n` — an exclusive bound (#239).  The operator is
+                    // structural here; whether this directive and this field type
+                    // may carry one is a semantic question, checked in `validate`.
+                    Token::Gt | Token::Lt => {
+                        let greater = matches!(self.current_token(), Token::Gt);
+                        let op = if greater { '>' } else { '<' };
+                        self.advance();
+                        let value = match self.current_token() {
+                            Token::Number(n) => ConstraintParam::Number(*n),
+                            Token::Fractional(s) => ConstraintParam::Fractional(s.clone()),
+                            other => {
+                                return Err(format!(
+                                    "Expected a number after '{op}' in constraint \
+                                     parameters, found {other:?}"
+                                ))
+                            }
+                        };
+                        self.advance();
+                        constraint = constraint.with_param(ConstraintParam::Exclusive {
+                            greater,
+                            value: Box::new(value),
+                        });
+                    }
+                    Token::Ident(s) => {
+                        let ident = s.clone();
+                        self.advance();
+                        // `name: value` (#235).  The colon-in-directive grammar
+                        // already exists for `@projection(name: a, b)`, but that is
+                        // parsed by a bespoke routine; this generalizes it to the
+                        // shared parameter loop so any directive can take named args.
+                        // Whether a given directive *accepts* them is a per-directive
+                        // question, checked after the loop.
+                        if matches!(self.current_token(), Token::Colon) {
+                            self.advance();
+                            let value = match self.current_token() {
+                                Token::Number(n) => ConstraintParam::Number(*n),
+                                Token::Fractional(s) => ConstraintParam::Fractional(s.clone()),
+                                Token::Str(s) => ConstraintParam::String(s.clone()),
+                                Token::Ident(s) => ConstraintParam::String(s.clone()),
+                                other => {
+                                    return Err(format!(
+                                        "Expected a value after '{ident}:' in constraint \
+                                         parameters, found {other:?}"
+                                    ))
+                                }
+                            };
+                            self.advance();
+                            constraint = constraint.with_param(ConstraintParam::Named {
+                                name: ident,
+                                value: Box::new(value),
+                            });
+                        } else {
+                            constraint = constraint.with_param(ConstraintParam::String(ident));
+                        }
                     }
                     Token::Str(s) => {
                         constraint = constraint.with_param(ConstraintParam::String(s.clone()));
@@ -371,10 +594,125 @@ impl Parser {
             }
         }
 
+        if constraint.name == "length" {
+            self.check_length_constraint(&constraint, constraint_position)?;
+        }
+
         Ok(constraint)
     }
 
+    /// Validate `@length`'s arguments and warn on the single-arg meaning change
+    /// (#235).
+    ///
+    /// This lives in the parser because it is where the argument *names* are known.
+    /// The codegen side filters parameters it does not recognize, so an unchecked
+    /// `@length(foo: 3)` would silently produce a field with no bound at all — a
+    /// constraint the schema declares and the database does not enforce. Rejecting
+    /// it here is the difference between a typo being caught and being ignored.
+    ///
+    /// The accepted surface:
+    ///
+    /// | spelling | meaning |
+    /// |---|---|
+    /// | `@length(min: n)` | at least n |
+    /// | `@length(max: n)` | at most n |
+    /// | `@length(min: a, max: b)` | between a and b |
+    /// | `@length(a, b)` | between a and b — unchanged |
+    /// | `@length(n)` | **exactly** n — changed from "at most n" |
+    fn check_length_constraint(
+        &mut self,
+        constraint: &Constraint,
+        position: Option<Position>,
+    ) -> Result<(), String> {
+        let named: Vec<(&str, &ConstraintParam)> = constraint
+            .params
+            .iter()
+            .filter_map(|p| match p {
+                ConstraintParam::Named { name, value } => Some((name.as_str(), value.as_ref())),
+                _ => None,
+            })
+            .collect();
+
+        if named.is_empty() {
+            // Positional.  Only the single-arg form changed meaning; the pair is
+            // kept first-class and says nothing.
+            if constraint.params.len() == 1
+                && matches!(constraint.params[0], ConstraintParam::Number(_))
+            {
+                let ConstraintParam::Number(n) = constraint.params[0] else {
+                    unreachable!("guarded by the matches! above")
+                };
+                self.warn(
+                    format!(
+                        "`@length({n})` now means an EXACT length of {n}; it previously meant a \
+                         maximum of {n}. Write `@length(max: {n})` to keep the old meaning, or \
+                         `@length({n})` deliberately to require exactly {n}."
+                    ),
+                    position,
+                    Some(format!("@length(max: {n})")),
+                );
+            }
+            return Ok(());
+        }
+
+        if named.len() != constraint.params.len() {
+            return Err(
+                "@length takes either positional numbers or named arguments, not both — \
+                 write `@length(min: a, max: b)`"
+                    .to_string(),
+            );
+        }
+
+        let (mut min, mut max) = (None, None);
+        for (name, value) in named {
+            let slot = match name {
+                "min" => &mut min,
+                "max" => &mut max,
+                other => {
+                    return Err(format!(
+                        "Unknown @length argument `{other}` — the accepted names are `min` and \
+                         `max`, as in `@length(min: 3, max: 64)`"
+                    ))
+                }
+            };
+            let ConstraintParam::Number(n) = value else {
+                return Err(format!(
+                    "@length argument `{name}` must be a number, as in `@length({name}: 20)`"
+                ));
+            };
+            if slot.is_some() {
+                return Err(format!("duplicate @length argument `{name}`"));
+            }
+            *slot = Some(*n);
+        }
+
+        if let (Some(lo), Some(hi)) = (min, max)
+            && lo > hi
+        {
+            return Err(format!(
+                "@length min ({lo}) is greater than max ({hi}) — no value can satisfy it"
+            ));
+        }
+
+        Ok(())
+    }
+
     fn parse_type(&mut self) -> Result<FieldType, String> {
+        // `bytes(N)` is contextual and arrives as an identifier, so it has to be
+        // claimed before the `Token::Ident` arm below reads it as a struct name.
+        if self.at_bytes_type() {
+            return self.parse_bytes_type();
+        }
+        // `string(N)` needs no such rescue — `string` is reserved — but it does
+        // need claiming before the bare-`string` arm in `parse_primitive_type`.
+        if self.at_parameterized_string() {
+            return self.parse_string_type();
+        }
+        // `timestamp(<key>)` — the same claim, for the same reason (#254).
+        if self.at_parameterized_timestamp() {
+            return self.parse_timestamp_type();
+        }
+
         // Check for relation types first
         match self.current_token() {
             // Fixed array or One-to-many: [type; count] or [Post]
@@ -383,6 +721,25 @@ impl Parser {
 
                 // Check if this is a fixed array [type; count] or one-to-many [Model]
                 let first_token = self.current_token().clone();
+
+                // `[bytes(20); 5]` — claim the contextual keyword before the
+                // `Token::Ident` arm treats it as a struct name (#233).
+                if self.at_bytes_type() {
+                    let inner_type = self.parse_bytes_type()?;
+                    self.expect(Token::Semicolon)?;
+                    let count = match self.current_token() {
+                        Token::Number(n) => *n as usize,
+                        _ => {
+                            return Err(format!(
+                                "Expected array count, found {:?}",
+                                self.current_token()
+                            ))
+                        }
+                    };
+                    self.advance();
+                    self.expect(Token::RBracket)?;
+                    return Ok(FieldType::FixedArray(Box::new(inner_type), count));
+                }
 
                 match first_token {
                     Token::Ident(name) => {
@@ -462,6 +819,12 @@ impl Parser {
             // Optional reference or nullable primitive: ?User  or  ?i32
             Token::Question => {
                 self.advance();
+                // `?bytes(3)` — claim the contextual keyword before the
+                // `Token::Ident` arm reads it as an optional model ref (#233).
+                if self.at_bytes_type() {
+                    let inner = self.parse_bytes_type()?;
+                    return Ok(FieldType::Nullable(Box::new(inner)));
+                }
                 match self.current_token().clone() {
                     Token::Ident(name) => {
                         self.advance();
@@ -479,7 +842,7 @@ impl Parser {
                     | Token::TypeTimestamp
                     | Token::TypeJson
                     | Token::TypeDecimal
-                    | Token::TypeChar => {
+                    | Token::TypeCharDeprecated => {
                         let inner = self.parse_primitive_type()?;
                         return Ok(FieldType::Nullable(Box::new(inner)));
                     }
@@ -544,27 +907,23 @@ impl Parser {
             Token::TypeI64 => FieldType::I64,
             Token::TypeF64 => FieldType::F64,
             Token::TypeBool => FieldType::Bool,
+            // `string(N)` is the parameterized form (#238); bare `string` falls
+            // through to the variable-storage type below, unchanged (res 10).
+            Token::TypeString if matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_string_type()
+            }
             Token::TypeString => FieldType::String,
             Token::TypeJson => FieldType::Json,
             Token::TypeDecimal => FieldType::Decimal,
             Token::TypeUuid => FieldType::Uuid,
-            Token::TypeTimestamp => FieldType::Timestamp,
-            Token::TypeChar => {
-                // char(N) - expect (N)
-                self.advance();
-                self.expect(Token::LParen)?;
-                let size = match self.current_token() {
-                    Token::Number(n) => *n as usize,
-                    _ => {
-                        return Err(format!(
-                            "Expected size after 'char(', found {:?}",
-                            self.current_token()
-                        ))
-                    }
-                };
-                self.advance();
-                self.expect(Token::RParen)?;
-                return Ok(FieldType::Char(size));
+            Token::TypeTimestamp if matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_timestamp_type()
+            }
+            Token::TypeTimestamp => FieldType::Timestamp(TimestampPrecision::default()),
+            Token::TypeCharDeprecated => return self.parse_bytes_type(),
+            // The contextual `bytes(N)` spelling arrives as an identifier (#233).
+            Token::Ident(name) if name == "bytes" && matches!(self.peek_token(), Token::LParen) => {
+                return self.parse_bytes_type()
             }
             _ => return Err(format!("Expected type, found {:?}", self.current_token())),
         };
@@ -768,11 +1127,12 @@ impl Parser {
                 | FieldType::F64
                 | FieldType::Bool
                 | FieldType::String
+                | FieldType::StringN { .. }
                 | FieldType::Json
                 | FieldType::Decimal
                 | FieldType::Uuid
-                | FieldType::Timestamp
-                | FieldType::Char(_)
+                | FieldType::Timestamp(_)
+                | FieldType::Bytes(_)
                 | FieldType::FixedArray(_, _) => {
                     let inner = field_type.clone();
                     self.advance();
@@ -1163,10 +1523,21 @@ impl Parser {
 
     /// Parse the input into a [`Schema`], running the full positioned semantic
     /// validation ([`crate::validate::validate_schema`]) and failing fast on the
-    /// first diagnostic to preserve the historical `Result<Schema, String>`
+    /// first **error** to preserve the historical `Result<Schema, String>`
     /// contract. Naming diagnostics are gated by the parser's `use_validation`
     /// flag (see [`Self::new_with_validation`]); structural/reference diagnostics
     /// always run.
+    ///
+    /// Non-fatal diagnostics (#237) do **not** fail the parse. They are moved into
+    /// the warning buffer, so a caller on this fail-fast path still surfaces them
+    /// via [`Self::warnings`] / [`Self::take_warnings`] — which is exactly what
+    /// `forgedb generate` does.
+    ///
+    /// This partitioning is load-bearing (#258). `Severity` shipped with no
+    /// emitters, so until the first `validate_schema` warning existed nothing
+    /// exercised this path — and the old `errors.first()` would have turned that
+    /// warning into a hard parse failure, which is a removal rather than a
+    /// deprecation. Any new advisory must stay non-fatal here.
     pub fn parse(&mut self) -> Result<Schema, String> {
         let schema = self.parse_unvalidated()?;
 
@@ -1176,9 +1547,12 @@ impl Parser {
         }
         crate::validate::collect_structure_errors(&schema, &mut errors);
 
-        if let Some(first) = errors.first() {
+        if let Some(first) = errors.iter().find(|d| !d.is_warning()) {
             return Err(first.to_string());
         }
+        // No error: keep the advisories on the warning channel rather than
+        // dropping them. `parse_unvalidated` cleared the buffer for this run.
+        self.warnings.extend(errors.into_iter().filter(|d| d.is_warning()));
 
         Ok(schema)
     }
@@ -1585,6 +1959,195 @@ mod tests {
         );
     }
 
+    // ---- #235: named `@length` arguments -------------------------------------
+    //
+    // The accepted surface (decided on the issue 2026-08-03):
+    //
+    //   @length(min: 1)          min only  — inexpressible before this
+    //   @length(max: 20)         max only  — the new spelling for the old @length(20)
+    //   @length(min: 3, max: 5)  both
+    //   @length(3, 5)            min 3, max 5 — UNCHANGED, kept first-class
+    //   @length(3)               EXACT (min = max = 3) — a BREAKING meaning change
+    //
+    // The single-arg change is silent at every other layer — it still parses, still
+    // compiles, and only shows up as a 422 at write time — so the warning is the
+    // only signal a reader gets. That is why it is asserted here, not just the shape.
+
+    /// The named form reaches the AST as `Named`, in each combination.
+    #[test]
+    fn length_accepts_named_arguments() {
+        for (src_args, expected) in [
+            (
+                "min: 1",
+                vec![ConstraintParam::Named {
+                    name: "min".to_string(),
+                    value: Box::new(ConstraintParam::Number(1)),
+                }],
+            ),
+            (
+                "max: 20",
+                vec![ConstraintParam::Named {
+                    name: "max".to_string(),
+                    value: Box::new(ConstraintParam::Number(20)),
+                }],
+            ),
+            (
+                "min: 3, max: 64",
+                vec![
+                    ConstraintParam::Named {
+                        name: "min".to_string(),
+                        value: Box::new(ConstraintParam::Number(3)),
+                    },
+                    ConstraintParam::Named {
+                        name: "max".to_string(),
+                        value: Box::new(ConstraintParam::Number(64)),
+                    },
+                ],
+            ),
+            // Order is preserved but not required — `max:` first is equally valid.
+            (
+                "max: 64, min: 3",
+                vec![
+                    ConstraintParam::Named {
+                        name: "max".to_string(),
+                        value: Box::new(ConstraintParam::Number(64)),
+                    },
+                    ConstraintParam::Named {
+                        name: "min".to_string(),
+                        value: Box::new(ConstraintParam::Number(3)),
+                    },
+                ],
+            ),
+        ] {
+            let src = format!(
+                "Thing {{\n  id: +uuid\n  name: string @length({src_args})\n}}\n"
+            );
+            let mut parser = Parser::new(&src).unwrap();
+            let schema = parser
+                .parse()
+                .unwrap_or_else(|e| panic!("`@length({src_args})` must parse: {e}"));
+            let cons = field_constraints(&schema, "Thing", "name");
+            assert_eq!(cons[0].params, expected, "for `@length({src_args})`");
+            assert!(
+                parser.warnings().is_empty(),
+                "the named form is the recommended spelling and must be silent: {:?}",
+                parser.warnings()
+            );
+        }
+    }
+
+    /// Two-arg positional is kept first-class, not deprecated: same AST as before,
+    /// and no warning.
+    #[test]
+    fn length_positional_pair_is_unchanged_and_silent() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(3, 5)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let schema = parser.parse().unwrap();
+        let cons = field_constraints(&schema, "Thing", "name");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::Number(3), ConstraintParam::Number(5)]
+        );
+        assert!(
+            parser.warnings().is_empty(),
+            "the positional pair keeps working with no diagnostic: {:?}",
+            parser.warnings()
+        );
+    }
+
+    /// Single-arg `@length(N)` changed meaning from `max: N` to exact `N`. It still
+    /// parses, so the warning is the only thing that tells a reader their field's
+    /// validation just narrowed.
+    #[test]
+    fn length_single_arg_warns_that_it_now_means_exact() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(20)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let schema = parser.parse().expect("it must still parse");
+        let cons = field_constraints(&schema, "Thing", "name");
+        assert_eq!(
+            cons[0].params,
+            vec![ConstraintParam::Number(20)],
+            "the AST is unchanged — the meaning moved, not the shape"
+        );
+
+        let warnings = parser.take_warnings();
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        let w = &warnings[0];
+        assert!(w.is_warning(), "a meaning change is not a parse error");
+        // Both replacement spellings must be named: one to keep the old behavior,
+        // one to adopt the new. A warning that only says "this changed" leaves the
+        // reader to guess which way to go.
+        assert!(
+            w.message.contains("max: 20"),
+            "the warning must name the spelling that preserves the old meaning: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("exact"),
+            "the warning must say what it means now: {}",
+            w.message
+        );
+        assert!(w.position.is_some(), "the diagnostic is anchored in the source");
+    }
+
+    /// The named form is validated at parse time, where the argument names are
+    /// known. Each of these would otherwise be silently dropped by the codegen
+    /// filter and produce a field with no bound at all.
+    #[test]
+    fn length_rejects_malformed_named_arguments() {
+        for (args, expected_fragment) in [
+            ("foo: 3", "min"),
+            ("min: 1, min: 2", "duplicate"),
+            ("min: 5, max: 3", "min"),
+            ("1, max: 2", "positional"),
+            ("min: \"x\"", "number"),
+        ] {
+            let src = format!(
+                "Thing {{\n  id: +uuid\n  name: string @length({args})\n}}\n"
+            );
+            let err = Parser::new(&src)
+                .unwrap()
+                .parse()
+                .expect_err(&format!("`@length({args})` must be rejected"));
+            assert!(
+                err.to_lowercase().contains(expected_fragment),
+                "`@length({args})` error should mention {expected_fragment:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The colon grammar must also work on the recovering path the LSP uses — that
+    /// path re-enters the same parameter loop, so a form that parses in one and not
+    /// the other would show as a phantom editor diagnostic on valid source.
+    #[test]
+    fn length_named_arguments_survive_parse_recover() {
+        let src = r#"
+            Thing {
+                id: +uuid
+                name: string @length(min: 3, max: 64)
+            }
+        "#;
+        let mut parser = Parser::new(src).unwrap();
+        let parsed = parser.parse_recover();
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.is_warning()),
+            "valid source must produce no errors on the recovering path: {:?}",
+            parsed.diagnostics
+        );
+        let cons = field_constraints(&parsed.schema, "Thing", "name");
+        assert_eq!(cons[0].params.len(), 2, "both named args survive recovery");
+    }
+
     #[test]
     fn parses_enum_and_enum_typed_fields() {
         // A top-level enum declaration, a field referencing it by bare name (the
@@ -1919,5 +2482,338 @@ B
         assert!(p.parse().is_ok(), "a warning never fails a parse");
         assert_eq!(p.warnings().len(), 1);
         assert!(p.warnings()[0].is_warning());
+    }
+
+    /// A warning produced by `validate_schema` (not by the parser's own buffer)
+    /// must also stay non-fatal on the fail-fast path (#258).
+    ///
+    /// `Severity` shipped with no emitters, so this path was never exercised: the
+    /// old `errors.first()` took the first diagnostic of ANY severity, which would
+    /// have turned the first semantic advisory into a hard parse failure — and
+    /// `forgedb generate` parses through here, so every affected schema would have
+    /// stopped generating. That is a removal, not a deprecation.
+    #[test]
+    fn fail_fast_parse_does_not_fail_on_a_validate_schema_warning() {
+        // `&` on the identity is redundant → advisory (#258).
+        let mut p = Parser::new("Thing {\n  id: &+uuid\n  name: string\n}\n").unwrap();
+        let schema = p.parse().expect("a redundant modifier is valid, not an error");
+        assert_eq!(schema.models.len(), 1);
+
+        let warnings = p.take_warnings();
+        assert_eq!(warnings.len(), 1, "surfaced, not dropped: {warnings:?}");
+        assert!(warnings[0].is_warning());
+        assert!(warnings[0].message.contains("has no effect"));
+    }
+
+    /// The partition keys on severity, not on position in the list: a real error
+    /// still fails even when an advisory was collected first.
+    #[test]
+    fn fail_fast_parse_still_fails_on_an_error_beside_a_warning() {
+        // `Thing` warns (redundant `&`); `Bad` is a hard error (no identity).
+        let mut p =
+            Parser::new("Thing {\n  id: &+uuid\n}\n\nBad {\n  name: string\n}\n").unwrap();
+        let err = p.parse().expect_err("the missing identity is still fatal");
+        assert!(err.contains("no identity field"), "reported the error, not the warning: {err}");
+    }
+
+    // ---- #233: `char(n)` → `bytes(n)` ---------------------------------------
+    //
+    // The first real producer on the #237 channel. Both spellings must reach the
+    // *same* `FieldType::Bytes`, in every type position, with a warning on
+    // exactly the deprecated one.
+
+    /// Parse a single-model schema and return `(field_type, warnings)`.
+    fn parse_field(src: &str, field: &str) -> (FieldType, Vec<ValidationError>) {
+        let mut p = Parser::new(src).unwrap();
+        let schema = p.parse().expect("schema parses");
+        let ty = schema
+            .models
+            .iter()
+            .flat_map(|m| &m.fields)
+            .find(|f| f.name == field)
+            .unwrap_or_else(|| panic!("field `{field}` not found"))
+            .field_type
+            .clone();
+        (ty, p.take_warnings())
+    }
+
+    /// The canonical spelling parses clean — no diagnostic of any severity.
+    #[test]
+    fn bytes_parses_without_a_diagnostic() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: bytes(3)\n}\n", "code");
+        assert_eq!(ty, FieldType::Bytes(3));
+        assert!(warnings.is_empty(), "canonical spelling is silent: {warnings:?}");
+    }
+
+    /// The deprecated spelling reaches the identical AST, and warns exactly once
+    /// — positioned at the `char` keyword, and naming the replacement.
+    #[test]
+    fn char_parses_to_bytes_and_warns_once() {
+        // 1: T {   2:   id: +uuid   3:   code: char(3)
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: char(3)\n}\n", "code");
+        assert_eq!(ty, FieldType::Bytes(3), "same AST as `bytes(3)`");
+        assert_eq!(warnings.len(), 1, "exactly one diagnostic: {warnings:?}");
+
+        let w = &warnings[0];
+        assert!(w.is_warning(), "a deprecation is never an error");
+        assert_eq!(
+            w.position.map(|p| (p.line, p.column)),
+            Some((3, 9)),
+            "anchored at the `char` keyword, not the size or the field name"
+        );
+        assert_eq!(
+            w.suggestion.as_deref(),
+            Some("bytes(3)"),
+            "the suggestion carries the size, so a quick-fix can apply it verbatim"
+        );
+    }
+
+    /// The deprecation reaches *inside* the compound type positions, not just a
+    /// bare field type. Each is a separate parse path in `parse_type`.
+    #[test]
+    fn char_warns_in_every_type_position() {
+        for (src_type, expected) in [
+            ("char(2)?", FieldType::Nullable(Box::new(FieldType::Bytes(2)))),
+            ("?char(4)", FieldType::Nullable(Box::new(FieldType::Bytes(4)))),
+            (
+                "[char(8); 2]",
+                FieldType::FixedArray(Box::new(FieldType::Bytes(8)), 2),
+            ),
+            ("^&char(5)", FieldType::Bytes(5)),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert_eq!(warnings.len(), 1, "`{src_type}` warns exactly once");
+        }
+    }
+
+    /// `^` / `&` are parsed before the type, so a deprecation inside a modified
+    /// field must not eat them.
+    #[test]
+    fn char_deprecation_preserves_modifiers() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  key: ^&char(5)\n}\n").unwrap();
+        let schema = p.parse().expect("parses");
+        let f = schema.models[0]
+            .fields
+            .iter()
+            .find(|f| f.name == "key")
+            .unwrap();
+        assert!(f.indexed && f.unique, "`^` and `&` survive the warning");
+        assert_eq!(p.warnings().len(), 1);
+    }
+
+    /// `bytes` is **contextual**, not reserved: it stays usable as a field name.
+    /// The Chinook-derived `music-store` example has exactly this column, so
+    /// reserving the word would have turned a valid schema into a parse error on
+    /// a minor version bump.
+    #[test]
+    fn bytes_is_still_a_valid_field_name() {
+        let (ty, warnings) = parse_field(
+            "T {\n  id: +uuid\n  bytes: i32?\n  blob: bytes(4)\n}\n",
+            "bytes",
+        );
+        assert_eq!(ty, FieldType::Nullable(Box::new(FieldType::I32)));
+        assert!(warnings.is_empty());
+
+        let (blob, _) = parse_field(
+            "T {\n  id: +uuid\n  bytes: i32?\n  blob: bytes(4)\n}\n",
+            "blob",
+        );
+        assert_eq!(
+            blob,
+            FieldType::Bytes(4),
+            "the type still resolves in the same schema as the field name"
+        );
+    }
+
+    /// Bare `bytes` with no size is not the type — it falls through to the
+    /// struct-reference path, exactly as any other unknown bare identifier does.
+    /// This is what keeps the contextual keyword from swallowing real names.
+    #[test]
+    fn bare_bytes_without_a_size_is_not_the_type() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes\n}\n").unwrap();
+        // Unresolvable as a struct, so validation rejects it — the point is that
+        // it was never parsed as `FieldType::Bytes`.
+        assert!(p.parse().is_err(), "a sizeless `bytes` is not a type");
+    }
+
+    // ---- #238: `string(N)` / `string(N!)` -----------------------------------
+    //
+    // A fixed-width inline string column. `N` counts CHARACTERS (res 3), capped
+    // at 255 (res 7) — which the AST makes a type-level fact by carrying a `u8`,
+    // so the range check happens exactly once, here. `!` is a brand-new token
+    // meaning *exactly N* (res 2); it never appeared in the language before.
+
+    /// The at-most-N spelling.
+    #[test]
+    fn string_n_parses_to_the_inexact_variant() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  slug: string(64)\n}\n", "slug");
+        assert_eq!(ty, FieldType::StringN { chars: 64, exact: false });
+        assert!(warnings.is_empty(), "no diagnostic for a well-formed width: {warnings:?}");
+    }
+
+    /// The exactly-N spelling. `!` binds to the width, inside the parens.
+    #[test]
+    fn string_n_bang_parses_to_the_exact_variant() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  code: string(26!)\n}\n", "code");
+        assert_eq!(ty, FieldType::StringN { chars: 26, exact: true });
+        assert!(warnings.is_empty(), "no diagnostic: {warnings:?}");
+    }
+
+    /// Res 7's bound is enforced at the point the `u8` is constructed, so no
+    /// downstream site can ever be handed an over-wide N. Zero is refused for the
+    /// same reason: a column that can hold nothing is never what was meant.
+    #[test]
+    fn string_n_width_is_bounded_at_the_parse() {
+        for src in ["string(0)", "string(256)", "string(1000)", "string(0!)", "string(256!)"] {
+            let schema = format!("T {{\n  id: +uuid\n  f: {src}\n}}\n");
+            let mut p = Parser::new(&schema).unwrap();
+            let err = p.parse().expect_err("`{src}` must not parse");
+            assert!(
+                err.contains("between 1 and 255"),
+                "`{src}` names the admissible range, got: {err}"
+            );
+        }
+    }
+
+    /// A negative width never reaches the range check — the lexer reads `-1` as a
+    /// number, so the diagnostic still has to name the range rather than report a
+    /// type mismatch.
+    #[test]
+    fn string_n_rejects_a_negative_width() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: string(-1)\n}\n").unwrap();
+        let err = p.parse().expect_err("a negative width must not parse");
+        assert!(err.contains("between 1 and 255"), "got: {err}");
+    }
+
+    /// Res 10's regression guard: bare `string` is untouched — still the
+    /// variable-storage type, in every position.
+    #[test]
+    fn bare_string_is_unchanged() {
+        for (src_type, expected) in [
+            ("string", FieldType::String),
+            ("string?", FieldType::Nullable(Box::new(FieldType::String))),
+            ("?string", FieldType::Nullable(Box::new(FieldType::String))),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` is still bare `string`");
+            assert!(warnings.is_empty());
+        }
+    }
+
+    /// `string(N)` reaches every compound type position, each of which is a
+    /// separate arm of `parse_type`.
+    #[test]
+    fn string_n_parses_in_every_type_position() {
+        for (src_type, expected) in [
+            ("string(8)?", FieldType::Nullable(Box::new(FieldType::StringN { chars: 8, exact: false }))),
+            ("?string(8)", FieldType::Nullable(Box::new(FieldType::StringN { chars: 8, exact: false }))),
+            ("string(4!)?", FieldType::Nullable(Box::new(FieldType::StringN { chars: 4, exact: true }))),
+            ("^&string(5!)", FieldType::StringN { chars: 5, exact: true }),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert!(warnings.is_empty(), "`{src_type}`: {warnings:?}");
+        }
+    }
+
+    /// `!` is a new token and it is claimed by exactly one grammar production. A
+    /// stray one is a positioned parse error, not a silently skipped character —
+    /// which is what it would be if the lexer had no arm for it at all.
+    #[test]
+    fn a_stray_bang_is_a_parse_error() {
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: !string\n}\n").unwrap();
+        assert!(p.parse().is_err(), "`!` outside `string(N!)` is not a modifier");
+
+        let mut p = Parser::new("T {\n  id: +uuid\n  f: bytes(3!)\n}\n").unwrap();
+        assert!(p.parse().is_err(), "`!` is not admitted by `bytes(N)`");
+    }
+
+    // ---- #254: `timestamp(s|ms|us)` -----------------------------------------
+    //
+    // Precision is a property of the TYPE, not of the field, so it survives
+    // `?` and `[T; N]`. Storage stays microseconds whatever is declared; the key
+    // is the allocation quantum and the guarantee about stored values.
+
+    /// Scenario 10 — a bare `timestamp` is `timestamp(ms)`. The default lives on
+    /// `TimestampPrecision`, so no site has to remember the rule.
+    #[test]
+    fn a_bare_timestamp_is_millis() {
+        let (ty, warnings) = parse_field("T {\n  id: +uuid\n  at: timestamp\n}\n", "at");
+        assert_eq!(ty, FieldType::Timestamp(TimestampPrecision::Millis));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Scenario 11a — each declared key reaches the matching precision.
+    #[test]
+    fn each_precision_key_parses() {
+        for (key, expected) in [
+            ("s", TimestampPrecision::Seconds),
+            ("ms", TimestampPrecision::Millis),
+            ("us", TimestampPrecision::Micros),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  at: timestamp({key})\n}}\n");
+            let (ty, warnings) = parse_field(&src, "at");
+            assert_eq!(ty, FieldType::Timestamp(expected), "timestamp({key})");
+            assert!(warnings.is_empty(), "timestamp({key}): {warnings:?}");
+        }
+    }
+
+    /// Scenario 11b — anything else is a positioned parse error that NAMES the
+    /// three keys. `ns` is the one someone will actually try, and it is bounded
+    /// out by the microsecond storage unit rather than merely unimplemented.
+    #[test]
+    fn an_unknown_precision_key_names_the_three_that_exist() {
+        for bad in ["ns", "seconds", "millis", "S", "MS", "us2", "micro"] {
+            let src = format!("T {{\n  id: +uuid\n  at: timestamp({bad})\n}}\n");
+            let mut p = Parser::new(&src).unwrap();
+            let err = p.parse().expect_err("timestamp({bad}) must not parse");
+            assert!(
+                err.contains("`s`") && err.contains("`ms`") && err.contains("`us`"),
+                "timestamp({bad}) must name the three admissible keys, got: {err}"
+            );
+        }
+        // An empty or non-identifier argument is also refused, and refused with
+        // the same message — there is one thing that can go in those parens.
+        for src_type in ["timestamp()", "timestamp(1)", "timestamp(us!)"] {
+            let src = format!("T {{\n  id: +uuid\n  at: {src_type}\n}}\n");
+            let mut p = Parser::new(&src).unwrap();
+            assert!(p.parse().is_err(), "`{src_type}` must not parse");
+        }
+    }
+
+    /// Precision survives every compound type position, which is the whole
+    /// reason it rides in the variant rather than on `Field`.
+    #[test]
+    fn precision_survives_every_type_position() {
+        for (src_type, expected) in [
+            (
+                "timestamp(us)?",
+                FieldType::Nullable(Box::new(FieldType::Timestamp(TimestampPrecision::Micros))),
+            ),
+            (
+                "?timestamp(s)",
+                FieldType::Nullable(Box::new(FieldType::Timestamp(TimestampPrecision::Seconds))),
+            ),
+            (
+                "^timestamp(us)",
+                FieldType::Timestamp(TimestampPrecision::Micros),
+            ),
+            (
+                "[timestamp(us); 3]",
+                FieldType::FixedArray(
+                    Box::new(FieldType::Timestamp(TimestampPrecision::Micros)),
+                    3,
+                ),
+            ),
+        ] {
+            let src = format!("T {{\n  id: +uuid\n  f: {src_type}\n}}\n");
+            let (ty, warnings) = parse_field(&src, "f");
+            assert_eq!(ty, expected, "`{src_type}` reaches the right AST");
+            assert!(warnings.is_empty(), "`{src_type}`: {warnings:?}");
+        }
     }
 }

@@ -135,8 +135,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-forgedb-storage = "0.2"
-forgedb-types = "0.2"
+forgedb-storage = "0.3"
+forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
 forgedb-wal = "0.2"
 forgedb-auth = {{ version = "0.2", features = ["jwks-http"] }}
@@ -152,7 +152,7 @@ utoipa = {{ version = "5", features = ["uuid"] }}
 utoipa-axum = "0.2"
 axum = {{ version = "0.8", features = ["ws"] }}
 tokio = {{ version = "1", features = ["full"] }}
-tower-http = {{ version = "0.6", features = ["trace"] }}
+tower-http = {{ version = "0.6", features = ["trace", "cors"] }}
 tracing = "0.1"
 tracing-subscriber = {{ version = "0.3", features = ["env-filter", "json"] }}
 "#,
@@ -186,6 +186,21 @@ mod api;
 //   FORGEDB_PORT         bind port (default: 3000)
 //   FORGEDB_SHUTDOWN_TIMEOUT  max seconds to drain in-flight requests on
 //                        SIGINT/SIGTERM before forcing exit (default: 0 = unbounded)
+//   FORGEDB_CORS_ORIGINS comma-separated origins allowed to call this API from a
+//                        browser on a different origin — e.g.
+//                        `https://app.example,https://staging.app.example`, or a
+//                        single `*` for a deliberately public API. Unset (the
+//                        default) emits no CORS layer at all, so a cross-origin
+//                        browser call is blocked by the browser; the generated
+//                        TypeScript SDK is fetch-based, so set this whenever the
+//                        page and the API are not same-origin. An unparseable
+//                        value refuses to start rather than silently serving with
+//                        CORS closed. NOTE: this covers the HTTP routes. The
+//                        WebSocket routes (/subscribe, /live-query, /replicate)
+//                        are checked against the SAME list by the handlers,
+//                        because browsers neither preflight nor CORS-enforce a
+//                        handshake — so with this unset they stay reachable from
+//                        any origin, which is the pre-existing behavior.
 //
 // Verify-only JWT tenant guard (enabled when FORGEDB_JWT_PUBKEY is set):
 //   FORGEDB_JWT_PUBKEY   path to the IdP's PEM public key (verification key)
@@ -236,12 +251,32 @@ async fn main() {
         database::Database::open_at(data_dir),
     ));
 
+    // Cross-origin policy (#140) is deployment identity, not a generate-time
+    // decision: the same binary is promoted to localhost, staging and production
+    // with different allowed origins. So it is read here, at process start, and
+    // never baked into the generated code. Fail closed and LOUD on a malformed
+    // value — serving with CORS silently shut would present to the developer as
+    // "the browser is blocking me" with nothing on the server side to explain it,
+    // which is the exact no-diagnostic failure this knob exists to remove. Same
+    // stance as `build_authenticator`'s refusal to start unauthenticated.
+    let cors_origins = match std::env::var("FORGEDB_CORS_ORIGINS") {
+        Ok(raw) => match api::parse_origins(&raw) {
+            Ok(origins) => origins,
+            Err(e) => panic!("FORGEDB_CORS_ORIGINS is invalid: {e} — refusing to start"),
+        },
+        Err(_) => None,
+    };
+    if let Some(list) = &cors_origins {
+        tracing::info!(origins = ?list, "CORS enabled for the HTTP and WebSocket routes");
+    }
+    let http_opts = api::HttpOptions { allowed_origins: cors_origins };
+
     let router = match build_authenticator(tenant.as_deref()) {
         Some(auth) => {
             tracing::info!(tenant = ?tenant, "JWT tenant guard enabled");
-            api::create_router_with_auth(db, std::sync::Arc::new(auth))
+            api::create_router_with_auth_and_options(db, std::sync::Arc::new(auth), http_opts)
         }
-        None => api::create_router(db),
+        None => api::create_router_with_options(db, http_opts),
     };
 
     let addr = format!("{host}:{port}");

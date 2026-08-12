@@ -21,7 +21,7 @@ pub struct Account {
     pub metadata: serde_json::Value,
     pub bio: Option<String>,
     pub login_count: u64,
-    pub created_at: i64,
+    pub created_at: String,
     pub projects: serde_json::Value,
 }
 /// Input to `create_account` — a `Account` without the fields the server
@@ -74,7 +74,7 @@ pub struct ProjectCard {
 pub struct AuditEvent {
     pub id: String,
     pub kind: String,
-    pub at: i64,
+    pub at: String,
 }
 /// Input to `create_audit_event` — a `AuditEvent` without the fields the server
 /// synthesizes (`+uuid`/`+timestamp` autos).

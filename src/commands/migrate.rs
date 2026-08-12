@@ -30,6 +30,20 @@ pub struct MigrateRunOptions {
     pub bin_dir: Option<PathBuf>,
 }
 
+/// Options for `forgedb migrate engine` (#254): the ForgeDB **byte-format**
+/// migration, orthogonal to the schema-version transformer above.
+pub struct MigrateEngineOptions {
+    /// Source data directory (stamped at the old engine generation).
+    pub src: PathBuf,
+    /// Destination directory to materialize (must not exist / be empty).
+    pub dest: PathBuf,
+    /// Schema file (default: auto-discovered `schema.forge`). An engine bump
+    /// changes no `.forge`, so the SAME schema is baked on both sides of the hop.
+    pub schema: Option<PathBuf>,
+    /// Where to emit + build the hop crate (default `migrations/engine`).
+    pub output: Option<PathBuf>,
+}
+
 /// Create a new migration
 pub fn create(opts: MigrateCreateOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
@@ -70,7 +84,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
                 .map_err(map_err)?;
             forgedb_migrations::save_versioned_schema(
                 &migrations_dir,
-                lineage.current_format_version(),
+                lineage.current_schema_version(),
                 &new_src,
             )
             .map_err(map_err)?;
@@ -102,7 +116,7 @@ pub fn create(opts: MigrateCreateOptions) -> Result<()> {
         // Assign the serial version interlock (#74 Phase 2) from the committed
         // lineage: this migration bumps the on-disk format version by one, so a
         // regenerated app expects the new version and refuses a not-yet-migrated
-        // data dir (the Phase 1 open guard).  `EXPECTED_FORMAT_VERSION` is derived
+        // data dir (the Phase 1 open guard).  `EXPECTED_SCHEMA_VERSION` is derived
         // from this lineage at `generate` time — never hand-edited (red line #8).
         let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir)
             .map_err(map_err)?;
@@ -333,6 +347,137 @@ pub fn run(opts: MigrateRunOptions) -> Result<()> {
     Ok(())
 }
 
+/// `forgedb migrate engine` (#254): carry a data dir across a ForgeDB
+/// **byte-format generation** boundary.
+///
+/// This is NOT the schema-version transformer. The two counters are orthogonal:
+/// `migrate up` replays the app's own `migrations/` lineage, and this replays
+/// ForgeDB's engine generations. An engine bump changes no `.forge`, produces no
+/// lineage hop, and would therefore run nothing at all through the transformer —
+/// which is exactly why it needs its own command rather than a fold-in.
+///
+/// The hop crate is generated (never schema-blind): a nullable, arrayed, or
+/// struct-nested timestamp is written as an opaque `FixedBytes` transmute that no
+/// schema-agnostic reader may decode, and 81 of the 247 timestamp fields in the
+/// example corpus are nullable. See `forgedb_codegen::engine`.
+pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
+    let output = opts
+        .output
+        .unwrap_or_else(|| PathBuf::from("migrations").join("engine"));
+
+    let Some((schema_version, from_engine)) = detect_src_versions(&opts.src)? else {
+        return Err(CliError::Migration(format!(
+            "{} does not look like a ForgeDB data dir (no <model>/manifest.json)",
+            opts.src.display()
+        )));
+    };
+    let to_engine = forgedb_codegen::rust::CURRENT_ENGINE_VERSION;
+
+    if from_engine == to_engine {
+        ui::success(&format!(
+            "{} is already at engine generation {to_engine} — nothing to migrate.",
+            opts.src.display()
+        ));
+        return Ok(());
+    }
+    if from_engine > to_engine {
+        return Err(CliError::Migration(format!(
+            "{} is stamped at engine generation {from_engine}, newer than this build's {to_engine} \
+             — upgrade the ForgeDB CLI rather than migrating backwards",
+            opts.src.display()
+        )));
+    }
+
+    ui::info(&format!(
+        "Engine migration: {} (schema v{schema_version}, engine generation {from_engine} → {to_engine})",
+        opts.src.display()
+    ));
+
+    emit_engine(opts.schema.as_deref(), schema_version, from_engine, to_engine, &output)?;
+
+    ui::info("Compiling the engine-hop bin (cargo build --release)...");
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&output)
+        .status()
+        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
+    if !status.success() {
+        return Err(CliError::Migration(
+            "engine-hop build failed (see cargo output above)".to_string(),
+        ));
+    }
+    let bin = output.join("target/release/forgedb-transform");
+
+    ui::info(&format!(
+        "Migrating {} → {} (the source dir is left untouched — it is your rollback)",
+        opts.src.display(),
+        opts.dest.display()
+    ));
+    run_transformer(&bin, &opts.src, &opts.dest)?;
+    ui::success("Engine migration complete — point the regenerated app at the destination dir");
+    Ok(())
+}
+
+/// Emit the engine-hop crate into `output`. The same schema is baked on both
+/// sides; only `EXPECTED_ENGINE_VERSION` differs between the two modules.
+fn emit_engine(
+    schema: Option<&Path>,
+    schema_version: u32,
+    from_engine: u32,
+    to_engine: u32,
+    output: &Path,
+) -> Result<()> {
+    use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
+
+    let schema_path = match schema {
+        Some(p) => p.to_path_buf(),
+        None => ["schema.forge", "schema.lang", "schema.forgedb"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .ok_or_else(|| {
+                CliError::SchemaNotFound(
+                    "No schema file found. Expected one of: schema.forge, schema.lang, \
+                     schema.forgedb (or pass --schema)"
+                        .to_string(),
+                )
+            })?,
+    };
+    let src = std::fs::read_to_string(&schema_path)
+        .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path.display(), e)))?;
+    let parsed = forgedb_parser::Parser::new(&src)
+        .and_then(|mut p| p.parse())
+        .map_err(|e| CliError::SchemaValidation(format!("{}: {e}", schema_path.display())))?;
+
+    let plan = EngineHopPlan {
+        schema: &parsed,
+        schema_version,
+        from_engine,
+        to_engine,
+    };
+    let crate_out = EngineMigrationGenerator::generate(&plan, "forgedb-engine-migrate")
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+
+    std::fs::create_dir_all(output)?;
+    let cargo_path = output.join("Cargo.toml");
+    if !cargo_path.exists() {
+        std::fs::write(&cargo_path, &crate_out.cargo_toml)?;
+    }
+    for (rel, content) in &crate_out.sources {
+        let path = output.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, content)?;
+    }
+    ui::success(&format!(
+        "Generated engine-hop crate ({} source files) at {}",
+        crate_out.sources.len(),
+        output.display()
+    ));
+    Ok(())
+}
+
 /// Options for the one-CLI `migrate up` orchestration (#74 Phase 4).
 pub struct MigrateUpOptions {
     /// Origin format version.  Defaults to the version detected from the source
@@ -361,7 +506,7 @@ pub struct MigrateUpOptions {
 pub fn up(opts: MigrateUpOptions) -> Result<()> {
     let migrations_dir = PathBuf::from("migrations");
     let lineage = forgedb_migrations::MigrationLineage::load(&migrations_dir).map_err(map_err)?;
-    let to = opts.to.unwrap_or_else(|| lineage.current_format_version());
+    let to = opts.to.unwrap_or_else(|| lineage.current_schema_version());
     let output = opts
         .output
         .clone()
@@ -391,7 +536,7 @@ pub fn up(opts: MigrateUpOptions) -> Result<()> {
         Some(f) => f,
         None => {
             let first = &jobs[0].0;
-            detect_src_format_version(first)?.ok_or_else(|| {
+            detect_src_schema_version(first)?.ok_or_else(|| {
                 CliError::Migration(format!(
                     "could not detect the source format version of {} — pass --from explicitly",
                     first.display()
@@ -488,7 +633,7 @@ fn collect_tenant_jobs(
             continue;
         }
         // Only sweep dirs that actually hold data (a model manifest).
-        if detect_src_format_version(&path)?.is_none() {
+        if detect_src_schema_version(&path)?.is_none() {
             continue;
         }
         jobs.push((path, root.join(format!("{name}{suffix}"))));
@@ -503,12 +648,24 @@ fn collect_tenant_jobs(
     Ok(jobs)
 }
 
-/// Detect the on-disk `format_version` of a data directory by reading the first
+/// Detect the on-disk schema serial of a data directory by reading the first
 /// `<model>/manifest.json` under it (#74 Phase 4).  Every model/junction manifest
 /// in a consistent dir carries the same version (the app open-guard enforces it),
 /// so the first one found is authoritative.  `None` when the dir holds no manifest
 /// (not a data dir, or empty).
-fn detect_src_format_version(data_dir: &Path) -> Result<Option<u32>> {
+fn detect_src_schema_version(data_dir: &Path) -> Result<Option<u32>> {
+    Ok(detect_src_versions(data_dir)?.map(|(schema, _engine)| schema))
+}
+
+/// Both on-disk counters, read from the first model manifest under `data_dir`.
+///
+/// They are orthogonal (#254): `schema_version` (on-disk key `format_version`) is
+/// the **app's** migration serial, `engine_version` is **ForgeDB's** byte-format
+/// generation.  A manifest written before the engine counter existed has none,
+/// which baselines to generation 1 — the same default the `Manifest` struct
+/// applies, kept identical here so the CLI and the engine cannot disagree about
+/// what an old dir is.
+fn detect_src_versions(data_dir: &Path) -> Result<Option<(u32, u32)>> {
     if !data_dir.is_dir() {
         return Ok(None);
     }
@@ -523,11 +680,14 @@ fn detect_src_format_version(data_dir: &Path) -> Result<Option<u32>> {
             let txt = std::fs::read_to_string(&manifest).map_err(|e| {
                 CliError::Migration(format!("failed to read {}: {}", manifest.display(), e))
             })?;
-            if let Some(fv) = serde_json::from_str::<serde_json::Value>(&txt)
-                .ok()
-                .and_then(|v| v.get("format_version").and_then(|x| x.as_u64()))
-            {
-                return Ok(Some(fv as u32));
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                if let Some(fv) = v.get("format_version").and_then(|x| x.as_u64()) {
+                    let ev = v
+                        .get("engine_version")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(1);
+                    return Ok(Some((fv as u32, ev as u32)));
+                }
             }
         }
     }
@@ -759,9 +919,15 @@ fn add_field_default_json(
                 Some(FieldType::F64) => "0.0".to_string(),
                 Some(
                     FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                    | FieldType::Timestamp,
+                    | FieldType::Timestamp(_),
                 ) => "0".to_string(),
-                Some(FieldType::String | FieldType::Char(_)) => "\"\"".to_string(),
+                // #238: an inline `string(N)` is a `String` in the generated
+                // struct, so its type-zero is the empty string like any other.
+                // (`string(N!)` would reject `""` at write, but this arm is
+                // defensive residue for a mis-tagged hop, not a real default.)
+                Some(FieldType::String | FieldType::StringN { .. } | FieldType::Bytes(_)) => {
+                    "\"\"".to_string()
+                }
                 _ => "null".to_string(),
             }
         }
@@ -782,7 +948,7 @@ fn add_field_default_json(
             }
             Some(
                 FieldType::U32 | FieldType::U64 | FieldType::I32 | FieldType::I64
-                | FieldType::Timestamp,
+                | FieldType::Timestamp(_),
             ) => {
                 if d.parse::<i64>().is_ok() {
                     d.to_string()

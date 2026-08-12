@@ -135,7 +135,7 @@ Profile {
 Product {
   id: +uuid
   name: &string @length(1, 200)
-  sku: ^&string @length(10)
+  sku: ^&string @length(max: 10)
   price: f64 @min(0)
   stock: i32 @default(0)
 

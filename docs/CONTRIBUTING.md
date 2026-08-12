@@ -423,6 +423,52 @@ Releases go **publish the substrate → merge `develop` into `main` → tag**, i
 order. The `Substrate reclose` workflow runs on `main` and proves the first step
 actually happened.
 
+### There is exactly one `develop`
+
+No `v0.5-develop` alongside a `v0.4-develop`. The branch name never contains a
+version, for two reasons.
+
+crates.io has **one version line per crate**, and the publish gap is defined
+relative to what is currently published — so two cycle branches carrying
+unpublished substrate changes cannot both be measured against it. Whichever
+publishes first silently redefines the other's gap. Separately, the **milestone
+already says when a change ships**; putting a version in the branch name encodes
+that a second time, somewhere harder to query and harder to correct.
+
+Keeping it version-agnostic also makes it self-advancing: `develop` means "the
+cycle in flight," so tagging a release turns it into the next cycle with no
+rename and no workflow edit.
+
+**So what keeps next-cycle work off `develop` is the milestone, not the branch:**
+
+> A PR targeting `develop` may not close an issue milestoned later than the cycle
+> in flight (the lowest open `v*` milestone).
+
+Note the shape — a deny-list on *future* milestones, not an allow-list on the
+current one. Chores, CI fixes and typo PRs close no issue and pass silently, and
+correctly so: work with no issue cannot be next-cycle work, because next-cycle
+work is *defined* by carrying that milestone.
+
+The `Cycle scope` workflow enforces this on PRs to `develop`. Most work here
+merges locally, so run the same check yourself before merging a branch back:
+
+```bash
+make cycle-scope ISSUE=245        # the issue(s) your branch closes
+make cycle-scope PR=250           # or a PR, as CI does
+```
+
+If it blocks you, the work is not wrong — it is early. Keep the branch, let
+`develop` ship its cycle, then rebase and land it. The only other correct
+response is that the issue was mis-scheduled, in which case move the milestone
+rather than merging past it.
+
+**Work scheduled for a later version** therefore lives on its own branch off
+`develop`, unmerged, carrying its real milestone. Two long-lived branches *are*
+legitimate and neither is a second cycle line: a maintenance line cut off a tag
+(`release/v0.4.x`) when a patch is needed after the cycle moved on, and a track
+that cannot merge into the current cycle at all — named for the work
+(`format-v2`), never for a version, so nobody reads it as a release line.
+
 ### Before Submitting
 
 **1. Create an issue** (if one doesn't exist) describing the change.

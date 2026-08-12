@@ -46,7 +46,7 @@ const FILTERABLE_CONTROLS = new Set<FieldControl>([
   "float",
   "bool",
   "ts",
-  "char",
+  "bytes",
 ]);
 
 /** The fields a model can be filtered on, in schema order. */
@@ -81,7 +81,7 @@ interface FieldDto {
   unique: boolean;
   indexed: boolean;
   nullable: boolean;
-  charLen: number | null;
+  bytesLen: number | null;
   arrayLen: number | null;
   fulltext: boolean;
   computed: boolean;
@@ -156,8 +156,8 @@ function controlFor(f: FieldDto): FieldControl {
       return "bool";
     case "timestamp":
       return "ts";
-    case "char":
-      return "char";
+    case "bytes":
+      return "bytes";
     case "required_ref":
     case "optional_ref":
       return "fk";
@@ -179,11 +179,11 @@ function controlFor(f: FieldDto): FieldControl {
   }
 }
 
-/** Truthful type label, e.g. "uuid", "char(8)", "*Org", "?User", "[Post]". */
+/** Truthful type label, e.g. "uuid", "bytes(8)", "*Org", "?User", "[Post]". */
 function typeLabelFor(f: FieldDto): string {
   switch (f.kind) {
-    case "char":
-      return `char(${f.charLen ?? 0})`;
+    case "bytes":
+      return `bytes(${f.bytesLen ?? 0})`;
     case "fixed_array":
       return `[array; ${f.arrayLen ?? 0}]`;
     case "struct":
@@ -231,7 +231,7 @@ function mapField(
     field.min = numericDirective(f, "min");
     field.max = numericDirective(f, "max");
   }
-  if (control === "char") field.len = f.charLen ?? undefined;
+  if (control === "bytes") field.len = f.bytesLen ?? undefined;
   if (control === "fk") field.fkTarget = f.relTarget ?? undefined;
   if (control === "hasmany" || control === "m2m")
     field.target = f.relTarget ?? undefined;
