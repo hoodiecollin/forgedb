@@ -341,8 +341,9 @@ every deferred limit — is stated in [`docs/WHAT_V1_IS.md`](docs/WHAT_V1_IS.md)
 This file describes the **durable shape** of the project. Point-in-time state — what's landed,
 what's next, exact versions — lives in ground truth, not here:
 
-- **Feature status & backlog:** `gh issue list` (labels: `epic`, `plan-next`, `perf`, `config`,
-  `idea`, `tech-debt`, `experiment`, `rfc`) + git history. The narrative is in
+- **Feature status & backlog:** `gh issue list` (types: `improvement`, `bugfix`, `experiment`;
+  plus `epic`, `hotfix`, `release-gate`) and `pm-playbook ladder` for the derived rung, which no
+  label carries and no filter can compute + git history. The narrative is in
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/V1_ROADMAP.md`](docs/V1_ROADMAP.md).
 - **What a feature is guarded by:** the guard test itself — grep `crates/codegen/tests/` for
   `test_rust_generation_*` / `test_api_generation_*`. The test is the record; a prose list drifts.
@@ -358,28 +359,18 @@ what's next, exact versions — lives in ground truth, not here:
 ### Project management (the ONE tracking model — no parallel systems)
 
 ForgeDB follows the **ai-pm-playbook** (the portable form of the model worked out here; adopted
-2026-07-31, which added `.github/ISSUE_TEMPLATE/*` and the `surface:*` labels). Section refs below
-(§3.2, §4, §6.1, §9) are to that playbook. All work is tracked in **GitHub Issues** on
-`hoodiecollin/forgedb`. There are exactly **two orthogonal axes**, and nothing else decomposes work:
+2026-07-31, migrated to **v2.0** on 2026-08-12). **The doctrine is vendored at `.pm-playbook/` and
+is authoritative** — read `.pm-playbook/AGENT.md` before you create, label, milestone or close an
+issue, and do not re-transcribe the model here. Section refs below are to that playbook. All work
+is tracked in **GitHub Issues** on `hoodiecollin/forgedb`.
 
-- **Milestone = *when* (the release spine).** A core release milestone (`v0.3.0`, …) means
-  *scheduled for that version*. Assigning a milestone is the only signal that something is
-  scheduled.
-- **Labels = *what kind / maturity*.** `epic` (umbrella), `rfc` (design captured as an issue —
-  proposals are **not** committed as repo files), `experiment` (a spike to measure), `idea`
-  (speculative; needs a design note first), `bug`, `tech-debt`, `perf`, `config`. Plus
-  **`plan-next` = "committed but not yet scheduled to a version."**
+The two axes, in one line each: a **milestone** says *when* and means **committed** (being the
+cycle in flight is what means *scheduled*); **labels** say *what kind*. Every work item carries
+exactly one of `improvement` / `bugfix` / `experiment`, and that type decides its gate sub-issues.
+The commitment ladder is **derived** from gate state — ask `pm-playbook ladder`, never a filter.
 
-**The commitment ladder** is the spine of the label axis — work is ranked by distance from shipped:
-`idea` → *(Gate 1: accepted `rfc`)* → `plan-next` → *(assign milestone, drop `plan-next`)* →
-in flight → closed-into-milestone → **released** (the GitHub Release tag). "Closed" and "shipped"
-are distinct rungs: an issue closes into its milestone when code merges, and the roadmap keeps
-reading *pending release* until the tag exists.
-
-**Label invariants (§3.2) — enforce on every issue; violations are the #1 drift smell:**
-`plan-next` ⊕ milestone · `idea` ⊕ `plan-next` · `idea` ⊕ milestone (scheduled implies committed) ·
-`experiment` ⊕ {`idea`, `plan-next`, milestone} · `release-gate` ⇒ milestone, and
-`release-gate` ⊕ {`idea`, `plan-next`, `experiment`}.
+Verify with `npx @hoodiecollin/pm-playbook check` — exit 0 means compliant. What follows is only
+what is **specific to this repo** and is not in the playbook.
 
 **`release-gate` = blocks the tag (§5.2).** The rung between *closed-into-milestone* and
 *released*. An open `release-gate` issue on a milestone means **that milestone cannot be tagged**,
@@ -417,17 +408,12 @@ core roadmap excludes them by label prefix — `apps/website/lib/roadmap-transfo
 (`isCoreScoped`) drops any `surface:*` that isn't `surface:core`, so a newly-added surface is
 filtered the moment it exists.
 
-**`experiment` never rides the release spine.** A milestone ships features/fixes/perf — things that
-produce a binary a user installs. An `experiment` is *a spike to measure*; its deliverable is a
-**decision**, not a shippable artifact. So an `experiment`-labeled issue is **never** put on a `v*`
-milestone (same mutual-exclusion class as `idea` + `plan-next`), and it is likewise mutually exclusive
-with `idea` (a spike you've committed to running is no longer merely speculative) and with `plan-next`.
-Experiments run as an **unscheduled research track**; the *measured conclusion* may then commit new
-feature work — and **that** work, not the spike, is what gets scheduled. Corollary: **never anchor a
-milestone's theme on an experiment's hoped-for outcome** — you cannot schedule a feature whose existence
-the experiment has not yet decided. The `experiment` label is the discipline test: if an issue's primary
-output is a measurement/evaluation/feasibility verdict, it is an experiment (off the spine); if it is
-shippable code that ships regardless of any measurement, it is a feature/perf/`config` item (on the spine).
+**`experiment` never rides the release spine (§4).** The playbook covers the rule; the ForgeDB
+corollary worth stating is this: **never anchor a milestone's theme on an experiment's hoped-for
+outcome.** You cannot schedule a feature whose existence the experiment has not yet decided. The
+discipline test when typing an issue — if its primary output is a measurement, evaluation or
+feasibility verdict, it is an `experiment` and stays off the spine; if it is shippable code that
+ships regardless of any measurement, it is an `improvement`.
 
 **Epics decompose via GitHub *native sub-issues*** (the `Parent issue` / `Sub-issues progress`
 link — `gh api repos/OWNER/REPO/issues/N/sub_issues`), *not* task-list checkboxes (secondary,
@@ -435,19 +421,23 @@ drift-prone) and *not* a labels/fields convention. An epic is a top-level contai
 releases; each child carries its own milestone. The website `/roadmap` reads exactly this shape
 (epics collapsible, standalone issues alongside) — see [`apps/website/lib/roadmap-transform.ts`].
 
-**Parenting is for work on the commitment ladder — never parent an `idea` or an `experiment`.**
-Both are barred from carrying a milestone by the invariants above, so neither can ever close
-into a release, and making one a sub-issue does two bad things: it pins the epic's `done/total`
-below 100% permanently (the transform counts every child indiscriminately), and it removes the
-child from the standalone list — the *only* path by which an `idea` reaches the roadmap's
-**Ideas** section and an `experiment`/`rfc` reaches **Labs** (`claimedChildren`). Parenting an
-idea to an epic therefore **hides** it. Link them instead with a plain `#number` reference under
-a *Related, deliberately unparented* heading in the epic body: GitHub records a cross-reference
-event on the child, so the link is bidirectional and machine-visible with nothing to
-hand-maintain, and unlike a checkbox it carries no status to drift. When an experiment's
-measured conclusion commits real work, *that* work is a new issue — and it parents normally.
-(The one coherent exception is an epic that is *itself* labeled `experiment`, e.g. #167: it
-rides no release spine, so its children completing is a meaningful signal.)
+**Never parent an unmilestoned work item or an `experiment` to an epic.** Neither can close into a
+release, and making one a sub-issue does two bad things: it pins the epic's `done/total` below 100%
+permanently (the transform counts every child indiscriminately), and it removes the child from the
+standalone list — the *only* path by which an unmilestoned item reaches the roadmap's **Ideas**
+section and an `experiment` reaches **Labs** (`claimedChildren`). Parenting an idea to an epic
+therefore **hides** it. Link them instead with a plain `#number` reference under a *Related,
+deliberately unparented* heading in the epic body: GitHub records a cross-reference event on the
+child, so the link is bidirectional and machine-visible with nothing to hand-maintain, and unlike a
+checkbox it carries no status to drift. When an experiment's measured conclusion commits real work,
+*that* work is a new issue — and it parents normally. (The one coherent exception is an epic that
+is *itself* labeled `experiment`, e.g. #167: it rides no release spine, so its children completing
+is a meaningful signal.)
+
+**Gate sub-issues are not roadmap entries.** `materialize` creates them under a work item, so they
+are children of an issue rather than of an epic and `claimedChildren` does not filter them. The
+transform excludes them by label pattern (`isGate`); leave that filter in place or a single
+milestone's gate set floods the roadmap.
 
 **Retired — do NOT reintroduce:** the "workstream" decomposition (`WS1`/`WS2`/`Workstream 2` sub-
 tasking of an epic) and the flat 5-bucket roadmap are **dead patterns**. Break an epic into real
@@ -552,22 +542,20 @@ of truth.
    task boundaries; when a claim disagrees with code, fix the claim. Do not pin an exact test count
    in prose (chronic drift source — run the runner).
 
-5. **Design docs are not committed to the repo.** Proposals / design notes live as **`rfc`-labeled
-   GitHub issues**, not files — run the **`rfc-workflow`** skill to file one (it has the gate, the
-   dedup check, the body template, and the epic cross-link). (The historical `docs/proposals/` set
-   was removed; git history holds it. Shipped-feature *architecture* reference belongs in
-   `docs/ARCHITECTURE.md`.)
+5. **Design docs are not committed to the repo.** Proposals / design notes live as **gate
+   sub-issues**, not files — run the **`design-gates`** skill to file one (it has the dedup check,
+   the body template, and the epic cross-link). (The historical `docs/proposals/` set was removed;
+   git history holds it. Shipped-feature *architecture* reference belongs in `docs/ARCHITECTURE.md`.)
 
-6. **Design → plan → spec, in series, before any code (§9).** Three gates, none of them a file:
-   **Gate 1 — design-doc** (`rfc` issue: problem, desired behavior, solution *shape*, alternatives,
-   explicit non-goals). Solution-shaped, not code-shaped; catches *conceptual* gotchas. Accepted →
-   drop `idea`, add `plan-next`. **Gate 2 — implementation-plan** (files to touch, build order,
-   interfaces, blockers, and the BDD scenarios to write), on the issue, after scheduling and before
-   code; catches *execution* gotchas. **Gate 3 — BDD spec-first**: scenarios RED → implement to
-   GREEN → refactor under green. State is **derived from the artifacts' existence**, never from a
-   `needs-design`-style status label, and **effort labels are banned**. Templates for gates 1–2 live
-   in `.github/ISSUE_TEMPLATE/`. When a feature ships, fold its durable design into
-   `docs/ARCHITECTURE.md` and **close the `rfc`**.
+6. **Gates in series, before any code (§9).** A work item's gates are **native sub-issues** created
+   by `pm-playbook materialize` — never by hand, and always as a complete set. For an `improvement`:
+   **gate 1 design** (problem, desired behavior, solution *shape*, alternatives, explicit non-goals
+   — solution-shaped, not code-shaped; catches *conceptual* gotchas), **gate 2 plan** (files to
+   touch, build order, interfaces, blockers, and the BDD scenarios to write; catches *execution*
+   gotchas), **gate 3 impl** (scenarios RED → implement to GREEN → refactor under green). A
+   `bugfix` takes two: diagnose → fix. **Closing a gate means accepted**, and the rung is derived
+   from which gates are closed — never from a status label, and **effort labels are banned**. When
+   a feature ships, fold its durable design into `docs/ARCHITECTURE.md`.
 
 7. **Reopening an accepted gate? Purge the issue body FIRST (§9.1).** Gates get redone — new
    information lands, a constraint turns out to be an artifact of an assumption. The moment you
@@ -608,3 +596,52 @@ of truth.
 - `forgedb-product-manager` — product/architecture decisions; guards the generator identity.
 - `forgedb-schema-author` — authors realistic `.forge` example schemas.
 - `rust-core-library` — idiomatic Rust for core library/crate work.
+
+<!-- pm-playbook:begin -->
+## Project management — pm-playbook v2.0.0
+
+Issue tracking in this repo follows the **pm-playbook** two-axis model. The full doctrine is
+vendored at `.pm-playbook/` and is authoritative; this block is only a summary.
+
+**Before you create, label, milestone, or close an issue — read `.pm-playbook/AGENT.md`.**
+It is a short router: load only the reference section relevant to what you are doing.
+
+**The two axes, and nothing else, organize work:**
+- **Milestone** = *when*. Assigning one means **committed**. *Focus* — the milestone being the
+  cycle in flight — is what means scheduled. There is no label for "committed but unscheduled."
+- **Labels** = *what kind*. Epics decompose via **native sub-issues**, never checkboxes and never
+  a Project field.
+- There are **no Priority / Size / Workstream fields**. Do not propose adding any.
+
+**Every work item carries exactly one type, and the type decides its gates:**
+
+| Type | Gates |
+|---|---|
+| `improvement` | design → plan → impl |
+| `bugfix` | diagnose → fix (`hotfix` is a bounded form of this) |
+| `experiment` | research → evaluate (never milestoned) |
+
+Each gate is a sub-issue labelled `{type}:gate-{n}`. A closed gate means approved. The tree is
+exactly three levels: epic → work item → gate.
+
+**The commitment ladder is DERIVED from gate state — there are no maturity labels.** Walk the
+gates in order; the first not closed decides the rung. Ask for it with `pm-playbook ladder`; no
+GitHub filter can compute it.
+
+**Invariants — violating one is a bug, not a style preference:**
+- Exactly **one** type label per work item — never zero, never two (PM010).
+- `experiment` never carries a milestone. A spike's deliverable is a finding; it feeds the
+  release spine, it never rides it (PM003).
+- **Never create a gate by hand** — `pm-playbook materialize` owns them and creates a complete
+  set at once. A hand-made gate destroys the meaning of an absent one.
+- A gate's milestone equals its parent's (PM011); an `epic` never carries gates (PM012).
+- `release-gate` always has a milestone and never carries `experiment`. An open `release-gate`
+  means its milestone **cannot be tagged** (PM004/PM005).
+- A non-core `surface:*` issue never rides a core `v*` milestone (PM006).
+
+**Verify before opening a PR** — exit code 0 means compliant:
+
+```bash
+npx @hoodiecollin/pm-playbook check
+```
+<!-- pm-playbook:end -->

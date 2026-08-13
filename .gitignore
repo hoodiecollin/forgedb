@@ -50,3 +50,6 @@ apps/vscode-forgedb/*.vsix
 
 # devbox nix runtime profile (machine-specific; devbox.json/.lock are committed)
 .devbox/
+
+# Materialized backlog — machine-owned local state, rewritten by `pm-playbook pull`.
+.pm-playbook/backlog/

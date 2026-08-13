@@ -14,7 +14,7 @@
  * nothing and passes silently, and correctly so. Work with no issue cannot be next-cycle work,
  * because next-cycle work is *defined* by carrying that milestone.
  *
- * The cycle in flight is DERIVED — the lowest open `v*` milestone by version order — never
+ * The cycle in flight is DERIVED — the lowest open `v*` milestone on an unreleased line — never
  * configured. Nothing to update, nothing to drift from the actual spine, and it advances on its
  * own the moment a milestone closes. That is also its one prerequisite: closing the milestone is
  * part of the release ritual. A milestone left open after its tag freezes the gate and starts
@@ -73,17 +73,38 @@ function compareMilestones(a: string, b: string): number {
 }
 
 /**
- * The cycle in flight: the lowest open core milestone.
+ * The cycle in flight: the lowest open core milestone **on an unreleased line**.
  *
  * `^v\d` deliberately excludes the non-core surface namespaces (`vscode-v*`) — those ship on their
  * own line and are not on this spine, so "later than the cycle" is not a question with an answer
  * for them.
+ *
+ * The "on an unreleased line" clause is what stops a HOTFIX from hijacking the gate. A patch
+ * milestone (v0.4.1) sorts below the real cycle (v0.5.0), so taking the lowest open milestone
+ * outright makes the patch the cycle — and then every legitimate v0.5.0 PR into `develop` is
+ * "milestoned later than the cycle in flight" and gets blocked for the entire hotfix window. A
+ * CLOSED milestone on the same `major.minor` line is the evidence that line already shipped, so
+ * the whole line is skipped rather than just that one tag. PLAYBOOK §5.6, and the same rule
+ * `pm-playbook`'s own `currentCycle` applies.
  */
 async function currentCycle(): Promise<string | null> {
-  const raw = JSON.parse(await gh(["api", `repos/${REPO}/milestones?state=open&per_page=100`]));
-  const open = (raw as { title: string }[])
-    .map((m) => m.title)
-    .filter((t) => /^v\d/i.test(t.trim()))
+  const [openRaw, closedRaw] = await Promise.all([
+    gh(["api", `repos/${REPO}/milestones?state=open&per_page=100`]),
+    gh(["api", `repos/${REPO}/milestones?state=closed&per_page=100`]),
+  ]);
+
+  const coreTitles = (raw: string): string[] =>
+    (JSON.parse(raw) as { title: string }[]).map((m) => m.title).filter((t) => /^v\d/i.test(t.trim()));
+
+  const line = (title: string): string => {
+    const m = /^v(\d+)\.(\d+)\./i.exec(title.trim());
+    return m ? `${m[1]}.${m[2]}` : title.trim();
+  };
+
+  const shippedLines = new Set(coreTitles(closedRaw).map(line));
+
+  const open = coreTitles(openRaw)
+    .filter((t) => !shippedLines.has(line(t)))
     .sort(compareMilestones);
   return open[0] ?? null;
 }
@@ -184,7 +205,7 @@ if (prFlag) {
 const isFuture = (m: string | null) => m !== null && /^v\d/i.test(m.trim()) && compareMilestones(m, cycle) > 0;
 
 console.log(`Cycle-scope gate — ${subject}`);
-console.log(`Cycle in flight: ${cycle} (derived: lowest open v* milestone)\n`);
+console.log(`Cycle in flight: ${cycle} (derived: lowest open v* milestone on an unreleased line)\n`);
 
 const blocked = closing.filter((c) => isFuture(c.milestone));
 

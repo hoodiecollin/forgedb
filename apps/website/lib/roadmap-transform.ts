@@ -9,10 +9,12 @@
  *     GitHub sub-issues) live UNDER their epic, each annotated with where it
  *     lands (shipped in vX / done-awaiting vY / open).
  *   - STANDALONE issues (no epic parent: bug fixes, one-offs) are top-level too.
- *   - `when` is milestone-driven (the release spine); `plan-next` now means
- *     "committed but not yet scheduled to a version" (distinct from a milestone).
- *   - Forward status buckets: active (scheduled / in-flight) · planned
- *     (committed, unscheduled) · labs (experiment/rfc) · ideas (idea).
+ *   - `when` is milestone-driven (the release spine). Under the two-axis model a
+ *     milestone means COMMITTED, and being the cycle in flight is what means
+ *     SCHEDULED — so the milestone alone separates active from planned.
+ *   - Forward status buckets: active (on the cycle in flight) · planned
+ *     (committed to a later milestone) · labs (experiment) · ideas (no milestone).
+ *   - GATE sub-issues are excluded entirely; they are process, not roadmap.
  *   - Marketing/extension scopes (`website`/`vscode`) are excluded — this is the
  *     CORE roadmap, mirroring cliff.toml's changelog scope filter.
  */
@@ -95,6 +97,21 @@ function has(labels: string[], l: string): boolean {
   return labels.includes(l);
 }
 
+/**
+ * Gate sub-issues (`improvement:gate-1`, `bugfix:gate-2`, …) are process artifacts, not roadmap
+ * entries. They are children of a WORK ITEM rather than of an epic, so the `claimedChildren` filter
+ * below — which only knows about epic children — does not catch them, and without this they would
+ * each render as a standalone roadmap card. A single milestone's materialized gate set is ~26
+ * issues, so this is the difference between a roadmap and a task dump.
+ *
+ * Matched by pattern rather than an enumerated list so a new work type's gates are excluded the
+ * moment the type exists.
+ */
+const GATE_LABEL = /^[a-z]+:gate-\d+$/;
+function isGate(labels: string[]): boolean {
+  return labels.some((l) => GATE_LABEL.test(l));
+}
+
 export function buildRoadmap(
   issues: RawIssue[],
   milestones: RawMilestone[],
@@ -140,17 +157,38 @@ export function buildRoadmap(
     })
     .sort((a, b) => cmpVersion(coreVersion(b.title)!, coreVersion(a.title)!));
 
-  // Next release in flight: lowest core milestone with no published release.
+  /*
+   * Next release in flight: the lowest core milestone on an UNRELEASED LINE.
+   *
+   * The "on an unreleased line" clause is what keeps a hotfix from hijacking the cycle. A patch
+   * milestone (v0.4.1) sorts below the real cycle (v0.5.0) and has no release of its own, so
+   * "lowest milestone with no published release" picks the patch — and every v0.5.0 item then
+   * reads as `planned` rather than `active` for the whole hotfix window. A published v0.4.0 is the
+   * evidence that the 0.4 line already shipped, so the whole line is excluded, not just that tag.
+   * PLAYBOOK §5.6, and the same rule pm-playbook's own `currentCycle` applies.
+   */
+  const releasedLines = new Set<string>();
+  for (const tag of publishedTags) {
+    const v = coreVersion(tag)!;
+    releasedLines.add(`${v[0]}.${v[1]}`);
+  }
+  const onReleasedLine = (title: string): boolean => {
+    const v = coreVersion(title)!;
+    return releasedLines.has(`${v[0]}.${v[1]}`);
+  };
+
   const nextMs =
     coreMilestones
-      .filter((m) => !publishedTags.has(m.title))
+      .filter((m) => !publishedTags.has(m.title) && !onReleasedLine(m.title))
       .sort((a, b) => cmpVersion(coreVersion(a.title)!, coreVersion(b.title)!))[0] ?? null;
   const nextMilestone = nextMs
     ? { title: nextMs.title, url: nextMs.html_url, done: nextMs.closed_issues, open: nextMs.open_issues }
     : null;
 
   const byNumber = new Map(realIssues.map((i) => [i.number, i]));
-  const childrenByEpic = new Map(epics.map((e) => [e.number, e.children.filter((c) => !c.pull_request)]));
+  const childrenByEpic = new Map(
+    epics.map((e) => [e.number, e.children.filter((c) => !c.pull_request && !isGate(labelsOf(c)))]),
+  );
   const claimedChildren = new Set<number>();
   for (const e of epics) for (const c of e.children) claimedChildren.add(c.number);
 
@@ -173,12 +211,14 @@ export function buildRoadmap(
   };
 
   function epicStatus(labels: string[], state: "open" | "closed", children: ChildIssue[]): Status {
-    if (has(labels, "experiment") || has(labels, "rfc")) return "labs";
+    if (has(labels, "experiment")) return "labs";
+    // An epic with nothing under it yet is a forward bet, not work in progress. Under the two-axis
+    // model there is no `idea` label to consult — an epic that has decomposed into nothing is the
+    // definition of one.
+    if (children.length === 0 && state === "open") return "ideas";
     // A closed epic, or one whose work is entirely finished, reads as active
     // "wrapping up" rather than a forward bet; closed epics surface under Shipped.
-    if (has(labels, "idea") && children.length === 0) return "ideas";
-    if (children.length > 0 || state === "closed") return "active";
-    return "planned";
+    return "active";
   }
 
   const epicItems: EpicItem[] = [];
@@ -213,17 +253,25 @@ export function buildRoadmap(
       const t = i.milestone?.title ?? null;
       return isCoreMilestone(t) && !isPublishedMilestone(t) ? "active" : null;
     }
-    if (has(labels, "experiment") || has(labels, "rfc")) return "labs";
-    if (has(labels, "idea")) return "ideas";
-    if (i.milestone != null) return "active"; // scheduled to a version
-    if (has(labels, "plan-next")) return "planned"; // committed, unscheduled
-    return null; // bare backlog (bug/tech-debt/perf/config) — rolls up, not headlined
+    // An `experiment`'s deliverable is a finding, not a shippable artifact — it never carries a
+    // milestone, so it is checked before the milestone axis rather than after it.
+    if (has(labels, "experiment")) return "labs";
+    // The two-axis model puts the whole remaining answer on the milestone:
+    //   none            → uncommitted, i.e. an idea
+    //   not the cycle   → committed, not yet scheduled
+    //   the cycle       → scheduled, in flight
+    // There are no maturity labels left to consult; `idea` and `plan-next` were retired precisely
+    // because they were a second copy of this, free to disagree with it.
+    const t = i.milestone?.title ?? null;
+    if (t == null) return "ideas";
+    return t === nextMs?.title ? "active" : "planned";
   }
 
   const issueItems: IssueItem[] = [];
   for (const i of realIssues) {
     const labels = labelsOf(i);
     if (has(labels, "epic")) continue; // epics handled above
+    if (isGate(labels)) continue; // process artifact, not a roadmap entry
     if (claimedChildren.has(i.number)) continue; // shown under its epic
     if (!isCoreScoped(labels)) continue;
     const status = issueStatus(i, labels);
