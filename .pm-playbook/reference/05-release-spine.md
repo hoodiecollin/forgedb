@@ -244,7 +244,7 @@ That is not hypothetical. It is what a settings/prose/history disagreement looks
 
 Three sources, three answers, and each contributor followed whichever they met first.
 
-Two rules make the choice legible once it is made:
+Three rules make the choice legible once it is made:
 
 1. **Write it in `CONTRIBUTING.md`**, with the exact command if work merges locally. When the
    choice is merge commits, say that `--no-ff` is required: a branch that is merely ahead
@@ -255,6 +255,32 @@ Two rules make the choice legible once it is made:
    branch therefore leaves its issue **open** however the body is written, and it must be closed
    by hand. Teams adopting an integration branch discover this by finding a milestone full of
    merged work that still reads as unfinished.
+3. **Name the mechanics for *each direction* of the trunk↔integration sync, because they are not
+   symmetric.** Integration → trunk **is** the release, and it is a merge commit: that boundary is
+   the record of what shipped together, which is rule 1. Trunk → integration is only a **sync**,
+   and it should be a **rebase**.
+
+   A back-merge in that direction adds a commit whose entire payload is already on trunk. Do it
+   every release and the integration branch fills with content-free `Merge trunk into integration`
+   commits — noise that buries the real work, and worse, makes `trunk..integration` a liar: it
+   lists commits that changed nothing, so the one query that should answer "what is unreleased?"
+   stops meaning that.
+
+   Two operational notes, both of which surprise people the first time:
+
+   - Rebasing a *pushed* integration branch rewinds the ref, so it needs `--force-with-lease`.
+     **Check the branch protections before adopting this**: if the integration branch is protected
+     against non-fast-forward pushes, the rule cannot be applied there without a bypass — resolve
+     that deliberately rather than discovering it mid-release. (Protecting only the default branch
+     is the common setup, and leaves the integration branch free.)
+   - `git rebase` drops merge commits by default. If the integration branch's only commits since
+     the last release *are* prior back-merges, it collapses to exactly trunk — the correct outcome,
+     though it looks alarming. Confirm `git diff trunk integration` is empty before force-pushing,
+     so you know what was dropped carried nothing.
+
+   This does not contradict rule 1. Rule 1 governs how a **branch of work lands**; this governs a
+   **sync between two long-lived branches**. A repo can, and usually should, disable rebase merging
+   for pull requests while still rebasing the integration branch onto trunk locally.
 
 ### 5.5 Enforcement points — a rule needs a place where it can fail
 
