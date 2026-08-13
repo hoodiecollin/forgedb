@@ -6,6 +6,11 @@ commits with [git-cliff](https://git-cliff.org); do not edit it by hand — run
 `make changelog`. The format follows [Keep a Changelog](https://keepachangelog.com),
 and the project honors [Semantic Versioning](https://semver.org) per `docs/SEMVER.md`.
 
+## [0.4.1] - 2026-08-13
+
+### Bug Fixes
+
+- **migrate:** Ask cargo for the transformer path instead of guessing it
 ## [0.4.0] - 2026-08-12
 
 > **Breaking release — upgrading needs action.** Required migration steps are in

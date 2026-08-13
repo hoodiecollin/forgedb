@@ -32,7 +32,7 @@ edition = "2024"
 
 [package]
 name = "forgedb"
-version = "0.4.0"
+version = "0.4.1"
 edition.workspace = true
 authors = ["Collin Kokotas"]
 license = "MIT OR Apache-2.0"
