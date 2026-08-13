@@ -16,7 +16,8 @@
 # and correctly so — work with no issue cannot be next-cycle work, because next-cycle work is
 # *defined* by carrying that milestone.
 #
-# The cycle in flight is DERIVED (lowest open `v*` milestone), never configured here. Nothing to
+# The cycle in flight is DERIVED (lowest open `v*` milestone on an unreleased line, so a hotfix
+# patch milestone cannot hijack it), never configured here. Nothing to
 # update when a release ships, and it advances on its own: when v0.4.0's milestone closes, v0.5.0
 # becomes the cycle and v0.5 PRs start passing the same instant `develop` legitimately becomes
 # v0.5's cycle. That is also its one prerequisite — CLOSING THE MILESTONE IS PART OF THE RELEASE
