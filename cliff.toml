@@ -94,7 +94,10 @@ commit_parsers = [
   # the experiment track (CLAUDE.md: experiment work never rides the release spine)
   # — a benchmark driver produces a measurement, not a binary a user installs, so
   # `feat(benchmarks)` must never surface as a release feature.
-  { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew|benchmarks|bench)\\)", skip = true },
+  # `ci` is here for the same reason as `benchmarks`: a workflow fix ships to
+  # nobody. `ci(...)` is already skipped by type, but `fix(ci)` is not, and a
+  # reader of the release notes cannot act on our cycle-scope gate.
+  { message = "\\((website|vscode|npm|pypi|winget|docker|brew|homebrew|benchmarks|bench|ci)\\)", skip = true },
   # Any `type!:` / `type(scope)!:` breaking marker headlines its own section,
   # regardless of the underlying type.
   { message = "^[a-z]+(\\(.+\\))?!:", group = "<!-- 0 -->Breaking changes" },
