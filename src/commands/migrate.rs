@@ -292,17 +292,127 @@ fn compile_transformer(from: u32, to: u32, output: &Path) -> Result<PathBuf> {
     emit_transform(from, to, output, true)?;
 
     ui::info("Compiling the transformer (cargo build --release)...");
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(output)
-        .status()
+    cargo_build_transform_bin(output, "transformer")
+}
+
+/// The transformer bin's name, fixed by the `[[bin]]` section of the manifest
+/// `TransformGenerator::cargo_toml` emits (the engine-hop crate reuses it).
+const TRANSFORM_BIN: &str = "forgedb-transform";
+
+/// `cargo build --release` in `crate_dir`, returning the bin's path **as cargo
+/// reports it** rather than as we guess it (#292).
+///
+/// The path is not ours to compute.  Cargo resolves its target directory from
+/// `CARGO_TARGET_DIR` and from `[build] target-dir` in every `config.toml` on its
+/// discovery chain — including `$CARGO_HOME/config.toml`, which is machine-wide —
+/// so any path we join by hand is wrong for those users, and wrong *silently*:
+/// this function used to return a constructed path it never checked, so `migrate
+/// build` exited 0 while naming a file that was not there.
+///
+/// `--message-format=json-render-diagnostics` puts one JSON message per line on
+/// stdout while leaving human-readable diagnostics and progress on stderr, so
+/// capturing stdout costs the user no output.  The `compiler-artifact` message for
+/// the bin carries its real `executable`, and it is emitted on a fully-cached
+/// rebuild too — a no-op build still has to report where the binary is.
+fn cargo_build_transform_bin(crate_dir: &Path, what: &str) -> Result<PathBuf> {
+    let child = std::process::Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--message-format=json-render-diagnostics",
+        ])
+        .current_dir(crate_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
         .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
-    if !status.success() {
-        return Err(CliError::Migration(
-            "transformer build failed (see cargo output above)".to_string(),
-        ));
+    let out = child
+        .wait_with_output()
+        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::Migration(format!(
+            "{what} build failed (see cargo output above)"
+        )));
     }
-    Ok(output.join("target/release/forgedb-transform"))
+
+    let mut executable: Option<PathBuf> = None;
+    for line in out.stdout.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        if msg.pointer("/target/name").and_then(|n| n.as_str()) != Some(TRANSFORM_BIN) {
+            continue;
+        }
+        if let Some(exe) = msg.get("executable").and_then(|e| e.as_str()) {
+            executable = Some(PathBuf::from(exe));
+        }
+    }
+
+    let bin = executable.ok_or_else(|| {
+        CliError::Migration(format!(
+            "the {what} build emitted no `{TRANSFORM_BIN}` executable — check that {} still \
+             declares `[[bin]] name = \"{TRANSFORM_BIN}\"`",
+            crate_dir.join("Cargo.toml").display()
+        ))
+    })?;
+    // Never hand back a path without checking it: reporting success for a file that
+    // is not there is the whole of #292.
+    if !bin.is_file() {
+        return Err(CliError::Migration(format!(
+            "cargo reported the {what} bin at {} but nothing is there",
+            bin.display()
+        )));
+    }
+    Ok(bin)
+}
+
+/// Locate an already-built transformer bin **without building** (#292).
+///
+/// `migrate run` is the one site that cannot ask cargo what it just produced,
+/// because it deliberately produces nothing — it runs a bin an earlier `migrate
+/// build` left behind.  `cargo metadata` reports the same resolved
+/// `target_directory` a build would use, so this honours the redirect without
+/// compiling anything.  The crate-local `target/` is searched as well, so a tree
+/// built under different configuration is still found, and every location looked in
+/// is named if none of them hit — the old error named only the one guess, which is
+/// what made this a loop with no exit.
+fn locate_transform_bin(crate_dir: &Path) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(crate_dir)
+        .output();
+    if let Ok(out) = &out
+        && out.status.success()
+        && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(dir) = meta.get("target_directory").and_then(|t| t.as_str())
+    {
+        candidates.push(PathBuf::from(dir).join("release").join(TRANSFORM_BIN));
+    }
+
+    let local = crate_dir.join("target").join("release").join(TRANSFORM_BIN);
+    if !candidates.contains(&local) {
+        candidates.push(local);
+    }
+
+    if let Some(hit) = candidates.iter().find(|p| p.is_file()) {
+        return Ok(hit.clone());
+    }
+    Err(CliError::Migration(format!(
+        "transformer bin not found — looked in:\n{}\nRun `forgedb migrate build --from <F> --to <T>` first.",
+        candidates
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )))
 }
 
 /// Run a built transformer bin over a single `src → dest` data dir (#74 Phase
@@ -328,13 +438,7 @@ pub fn run(opts: MigrateRunOptions) -> Result<()> {
     let bin_dir = opts
         .bin_dir
         .unwrap_or_else(|| PathBuf::from("migrations/transform"));
-    let bin = bin_dir.join("target/release/forgedb-transform");
-    if !bin.exists() {
-        return Err(CliError::Migration(format!(
-            "transformer bin not found at {} — run `forgedb migrate build --from <F> --to <T>` first",
-            bin.display()
-        )));
-    }
+    let bin = locate_transform_bin(&bin_dir)?;
 
     ui::info(&format!(
         "Migrating {} → {} via {}",
@@ -396,17 +500,7 @@ pub fn engine(opts: MigrateEngineOptions) -> Result<()> {
     emit_engine(opts.schema.as_deref(), schema_version, from_engine, to_engine, &output)?;
 
     ui::info("Compiling the engine-hop bin (cargo build --release)...");
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(&output)
-        .status()
-        .map_err(|e| CliError::Migration(format!("failed to run cargo: {e}")))?;
-    if !status.success() {
-        return Err(CliError::Migration(
-            "engine-hop build failed (see cargo output above)".to_string(),
-        ));
-    }
-    let bin = output.join("target/release/forgedb-transform");
+    let bin = cargo_build_transform_bin(&output, "engine-hop")?;
 
     ui::info(&format!(
         "Migrating {} → {} (the source dir is left untouched — it is your rollback)",

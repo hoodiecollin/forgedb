@@ -213,12 +213,13 @@ jobs:
         run: |
           set -euxo pipefail
           cd "$APP"
-          # `migrate build` hardcodes <output>/target/release/forgedb-transform
-          # and does not honour CARGO_TARGET_DIR, so the shared target dir has to
-          # come off for this one step or the binary lands somewhere the CLI will
-          # not look. Unsetting it also makes this step run the exact command an
-          # operator runs.
-          unset CARGO_TARGET_DIR
+          # The shared CARGO_TARGET_DIR deliberately stays ON here. It used to be
+          # unset for this step, because `migrate build` hardcoded
+          # <output>/target/release/forgedb-transform and reported a path nothing
+          # was at (#292). That workaround is what found the bug, so keeping the
+          # redirect is now the point of the step: it is the only place the real
+          # transformer, built against the PUBLISHED substrate, is asked for its
+          # path under a redirected target dir.
 
           # The transformer replays a RECORDED lineage and refuses a synthesized
           # jump, so a v1 -> v2 hop has to exist before it can be built: record
@@ -233,9 +234,16 @@ jobs:
           # migrations/transform AND compiles it release. (Plain `generate
           # transform` defaults its output to ./generated, where it would
           # overwrite the app's own manifest.)
-          "$FORGEDB" migrate build --from 1 --to 2
+          "$FORGEDB" migrate build --from 1 --to 2 | tee build.log
           grep '^forgedb-' migrations/transform/Cargo.toml
-          test -x migrations/transform/target/release/forgedb-transform
+
+          # #292: assert the path the CLI *reports* is the path cargo *wrote*. The
+          # exit code cannot carry this — the defect was exit 0 naming a file that
+          # was not there — so both halves are asserted, plus the absence of the
+          # location the old code guessed.
+          test -x "$CARGO_TARGET_DIR/release/forgedb-transform"
+          grep -qF "Built transformer: $CARGO_TARGET_DIR/release/forgedb-transform" build.log
+          test ! -e migrations/transform/target
 
       - name: No path dependency may have leaked into any resolve
         shell: bash
