@@ -29,7 +29,12 @@ function formatDate(iso: string): string {
   return `${MONTHS[Number(mo) - 1] ?? mo} ${Number(d)}, ${y}`;
 }
 
-const CHIP_LABELS = ["rfc", "experiment", "perf", "config", "tech-debt"];
+/*
+ * Labels worth surfacing as a chip. `improvement` is deliberately absent: it is the default type
+ * on the overwhelming majority of roadmap items, so a chip for it would appear nearly everywhere
+ * and distinguish nothing. A chip earns its place by being the exception.
+ */
+const CHIP_LABELS = ["experiment", "bugfix", "hotfix", "release-gate"];
 
 /** A tiny milestone/state chip for a standalone issue or a child. */
 function WhenChip({ item }: { item: Pick<ChildIssue, "shipped" | "pending" | "state" | "milestone"> }) {
