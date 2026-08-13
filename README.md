@@ -187,7 +187,7 @@ The full docs — with an ecosystem toggle for TypeScript / Python / Rust / Go �
 
 Contributions are welcome — bug fixes, tests, docs, examples, and performance work
 especially. Start with the [Contributing Guide](./docs/CONTRIBUTING.md). Design proposals
-are filed as [`rfc`-labeled issues](https://github.com/hoodiecollin/forgedb/issues), not
+are filed as [design gate issues](https://github.com/hoodiecollin/forgedb/issues), not
 committed docs.
 
 - **Issues:** <https://github.com/hoodiecollin/forgedb/issues>
