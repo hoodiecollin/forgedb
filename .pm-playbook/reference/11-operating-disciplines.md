@@ -7,16 +7,26 @@ Standing rules that keep Issues the single, always-current source of truth:
 
 - **Backlog lives in Issues — no markdown backlog.** No `TASKS.md` / `TODO.md` shadow list. Ask
   "what's next" with `gh issue list --state open` (filter by label / milestone), not a file.
-  - **A reconciled local mirror is not a shadow backlog.** `pull` materializes Issues to
-    `.pm-playbook/backlog/` so agents can read and edit them without a round trip per question.
-    That is allowed, and the distinction is precise: **a second copy is a shadow backlog when it
-    can disagree with Issues indefinitely.** This one cannot. It is gitignored rather than
-    committed, so it is never a reviewable artifact competing with the issue; `pull` overwrites it
-    from GitHub; and `push` refuses outright the moment both sides have moved, rather than merging
-    or picking a winner. A `TASKS.md` has none of those properties — nothing overwrites it and
-    nothing refuses on its behalf, so it drifts silently and forever. **If you find yourself
-    hand-maintaining a file the tooling does not reconcile, that is the forbidden thing**,
-    regardless of where it lives.
+  - **Read the mirror, not one API call per question.** `pull` materializes Issues to
+    `.pm-playbook/backlog/` — every body, comment, label, milestone and parent link as ordinary
+    files. **When the mirror exists, it is where an agent reads the backlog**: "what is left in
+    this release" and "what did we decide on #42" become a `grep` over local files instead of a
+    round trip each, and reading twelve issue bodies over the API is twelve of them. `check
+    --no-remote` lints the same mirror with the same issue-level rules.
+
+    Three properties bound its use. It is **gitignored and machine-local**, so a fresh clone has no
+    mirror and its absence means "not pulled here yet," never "no issues." It **goes stale** the
+    moment anyone else moves an issue — `pull` again when it matters. And **reading is local while
+    writing is not**: edit-then-`push`, which refuses outright when both sides moved, or go through
+    `gh` directly. Never hand-edit a file and assume GitHub knows.
+  - **A reconciled local mirror is not a shadow backlog.** The distinction is precise: **a second
+    copy is a shadow backlog when it can disagree with Issues indefinitely.** This one cannot. It
+    is gitignored rather than committed, so it is never a reviewable artifact competing with the
+    issue; `pull` overwrites it from GitHub; and `push` refuses outright the moment both sides have
+    moved, rather than merging or picking a winner. A `TASKS.md` has none of those properties —
+    nothing overwrites it and nothing refuses on its behalf, so it drifts silently and forever.
+    **If you find yourself hand-maintaining a file the tooling does not reconcile, that is the
+    forbidden thing**, regardless of where it lives.
 - **Auto-file issues for new work.** When you commit to a piece of work, `gh issue create` first —
   with exactly one type label, and a body that states the *need* rather than the solution — *then*
   implement. Don't wait to be asked. Leave it unmilestoned if it is speculative; that is what

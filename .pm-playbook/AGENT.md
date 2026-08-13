@@ -100,14 +100,46 @@ violations with an executable fix on each.
    sequencing, identity fit. For a pre-launch product, "users want it" is data you do not have.
    Never estimate in time units, and never add effort labels.
 
+## Read the local mirror, not one API call per question
+
+If `.pm-playbook/backlog/` exists, **that is where you read the backlog.** `pull` materializes
+every issue — body, comments, labels, milestone, parentage — into ordinary files you can grep,
+open, and read in bulk. Answering "what is left in this release" or "what did we decide on #42"
+from the mirror costs one `grep`; asking GitHub costs a round trip per issue, and reading twelve
+issue bodies over the API is twelve of them.
+
+```bash
+npx @hoodiecollin/pm-playbook pull        # refresh the mirror (safe to re-run; overwrites from GitHub)
+ls .pm-playbook/backlog/                  # no mirror yet? run pull, or query GitHub for a one-off
+```
+
+Three things to know before you rely on it:
+
+- **It is gitignored and machine-local.** A fresh clone has no mirror until someone runs `pull`.
+  Its absence means "not pulled here yet," never "no issues."
+- **It goes stale the moment someone else moves an issue.** `pull` again when it matters; it is
+  cheap and idempotent. `check --no-remote` lints the mirror and says so in its output.
+- **Reading is local; WRITING is not.** Never hand-edit a file to change an issue's state and
+  assume GitHub knows. Edit the mirror and reconcile with `push`, which refuses outright when both
+  sides moved rather than picking a winner — or skip the mirror and use `gh` / the CLI directly.
+  Creating, closing, labelling and milestoning all go through GitHub.
+
 ## Useful queries
 
 ```bash
+# From the mirror — no network, and greppable in bulk.
+rg -l 'label' .pm-playbook/backlog/       # anything, across every body and comment at once
+cat .pm-playbook/backlog/standalone/42/body.md
+npx @hoodiecollin/pm-playbook check --no-remote     # lint offline, same issue-level rules
+
+# From GitHub — authoritative, one round trip each. Use when the mirror is absent or stale.
 gh issue list --state open                        # the backlog (never a markdown file)
 gh issue list --label release-gate --state open   # "can we tag?" — any row blocks its milestone
 gh issue list --milestone vX.Y.Z --state open     # what is left in this release
 gh issue list --label improvement:gate-1 --state open   # every design currently in progress
 
+npx @hoodiecollin/pm-playbook pull                           # refresh the mirror from GitHub
+npx @hoodiecollin/pm-playbook push                           # send local mirror edits back (previews first)
 npx @hoodiecollin/pm-playbook ladder                         # the rung of every work item — no filter can do this
 npx @hoodiecollin/pm-playbook materialize --yes              # gates for the cycle in flight (idempotent)
 npx @hoodiecollin/pm-playbook materialize --issue <n> --yes  # an experiment's gates, by decision
