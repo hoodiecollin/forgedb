@@ -576,6 +576,9 @@ fn run(cli: Cli) -> Result<()> {
                 output: resolved_output,
                 schema: resolved_schema,
                 no_api,
+                // Same resolution as `Commands::Generate` above, from the same
+                // loaded config — `build` must bake what `generate` would (#361).
+                gen_config: forge_config.gen_config()?,
             })
         }
 

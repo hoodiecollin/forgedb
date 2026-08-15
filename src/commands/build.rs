@@ -7,6 +7,16 @@ pub struct BuildOptions {
     pub output: Option<String>,
     pub schema: Option<String>,
     pub no_api: bool,
+    /// Generate-time runtime-behavior config (epic #126), resolved by the caller
+    /// from the **one** config the CLI loaded.
+    ///
+    /// This is passed in rather than loaded here (#361): `build` used to call
+    /// `load_config(None)` itself, so a single invocation was served by two
+    /// different files — `--config` for the output/schema paths and whatever sat
+    /// in the working directory for every `[runtime]`/`[storage]` knob. Taking it
+    /// as an argument is what makes that unrepresentable; two loaders that merely
+    /// agree today is the same bug waiting.
+    pub gen_config: forgedb_codegen::GenConfig,
 }
 
 pub fn run(options: BuildOptions) -> Result<()> {
@@ -21,11 +31,6 @@ pub fn run(options: BuildOptions) -> Result<()> {
         components: false,
         schema: options.schema.clone(),
     })?;
-
-    // Generate-time runtime-behavior config (epic #126): honor the schema-blind
-    // [runtime]/[storage] knobs from forgedb.toml (discovered in the CWD) so a
-    // `build` bakes the same tailored behavior as `generate`.
-    let gen_config = crate::config::load_config(None)?.gen_config()?;
 
     // Generate code — respect the --no-api flag by running only the targets we want.
     ui::info("Generating code...");
@@ -46,7 +51,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
                 output: options.output.clone(),
                 schema: options.schema.clone(),
                 config_targets: None,
-                gen_config,
+                gen_config: options.gen_config,
                 force: true,
                 from: None,
                 to: None,
@@ -62,7 +67,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
             output: options.output.clone(),
             schema: options.schema.clone(),
             config_targets: None,
-            gen_config,
+            gen_config: options.gen_config,
             force: true,
             from: None,
             to: None,
