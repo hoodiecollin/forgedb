@@ -1,0 +1,163 @@
+//! End-to-end coverage for the global `--config` flag (#361).
+//!
+//! Nothing in the suite exercised `--config` before this file existed, which is
+//! why `forgedb build` could ignore it for an entire release: `src/config.rs`'s
+//! unit tests all call `toml::from_str` directly, so the *parsing* was covered
+//! and the *loading* never was.
+//!
+//! These tests use a **three-valued** discriminator on purpose. With only two
+//! states, a command that read no config at all and fell back to the built-in
+//! default would be indistinguishable from one that read the right file:
+//!
+//! | source                    | `wal_checkpoint_interval` | `fsync`  |
+//! |---------------------------|---------------------------|----------|
+//! | built-in default          | 1000                      | `always` |
+//! | `./forgedb.toml`          | 500                       | `never`  |
+//! | the `--config` path       | 250                       | `always` |
+
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use tempfile::TempDir;
+
+/// Built-in default, asserted against so a "read nothing" fix cannot pass.
+const DEFAULT_INTERVAL: u64 = 1000;
+/// What `./forgedb.toml` sets — the value #361 baked in erroneously.
+const CWD_INTERVAL: u64 = 500;
+/// What the `--config` file sets — the only correct answer.
+const EXPLICIT_INTERVAL: u64 = 250;
+
+fn forgedb_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
+    cmd.current_dir(dir);
+    cmd
+}
+
+fn write_schema(dir: &Path) {
+    fs::write(dir.join("schema.forge"), "Post {\n  id: +uuid\n  title: string\n}\n")
+        .expect("write schema");
+}
+
+fn write_config(path: &Path, interval: u64, fsync: &str) {
+    fs::write(
+        path,
+        format!(
+            "[project]\nname = \"discriminator\"\n\n\
+             [storage]\nwal_checkpoint_interval = {interval}\nfsync = \"{fsync}\"\n"
+        ),
+    )
+    .expect("write config");
+}
+
+/// Read the `WAL_CHECKPOINT_INTERVAL` const out of a generated `database.rs`.
+///
+/// Parsed rather than substring-matched so `prettyplease` reformatting cannot
+/// silently turn this guard into a no-op.
+fn baked_interval(generated_dir: &Path) -> u64 {
+    let src = fs::read_to_string(generated_dir.join("database.rs"))
+        .expect("generated database.rs should exist");
+    let line = src
+        .lines()
+        .find(|l| l.contains("const WAL_CHECKPOINT_INTERVAL"))
+        .unwrap_or_else(|| panic!("no WAL_CHECKPOINT_INTERVAL const in {generated_dir:?}"));
+    line.rsplit('=')
+        .next()
+        .expect("const has a value")
+        .trim()
+        .trim_end_matches(';')
+        .parse()
+        .unwrap_or_else(|_| panic!("unparseable const line: {line}"))
+}
+
+/// Read the baked `FsyncPolicy` variant out of a generated `database.rs`.
+///
+/// Matches only the **fully-qualified** `forgedb_wal::FsyncPolicy::` path. A doc
+/// comment in the generated file contains a bare `` `FsyncPolicy::Always` ``
+/// unconditionally, so a search for the unqualified name reports `Always` even
+/// when `never` was configured — i.e. it passes while the bug is present.
+fn baked_fsync(generated_dir: &Path) -> String {
+    const PATH: &str = "forgedb_wal::FsyncPolicy::";
+    let src = fs::read_to_string(generated_dir.join("database.rs"))
+        .expect("generated database.rs should exist");
+    let (_, rest) = src
+        .split_once(PATH)
+        .unwrap_or_else(|| panic!("no qualified {PATH} in {generated_dir:?}"));
+    rest.chars().take_while(|c| c.is_alphanumeric()).collect()
+}
+
+/// `build` must bake the config the user named with `--config`, not the one that
+/// happens to sit in the working directory.
+///
+/// `generate` runs first as an **in-run control**: it is known to thread the
+/// loaded config through, so if it also came out wrong the failure would be in
+/// config loading rather than in `build`, and the two diagnoses are very
+/// different. Detection does not depend on the control; attribution does.
+#[test]
+fn build_honors_explicit_config_over_a_cwd_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    write_schema(root);
+    write_config(&root.join("forgedb.toml"), CWD_INTERVAL, "never");
+    write_config(&root.join("prod.toml"), EXPLICIT_INTERVAL, "always");
+
+    let control = forgedb_cmd(root)
+        .args(["--config", "prod.toml", "generate", "rust", "--output", "gen-generate"])
+        .output()
+        .expect("run generate");
+    assert!(
+        control.status.success(),
+        "control `generate` failed: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert_eq!(
+        baked_interval(&root.join("gen-generate")),
+        EXPLICIT_INTERVAL,
+        "control: `generate` must read the --config file"
+    );
+
+    // `build`'s exit status is deliberately not asserted: the fixture has no
+    // Cargo.toml, so the trailing `cargo build` fails for an unrelated reason.
+    // Codegen has already written the file by then, and the generated bytes are
+    // what this test is about — a real project would exit zero either way.
+    forgedb_cmd(root)
+        .args(["--config", "prod.toml", "build", "--output", "gen-build"])
+        .output()
+        .expect("run build");
+
+    let built = root.join("gen-build");
+    assert_eq!(
+        baked_interval(&built),
+        EXPLICIT_INTERVAL,
+        "`build` baked the wrong config (#361): {} is ./forgedb.toml, {DEFAULT_INTERVAL} is the \
+         built-in default, {EXPLICIT_INTERVAL} is the --config file the user named",
+        CWD_INTERVAL
+    );
+    assert_eq!(
+        baked_fsync(&built),
+        "Always",
+        "`build` baked a weaker durability policy than the named config asked for"
+    );
+}
+
+/// The same defect in its quieter direction: with no `forgedb.toml` in the
+/// working directory the re-read silently fell back to built-in defaults, so the
+/// user's production knobs simply did not apply and nothing was reported.
+#[test]
+fn build_honors_explicit_config_when_no_cwd_file_exists() {
+    let dir = TempDir::new().expect("tempdir");
+    let root = dir.path();
+    write_schema(root);
+    write_config(&root.join("prod.toml"), EXPLICIT_INTERVAL, "always");
+    assert!(!root.join("forgedb.toml").exists(), "fixture must have no CWD config");
+
+    forgedb_cmd(root)
+        .args(["--config", "prod.toml", "build", "--output", "gen-build"])
+        .output()
+        .expect("run build");
+
+    assert_eq!(
+        baked_interval(&root.join("gen-build")),
+        EXPLICIT_INTERVAL,
+        "`build` fell back to defaults instead of reading --config"
+    );
+}
