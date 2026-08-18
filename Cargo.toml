@@ -91,6 +91,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 ctrlc = "3.4"
+home = "0.5"
 
 [dev-dependencies]
 forgedb-parser = { path = "crates/parser", version = "0.4.0" }
@@ -103,6 +104,10 @@ forgedb-migrations = { path = "crates/migrations", version = "0.3.0" }
 forgedb-compaction = { path = "crates/compaction", version = "0.1.0" }
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3.8"
+# Used by tests/cache_dir_test.rs to parse the emitted workspace root and to
+# assert FORGEDB_HOME actually diverts away from the real home directory.
+toml = "0.8"
+home = "0.5"
 # Structural guards over generated source (#282 BDD-9). `prettyplease` breaks lines by
 # length, so the same emitted call renders `return db .post .__with_page(` in one schema
 # and unbroken in another — a literal needle matches nothing and the guard passes
