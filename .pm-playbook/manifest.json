@@ -1,6 +1,6 @@
 {
   "package": "@hoodiecollin/pm-playbook",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "migratedThrough": "2.0.0",
   "files": {
     "AGENT.md": "ce79df856480ae8ace8bb8efcaeb0e9964d97f5b02e6b0147aa3c25933ce9bc1",
