@@ -82,6 +82,17 @@ pub fn forgedb_home() -> Result<PathBuf> {
         })
 }
 
+/// `<home>/ledger` — the project-id claim ledger (#333).
+///
+/// It lives in the cache dir because it is a **detector**, never the record of a
+/// resolution: a resolved collision is written into the colliding project's own
+/// `forgedb.toml`.  That division is what keeps it safe under C1 — the ledger is
+/// a rebuildable cache of currently-claimed ids, so GC may delete it freely, and
+/// deleting it cannot resurrect a collision.
+pub fn ledger_root() -> Result<PathBuf> {
+    Ok(forgedb_home()?.join("ledger"))
+}
+
 /// `<home>/projects` — the parent of every per-project workspace.
 pub fn projects_root() -> Result<PathBuf> {
     Ok(forgedb_home()?.join("projects"))
@@ -135,13 +146,20 @@ fn normalize_for_hash(rel_schema: &Path) -> String {
 /// threat model is an accidental collision between two schema paths in one
 /// project, not an adversary choosing them.
 pub fn member_hash(rel_schema: &Path) -> String {
+    path_hash(&normalize_for_hash(rel_schema))
+}
+
+/// FNV-1a (64-bit) over a string, rendered as 16 lowercase hex digits.
+///
+/// The one hash in the CLI, shared by the member hash above and by #333's
+/// project-path fallback id, so there is a single place a drift would show up
+/// and a single set of golden vectors pinning it.
+pub fn path_hash(input: &str) -> String {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x100_0000_01b3;
 
-    let normalized = normalize_for_hash(rel_schema);
-
     let mut hash = FNV_OFFSET_BASIS;
-    for byte in normalized.as_bytes() {
+    for byte in input.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }

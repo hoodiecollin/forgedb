@@ -16,6 +16,9 @@ fn setup_test_dir() -> TempDir {
 /// hermetic and safe to run in parallel (no process-global `set_current_dir`).
 fn forgedb_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
+    // #333: keep every claim this suite makes inside its own tempdir rather than
+    // in the developer's real `~/.forgedb`.
+    cmd.env("FORGEDB_HOME", dir.join(".forgedb-home"));
     cmd.current_dir(dir);
     cmd
 }
@@ -44,6 +47,9 @@ fn test_init_command_creates_project_structure() {
         template: None,
         rust: true,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
 
     let result = run(options);
@@ -77,6 +83,9 @@ fn test_init_with_blog_template() {
         template: Some("blog".to_string()),
         rust: true,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
 
     let result = run(options);
@@ -106,6 +115,9 @@ fn test_init_emits_onhost_systemd_deploy() {
         template: None,
         rust: true,
         api_only: false,
+        // Explicit: these fixtures live in a tempdir with no enclosing project,
+        // and pinning the answer keeps them independent of what is above them.
+        isolated: Some(true),
     };
     run(options).expect("init should succeed");
 

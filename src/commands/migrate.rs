@@ -523,20 +523,7 @@ fn emit_engine(
 ) -> Result<()> {
     use forgedb_codegen::{EngineHopPlan, EngineMigrationGenerator};
 
-    let schema_path = match schema {
-        Some(p) => p.to_path_buf(),
-        None => ["schema.forge", "schema.lang", "schema.forgedb"]
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                CliError::SchemaNotFound(
-                    "No schema file found. Expected one of: schema.forge, schema.lang, \
-                     schema.forgedb (or pass --schema)"
-                        .to_string(),
-                )
-            })?,
-    };
+    let schema_path = crate::project::find_schema(schema.map(|p| p.to_string_lossy()).as_deref())?;
     let src = std::fs::read_to_string(&schema_path)
         .map_err(|e| CliError::SchemaNotFound(format!("{}: {}", schema_path.display(), e)))?;
     let parsed = forgedb_parser::Parser::new(&src)

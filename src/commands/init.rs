@@ -1,4 +1,4 @@
-use crate::{error::CliError, templates, ui, Result};
+use crate::{error::CliError, project, templates, ui, Result};
 use std::fs;
 use std::path::Path;
 
@@ -7,6 +7,10 @@ pub struct InitOptions {
     pub template: Option<String>,
     pub rust: bool,
     pub api_only: bool,
+    /// `--isolated` / `--no-isolated`.  `None` means "decide from what is
+    /// above me", which is the whole reason this is three-valued rather than a
+    /// plain flag: the useful default depends on the tree.
+    pub isolated: Option<bool>,
 }
 
 pub fn run(options: InitOptions) -> Result<()> {
@@ -18,6 +22,14 @@ pub fn run(options: InitOptions) -> Result<()> {
         return Err(CliError::ProjectExists(options.project_name.clone()));
     }
 
+    // Scaffolding *inside* an existing project is the normal case, not an error
+    // (#333 §6/§7) — a new schema under an existing project is exactly what
+    // adding an app looks like. So `init` asks nothing and simply reports what
+    // it found, then records the answer explicitly.
+    let isolated = resolve_isolated(&options)?;
+    let project_id = derive_project_id(&options.project_name);
+    refuse_a_taken_name(&project_id, isolated)?;
+
     // Create project directory structure
     create_project_structure(&options)?;
 
@@ -25,7 +37,7 @@ pub fn run(options: InitOptions) -> Result<()> {
     create_schema_file(&options)?;
 
     // Create config file
-    create_config_file(&options)?;
+    create_config_file(&options, &project_id, isolated)?;
 
     // Create .gitignore
     create_gitignore(&options)?;
@@ -84,8 +96,79 @@ fn create_schema_file(options: &InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn create_config_file(options: &InitOptions) -> Result<()> {
-    let config_content = templates::default_config(&options.project_name);
+/// Decide whether the new project stands alone, and say why.
+///
+/// The flags are the complete contract; the report is the only thing that would
+/// otherwise need a prompt, and it is one-way. Nothing here blocks on a TTY.
+fn resolve_isolated(options: &InitOptions) -> Result<bool> {
+    if let Some(explicit) = options.isolated {
+        return Ok(explicit);
+    }
+
+    // Walk from where the project will be created — the new directory does not
+    // exist yet, so start at its parent. `forgedb init apps/api` must see what is
+    // above `apps/`, not only what is above the CWD.
+    let parent = Path::new(&options.project_name).parent().unwrap_or(Path::new(""));
+    let from = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let chain = project::Chain::walk(from)?;
+    match chain.project_root() {
+        Some(_) => {
+            let id = project::identify(&chain)?;
+            ui::info(&format!(
+                "Joining the enclosing project {:?} (rooted at {}). \
+                 Pass --isolated to stand alone instead.",
+                id.name,
+                id.root.display()
+            ));
+            Ok(false)
+        }
+        None => Ok(true),
+    }
+}
+
+/// C12: report a taken project id here, where the name is being chosen, rather
+/// than at the first `generate` — by which point the user has a scaffolded tree
+/// whose name they now have to change.
+///
+/// Only meaningful for a project root: a config that joins an enclosing project
+/// declares no name of its own, so it cannot collide.
+fn refuse_a_taken_name(project_name: &str, isolated: bool) -> Result<()> {
+    if !isolated {
+        return Ok(());
+    }
+    if let Some(held_by) = project::held_by(project_name)? {
+        return Err(CliError::Config(format!(
+            "Project name {project_name:?} is already claimed by {}.\n\n\
+             Two projects sharing an id would share one build cache, one lockfile \
+             and one target directory. Pick a different name, or pass \
+             --no-isolated to join an enclosing project instead.",
+            held_by.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The project id for a scaffold: the **last component** of the path, not the
+/// path.
+///
+/// `forgedb init ./apps/api` should name the project `api`. Writing the whole
+/// argument was harmless while `[project].name` was ignored; since #333 the name
+/// is used verbatim as a directory under `~/.forgedb`, so a path there is either
+/// rejected or escapes the cache.
+fn derive_project_id(project_name: &str) -> String {
+    Path::new(project_name)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| project_name.to_string())
+}
+
+fn create_config_file(options: &InitOptions, project_id: &str, isolated: bool) -> Result<()> {
+    let config_content = templates::default_config(project_id, isolated);
     let config_path = Path::new(&options.project_name).join("forgedb.toml");
     fs::write(config_path, config_content)?;
 

@@ -1,25 +1,99 @@
 /// Compile-time generator configuration loaded from `forgedb.toml`.
 ///
-/// The generator consumes the `[generate]`, `[tenant]`, `[auth]`, `[runtime]`,
-/// and `[storage]` tables; any other table present in a project's `forgedb.toml`
-/// (e.g. `[project]`) is silently ignored, so this struct is forward-compatible
-/// with the full config file emitted by `forgedb init`.
+/// **Unknown tables and unknown keys are errors** (#333).  Every table this
+/// struct declares must be one `forgedb init` emits, and vice versa — the
+/// scaffold has to parse against its own CLI.  Silently ignoring a key was the
+/// worse failure even for the version skew it was meant to tolerate: a knob the
+/// CLI does not know reads as applied and is not, so `fsync = "never"` quietly
+/// stays `always` and the wrong bytes get generated with no signal.
+///
+/// Which config governs a schema is decided by [`crate::project`], not here:
+/// the nearest `forgedb.toml` at or above the schema's directory, or an explicit
+/// `--config` path, which is an outright override.  This module only parses.
 ///
 /// Precedence (highest → lowest):
 /// 1. Explicit CLI flag (`--output`, `--schema`, …)
-/// 2. Value from the loaded config file (`[generate]` table)
-/// 3. Built-in default (`./generated`, `schema.forge`, all targets)
+/// 2. Value from the governing config file (`[generate]` table)
+/// 3. Built-in default (`./generated`, all targets)
 use serde::Deserialize;
-use std::path::Path;
+use toml::Spanned;
 
 use crate::error::{CliError, Result};
 
+/// Project identity and grouping (`[project]` table in `forgedb.toml`) — #333.
+///
+/// A `forgedb.toml` does **not** declare an app; a `.forge` schema does.  This
+/// table says only what an enclosing config cannot: whether the schemas beneath
+/// it form a project of their own.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Explicit project id.  Only meaningful at the project root — declaring it
+    /// at a nested, non-isolated config is a positioned error, because it reads
+    /// as authoritative and is not.  Spanned so that error can name its line.
+    pub name: Option<Spanned<String>>,
+    /// Inert metadata.  Deliberately has **no** effect on generation or on
+    /// identity: identity is `name` + root path, and giving a version a role
+    /// would create a second axis on which two roots could collide.
+    pub version: Option<String>,
+    /// Whether the schemas beneath this config form their own project.
+    ///
+    /// **Absent means `true`, inverting `bool`'s own default on purpose.** Read
+    /// naturally, an absent `isolated` would be "not isolated" — grouped — so a
+    /// monorepo root config added for an unrelated reason would silently absorb
+    /// every app beneath it into one project and one lockfile.  A config that
+    /// never heard of grouping is not in a group; grouping stays opt-in, and
+    /// `forgedb init` always writes the field explicitly.
+    #[serde(default = "isolated_default")]
+    pub isolated: bool,
+}
+
+fn isolated_default() -> bool {
+    true
+}
+
+/// Hand-written, **not** derived.
+///
+/// `ForgeConfig::project` carries `#[serde(default)]`, so a config with no
+/// `[project]` table at all is built from this impl rather than from
+/// `isolated_default` — and a derived `Default` would give `isolated = false`
+/// there, quietly regrouping every app whose config predates the field. The two
+/// defaults have to agree, and only one of them is reachable from the attribute.
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        ProjectConfig {
+            name: None,
+            version: None,
+            isolated: isolated_default(),
+        }
+    }
+}
+
+impl ProjectConfig {
+    /// The declared project name, if any.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_ref().map(|n| n.as_ref().as_str())
+    }
+}
+
 /// Generator-specific configuration (`[generate]` table in `forgedb.toml`).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct GenerateConfig {
-    /// Schema file path (default: `schema.forge`).
-    pub schema: Option<String>,
+    /// **Removed in #333.**  Declared only so the key stays *recognized and
+    /// rejected*: under `deny_unknown_fields` it would otherwise report
+    /// `unknown field 'schema'`, which is true and useless.  A config governs
+    /// every schema beneath it, so naming one is a category error — and it
+    /// admitted a real loop (read config A to find the schema, then discover
+    /// config B is that schema's nearest ancestor).  See [`removal_error`].
+    pub schema: Option<Spanned<toml::Value>>,
     /// Output directory for generated files (default: `./generated`).
+    ///
+    /// Relative paths resolve against **the schema's** directory, not the
+    /// config's: under a root config governing several apps, config-relative
+    /// would send every app's `output = "generated"` to the same directory and
+    /// silently interleave their generated code.  Schema-relative makes this a
+    /// per-app pattern instead.
     pub output: Option<String>,
     /// Which targets to enable.  When absent all targets are enabled.
     /// Valid values: `rust`, `typescript`, `api`, `stubs`.
@@ -31,6 +105,7 @@ pub struct GenerateConfig {
 /// `forgedb serve` process serves exactly one tenant.  This table declares the
 /// root the `forgedb tenant` CLI manages and generated processes open under.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TenantConfig {
     /// Root directory under which each tenant's data dir lives (default `./data`).
     pub root: Option<String>,
@@ -49,6 +124,7 @@ impl TenantConfig {
 /// source `forgedb serve` translates into that env.  **Never** read from a
 /// `.forge` schema — auth is deployment config, the schema is data shape.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     /// Turn the JWT tenant guard on for the generated server.
     #[serde(default)]
@@ -122,6 +198,7 @@ impl AuthConfig {
 /// schema. Absent values reproduce today's output byte-for-byte, except
 /// `replication` (default OFF — the #130 sanctioned exception).
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     /// Attach the durable replication broker (#130, Tier A). Default `false`:
     /// an unused broker's second `F_FULLFSYNC` per write is pure waste. Turn on
@@ -143,6 +220,7 @@ pub struct RuntimeConfig {
 /// Schema-blind, baked at generate time (Tier A/B). Defaults are byte-identical
 /// to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     /// WAL fsync policy (#129): `"always"` (default, crash-safe) or `"never"`
     /// (durability-weakening opt-in — a real data-loss window on power loss).
@@ -162,6 +240,7 @@ pub struct StorageConfig {
 /// Schema-blind, baked at generate time (Tier B). Defaults are byte-identical
 /// to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionConfig {
     /// Default retry count for `transaction_optimistic` (#146). Default 3.
     /// Per-call control stays available via `transaction_retrying(retries, f)`.
@@ -173,6 +252,7 @@ pub struct TransactionConfig {
 /// to today's output. (The generated server's host/port and shutdown drain are
 /// separate DEPLOY-environment knobs read from env at process start, not baked.)
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// List-endpoint page size when the client omits `?limit` (#141). Default 50.
     pub page_default_limit: Option<usize>,
@@ -188,6 +268,7 @@ pub struct ServerConfig {
 /// Schema-blind, substituted into the static Worker bootstrap at generate time
 /// (Tier B). Defaults are byte-identical to today's output.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WasmConfig {
     /// Browser read-replica auto-commit debounce, ms (#148). Default 250.
     pub commit_debounce_ms: Option<u64>,
@@ -195,9 +276,19 @@ pub struct WasmConfig {
     pub commit_max_frames: Option<u64>,
 }
 
-/// Top-level config struct.  Unknown top-level TOML tables are ignored.
+/// Top-level config struct.  An unknown top-level table is an error (#333) —
+/// a misspelled `[projekt]` would otherwise be ignored, identity would fall
+/// through to manifest detection or the path hash, and two projects could
+/// silently merge through the very mechanism meant to be a compatibility
+/// feature.
+///
+/// Every table `forgedb init` emits must appear here, or the scaffold fails
+/// against its own CLI; `scaffolded_config_parses_strictly` is that guard.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ForgeConfig {
+    #[serde(default)]
+    pub project: ProjectConfig,
     #[serde(default)]
     pub generate: GenerateConfig,
     #[serde(default)]
@@ -273,39 +364,88 @@ impl ForgeConfig {
     }
 }
 
-/// Load generator configuration.
+/// The file name a config is always stored under.
+pub const CONFIG_FILE: &str = "forgedb.toml";
+
+/// 1-based line and column of a byte offset in `content`.
 ///
-/// * `path = Some(p)` — load from the explicit path; error if the file is
-///   missing or contains invalid TOML.
-/// * `path = None` — look for `forgedb.toml` in the current working directory;
-///   return the default config silently if the file does not exist.
-pub fn load_config(path: Option<&str>) -> Result<ForgeConfig> {
-    match path {
-        Some(explicit_path) => {
-            let content = std::fs::read_to_string(explicit_path).map_err(|e| {
-                CliError::Config(format!(
-                    "Cannot read config file '{}': {}",
-                    explicit_path, e
-                ))
-            })?;
-            toml::from_str(&content).map_err(|e| {
-                CliError::Config(format!(
-                    "Invalid config file '{}': {}",
-                    explicit_path, e
-                ))
-            })
-        }
-        None => {
-            if Path::new("forgedb.toml").exists() {
-                let content = std::fs::read_to_string("forgedb.toml")
-                    .map_err(|e| CliError::Config(format!("Cannot read forgedb.toml: {}", e)))?;
-                toml::from_str(&content)
-                    .map_err(|e| CliError::Config(format!("Invalid forgedb.toml: {}", e)))
-            } else {
-                Ok(ForgeConfig::default())
-            }
-        }
+/// `toml` reports spans as byte offsets; every positioned diagnostic in this
+/// crate goes through here so they all count lines the same way.
+pub fn line_col(content: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(content.len());
+    let before = &content[..clamped];
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// The position of the **key** on the line a value's span points into.
+///
+/// `Spanned` reports where the *value* starts, so `name = "api"` positions at
+/// column 8 — past the thing the reader has to change. Every diagnostic here is
+/// about a key, so they all point at the start of its line instead.
+pub fn key_position(content: &str, value_offset: usize) -> (usize, usize) {
+    let (line, _) = line_col(content, value_offset);
+    let indent = content
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map_or(0, |l| l.chars().take_while(|c| c.is_whitespace()).count());
+    (line, indent + 1)
+}
+
+/// Parse a `forgedb.toml` from its text, applying the diagnostics that
+/// `deny_unknown_fields` alone cannot produce.
+///
+/// `path` is used only for the message; nothing is read from disk here, which is
+/// what lets the strict-parsing tests run without fixtures.
+pub fn parse_config(content: &str, path: &std::path::Path) -> Result<ForgeConfig> {
+    let config: ForgeConfig = toml::from_str(content).map_err(|e| {
+        // The library already emits `TOML parse error at line L, column C`, a
+        // caret snippet, the offending key AND the expected set.  Wrapping that
+        // in `Configuration error:` would only bury it, so it is rendered
+        // verbatim under the file it came from.
+        CliError::ConfigDiagnostic(format!("{}:\n{}", path.display(), e))
+    })?;
+
+    if let Some(removed) = &config.generate.schema {
+        return Err(removal_error(content, path, removed.span().start));
     }
+
+    Ok(config)
+}
+
+/// The bespoke diagnostic for the removed `[generate].schema` key (#333 §10).
+///
+/// `deny_unknown_fields` would report `unknown field 'schema'` — true, and
+/// useless.  A removal the user cannot act on is a worse break than the removal
+/// itself, so the key stays recognized and this names what replaced it.
+fn removal_error(content: &str, path: &std::path::Path, offset: usize) -> CliError {
+    let (line, column) = key_position(content, offset);
+    CliError::ConfigDiagnostic(format!(
+        "{}:{}:{}: `[generate].schema` was removed.\n\n\
+         A config governs every schema beneath it, so it cannot name one: the \
+         same file may be the nearest ancestor of several apps. It also admitted \
+         a loop — the config that named a schema need not be the config that \
+         governs it.\n\n\
+         The schema is named by the invocation or found beside you: pass \
+         `--schema <path>`, or leave it out and keep the schema next to this file.",
+        path.display(),
+        line,
+        column
+    ))
+}
+
+/// Read and parse a config file from an explicit path.
+///
+/// Every config read in the CLI comes through here or [`parse_config`], and both
+/// are reached only from [`crate::project`].  That is a greppable property, and
+/// it is the invariant #361 established: two loaders means two identities, and a
+/// single invocation served by two of them mis-keys the build cache silently.
+pub fn load_config_file(path: &std::path::Path) -> Result<ForgeConfig> {
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CliError::Config(format!("Cannot read config file '{}': {}", path.display(), e))
+    })?;
+    parse_config(&content, path)
 }
 
 #[cfg(test)]

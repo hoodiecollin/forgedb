@@ -111,17 +111,39 @@ Todo {
 "#
 }
 
-/// Default forgedb.toml configuration
-pub fn default_config(project_name: &str) -> String {
+/// Default forgedb.toml configuration.
+///
+/// `isolated` is written **explicitly, always** (#333). The field's absent value
+/// is `true`, so writing it changes nothing today — it exists so that "these are
+/// separate projects" is a declaration rather than an absence. An absence is
+/// fragile: someone adds a config above this one for an unrelated reason and
+/// every app beneath it silently regroups into one build cache.
+pub fn default_config(project_name: &str, isolated: bool) -> String {
+    // `name` is written ONLY when this config is a project root. A nested,
+    // non-isolated config that declares a name is a contradiction ForgeDB rejects
+    // (#333 §6) — it reads as authoritative and is not — so scaffolding one would
+    // make `init` emit a config that fails on the very next `generate`.
+    let name = if isolated {
+        format!("name = \"{project_name}\"\n")
+    } else {
+        "# No `name`: this config joins the enclosing project, and only a project root\n\
+         # may name one. Set `isolated = true` below to make this a project of its own.\n"
+            .to_string()
+    };
     format!(
         r#"[project]
-name = "{}"
-version = "0.1.0"
+{}version = "0.1.0"
+# Do the schemas beneath this config form their own project, or do they join an
+# enclosing one? A project is the unit of build cache, lockfile and target dir.
+isolated = {}
 
 # Generator configuration — consumed by the forgedb CLI.
 # Precedence: explicit CLI flag > values below > built-in defaults.
 [generate]
-schema = "schema.forge"
+# NOTE: there is no `schema` key. A config governs every schema beneath it, so it
+# cannot name one — pass `--schema`, or keep the schema next to this file.
+# Relative paths below resolve against the SCHEMA's directory, so under a shared
+# root config `output` is a per-app pattern rather than one shared directory.
 output = "./generated"
 # Uncomment to restrict which targets are generated:
 # targets = ["rust", "typescript", "api", "stubs"]
@@ -219,7 +241,7 @@ enabled = false
 #                                  # e.g. ["RS256", "ES256"] (default ["RS256"])
 # leeway_secs = 60                 # clock-skew leeway seconds (default)
 "#,
-        project_name
+        name, isolated
     )
 }
 
