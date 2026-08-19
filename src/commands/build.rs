@@ -11,7 +11,7 @@ pub struct BuildOptions {
     /// from the **one** config the CLI loaded.
     ///
     /// This is passed in rather than loaded here (#361): `build` used to call
-    /// `load_config(None)` itself, so a single invocation was served by two
+    /// the config itself, so a single invocation was served by two
     /// different files — `--config` for the output/schema paths and whatever sat
     /// in the working directory for every `[runtime]`/`[storage]` knob. Taking it
     /// as an argument is what makes that unrepresentable; two loaders that merely

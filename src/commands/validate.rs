@@ -253,18 +253,7 @@ pub fn run(options: ValidateOptions) -> Result<()> {
 }
 
 fn find_schema_file() -> Result<String> {
-    let candidates = ["schema.forge", "schema.lang", "schema.forgedb"];
-
-    for candidate in &candidates {
-        if std::path::Path::new(candidate).exists() {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    Err(CliError::SchemaNotFound(
-        "No schema file found. Expected one of: schema.forge, schema.lang, schema.forgedb"
-            .to_string(),
-    ))
+    Ok(crate::project::find_schema(None)?.display().to_string())
 }
 
 #[cfg(test)]

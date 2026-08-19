@@ -1,9 +1,11 @@
 use clap::{Parser, Subcommand};
 
+mod cache;
 mod commands;
 mod config;
 mod diagnostics;
 mod error;
+mod project;
 mod templates;
 mod ui;
 
@@ -47,6 +49,16 @@ enum Commands {
         /// Generate API only
         #[arg(long)]
         api_only: bool,
+
+        /// Stand alone: the schemas here form their own project, even inside an
+        /// existing one.  Mutually exclusive with `--no-isolated`; omit both to
+        /// join an enclosing project when there is one.
+        #[arg(long, group = "grouping")]
+        isolated: bool,
+
+        /// Join the enclosing project, sharing its build cache and lockfile.
+        #[arg(long, group = "grouping")]
+        no_isolated: bool,
     },
 
     /// Generate code from schema
@@ -478,14 +490,29 @@ enum BackupCommands {
     },
 }
 
+/// The directory a schema's governing config is walked up from.
+///
+/// A bare `schema.forge` has no parent component, and walking from `""` would
+/// resolve against the filesystem root rather than the CWD — which is the
+/// difference between "the config beside my schema" and "any config on the
+/// machine".
+fn schema_dir(schema: &std::path::Path) -> &std::path::Path {
+    match schema.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
     // Wire the global -v/-q flags into the UI output level: --quiet suppresses
     // everything but errors, --verbose unlocks detail lines.
     ui::set_verbosity(cli.verbose, cli.quiet);
 
-    // Load generator config (--config path or auto-discover forgedb.toml).
-    // Commands that need config-derived defaults pull from this.
-    let forge_config = config::load_config(cli.config.as_deref())?;
+    // Config is no longer loaded once, up front, from the CWD (#333): which
+    // config governs an app depends on where that app's *schema* lives, so the
+    // schema-taking arms below resolve their schema first and walk up from it.
+    // `--config` still overrides the knobs outright.
+    let explicit_config = cli.config.as_deref();
 
     match cli.command {
         Commands::Init {
@@ -493,11 +520,20 @@ fn run(cli: Cli) -> Result<()> {
             template,
             rust,
             api_only,
+            isolated,
+            no_isolated,
         } => commands::init::run(commands::init::InitOptions {
             project_name,
             template,
             rust,
             api_only,
+            // clap's ArgGroup guarantees at most one is set, so this is a
+            // three-valued answer, not a precedence rule.
+            isolated: match (isolated, no_isolated) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
         }),
 
         Commands::Generate {
@@ -512,9 +548,26 @@ fn run(cli: Cli) -> Result<()> {
             from,
             to,
         } => {
-            // Precedence: CLI flag > config > built-in default
-            let resolved_output = output.or_else(|| forge_config.generate.output.clone());
-            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            // The schema names itself; no config participates (#333 §10).
+            let schema_path = project::find_schema(schema.as_deref())?;
+            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            // Resolved (and claimed) here rather than lazily: a project id is a
+            // precondition of generating, so a collision must be refused before
+            // any bytes are written, not after.
+            let _project = governing.identify_reported()?;
+            let forge_config = governing.config();
+            // Precedence: CLI flag > config > built-in default.  A config's
+            // relative `output` is resolved against the SCHEMA's directory, so a
+            // root config's `output = "generated"` is a per-app pattern rather
+            // than one shared directory every app interleaves into.
+            let resolved_output = output.or_else(|| {
+                forge_config
+                    .generate
+                    .output
+                    .as_deref()
+                    .map(|o| governing.resolve_path(o).display().to_string())
+            });
+            let resolved_schema = Some(schema_path.display().to_string());
             // The `--sdk`/`--runtime`/`--replica` flags are a clap ArgGroup, so at
             // most one is set — collapse them into the mode axis (#122).
             let mode = if sdk {
@@ -551,7 +604,7 @@ fn run(cli: Cli) -> Result<()> {
             components,
             schema,
         } => {
-            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            let resolved_schema = Some(project::find_schema(schema.as_deref())?.display().to_string());
             commands::validate::run(commands::validate::ValidateOptions {
                 strict,
                 schema_only,
@@ -568,8 +621,21 @@ fn run(cli: Cli) -> Result<()> {
             schema,
             no_api,
         } => {
-            let resolved_output = output.or_else(|| forge_config.generate.output.clone());
-            let resolved_schema = schema.or_else(|| forge_config.generate.schema.clone());
+            // Resolved exactly as `Commands::Generate` does, from the same walk —
+            // `build` must compile in the same place `generate` emitted into, and
+            // must bake what `generate` would (#361, extended to identity by #333).
+            let schema_path = project::find_schema(schema.as_deref())?;
+            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let _project = governing.identify_reported()?;
+            let forge_config = governing.config();
+            let resolved_output = output.or_else(|| {
+                forge_config
+                    .generate
+                    .output
+                    .as_deref()
+                    .map(|o| governing.resolve_path(o).display().to_string())
+            });
+            let resolved_schema = Some(schema_path.display().to_string());
             commands::build::run(commands::build::BuildOptions {
                 release,
                 target,
@@ -733,6 +799,10 @@ fn run(cli: Cli) -> Result<()> {
         },
 
         Commands::Tenant(tenant_cmd) => {
+            // No schema to start from, so the walk starts at the CWD — which
+            // reproduces the old CWD-only lookup as a special case of it.
+            let governing = project::govern_cwd(explicit_config)?;
+            let forge_config = governing.config();
             // Root precedence: --root flag > [tenant].root in config > ./data.
             let default_root = forge_config.tenant.root();
             let resolve = |root: Option<String>| {

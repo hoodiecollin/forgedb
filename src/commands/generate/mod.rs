@@ -38,7 +38,8 @@ pub struct GenerateOptions {
     pub mode: Option<GenerateMode>,
     pub check: bool,
     pub output: Option<String>,
-    /// Explicit schema file path (from CLI `--schema` or config `[generate].schema`).
+    /// Resolved schema file path (from CLI `--schema`, else found beside the
+    /// caller). No config participates — `[generate].schema` was removed in #333.
     /// When `None`, `find_schema_file()` searches for the default names.
     pub schema: Option<String>,
     /// Target list from `[generate].targets` in `forgedb.toml`.
@@ -1004,17 +1005,7 @@ fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
 }
 
 fn find_schema_file() -> Result<String> {
-    // Look for common schema file names
-    let candidates = ["schema.forge", "schema.lang", "schema.forgedb"];
-
-    for candidate in &candidates {
-        if Path::new(candidate).exists() {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    Err(CliError::SchemaNotFound(
-        "No schema file found. Expected one of: schema.forge, schema.lang, schema.forgedb"
-            .to_string(),
-    ))
+    // One list of candidate names, in `project` (#333) — this used to be one of
+    // three open-coded copies, so adding a name meant finding all three.
+    Ok(crate::project::find_schema(None)?.display().to_string())
 }
