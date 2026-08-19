@@ -70,9 +70,13 @@ Two consequences for existing trees:
 - **A schema that ran on built-in defaults may now inherit an ancestor config's knobs.**
   This is the feature, and it is still a behavior change. It bites only where a config
   already sits above a schema that had none of its own.
-- **A relative `[generate].output` now resolves against the schema's directory**, not the
-  CWD. For a single app whose config sits beside its schema — every project `forgedb init`
-  has ever produced — these are the same directory and nothing moves.
+- **A relative output directory now resolves against the schema's directory**, not the
+  CWD. This covers the built-in `generated` default as well as an explicit
+  `[generate].output`; an explicit `--output` flag is the invocation's own word and is
+  used verbatim. For a single app whose config sits beside its schema — every project
+  `forgedb init` has ever produced — these are the same directory and nothing moves. It
+  differs only when `--schema` points somewhere else, where the old behavior had **two
+  apps in one project overwriting each other's generated code** in a single `./generated`.
 
 **Remedy, if you want the old behavior:** put a `forgedb.toml` beside the schema, or pass
 `-c/--config`, which is an outright override and does no walk.

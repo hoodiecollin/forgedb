@@ -10,13 +10,13 @@ project a schema belongs to. Both are read at generate time.
 
 ```toml
 [generate]
-output = "./generated"
+output = "generated"
 targets = ["rust", "typescript", "api", "stubs"]
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `output` | string | `"./generated"` | Output directory, resolved against the **schema's** directory. |
+| `output` | string | `"generated"` | Output directory, resolved against the **schema's** directory. |
 | `targets` | string[] | *(all targets)* | Which targets to emit. When absent, all are enabled. |
 
 Valid `targets` values: `rust`, `typescript`, `api`, `openapi`, `stubs`, plus the

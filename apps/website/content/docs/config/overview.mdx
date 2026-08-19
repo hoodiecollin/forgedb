@@ -40,10 +40,11 @@ that is missing or contains invalid TOML is a hard error. A missing `forgedb.tom
 [`[project]`](/docs/config/generate/).
 
 <Callout type="warning" title="Relative paths resolve against the schema">
-A relative `[generate].output` is resolved against **the schema's** directory, not the
-config's. Under one shared root config, `output = "generated"` therefore means
-`apps/api/generated` and `apps/web/generated` — a per-app pattern, rather than one
-directory both apps interleave their generated code into.
+A relative output directory is resolved against **the schema's** directory, not the
+config's — the built-in `generated` default included. Under one shared root config,
+`output = "generated"` therefore means `apps/api/generated` and `apps/web/generated` — a
+per-app pattern, rather than one directory both apps overwrite each other in. An explicit
+`--output` flag is the invocation's own word and is used verbatim.
 </Callout>
 
 ## Unknown keys are errors

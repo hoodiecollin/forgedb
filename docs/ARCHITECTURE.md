@@ -93,9 +93,52 @@ implementation is wrong:
 
 Identity resolves at the project root in order: explicit `[project].name`, then exactly one
 ecosystem manifest name beside it, then a hash of the root's **absolute** path. That last
-one is deliberately asymmetric with #334's member hash, which is over a *project-relative*
-path: a member must resolve identically on another machine, while a fallback project id
-only has to be unique on this one.
+one is deliberately asymmetric with the member hash below, which is over a
+*project-relative* path: a member must resolve identically on another machine, while a
+fallback project id only has to be unique on this one.
+
+### Where it builds (`src/cache.rs`)
+
+`~/.forgedb/projects/<id>/` is a cargo workspace **ForgeDB owns**: a virtual manifest, one
+member per app, one `Cargo.lock` and one `target/` shared by every member. Sharing those
+is the entire point — it is what makes the substrate compile once per *project* rather than
+once per *app*.
+
+```
+~/.forgedb/projects/<id>/
+  Cargo.toml            # the workspace ROOT — virtual, rewritten in full each time
+  Cargo.lock            # one resolution shared by every app
+  target/               # one target dir shared by every app
+  apps/<member-hash>/   # one member per app
+```
+
+- **A member path is a pure function of `(project id, project-relative schema path)`**, so
+  the cache needs no index of its own contents and a clone or CI runner resolves to the
+  same directory.
+- **The hash is hand-rolled FNV-1a, pinned by golden vectors, and never `DefaultHasher`** —
+  which is explicitly not stable across Rust releases, and `cargo install` builds with the
+  user's toolchain, so `rust-toolchain.toml` does not reach them. Re-keying every member on
+  a rustup upgrade presents as "ForgeDB got slow" and is nearly undiagnosable. #366 is that
+  mistake already shipped elsewhere in this repo.
+- **`resolver = "3"` is correctness, not cosmetics.** A virtual manifest without it falls
+  back to resolver 1, which unifies features *more* aggressively than 2/3 — making C11's
+  cross-app coupling worse exactly where the design contains it — and warns on every cargo
+  invocation in a directory the user never opened.
+- **The root manifest is derived, never remembered.** `write_workspace_root` takes the
+  whole member set; there is deliberately no "add a member" entry point, because a patched
+  manifest accumulates entries for apps whose schemas were deleted and that state survives
+  a regenerate.
+- **The member set accretes from disk.** Generating one app has no knowledge of its
+  siblings, so the live set is rebuilt each time from the member directories whose recorded
+  schema still exists — a `stat` per member rather than a subtree scan of the user's repo.
+- **An empty live set refuses to GC**, rather than reporting every member as garbage. The
+  dangerous case is a GC run reached from an error path that produced no members.
+- **Nothing in the cache is an input.** Deleting it and regenerating reproduces identical
+  generated *source*. It may reproduce a different dependency *resolution* — that is C1 as
+  scoped by #343 §4, and nothing may depend on the lockfile surviving.
+- **A data root that resolves inside the cache is refused** (C4). The trap is not a bad
+  decision but a relative default: `[tenant].root` defaults to `"data"`, so running from
+  inside the cache dir puts a database there without anyone choosing it.
 
 ---
 

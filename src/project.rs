@@ -45,6 +45,9 @@ pub const SCHEMA_CANDIDATES: [&str; 3] = ["schema.forge", "schema.lang", "schema
 /// Ecosystem manifests a project name can be borrowed from, in the order they
 /// are reported.  Read **only** to suggest a name: ForgeDB has no opinion about,
 /// and no write access to, any of these ecosystems' workspace membership.
+/// Where generated code goes when neither a flag nor a config names a directory.
+const DEFAULT_OUTPUT: &str = "generated";
+
 const MANIFESTS: [&str; 4] = ["Cargo.toml", "package.json", "pyproject.toml", "go.mod"];
 
 /// One `forgedb.toml` found by the walk.
@@ -503,6 +506,28 @@ impl Governing {
                 .unwrap_or(joined),
             Err(_) => joined,
         }
+    }
+
+    /// Where this app's code is emitted: `--output` verbatim, else the config's
+    /// `[generate].output`, else the built-in `generated` — the last two both
+    /// resolved against **the schema's** directory.
+    ///
+    /// The built-in default is re-based for the same reason the config value is,
+    /// and leaving it out was a real bug: under one root config with no `output`
+    /// key at all, every app in the project emitted into the *same* `./generated`
+    /// and overwrote its siblings. A CLI flag is the invocation's own word and
+    /// stays verbatim.
+    pub fn output(&self, flag: Option<&str>) -> String {
+        if let Some(explicit) = flag {
+            return explicit.to_string();
+        }
+        let declared = self
+            .config()
+            .generate
+            .output
+            .as_deref()
+            .unwrap_or(DEFAULT_OUTPUT);
+        self.resolve_path(declared).display().to_string()
     }
 
     /// The project this app belongs to, with its id claimed.

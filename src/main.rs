@@ -1,13 +1,11 @@
 use clap::{Parser, Subcommand};
 
-mod cache;
-mod commands;
-mod config;
-mod diagnostics;
-mod error;
-mod project;
-mod templates;
-mod ui;
+// The binary links the LIBRARY rather than re-declaring the same modules, so
+// each is compiled once. Re-declaring them made every `pub` item that only the
+// library's consumers use — the tests, and #335's callers — read as dead code in
+// the binary, which is a warning that can only be silenced by an `#[allow]` that
+// then outlives its reason and hides a real hole.
+use forgedb::{cache, commands, error, project, ui};
 
 use error::Result;
 
@@ -503,6 +501,28 @@ fn schema_dir(schema: &std::path::Path) -> &std::path::Path {
     }
 }
 
+/// Place an app in its project's build cache and report where that is.
+///
+/// C7: **every** generate and build prints the cache path it wrote to. While the
+/// build happened in a directory the user chose, a silent path was survivable;
+/// once it happens in a hashed directory they have never seen, the thing that
+/// makes the generator identity self-evident — opening `database.rs` and seeing
+/// your own models — is gone unless the path is named.
+fn place_in_cache(
+    project: &project::ProjectId,
+    schema: &std::path::Path,
+) -> Result<cache::Placement> {
+    let placement = cache::place(&project.name, &project.root, schema)?;
+    ui::info(&format!("Build cache: {}", placement.member.display()));
+    for orphan in &placement.orphans {
+        ui::detail(&format!(
+            "Orphaned member (its schema is gone): {}",
+            orphan.display()
+        ));
+    }
+    Ok(placement)
+}
+
 fn run(cli: Cli) -> Result<()> {
     // Wire the global -v/-q flags into the UI output level: --quiet suppresses
     // everything but errors, --verbose unlocks detail lines.
@@ -554,19 +574,14 @@ fn run(cli: Cli) -> Result<()> {
             // Resolved (and claimed) here rather than lazily: a project id is a
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
-            let _project = governing.identify_reported()?;
+            let project = governing.identify_reported()?;
+            place_in_cache(&project, &schema_path)?;
             let forge_config = governing.config();
             // Precedence: CLI flag > config > built-in default.  A config's
             // relative `output` is resolved against the SCHEMA's directory, so a
             // root config's `output = "generated"` is a per-app pattern rather
             // than one shared directory every app interleaves into.
-            let resolved_output = output.or_else(|| {
-                forge_config
-                    .generate
-                    .output
-                    .as_deref()
-                    .map(|o| governing.resolve_path(o).display().to_string())
-            });
+            let resolved_output = Some(governing.output(output.as_deref()));
             let resolved_schema = Some(schema_path.display().to_string());
             // The `--sdk`/`--runtime`/`--replica` flags are a clap ArgGroup, so at
             // most one is set — collapse them into the mode axis (#122).
@@ -626,15 +641,10 @@ fn run(cli: Cli) -> Result<()> {
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
             let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
-            let _project = governing.identify_reported()?;
+            let project = governing.identify_reported()?;
+            place_in_cache(&project, &schema_path)?;
             let forge_config = governing.config();
-            let resolved_output = output.or_else(|| {
-                forge_config
-                    .generate
-                    .output
-                    .as_deref()
-                    .map(|o| governing.resolve_path(o).display().to_string())
-            });
+            let resolved_output = Some(governing.output(output.as_deref()));
             let resolved_schema = Some(schema_path.display().to_string());
             commands::build::run(commands::build::BuildOptions {
                 release,
@@ -805,28 +815,38 @@ fn run(cli: Cli) -> Result<()> {
             let forge_config = governing.config();
             // Root precedence: --root flag > [tenant].root in config > ./data.
             let default_root = forge_config.tenant.root();
-            let resolve = |root: Option<String>| {
-                root.map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| default_root.clone())
+            // C4: refuse a data root that RESOLVES inside the build cache. The
+            // trap is not a bad decision, it is a relative default — nobody
+            // writes "put the database in the build cache", they run something
+            // whose working directory is the cache dir and `[tenant].root`'s
+            // `"data"` does it for them. Checking the configured value catches
+            // nothing, because the dangerous case is the one where nothing was
+            // configured at all.
+            let resolve = |root: Option<String>| -> Result<std::path::PathBuf> {
+                let resolved = root
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| default_root.clone());
+                cache::assert_not_in_cache(&resolved)?;
+                Ok(resolved)
             };
             match tenant_cmd {
                 TenantCommands::Create { name, root } => {
                     commands::tenant::create(commands::tenant::CreateOptions {
                         name,
-                        root: resolve(root),
+                        root: resolve(root)?,
                         auth_env: forge_config.auth.env_exports(),
                     })
                 }
                 TenantCommands::List { root, json } => {
                     commands::tenant::list(commands::tenant::ListOptions {
-                        root: resolve(root),
+                        root: resolve(root)?,
                         json,
                     })
                 }
                 TenantCommands::Drop { name, root, force } => {
                     commands::tenant::drop(commands::tenant::DropOptions {
                         name,
-                        root: resolve(root),
+                        root: resolve(root)?,
                         force,
                     })
                 }

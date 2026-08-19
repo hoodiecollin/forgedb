@@ -246,6 +246,67 @@ pub fn write_workspace_root(project: &Path, members: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Records, inside a member directory, which schema it was generated from.
+///
+/// The member *path* is deliberately keyed by a project-RELATIVE path so it
+/// resolves the same on another machine; liveness needs the absolute one, which
+/// is a machine-local fact and therefore belongs in the cache rather than in the
+/// key.  Without it a member directory is an opaque hash that cannot be checked
+/// against anything — the epic's "stale members are dropped by a `stat` per
+/// member rather than found by a scan" has nothing to `stat`.
+const MEMBER_SCHEMA_FILE: &str = "schema-path";
+
+/// Note which schema a member directory belongs to.
+pub fn record_member(member: &Path, schema: &Path) -> Result<()> {
+    std::fs::create_dir_all(member)?;
+    std::fs::write(member.join(MEMBER_SCHEMA_FILE), schema.to_string_lossy().as_bytes())?;
+    Ok(())
+}
+
+/// The schema a member directory belongs to, if it recorded one.
+pub fn member_schema(member: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(member.join(MEMBER_SCHEMA_FILE)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Every member directory in a project whose schema still exists, plus `keep`.
+///
+/// This is how the member set **accretes**: generating one app does not know
+/// about its siblings, so the set is rebuilt from what is on disk each time
+/// rather than remembered.  A member whose schema is gone is simply not returned,
+/// which is what drops a renamed or deleted app without a subtree scan of the
+/// user's repo.
+///
+/// A member that recorded nothing is **kept**, not dropped: an unreadable marker
+/// means "written by a version that did not record one", and guessing that such a
+/// directory is garbage is the one mistake here that destroys work.
+pub fn live_members(project: &Path, keep: &Path) -> Result<Vec<PathBuf>> {
+    let mut live = vec![keep.to_path_buf()];
+
+    let apps_dir = project.join("apps");
+    if apps_dir.exists() {
+        for entry in std::fs::read_dir(&apps_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let path = entry.path();
+            if path == keep {
+                continue;
+            }
+            match member_schema(&path) {
+                Some(schema) if !schema.exists() => continue,
+                _ => live.push(path),
+            }
+        }
+    }
+
+    live.sort();
+    live.dedup();
+    Ok(live)
+}
+
 /// Member directories present on disk that the live set does not name.
 ///
 /// Renaming or moving a schema file changes its hash and orphans the old member
@@ -321,6 +382,63 @@ pub fn assert_not_in_cache(data_root: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Where one app's generated code is cached, and the state of the project around
+/// it.
+#[derive(Debug)]
+pub struct Placement {
+    /// The ForgeDB-owned workspace root for this project.
+    pub project: PathBuf,
+    /// This app's member directory beneath it.
+    pub member: PathBuf,
+    /// Member directories whose schema no longer exists.
+    pub orphans: Vec<PathBuf>,
+}
+
+/// Place an app in its project's cache workspace: ensure the member directory,
+/// record what it belongs to, and rewrite the workspace root around the current
+/// member set.
+///
+/// `project_root` is the app's project root **on the user's filesystem** — the
+/// directory the schema path is made relative to, so that the member hash is a
+/// property of the tree rather than of this machine.
+pub fn place(project_id: &str, project_root: &Path, schema: &Path) -> Result<Placement> {
+    let project = project_dir(project_id)?;
+    let schema = absolutize(schema);
+
+    // The project root always comes from the schema's own ancestor chain, so it
+    // is an ancestor of the schema — but a caller that resolved them separately
+    // could hand over a pair that is not, and hashing an absolute path there is
+    // still deterministic, merely not portable. Better than silently colliding on
+    // a bare file name.
+    let relative = schema
+        .strip_prefix(project_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| schema.clone());
+
+    let member = member_dir(project_id, &relative)?;
+    record_member(&member, &schema)?;
+
+    let live = live_members(&project, &member)?;
+    write_workspace_root(&project, &live)?;
+    let orphans = orphans(&project, &live)?;
+
+    Ok(Placement {
+        project,
+        member,
+        orphans,
+    })
+}
+
+fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(p),
+        Err(_) => p.to_path_buf(),
+    }
 }
 
 /// Canonicalize as much of a path as exists, keeping the rest verbatim.

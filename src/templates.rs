@@ -144,7 +144,7 @@ isolated = {}
 # cannot name one — pass `--schema`, or keep the schema next to this file.
 # Relative paths below resolve against the SCHEMA's directory, so under a shared
 # root config `output` is a per-app pattern rather than one shared directory.
-output = "./generated"
+output = "generated"
 # Uncomment to restrict which targets are generated:
 # targets = ["rust", "typescript", "api", "stubs"]
 
