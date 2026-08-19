@@ -1,24 +1,22 @@
 ---
 title: "[generate] & [project]"
-description: "The [generate] and [project] tables — schema path, output directory, targets, and project metadata."
+description: "The [generate] and [project] tables — output directory, targets, project identity, and grouping."
 purpose: "reference"
 ---
-The `[generate]` table controls what `forgedb generate` reads and emits; `[project]`
-carries plain metadata. Both are read at generate time.
+The `[generate]` table controls what `forgedb generate` emits; `[project]` says which
+project a schema belongs to. Both are read at generate time.
 
 ## `[generate]`
 
 ```toml
 [generate]
-schema = "schema.forge"
 output = "./generated"
 targets = ["rust", "typescript", "api", "stubs"]
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `schema` | string | `"schema.forge"` | Path to the `.forge` schema file to transpile. |
-| `output` | string | `"./generated"` | Output directory for generated files. |
+| `output` | string | `"./generated"` | Output directory, resolved against the **schema's** directory. |
 | `targets` | string[] | *(all targets)* | Which targets to emit. When absent, all are enabled. |
 
 Valid `targets` values: `rust`, `typescript`, `api`, `openapi`, `stubs`, plus the
@@ -27,9 +25,16 @@ the default set `rust`, `typescript`, `api`, `openapi`, `stubs` is generated. `w
 `ffi` emit only when listed explicitly.
 
 <Callout type="note" title="CLI flags override these">
-`--schema` and `--output` on the `forgedb generate` command take precedence over the
-`[generate]` values, which in turn take precedence over the built-in defaults. See
+`--output` on the `forgedb generate` command takes precedence over the `[generate]` value,
+which in turn takes precedence over the built-in default. See
 [configuration precedence](/docs/config/overview/).
+</Callout>
+
+<Callout type="warning" title="There is no `schema` key">
+`[generate].schema` was **removed**. A config governs every schema beneath it, so it
+cannot name one — the same file may be the nearest ancestor of several apps. The schema is
+named by the invocation (`--schema`) or found beside you (`schema.forge`). A config that
+still sets the key fails with a diagnostic saying so.
 </Callout>
 
 ## `[project]`
@@ -38,16 +43,44 @@ the default set `rust`, `typescript`, `api`, `openapi`, `stubs` is generated. `w
 [project]
 name = "my-app"
 version = "0.1.0"
+isolated = true
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `name` | string | *(unset)* | Project name (metadata). |
-| `version` | string | *(unset)* | Project version (metadata). |
+| `name` | string | *(detected)* | The project id. |
+| `version` | string | *(unset)* | Metadata. Deliberately affects nothing. |
+| `isolated` | bool | `true` | Do the schemas beneath this config form their own project? |
 
-`[project]` is metadata only; it does not affect generated code. `forgedb init` emits it
-and the generator ignores it. Unknown tables are ignored too, which keeps the config
-forward-compatible.
+A **project** is the unit of build cache, lockfile and target directory. Apps in one
+project compile the substrate once between them; apps in different projects do not share
+pins.
+
+### How the id is decided
+
+At the project root, in order: an explicit `[project].name`; else the name from exactly
+one ecosystem manifest beside it (`Cargo.toml`, `package.json`, `pyproject.toml`,
+`go.mod`); else a hash of the root's path, with a warning. Two manifests naming the
+directory is an error rather than a guess — set `name` to say which.
+
+Two projects resolving to the same id is refused. Resolve it by setting a different
+`name` in your own `forgedb.toml`: recording it there rather than in the cache is what
+makes the resolution survive `rm -rf ~/.forgedb`.
+
+### `isolated`, and why absent means `true`
+
+`isolated = true` stops the upward walk: these schemas are their own project. `false`
+joins the enclosing one.
+
+An omitted `isolated` means **`true`**, which is the opposite of how a missing boolean
+usually reads. It has to be: otherwise adding a config at a monorepo root for an unrelated
+reason would silently absorb every app beneath it into one project, re-unifying pins that
+were deliberately apart. Grouping is opt-in, and `forgedb init` always writes the field —
+`--isolated` / `--no-isolated` decide it, and with neither, `init` joins an enclosing
+project if it finds one and reports which.
+
+Declaring `name` at a config that is *not* the project root is an error: it reads as
+authoritative and is not.
 
 ## Related
 

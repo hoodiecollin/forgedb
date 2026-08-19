@@ -59,6 +59,44 @@ The CLI (root crate `forgedb`, `src/`) orchestrates the pipeline: `src/main.rs` 
 `src/commands/*` (one module per subcommand). Commands: `init`, `generate`, `validate`, `build`,
 `dev`, `migrate`, `compact`, `backup`, `tenant`, `coordinate`.
 
+### Which project is this? (`src/project.rs`)
+
+A **project** is the unit of build cache, lockfile and target directory. It is not a
+directory the user declares: a `.forge` schema declares an *app*, and a `forgedb.toml`
+carries knobs for the apps beneath it plus one statement about grouping.
+
+Everything follows from that premise, and each point below is a place an obvious
+implementation is wrong:
+
+- **The walk starts at the schema, never at the CWD.** Otherwise `cd` changes an app's
+  project id, and therefore its build-cache key — an invocation artifact leaking into a
+  fact about the tree.
+- **One walk, two answers.** Knobs come from the *nearest* config; identity from the
+  *project root* — the nearest `isolated = true` config, else the outermost. In any
+  monorepo those are different directories, so code that resolves "the project config"
+  once and uses it for both compiles, runs, and mis-keys the cache silently. `Chain`
+  exposes `nearest()` and `project_root()` and no way to ask for "the" config.
+- **An absent `isolated` means `true`.** Inverting `bool`'s own default is deliberate:
+  grouped-by-default would let a root config added for an unrelated reason absorb every
+  app beneath it into one lockfile. `ProjectConfig`'s `Default` impl is hand-written for
+  the same reason — the `#[serde(default)]` on an absent `[project]` table does not reach
+  the field-level default.
+- **The ledger detects; the config records.** A resolved id collision is written into the
+  colliding project's *own* `forgedb.toml`. A resolution held in `~/.forgedb` would be
+  erased by the GC that owns that directory, and the collision would come back as a silent
+  merge rather than an error.
+- **The walk has a stop boundary** — a repository root, `$HOME`, or the filesystem root —
+  or a stray `~/forgedb.toml` captures every project on the machine.
+- **Unknown config keys are errors.** Ignoring them was never forward compatibility: a knob
+  an older CLI does not know reads as applied and is not, and a misspelled `[projekt]`
+  merges two projects through the mechanism meant to protect them.
+
+Identity resolves at the project root in order: explicit `[project].name`, then exactly one
+ecosystem manifest name beside it, then a hash of the root's **absolute** path. That last
+one is deliberately asymmetric with #334's member hash, which is over a *project-relative*
+path: a member must resolve identically on another machine, while a fallback project id
+only has to be unique on this one.
+
 ---
 
 ## Crate topology

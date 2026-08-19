@@ -109,6 +109,27 @@ Root crate `forgedb` (`src/`) is the CLI: `src/main.rs` (clap), `src/commands/*`
 (one module per subcommand), `src/{templates,ui,error}.rs`. It orchestrates the crates
 in `crates/`:
 
+Two modules answer "where does this build happen", and both are the ONE definition of what
+they own (epic #332) — do not re-derive either inline:
+- `src/project.rs` (#333) — **which project is this.** One upward walk from **the schema's**
+  directory (never the CWD), yielding two different answers that are frequently different
+  directories: knobs from `Chain::nearest()`, identity from `Chain::project_root()` (nearest
+  `[project].isolated`, else outermost). Also the **single entry point for reading config** —
+  `config::{parse_config, load_config_file}` are reached from here and nowhere else, which is
+  the greppable form of #361's one-loader invariant. Id order: `[project].name` → exactly one
+  ecosystem manifest → hash of the root's **absolute** path. The claim ledger under
+  `~/.forgedb/ledger/` **detects** collisions; a resolution is recorded in the project's own
+  `forgedb.toml`, never in the cache.
+- `src/cache.rs` (#334) — **where generated code is built.** `~/.forgedb/projects/<id>/` as a
+  ForgeDB-owned cargo workspace: virtual manifest pinning `resolver = "3"`, one `Cargo.lock`
+  and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is
+  FNV-1a over the **project-relative** schema path (asymmetric with the project fallback id
+  above, on purpose) and is pinned by golden vectors — `DefaultHasher` is not stable across
+  Rust releases and `cargo install` uses the user's toolchain.
+
+`forgedb.toml` **rejects unknown tables and keys** (#333) and there is no `[generate].schema`
+key; both are breaking, both are in `docs/UPGRADING.md`.
+
 **Published to crates.io — schema-agnostic substrate (independent version lines, do NOT normalize):**
 
 > **Do not trust any version number, publish date, or publish-gap status written inline below —
