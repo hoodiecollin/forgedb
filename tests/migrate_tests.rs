@@ -43,6 +43,8 @@ const V2: &str = "Widget {\n  id: +uuid\n  sku: &string\n  qty: u32\n  note: str
 /// `migrations/` from the process working directory).
 fn forgedb(dir: &Path, target: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
+    // #333: keep any project-id claim inside the fixture's own tempdir.
+    cmd.env("FORGEDB_HOME", dir.join(".forgedb-home"));
     cmd.current_dir(dir).env("CARGO_TARGET_DIR", target);
     cmd
 }

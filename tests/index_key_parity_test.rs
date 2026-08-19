@@ -145,6 +145,11 @@ fn monomorphic_index_keys_match_the_legacy_form_except_where_it_was_broken() {
     let gen_status = Command::new(forgedb)
         .args(["generate", "rust", "--output", "src", "--schema", "schema.forge"])
         .current_dir(&proj)
+        // #333: `generate` claims this project id in the ledger under the
+        // ForgeDB home. Without an override that is the developer's real
+        // `~/.forgedb`, so two fixtures sharing a project name collide across
+        // unrelated test runs — and the suite writes outside the tempdir.
+        .env("FORGEDB_HOME", proj.join(".forgedb-home"))
         .status()
         .expect("run forgedb generate");
     assert!(gen_status.success(), "forgedb generate rust failed");

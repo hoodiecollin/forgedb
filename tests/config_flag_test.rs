@@ -30,6 +30,12 @@ const EXPLICIT_INTERVAL: u64 = 250;
 fn forgedb_cmd(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_forgedb"));
     cmd.current_dir(dir);
+    // #333: `generate` claims this project id in the ForgeDB home. Both tests
+    // here scaffold `name = "discriminator"` in a fresh tempdir, so without an
+    // override the second one collides with the first's claim in the developer's
+    // real `~/.forgedb` — and the collision refusal is correct, which is what
+    // makes this a test-isolation bug rather than a product bug.
+    cmd.env("FORGEDB_HOME", dir.join(".forgedb-home"));
     cmd
 }
 

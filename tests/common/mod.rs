@@ -86,6 +86,11 @@ pub fn generate_compile_run(tag: &str, schema: &str, driver: &str) -> (Output, P
     let generated = Command::new(forgedb)
         .args(["generate", "all", "--output", "src", "--schema", "schema.forge"])
         .current_dir(&proj)
+        // #333: `generate` claims this project id in the ledger under the
+        // ForgeDB home. Without an override that is the developer's real
+        // `~/.forgedb`, so two fixtures sharing a project name collide across
+        // unrelated test runs — and the suite writes outside the tempdir.
+        .env("FORGEDB_HOME", proj.join(".forgedb-home"))
         .output()
         .expect("run forgedb generate");
     assert!(
