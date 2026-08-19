@@ -125,7 +125,20 @@ they own (epic #332) — do not re-derive either inline:
   and one `target/` shared by every member, `apps/<member-hash>/` per app. The member hash is
   FNV-1a over the **project-relative** schema path (asymmetric with the project fallback id
   above, on purpose) and is pinned by golden vectors — `DefaultHasher` is not stable across
-  Rust releases and `cargo install` uses the user's toolchain.
+  Rust releases and `cargo install` uses the user's toolchain. The root manifest is
+  **rewritten, never patched**, around a member set that **accretes from disk**: each member
+  records the absolute schema it belongs to, so liveness is a `stat` per member rather than a
+  scan of the user's repo, and a member that recorded nothing is KEPT.
+
+**A relative output directory resolves against the SCHEMA's directory, not the CWD — the
+built-in `generated` default included** (`Governing::output` owns all three cases; a
+`--output` flag is the invocation's own word and stays verbatim). Under one root config,
+`output` is a per-app pattern; the CWD-relative reading had every app in a project
+overwriting its siblings.
+
+**`src/main.rs` links the library** (`use forgedb::{…}`) rather than re-declaring its
+modules. Re-declaring compiles each twice and makes every `pub` item only the tests use read
+as dead code in the binary — do not reintroduce `mod` declarations there.
 
 `forgedb.toml` **rejects unknown tables and keys** (#333) and there is no `[generate].schema`
 key; both are breaking, both are in `docs/UPGRADING.md`.

@@ -21,10 +21,12 @@ Accepted on every command.
 |---|---|---|
 | `-v`, `--verbose` | bool (false) | Enable verbose output. |
 | `-q`, `--quiet` | bool (false) | Suppress output. |
-| `-c`, `--config <PATH>` | string (auto-discover `forgedb.toml`) | Path to the config file. Commands that need config-derived defaults (schema path, output dir, `[runtime]`/`[storage]`/`[tenant]`/`[auth]` tables) read it from here. |
+| `-c`, `--config <PATH>` | string (nearest ancestor `forgedb.toml`) | Path to the config file, overriding discovery outright. Without it, the nearest `forgedb.toml` **at or above the schema's directory** applies. It does not override which project a schema belongs to. |
 
 <Callout type="note" title="Config precedence">
-For resolvable defaults the order is: CLI flag &gt; `forgedb.toml` &gt; built-in default.
+For resolvable defaults the order is: CLI flag &gt; `forgedb.toml` &gt; built-in default. A
+relative directory from either of the last two resolves against **the schema's** directory,
+not the working directory, so one config can govern several apps without them colliding.
 See [configuration](/docs/config/overview/) for the full set of tables and keys.
 </Callout>
 

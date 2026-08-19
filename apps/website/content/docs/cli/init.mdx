@@ -23,6 +23,12 @@ forgedb init <project_name> [--template <name>] [--rust] [--api-only]
 | `-t`, `--template <name>` | string (blank) | Starter schema: `blog`, `ecommerce`, `todo`, or `blank`. An unknown value falls back to `blank` with a warning. |
 | `--rust` | bool (false) | Include the Rust backend scaffold (also included by default unless `--api-only`). |
 | `--api-only` | bool (false) | Generate the API scaffold only — skip the Rust server files and deploy artifacts. |
+| `--isolated` | bool | The new schemas form their own project, even inside an existing one. |
+| `--no-isolated` | bool | Join the enclosing project, sharing its build cache and lockfile. |
+
+With neither grouping flag, `init` joins an enclosing project when it finds one and reports
+which — scaffolding inside an existing project is how you add an app, not an error. See
+[`[project]`](/docs/config/generate/).
 
 <Callout type="note" title="What gets created">
 Every project gets `schema.forge`, `forgedb.toml`, `.gitignore`, `README.md`, and a

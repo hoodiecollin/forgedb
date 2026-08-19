@@ -54,8 +54,8 @@ implemented and errors explicitly. The old flat verbs `generate typescript` /
 | `--runtime` | bool | Mode (runtime targets): in-process native FFI binding. |
 | `--replica` | bool | Mode (runtime targets): in-process read-replica follower. |
 | `--check` | bool (false) | Verify nothing needs regeneration (CI mode); do not write. |
-| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. |
-| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. |
+| `-o`, `--output <DIR>` | string (`[generate].output`, else `generated`) | Output directory. The flag is used verbatim; the other two resolve against **the schema's** directory. |
+| `-s`, `--schema <PATH>` | string (auto-discover) | Schema file path. Auto-discovery looks for `schema.forge`, `schema.lang`, `schema.forgedb`. **No config names the schema** — the config that applies is found by walking up from it. |
 | `-f`, `--force` | bool (false) | Regenerate even if up-to-date; overwrite existing output. |
 | `--from <N>` | u32 | Origin format version — `transform` target only. |
 | `--to <N>` | u32 | Destination format version — `transform` target only. |
