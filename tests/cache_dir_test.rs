@@ -1,11 +1,9 @@
 //! Guards for the ForgeDB build cache directory (#334, epic #332).
 //!
 //! Scenario numbers refer to the BDD table in the accepted plan gate (#344).
-//! Scenarios 4, 7, 9 (the `TenantConfig` half) and 12 need `generate` to be
-//! wired to the cache dir — that is plan step 6, which waits on #333's
-//! implementation (#342).  They are named in `blocked_on_342.rs`-style comments
-//! at the bottom of this file rather than silently omitted, so the gap is
-//! visible rather than looking like coverage.
+//! Scenarios 4, 7 and 12 needed `generate` wired to the cache dir (plan step 6,
+//! which waited on #333); they are at the bottom of this file and are no longer
+//! deferred.
 //!
 //! **Every test in this file sets `FORGEDB_HOME`.**  A code path that reaches
 //! `home::home_dir()` directly would pass this suite while writing into the
@@ -365,16 +363,309 @@ fn scenario_11_an_empty_live_set_refuses_to_scan() {
 }
 
 // ---------------------------------------------------------------------------
-// Blocked on #342 (plan step 6 — wiring)
+// Scenarios 4, 7 and 12 — the wiring (plan step 6)
 // ---------------------------------------------------------------------------
 //
-// These scenarios from #344's table need `generate` to resolve a project id and
-// emit into the cache dir, which is plan step 6 and waits on #333's
-// implementation:
-//
-//   * Scenario 4  — two apps in one project share a lockfile and a target dir
-//   * Scenario 7  — a wipe reproduces identical generated SOURCE (scoped C1)
-//   * Scenario 12 — mixed-edition members build with no resolver warning
-//
-// Scenario 5's resolver assertion above is the static half of 12; the dynamic
-// half needs a real `cargo build` over emitted members.
+// These were blocked on #342 and are now real.  They use the CLI as a
+// subprocess, because what they assert is a property of an *invocation*: which
+// project it resolved, and what it left on disk.
+
+const BIN: &str = env!("CARGO_BIN_EXE_forgedb");
+const SCHEMA: &str = "Note {\n  id: +uuid\n  body: string\n}\n";
+
+fn write(path: &Path, contents: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, contents).unwrap();
+}
+
+fn forgedb(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(BIN)
+        .args(args)
+        .current_dir(cwd)
+        .env("FORGEDB_HOME", home)
+        .output()
+        .expect("forgedb runs")
+}
+
+fn combined(out: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// The `members = [...]` entries of a workspace root manifest.
+fn members_of(project: &Path) -> Vec<String> {
+    let src = std::fs::read_to_string(project.join("Cargo.toml"))
+        .unwrap_or_else(|e| panic!("no workspace root at {}: {e}", project.display()));
+    src.lines()
+        .filter_map(|l| l.trim().strip_prefix('"'))
+        .filter_map(|l| l.split('"').next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// **Scenario 4.** Two apps in one project land under ONE workspace root, so
+/// they share its `Cargo.lock` and its `target/`.
+///
+/// Sharing is the entire reason the cache dir is a workspace rather than a
+/// directory of unrelated crates — it is what makes the substrate compile once
+/// per *project* instead of once per *app*. Asserted through the workspace root's
+/// member list plus a real `cargo build`, because "both directories exist" would
+/// pass even if each app had its own root.
+#[test]
+fn scenario_4_two_apps_in_one_project_share_one_workspace() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(&root.join("forgedb.toml"), "[project]\nname = \"shared\"\n");
+
+    for app in ["api", "web"] {
+        write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
+        let out = forgedb(
+            &root,
+            &env.home,
+            &["generate", "rust", "--schema", &format!("apps/{app}/schema.forge")],
+        );
+        assert!(out.status.success(), "generate {app}:\n{}", combined(&out));
+    }
+
+    let project = env.home.join("projects").join("shared");
+    let members = members_of(&project);
+    assert_eq!(members.len(), 2, "both apps are members: {members:?}");
+
+    // The member paths are the hashes of the two PROJECT-RELATIVE schema paths —
+    // recomputed here rather than read back, so this also pins that the wiring
+    // made the path relative to the project root and not to the CWD.
+    for app in ["api", "web"] {
+        let expect = format!(
+            "apps/{}",
+            cache::member_hash(Path::new(&format!("apps/{app}/schema.forge")))
+        );
+        assert!(members.contains(&expect), "{expect} in {members:?}");
+    }
+
+    // One lockfile and one target dir, at the root — the property the shared
+    // workspace exists for. Stub members keep this a workspace test rather than a
+    // substrate compile.
+    for member in &members {
+        let dir = project.join(member);
+        write(
+            &dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"m{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                &member[5..13]
+            ),
+        );
+        write(&dir.join("src/lib.rs"), "");
+    }
+    let built = std::process::Command::new("cargo")
+        .arg("build")
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        built.status.success(),
+        "cargo build over the cache workspace:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    assert!(project.join("Cargo.lock").is_file(), "one lockfile for both apps");
+    assert!(project.join("target").is_dir(), "one target dir for both apps");
+}
+
+/// **Scenario 7.** Wiping the cache reproduces byte-identical generated
+/// *source*.
+///
+/// This is C1 as **scoped** by the design gate (#343 §4): read literally, "delete
+/// the cache and regenerate produces an identical result" contradicts the
+/// one-lockfile-per-project mechanism this issue exists to build, and C9's
+/// deliberate invalidation. What must hold is that nothing in the cache is an
+/// *input* to generation — so the emitted source is identical, while the
+/// dependency *resolution* is explicitly free to differ.
+#[test]
+fn scenario_7_a_wipe_reproduces_identical_generated_source() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(&root.join("forgedb.toml"), "[project]\nname = \"wipe\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let generate = |out_dir: &str| {
+        let out = forgedb(&root, &env.home, &["generate", "rust", "--force", "--output", out_dir]);
+        assert!(out.status.success(), "generate:\n{}", combined(&out));
+        std::fs::read_to_string(root.join(out_dir).join("database.rs")).unwrap()
+    };
+
+    let before = generate("gen-before");
+    assert!(env.home.join("projects/wipe").is_dir(), "the cache was populated");
+
+    std::fs::remove_dir_all(&env.home).unwrap();
+
+    let after = generate("gen-after");
+    assert_eq!(before, after, "generated source must not depend on the cache");
+    assert!(
+        env.home.join("projects/wipe").is_dir(),
+        "…and the cache rebuilt itself from nothing"
+    );
+}
+
+/// **Scenario 12.** A 2021 member and a 2024 member under one root build with no
+/// resolver warning.
+///
+/// Scenario 5 pins `resolver = "3"` in the rendered bytes; this is the half that
+/// proves what those bytes are *for*. Without the key cargo warns on **every**
+/// invocation, in a directory the user never opened — and silently falls back to
+/// resolver 1, which unifies features more aggressively than 2/3 and so makes
+/// C11's cross-app coupling worse exactly where the design is containing it.
+///
+/// Mixed editions are not hypothetical here: the `init` scaffold emits
+/// `edition = "2021"` while the transform crate emits `edition = "2024"`.
+#[test]
+fn scenario_12_mixed_edition_members_build_without_a_resolver_warning() {
+    let env = scoped_home();
+    let project = env.home.join("projects").join("mixed");
+
+    let mut members = Vec::new();
+    for (name, edition) in [("old", "2021"), ("new", "2024")] {
+        let dir = project.join("apps").join(name);
+        write(
+            &dir.join("Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"{edition}\"\n"),
+        );
+        write(&dir.join("src/lib.rs"), "");
+        members.push(dir);
+    }
+    cache::write_workspace_root(&project, &members).unwrap();
+
+    let built = std::process::Command::new("cargo")
+        .arg("build")
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    let stderr = String::from_utf8_lossy(&built.stderr);
+
+    assert!(built.status.success(), "cargo build failed:\n{stderr}");
+    assert!(
+        !stderr.contains("resolver"),
+        "cargo warned about the resolver in a directory the user never opened:\n{stderr}"
+    );
+}
+
+/// C7: `generate` names the cache directory it wrote to.
+///
+/// The constraint exists because the generator identity is *partly self-enforcing
+/// today* — a user opens `generated/database.rs` and sees their own models. Move
+/// the build into a hashed directory they have never seen and that property is
+/// gone unless the path is printed. A guard on the function without a guard on
+/// the printing would let it be dropped in a refactor with nothing failing.
+#[test]
+fn generate_names_the_cache_directory_it_wrote_to() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(&root.join("forgedb.toml"), "[project]\nname = \"visible\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = forgedb(&root, &env.home, &["generate", "rust"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let member = cache::member_dir("visible", Path::new("schema.forge")).unwrap();
+    assert!(
+        combined(&out).contains(&member.display().to_string()),
+        "the cache path must be named in the output:\n{}",
+        combined(&out)
+    );
+}
+
+/// C4 has a caller, and it runs on a path nobody configured.
+///
+/// `assert_not_in_cache` was written with #334's earlier steps and had run **zero
+/// times** until the wiring landed: a guard whose wiring is untested is a guard
+/// that does not exist. Driven through the CLI rather than the function, because
+/// what broke would be the *call*, not the check.
+#[test]
+fn a_tenant_root_inside_the_cache_is_refused_through_the_cli() {
+    let env = scoped_home();
+    let inside = env.home.join("projects").join("somewhere");
+    std::fs::create_dir_all(&inside).unwrap();
+
+    // No `[tenant] root` anywhere — the hazard is the RELATIVE default resolving
+    // against a working directory that happens to be in the cache.
+    let out = forgedb(&inside, &env.home, &["tenant", "list"]);
+
+    assert!(!out.status.success(), "must refuse:\n{}", combined(&out));
+    assert!(
+        combined(&out).contains("build cache"),
+        "and say why:\n{}",
+        combined(&out)
+    );
+}
+
+/// A member directory that recorded no schema is **kept**, not collected.
+///
+/// The conservative direction is deliberate and asymmetric: an unreadable marker
+/// means "written by a version that did not record one", and evicting a live
+/// member forces a full regenerate-and-recompile rather than an incremental
+/// rebuild. Guessing wrong in the other direction costs a stale directory.
+#[test]
+fn a_member_with_no_recorded_schema_is_kept() {
+    let env = scoped_home();
+    let project = env.home.join("projects").join("legacy");
+    let mystery = project.join("apps").join("deadbeefdeadbeef");
+    std::fs::create_dir_all(&mystery).unwrap();
+    let mine = project.join("apps").join("0000000000000000");
+
+    let live = cache::live_members(&project, &mine).unwrap();
+    assert!(live.contains(&mystery), "kept: {live:?}");
+    assert!(live.contains(&mine));
+}
+
+/// The member set **accretes** rather than being remembered, and a member whose
+/// schema is gone drops out of it.
+///
+/// Not in #344's table. It is the mechanism scenario 4 depends on — generating
+/// one app has no knowledge of its siblings, so the set has to be rebuilt from
+/// disk each time — and the failure it guards is silent: a stale member keeps a
+/// deleted app's `target/` alive forever and keeps appearing in a manifest that
+/// claims to be a pure function of the live set.
+#[test]
+fn a_member_whose_schema_is_gone_drops_out_of_the_set() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(&root.join("forgedb.toml"), "[project]\nname = \"accrete\"\n");
+
+    for app in ["keep", "doomed"] {
+        write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
+        let out = forgedb(
+            &root,
+            &env.home,
+            &["generate", "rust", "--schema", &format!("apps/{app}/schema.forge")],
+        );
+        assert!(out.status.success(), "{}", combined(&out));
+    }
+
+    let project = env.home.join("projects").join("accrete");
+    assert_eq!(members_of(&project).len(), 2);
+
+    std::fs::remove_dir_all(root.join("apps/doomed")).unwrap();
+    let out = forgedb(
+        &root,
+        &env.home,
+        &["-v", "generate", "rust", "--force", "--schema", "apps/keep/schema.forge"],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let members = members_of(&project);
+    assert_eq!(members.len(), 1, "the deleted app left the set: {members:?}");
+    assert!(
+        combined(&out).contains("Orphaned member"),
+        "…and it was reported rather than dropped silently:\n{}",
+        combined(&out)
+    );
+}
