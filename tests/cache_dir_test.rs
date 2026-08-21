@@ -397,13 +397,70 @@ fn combined(out: &std::process::Output) -> String {
 
 /// The `members = [...]` entries of a workspace root manifest.
 fn members_of(project: &Path) -> Vec<String> {
+    array_of(project, "members")
+}
+
+/// `default-members`, or an empty vec when the key is absent — which is the
+/// *correct* rendering whenever the filtered set equals `members` or is empty
+/// (#335 §4), not a sign of a missing key.
+fn default_members_of(project: &Path) -> Vec<String> {
+    array_of(project, "default-members")
+}
+
+/// Parse one `key = [ … ]` array of quoted strings out of the workspace root.
+///
+/// Keyed on the array rather than on "every quoted line in the file", because
+/// the root now carries two arrays and conflating them would let a
+/// `default-members` entry satisfy an assertion about `members`.
+fn array_of(project: &Path, key: &str) -> Vec<String> {
     let src = std::fs::read_to_string(project.join("Cargo.toml"))
         .unwrap_or_else(|e| panic!("no workspace root at {}: {e}", project.display()));
-    src.lines()
-        .filter_map(|l| l.trim().strip_prefix('"'))
-        .filter_map(|l| l.split('"').next())
-        .map(str::to_string)
-        .collect()
+
+    let mut out = Vec::new();
+    let mut inside = false;
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(&format!("{key} = [")) {
+            // The empty-array rendering `members = []` is one line.
+            if trimmed.ends_with("[]") {
+                return out;
+            }
+            inside = true;
+            continue;
+        }
+        if inside {
+            if trimmed == "]" {
+                break;
+            }
+            if let Some(rest) = trimmed.strip_prefix('"')
+                && let Some(name) = rest.split('"').next()
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The app CONTAINERS on disk — `apps/<hash>`, project-relative.
+///
+/// Distinct from [`members_of`] since #335: a container holds the `schema-path`
+/// marker and the per-kind package directories and is **never itself a member**,
+/// because a `members` entry naming a directory with no manifest is
+/// project-wide fatal. Tests about app liveness and accretion assert on
+/// containers; tests about what cargo will build assert on members.
+fn containers_of(project: &Path) -> Vec<String> {
+    let apps = project.join("apps");
+    let Ok(entries) = std::fs::read_dir(&apps) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| format!("apps/{}", e.file_name().to_string_lossy()))
+        .collect();
+    out.sort();
+    out
 }
 
 /// **Scenario 4.** Two apps in one project land under ONE workspace root, so
@@ -433,34 +490,74 @@ fn scenario_4_two_apps_in_one_project_share_one_workspace() {
     }
 
     let project = env.home.join("projects").join("shared");
-    let members = members_of(&project);
-    assert_eq!(members.len(), 2, "both apps are members: {members:?}");
+    let containers = containers_of(&project);
+    assert_eq!(containers.len(), 2, "both apps have containers: {containers:?}");
 
-    // The member paths are the hashes of the two PROJECT-RELATIVE schema paths —
-    // recomputed here rather than read back, so this also pins that the wiring
+    // The container paths are the hashes of the two PROJECT-RELATIVE schema paths
+    // — recomputed here rather than read back, so this also pins that the wiring
     // made the path relative to the project root and not to the CWD.
     for app in ["api", "web"] {
         let expect = format!(
             "apps/{}",
             cache::member_hash(Path::new(&format!("apps/{app}/schema.forge")))
         );
-        assert!(members.contains(&expect), "{expect} in {members:?}");
+        assert!(containers.contains(&expect), "{expect} in {containers:?}");
     }
 
     // One lockfile and one target dir, at the root — the property the shared
-    // workspace exists for. Stub members keep this a workspace test rather than a
-    // substrate compile.
-    for member in &members {
-        let dir = project.join(member);
+    // workspace exists for. Stub packages keep this a workspace test rather than
+    // a substrate compile.
+    //
+    // They go INSIDE the containers, one level below them, because a container
+    // has no manifest of its own. Until #335 step 5a emits real packages this is
+    // what a member looks like.
+    for container in &containers {
+        let dir = project.join(container).join("core");
         write(
             &dir.join("Cargo.toml"),
             &format!(
                 "[package]\nname = \"m{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
-                &member[5..13]
+                &container[5..13]
             ),
         );
         write(&dir.join("src/lib.rs"), "");
     }
+
+    // The root was rendered BEFORE those packages existed, so it names none of
+    // them — that is the reserve/sync_root ordering, and re-deriving here is what
+    // an emission step does after it writes. Without this the `cargo build` below
+    // would pass having built nothing, which is the vacuous-green shape this
+    // whole issue is about.
+    let keep = project.join(&containers[0]);
+    cache::sync_root(&project, &keep).expect("sync_root");
+
+    let members = members_of(&project);
+    assert_eq!(members.len(), 2, "both apps' packages are members: {members:?}");
+    for container in &containers {
+        let expect = format!("{container}/core");
+        assert!(members.contains(&expect), "{expect} in {members:?}");
+    }
+
+    // Every member is a `core`, so the default-member filter is a no-op and the
+    // key must be OMITTED rather than written as an equal copy.
+    assert!(
+        default_members_of(&project).is_empty(),
+        "default-members should be omitted when it would equal members"
+    );
+
+    // `cargo metadata` is what could never pass before #335: the shipped shape
+    // listed containers, which have no manifest, and cargo exits 101 on that.
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        meta.status.success(),
+        "the cache root is not a loadable workspace:\n{}",
+        String::from_utf8_lossy(&meta.stderr)
+    );
+
     let built = std::process::Command::new("cargo")
         .arg("build")
         .current_dir(&project)
@@ -651,7 +748,24 @@ fn a_member_whose_schema_is_gone_drops_out_of_the_set() {
     }
 
     let project = env.home.join("projects").join("accrete");
-    assert_eq!(members_of(&project).len(), 2);
+    let containers = containers_of(&project);
+    assert_eq!(containers.len(), 2);
+
+    // Give each app a stub package, so the manifest's member list reflects the
+    // live set rather than being empty. Until step 5a emits real packages this
+    // is what a member looks like — and without one the assertion below would
+    // pass vacuously against `members = []`.
+    for container in &containers {
+        let dir = project.join(container).join("core");
+        write(
+            &dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"m{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                &container[5..13]
+            ),
+        );
+        write(&dir.join("src/lib.rs"), "");
+    }
 
     std::fs::remove_dir_all(root.join("apps/doomed")).unwrap();
     let out = forgedb(
@@ -661,11 +775,207 @@ fn a_member_whose_schema_is_gone_drops_out_of_the_set() {
     );
     assert!(out.status.success(), "{}", combined(&out));
 
+    // The dead app's PACKAGE leaves the manifest, which is the property that
+    // matters: a stale member keeps a deleted app's `target/` alive forever and
+    // keeps appearing in a file that claims to be a pure function of the live
+    // set. Its container directory stays on disk — reaping that is GC's job, and
+    // it is reported rather than deleted silently.
     let members = members_of(&project);
     assert_eq!(members.len(), 1, "the deleted app left the set: {members:?}");
+    assert!(
+        members[0].starts_with(&containers_of(&project)[0])
+            || members[0].contains(&cache::member_hash(Path::new("apps/keep/schema.forge"))),
+        "the surviving member is not the app we kept: {members:?}"
+    );
     assert!(
         combined(&out).contains("Orphaned member"),
         "…and it was reported rather than dropped silently:\n{}",
         combined(&out)
     );
 }
+
+// ---------------------------------------------------------------------------
+// #335 step 2 — containers, the scan-derived member set, and default-members
+// ---------------------------------------------------------------------------
+
+/// Build a project on disk with the given package directories under one
+/// container, then derive the root from it.
+fn synth_project(env: &EnvGuard, name: &str, kinds: &[&str]) -> (PathBuf, PathBuf) {
+    let project = env.home.join("projects").join(name);
+    let container = project.join("apps").join("deadbeefdeadbeef");
+    std::fs::create_dir_all(&container).unwrap();
+    // A container records the schema it belongs to; `live_members` keeps a
+    // container whose marker is unreadable, so an absent one is also fine here.
+    for kind in kinds {
+        let dir = container.join(kind);
+        write(
+            &dir.join("Cargo.toml"),
+            &format!("[package]\nname = \"p-{}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n", kind),
+        );
+        write(&dir.join("src/lib.rs"), "");
+    }
+    cache::sync_root(&project, &container).expect("sync_root");
+    (project, container)
+}
+
+/// **#335 §1.** The container itself is never a member. A `members` entry naming
+/// a directory with no manifest is project-wide fatal — it is the shape #334
+/// shipped, and the reason nothing has ever built in this cache.
+#[test]
+fn a_container_is_never_a_member() {
+    let env = scoped_home();
+    let (project, _) = synth_project(&env, "containers", &["core"]);
+
+    let members = members_of(&project);
+    assert_eq!(members, vec!["apps/deadbeefdeadbeef/core".to_string()]);
+    assert!(
+        !members.contains(&"apps/deadbeefdeadbeef".to_string()),
+        "the container was listed as a member: {members:?}"
+    );
+
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        meta.status.success(),
+        "cache root is not loadable:\n{}",
+        String::from_utf8_lossy(&meta.stderr)
+    );
+}
+
+/// **#335 §3.** A container with no packages contributes nothing and breaks
+/// nothing — the REST-only app. `members = []` is a legal workspace.
+#[test]
+fn a_container_with_no_packages_renders_as_nothing() {
+    let env = scoped_home();
+    let (project, _) = synth_project(&env, "restonly", &[]);
+
+    assert!(members_of(&project).is_empty());
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        meta.status.success(),
+        "an empty member set should still load:\n{}",
+        String::from_utf8_lossy(&meta.stderr)
+    );
+}
+
+/// **#335 §4.** `wasm` is excluded from `default-members` so a bare `cargo build`
+/// at the root does not try to build the replica for the host triple. C7 prints
+/// this path, so a user will eventually `cd` here and type that.
+#[test]
+fn default_members_excludes_wasm_and_stays_a_subset() {
+    let env = scoped_home();
+    let (project, _) = synth_project(&env, "withwasm", &["core", "wasm"]);
+
+    let members = members_of(&project);
+    let defaults = default_members_of(&project);
+
+    assert_eq!(members.len(), 2, "{members:?}");
+    assert_eq!(defaults, vec!["apps/deadbeefdeadbeef/core".to_string()]);
+
+    // Not a subset is PROJECT-WIDE FATAL — it breaks `build`, `build -p <a valid
+    // member>` and `metadata` alike.
+    for d in &defaults {
+        assert!(members.contains(d), "{d} is not in members {members:?}");
+    }
+}
+
+/// **#335 §4.** When the filter changes nothing, the key is OMITTED rather than
+/// written as an equal copy — two lists that must stay identical is the skew
+/// this derivation exists to prevent.
+#[test]
+fn default_members_is_omitted_when_it_would_equal_members() {
+    let env = scoped_home();
+    let (project, _) = synth_project(&env, "allnative", &["core", "server", "ffi"]);
+
+    assert_eq!(members_of(&project).len(), 3);
+    let manifest = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !manifest.contains("default-members"),
+        "default-members should be absent:\n{manifest}"
+    );
+}
+
+/// **#335 §4.** An empty filtered set omits the key too. Writing
+/// `default-members = []` instead produces cargo's misleading "the workspace has
+/// no members". Reachable for a REST-only app with a migration lineage, whose
+/// only packages are `transform-*`/`engine-*`.
+#[test]
+fn default_members_is_omitted_rather_than_emptied() {
+    let env = scoped_home();
+    let (project, _) = synth_project(&env, "lineageonly", &["transform-1-2", "engine-2-3"]);
+
+    assert_eq!(members_of(&project).len(), 2);
+    let manifest = std::fs::read_to_string(project.join("Cargo.toml")).unwrap();
+    assert!(
+        !manifest.contains("default-members"),
+        "an empty filtered set must omit the key, not write []:\n{manifest}"
+    );
+
+    let built = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        built.status.success(),
+        "omitting the key must leave a buildable workspace:\n{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+}
+
+/// **#335 §3.** A directory ForgeDB did not emit is left unlisted rather than
+/// admitted. Listing it would make ForgeDB responsible for a manifest it does
+/// not own, and a broken one is project-wide fatal; not listing it is inert.
+#[test]
+fn an_unrecognised_directory_is_not_admitted_as_a_member() {
+    let env = scoped_home();
+    let (project, container) = synth_project(&env, "stray", &["core"]);
+
+    // A plausible-looking stray with a perfectly valid manifest.
+    let stray = container.join("scratch");
+    write(
+        &stray.join("Cargo.toml"),
+        "[package]\nname = \"stray\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    );
+    write(&stray.join("src/lib.rs"), "");
+
+    cache::sync_root(&project, &container).expect("sync_root");
+
+    let members = members_of(&project);
+    assert_eq!(
+        members,
+        vec!["apps/deadbeefdeadbeef/core".to_string()],
+        "an unrecognised directory was admitted: {members:?}"
+    );
+}
+
+/// **#335 §3.** `reserve` must not touch the workspace root.
+///
+/// It runs BEFORE emission, so a root rendered there would list the packages of
+/// the *previous* run — and an app's very first generate would produce a root
+/// naming none of its own packages. That failure is invisible on a warm cache;
+/// this is the assertion that makes the split load-bearing rather than stylistic.
+#[test]
+fn reserve_does_not_write_the_workspace_root() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let schema = root.join("schema.forge");
+    write(&schema, SCHEMA);
+
+    let reserved = cache::reserve("fresh", &root, &schema).expect("reserve");
+
+    assert!(reserved.container.is_dir(), "the container was not created");
+    assert!(
+        !reserved.project.join("Cargo.toml").exists(),
+        "reserve wrote the workspace root; it must be sync_root's job"
+    );
+}
+
