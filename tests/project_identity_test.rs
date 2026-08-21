@@ -50,6 +50,36 @@ fn run(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
         .expect("forgedb binary runs")
 }
 
+/// The one `ffi` package this project's cache holds, if any.
+///
+/// **The discriminator for "did `all` reach the opt-in targets" lives in the
+/// CACHE, not in the output directory** (#335 step 7): `generate` stopped
+/// writing `ffi/`, `napi/`, `pyo3/` and `replica/` into the user's tree and
+/// emits them as members of the project's cargo workspace instead. Asserting on
+/// `generated/ffi` after that flip is asserting on a directory nothing writes
+/// any more — it would fail whatever the target filter did, which is the same
+/// as not testing the filter.
+///
+/// Found by scan rather than by joining a hash: the app hash is FNV-1a over the
+/// project-relative schema path, and recomputing it here would be a second
+/// derivation of something the CLI already settled.
+fn cache_ffi_package(home: &Path) -> Option<PathBuf> {
+    let projects = home.join("projects");
+    for project in std::fs::read_dir(&projects).ok()?.flatten() {
+        let apps = project.path().join("apps");
+        let Ok(entries) = std::fs::read_dir(&apps) else {
+            continue;
+        };
+        for app in entries.flatten() {
+            let ffi = app.path().join("ffi");
+            if ffi.join("Cargo.toml").is_file() {
+                return Some(ffi);
+            }
+        }
+    }
+    None
+}
+
 fn combined(out: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -540,7 +570,9 @@ fn scenario_17_output_is_schema_relative() {
     let root = repo_root(&tmp);
     write(
         &root.join("forgedb.toml"),
-        "[project]\nname = \"mono\"\n\n[generate]\noutput = \"generated\"\n",
+        // `targets` is required as of #335 §12 — a config that declares part of
+        // `[generate]` may not leave the most consequential key to be guessed.
+        "[project]\nname = \"mono\"\n\n[generate]\noutput = \"generated\"\ntargets = [\"all\"]\n",
     );
     for app in ["api", "web"] {
         write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
@@ -679,4 +711,169 @@ impl NameErr for Result<project::ProjectId, forgedb::CliError> {
             Ok(id) => panic!("{name:?} was accepted as a project id: {id:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #335 step 4 — `[generate].targets` is required, and speaks the CLI vocabulary
+//
+// Prefixed `s335_` because the scenario numbers above belong to #344/#333's
+// plan; these are #347's and the two sets overlap.
+// ---------------------------------------------------------------------------
+
+/// **Scenario 16.** A `[generate]` table that omits `targets` is a positioned
+/// error naming `["all"]`.
+///
+/// The refused case is deliberately narrow: a config that declares *part* of
+/// `[generate]` and leaves the most consequential key to be guessed. A project
+/// with no config file, or with no `[generate]` table, takes the built-in
+/// `["all"]` — see the two tests below.
+#[test]
+fn s335_16_absent_targets_is_a_positioned_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"needs-targets\"\n\n[generate]\noutput = \"generated\"\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "rust"]);
+    assert!(!out.status.success(), "should have refused:\n{}", combined(&out));
+
+    let msg = combined(&out);
+    assert!(msg.contains("`[generate].targets` is required"), "{msg}");
+    assert!(msg.contains("forgedb.toml:4:1"), "not positioned at the table: {msg}");
+    assert!(msg.contains("targets = [\"all\"]"), "does not name the remedy: {msg}");
+}
+
+/// A project with **no config file at all** keeps working, and the built-in
+/// default is a *stated* `["all"]` rather than an absence.
+///
+/// **This asserts through `generate all`, and that is load-bearing.** A
+/// single-target invocation such as `generate rust` never consults
+/// `config_targets` at all (#335 §12) — so written that way this test passes
+/// whatever the default is, including `None`. Verified by mutation: nulling the
+/// default left the `generate rust` form green. `ffi` is the discriminator
+/// because it is reachable only by the filter naming it — and it is looked for
+/// in the CACHE, per [`cache_ffi_package`].
+#[test]
+fn s335_16_no_config_file_still_generates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "all"]);
+    assert!(out.status.success(), "no config should be fine:\n{}", combined(&out));
+    assert!(root.join("generated/database.rs").is_file());
+    assert!(
+        cache_ffi_package(home.path()).is_some(),
+        "the built-in default did not declare `all`:\n{}",
+        combined(&out)
+    );
+}
+
+/// A config file with no `[generate]` table at all has declared nothing about
+/// generation, so it takes the same built-in default — asserted the same way,
+/// and for the same reason.
+#[test]
+fn s335_16_a_config_without_a_generate_table_still_generates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(&root.join("forgedb.toml"), "[project]\nname = \"no-gen-table\"\n");
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "all"]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(
+        cache_ffi_package(home.path()).is_some(),
+        "an absent [generate] table did not take the built-in default:\n{}",
+        combined(&out)
+    );
+}
+
+/// **Scenario 17.** An unknown value is an error naming the legal set.
+///
+/// Today `targets = ["napi"]` emits **nothing at all** and reports nothing: the
+/// filter is present, so every real target is disabled and no error is raised.
+/// `napi` is chosen deliberately — it is an *internal* name that was never a
+/// legal config value, which is exactly the trap.
+#[test]
+fn s335_17_an_unknown_target_value_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"bad-target\"\n\n[generate]\ntargets = [\"napi\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "rust"]);
+    assert!(!out.status.success(), "should have refused:\n{}", combined(&out));
+
+    let msg = combined(&out);
+    assert!(msg.contains("Unknown `[generate].targets` value `napi`"), "{msg}");
+    assert!(msg.contains("node-runtime"), "does not name the replacement: {msg}");
+    assert!(
+        msg.contains("generate node --runtime"),
+        "does not name the CLI equivalent: {msg}"
+    );
+}
+
+/// **Scenario 19.** A retired spelling still works and **warns**, naming its
+/// replacement. Silence here is how the two vocabularies drifted apart.
+#[test]
+fn s335_19_a_deprecated_target_spelling_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"deprecated\"\n\n[generate]\ntargets = [\"typescript\", \"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "all"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let msg = combined(&out);
+    assert!(msg.contains("node-sdk"), "the warning does not name the replacement: {msg}");
+
+    // ...and it still means what it always meant.
+    assert!(root.join("generated/types.ts").is_file(), "the TS output was not emitted");
+}
+
+/// **Scenario 18.** `["all"]` genuinely means all — including the targets that
+/// were opt-in and therefore unreachable from `generate all` no matter what.
+///
+/// `ffi` is the discriminator: it has always been gated on the filter *naming*
+/// it, so under the old "absent means everything" reading a default project
+/// could never emit it.
+#[test]
+fn s335_18_all_reaches_the_opt_in_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let root = repo_root(&tmp);
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"reach-all\"\n\n[generate]\ntargets = [\"all\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = run(&root, home.path(), &["generate", "all"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    // Always-on, as before.
+    assert!(root.join("generated/database.rs").is_file());
+    assert!(root.join("generated/types.ts").is_file());
+    // Opt-in — unreachable from `all` before #335 §12. Looked for in the CACHE:
+    // step 7 moved the ffi package out of the output directory, so the old
+    // `generated/ffi` assertion would now fail no matter what the filter did.
+    assert!(
+        cache_ffi_package(home.path()).is_some(),
+        "`all` did not reach the opt-in ffi target"
+    );
 }

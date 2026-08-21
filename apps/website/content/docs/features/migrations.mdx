@@ -1,6 +1,6 @@
 ---
 title: "Migrations"
-description: "Schema evolution the generator way — a version interlock, automatic additive backfill, Auto/Authored hop classification, and an offline transformer bin driven by forgedb migrate create → migrate up, with a per-tenant sweep."
+description: "Schema evolution the generator way — a version interlock, automatic additive backfill, Auto/Authored hop classification, and an offline transformer bin driven by forgedb migrate create → build → run."
 purpose: "orientation"
 ---
 
@@ -79,7 +79,7 @@ You fill in every TODO and freeze it. `authored_transform(model, row)` receives 
 JSON after the automatic ops and returns it reshaped for the next version.
 </DiveDeeper>
 
-## Lifecycle — `migrate create` → `migrate up`
+## Lifecycle — `migrate create` → `build` → `run`
 
 ```bash
 # 1. Edit schema.forge, then record + classify the change:
@@ -94,46 +94,60 @@ forgedb migrate create "qty to string" --auto --schema schema.forge
 # 3. Regenerate your app (its EXPECTED_FORMAT_VERSION advances):
 forgedb generate
 
-# 4. With the app STOPPED, migrate the data in one step:
-forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
+# 4. Build the transformer for the range, then — with the app STOPPED — run it:
+forgedb migrate build --schema schema.forge --from 1 --to 2
+forgedb migrate run   --schema schema.forge --from 1 --to 2 \
+  --src ./data --dest ./data-migrated
 
 # 5. Point the regenerated app at ./data-migrated.
 ```
 
-`migrate up` builds the transformer crate for the range, compiles it, and runs it. It writes a
-**fresh destination** and leaves the source untouched, so the original is your rollback.
-`--from` defaults to the version detected from the source manifests, and `--to` to the
-lineage's current version.
+`run` writes a **fresh destination** and leaves the source untouched, so the original is your
+rollback. `build` and `run` name the same range and the same app, which is how `run` finds
+the exact binary `build` produced.
+
+<Callout type="note" title="`migrate up` was removed">
+It was a wrapper over these two commands, so run the two. What is genuinely lost is the
+per-tenant sweep and `--from` auto-detection; both are tracked for restoration as #373.
+Passing `forgedb migrate up` today errors and names the pair.
+</Callout>
 
 <ImplementationDetails summary="the generated transformer crate, exactly">
-For a `--from B --to G` range, ForgeDB emits a self-contained crate at `migrations/transform/`:
-one typed module per version (`vN.rs`, each carrying its own version open-guard), any frozen
-authored bodies embedded verbatim, and a `main.rs` that is a fixed straight-line chain of named
-`transform_vN_to_vM` hop functions. There is no runtime step interpreter. Each hop reads every
-row through the `vN` typed structs, applies the baked structural ops then the authored
-transform, and writes through `vM`'s `insert`, which preserves record ids so foreign keys stay
-valid. Multi-hop ranges replay through temp dirs and publish with a single atomic rename. The
+For a `--from B --to G` range, ForgeDB emits a crate named `transform-<B>-<G>` into the app's
+container in the build cache — a member of the project's cargo workspace, sharing its
+`Cargo.lock` and `target/`, never a `[package]` dropped into your tree. It holds one typed
+module per version (`vN.rs`, each carrying its own version open-guard), any frozen authored
+bodies embedded verbatim, and a `main.rs` that is a fixed straight-line chain of named
+`transform_vN_to_vM` hop functions. The range is in the *package* name because one
+`transform/` per app collided across ranges, and `run` got whichever built last.
+
+There is no runtime step interpreter. Each hop reads every row through the `vN` typed
+structs, applies the baked structural ops then the authored transform, and writes through
+`vM`'s `insert`, which preserves record ids so foreign keys stay valid. Multi-hop ranges replay through temp dirs and publish with a single atomic rename. The
 crate depends only on your app's substrate (storage, types), never on `forgedb-parser` or
 `forgedb-migrations`, and it never parses a `.forge` at runtime.
 </ImplementationDetails>
 
-## Per-tenant sweep
+## Per-tenant migration
 
 Under [multi-tenancy](/docs/features/multi-tenancy/), each tenant is an independent data dir
-under one root. `migrate up` sweeps them in one command:
+under one root. Build the transformer once, then run it per tenant:
 
 ```bash
-forgedb migrate up --tenant-root ./tenants --to 2
-# migrates ./tenants/<t> → ./tenants/<t>-migrated-v2 for every tenant data dir
+forgedb migrate build --schema schema.forge --from 1 --to 2
+for t in ./tenants/*/; do
+  forgedb migrate run --schema schema.forge --from 1 --to 2 \
+    --src "$t" --dest "${t%/}-migrated-v2"
+done
 ```
 
-It builds the transformer once and runs it per tenant independently. A tenant that fails, or is
-at an unexpected version the open-guard refuses, is reported and skipped with its source
-unchanged, and the command exits non-zero if any tenant failed.
+Each run is independent: a tenant at an unexpected version is refused by the open-guard with
+its source unchanged. The single-command sweep (`--tenant-root`, with its skip-and-report
+behavior and non-zero exit) left with `migrate up` and is tracked as #373.
 
 ## Limits
 
-- **Offline / exclusive-writer.** `migrate up` is offline; online (live-writer) migration is
+- **Offline / exclusive-writer.** `migrate run` is offline; online (live-writer) migration is
   not supported.
 - Additive backfill uses the **type zero**, not `@default` (deferred).
 - `compaction_epoch` verification before apply is deferred — the format-version guard is the

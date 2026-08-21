@@ -23,3 +23,7 @@ prettyplease = "0.2"
 
 [dev-dependencies]
 insta = "1.40"
+# Dev-only: the generated cargo manifests are asserted to be valid TOML. A
+# malformed manifest is the exact failure class #335 is about, and a string
+# snapshot cannot see it.
+toml = "0.8"

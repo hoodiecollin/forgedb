@@ -6,14 +6,35 @@
 # full outside-repo chain actually **builds, links, and runs**:
 #
 #   1. Build the `forgedb` CLI from this checkout (`cargo build --release`).
-#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema
-#      (so the emitted `ffi/Cargo.toml` resolves the substrate crates from
-#      crates.io, not the workspace — the true installed-user path).
-#   3. `forgedb generate go --runtime` → emits `ffi/` (cdylib) + `go/` (cgo pkg).
-#   4. `cargo build --release` the sibling `ffi/` cdylib (the generated cgo
-#      `LDFLAGS` hardcodes `../ffi/target/release`, so release is mandatory).
+#   2. `forgedb init` a temp project OUTSIDE the checkout + a multi-model schema,
+#      with FORGEDB_HOME outside it too (so every substrate crate resolves from
+#      crates.io, not from this workspace — the true installed-user path).
+#   3. `forgedb generate go --runtime` → emits the `go/` cgo package into the
+#      output directory, and the `ffi` package into the build cache.
+#   4. `forgedb build` → compiles the cache workspace AND delivers the ffi
+#      **staticlib** to `generated/go/libforgedb.a`.
 #   5. `go mod tidy` (pulls `arrow-go/v18`) + `CGO_ENABLED=1 go build ./...`.
 #   6. Round-trip smoke `go run`: open → insert → get → assert.
+#   7. Delete the cargo target directory, then run the smoke binary AGAIN.
+#
+# WHY STEP 4 IS `forgedb build` AND WHY THE ARCHIVE, NOT THE DYLIB (#335)
+#
+# This file used to say: "`cargo build --release` the sibling `ffi/` cdylib (the
+# generated cgo LDFLAGS hardcodes `../ffi/target/release`, so release is
+# mandatory)". Both halves of that are gone.
+#
+# There is no sibling `generated/ffi/` any more — the ffi package is a member of
+# ForgeDB's own cache workspace, and `forgedb build` is what compiles it. And the
+# cgo preamble no longer points into a cargo target directory at all: it is
+# `-L${SRCDIR} -lforgedb`, resolved against a `libforgedb.a` sitting beside the
+# Go source, which `forgedb build` copies there.
+#
+# The archive rather than the dylib is the whole point. rustc stamps an ABSOLUTE
+# `LC_ID_DYLIB` into a cdylib, so a Go binary that linked one records the cache
+# path — and the cache is a cache, deletable at any time (C8). The binary then
+# dies `dyld: Library not loaded`, and CI never sees it, because the cache still
+# exists while the workflow runs. Step 7 exists precisely to remove that blind
+# spot: it deletes the target directory and re-runs the binary.
 #
 # Toolchain matrix mirrors pypi.yml's same-arch convention: Rust (pinned 1.96 via
 # rust-toolchain.toml) + Go + `CGO_ENABLED=1` + a C compiler, Unix-only (Windows
@@ -74,10 +95,27 @@ jobs:
           WORK="$(mktemp -d "${RUNNER_TEMP}/go-reclose.XXXXXX")"
           cd "$WORK"
 
+          # The build cache must live outside the checkout, and this is an
+          # assertion rather than a comment: the repo root Cargo.toml has
+          # `members` and no `exclude`, so a cache under $GITHUB_WORKSPACE would
+          # join this repo's cargo workspace and resolve every forgedb-* crate by
+          # PATH — the reclose would then be measuring the checkout, silently,
+          # while passing.
+          export FORGEDB_HOME="$WORK/forgedb-home"
+          case "$FORGEDB_HOME" in
+            "${GITHUB_WORKSPACE}"*)
+              echo "FAIL: FORGEDB_HOME ($FORGEDB_HOME) is inside the checkout" >&2
+              exit 1;;
+          esac
+
           # 2. Fresh project + a multi-model schema (relations exercise the
           #    relation-op codegen the single-model init default does not).
           "$FORGEDB" init app
           cd app
+          # `init` scaffolds no cargo package (#335); `forgedb build` compiles in
+          # the cache. If one ever comes back, step 4 is no longer what is
+          # under test.
+          test ! -e Cargo.toml
           cat > schema.forge <<'SCHEMA'
           Author {
             id: +uuid
@@ -95,12 +133,29 @@ jobs:
           SCHEMA
           "$FORGEDB" validate
 
-          # 3. Emit the FFI engine crate + the Go cgo package.
+          # 3. Emit the Go cgo package (and, in the cache, the ffi package it
+          #    links). Nothing is written outside `generated/` and the cache.
           "$FORGEDB" generate go --runtime
 
-          # 4. Build the sibling cdylib in RELEASE (the cgo LDFLAGS point at
-          #    ../ffi/target/release). Deps resolve from crates.io.
-          (cd generated/ffi && cargo build --release)
+          # The generated cgo preamble must link the archive beside the source,
+          # not a path into a cargo target directory. Asserted on the emitted
+          # source, because this is the line whose earlier form made a Go binary
+          # depend on a directory ForgeDB is free to delete.
+          grep -q -- '-L\${SRCDIR} -lforgedb' generated/go/forgedb.go
+          ! grep -q 'ffi/target/release' generated/go/forgedb.go
+
+          # 4. `forgedb build` compiles the cache workspace and DELIVERS the ffi
+          #    staticlib to generated/go/libforgedb.a. Every substrate dep
+          #    resolves from crates.io, because the cache is outside the checkout.
+          "$FORGEDB" build
+          test -f generated/go/libforgedb.a
+          # The delivered file is an archive, not a shared object — the one
+          # distinction the C8 GC turns into a crash.
+          case "$(file -b generated/go/libforgedb.a)" in
+            *archive*) ;;
+            *) echo "FAIL: generated/go/libforgedb.a is not an archive" >&2;
+               file -b generated/go/libforgedb.a >&2; exit 1;;
+          esac
 
           # 5. Tidy (pulls arrow-go/v18) + compile the package with cgo.
           (cd generated/go && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go build ./...)
@@ -161,4 +216,38 @@ jobs:
           	fmt.Printf("OK round-trip: id=%s email=%s name=%s\n", got.Id, got.Email, got.Name)
           }
           MAIN
-          (cd generated/smoke && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go run .)
+          # Built to a FILE rather than `go run`, because step 7 has to run the
+          # same binary again after the cargo target directory is gone.
+          (cd generated/smoke && CGO_ENABLED=1 go mod tidy && CGO_ENABLED=1 go build -o smoke . && ./smoke)
+
+          # 7. THE C8 GUARD. Delete the entire cargo target directory — the build
+          #    cache GC, in full — and run the binary again.
+          #
+          #    This is the check that would have caught the dylib mistake, and it
+          #    is invisible without it: the cache still exists while CI runs, so a
+          #    binary carrying an absolute LC_ID_DYLIB passes every step above and
+          #    dies on the user's machine after the first `forgedb` cleanup. A
+          #    statically linked archive has its contents inside the binary, so
+          #    there is nothing left to dangle.
+          rm -rf "$FORGEDB_HOME/projects"
+          (cd generated/smoke && ./smoke)
+
+          #    And corroborate it: nothing outside the system is resolved at load
+          #    time. The successful re-run above is the primary evidence; this
+          #    says WHY, so a future regression reads as a dangling reference
+          #    rather than as a mystery crash.
+          case "$(uname -s)" in
+            Darwin)
+              otool -L generated/smoke/smoke
+              # Every dependency must live in a system prefix. Anything else is a
+              # path baked in at link time, which is exactly the LC_ID_DYLIB
+              # failure. `tail -n +2` drops the "<binary>:" header line.
+              ! otool -L generated/smoke/smoke | tail -n +2 | awk '{print $1}' \
+                | grep -qv -e '^/usr/lib/' -e '^/System/Library/';;
+            *)
+              ldd generated/smoke/smoke || true
+              # `not found` is what a deleted cache looks like to the dynamic
+              # loader, and the cache directory must not be named at all.
+              ! ldd generated/smoke/smoke 2>/dev/null | grep -q 'not found'
+              ! ldd generated/smoke/smoke 2>/dev/null | grep -q "$FORGEDB_HOME";;
+          esac

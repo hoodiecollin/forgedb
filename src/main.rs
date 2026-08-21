@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 // library's consumers use — the tests, and #335's callers — read as dead code in
 // the binary, which is a warning that can only be silenced by an `#[allow]` that
 // then outlives its reason and hides a real hole.
-use forgedb::{cache, commands, error, project, ui};
+use forgedb::{cache, commands, error, naming, project, targets, ui};
 
 use error::Result;
 
@@ -40,12 +40,19 @@ enum Commands {
         #[arg(short, long)]
         template: Option<String>,
 
-        /// Include Rust backend
-        #[arg(long)]
+        /// REMOVED (#335). Kept in the parser ONLY so it can be refused by
+        /// name: `init` no longer scaffolds a cargo package at all, so a flag
+        /// that selected one has nothing left to select. Deleting it outright
+        /// would give clap's generic "unexpected argument", which names no
+        /// replacement — and a flag that reads as applied and is not is the
+        /// exact failure #335 deletes everywhere else. `init::refuse_removed_flags`
+        /// owns the diagnostic.
+        #[arg(long, hide = true)]
         rust: bool,
 
-        /// Generate API only
-        #[arg(long)]
+        /// REMOVED (#335) — see `--rust` above. Narrow what is generated with
+        /// `[generate].targets` in `forgedb.toml` instead.
+        #[arg(long, hide = true)]
         api_only: bool,
 
         /// Stand alone: the schemas here form their own project, even inside an
@@ -133,9 +140,13 @@ enum Commands {
         #[arg(long, default_value = "true")]
         release: bool,
 
-        /// Build target (native, wasm, both)
-        #[arg(short, long, default_value = "native")]
-        target: String,
+        /// REMOVED (#335). Kept only so passing it errors with the replacement
+        /// named, rather than clap's `unexpected argument`: what gets built is
+        /// decided by `[generate].targets`, and a cargo `--target` is
+        /// invocation-wide, so `--target wasm` never meant "also build the
+        /// browser replica".
+        #[arg(short, long, hide = true)]
+        target: Option<String>,
 
         /// Output directory
         #[arg(short, long)]
@@ -148,17 +159,34 @@ enum Commands {
         /// Skip API server build
         #[arg(long)]
         no_api: bool,
+
+        /// Print the cargo invocations and compile nothing
+        #[arg(long)]
+        plan: bool,
+
+        /// Write the machine-readable artifact report to PATH (`-` = stdout)
+        #[arg(long, value_name = "PATH")]
+        report: Option<String>,
+
+        /// Print exactly one absolute artifact path for KIND (core, server, ffi, napi, pyo3, wasm)
+        #[arg(long, value_name = "KIND")]
+        print_artifact: Option<String>,
     },
 
     /// Watch schema file and auto-regenerate on changes
     Dev {
         /// Schema file to watch
-        #[arg(short, long, default_value = "schema.forge")]
-        schema: String,
+        ///
+        /// No clap default: the schema is FOUND by `project::find_schema` and the
+        /// output is RESOLVED against it, exactly as `generate` does. A literal
+        /// `"schema.forge"` / `"generated"` default here is what let `dev` bypass
+        /// the config walk entirely (#364).
+        #[arg(short, long)]
+        schema: Option<String>,
 
         /// Output directory for generated code
-        #[arg(short, long, default_value = "generated")]
-        output: String,
+        #[arg(short, long)]
+        output: Option<String>,
 
         /// Debounce delay in milliseconds
         #[arg(short, long, default_value = "200")]
@@ -246,17 +274,34 @@ enum MigrateCommands {
         #[arg(short, long)]
         auto: bool,
 
-        /// Schema file to diff against the recorded snapshot (for --auto)
+        /// The app this migration belongs to (REQUIRED — #335 §9).
+        ///
+        /// Every path derives from it: `migrations/` is read beside this file,
+        /// and the build cache is keyed by it. Nothing is discovered from the
+        /// working directory any more.
         #[arg(short, long)]
-        schema: Option<std::path::PathBuf>,
+        schema: std::path::PathBuf,
     },
 
     /// Show migration status
-    Status,
+    Status {
+        /// The app whose lineage to report (REQUIRED — #335 §9).
+        #[arg(short, long)]
+        schema: std::path::PathBuf,
+    },
 
     /// Generate + compile the offline transformer bin for a version range (#74).
     /// The one operator artifact that migrates data-at-rest from --from to --to.
     Build {
+        /// The app to build the transformer for (REQUIRED — #335 §9).
+        ///
+        /// It selects the app, and nothing else: the transformer itself is
+        /// generated from the committed per-version schemas under the app's
+        /// `migrations/`, so a drifted current schema cannot change a
+        /// historical hop.
+        #[arg(short, long)]
+        schema: std::path::PathBuf,
+
         /// Origin (current on-disk) format version
         #[arg(long)]
         from: u32,
@@ -265,13 +310,30 @@ enum MigrateCommands {
         #[arg(long)]
         to: u32,
 
-        /// Where to emit + build the transformer (default: migrations/transform)
-        #[arg(short, long)]
+        /// REMOVED (#335): the transformer is built as a member of ForgeDB's
+        /// own cache workspace. Kept parseable only so that passing it is an
+        /// error naming the replacement instead of clap's "unexpected
+        /// argument", which names none.
+        #[arg(short, long, hide = true)]
         output: Option<std::path::PathBuf>,
     },
 
     /// Run a built transformer over a src→dest data dir (app must be stopped).
     Run {
+        /// The app whose transformer to run (REQUIRED — #335 §9).
+        #[arg(short, long)]
+        schema: std::path::PathBuf,
+
+        /// Origin format version — REQUIRED, because the transformer is a
+        /// range-stamped cache member (`transform-<from>-<to>`) and cannot be
+        /// named without its range.
+        #[arg(long)]
+        from: u32,
+
+        /// Destination format version
+        #[arg(long)]
+        to: u32,
+
         /// Source data directory (at the origin format version)
         #[arg(long)]
         src: std::path::PathBuf,
@@ -280,17 +342,19 @@ enum MigrateCommands {
         #[arg(long)]
         dest: std::path::PathBuf,
 
-        /// The transformer crate dir (default: migrations/transform)
-        #[arg(long)]
+        /// REMOVED (#335): a directory cannot name a range-stamped member.
+        /// Kept parseable only so that passing it errors with the replacement.
+        #[arg(long, hide = true)]
         bin_dir: Option<std::path::PathBuf>,
     },
 
     /// Migrate a data dir across a ForgeDB **byte-format generation** (#254).
     ///
-    /// Orthogonal to the schema-version transformer: `migrate up` replays the
-    /// app's own `migrations/` lineage, this replays ForgeDB's engine
-    /// generations.  An engine bump changes no `.forge`, so it produces no
-    /// lineage hop and `migrate up` would run nothing.  The app must be STOPPED.
+    /// Orthogonal to the schema-version transformer: `migrate build`/`run`
+    /// replay the app's own `migrations/` lineage, this replays ForgeDB's
+    /// engine generations.  An engine bump changes no `.forge`, so it produces
+    /// no lineage hop and the transformer would run nothing.  The app must be
+    /// STOPPED.
     Engine {
         /// Source data directory (at the old engine generation)
         #[arg(long)]
@@ -300,46 +364,30 @@ enum MigrateCommands {
         #[arg(long)]
         dest: std::path::PathBuf,
 
-        /// Schema file (default: auto-discovered).  The SAME schema is baked on
-        /// both sides — an engine bump changes no `.forge`.
-        #[arg(long)]
-        schema: Option<std::path::PathBuf>,
-
-        /// Where to emit + build the hop crate (default: migrations/engine)
+        /// The app (REQUIRED — #335 §9).  Unlike the transformer's, this
+        /// schema is not location-only: an engine bump changes no `.forge`, so
+        /// the SAME schema is baked on both sides of the hop.
         #[arg(short, long)]
+        schema: std::path::PathBuf,
+
+        /// REMOVED (#335): the hop crate is built as a member of ForgeDB's own
+        /// cache workspace. Its old default, `migrations/engine`, is exactly
+        /// the path that reproduces #328 — on the mandatory upgrade command.
+        #[arg(short, long, hide = true)]
         output: Option<std::path::PathBuf>,
     },
 
-    /// One-CLI migration: build the transformer + run it over a data dir (or every
-    /// tenant dir under --tenant-root).  The app must be STOPPED.  #74 Phase 4.
+    /// REMOVED (#335) — was: build the transformer + run it in one command.
+    ///
+    /// A tombstone rather than a deleted subcommand, so that an operator
+    /// following a runbook is told what to run instead of getting clap's
+    /// "unrecognized subcommand". Restoration of the per-tenant sweep is #373.
+    #[command(hide = true)]
     Up {
-        /// Origin format version (default: detected from the source manifests)
-        #[arg(long)]
-        from: Option<u32>,
-
-        /// Destination format version (default: the lineage's current version)
-        #[arg(long)]
-        to: Option<u32>,
-
-        /// Source data directory (single-dir mode)
-        #[arg(long)]
-        src: Option<std::path::PathBuf>,
-
-        /// Destination directory to materialize (single-dir mode)
-        #[arg(long)]
-        dest: Option<std::path::PathBuf>,
-
-        /// Transformer crate dir (default: migrations/transform)
-        #[arg(short, long)]
-        output: Option<std::path::PathBuf>,
-
-        /// Migrate every data dir directly under this root (per-tenant sweep)
-        #[arg(long)]
-        tenant_root: Option<std::path::PathBuf>,
-
-        /// Per-tenant destination suffix (default: -migrated-v<to>)
-        #[arg(long)]
-        dest_suffix: Option<String>,
+        /// Every flag `migrate up` used to take, swallowed so the tombstone —
+        /// and not clap — is what answers.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 }
 
@@ -501,26 +549,105 @@ fn schema_dir(schema: &std::path::Path) -> &std::path::Path {
     }
 }
 
-/// Place an app in its project's build cache and report where that is.
+/// Reserve an app's container and report where it is — the BEFORE half of the
+/// old `place_in_cache` (#335 §3).
 ///
 /// C7: **every** generate and build prints the cache path it wrote to. While the
 /// build happened in a directory the user chose, a silent path was survivable;
 /// once it happens in a hashed directory they have never seen, the thing that
 /// makes the generator identity self-evident — opening `database.rs` and seeing
 /// your own models — is gone unless the path is named.
-fn place_in_cache(
+///
+/// Split from [`sync_after_emission`] because rendering the workspace root here
+/// would list the packages of the PREVIOUS run: an app's very first `generate`
+/// would write a root naming none of its own packages, and `cargo build -p <its
+/// core>` would fail with `did not match any packages`.
+fn reserve_in_cache(
     project: &project::ProjectId,
     schema: &std::path::Path,
-) -> Result<cache::Placement> {
-    let placement = cache::place(&project.name, &project.root, schema)?;
-    ui::info(&format!("Build cache: {}", placement.member.display()));
-    for orphan in &placement.orphans {
+    symbol_naming: naming::SymbolNaming,
+) -> Result<cache::Reserved> {
+    let reserved = cache::reserve(&project.name, &project.root, schema, symbol_naming)?;
+    ui::info(&format!("Build cache: {}", reserved.container.display()));
+    Ok(reserved)
+}
+
+/// Re-derive the workspace root from what is now on disk — the AFTER half —
+/// pruning the packages this app's config no longer declares (#335 §3).
+///
+/// `declared` is what `[generate].targets` asks for, expressed as package kinds,
+/// and **not** what this invocation selected: `forgedb generate rust` under
+/// `targets = ["all"]` must leave `napi/` alone. `None` disables the prune
+/// entirely, for an invocation that emitted nothing — `--check` compares a
+/// scratch directory and touches nothing on disk, so it must delete nothing
+/// either.
+///
+/// The de-list-then-delete order lives in [`cache::prune`], not here: a caller
+/// cannot get it wrong because a caller cannot express the other order.
+fn sync_after_emission(
+    reserved: &cache::Reserved,
+    declared: Option<&[naming::PackageKind]>,
+) -> Result<cache::Synced> {
+    let doomed = match declared {
+        Some(declared) => cache::prunable(
+            &reserved.container,
+            declared,
+            naming::PruneOwner::GenerateBuild,
+        )?,
+        None => Vec::new(),
+    };
+
+    let pruned = cache::prune(&reserved.project, &reserved.container, &doomed)?;
+    report_sync(
+        &reserved.project,
+        pruned.synced.lock_dropped,
+        &pruned.synced.orphans,
+    );
+    // Reported at `info`, not `detail`: this is a deletion ForgeDB performed in a
+    // directory the user never opens, and the same reasoning as C9's lockfile
+    // drop applies — a silent one is indistinguishable from a package that was
+    // never emitted.
+    for dir in &pruned.removed {
+        ui::info(&format!(
+            "Pruned (no longer in [generate].targets): {}",
+            dir.display()
+        ));
+    }
+    Ok(pruned.synced)
+}
+
+/// The app one `migrate` invocation acts on (#335 §9).
+///
+/// `--schema` is required by the parser on every `migrate` arm, so there is no
+/// discovery step and no default to fall back to — a defaulted schema path is
+/// the same defect as a CWD-relative `migrations/`, wearing a different name.
+/// The global `--config` rides along so `migrate` governs exactly the way
+/// `generate` does.
+fn migrate_app(
+    schema: std::path::PathBuf,
+    explicit_config: Option<&str>,
+) -> commands::migrate::AppRef {
+    commands::migrate::AppRef {
+        schema,
+        config: explicit_config.map(str::to_string),
+    }
+}
+
+fn report_sync(project: &std::path::Path, lock_dropped: bool, orphans: &[std::path::PathBuf]) {
+    // C9: a CLI upgrade invalidates the project's dependency resolution, and the
+    // drop happens in a directory the user never opens — so it is reported.
+    if lock_dropped {
+        ui::info(&format!(
+            "CLI version changed — dropped {}/Cargo.lock so dependencies re-resolve",
+            project.display()
+        ));
+    }
+    for orphan in orphans {
         ui::detail(&format!(
             "Orphaned member (its schema is gone): {}",
             orphan.display()
         ));
     }
-    Ok(placement)
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -575,7 +702,9 @@ fn run(cli: Cli) -> Result<()> {
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
             let project = governing.identify_reported()?;
-            place_in_cache(&project, &schema_path)?;
+            // Reserve BEFORE emission (it needs the path); re-derive the
+            // workspace root AFTER, once this app's packages exist (#335 §3).
+            let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             // Precedence: CLI flag > config > built-in default.  A config's
             // relative `output` is resolved against the SCHEMA's directory, so a
@@ -598,18 +727,40 @@ fn run(cli: Cli) -> Result<()> {
             // schema-blind [runtime]/[storage] knobs into the codegen GenConfig
             // baked into database.rs. An invalid knob value is a config error.
             let gen_config = forge_config.gen_config()?;
+            // Canonical internal names, never the raw user spellings (#335 §12,
+            // decision 10). The warnings are the deprecated pre-#122 values; a
+            // deprecated value that behaves identically and says nothing is how
+            // the config and CLI vocabularies drifted apart to begin with.
+            let (config_targets, target_warnings) = forge_config.resolved_targets()?;
+            for warning in &target_warnings {
+                ui::warning(warning);
+            }
+            // What the package prune judges (#335 §3 rule 3): the DECLARED set,
+            // never the target THIS invocation selected — `generate rust` under
+            // `targets = ["all"]` must leave `napi/` alone. Read here rather
+            // than inside `generate::run`, where `config_targets` is consumed
+            // only by the `"all"` arm: a prune wired off the value that function
+            // receives would see `None` for every single-target invocation,
+            // which is exactly the set of invocations that can narrow anything.
+            //
+            // `--check` writes nothing (it compares a scratch dir and removes
+            // it), so it must delete nothing: no prune.
+            let declared = (!check).then(|| targets::declared_packages(&config_targets));
             commands::generate::run(commands::generate::GenerateOptions {
                 target,
                 mode,
                 check,
                 output: resolved_output,
                 schema: resolved_schema,
-                config_targets: forge_config.generate.targets.clone(),
+                config_targets: Some(config_targets),
                 gen_config,
                 force,
                 from,
                 to,
-            })
+                cache_container: Some(reserved.container.clone()),
+            })?;
+            sync_after_emission(&reserved, declared.as_deref())?;
+            Ok(())
         }
 
         Commands::Validate {
@@ -619,7 +770,11 @@ fn run(cli: Cli) -> Result<()> {
             components,
             schema,
         } => {
-            let resolved_schema = Some(project::find_schema(schema.as_deref())?.display().to_string());
+            let resolved_schema = Some(
+                project::find_schema(schema.as_deref())?
+                    .display()
+                    .to_string(),
+            );
             commands::validate::run(commands::validate::ValidateOptions {
                 strict,
                 schema_only,
@@ -635,27 +790,79 @@ fn run(cli: Cli) -> Result<()> {
             output,
             schema,
             no_api,
+            plan,
+            report,
+            print_artifact,
         } => {
+            // In the two machine-readable modes stdout belongs to the consumer —
+            // a `$(…)` capturing one path, or a JSON document being piped — so
+            // every human-facing line is silenced BEFORE the first one is
+            // printed. `identify_reported` and `reserve_in_cache` below both
+            // print, which is why this is the first statement in the arm rather
+            // than something `build::run` could do for itself.
+            //
+            // Silenced rather than redirected: `ui` writes to stdout by design
+            // (its warnings are part of `validate`'s report), and moving the
+            // module wholesale to stderr would change every command instead of
+            // this one. `ui::error` already goes to stderr, so a failure is
+            // still visible.
+            if commands::build::stdout_is_machine_readable(
+                print_artifact.as_deref(),
+                report.as_deref(),
+            ) {
+                ui::set_verbosity(false, true);
+            }
             // Resolved exactly as `Commands::Generate` does, from the same walk —
             // `build` must compile in the same place `generate` emitted into, and
             // must bake what `generate` would (#361, extended to identity by #333).
             let schema_path = project::find_schema(schema.as_deref())?;
             let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
             let project = governing.identify_reported()?;
-            place_in_cache(&project, &schema_path)?;
+            let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
             let resolved_schema = Some(schema_path.display().to_string());
+            // `build` reaches every declared target (#335 §12). It used to pass
+            // `config_targets: None`, which made every opt-in arm of
+            // `generate_all` unreachable from `forgedb build` entirely.
+            let (config_targets, target_warnings) = forge_config.resolved_targets()?;
+            for warning in &target_warnings {
+                ui::warning(warning);
+            }
+            // Same declared-set prune as `Commands::Generate` (#335 §3 rule 3);
+            // `build` owns the same package kinds `generate` does.
+            let declared = targets::declared_packages(&config_targets);
+            let container = reserved.container.clone();
+            let project_root = reserved.project.clone();
+            let gen_config = forge_config.gen_config()?;
+            // Unlike `Generate`, the AFTER half runs in the MIDDLE of the
+            // command rather than after it: `build` emits the packages it is
+            // about to compile, and the root manifest cargo reads is rendered
+            // from a scan of what is on disk. Synced only after `build::run`
+            // returned, an app's very first `forgedb build` would hand cargo the
+            // previous run's member list — `error: package(s) … not found`, on a
+            // cold cache only. Handed in as the same function `Generate` calls,
+            // never a second derivation of it (`dev` does the same).
+            let sync: commands::dev::SyncHook =
+                Box::new(move || sync_after_emission(&reserved, Some(&declared)).map(|_| ()));
             commands::build::run(commands::build::BuildOptions {
                 release,
                 target,
                 output: resolved_output,
                 schema: resolved_schema,
                 no_api,
+                config_targets,
                 // Same resolution as `Commands::Generate` above, from the same
                 // loaded config — `build` must bake what `generate` would (#361).
-                gen_config: forge_config.gen_config()?,
-            })
+                gen_config,
+                cache_container: Some(container),
+                cache_project: Some(project_root),
+                plan_only: plan,
+                report,
+                print_artifact,
+                sync: Some(sync),
+            })?;
+            Ok(())
         }
 
         Commands::Dev {
@@ -663,66 +870,104 @@ fn run(cli: Cli) -> Result<()> {
             output,
             debounce,
             clear,
-        } => commands::dev::run(commands::dev::DevOptions {
-            schema,
-            output,
-            debounce,
-            clear,
-        }),
+        } => {
+            // Resolved by the SAME chain `Commands::Generate` runs, because a
+            // watch-driven regeneration must be the same emission a hand-run
+            // `forgedb generate` produces (#364). `dev` reached
+            // `forgedb_watcher::auto_watch` directly before this, so it read no
+            // config at all: every save rewrote `database.rs` with
+            // `GenConfig::DEFAULT` and `schema_version = 1`.
+            let schema_path = project::find_schema(schema.as_deref())?;
+            let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
+            let project = governing.identify_reported()?;
+            let reserved = reserve_in_cache(&project, &schema_path, governing.symbol_naming())?;
+            let forge_config = governing.config();
+            let resolved_output = governing.output(output.as_deref());
+            let gen_config = forge_config.gen_config()?;
+            let (config_targets, target_warnings) = forge_config.resolved_targets()?;
+            for warning in &target_warnings {
+                ui::warning(warning);
+            }
+            let declared = targets::declared_packages(&config_targets);
+            let container = reserved.container.clone();
+            // `dev` blocks in the watch loop until Ctrl+C, so there is no "after
+            // `dev::run`" in which to re-derive the workspace root. The AFTER half
+            // is handed in and runs after each regeneration instead — the same
+            // function `Generate`/`Build` call, never a second derivation of it.
+            let sync: commands::dev::SyncHook =
+                Box::new(move || sync_after_emission(&reserved, Some(&declared)).map(|_| ()));
+            commands::dev::run(commands::dev::DevOptions {
+                generate: commands::dev::DevGenerate {
+                    schema: schema_path.display().to_string(),
+                    output: resolved_output,
+                    config_targets,
+                    gen_config,
+                    cache_container: Some(container),
+                },
+                debounce,
+                clear,
+                sync,
+            })
+        }
 
+        // Every `migrate` arm takes ONE required `--schema` (#335 §9): it is
+        // the app selector, and `migrate.rs` runs the same
+        // `govern -> identify_reported -> reserve` chain the Generate arm runs
+        // from it. Nothing here is resolved from the working directory.
         Commands::Migrate(migrate_cmd) => match migrate_cmd {
-            MigrateCommands::Create { description, auto, schema } => {
-                commands::migrate::create(commands::migrate::MigrateCreateOptions {
-                    description,
-                    schema,
-                    auto,
+            MigrateCommands::Create {
+                description,
+                auto,
+                schema,
+            } => commands::migrate::create(commands::migrate::MigrateCreateOptions {
+                app: migrate_app(schema, explicit_config),
+                description,
+                auto,
+            }),
+            MigrateCommands::Status { schema } => {
+                commands::migrate::status(commands::migrate::MigrateStatusOptions {
+                    app: migrate_app(schema, explicit_config),
                 })
             }
-            MigrateCommands::Status => {
-                commands::migrate::status(commands::migrate::MigrateStatusOptions)
-            }
-            MigrateCommands::Build { from, to, output } => {
-                commands::migrate::build(commands::migrate::MigrateBuildOptions {
-                    from,
-                    to,
-                    output,
-                })
-            }
-            MigrateCommands::Run { src, dest, bin_dir } => {
-                commands::migrate::run(commands::migrate::MigrateRunOptions {
-                    src,
-                    dest,
-                    bin_dir,
-                })
-            }
+            MigrateCommands::Build {
+                schema,
+                from,
+                to,
+                output,
+            } => commands::migrate::build(commands::migrate::MigrateBuildOptions {
+                app: migrate_app(schema, explicit_config),
+                from,
+                to,
+                removed_output: output,
+            }),
+            MigrateCommands::Run {
+                schema,
+                from,
+                to,
+                src,
+                dest,
+                bin_dir,
+            } => commands::migrate::run(commands::migrate::MigrateRunOptions {
+                app: migrate_app(schema, explicit_config),
+                from,
+                to,
+                src,
+                dest,
+                removed_bin_dir: bin_dir,
+            }),
             MigrateCommands::Engine {
                 src,
                 dest,
                 schema,
                 output,
             } => commands::migrate::engine(commands::migrate::MigrateEngineOptions {
+                app: migrate_app(schema, explicit_config),
                 src,
                 dest,
-                schema,
-                output,
+                removed_output: output,
             }),
-            MigrateCommands::Up {
-                from,
-                to,
-                src,
-                dest,
-                output,
-                tenant_root,
-                dest_suffix,
-            } => commands::migrate::up(commands::migrate::MigrateUpOptions {
-                from,
-                to,
-                src,
-                dest,
-                output,
-                tenant_root,
-                dest_suffix,
-            }),
+            // Swallowed args and all: the tombstone answers, not clap.
+            MigrateCommands::Up { args: _ } => commands::migrate::up(),
         },
 
         Commands::Lsp { server_path, args } => {

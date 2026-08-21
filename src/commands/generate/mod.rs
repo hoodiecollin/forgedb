@@ -54,6 +54,116 @@ pub struct GenerateOptions {
     pub from: Option<u32>,
     /// Destination format version for the `transform` target (#74 Phase 3).
     pub to: Option<u32>,
+    /// The app's container in the build cache, reserved by the caller BEFORE
+    /// this runs (#335 §1/§3).
+    ///
+    /// `None` means "do not write cache packages" — the `check` mode and any
+    /// caller that has not reserved one. The caller re-derives the workspace
+    /// root AFTER this returns, because a root rendered before emission lists
+    /// the previous run's packages.
+    pub cache_container: Option<PathBuf>,
+}
+
+/// Every app-derived name one `generate` invocation builds under (#335 §2).
+///
+/// Computed ONCE in [`run`] and threaded, never re-derived. The FFI symbol
+/// prefix baked into `ffi/src/lib.rs`, the prototypes declared in `forgedb.h`,
+/// the `C.` calls in `forgedb.go` and the cache package names must all agree,
+/// and every extra derivation is a way for them to stop agreeing *silently* —
+/// a Go package that links against a symbol set nothing exports.
+#[derive(Debug, Clone)]
+struct AppNaming {
+    /// The app's legible derived identity, e.g. `foo_services_blog`.
+    app_name: String,
+    /// `<app_name>_` — the per-app prefix on every exported C symbol.
+    symbol_prefix: String,
+}
+
+impl AppNaming {
+    /// The hash stand-in when no cache container was reserved.
+    ///
+    /// A `None` container means this invocation writes nothing into the cache,
+    /// so nothing derived here can collide with another app — but the names
+    /// still have to be *legal*, and an empty hash renders `blog--ffi`.
+    /// [`crate::cache::member_hash`] is deliberately NOT recomputed here: it is
+    /// keyed on the PROJECT-RELATIVE schema path, which this function does not
+    /// have, so a second derivation would disagree with the cache's without
+    /// saying so.
+    const NO_CONTAINER: &'static str = "local";
+
+    fn for_run(container: Option<&Path>, schema_path: &str) -> AppNaming {
+        // Read, never re-derive. The name is a function of the project's whole
+        // app set (`naming::app_name`), which this function cannot see — it has
+        // one schema path and no project root. `cache::reserve` computed it with
+        // all three inputs in hand and wrote it into the container.
+        let app_name = container
+            .and_then(crate::cache::member_app_name)
+            .unwrap_or_else(|| {
+                // No container means this invocation writes nothing into the
+                // cache, so nothing derived here can collide with another app —
+                // but the names still have to be legal. Fall back to the app's
+                // own path segments with no project id and no siblings.
+                let local = crate::naming::app_name(
+                    Self::NO_CONTAINER,
+                    Path::new(schema_path),
+                    &[],
+                    crate::naming::SymbolNaming::Minimal,
+                );
+                local
+            });
+        let symbol_prefix = crate::naming::symbol_prefix(&app_name);
+        AppNaming {
+            app_name,
+            symbol_prefix,
+        }
+    }
+
+    fn package(&self, kind: &crate::naming::PackageKind) -> String {
+        crate::naming::package_name(&self.app_name, kind)
+    }
+}
+
+/// The invocation-wide inputs every emitter arm reads.
+///
+/// Grouped into one value because the arms took eight positional parameters
+/// otherwise, and eight positional parameters of which three are `bool`/`u32`
+/// is a call site that can be reordered wrongly and still compile.
+struct Emit<'a> {
+    schema: &'a forgedb_parser::Schema,
+    /// Where `output`-placed artifacts go. In `--check` mode this is a scratch
+    /// directory, never the committed one.
+    output: &'a Path,
+    force: bool,
+    schema_version: u32,
+    gen_config: forgedb_codegen::GenConfig,
+    naming: &'a AppNaming,
+}
+
+/// Everything one `generate` invocation will write into the app's build-cache
+/// container (#335 §1/§6).
+///
+/// This replaces the previous lookup, which scanned the emitted-file list for
+/// OUTPUT-relative paths (`ffi/src/lib.rs`, `napi/src/database.rs`, …). After
+/// the placement flip those paths are never written, so there is no key left to
+/// scan for — and the replacement is better than a renamed key would have been:
+/// each field is set by exactly one emitter, so "one app, one `database.rs`"
+/// stops being a property five call sites are trusted to honour and becomes a
+/// single `Option` that is filled once.
+#[derive(Default)]
+struct CacheEmission {
+    /// The exact bytes `core/src/lib.rs` receives: the generated database plus
+    /// [`CORE_SUBSTRATE_REEXPORTS`]. The SAME `String` is written to
+    /// `<output>/database.rs` as the mirror, which is what makes the two
+    /// byte-identical by construction rather than by assertion.
+    core_lib: Option<String>,
+    /// `server/src/api.rs`, and the `<output>/api.rs` mirror.
+    api: Option<String>,
+    /// Each wrapper's `src/lib.rs`. `None` means this invocation did not emit
+    /// that package, and the cache writer skips it.
+    ffi: Option<String>,
+    napi: Option<String>,
+    pyo3: Option<String>,
+    wasm: Option<String>,
 }
 
 pub fn run(options: GenerateOptions) -> Result<()> {
@@ -155,29 +265,41 @@ pub fn run(options: GenerateOptions) -> Result<()> {
     ui::detail(&format!("output dir: {}", committed_path.display()));
     ui::detail(&format!("schema version: {}", schema_version));
     ui::detail(&format!("resolved target: {}", target));
+
+    // Every derived name this invocation builds under (#335 §2), computed once
+    // and threaded from here. The symbol prefix in particular is load-bearing:
+    // `ffi.rs`, `forgedb.h` and `forgedb.go` are three emitters of the SAME
+    // symbol set, and they agree only because all three read this one value.
+    let naming = AppNaming::for_run(options.cache_container.as_deref(), &schema_path);
+
+    // The invocation-wide inputs every emitter arm reads (#335 §6). Grouped so
+    // an arm takes three parameters instead of eight, and so adding an input
+    // cannot silently reorder an existing call site's arguments.
+    let ctx = Emit {
+        schema: &schema,
+        output: &output_path,
+        force,
+        schema_version,
+        gen_config: options.gen_config,
+        naming: &naming,
+    };
+
+    // Everything this invocation hands the cache. After the flip (#335 §6)
+    // `output` never receives `ffi/`, `napi/`, `pyo3/` or `replica/`'s crate, so
+    // there is no output-relative path left for the cache emitter to key on —
+    // the wrapper bodies reach it through here instead.
+    let mut cache = CacheEmission::default();
     let mut generated_files = Vec::new();
 
     match target.as_str() {
         "all" => {
             // When config restricts which targets to emit, honour that list;
             // otherwise generate everything.
-            let allowed = options.config_targets.as_deref();
-            generated_files.extend(generate_all(
-                &schema,
-                &output_path,
-                force,
-                allowed,
-                schema_version,
-                options.gen_config,
-            )?);
+            let allowed = options.config_targets.clone();
+            generate_all(&ctx, allowed.as_deref(), &mut cache, &mut generated_files)?;
         }
         "rust" => {
-            let result =
-                RustGenerator::generate_with_config(&schema, schema_version, options.gen_config)
-                    .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-            let path = output_path.join("database.rs");
-            write_file(&path, &result.code, force)?;
-            generated_files.push((path, result));
+            ensure_database(&ctx, &mut cache, &mut generated_files)?;
         }
         "typescript" => {
             let result = TypeScriptGenerator::generate(&schema)
@@ -188,11 +310,7 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             write_ts_package_scaffold(&output_path)?;
         }
         "api" => {
-            let result = ApiGenerator::generate_with_config(&schema, options.gen_config)
-                .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-            let path = output_path.join("api.rs");
-            write_file(&path, &result.code, force)?;
-            generated_files.push((path, result));
+            emit_api(&ctx, &mut cache, &mut generated_files)?;
         }
         "openapi" => {
             let result = OpenApiGenerator::generate(&schema)
@@ -211,62 +329,36 @@ pub fn run(options: GenerateOptions) -> Result<()> {
             generated_files.push((path, result));
         }
         "wasm" => {
-            generated_files.extend(generate_wasm_replica(
-                &schema,
-                &output_path,
-                force,
-                schema_version,
-                options.gen_config,
-            )?);
+            generate_wasm_replica(&ctx, &mut cache, &mut generated_files)?;
         }
         "ffi" => {
-            generated_files.extend(generate_ffi_engine(
-                &schema,
-                &output_path,
-                force,
-                schema_version,
-            )?);
+            generate_ffi_engine(&ctx, &mut cache, &mut generated_files)?;
         }
         // Per-runtime ergonomic wrappers (#51/#52/#117). Resolved here from
         // `python --runtime` / `node|bun --runtime`; the generators land in their
         // own phases.
         "pyo3" => {
-            generated_files.extend(generate_pyo3_binding(
-                &schema,
-                &output_path,
-                force,
-                schema_version,
-            )?);
+            generate_pyo3_binding(&ctx, &mut cache, &mut generated_files)?;
         }
         "napi" => {
-            generated_files.extend(generate_napi_binding(
-                &schema,
-                &output_path,
-                force,
-                schema_version,
-            )?);
+            generate_napi_binding(&ctx, &mut cache, &mut generated_files)?;
         }
-        // Golang binding (RFC #203). Resolved from `go --runtime`;
-        // rides the FFI cdylib over cgo — adds no new C symbol / substrate dep.
+        // Golang binding (RFC #203). Resolved from `go --runtime`; rides the FFI
+        // engine's `staticlib` over cgo — adds no new C symbol / substrate dep.
         "go" => {
-            generated_files.extend(generate_go_binding(
-                &schema,
-                &output_path,
-                force,
-                schema_version,
-            )?);
+            generate_go_binding(&ctx, &mut cache, &mut generated_files)?;
         }
         // REST client SDKs (#118/#205/#206). Resolved from `python|go|rust --sdk`.
         // Transport clients over the generated REST API — no on-disk format, so
         // they take no `schema_version`.
         "rust-sdk" => {
-            generated_files.extend(generate_rust_sdk(&schema, &output_path, force)?);
+            generate_rust_sdk(&ctx, &mut generated_files)?;
         }
         "python-sdk" => {
-            generated_files.extend(generate_python_sdk(&schema, &output_path, force)?);
+            generate_python_sdk(&ctx, &mut generated_files)?;
         }
         "go-sdk" => {
-            generated_files.extend(generate_go_sdk(&schema, &output_path, force)?);
+            generate_go_sdk(&ctx, &mut generated_files)?;
         }
         _ => {
             return Err(CliError::Other(format!(
@@ -324,6 +416,20 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         ));
     }
 
+    // The supersession rule (#335 §6). It runs on every real generate, and it is
+    // about the files this invocation deliberately did NOT write: `output` no
+    // longer receives the `ffi`, `napi`, `pyo3` or `replica` crates, and a
+    // frozen-but-compilable copy of one is a build that keeps going green
+    // against a database that stopped tracking the schema.
+    supersede_moved_packages(&committed_path)?;
+
+    // The cache packages (#335 §1). `core/src/lib.rs` gets the SAME `String`
+    // `<output>/database.rs` got — one value, two writes — never a second
+    // generator invocation.
+    if let Some(container) = &options.cache_container {
+        emit_cache_packages(container, &naming, &cache)?;
+    }
+
     // Report results
     ui::success(&format!("Generated {} files:", generated_files.len()));
     for (path, result) in &generated_files {
@@ -341,304 +447,322 @@ pub fn run(options: GenerateOptions) -> Result<()> {
 /// Generate all (or a filtered subset of) artifacts.
 ///
 /// `target_filter` — when `Some`, only generates targets whose names appear in
-/// the slice; `None` means generate everything.  Valid names: `rust`,
-/// `typescript`, `api`, `openapi`, `stubs`.
+/// the slice; `None` means generate everything.
 fn generate_all(
-    schema: &forgedb_parser::Schema,
-    output_path: &PathBuf,
-    force: bool,
+    ctx: &Emit<'_>,
     target_filter: Option<&[String]>,
-    schema_version: u32,
-    gen_config: forgedb_codegen::GenConfig,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    // A default-on target: emitted unless config narrows the list.
     let enabled = |name: &str| -> bool {
-        target_filter.map_or(true, |ts| ts.iter().any(|t| t.as_str() == name))
+        target_filter.is_none_or(|ts| ts.iter().any(|t| t.as_str() == name))
+    };
+    // An OPT-IN target: the default `all` (no config filter) skips it, because
+    // each emits a whole extra package most projects do not want. A project
+    // turns one on by naming it in `[generate].targets`.
+    let opt_in = |name: &str| -> bool {
+        target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == name))
     };
 
-    let mut files = Vec::new();
-
-    // Generate Rust database code (with the #126 generate-time runtime config).
+    // The app's database (with the #126 generate-time runtime config).
     if enabled("rust") {
-        let rust_result = RustGenerator::generate_with_config(schema, schema_version, gen_config)
-            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-        let rust_path = output_path.join("database.rs");
-        write_file(&rust_path, &rust_result.code, force)?;
-        files.push((rust_path, rust_result));
+        ensure_database(ctx, cache, files)?;
     }
 
     // Generate TypeScript types
     if enabled("typescript") {
-        let ts_result = TypeScriptGenerator::generate(schema)
+        let ts_result = TypeScriptGenerator::generate(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-        let ts_path = output_path.join("types.ts");
-        write_file(&ts_path, &ts_result.code, force)?;
+        let ts_path = ctx.output.join("types.ts");
+        write_file(&ts_path, &ts_result.code, ctx.force)?;
         files.push((ts_path, ts_result));
-        write_ts_package_scaffold(output_path)?;
+        write_ts_package_scaffold(ctx.output)?;
     }
 
     // Generate API
     if enabled("api") {
-        let api_result = ApiGenerator::generate_with_config(schema, gen_config)
-            .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-        let api_path = output_path.join("api.rs");
-        write_file(&api_path, &api_result.code, force)?;
-        files.push((api_path, api_result));
+        emit_api(ctx, cache, files)?;
     }
 
     // Generate OpenAPI spec
     if enabled("openapi") {
-        let openapi_result = OpenApiGenerator::generate(schema)
+        let openapi_result = OpenApiGenerator::generate(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-        let openapi_path = output_path.join("openapi.json");
-        write_file(&openapi_path, &openapi_result.code, force)?;
+        let openapi_path = ctx.output.join("openapi.json");
+        write_file(&openapi_path, &openapi_result.code, ctx.force)?;
         files.push((openapi_path, openapi_result));
     }
 
     // Generate stubs
     if enabled("stubs") {
-        let stub_result = StubGenerator::generate(schema)
+        let stub_result = StubGenerator::generate(ctx.schema)
             .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-        let stubs_dir = output_path.join("stubs");
+        let stubs_dir = ctx.output.join("stubs");
         fs::create_dir_all(&stubs_dir)?;
         let stub_path = stubs_dir.join("README.md");
-        write_file(&stub_path, &stub_result.code, force)?;
+        write_file(&stub_path, &stub_result.code, ctx.force)?;
         files.push((stub_path, stub_result));
     }
 
-    // Generate the wasm browser read-replica crate.  This is an OPT-IN target:
-    // the default `all` (no config filter) skips it, since it emits a whole
-    // browser crate most projects don't need; a project enables it by listing
-    // `wasm` in `[generate].targets`.
-    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "wasm")) {
-        files.extend(generate_wasm_replica(
-            schema,
-            output_path,
-            force,
-            schema_version,
-            gen_config,
-        )?);
+    // The wasm browser read-replica.
+    if opt_in("wasm") {
+        generate_wasm_replica(ctx, cache, files)?;
     }
 
-    // Generate the native FFI engine crate (the Layer-0 C-ABI spine every
-    // language binding hangs off).  Also OPT-IN — the default `all` skips it; a
-    // project enables it by listing `ffi` in `[generate].targets`.
-    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "ffi")) {
-        files.extend(generate_ffi_engine(schema, output_path, force, schema_version)?);
+    // The native FFI engine (the Layer-0 C-ABI spine every language binding
+    // hangs off, and the `staticlib` the Go binding links).
+    if opt_in("ffi") {
+        generate_ffi_engine(ctx, cache, files)?;
     }
 
-    // REST client SDKs (#118/#205/#206) — also OPT-IN (the default `all` skips
-    // them; a project enables one by listing `rust-sdk`/`python-sdk`/`go-sdk` in
-    // `[generate].targets`).  Each emits a portable network client, no on-disk
-    // format, so none take `schema_version`.
-    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "rust-sdk")) {
-        files.extend(generate_rust_sdk(schema, output_path, force)?);
+    // REST client SDKs (#118/#205/#206). Each emits a portable network client,
+    // no on-disk format, so none take `schema_version`.
+    if opt_in("rust-sdk") {
+        generate_rust_sdk(ctx, files)?;
     }
-    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "python-sdk")) {
-        files.extend(generate_python_sdk(schema, output_path, force)?);
+    if opt_in("python-sdk") {
+        generate_python_sdk(ctx, files)?;
     }
-    if target_filter.is_some_and(|ts| ts.iter().any(|t| t.as_str() == "go-sdk")) {
-        files.extend(generate_go_sdk(schema, output_path, force)?);
+    if opt_in("go-sdk") {
+        generate_go_sdk(ctx, files)?;
     }
 
-    Ok(files)
+    // The three native runtime bindings.  These had NO arm here at all until
+    // #335 §12: they were reachable only through a single-target CLI invocation
+    // (`generate node --runtime`, `generate python --runtime`, `generate go
+    // --runtime`), so `[generate].targets` could name them and `generate all`
+    // would still emit nothing.  Decision 10 gives them config spellings, which
+    // is only meaningful if `all` can actually reach them.
+    if opt_in("napi") {
+        generate_napi_binding(ctx, cache, files)?;
+    }
+    if opt_in("pyo3") {
+        generate_pyo3_binding(ctx, cache, files)?;
+    }
+    if opt_in("go") {
+        // `generate_go_binding` emits the FFI engine itself and is idempotent, so
+        // `targets = ["ffi", "go"]` reaches it twice and still emits one engine.
+        generate_go_binding(ctx, cache, files)?;
+    }
+
+    Ok(())
 }
 
-/// Generate the native FFI engine crate (language bindings #51/#52/#117): the
-/// Layer-0 C-ABI spine (`ffi/src/ffi.rs`) over the SAME generated `database.rs`
-/// (`ffi/src/database.rs`), plus a `Cargo.toml` scaffold written only when
-/// absent.  Build it with `cargo build --release` to produce the `cdylib` a
-/// Python/Node/Bun binding loads.
+/// Generate the app's ONE database, write the `output/database.rs` mirror, and
+/// hand the cache the exact bytes `core/src/lib.rs` receives — **at most once
+/// per invocation**.
+///
+/// # Why this is memoized rather than called per arm
+///
+/// Five arms need a database: `rust` and the four binding wrappers. Until #335
+/// each of the five called [`RustGenerator`] itself, and only the `rust` arm
+/// threaded the app's [`forgedb_codegen::GenConfig`] — so a single `generate`
+/// run wrote **two databases with different durability semantics** and nothing
+/// said so. Routing all five through one memoized call makes "one app, one
+/// database" a property of the code rather than of five call sites that are each
+/// expected to pass the same arguments.
+///
+/// # One value, two writes
+///
+/// `core_lib` is built once. `<output>/database.rs` and `core/src/lib.rs`
+/// receive that same `String`; nothing recomputes it, which is what makes the
+/// mirror structurally incapable of drifting from the copy ForgeDB compiles.
+fn ensure_database(
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.core_lib.is_some() {
+        return Ok(());
+    }
+
+    let result = RustGenerator::generate_with_config(ctx.schema, ctx.schema_version, ctx.gen_config)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let core_lib = format!("{}{}", result.code, CORE_SUBSTRATE_REEXPORTS);
+
+    let path = ctx.output.join("database.rs");
+    write_file(&path, &core_lib, ctx.force)?;
+    files.push((
+        path,
+        forgedb_codegen::GeneratedCode {
+            code: core_lib.clone(),
+            description: result.description,
+        },
+    ));
+    cache.core_lib = Some(core_lib);
+    Ok(())
+}
+
+/// Emit the REST API layer: the `<output>/api.rs` mirror and the bytes
+/// `server/src/api.rs` receives — one value, two writes (#335 §6).
+fn emit_api(
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.api.is_some() {
+        return Ok(());
+    }
+    let result = ApiGenerator::generate_with_config(ctx.schema, ctx.gen_config)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let path = ctx.output.join("api.rs");
+    write_file(&path, &result.code, ctx.force)?;
+    cache.api = Some(result.code.clone());
+    files.push((path, result));
+    Ok(())
+}
+
+/// Generate the native FFI engine package (language bindings #51/#52/#117): the
+/// Layer-0 C-ABI spine over the app's one `core`.
+///
+/// **It writes nothing into `output`** (#335 §6): the package is emitted wholly
+/// into the build cache, where `forgedb build` compiles it. Idempotent, because
+/// the `go` arm needs the same package.
 fn generate_ffi_engine(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-    schema_version: u32,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let ffi_dir = output_path.join("ffi");
-    let src_dir = ffi_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let mut files = Vec::new();
-
-    // The Layer-0 C-ABI spine (lifecycle + error surface).  Emitted as the crate
-    // root `lib.rs` so its `mod database;` resolves to `src/database.rs` (same
-    // shape as the wasm replica's `lib.rs`).
-    let ffi_result = FfiGenerator::generate(schema)
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.ffi.is_some() {
+        return Ok(());
+    }
+    ensure_database(ctx, cache, files)?;
+    let ffi_result = FfiGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &ffi_result.code, force)?;
-    files.push((lib_path, ffi_result));
-
-    // The generated database the spine wraps (same generator as the `rust`
-    // target — the FFI engine is the same data logic, exposed over the C-ABI).
-    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let db_path = src_dir.join("database.rs");
-    write_file(&db_path, &rust_result.code, force)?;
-    files.push((db_path, rust_result));
-
-    write_ffi_engine_scaffold(&ffi_dir)?;
-    Ok(files)
+    cache.ffi = Some(ffi_result.code);
+    Ok(())
 }
 
-/// Generate the PyO3 Python binding crate (#51): the `#[pyclass]` wrapper
-/// (`pyo3/src/lib.rs`) over the SAME generated `database.rs`
-/// (`pyo3/src/database.rs`), plus a `Cargo.toml` scaffold written only when
-/// absent.  Build it with `maturin develop` / `maturin build` (or a plain
-/// `cargo build` for the compile check) to produce the `forgedb` extension
-/// module Python imports.
+/// Generate the PyO3 Python binding package (#51) into the build cache.
+///
+/// `#[pymodule] fn forgedb` is deliberately NOT renamed to the derived package
+/// name: CPython resolves `PyInit_<stem>` from the **delivered filename**, so the
+/// user's `import forgedb` depends on how the artifact is named on disk, not on
+/// cargo's package name.
 fn generate_pyo3_binding(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-    schema_version: u32,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let pyo3_dir = output_path.join("pyo3");
-    let src_dir = pyo3_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let mut files = Vec::new();
-
-    // The PyO3 wrapper (crate root `lib.rs` so its `mod database;` resolves to
-    // `src/database.rs`, same shape as the FFI engine / wasm replica).
-    let py_result =
-        PyO3Generator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &py_result.code, force)?;
-    files.push((lib_path, py_result));
-
-    // The generated database the wrapper binds (same generator as the `rust`
-    // target — the binding is the same data logic, exposed to Python).
-    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.pyo3.is_some() {
+        return Ok(());
+    }
+    ensure_database(ctx, cache, files)?;
+    let py_result = PyO3Generator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let db_path = src_dir.join("database.rs");
-    write_file(&db_path, &rust_result.code, force)?;
-    files.push((db_path, rust_result));
-
-    let cargo_path = pyo3_dir.join("Cargo.toml");
-    if !cargo_path.exists() {
-        fs::write(
-            &cargo_path,
-            PyO3Generator::cargo_toml_scaffold("forgedb-python"),
-        )?;
-        ui::info(&format!(
-            "  ✓ {} (PyO3 binding scaffold)",
-            cargo_path.display()
-        ));
-    }
-
-    // pyproject.toml so `maturin` can build a wheel out of the box. User-editable
-    // — written only when absent.
-    let pyproject_path = pyo3_dir.join("pyproject.toml");
-    if !pyproject_path.exists() {
-        fs::write(&pyproject_path, PYO3_PYPROJECT_SCAFFOLD)?;
-        ui::info(&format!(
-            "  ✓ {} (maturin pyproject)",
-            pyproject_path.display()
-        ));
-    }
-
-    Ok(files)
+    cache.pyo3 = Some(py_result.code);
+    Ok(())
 }
 
-/// Generate the NAPI-RS Node/Bun binding crate (#52/#117): the `#[napi]` wrapper
-/// (`napi/src/lib.rs`) over the SAME generated `database.rs`
-/// (`napi/src/database.rs`), plus `Cargo.toml` / `build.rs` / `package.json`
-/// scaffolds written only when absent.  Build it with `napi build` (or a plain
-/// `cargo build` for the compile check) to produce the `forgedb` `.node` addon
-/// both Node and Bun `require()` (Option A — one artifact for both runtimes).
+/// Generate the NAPI-RS Node/Bun binding package (#52/#117) into the build
+/// cache. One `.node` addon serves both runtimes (Option A).
 fn generate_napi_binding(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-    schema_version: u32,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let napi_dir = output_path.join("napi");
-    let src_dir = napi_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let mut files = Vec::new();
-
-    // The NAPI-RS wrapper (crate root `lib.rs` so its `mod database;` resolves to
-    // `src/database.rs`, same shape as the FFI engine / PyO3 / wasm replica).
-    let napi_result =
-        NapiGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &napi_result.code, force)?;
-    files.push((lib_path, napi_result));
-
-    // The generated database the wrapper binds (same generator as the `rust`
-    // target — the binding is the same data logic, exposed to Node/Bun).
-    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.napi.is_some() {
+        return Ok(());
+    }
+    ensure_database(ctx, cache, files)?;
+    let napi_result = NapiGenerator::generate(ctx.schema)
         .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let db_path = src_dir.join("database.rs");
-    write_file(&db_path, &rust_result.code, force)?;
-    files.push((db_path, rust_result));
+    cache.napi = Some(napi_result.code);
+    Ok(())
+}
 
-    // User-editable config scaffolds — written only when absent (a regenerate,
-    // even `--force` which overwrites the `.rs` files, never clobbers them).
-    let cargo_path = napi_dir.join("Cargo.toml");
-    if !cargo_path.exists() {
-        fs::write(&cargo_path, NapiGenerator::cargo_toml_scaffold("forgedb-node"))?;
-        ui::info(&format!("  ✓ {} (NAPI-RS binding scaffold)", cargo_path.display()));
+/// Generate the `wasm32` browser read-replica (#110 Milestone C).
+///
+/// The Rust crate moves into the cache like the other three wrappers. The
+/// **browser-side assets do not**: `replica-client.ts` and `replica-worker.js`
+/// are files the user's page imports and serves, and a content-hashed directory
+/// under `~/.forgedb` is unservable — the same argument §6 makes for keeping
+/// `go/` in `output`. So `replica/` survives in `output` holding `client/` only,
+/// and its `src/` is superseded by [`supersede_moved_packages`].
+fn generate_wasm_replica(
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    if cache.wasm.is_some() {
+        return Ok(());
     }
+    ensure_database(ctx, cache, files)?;
 
-    let build_path = napi_dir.join("build.rs");
-    if !build_path.exists() {
-        fs::write(&build_path, NapiGenerator::build_rs_scaffold())?;
-        ui::info(&format!("  ✓ {} (napi-build script)", build_path.display()));
-    }
+    // The wasm-bindgen transport glue — a cache package.
+    let wasm_result =
+        WasmGenerator::generate(ctx.schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    cache.wasm = Some(wasm_result.code);
 
-    let package_path = napi_dir.join("package.json");
-    if !package_path.exists() {
-        fs::write(&package_path, NapiGenerator::package_json_scaffold())?;
-        ui::info(&format!("  ✓ {} (@napi-rs/cli package)", package_path.display()));
-    }
+    // The main-thread async client (#110 #2): a per-schema TS `ReplicaClient`
+    // that RPCs into the Worker running the engine — mirrors the transport's read
+    // surface exactly, invents nothing.
+    let client_dir = ctx.output.join("replica").join("client");
+    fs::create_dir_all(&client_dir)?;
+    let client_result = WasmGenerator::generate_client(ctx.schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let client_path = client_dir.join("replica-client.ts");
+    write_file(&client_path, &client_result.code, ctx.force)?;
+    files.push((client_path, client_result));
 
-    Ok(files)
+    // The STATIC, schema-agnostic Worker bootstrap. It runs the engine,
+    // follows `/replicate`, and debounces auto-commit. Emitted verbatim (NOT from
+    // a schema-aware path) so it cannot become schema-aware — the PM constraint.
+    let worker_path = client_dir.join("replica-worker.js");
+    write_file(
+        &worker_path,
+        &WasmGenerator::worker_bootstrap_with_config(ctx.gen_config),
+        ctx.force,
+    )?;
+    ui::info(&format!(
+        "  ✓ {} (static worker bootstrap)",
+        worker_path.display()
+    ));
+
+    Ok(())
 }
 
 /// Generate the Golang binding (RFC #203): a per-schema Go cgo package
-/// (`go/forgedb.go` + `go/forgedb.h`) that binds the SAME generated native FFI
-/// C-ABI over cgo, alongside the FFI engine crate itself (`ffi/`, the `cdylib`
-/// the Go package links). At NAPI-RS parity (CRUD, snapshot reads, relation
-/// traversal, async CRUD, Arrow export). Rides the existing C-ABI unchanged —
-/// adds no new C symbol and no new substrate dep. A `go.mod` scaffold is written
-/// only when absent. Build order: `cargo build --release` in `ffi/`, then
-/// `go build` in `go/`.
+/// (`go/forgedb.go` + `go/forgedb.h`) that binds the generated native FFI C-ABI.
+///
+/// **`go/` stays in `output`** (#335 §6): it is Go source the user's program
+/// imports, and a hashed cache directory is unimportable. The engine it links is
+/// the cache's FFI package, delivered here as `libforgedb.a` by `forgedb build`
+/// — see [`deliver_go_staticlib`].
 fn generate_go_binding(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-    schema_version: u32,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    // The FFI engine crate (cdylib) the Go package links against — reused
-    // verbatim, so Go requires no new C symbol.
-    let mut files = generate_ffi_engine(schema, output_path, force, schema_version)?;
+    ctx: &Emit<'_>,
+    cache: &mut CacheEmission,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    // The FFI engine package the Go binding links against — reused verbatim, so
+    // Go requires no new C symbol. Idempotent, so `targets = ["ffi", "go"]`
+    // emits one engine rather than racing two arms to write the same files.
+    generate_ffi_engine(ctx, cache, files)?;
 
-    let go_dir = output_path.join("go");
+    let go_dir = ctx.output.join("go");
     fs::create_dir_all(&go_dir)?;
 
     // The generated Go cgo package.
-    let go_result =
-        GoGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let go_result = GoGenerator::generate(ctx.schema, &ctx.naming.symbol_prefix)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let go_path = go_dir.join("forgedb.go");
-    write_file(&go_path, &go_result.code, force)?;
+    write_file(&go_path, &go_result.code, ctx.force)?;
     files.push((go_path, go_result));
 
     // The async completion bridge (the `//export` callback — a separate file, per
     // cgo's rule that an `//export` file's preamble carries no C definitions).
-    let async_result = GoGenerator::generate_async_bridge();
+    let async_result = GoGenerator::generate_async_bridge(&ctx.naming.symbol_prefix);
     let async_path = go_dir.join("forgedb_async.go");
-    write_file(&async_path, &async_result.code, force)?;
+    write_file(&async_path, &async_result.code, ctx.force)?;
     files.push((async_path, async_result));
 
     // Arrow columnar export (only when the schema has exportable columns) — the
     // ONE part of the Go binding that pulls an external module (arrow-go).
-    let needs_arrow = GoGenerator::needs_arrow(schema);
-    if let Some(arrow_result) = GoGenerator::generate_arrow(schema) {
+    let needs_arrow = GoGenerator::needs_arrow(ctx.schema);
+    if let Some(arrow_result) = GoGenerator::generate_arrow(ctx.schema, &ctx.naming.symbol_prefix) {
         let arrow_path = go_dir.join("forgedb_arrow.go");
-        write_file(&arrow_path, &arrow_result.code, force)?;
+        write_file(&arrow_path, &arrow_result.code, ctx.force)?;
         files.push((arrow_path, arrow_result));
         ui::warning(
             "the Go Arrow export uses the external module `github.com/apache/arrow-go/v18` \
@@ -646,22 +770,26 @@ fn generate_go_binding(
         );
     }
 
-    // The C header cgo `#include`s (declares the `forgedb_*` prototypes).
-    let header_result =
-        GoGenerator::generate_header(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    // The C header cgo `#include`s (declares the app's prefixed prototypes).
+    let header_result = GoGenerator::generate_header(ctx.schema, &ctx.naming.symbol_prefix)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let header_path = go_dir.join("forgedb.h");
-    write_file(&header_path, &header_result.code, force)?;
+    write_file(&header_path, &header_result.code, ctx.force)?;
     files.push((header_path, header_result));
 
-    // User-editable `go.mod` — written only when absent (like every other
-    // binding scaffold; a `--force` regenerate never clobbers it).
+    // User-editable `go.mod` — written only when absent. This only-if-absent rule
+    // survives the flip because `go/` is a DELIVERED directory in the user's tree
+    // (#335 §7 retires it only for cache members, which are ForgeDB-owned).
     let go_mod_path = go_dir.join("go.mod");
     if !go_mod_path.exists() {
         fs::write(
             &go_mod_path,
             GoGenerator::go_mod_scaffold("forgedb", needs_arrow),
         )?;
-        ui::info(&format!("  ✓ {} (Go module scaffold)", go_mod_path.display()));
+        ui::info(&format!(
+            "  ✓ {} (Go module scaffold)",
+            go_mod_path.display()
+        ));
     }
 
     let readme_path = go_dir.join("README.md");
@@ -670,7 +798,7 @@ fn generate_go_binding(
         ui::info(&format!("  ✓ {} (Go binding README)", readme_path.display()));
     }
 
-    Ok(files)
+    Ok(())
 }
 
 /// Generate the Rust REST client SDK crate (#206): a `reqwest`-based async client
@@ -679,19 +807,17 @@ fn generate_go_binding(
 /// forgedb substrate crates, only `reqwest`/`serde`. Build with `cargo build` in
 /// `rust-sdk/`.
 fn generate_rust_sdk(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let sdk_dir = output_path.join("rust-sdk");
+    ctx: &Emit<'_>,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    let sdk_dir = ctx.output.join("rust-sdk");
     let src_dir = sdk_dir.join("src");
     fs::create_dir_all(&src_dir)?;
 
-    let mut files = Vec::new();
-    let result =
-        RustSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let result = RustSdkGenerator::generate(ctx.schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &result.code, force)?;
+    write_file(&lib_path, &result.code, ctx.force)?;
     files.push((lib_path, result));
 
     let cargo_path = sdk_dir.join("Cargo.toml");
@@ -702,7 +828,7 @@ fn generate_rust_sdk(
         )?;
         ui::info(&format!("  ✓ {} (Rust SDK scaffold)", cargo_path.display()));
     }
-    Ok(files)
+    Ok(())
 }
 
 /// Generate the Python REST client SDK (#118): a stdlib-`urllib` client module
@@ -710,18 +836,16 @@ fn generate_rust_sdk(
 /// `pyproject.toml` scaffold written only when absent. Dependency-free. Install
 /// with `pip install .` in `python-sdk/`.
 fn generate_python_sdk(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let sdk_dir = output_path.join("python-sdk");
+    ctx: &Emit<'_>,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    let sdk_dir = ctx.output.join("python-sdk");
     fs::create_dir_all(&sdk_dir)?;
 
-    let mut files = Vec::new();
-    let result =
-        PythonSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+    let result = PythonSdkGenerator::generate(ctx.schema)
+        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let py_path = sdk_dir.join("forgedb_client.py");
-    write_file(&py_path, &result.code, force)?;
+    write_file(&py_path, &result.code, ctx.force)?;
     files.push((py_path, result));
 
     let pyproject_path = sdk_dir.join("pyproject.toml");
@@ -732,7 +856,7 @@ fn generate_python_sdk(
             pyproject_path.display()
         ));
     }
-    Ok(files)
+    Ok(())
 }
 
 /// Generate the Go REST client SDK (#205): a pure-stdlib `net/http` client
@@ -740,129 +864,31 @@ fn generate_python_sdk(
 /// `README.md` scaffolds written only when absent. No cgo, no external module.
 /// Build with `go build` in `go-sdk/`.
 fn generate_go_sdk(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let sdk_dir = output_path.join("go-sdk");
+    ctx: &Emit<'_>,
+    files: &mut Vec<(PathBuf, forgedb_codegen::GeneratedCode)>,
+) -> Result<()> {
+    let sdk_dir = ctx.output.join("go-sdk");
     fs::create_dir_all(&sdk_dir)?;
 
-    let mut files = Vec::new();
     let result =
-        GoSdkGenerator::generate(schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
+        GoSdkGenerator::generate(ctx.schema).map_err(|e| CliError::CodeGeneration(e.to_string()))?;
     let go_path = sdk_dir.join("client.go");
-    write_file(&go_path, &result.code, force)?;
+    write_file(&go_path, &result.code, ctx.force)?;
     files.push((go_path, result));
 
     let mod_path = sdk_dir.join("go.mod");
     if !mod_path.exists() {
         fs::write(&mod_path, GoSdkGenerator::go_mod_scaffold("forgedb-client"))?;
-        ui::info(&format!("  ✓ {} (Go SDK module scaffold)", mod_path.display()));
+        ui::info(&format!(
+            "  ✓ {} (Go SDK module scaffold)",
+            mod_path.display()
+        ));
     }
 
     let readme_path = sdk_dir.join("README.md");
     if !readme_path.exists() {
         fs::write(&readme_path, GoSdkGenerator::readme_scaffold())?;
         ui::info(&format!("  ✓ {} (Go SDK README)", readme_path.display()));
-    }
-    Ok(files)
-}
-
-/// The `maturin` build config for the generated PyO3 binding.
-const PYO3_PYPROJECT_SCAFFOLD: &str = r#"[build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
-
-[project]
-name = "forgedb"
-version = "0.1.0"
-requires-python = ">=3.8"
-description = "Generated ForgeDB Python binding"
-
-[tool.maturin]
-features = ["pyo3/extension-module"]
-"#;
-
-/// Write the FFI engine crate's `Cargo.toml`.  User-editable config, so it is
-/// written ONLY when absent — a regenerate (even `--force`, which overwrites the
-/// `.rs` files) never clobbers it, mirroring the wasm replica scaffold.
-fn write_ffi_engine_scaffold(ffi_dir: &Path) -> Result<()> {
-    let path = ffi_dir.join("Cargo.toml");
-    if !path.exists() {
-        fs::write(&path, FfiGenerator::cargo_toml_scaffold("forgedb-ffi-engine"))?;
-        ui::info(&format!("  ✓ {} (native FFI engine scaffold)", path.display()));
-    }
-    Ok(())
-}
-
-/// Generate the `wasm32` browser read-replica crate (#110 Milestone C): the
-/// `#[wasm_bindgen]` transport (`replica/src/lib.rs`) over the SAME generated
-/// `database.rs` (`replica/src/database.rs`), plus a `Cargo.toml` scaffold
-/// written only when absent.  Build it with `wasm-pack build --target web`.
-fn generate_wasm_replica(
-    schema: &forgedb_parser::Schema,
-    output_path: &Path,
-    force: bool,
-    schema_version: u32,
-    gen_config: forgedb_codegen::GenConfig,
-) -> Result<Vec<(PathBuf, forgedb_codegen::GeneratedCode)>> {
-    let replica_dir = output_path.join("replica");
-    let src_dir = replica_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
-
-    let mut files = Vec::new();
-
-    // The wasm-bindgen transport glue.
-    let wasm_result = WasmGenerator::generate(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let lib_path = src_dir.join("lib.rs");
-    write_file(&lib_path, &wasm_result.code, force)?;
-    files.push((lib_path, wasm_result));
-
-    // The generated database the transport compiles against (same generator as
-    // the `rust` target — the follower is the same data logic, recompiled).  It
-    // shares the server's lineage version so the replica's `EXPECTED_SCHEMA_VERSION`
-    // matches the data it follows.
-    let rust_result = RustGenerator::generate_with_schema_version(schema, schema_version)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let db_path = src_dir.join("database.rs");
-    write_file(&db_path, &rust_result.code, force)?;
-    files.push((db_path, rust_result));
-
-    // The main-thread async client (#110 #2): a per-schema TS `ReplicaClient`
-    // that RPCs into the Worker running the engine — mirrors the transport's read
-    // surface exactly, invents nothing.
-    let client_dir = replica_dir.join("client");
-    fs::create_dir_all(&client_dir)?;
-    let client_result = WasmGenerator::generate_client(schema)
-        .map_err(|e| CliError::CodeGeneration(e.to_string()))?;
-    let client_path = client_dir.join("replica-client.ts");
-    write_file(&client_path, &client_result.code, force)?;
-    files.push((client_path, client_result));
-
-    // The STATIC, schema-agnostic Worker bootstrap. It runs the engine,
-    // follows `/replicate`, and debounces auto-commit. Emitted verbatim (NOT from
-    // a schema-aware path) so it cannot become schema-aware — the PM constraint.
-    let worker_path = client_dir.join("replica-worker.js");
-    write_file(
-        &worker_path,
-        &WasmGenerator::worker_bootstrap_with_config(gen_config),
-        force,
-    )?;
-    ui::info(&format!("  ✓ {} (static worker bootstrap)", worker_path.display()));
-
-    write_wasm_replica_scaffold(&replica_dir)?;
-    Ok(files)
-}
-
-/// Write the wasm replica crate's `Cargo.toml`.  User-editable config, so it is
-/// written ONLY when absent — a regenerate (even `--force`, which overwrites the
-/// `.rs` files) never clobbers it, mirroring the TS SDK's `package.json`.
-fn write_wasm_replica_scaffold(replica_dir: &Path) -> Result<()> {
-    let path = replica_dir.join("Cargo.toml");
-    if !path.exists() {
-        fs::write(&path, WasmGenerator::cargo_toml_scaffold("forgedb-replica"))?;
-        ui::info(&format!("  ✓ {} (wasm replica scaffold)", path.display()));
     }
     Ok(())
 }
@@ -915,6 +941,16 @@ fn write_file(path: &PathBuf, content: &str, force: bool) -> Result<()> {
 ///   and map `(runtime, mode)` to the matching generator.
 /// - The pre-#122 flat verbs `typescript`/`wasm` are a **clean break**: they
 ///   error with a pointer to the new form (this CLI is pre-1.0; see docs/SEMVER).
+/// Test-only door onto [`resolve_target`], so `crate::targets`'s anti-drift
+/// guard can assert that every config spelling means what its documented
+/// command line means.  Exposing the resolver rather than duplicating its table
+/// is the point: a copy is a second definition, which is the defect decision 10
+/// removes.
+#[cfg(test)]
+pub fn resolve_target_for_test(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
+    resolve_target(raw, mode)
+}
+
 fn resolve_target(raw: &str, mode: Option<GenerateMode>) -> Result<String> {
     let target = raw.to_lowercase();
 
@@ -1008,4 +1044,322 @@ fn find_schema_file() -> Result<String> {
     // One list of candidate names, in `project` (#333) — this used to be one of
     // three open-coded copies, so adding a name meant finding all three.
     Ok(crate::project::find_schema(None)?.display().to_string())
+}
+
+/// Substrate `core` re-exports so its dependents can reach it without pinning it.
+///
+/// **This is what makes substrate type identity structural rather than lucky.**
+/// The generated `api.rs` and the four binding wrappers name substrate crates
+/// ABSOLUTELY — `forgedb_storage::Snapshot`, `forgedb_types::*` — so each of
+/// them would otherwise have to pin those crates itself, and their types would
+/// unify with `core`'s only because one lockfile happened to resolve several
+/// independently-authored pin lists identically. Routing every dependent
+/// through `core` makes agreement a property of the code.
+///
+/// Only the crates a dependent names but does not pin belong here. `auth` and
+/// `query-params` stay pinned by `server` directly: those are API-layer
+/// substrate that `core` itself does not link.
+///
+/// `changefeed` IS here, and it is the one entry that is not about `api.rs`:
+/// the wasm replica names `forgedb_changefeed::durable::PersistedEvent` to
+/// decode the frames it follows. `core` already pins `forgedb-changefeed`
+/// unconditionally, so re-exporting it costs the replica nothing and buys the
+/// same type-identity guarantee as the other two — a replica that pinned it
+/// itself would decode a `PersistedEvent` that is only coincidentally the same
+/// type as the one `core` was compiled against.
+///
+/// Reached through the crate root's `use forgedb_core::*;`, which is why these
+/// must be `pub use` at the root rather than inside a module.
+pub const CORE_SUBSTRATE_REEXPORTS: &str = "\n\
+// ---------------------------------------------------------------------------\n\
+// Appended by ForgeDB (#335 §1). Not part of the generated database.\n\
+//\n\
+// Dependents of this crate name these substrate crates by absolute path. They\n\
+// are re-exported here so those dependents pin ZERO substrate of their own and\n\
+// their types UNIFY with this crate's, rather than merely resolving to the same\n\
+// version by lockfile coincidence.\n\
+// ---------------------------------------------------------------------------\n\
+pub use forgedb_changefeed;\n\
+pub use forgedb_storage;\n\
+pub use forgedb_types;\n";
+
+/// Write the app's cache packages from the values this invocation produced
+/// (#335 §1/§6).
+///
+/// # One value, two writes
+///
+/// `core/src/lib.rs` receives **the same `String` `<output>/database.rs`
+/// received** — [`ensure_database`] builds it once and both sinks read it. The
+/// shipped defect was the opposite: five arms each calling `RustGenerator`, only
+/// one of them threading the app's `GenConfig`, so one `generate` run produced
+/// two databases with different durability semantics.
+///
+/// The old "are all five copies equal?" check is gone, and its absence is the
+/// point: there is now one copy, so there is nothing left to compare. A check
+/// that can never fire is a check that stops being read.
+///
+/// # The manifests are rewritten, not preserved
+///
+/// Every scaffolder in the output directory writes its `Cargo.toml` only when
+/// absent, and says so: those files are the user's. **Nothing in the cache is
+/// user-editable.** Carried forward unchanged, a CLI upgrade that bumps a
+/// substrate pin would never reach an existing member, and the stale pin would
+/// sit in a directory the user never opens where the publish-gap check cannot
+/// see it.
+fn emit_cache_packages(
+    container: &Path,
+    naming: &AppNaming,
+    cache: &CacheEmission,
+) -> Result<()> {
+    let Some(core_lib) = cache.core_lib.as_deref() else {
+        // No Rust database was emitted in this invocation (a `--sdk`-only or
+        // stubs-only run), so there is no `core` to write and nothing that
+        // depends on one.
+        return Ok(());
+    };
+
+    let core_pkg = naming.package(&crate::naming::PackageKind::Core);
+    let core_dir = container.join(crate::naming::PackageKind::Core.dir());
+    fs::create_dir_all(core_dir.join("src"))?;
+    // utoipa is pinned iff this app emits a server (#335 §10): with the derive
+    // in `core` and its `#[openapi(components(schemas(...)))]` consumer in
+    // `server`, the orphan rule blocks supplying the impl from `server`.
+    fs::write(
+        core_dir.join("Cargo.toml"),
+        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, cache.api.is_some()),
+    )?;
+    fs::write(core_dir.join("src/lib.rs"), core_lib)?;
+    ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
+
+    if let Some(api) = cache.api.as_deref() {
+        let server_pkg = naming.package(&crate::naming::PackageKind::Server);
+        let server_dir = container.join(crate::naming::PackageKind::Server.dir());
+        fs::create_dir_all(server_dir.join("src"))?;
+        fs::write(
+            server_dir.join("Cargo.toml"),
+            forgedb_codegen::ServerPackage::cargo_toml(&server_pkg, &core_pkg),
+        )?;
+        // `api.rs` needs no generator change: it opens with `use super::*;`, so a
+        // `main.rs` that globs `forgedb_core` compiles it verbatim.
+        fs::write(server_dir.join("src/api.rs"), api)?;
+        fs::write(
+            server_dir.join("src/main.rs"),
+            forgedb_codegen::ServerPackage::main_rs(forgedb_codegen::ServerLayout::Cache),
+        )?;
+        ui::detail(&format!("  ✓ {} (cache package)", server_dir.display()));
+    }
+
+    // --- The four binding wrappers (#335 §1, steps 5b + 7) -------------------
+    //
+    // Each manifest pins ZERO substrate, reaching all of it through `core`. That
+    // is what makes their substrate types UNIFY with `core`'s: before this,
+    // every wrapper carried its own pin list beside its own copy of
+    // `database.rs`, and the four copies agreed only because one lockfile
+    // resolved four independently-authored lists the same way.
+    //
+    // A wrapper arm cannot fire without `core`: every emitter that sets one of
+    // these fields calls `ensure_database` first, and this function returns
+    // early when that produced nothing.
+    use crate::naming::PackageKind;
+
+    if let Some(napi) = cache.napi.as_deref() {
+        write_wrapper_package(
+            container,
+            &PackageKind::Napi,
+            NapiGenerator::cargo_toml(&naming.package(&PackageKind::Napi), &core_pkg),
+            napi,
+            &[
+                ("build.rs", NapiGenerator::build_rs_scaffold()),
+                ("package.json", NapiGenerator::package_json_scaffold()),
+            ],
+        )?;
+    }
+
+    if let Some(pyo3) = cache.pyo3.as_deref() {
+        // The `build.rs` is not optional packaging: without
+        // `pyo3_build_config::add_extension_module_link_args()` a plain
+        // `cargo build` of an extension module fails at LINK time on macOS
+        // (undefined `_PyExc_*`), which a `cargo check` never reaches.
+        write_wrapper_package(
+            container,
+            &PackageKind::Pyo3,
+            PyO3Generator::cargo_toml(&naming.package(&PackageKind::Pyo3), &core_pkg),
+            pyo3,
+            &[("build.rs", PyO3Generator::build_rs_scaffold())],
+        )?;
+    }
+
+    if let Some(ffi) = cache.ffi.as_deref() {
+        write_wrapper_package(
+            container,
+            &PackageKind::Ffi,
+            FfiGenerator::cargo_toml(&naming.package(&PackageKind::Ffi), &core_pkg),
+            ffi,
+            &[],
+        )?;
+    }
+
+    if let Some(wasm) = cache.wasm.as_deref() {
+        write_wrapper_package(
+            container,
+            &PackageKind::Wasm,
+            WasmGenerator::cargo_toml(&naming.package(&PackageKind::Wasm), &core_pkg),
+            wasm,
+            &[],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Write one binding wrapper as a cache package: manifest, `src/lib.rs`, and
+/// whatever build-time files that wrapper needs beside them.
+///
+/// Everything here is rewritten in full on every generate, like every other file
+/// in the cache. There is no write-only-when-absent branch **on purpose**: the
+/// output directory's scaffolds are the user's and are preserved, but a stale
+/// manifest in a directory the user never opens is how a CLI upgrade that bumps
+/// a substrate pin fails to reach an existing project.
+fn write_wrapper_package(
+    container: &Path,
+    kind: &crate::naming::PackageKind,
+    manifest: String,
+    lib_rs: &str,
+    extra: &[(&str, &str)],
+) -> Result<()> {
+    let dir = container.join(kind.dir());
+    fs::create_dir_all(dir.join("src"))?;
+    fs::write(dir.join("Cargo.toml"), manifest)?;
+    fs::write(dir.join("src").join("lib.rs"), lib_rs)?;
+    for (name, content) in extra {
+        fs::write(dir.join(name), content)?;
+    }
+    ui::detail(&format!("  ✓ {} (cache package)", dir.display()));
+    Ok(())
+}
+
+// ===========================================================================
+// The supersession rule (#335 §6)
+// ===========================================================================
+
+/// The package directories `output` has stopped receiving, and the Rust files
+/// ForgeDB used to write under each.
+///
+/// `replica` is here for `src/` only — its `client/` assets are still emitted
+/// (see [`generate_wasm_replica`]).
+const MOVED_PACKAGES: [&str; 4] = ["ffi", "napi", "pyo3", "replica"];
+
+/// The generated Rust files each moved package used to hold. Naming them
+/// explicitly rather than walking `src/` is deliberate: the rule is "replace
+/// what ForgeDB generated", and a walk would also rewrite a file the user put
+/// there.
+const MOVED_PACKAGE_FILES: [&str; 2] = ["lib.rs", "database.rs"];
+
+/// Replace a superseded generated file's contents with a `compile_error!`.
+///
+/// Pure and deterministic — the idempotence in [`supersede_moved_packages`] is a
+/// content compare against this exact string, so it must not carry a timestamp,
+/// a path that varies, or anything else that changes between runs.
+fn supersession_text(package: &str) -> String {
+    format!(
+        "// Superseded by ForgeDB. This file is NO LONGER GENERATED here.\n\
+         //\n\
+         // ForgeDB now owns the build: the `{package}` package is emitted into, and\n\
+         // compiled from, the ForgeDB build cache instead of this directory. Nothing\n\
+         // regenerates this copy, so leaving it compilable would let a build keep\n\
+         // succeeding against a database that no longer tracks your schema.\n\
+         //\n\
+         //   forgedb build                     # compile the current packages\n\
+         //   forgedb build --report -          # where every artifact landed\n\
+         //\n\
+         // Delete this directory once nothing reads it. ForgeDB will not delete it\n\
+         // for you, and it has left every file it did not generate untouched.\n\
+         compile_error!(\"ForgeDB no longer generates the `{package}` package here — it moved into the ForgeDB build cache. Run `forgedb build`.\");\n"
+    )
+}
+
+/// Replace every Rust file ForgeDB generated under a moved package with a
+/// `compile_error!` naming what happened, reporting each path it rewrites.
+///
+/// # Why this is not optional cleanup
+///
+/// Removing `ffi/`, `napi/`, `pyo3/` and `replica/`'s crate from `output` leaves
+/// four directories frozen, never regenerated, **and still compilable** — in the
+/// exact workflow ForgeDB's own Go README and its own reclose tell users to run.
+/// Their build keeps going green against a `database.rs` that no longer tracks
+/// the schema. This converts every one of those silent-stale-success cases into
+/// a build failure carrying a message.
+///
+/// Idempotent by content compare, and it touches nothing else: the user-editable
+/// scaffolds beside these files (`pyproject.toml`, `package.json`, `go.mod`,
+/// `Cargo.toml`) are left exactly as they are.
+fn supersede_moved_packages(output_dir: &Path) -> Result<()> {
+    for package in MOVED_PACKAGES {
+        let want = supersession_text(package);
+        for file in MOVED_PACKAGE_FILES {
+            let path = output_dir.join(package).join("src").join(file);
+            // Never *create* one: only a file ForgeDB previously wrote here is
+            // superseded. An absent file is a project that never enabled this
+            // target, and planting a `compile_error!` in it would invent a
+            // failure rather than describe one.
+            let Ok(existing) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if existing == want {
+                continue;
+            }
+            fs::write(&path, &want)?;
+            ui::warning(&format!(
+                "superseded {} — the `{}` package moved into the ForgeDB build cache",
+                path.display(),
+                package
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ===========================================================================
+// Go static-library delivery (#335 §6, the one carve-out from "no delivery")
+// ===========================================================================
+
+/// The delivered name of the Go binding's static archive.
+///
+/// It is a FIXED name, not the derived package name, because the cgo preamble
+/// `crates/codegen/src/go.rs` emits is a `const &str` that must name the library
+/// it links: `-L${SRCDIR} -lforgedb`. Deriving it would mean threading the app's
+/// hash into a static template for no benefit — the archive already sits in a
+/// per-app directory.
+pub const GO_STATICLIB: &str = "libforgedb.a";
+
+/// Deliver the app's FFI **staticlib** beside its generated Go package.
+///
+/// This is the single carve-out from #335's "no delivery" non-goal, and it is
+/// forced: the Go binding is the one target whose *source* cannot be generated
+/// correctly without knowing where its library will be. `#337` generalizes the
+/// mechanism; it does not change this destination.
+///
+/// It must be the `staticlib`, never the `cdylib`. rustc stamps an **absolute**
+/// `LC_ID_DYLIB` into a cdylib, so a Go binary that linked one records the
+/// absolute cache path — and the cache is a cache, deletable at any time (C8),
+/// after which the binary dies `dyld: Library not loaded`. A copied archive's
+/// *contents* are linked in, so there is nothing left to dangle.
+pub fn deliver_go_staticlib(output_dir: &Path, staticlib: &Path) -> Result<PathBuf> {
+    let go_dir = output_dir.join("go");
+    if !go_dir.is_dir() {
+        return Err(CliError::Other(format!(
+            "cannot deliver {} — {} does not exist. Run `forgedb generate go --runtime` first.",
+            GO_STATICLIB,
+            go_dir.display()
+        )));
+    }
+    let dest = go_dir.join(GO_STATICLIB);
+    fs::copy(staticlib, &dest).map_err(|e| {
+        CliError::Other(format!(
+            "failed to deliver {} to {}: {e}",
+            staticlib.display(),
+            dest.display()
+        ))
+    })?;
+    Ok(dest)
 }

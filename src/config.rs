@@ -46,6 +46,23 @@ pub struct ProjectConfig {
     /// `forgedb init` always writes the field explicitly.
     #[serde(default = "isolated_default")]
     pub isolated: bool,
+    /// How much of an app's relative path its derived names carry.
+    ///
+    /// `"minimal"` (the default) uses the shortest trailing run of path
+    /// segments that is unique among the project's apps; `"uniform"` always
+    /// uses every segment.  Only meaningful at the **project root**, because it
+    /// governs the whole app set: under `minimal`, whether `blog` needs
+    /// `services_` in front is a fact about that app's *siblings*.
+    ///
+    /// This is what replaced hash-based disambiguation, and the trade is
+    /// explicit: names became legible (`foo_services_blog-core` rather than
+    /// `schema-60acb6cba9beb3cf-core`) and stopped being **stable**.  Adding an
+    /// app can rename an existing one, which re-keys its cached packages and
+    /// changes every exported C symbol, breaking already-linked FFI consumers
+    /// until they rebuild.  `uniform` narrows that to renames caused by *moving*
+    /// a schema; it cannot eliminate them.
+    #[serde(default)]
+    pub symbol_naming: crate::naming::SymbolNaming,
 }
 
 fn isolated_default() -> bool {
@@ -65,6 +82,7 @@ impl Default for ProjectConfig {
             name: None,
             version: None,
             isolated: isolated_default(),
+            symbol_naming: crate::naming::SymbolNaming::default(),
         }
     }
 }
@@ -77,7 +95,7 @@ impl ProjectConfig {
 }
 
 /// Generator-specific configuration (`[generate]` table in `forgedb.toml`).
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerateConfig {
     /// **Removed in #333.**  Declared only so the key stays *recognized and
@@ -95,9 +113,69 @@ pub struct GenerateConfig {
     /// silently interleave their generated code.  Schema-relative makes this a
     /// per-app pattern instead.
     pub output: Option<String>,
-    /// Which targets to enable.  When absent all targets are enabled.
-    /// Valid values: `rust`, `typescript`, `api`, `stubs`.
+    /// Which targets to generate — **required, and explicit** (#335 §12).
+    ///
+    /// An absent key inside a declared `[generate]` table is an error, not
+    /// "everything": the half-declared table left the most consequential key to
+    /// be guessed, and the package prune ([`crate::cache::prunable`]) is defined
+    /// against the *declared* set, which an absence cannot state.  Write
+    /// `targets = ["all"]` for today's behavior; that is what a project with no
+    /// `[generate]` table at all takes from [`GenerateConfig::default`].
+    ///
+    /// The legal values are the CLI's #122 runtime × mode vocabulary
+    /// (maintainer decision 10), hyphen-joined where a mode is required, so one
+    /// spelling means the same thing in a config file and on the command line:
+    ///
+    /// | value | equivalent command |
+    /// |---|---|
+    /// | `all` | `generate all` |
+    /// | `rust` | `generate rust` |
+    /// | `api` | `generate api` |
+    /// | `openapi` | `generate openapi` |
+    /// | `stubs` | `generate stubs` |
+    /// | `ffi` | `generate ffi` |
+    /// | `node-sdk` / `bun-sdk` | `generate node\|bun --sdk` |
+    /// | `node-runtime` / `bun-runtime` | `generate node\|bun --runtime` |
+    /// | `python-sdk` | `generate python --sdk` |
+    /// | `python-runtime` | `generate python --runtime` |
+    /// | `go-sdk` | `generate go --sdk` |
+    /// | `go-runtime` | `generate go --runtime` |
+    /// | `rust-sdk` | `generate rust --sdk` |
+    /// | `browser-replica` | `generate browser --replica` |
+    ///
+    /// The pre-#122 spellings `typescript` and `wasm` still work and **warn**,
+    /// naming their replacements.  [`crate::targets`] is the one definition of
+    /// all of this — including the error text — so this table is a pointer, not
+    /// a second list: an unknown value is a positioned error listing the set
+    /// above, rather than the silent no-op it used to be.
     pub targets: Option<Vec<String>>,
+}
+
+/// The built-in default is a **stated value**, not an absence (#335 §12).
+///
+/// This is what makes "required" mean the right thing.  With `targets` written
+/// here rather than left `None`:
+///
+/// * **no `forgedb.toml` at all** — the fallback config — declares `["all"]`,
+///   so a project that never wrote a config keeps working exactly as before;
+/// * **a config file with no `[generate]` table** takes this same default,
+///   because it has declared nothing about generation;
+/// * **a config file WITH a `[generate]` table but no `targets` key** leaves the
+///   field `None` (serde's default for an `Option` field) and is **refused**.
+///
+/// That last case is the one worth refusing: a half-declared table where the
+/// most consequential key is left to be guessed.  The distinction costs one
+/// hand-written `Default` and removes the "absent means everything" reading that
+/// #335 §12 identifies as the same class of defect as #333's
+/// `ProjectConfig::default()`.
+impl Default for GenerateConfig {
+    fn default() -> Self {
+        Self {
+            schema: None,
+            output: None,
+            targets: Some(vec![crate::targets::DEFAULT_TARGETS.to_string()]),
+        }
+    }
 }
 
 /// Multi-tenancy configuration (`[tenant]` table).  Physical, dir-per-tenant
@@ -324,8 +402,20 @@ impl ForgeConfig {
                 )));
             }
         };
+        // #335 §10. Decided from the app's DECLARED target set, never from what a
+        // single invocation emitted — otherwise `generate rust` and `generate all`
+        // would bake different `database.rs` for the same project. Resolution
+        // failures fall back to ON, which is today's behavior: a spurious utoipa
+        // dependency is inert, while a missing derive is a compile error in
+        // `server` that the orphan rule makes unfixable downstream.
+        let web = self
+            .resolved_targets()
+            .map(|(targets, _)| targets.iter().any(|t| t == "api"))
+            .unwrap_or(true);
+
         Ok(forgedb_codegen::GenConfig {
             replication: self.runtime.replication,
+            web,
             fsync,
             wal_checkpoint_interval: self
                 .storage
@@ -411,7 +501,65 @@ pub fn parse_config(content: &str, path: &std::path::Path) -> Result<ForgeConfig
         return Err(removal_error(content, path, removed.span().start));
     }
 
+    // `[generate].targets` is REQUIRED in a config file (#335 §12, decision 2).
+    //
+    // It used to be optional, where ABSENT MEANT EVERY TARGET — the inverse of
+    // what an empty list normally reads as, and the same class of defect as
+    // #333's `ProjectConfig::default()`.  #335 defines the package prune against
+    // the *declared* set, so an absent value would collapse that set to whatever
+    // a single invocation happened to select: `forgedb generate rust` on a
+    // default project would prune away the server, the bindings and the replica.
+    //
+    // A project with NO config file at all is a different case and is not an
+    // error — it takes the built-in `["all"]`, which is a value like any other
+    // (see `crate::targets::DEFAULT_TARGETS`).  What is refused is a config file
+    // that declares some of `[generate]` and leaves this key to be guessed.
+    if config.generate.targets.is_none() {
+        return Err(missing_targets_error(content, path));
+    }
+
     Ok(config)
+}
+
+impl ForgeConfig {
+    /// The declared target set, as canonical internal names, plus any
+    /// deprecation warnings the caller should print.
+    ///
+    /// The one door onto `[generate].targets` — both `generate` and `build` come
+    /// through here, so neither can see the raw user spellings and neither can
+    /// invent its own reading of an absent value. `build` used to pass
+    /// `config_targets: None` outright (#335 §12), which made every opt-in arm
+    /// of `generate_all` unreachable from `forgedb build`.
+    pub fn resolved_targets(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let declared = self.generate.targets.as_deref().unwrap_or(&[]);
+        crate::targets::resolve_all(declared)
+    }
+}
+
+/// The diagnostic for an absent `[generate].targets` (#335 §12).
+///
+/// Anchored on the `[generate]` table header when there is one, so the caret
+/// lands where the key belongs rather than at the top of the file.
+fn missing_targets_error(content: &str, path: &std::path::Path) -> CliError {
+    let (line, column) = content
+        .find("[generate]")
+        .map(|offset| key_position(content, offset))
+        .unwrap_or((1, 1));
+
+    CliError::ConfigDiagnostic(format!(
+        "{}:{}:{}: `[generate].targets` is required.\n\n\
+         An absent value used to mean \"every target\", which is the opposite of \
+         what an absent list normally means — and it leaves the set of packages \
+         to build undefined.\n\n\
+         To keep exactly today's behavior, write:\n\n\
+         \x20   [generate]\n\
+         \x20   targets = [\"all\"]\n\n\
+         Legal values:\n{}",
+        path.display(),
+        line,
+        column,
+        crate::targets::legal_list()
+    ))
 }
 
 /// The bespoke diagnostic for the removed `[generate].schema` key (#333 §10).
@@ -508,6 +656,9 @@ commit_max_frames = 40
                 wasm_commit_debounce_ms: 500,
                 wasm_commit_max_frames: 40,
                 replication_log_retention: 4096,
+                // No `[generate]` table in this fixture, so the built-in
+                // `["all"]` applies and `all` expands to include `api` (#335 §12).
+                web: true,
             }
         );
     }

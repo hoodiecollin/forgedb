@@ -40,7 +40,7 @@
 //!     ↓
 //! TransformGenerator (codegen) → offline transformer bin
 //!     ↓
-//! `forgedb migrate up`  → data rewritten v1 → v2
+//! `forgedb migrate build` + `migrate run --from 1 --to 2`  → data rewritten
 //! ```
 //!
 //! # Examples

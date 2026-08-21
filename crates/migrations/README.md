@@ -7,7 +7,7 @@ every hop, and maintains the serial version lineage.
 It does **not** rewrite data at rest. Applying a migration to a data directory is
 done by an offline, per-version-range **transformer binary** that
 [`forgedb-codegen`](../codegen)'s `TransformGenerator` emits and that the
-`forgedb migrate up` CLI builds and runs. Keeping the rewrite in generated code
+`forgedb migrate` CLI builds and runs. Keeping the rewrite in generated code
 preserves ForgeDB's core invariant — the schema is a compile-time input to
 generation, never a runtime input to a generic engine.
 
@@ -54,7 +54,7 @@ hop_body_class()  ──►  Auto | Authored   (Authored hops are scaffolded for
 forgedb-codegen TransformGenerator  ──►  offline transformer bin
     │
     ▼
-forgedb migrate up  ──►  data rewritten v1 → v2 into a fresh dir
+forgedb migrate build ──► migrate run --from 1 --to 2  ──►  data rewritten
 ```
 
 ## Usage Examples

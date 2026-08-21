@@ -11,18 +11,62 @@ project a schema belongs to. Both are read at generate time.
 ```toml
 [generate]
 output = "generated"
-targets = ["rust", "typescript", "api", "stubs"]
+targets = ["all"]
 ```
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `output` | string | `"generated"` | Output directory, resolved against the **schema's** directory. |
-| `targets` | string[] | *(all targets)* | Which targets to emit. When absent, all are enabled. |
+| `targets` | string[] | **required** inside a declared `[generate]` table | Which targets to emit. |
 
-Valid `targets` values: `rust`, `typescript`, `api`, `openapi`, `stubs`, plus the
-opt-in `wasm` (browser read-replica) and `ffi` (C-ABI engine). When the key is absent,
-the default set `rust`, `typescript`, `api`, `openapi`, `stubs` is generated. `wasm` and
-`ffi` emit only when listed explicitly.
+### `targets` is required, and `["all"]` means all
+
+If you write a `[generate]` table, you must write `targets`. It used to be optional, where
+*absent meant every target* — the inverse of what an absent list normally reads as, and a set
+the build cache's package prune has no way to state. A project with **no
+`forgedb.toml` at all**, or one with no `[generate]` table, still takes the built-in
+`["all"]`; what is refused is a half-declared table that leaves the most consequential key to
+be guessed.
+
+```
+error: forgedb.toml:4:1: `[generate].targets` is required.
+```
+
+`["all"]` genuinely means all — including `ffi`, the browser replica, the REST SDKs and the
+three native runtime bindings. Under the old "absent means everything" reading those opt-in
+targets were reachable only by listing them, so `all` quietly skipped them.
+
+### Valid values
+
+They are the same runtime × mode vocabulary the CLI speaks, hyphen-joined where a mode is
+required, so one spelling means one thing in both places:
+
+| Value | Equivalent command |
+|---|---|
+| `all` | `forgedb generate all` |
+| `rust` | `forgedb generate rust` |
+| `api` | `forgedb generate api` |
+| `openapi` | `forgedb generate openapi` |
+| `stubs` | `forgedb generate stubs` |
+| `ffi` | `forgedb generate ffi` |
+| `node-sdk` / `bun-sdk` | `forgedb generate node --sdk` / `... bun --sdk` |
+| `python-sdk` | `forgedb generate python --sdk` |
+| `rust-sdk` | `forgedb generate rust --sdk` |
+| `go-sdk` | `forgedb generate go --sdk` |
+| `node-runtime` / `bun-runtime` | `forgedb generate node --runtime` / `... bun --runtime` |
+| `python-runtime` | `forgedb generate python --runtime` |
+| `go-runtime` | `forgedb generate go --runtime` |
+| `browser-replica` | `forgedb generate browser --replica` |
+
+An unknown value is now a **positioned error listing that set**, not a silent no-op —
+`targets = ["napi"]` used to emit nothing at all.
+
+<Callout type="warning" title="`typescript` and `wasm` were renamed">
+The pre-runtime spellings `typescript` and `wasm` still work and **warn**, naming their
+replacements (`node-sdk`, `browser-replica`). They are not silently accepted: `typescript` was
+legal here while `forgedb generate typescript` was a hard error, and a deprecated value that
+behaves identically and says nothing is how the two spellings drifted apart in the first place.
+</Callout>
 
 <Callout type="note" title="CLI flags override these">
 `--output` on the `forgedb generate` command takes precedence over the `[generate]` value,

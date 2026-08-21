@@ -106,9 +106,46 @@ impl EngineMigrationGenerator {
 
         Ok(TransformCrate {
             crate_name: crate_name.to_string(),
-            cargo_toml: crate::transform::TransformGenerator::cargo_toml(crate_name),
+            cargo_toml: Self::cargo_toml(crate_name),
             sources,
         })
+    }
+
+    /// The engine-hop crate's `Cargo.toml`.
+    ///
+    /// **This is deliberately not `TransformGenerator::cargo_toml`.** Reusing
+    /// that manifest verbatim is what made one app's `transform/` and
+    /// `engine/` declare the *same* `[[bin]] name = "forgedb-transform"`
+    /// (#335 §2): cargo reports `warning: output filename collision`, **exits
+    /// 0**, and leaves one file on disk — so the CLI, which resolved the
+    /// transformer by that literal, could run the wrong hop over a user's data
+    /// dir at exit 0. A data-corruption-class failure behind a warning.
+    ///
+    /// Two functions, one dependency block: `CLASS_C_SUBSTRATE_DEPS` is
+    /// shared, because a substrate pin bumped in one manifest and not the other
+    /// is invisible in a directory the user never opens. What is *not* shared
+    /// is the identity half — the package name and the bin derived from it,
+    /// which is the thing that must differ.
+    ///
+    /// Like every other package in the cache it is written **in full on every
+    /// emission**, never only-if-absent: nothing here is the user's.
+    pub fn cargo_toml(crate_name: &str) -> String {
+        format!(
+            r#"[package]
+name = "{crate_name}"
+version = "0.0.0"
+edition = "2024"
+
+# A ForgeDB ENGINE-generation hop (#254): the byte-format migration, orthogonal
+# to the app's own schema-version lineage. Compiled for one fixed generation
+# range and run against data-at-rest with the app stopped.
+[[bin]]
+name = "{crate_name}"
+path = "src/main.rs"
+
+{CLASS_C_SUBSTRATE_DEPS}"#,
+            CLASS_C_SUBSTRATE_DEPS = crate::transform::CLASS_C_SUBSTRATE_DEPS,
+        )
     }
 
     /// Just `src/main.rs`, for the codegen guard tests.
@@ -415,4 +452,104 @@ impl EngineMigrationGenerator {
 /// (`all()` / `insert`) — the same predicate the schema transformer uses.
 fn is_transactable(model: &Model) -> bool {
     model.identity_field().is_some()
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    /// #335 §2 / scenario 25's root cause, caught at the ONE layer that can see
+    /// it without a link step: the two class-C manifests must not declare the
+    /// same `[[bin]]`.
+    ///
+    /// `cargo check` never links, so it cannot see this at all, and a real
+    /// `cargo build` reports it as `warning: output filename collision` and
+    /// **exits 0**. So the guard has to be on the emitted bytes.
+    #[test]
+    fn transform_and_engine_declare_different_bins() {
+        let t = crate::transform::TransformGenerator::cargo_toml("blog-abcd-transform-1-2");
+        let e = EngineMigrationGenerator::cargo_toml("blog-abcd-engine-1-2");
+
+        assert!(t.contains("name = \"blog-abcd-transform-1-2\""), "{t}");
+        assert!(e.contains("name = \"blog-abcd-engine-1-2\""), "{e}");
+        // The literal that made them collide is gone from both.
+        assert!(!t.contains("forgedb-transform"), "{t}");
+        assert!(!e.contains("forgedb-transform"), "{e}");
+    }
+
+    /// The `[[bin]]` name is derived from the package name rather than fixed,
+    /// so a range-stamped package yields a range-stamped bin. Anchored on the
+    /// `[[bin]]` section, not on "the string appears somewhere" — the package
+    /// name appears in `[package]` too, which would pass while the bin was
+    /// still a literal.
+    #[test]
+    fn the_bin_section_carries_the_range() {
+        for (pkg, kind) in [
+            ("app-0-transform-1-2", "transform"),
+            ("app-0-engine-1-2", "engine"),
+        ] {
+            let toml = if kind == "transform" {
+                crate::transform::TransformGenerator::cargo_toml(pkg)
+            } else {
+                EngineMigrationGenerator::cargo_toml(pkg)
+            };
+            let bin_section = toml
+                .split("[[bin]]")
+                .nth(1)
+                .unwrap_or_else(|| panic!("no [[bin]] section in {toml}"));
+            assert!(
+                bin_section.contains(&format!("name = \"{pkg}\"")),
+                "the [[bin]] section must name the range-stamped package: {toml}"
+            );
+        }
+    }
+
+    /// A `[profile.*]` table in a **non-root member is ignored by cargo** (with
+    /// a warning), so shipping one is an optimization level that reads as
+    /// applied and is not — the exact failure class this design deletes
+    /// everywhere else. The floor moves to the build driver's root invocation.
+    ///
+    /// Same guard `wasm.rs` already carries for the replica manifest.
+    #[test]
+    fn neither_class_c_manifest_carries_a_profile() {
+        for toml in [
+            crate::transform::TransformGenerator::cargo_toml("x-transform-1-2"),
+            EngineMigrationGenerator::cargo_toml("x-engine-1-2"),
+        ] {
+            assert!(!toml.contains("[profile"), "{toml}");
+            assert!(!toml.contains("opt-level"), "{toml}");
+        }
+    }
+
+    /// Both are emitted as MEMBERS of ForgeDB's cache workspace, so neither may
+    /// carry a `[workspace]` table: that would cut the member out of the shared
+    /// lockfile and `target/`, which is the whole point of the cache. (#328 is
+    /// the absence of that table under a *foreign* root — a different fact, and
+    /// the resolution to it is the cache root, not a table here.)
+    #[test]
+    fn neither_class_c_manifest_declares_its_own_workspace() {
+        for toml in [
+            crate::transform::TransformGenerator::cargo_toml("x-transform-1-2"),
+            EngineMigrationGenerator::cargo_toml("x-engine-1-2"),
+        ] {
+            assert!(!toml.contains("[workspace]"), "{toml}");
+        }
+    }
+
+    /// The dependency block is shared, so both must carry the same substrate —
+    /// and neither may reach a schema-interpreting crate (C4/DV-7).
+    #[test]
+    fn both_link_the_same_provider_free_substrate() {
+        let t = crate::transform::TransformGenerator::cargo_toml("x-transform-1-2");
+        let e = EngineMigrationGenerator::cargo_toml("x-engine-1-2");
+        for toml in [&t, &e] {
+            assert!(toml.contains("forgedb-storage ="), "{toml}");
+            assert!(toml.contains("forgedb-types ="), "{toml}");
+            assert!(!toml.contains("forgedb-parser ="), "{toml}");
+            assert!(!toml.contains("forgedb-migrations ="), "{toml}");
+        }
+        // One dependency block, not two that must agree.
+        let deps = |s: &str| s.split("[dependencies]").nth(1).unwrap().to_string();
+        assert_eq!(deps(&t), deps(&e));
+    }
 }

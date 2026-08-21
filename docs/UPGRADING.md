@@ -14,9 +14,17 @@ Version policy is [`SEMVER.md`](SEMVER.md); pre-1.0, a **minor** bump is where b
 
 ## 0.5.0
 
-Three config breaks, all loud and all in `forgedb.toml`. None of them touch a data
-directory: nothing on disk needs migrating, and the generated code is unchanged. What
-changes is which config file applies to a schema, and what a config is allowed to contain.
+Seven breaks — four in `forgedb.toml`, three in the CLI surface — plus one rename that
+breaks no input you write. **None of them touch a data
+directory** — nothing on disk needs migrating, and every one of them is loud (a removed key,
+flag or command errors and names its replacement; nothing silently changes behavior).
+
+The four config breaks come first: the first three change only which config file applies to a
+schema and what a config is allowed to contain, and the fourth also changes **which targets get
+emitted**, because `["all"]` now genuinely means all. The three CLI breaks follow from one
+change — **ForgeDB now owns the build** (#335): it compiles the code it generates, in a
+workspace it owns, so `forgedb init` stops scaffolding a crate for you to compile and every
+command that produces a compiled artifact names its app explicitly.
 
 ### 1. `[generate].schema` was removed
 
@@ -81,6 +89,183 @@ Two consequences for existing trees:
 **Remedy, if you want the old behavior:** put a `forgedb.toml` beside the schema, or pass
 `-c/--config`, which is an outright override and does no walk.
 
+### 4. `[generate].targets` is now required, and its values are respelled
+
+Two breaks in one key, deliberately paired so an existing project edits it once.
+
+**It is required.** It used to be optional, where *absent meant every target*. That reading
+is the inverse of what the field default gives a caller, and #335 defines the package prune
+against the **declared** set — so an absent value would collapse that set to whatever a
+single invocation happened to select, and `forgedb generate rust` on a default project would
+prune away the server, the bindings and the replica.
+
+```
+error: forgedb.toml:4:1: `[generate].targets` is required.
+
+An absent value used to mean "every target", which is the opposite of what an
+absent list normally means — and it leaves the set of packages to build undefined.
+
+To keep exactly today's behavior, write:
+
+    [generate]
+    targets = ["all"]
+```
+
+**Which configs break:** one that declares a `[generate]` table without the key — including
+every `forgedb init` scaffold from an earlier release, which wrote `output` and no `targets`. A
+project with **no `forgedb.toml` at all**, or one whose config has no `[generate]` table, takes
+the built-in `["all"]` and does not break.
+
+**Its values now speak the same vocabulary the CLI does.** `forgedb generate node --sdk` has
+always been the command; `typescript` was its config spelling, and the CLI *rejects* that word
+outright. One name meaning two different things in two places is the kind of split that only
+shows up when someone copies a value from a doc into the wrong file.
+
+| Old config value | Now write | CLI equivalent |
+|---|---|---|
+| `typescript` | `node-sdk` (or `bun-sdk`) | `generate node --sdk` |
+| `wasm` | `browser-replica` | `generate browser --replica` |
+| `rust`, `api`, `openapi`, `stubs`, `ffi` | unchanged | `generate <name>` |
+| `rust-sdk`, `python-sdk`, `go-sdk` | unchanged | `generate <runtime> --sdk` |
+| *(no spelling existed)* | `node-runtime`, `bun-runtime`, `python-runtime`, `go-runtime` | `generate <runtime> --runtime` |
+
+The old spellings still work and **warn**, naming the replacement. They are not silently
+accepted — a deprecated value that behaves identically and says nothing is how the two
+vocabularies drifted apart in the first place.
+
+**Unknown values are now an error rather than a silent no-op.** `targets = ["napi"]` used to
+emit **nothing at all**: the filter was present, so every real target was disabled, and
+nothing was reported. It now names the legal set.
+
+**`["all"]` genuinely means all.** Previously the opt-in targets (`ffi`, `wasm`, the three
+REST SDKs) were reachable only by listing them explicitly, so a project with no `targets` key
+never emitted them from `generate all` despite "absent means everything". Stated here so it is
+not discovered as a regression: if you were relying on `all` skipping the browser replica, list
+what you want instead.
+
+### 5. `forgedb init` no longer scaffolds a Rust crate
+
+`init` used to write a `Cargo.toml` and a `src/main.rs` and expect you to `cargo build` them.
+It writes neither now. There is nothing in a fresh project to compile by hand:
+
+```bash
+forgedb init app
+ls app          # schema.forge, forgedb.toml, README, deploy files — and NO Cargo.toml
+forgedb generate all --schema app/schema.forge
+forgedb build        --schema app/schema.forge
+```
+
+`forgedb build` compiles the generated packages in **its own** cargo workspace under
+`~/.forgedb/projects/<id>/` (override with `FORGEDB_HOME`) and reports the artifact paths cargo
+emitted — including the path of the generated server binary. It used to run a bare `cargo build`
+in the current directory, which meant that pointing it at a directory holding an unrelated crate
+compiled *that crate* and reported success.
+
+**Your existing scaffold keeps working, and ForgeDB never deletes it.** `generate` still writes
+`database.rs` and `api.rs` into your output directory — as a mirror of the copy it compiles, from
+the same generator run, so the two cannot drift — and the scaffold's
+`#[path = "../generated/database.rs"]` modules keep resolving. For a while you will have two ways
+to run one server: your crate, and the cache's `server/`. That is stated rather than hidden. It
+ends when you delete your scaffold crate, or when in-tree Rust output lands (#338).
+
+**What you lose, stated plainly:** the editable `src/main.rs`. If you had added a route, a
+middleware layer or a tracing subscriber there, keep your crate — the mirror is exactly what
+keeps it compiling. New projects get one server, in the cache, that ForgeDB owns and rewrites.
+
+Four generated directories moved out of your output directory entirely — `ffi/`, `napi/`,
+`pyo3/`, `replica/` — because ForgeDB compiles them now. If you have those from a previous
+release, the next `generate` **replaces the generated `database.rs` inside each with a
+`compile_error!`** naming what happened, reports the path, and leaves your `pyproject.toml` /
+`package.json` / `go.mod` beside it untouched. That is deliberate: left alone those directories
+would still *compile*, forever, against a database that no longer tracks your schema.
+
+**Remedy:** none required for the scaffold itself. Delete the four superseded directories at
+your convenience, and delete your scaffold crate when you no longer want the second server.
+
+### 6. Every `forgedb migrate` subcommand requires `--schema`
+
+`migrate` used to resolve `migrations/` — and the transformer crate — relative to the current
+directory. It no longer resolves anything from the CWD:
+
+```bash
+forgedb migrate create "add note" --auto --schema schema.forge
+forgedb migrate status                   --schema schema.forge
+forgedb migrate build --from 1 --to 2    --schema schema.forge
+forgedb migrate run   --from 1 --to 2    --schema schema.forge --src ./data --dest ./data-v2
+forgedb migrate engine --src ./data --dest ./data-gen2 --schema schema.forge
+```
+
+The schema names the app, the app decides which project owns it, and the project decides which
+build cache the transformer is compiled in. `migrate run` gained `--from`/`--to` for the same
+reason: transformers are now range-stamped, so a range is how `run` names the one to execute.
+
+This one fixes a real defect rather than only tidying: the transformer's generated `Cargo.toml`
+declared a `[package]` with no `[workspace]` table, so emitting it under a foreign cargo
+workspace root made it refuse to build (#328) — on `migrate engine`, which is the *mandatory*
+v0.4.0 data-directory upgrade. There is deliberately **no fallback** to a `migrations/transform`
+beside you; discovery failing is a hard error naming the cache path.
+
+What stays in your tree is the lineage you author and commit: `migrations/<id>_*.json`,
+`migrations/schemas/v<n>.forge`, and any `migrations/<id>/transform.rs`.
+
+**Remedy:** add `--schema <path>` to every `migrate` invocation in your scripts and CI, and
+`--from`/`--to` to `migrate run`.
+
+### 7. Removed commands and flags
+
+Each of these **errors and names its replacement**. None of them silently no-ops, which is the
+whole point — a flag that reads as applied and is not is the failure mode this release deletes.
+
+| Removed | Use instead | Why |
+|---|---|---|
+| `forgedb migrate up` | `migrate build` then `migrate run` | A wrapper over those two, not a capability. Its per-tenant sweep and version auto-detection are tracked as **#373**. |
+| `forgedb migrate up --tenant-root` | a loop over `migrate run` (see [MIGRATIONS.md](MIGRATIONS.md)) | Same removal; **#373** restores the sweep. |
+| `forgedb build --target <native\|wasm\|both>` | declare `browser-replica` in `[generate].targets` | It ran `cargo build --target wasm32-unknown-unknown` **in your current directory** — i.e. it tried to build your axum server for the browser — and ran `rustup target add` behind your back. ForgeDB no longer mutates your toolchain; the driver issues the target split itself, and a missing target is already a clear rustc error telling you to add it. |
+| `forgedb init --rust` | *(nothing — it is the only mode)* | `init` scaffolds no Rust crate at all now, so the flag had nothing left to select. |
+| `forgedb init --api-only` | *(nothing — it is the only mode)* | Same: with no Rust scaffold, every project is what `--api-only` used to mean. |
+| `forgedb migrate build -o/--output <dir>` | *(nothing — the cache decides)* | It named a directory for a crate ForgeDB now places itself, in the workspace it owns. |
+| `forgedb migrate run --bin-dir <dir>` | `--from`/`--to` | Same: the transformer is resolved by app + range, not by a path you keep. |
+
+**Remedy:** grep your scripts and CI for these. Every one of them is a one-line substitution,
+and every one of them fails loudly rather than quietly doing the wrong thing.
+
+### 8. Generated package names and exported C symbols were renamed
+
+Not a break in anything you *write* — no key, flag or command changed — but every derived name
+changed, so **the first build after upgrading rebuilds from scratch** and any already-linked FFI
+or Go consumer must be rebuilt.
+
+Names used to be `<schema-stem>-<hash>-<kind>`; they are now `<project_id>_<path segments…>-<kind>`:
+
+```
+schema-60acb6cba9beb3cf-core   ->   foo_services_blog-core
+```
+
+The old scheme's readable half came from the schema's *file name*, which discards the directory —
+and `forgedb init` writes `schema.forge` for every project, so that half was the same constant for
+every app and the hash carried all of the discrimination. Names are now built from the schema's
+project-relative path, which is where the discriminating information actually lives.
+
+**Remedy:** none required. Run your build again. If you link the FFI or Go binding, rebuild the
+consumer — the exported C symbols carry the new prefix.
+
+**New key, opt-in:** `[project].symbol_naming` selects how much of the path a name carries.
+
+```toml
+[project]
+symbol_naming = "minimal"   # default — shortest suffix unique in the project
+# symbol_naming = "uniform" # every segment, always
+```
+
+`minimal` is more legible; `uniform` is more *stable*. Under `minimal`, adding an app can rename a
+sibling: dropping `app/blog/schema.forge` into a project that already has `services/blog/schema.forge`
+turns `foo_blog` into `foo_services_blog`, which re-keys that app's cached packages and changes its
+exported symbols. `uniform` narrows renames to schemas you actually move. Declare it at the
+**project root** — it governs the whole app set, and a nested config declaring it has no effect.
+
+The cache's own member directories are unaffected: they are still keyed by the path hash, so no
+data directory and no cache layout needs migrating.
+
 ### What is new rather than broken
 
 `[project]` is now read rather than ignored. `[project].name` is your project's id, and
@@ -138,10 +323,12 @@ forgedb migrate engine --src ./data --dest ./data-gen2
 
 Then point the regenerated app at the destination.
 
-This counter is orthogonal to the app's own schema-migration serial: `migrate up` replays
-*your* `migrations/` lineage, `migrate engine` replays *ForgeDB's* generations. An engine
-bump changes no `.forge` and produces no lineage hop, which is why `migrate up` would run
-nothing here. See [`MIGRATIONS.md`](MIGRATIONS.md).
+This counter is orthogonal to the app's own schema-migration serial: the lineage transformer
+replays *your* `migrations/` lineage, `migrate engine` replays *ForgeDB's* generations. An engine
+bump changes no `.forge` and produces no lineage hop, which is why the lineage transformer would
+run nothing here. See [`MIGRATIONS.md`](MIGRATIONS.md). (The command this described in v0.4.0 was
+`forgedb migrate up`, **removed in 0.5.0** — see entry 7 above. `migrate engine` itself is
+unchanged apart from now requiring `--schema`.)
 
 ### 2. `@length(N)` changed meaning — and it does not stop the build
 

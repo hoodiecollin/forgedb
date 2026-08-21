@@ -40,8 +40,15 @@ use quote::{format_ident, quote};
 /// The generated per-range transformer crate.
 pub struct TransformCrate {
     pub crate_name: String,
-    /// `Cargo.toml` — a user-editable scaffold, written ONLY when absent (mirrors
-    /// the wasm replica / TS SDK scaffolds).
+    /// `Cargo.toml`.
+    ///
+    /// It used to be described here as "a user-editable scaffold, written ONLY
+    /// when absent". It is neither, since #335 §9: both class-C packages are
+    /// emitted into ForgeDB's build cache, where **nothing is the user's** and
+    /// every file — the manifest included — is rewritten in full on every
+    /// emission. Carried forward unchanged, a CLI upgrade that bumps a
+    /// substrate pin would never reach an existing member, and the stale pin
+    /// would sit in a directory the user never opens.
     pub cargo_toml: String,
     /// `(relative path from crate root, content)` for every generated source file
     /// (`src/*.rs`) — always (re)written on generate.
@@ -434,7 +441,40 @@ impl TransformGenerator {
 
     /// The provider-free `Cargo.toml` (C4/DV-7): the same substrate closure the
     /// generated app links, and NOTHING that interprets a schema (no
-    /// `forgedb-parser`, no `forgedb-migrations`). Written only-if-absent.
+    /// `forgedb-parser`, no `forgedb-migrations`).
+    ///
+    /// # The `[[bin]]` name IS the package name
+    ///
+    /// It used to be the literal `forgedb-transform`, and `engine.rs` reused
+    /// this manifest verbatim — so one app's own `transform/` and `engine/`
+    /// declared the **same bin**. Cargo reports that as `warning: output
+    /// filename collision`, **exits 0**, and leaves one file on disk, while the
+    /// CLI resolved the transformer by that fixed literal: a data-corruption
+    /// -class failure behind a warning (#335 §2).
+    ///
+    /// The package name handed in here is already app-unique and
+    /// range-stamped (`crate::naming::package_name` in the CLI), and
+    /// `naming::bin_name` **is** `naming::package_name` — so deriving the bin
+    /// from the package makes those two names one fact instead of two facts
+    /// that have to agree.
+    ///
+    /// # No `[workspace]`, and no `[profile]`
+    ///
+    /// This package is emitted as a **member of ForgeDB's own cache
+    /// workspace** (#335 §1/§9). A `[package]` with no `[workspace]` table is
+    /// #328 only when it lands under a *foreign* cargo root, and the resolution
+    /// to that is the cache root — not a table here, which would make the
+    /// member its own workspace and cut it out of the shared lockfile and
+    /// `target/`.
+    ///
+    /// `[profile.release] opt-level = 2` is gone for a mechanical reason:
+    /// cargo **ignores** a `[profile]` in a non-root member (and warns), so
+    /// leaving it here would be an optimization level that reads as applied and
+    /// is not. The floor is set by the build driver on the root invocation.
+    ///
+    /// Written **always**, never only-if-absent: nothing in the cache is the
+    /// user's, and a manifest carried forward unchanged is how a bumped
+    /// substrate pin fails to reach an existing member.
     pub fn cargo_toml(crate_name: &str) -> String {
         format!(
             r#"[package]
@@ -445,13 +485,29 @@ edition = "2024"
 # The offline ForgeDB migration transformer (#74). Compiled once for a fixed
 # origin->destination version range, run against data-at-rest with the app stopped.
 [[bin]]
-name = "forgedb-transform"
+name = "{crate_name}"
 path = "src/main.rs"
 
-[dependencies]
-# The same schema-agnostic substrate the generated app links, and nothing that
-# interprets a schema (the identity red line: no schema at runtime, no migration
-# engine — the version modules are baked-in generated typed code).
+{CLASS_C_SUBSTRATE_DEPS}"#,
+            CLASS_C_SUBSTRATE_DEPS = CLASS_C_SUBSTRATE_DEPS,
+        )
+    }
+}
+
+/// The substrate dependency block shared by the two **class-C** packages —
+/// `transform-<from>-<to>` and `engine-<from>-<to>`.
+///
+/// The two manifests are emitted by two different functions on purpose (§2:
+/// `engine.rs` reusing `TransformGenerator::cargo_toml` verbatim is what made
+/// them declare the same `[[bin]]`), but the *dependency* half is one constant,
+/// because a substrate pin bumped in one and not the other is invisible: these
+/// manifests live in the build cache, in a directory the user never opens, where
+/// the publish-gap check cannot see them.
+///
+/// It is the same schema-agnostic substrate the generated app links, and nothing
+/// that interprets a schema — the identity red line: no schema at runtime, no
+/// migration engine. The version modules are baked-in generated typed code.
+pub(crate) const CLASS_C_SUBSTRATE_DEPS: &str = r#"[dependencies]
 forgedb-storage = "0.3"
 forgedb-types = "0.3"
 forgedb-changefeed = "0.2"
@@ -459,19 +515,13 @@ forgedb-wal = "0.2"
 forgedb-compaction = "0.1"
 forgedb-txn = "0.1"
 forgedb-coordinator = "0.2"
-serde = {{ version = "1", features = ["derive"] }}
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-uuid = {{ version = "1", features = ["v4", "serde"] }}
-rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
-utoipa = {{ version = "5", features = ["uuid"] }}
+uuid = { version = "1", features = ["v4", "serde"] }
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+utoipa = { version = "5", features = ["uuid"] }
 regex = "1"
-
-[profile.release]
-opt-level = 2
-"#
-        )
-    }
-}
+"#;
 
 /// The module name for a hop's embedded authored transform: `authored_<id>`.
 fn authored_mod_name(hop: &HopPlan) -> String {

@@ -203,37 +203,75 @@ Each substrate crate carries its own `description`/`keywords`/`categories`.
 
 ## The publish gap (the load-bearing discipline)
 
-Generated code pins substrate crates by caret range in the scaffold `Cargo.toml`. If generated
-code starts requiring a **new substrate crate** or a **new additive substrate API**, that
-crate/version must be **published before** `forgedb init` pins it — otherwise an outside-repo
-`init → generate → cargo build` cannot resolve from crates.io.
+Generated code pins substrate crates by version range in the **generated cache manifests**. If
+generated code starts requiring a **new substrate crate** or a **new additive substrate API**,
+that crate/version must be **published before** the generator pins it — otherwise an
+outside-repo `init → generate → build` cannot resolve from crates.io.
 
 The reclose is **proven**, not assumed: after publishing, run an isolated
 
 ```bash
-forgedb init --template blog        # in a throwaway dir outside this repo
-forgedb generate rust && forgedb generate api
-cargo build                          # must resolve every forgedb-* dep from crates.io, 0 errors
+# in a throwaway dir OUTSIDE this repo, with FORGEDB_HOME also outside it
+export FORGEDB_HOME="$(mktemp -d)"
+forgedb init app
+forgedb generate all --schema app/schema.forge
+forgedb build        --schema app/schema.forge   # every forgedb-* dep from crates.io, 0 errors
 ```
 
-and confirm the generated `Cargo.lock` resolved the freshly-published versions from
-`registry+https://.../crates.io-index`. Track the open/closed state of this gap in the
-project's GitHub issues, and keep the scaffold pins updated when you publish.
+**`forgedb build`, not `cargo build`** — since #335 there is no crate in the scaffold to build,
+and the command under test is the one an installed user actually runs. `FORGEDB_HOME` must be
+outside the checkout, and that is an assertion rather than a nicety: this repo's root
+`Cargo.toml` has `members` and no `exclude`, so a cache created inside the working tree joins
+*this workspace* and inherits its pinned toolchain and path dependencies — the reclose would be
+measuring the checkout instead of the registry.
 
-For the **wasm** replica, the equivalent reclose is `wasm-pack build --target web` against
-`forgedb-storage-web` + the wasm-flavored `types`/`wal`; note its own honest limits if
-the wasm toolchain can't run in a given environment.
+Then confirm the resolution came from the registry, in the **cache** lockfile
+(`$FORGEDB_HOME/projects/<id>/Cargo.lock`) — there is no lockfile under the app any more:
+
+```bash
+grep -c 'registry+https://github.com/rust-lang/crates.io-index' "$FORGEDB_HOME"/projects/*/Cargo.lock
+```
+
+State it positively — *every* `forgedb-*` package carries a registry source, and at least N of
+them do — never as "no `path+…` source appears". On cargo 1.96 / lockfile v4 a path dependency
+records **no `source` key at all**, so the negative form matches nothing whether or not the bug
+is present: it is a check that passes having inspected nothing.
+
+A `cargo generate-lockfile` against the cache root is the cheap half of this: it exits non-zero
+on an unpublished version, with the candidate list in the message, and compiles nothing. It
+catches the *missing-version* half of a publish gap; only the compiles catch the *stale-source*
+half.
+
+For the **browser replica**, the reclose is `forgedb generate browser --replica` + `forgedb
+build`, which resolves `forgedb-storage-web` from the registry and compiles against it. ForgeDB
+no longer runs `rustup target add` for you — install `wasm32-unknown-unknown` yourself, and note
+the honest limit if the wasm toolchain can't run in a given environment.
+
+Track the open/closed state of a gap in the project's GitHub issues (a knowingly deferred one is
+a `release-gate`), and update the generated pins when you publish.
 
 ---
 
 ## Version pins to update alongside a publish
 
 When you bump a substrate crate that generated code links, also update where the CLI emits its
-pin:
+pin. **The `init` scaffold no longer carries any** — it scaffolds no cargo package — so the pin
+lists live in codegen:
 
-- the scaffold `Cargo.toml` template in `src/commands/init.rs` (the caret pins),
+- `crates/codegen/src/core_pkg.rs` — the app's database crate, and the **largest** pin list
+  (storage, types, changefeed, wal, compaction, txn, the host-only coordinator, plus `utoipa`
+  when the app has a server),
+- `crates/codegen/src/server_pkg.rs` — the API binary (`forgedb-auth` with `jwks-http`,
+  `forgedb-query-params`, `forgedb-changefeed`, and the axum/utoipa stack),
+- `crates/codegen/src/transform.rs` — the offline migration bins, which pin substrate
+  **directly** because they cannot link `core` (a hop is pinned to its version range, not to
+  whatever the current schema is),
 - the substrate version matrix in [INSTALL.md](./INSTALL.md),
 - the substrate crate table in [PUBLIC_CRATES.md](./PUBLIC_CRATES.md).
+
+The four wrapper packages — `napi/`, `pyo3/`, `ffi/`, `wasm/` — pin **zero** substrate crates
+and reach it through `core`, so there is nothing to bump there and a `grep '^forgedb-'` on one
+of their manifests correctly matches nothing.
 
 Include `Cargo.lock` changes in the same commit when they're a side effect.
 
