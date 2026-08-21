@@ -1,5 +1,26 @@
-use forgedb_codegen::{ApiGenerator, RustGenerator, StubGenerator, TypeScriptGenerator};
-use forgedb_parser::Schema;
+//! Schema change detection for the watch loop.
+//!
+//! # This module used to generate code, and that was the bug (#364, #335 §16)
+//!
+//! `regenerate_internal` ran four generators of its own — `RustGenerator`,
+//! `TypeScriptGenerator`, `ApiGenerator`, `StubGenerator` — reachable from
+//! `forgedb dev` and from nowhere else.  It called `RustGenerator::generate`,
+//! which hardcodes `schema_version = 1` **and** `GenConfig::DEFAULT`, so a `dev`
+//! save overwrote `database.rs` with a database that read no `forgedb.toml` at
+//! all: wrong durability, wrong cascade depth, no replication broker, and an
+//! open guard that refuses the very data dir the app is running against on any
+//! project with a migration lineage.
+//!
+//! It was a *fourth* independent emission path, and parameterizing it — the fix
+//! #364 originally proposed — would have grown this published crate an API that
+//! duplicated the CLI's config resolution.  So the generation is **deleted**
+//! instead: `forgedb dev` now routes every regeneration through
+//! `commands::generate`, which is the same code path `forgedb generate` runs.
+//!
+//! What survives here is the half only the watcher can do: decide whether the
+//! file that changed is a schema worth acting on, and report a parse failure
+//! without letting a broken schema reach the generator.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -52,11 +73,17 @@ impl SchemaRegenerator {
         }
     }
 
-    /// Regenerate code from the schema file.
+    /// Check the schema and report whether a regeneration should follow.
     ///
-    /// Reads the schema, parses it, runs all four generators (Rust, TypeScript,
-    /// API, stubs) and writes the output files to the configured output
-    /// directory.  Returns a [`RegenerateResult`] describing what happened.
+    /// Reads and parses the schema file, and **writes nothing**.  Generation is
+    /// the CLI's (`forgedb dev` → `commands::generate`), so that a watch-driven
+    /// regeneration is the same emission a hand-run `forgedb generate` produces
+    /// — see this module's header for why it used to be otherwise.
+    ///
+    /// The returned [`RegenerateResult`] is what the caller's
+    /// [`RegenerateCallback`] receives: `success` means the schema parsed and the
+    /// caller may regenerate; a failure carries the lexer/parser message, and the
+    /// caller must **not** generate from a schema that did not parse.
     pub fn regenerate(&self) -> RegenerateResult {
         // Verify schema file exists
         if !self.schema_path.exists() {
@@ -103,60 +130,19 @@ impl SchemaRegenerator {
             }
         };
 
-        // Create output directory
-        if let Err(e) = fs::create_dir_all(&self.output_dir) {
-            return RegenerateResult {
-                success: false,
-                message: format!("Failed to create output directory: {}", e),
-                output_path: None,
-            };
+        // NOT `fs::create_dir_all(&self.output_dir)`: this module writes nothing,
+        // and creating the directory anyway would leave an empty `generated/`
+        // behind for a project whose resolved output is somewhere else entirely
+        // (a config `output`, or a `--output` flag — neither of which reaches
+        // this crate).
+        RegenerateResult {
+            success: true,
+            message: format!(
+                "Schema parsed ({} models) — regenerating",
+                schema.models.len()
+            ),
+            output_path: Some(self.output_dir.clone()),
         }
-
-        match self.regenerate_internal(&schema) {
-            Ok(()) => RegenerateResult {
-                success: true,
-                message: "Code regenerated successfully".to_string(),
-                output_path: Some(self.output_dir.clone()),
-            },
-            Err(e) => RegenerateResult {
-                success: false,
-                message: format!("Generation failed: {}", e),
-                output_path: None,
-            },
-        }
-    }
-
-    /// Run all generators and write output files.
-    ///
-    /// Output layout mirrors the CLI `generate all` command:
-    /// - `{output_dir}/database.rs` — Rust database implementation
-    /// - `{output_dir}/types.ts`    — TypeScript types and SDK
-    /// - `{output_dir}/api.rs`      — REST API implementation
-    /// - `{output_dir}/stubs/README.md` — Component stubs index
-    fn regenerate_internal(&self, schema: &Schema) -> Result<(), RegenerateError> {
-        // Rust database code
-        let rust_result = RustGenerator::generate(schema)
-            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
-        fs::write(self.output_dir.join("database.rs"), &rust_result.code)?;
-
-        // TypeScript types and SDK
-        let ts_result = TypeScriptGenerator::generate(schema)
-            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
-        fs::write(self.output_dir.join("types.ts"), &ts_result.code)?;
-
-        // REST API implementation
-        let api_result = ApiGenerator::generate(schema)
-            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
-        fs::write(self.output_dir.join("api.rs"), &api_result.code)?;
-
-        // Stubs index
-        let stub_result = StubGenerator::generate(schema)
-            .map_err(|e| RegenerateError::GenerationError(e.to_string()))?;
-        let stubs_dir = self.output_dir.join("stubs");
-        fs::create_dir_all(&stubs_dir)?;
-        fs::write(stubs_dir.join("README.md"), &stub_result.code)?;
-
-        Ok(())
     }
 
     /// Get the schema file path
@@ -172,3 +158,70 @@ impl SchemaRegenerator {
 
 /// Callback type for regeneration events
 pub type RegenerateCallback = Box<dyn Fn(&RegenerateResult) + Send>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "forgedb-watcher-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// #364 / #335 §16 — the guard for the deletion, asserted on the FILESYSTEM
+    /// rather than on the source.
+    ///
+    /// Four generators used to run here and write `database.rs`, `types.ts`,
+    /// `api.rs` and `stubs/README.md` into `output_dir`.  If any of them (or the
+    /// `create_dir_all` that preceded them) comes back, the directory appears
+    /// and this fails — which a grep for the generator names could not promise,
+    /// since a reintroduction under a different generator would slip through.
+    #[test]
+    fn a_clean_check_writes_nothing_at_all() {
+        let dir = scratch("writes-nothing");
+        let schema = dir.join("schema.forge");
+        fs::write(&schema, "User {\n  id: +uuid\n  email: string\n}\n").expect("write schema");
+        let out = dir.join("generated");
+
+        let result = SchemaRegenerator::new(schema.as_path(), out.as_path()).regenerate();
+
+        assert!(
+            result.success,
+            "a schema that parses must check clean: {}",
+            result.message
+        );
+        assert!(
+            !out.exists(),
+            "the watcher must not create — let alone write into — the output \
+             directory; generation belongs to `commands::generate`"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A schema that does not parse must report failure, so `forgedb dev`'s
+    /// callback can decline to regenerate from it.  Without this the deletion
+    /// above would be indistinguishable from "always say yes".
+    #[test]
+    fn a_schema_that_does_not_parse_fails_the_check() {
+        let dir = scratch("bad-schema");
+        let schema = dir.join("schema.forge");
+        fs::write(&schema, "User {\n  id: +uuid\n").expect("write schema");
+
+        let result =
+            SchemaRegenerator::new(schema.as_path(), dir.join("generated").as_path()).regenerate();
+
+        assert!(!result.success, "an unparseable schema must not check clean");
+        assert!(
+            result.message.contains("error"),
+            "the parser's own message is what reaches the user: {}",
+            result.message
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
