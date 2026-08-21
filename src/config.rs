@@ -46,6 +46,23 @@ pub struct ProjectConfig {
     /// `forgedb init` always writes the field explicitly.
     #[serde(default = "isolated_default")]
     pub isolated: bool,
+    /// How much of an app's relative path its derived names carry.
+    ///
+    /// `"minimal"` (the default) uses the shortest trailing run of path
+    /// segments that is unique among the project's apps; `"uniform"` always
+    /// uses every segment.  Only meaningful at the **project root**, because it
+    /// governs the whole app set: under `minimal`, whether `blog` needs
+    /// `services_` in front is a fact about that app's *siblings*.
+    ///
+    /// This is what replaced hash-based disambiguation, and the trade is
+    /// explicit: names became legible (`foo_services_blog-core` rather than
+    /// `schema-60acb6cba9beb3cf-core`) and stopped being **stable**.  Adding an
+    /// app can rename an existing one, which re-keys its cached packages and
+    /// changes every exported C symbol, breaking already-linked FFI consumers
+    /// until they rebuild.  `uniform` narrows that to renames caused by *moving*
+    /// a schema; it cannot eliminate them.
+    #[serde(default)]
+    pub symbol_naming: crate::naming::SymbolNaming,
 }
 
 fn isolated_default() -> bool {
@@ -65,6 +82,7 @@ impl Default for ProjectConfig {
             name: None,
             version: None,
             isolated: isolated_default(),
+            symbol_naming: crate::naming::SymbolNaming::default(),
         }
     }
 }
@@ -95,8 +113,41 @@ pub struct GenerateConfig {
     /// silently interleave their generated code.  Schema-relative makes this a
     /// per-app pattern instead.
     pub output: Option<String>,
-    /// Which targets to enable.  When absent all targets are enabled.
-    /// Valid values: `rust`, `typescript`, `api`, `stubs`.
+    /// Which targets to generate — **required, and explicit** (#335 §12).
+    ///
+    /// An absent key inside a declared `[generate]` table is an error, not
+    /// "everything": the half-declared table left the most consequential key to
+    /// be guessed, and the package prune ([`crate::cache::prunable`]) is defined
+    /// against the *declared* set, which an absence cannot state.  Write
+    /// `targets = ["all"]` for today's behavior; that is what a project with no
+    /// `[generate]` table at all takes from [`GenerateConfig::default`].
+    ///
+    /// The legal values are the CLI's #122 runtime × mode vocabulary
+    /// (maintainer decision 10), hyphen-joined where a mode is required, so one
+    /// spelling means the same thing in a config file and on the command line:
+    ///
+    /// | value | equivalent command |
+    /// |---|---|
+    /// | `all` | `generate all` |
+    /// | `rust` | `generate rust` |
+    /// | `api` | `generate api` |
+    /// | `openapi` | `generate openapi` |
+    /// | `stubs` | `generate stubs` |
+    /// | `ffi` | `generate ffi` |
+    /// | `node-sdk` / `bun-sdk` | `generate node\|bun --sdk` |
+    /// | `node-runtime` / `bun-runtime` | `generate node\|bun --runtime` |
+    /// | `python-sdk` | `generate python --sdk` |
+    /// | `python-runtime` | `generate python --runtime` |
+    /// | `go-sdk` | `generate go --sdk` |
+    /// | `go-runtime` | `generate go --runtime` |
+    /// | `rust-sdk` | `generate rust --sdk` |
+    /// | `browser-replica` | `generate browser --replica` |
+    ///
+    /// The pre-#122 spellings `typescript` and `wasm` still work and **warn**,
+    /// naming their replacements.  [`crate::targets`] is the one definition of
+    /// all of this — including the error text — so this table is a pointer, not
+    /// a second list: an unknown value is a positioned error listing the set
+    /// above, rather than the silent no-op it used to be.
     pub targets: Option<Vec<String>>,
 }
 

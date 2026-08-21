@@ -190,6 +190,59 @@ pub fn resolve_all(values: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     Ok((internal, warnings))
 }
 
+/// The cache packages a declared target set calls for (#335 §3, rule 3).
+///
+/// **Judged on the DECLARED set — `[generate].targets` — never on the target a
+/// single invocation selected.** That is the whole reason this takes a list of
+/// internal names rather than the one `resolve_target` produced: pruning against
+/// the selected set makes `forgedb generate rust` delete `napi/`, which is the
+/// reflex error here. `[generate].targets` is required and explicit since #335
+/// step 4, so the declared set is always stated.
+///
+/// The mapping is deliberately **generous**: a kind is declared if *anything*
+/// plausibly produces it. A wrongly-kept package is inert (a directory the root
+/// does not name is never built — measured); a wrongly-deleted one costs a
+/// regeneration. Fail toward keeping, exactly as [`crate::naming::PackageKind::from_dir`]
+/// does for names ForgeDB does not recognise.
+///
+/// Only the kinds `generate`/`build` own are ever returned: `transform-*` and
+/// `engine-*` are `migrate`'s, are not expressible in `[generate].targets` at
+/// all, and are kept out of `generate`'s reach by [`crate::naming::PackageKind::owner`]
+/// rather than by this list.
+pub fn declared_packages(internal: &[String]) -> Vec<crate::naming::PackageKind> {
+    use crate::naming::PackageKind;
+
+    let has = |name: &str| internal.iter().any(|t| t == name);
+
+    // `core` is the one `database.rs`, and every Rust package in the cache links
+    // it — including `server`, which is why `api` alone declares it. `go` is here
+    // because the Go runtime binding links the FFI staticlib, which links `core`.
+    let rust_side = ["rust", "api", "napi", "pyo3", "ffi", "wasm", "go"];
+
+    let mut kinds = Vec::new();
+    if rust_side.iter().any(|t| has(t)) {
+        kinds.push(PackageKind::Core);
+    }
+    if has("api") {
+        kinds.push(PackageKind::Server);
+    }
+    if has("napi") {
+        kinds.push(PackageKind::Napi);
+    }
+    if has("pyo3") {
+        kinds.push(PackageKind::Pyo3);
+    }
+    // The Go runtime binding has no cargo package of its own: it links the FFI
+    // staticlib, so declaring `go` declares `ffi`.
+    if has("ffi") || has("go") {
+        kinds.push(PackageKind::Ffi);
+    }
+    if has("wasm") {
+        kinds.push(PackageKind::Wasm);
+    }
+    kinds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +343,109 @@ mod tests {
 
         assert_eq!(internal, vec!["typescript".to_string(), "rust".to_string()]);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    // -- declared_packages (#335 §3 rule 3) ---------------------------------
+
+    use crate::naming::{PackageKind, PruneOwner};
+
+    /// `targets = ["all"]` must declare every kind `generate` can prune, or the
+    /// first `generate` under an `all` config reaps a package it just emitted.
+    #[test]
+    fn all_declares_every_generate_owned_package() {
+        let (internal, _) = resolve_all(&["all".into()]).unwrap();
+        let declared = declared_packages(&internal);
+
+        for kind in [
+            PackageKind::Core,
+            PackageKind::Server,
+            PackageKind::Napi,
+            PackageKind::Pyo3,
+            PackageKind::Ffi,
+            PackageKind::Wasm,
+        ] {
+            assert!(declared.contains(&kind), "`all` does not declare {}", kind.dir());
+        }
+    }
+
+    /// Nothing expressible in `[generate].targets` may declare — or reach —
+    /// a package `migrate` owns.
+    #[test]
+    fn no_target_value_declares_a_migrate_owned_package() {
+        let (internal, _) = resolve_all(&["all".into()]).unwrap();
+        for kind in declared_packages(&internal) {
+            assert_eq!(
+                kind.owner(),
+                PruneOwner::GenerateBuild,
+                "{} is not generate's to declare",
+                kind.dir()
+            );
+        }
+    }
+
+    #[test]
+    fn a_rust_only_app_declares_only_core() {
+        let (internal, _) = resolve_all(&["rust".into()]).unwrap();
+        assert_eq!(declared_packages(&internal), vec![PackageKind::Core]);
+    }
+
+    /// The Go runtime binding has no cargo package of its own — it links the FFI
+    /// staticlib. Declaring `go-runtime` therefore has to declare `ffi`, or the
+    /// prune deletes the library the Go build links against.
+    #[test]
+    fn the_go_runtime_declares_the_ffi_package_it_links() {
+        let (internal, _) = resolve_all(&["go-runtime".into()]).unwrap();
+        let declared = declared_packages(&internal);
+        assert!(declared.contains(&PackageKind::Ffi), "{declared:?}");
+        assert!(declared.contains(&PackageKind::Core), "{declared:?}");
+    }
+
+    /// An API-only app still declares `core`: `server` links it, and a `server`
+    /// whose `core` was pruned does not build.
+    #[test]
+    fn an_api_app_declares_core_and_server() {
+        let (internal, _) = resolve_all(&["api".into()]).unwrap();
+        let declared = declared_packages(&internal);
+        assert!(declared.contains(&PackageKind::Core), "{declared:?}");
+        assert!(declared.contains(&PackageKind::Server), "{declared:?}");
+    }
+
+    /// `config.rs`'s doc for `[generate].targets` is the value list a user
+    /// reads, and it documented **four** values against ten recognised until
+    /// #335 step 4 — the exact drift maintainer decision 10 exists to end.
+    ///
+    /// Anchored on [`VOCABULARY`]'s rows rather than on a count, so adding a row
+    /// without documenting it fails here rather than shipping a value nobody can
+    /// find.
+    #[test]
+    fn every_vocabulary_row_is_documented_where_users_read_it() {
+        let config_rs = include_str!("config.rs");
+        let doc: String = config_rs
+            .lines()
+            .filter(|l| l.trim_start().starts_with("///"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for row in VOCABULARY {
+            assert!(
+                doc.contains(&format!("`{}`", row.config)),
+                "`{}` is legal but undocumented in config.rs",
+                row.config
+            );
+        }
+        for (old, _) in DEPRECATED {
+            assert!(
+                doc.contains(&format!("`{old}`")),
+                "the deprecated spelling `{old}` is accepted but undocumented in config.rs"
+            );
+        }
+    }
+
+    /// An SDK-only app produces no cargo package at all, so it declares none —
+    /// and the prune must therefore be able to empty a container.
+    #[test]
+    fn an_sdk_only_app_declares_nothing() {
+        let (internal, _) = resolve_all(&["node-sdk".into(), "python-sdk".into()]).unwrap();
+        assert!(declared_packages(&internal).is_empty());
     }
 }
