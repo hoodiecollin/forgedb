@@ -1532,7 +1532,6 @@ name = "forgedb-watcher"
 version = "0.2.2"
 dependencies = [
  "crossbeam-channel",
- "forgedb-codegen",
  "forgedb-parser",
  "notify",
  "tracing",
