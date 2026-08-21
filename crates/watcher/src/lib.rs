@@ -147,7 +147,6 @@
 //! # Related Crates
 //!
 //! - [`forgedb-parser`](../forgedb_parser) - Parses schema files
-//! - [`forgedb-codegen`](../forgedb_codegen) - Code generators wired by this crate
 //! - [`forgedb`](../../) - Main CLI that uses this watcher
 //!
 //! # Dependencies
