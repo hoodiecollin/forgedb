@@ -169,7 +169,10 @@ These keep the two axes clean and the derived views trivial. **Enforce them on e
 `pm-playbook check` does, and each rule id below is what it reports.
 
 - **Exactly one type label per work item** (PM010). Not zero, not two. An epic is a container
-  rather than work, and a gate takes its type from its own label, so neither needs one.
+  rather than work, a gate takes its type from its own label, and a `release-gate` is a release
+  *obligation* rather than work with a design→plan→impl arc, so none of the three needs one. A
+  `release-gate` may carry a type anyway; it is simply not required to, and PM013 never asks one
+  for a gate set it could not fill.
 - **`experiment` ⊕ milestone** (PM003). A spike feeds the spine; it never rides it (§4).
 - **`release-gate` ⇒ milestone** (PM004), and **`release-gate` ⊕ `experiment`** (PM005). A gate
   blocks a *specific* tag, so it is meaningless without the milestone it blocks — and it is

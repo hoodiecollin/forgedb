@@ -1,13 +1,13 @@
 {
   "package": "@hoodiecollin/pm-playbook",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "migratedThrough": "2.0.0",
   "files": {
     "AGENT.md": "ce79df856480ae8ace8bb8efcaeb0e9964d97f5b02e6b0147aa3c25933ce9bc1",
-    "PLAYBOOK.md": "9cf57d9218a46f802286d2273ef6910d29e5578fd00fb523d89676fad15ff934",
+    "PLAYBOOK.md": "2d53d1a03ad5d7692cbd5e292a974dd5e675ce2175c7220e4aa92a997ecf03f6",
     "reference/01-two-axis-core.md": "bd2bb4e753be8c7951e676d300fe5b68e1c2310ac9aad29102135fba68aa0b80",
     "reference/02-commitment-ladder.md": "841209aec92aa9ba8fa6dacc010f985b16bd0e8331641d8e8e5217dc02466cc5",
-    "reference/03-labels.md": "4375a31195516c29f3cffd2d9f265f4166b51e4918737ff588ac58a94ecdcc0b",
+    "reference/03-labels.md": "98a12eb3944d57bd2d1c20bb0fe5737e5fccee91695f625030e08f073d121195",
     "reference/04-experiments.md": "0e713adfc694cea0c533f591b0105187edc8eda4cafa76f9c97c1d8071088e9c",
     "reference/05-release-spine.md": "643333a90b6ba219bbf035e9d0b2f4f430c849ba83de0876ae99badb17ec173e",
     "reference/06-surfaces.md": "cd46918f11b251f92301aa81347d1bcdaa341c3f9629fd0eaf03ada6a5f8decc",
