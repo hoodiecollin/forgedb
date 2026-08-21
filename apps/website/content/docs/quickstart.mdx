@@ -61,26 +61,29 @@ forgedb --version      # forgedb 0.2.0
 ## 2. Scaffold a project
 
 ```bash
-forgedb init myblog --template blog --rust
+forgedb init myblog --template blog
 cd myblog
 ```
 
-`--template` accepts `blog`, `ecommerce`, `todo`, or `blank` (the default). `--rust`
-includes the Rust backend scaffold. `init` writes:
+`--template` accepts `blog`, `ecommerce`, `todo`, or `blank` (the default). `init` writes:
 
 ```
 myblog/
   schema.forge          # your schema (the single source of truth)
-  forgedb.toml          # project + database + api + codegen config
-  Cargo.toml            # pins the schema-agnostic substrate crates
-  src/main.rs           # env-driven axum server (tenancy, JWT, graceful shutdown)
-  Dockerfile            # multi-stage build → slim runtime
+  forgedb.toml          # project + generate targets + runtime/storage config
+  generated/            # generated code — reviewed and committed
+  data/                 # this app's data directory
+  Dockerfile            # installs the pinned CLI and runs it
   .dockerignore
   docker-compose.yml
   deploy/               # systemd unit + env file
   .gitignore
   README.md
 ```
+
+There is no `Cargo.toml` and no `src/main.rs`: ForgeDB compiles the generated Rust in its
+own build cache, and the env-driven axum server is one of the artifacts
+[`forgedb build`](/docs/cli/build/) produces and reports the path of.
 
 The blog template's `schema.forge`:
 
@@ -178,22 +181,35 @@ generation, not a runtime query engine.
 ## 4. Build
 
 ```bash
-cargo build
+forgedb build
 ```
 
-The generated app links only the small, **schema-agnostic** substrate crates
-(`forgedb-storage`, `forgedb-wal`, `forgedb-types`, …) that `init` pinned in `Cargo.toml`;
-they resolve from crates.io. See the substrate version matrix in
-[installation](/docs/installation/).
+ForgeDB compiles the generated code in its own build cache — a cargo workspace under
+`~/.forgedb/projects/<project>/` — and prints where each artifact landed. Nothing is
+compiled inside your project, which contains no `Cargo.toml`.
+
+The generated code links only the small, **schema-agnostic** substrate crates
+(`forgedb-storage`, `forgedb-wal`, `forgedb-types`, …), resolved from crates.io. See the
+substrate version matrix in [installation](/docs/installation/), and
+[`forgedb build`](/docs/cli/build/) for `--plan`, `--report` and `--print-artifact`.
 
 ## 5. Run the server
 
-The generated `main.rs` is an axum server configured entirely from the environment:
+The generated server is an axum binary configured entirely from the environment. Ask
+ForgeDB where it is rather than composing the path:
 
 ```bash
-FORGEDB_PORT=3000 FORGEDB_DATA=./data ./target/debug/myblog
-# INFO myblog: ForgeDB serving tenant=None data_root=./data addr=127.0.0.1:3000
+SERVER="$(forgedb build --print-artifact server)"
+FORGEDB_PORT=3000 FORGEDB_DATA="$PWD/data" "$SERVER"
+# INFO myblog: ForgeDB serving tenant=None data_root=/…/myblog/data addr=127.0.0.1:3000
 ```
+
+<Callout type="note" title="Pass an absolute FORGEDB_DATA">
+The default data root is relative, and the server refuses to open a database inside
+ForgeDB's build cache — that directory holds derived artifacts only and may be deleted at
+any time. If you `cd` into the cache to poke around, pass an absolute `FORGEDB_DATA` or
+run from your project directory.
+</Callout>
 
 Key environment variables:
 

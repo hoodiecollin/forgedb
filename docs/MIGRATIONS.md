@@ -46,7 +46,8 @@ An additive change is one existing rows can satisfy without a value being invent
 # 2. Record the change (baselines the lineage on first run):
 forgedb migrate create "add note field" --auto --schema schema.forge
 # 3. Regenerate and rebuild your app:
-forgedb generate
+forgedb generate all --schema schema.forge
+forgedb build --schema schema.forge
 # 4. Restart. Existing rows are backfilled with defaults on first open.
 ```
 
@@ -85,49 +86,74 @@ forgedb migrate create "qty to string" --auto --schema schema.forge
 #    returns it reshaped for the next version. Fill in every TODO.
 
 # 3. Regenerate your app (its EXPECTED_SCHEMA_VERSION advances to the new version):
-forgedb generate
+forgedb generate all --schema schema.forge
 
-# 4. With the app STOPPED, migrate the data in one step:
-forgedb migrate up --from 1 --to 2 --src ./data --dest ./data-migrated
+# 4. Build the transformer for the range, then run it with the app STOPPED:
+forgedb migrate build --from 1 --to 2 --schema schema.forge
+forgedb migrate run   --from 1 --to 2 --schema schema.forge \
+  --src ./data --dest ./data-migrated
 
 # 5. Point the regenerated app at ./data-migrated.
 ```
 
-`migrate up` generates the transformer crate for the version range, `cargo build`s it, and
-runs it over the data dir. It writes a **fresh destination** and leaves the source untouched,
-so the original *is* your rollback. `--from` defaults to the version detected from the source
-manifests and `--to` to the lineage's current version, so `forgedb migrate up --src ./data
---dest ./data-migrated` usually suffices.
+`migrate build` emits the transformer crate for the version range and compiles it; `migrate run`
+executes it over the data dir. It writes a **fresh destination** and leaves the source untouched,
+so the original *is* your rollback.
+
+**Every `migrate` subcommand takes `--schema`, and it is required.** Nothing is resolved from the
+current directory: the schema names the app, the app decides which project owns it, and the
+project decides which build cache the transformer is compiled in. There is no fallback to a
+`migrations/transform` beside you — a fallback would emit a cargo package under whatever workspace
+your shell happens to be standing in, which is the defect (#328) that this ownership change exists
+to remove.
+
+`--from`/`--to` are required on **both** commands, and `run` needs them for the same reason
+`build` does: one app can have several built transformers, one per range, and the range is how
+`run` names the one to execute.
 
 ### How the transformer works
 
-For a `--from B --to G` range, ForgeDB emits a self-contained crate (`migrations/transform/`):
-one typed module per version (`vN.rs`, each carrying its own version open-guard), any frozen
-authored bodies embedded verbatim, and a `main.rs` that is a **fixed straight-line chain** of
-named `transform_vN_to_vM` hop functions — no runtime step interpreter. Each hop reads every
-row through the `vN` typed structs, applies the baked structural ops then the authored
-transform, and writes through `vM`'s `insert` (which preserves record ids, so foreign keys stay
-valid). Multi-hop ranges replay through temp dirs and publish with a single atomic rename.
+For a `--from B --to G` range, ForgeDB emits a self-contained crate — one typed module per version
+(`vN.rs`, each carrying its own version open-guard), any frozen authored bodies embedded verbatim,
+and a `main.rs` that is a **fixed straight-line chain** of named `transform_vN_to_vM` hop functions
+— no runtime step interpreter. Each hop reads every row through the `vN` typed structs, applies the
+baked structural ops then the authored transform, and writes through `vM`'s `insert` (which
+preserves record ids, so foreign keys stay valid). Multi-hop ranges replay through temp dirs and
+publish with a single atomic rename.
+
+**The crate is a member of your project's build cache**, at
+`~/.forgedb/projects/<id>/apps/<hash>/transform-<from>-<to>/`, sharing one `Cargo.lock` and one
+`target/` with every other app in the project. It is **range-stamped**, so building a second range
+does not overwrite the first, and `migrate build` prints the path it wrote plus the binary it
+produced. What stays in your tree is the *lineage* — `migrations/<id>_*.json`,
+`migrations/schemas/v<n>.forge` and any authored `migrations/<id>/transform.rs` — because that is
+the part you author and commit.
 
 The crate depends only on your app's substrate (storage/types/etc.) — never on
 `forgedb-parser` or `forgedb-migrations`, and it never parses a `.forge` at runtime.
 
 ---
 
-## Per-tenant sweep
+## Many tenants
 
-Under multi-tenancy, each tenant is an independent data dir under one root. `migrate up`
-sweeps them in one command:
+Under multi-tenancy each tenant is an independent data dir under one root, and each one is
+migrated the same way any single dir is. Build the transformer once, then run it per tenant:
 
 ```bash
-forgedb migrate up --tenant-root ./tenants --to 2
-# migrates ./tenants/<t> → ./tenants/<t>-migrated-v2 for every tenant data dir
+forgedb migrate build --from 1 --to 2 --schema schema.forge
+
+for t in ./tenants/*/; do
+  forgedb migrate run --from 1 --to 2 --schema schema.forge \
+    --src "$t" --dest "${t%/}-migrated-v2" || echo "FAILED: $t"
+done
 ```
 
-The sweep builds the transformer once and runs it per tenant independently: a tenant that
-fails (or is at an unexpected version — the bin's open-guard refuses it) is reported and
-skipped with its source unchanged, and the command exits non-zero if any tenant failed. Use
-`--dest-suffix` to change the output naming.
+Each run is independent: a tenant at an unexpected version is refused by the transformer's own
+open-guard with its source unchanged, so a failure stops that tenant and no other.
+
+**There is no built-in sweep command.** `forgedb migrate up --tenant-root` used to do this in one
+invocation and was removed along with the rest of `migrate up`; restoring the sweep — with version
+auto-detection and per-tenant failure accounting — is tracked as **#373**.
 
 ---
 
@@ -136,8 +162,8 @@ skipped with its source unchanged, and the command exits non-zero if any tenant 
 For a one-off change where you would rather not build a transformer, you can still dump with
 the old binary and reload into a fresh dir through `Database::create_<model>` (ids preserved,
 full integrity enforced), transforming each row in app code. This is the same typed replay the
-generated transformer automates; prefer `migrate up` for anything you will run more than once
-or across many tenants.
+generated transformer automates; prefer the generated transformer for anything you will run more
+than once or across many tenants.
 
 ---
 
@@ -151,22 +177,24 @@ The distinction is the whole point, because the two failures have different reme
 
 | mismatch | what happened | remedy |
 |---|---|---|
-| `format_version` (schema serial) | *your schema* changed since the dir was written | `forgedb migrate up` — replay your lineage |
+| `format_version` (schema serial) | *your schema* changed since the dir was written | `forgedb migrate build` + `migrate run` — replay your lineage |
 | `engine_version` | *ForgeDB* changed its byte format; your schema is fine | `forgedb migrate engine` |
 
 Conflating them would send you to regenerate a schema that is already correct. An engine bump
-changes no `.forge`, so it produces no lineage hop at all — `forgedb migrate up` would run nothing.
+changes no `.forge`, so it produces no lineage hop at all — the lineage transformer would run
+nothing.
 
 ```bash
 # with the app STOPPED
-forgedb migrate engine --src ./data --dest ./data-gen2
+forgedb migrate engine --src ./data --dest ./data-gen2 --schema schema.forge
 ```
 
 - `--dest` **must not already exist** (or must be empty) — it is materialized, not written into.
 - `--src` is **left untouched**; it is your rollback. Nothing migrates in place.
-- The hop crate is generated (default `migrations/engine`) and built with `cargo build --release`
-  as part of the command. Generated, not schema-blind, on purpose: a nullable, arrayed, or
-  struct-nested timestamp is an opaque fixed-byte blob no schema-agnostic column pass can find.
+- The hop crate is generated into your project's build cache as `engine-<from>-<to>/` and compiled
+  there as part of the command — the same place, and the same shared `target/`, as the lineage
+  transformer. Generated, not schema-blind, on purpose: a nullable, arrayed, or struct-nested
+  timestamp is an opaque fixed-byte blob no schema-agnostic column pass can find.
 - Already at the current generation → no-op. Stamped *newer* than your CLI → refused, telling you
   to upgrade the CLI rather than migrate backwards.
 
@@ -189,14 +217,17 @@ upgrade steps live in [UPGRADING.md](UPGRADING.md).
 | Command | Purpose |
 |---|---|
 | `forgedb migrate create <desc> --auto --schema <file>` | Diff against the snapshot; record + classify the change; scaffold any authored body. |
-| `forgedb migrate create <desc>` | Create an empty manual migration template. |
-| `forgedb migrate status` | Show applied / pending migrations. |
-| `forgedb migrate up --src <data> --dest <migrated> [--from F --to T]` | Build the transformer + run it over one data dir. |
-| `forgedb migrate up --tenant-root <root> [--to T]` | Per-tenant sweep. |
-| `forgedb migrate build --from F --to T [--output <dir>]` | (Lower-level) generate + compile the transformer only. |
-| `forgedb migrate run --src <data> --dest <migrated> [--bin-dir <dir>]` | (Lower-level) run an already-built transformer. |
-| `forgedb generate transform --from F --to T` | (Lower-level) emit the transformer crate without compiling. |
-| `forgedb migrate engine --src <data> --dest <new-dir>` | Carry a dir across a ForgeDB **engine** byte-format generation (orthogonal to the schema serial). |
+| `forgedb migrate create <desc> --schema <file>` | Create an empty manual migration template. |
+| `forgedb migrate status --schema <file>` | Show applied / pending migrations. |
+| `forgedb migrate build --from F --to T --schema <file>` | Generate + compile the transformer for one range. |
+| `forgedb migrate run --from F --to T --src <data> --dest <migrated> --schema <file>` | Run the transformer built for that range. |
+| `forgedb generate transform --from F --to T --schema <file>` | (Lower-level) emit the transformer source without compiling. |
+| `forgedb migrate engine --src <data> --dest <new-dir> --schema <file>` | Carry a dir across a ForgeDB **engine** byte-format generation (orthogonal to the schema serial). |
+
+`--schema` is required on every row above. Two flags that used to appear here are **gone, and
+error rather than no-op**: `migrate build -o/--output` and `migrate run --bin-dir` both named a
+directory for a crate ForgeDB now places itself. `forgedb migrate up` is gone with them — its
+one-command wrapper is the two rows above it, and its per-tenant sweep is **#373**.
 
 ---
 
@@ -207,4 +238,6 @@ upgrade steps live in [UPGRADING.md](UPGRADING.md).
   today; an in-process `compact()` renumbers rows within an epoch).
 - Cheap in-place byte-op hops (drop/rename without an O(rows) typed rewrite) — a perf
   optimization over uniform typed replay.
-- Online (live-writer) migration — `migrate up` is offline/exclusive-writer.
+- Online (live-writer) migration — the transformer is offline/exclusive-writer.
+- A one-command lineage migration with version auto-detection and a per-tenant sweep (the removed
+  `migrate up`) — **#373**.

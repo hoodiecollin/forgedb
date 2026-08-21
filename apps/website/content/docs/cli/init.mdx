@@ -1,16 +1,20 @@
 ---
 title: "forgedb init"
-description: "Scaffold a new ForgeDB project — schema, config, Rust server, and deploy files."
+description: "Scaffold a new ForgeDB project — schema, config, gitignore, and the deploy files that drive the CLI."
 purpose: "reference"
 ---
 Scaffold a new ForgeDB project directory: a starter `schema.forge`, a `forgedb.toml`, a
-`.gitignore`, a `README.md`, and (unless `--api-only`) an env-driven Rust server plus the
-container and systemd deploy files.
+`.gitignore`, a `README.md`, and the container + systemd deploy files.
+
+**`init` scaffolds no cargo package.** There is no `Cargo.toml` and no `src/main.rs`,
+because the generated Rust is compiled in ForgeDB's own build cache —
+[`forgedb build`](/docs/cli/build/) prints where the artifacts landed. The generated
+server binary is one of those artifacts; you do not own a crate that produces it.
 
 ## Synopsis
 
 ```bash
-forgedb init <project_name> [--template <name>] [--rust] [--api-only]
+forgedb init <project_name> [--template <name>] [--isolated | --no-isolated]
 ```
 
 `<project_name>` becomes the new directory; `init` refuses to run if it already exists.
@@ -21,8 +25,6 @@ forgedb init <project_name> [--template <name>] [--rust] [--api-only]
 |---|---|---|
 | `<project_name>` | string (required) | Project directory to create. |
 | `-t`, `--template <name>` | string (blank) | Starter schema: `blog`, `ecommerce`, `todo`, or `blank`. An unknown value falls back to `blank` with a warning. |
-| `--rust` | bool (false) | Include the Rust backend scaffold (also included by default unless `--api-only`). |
-| `--api-only` | bool (false) | Generate the API scaffold only — skip the Rust server files and deploy artifacts. |
 | `--isolated` | bool | The new schemas form their own project, even inside an existing one. |
 | `--no-isolated` | bool | Join the enclosing project, sharing its build cache and lockfile. |
 
@@ -30,29 +32,61 @@ With neither grouping flag, `init` joins an enclosing project when it finds one 
 which — scaffolding inside an existing project is how you add an app, not an error. See
 [`[project]`](/docs/config/generate/).
 
-<Callout type="note" title="What gets created">
-Every project gets `schema.forge`, `forgedb.toml`, `.gitignore`, `README.md`, and a
-`generated/` + `data/` layout. Unless `--api-only`, `init` also writes `src/main.rs` (a
-12-factor, env-driven, process-per-tenant server), a `Cargo.toml` pinning the substrate
-crates, a multi-stage `Dockerfile`, `.dockerignore`, `docker-compose.yml`, and a
-`deploy/` directory with a systemd unit + env file.
+<Callout type="warning" title="--rust and --api-only were removed">
+Both selected a *generation* target, which is now declared once in `forgedb.toml` as
+[`[generate].targets`](/docs/config/generate/). Passing either is an error naming the
+key, rather than a flag that reads as applied and is not. `targets` is required, and
+`["all"]` is what `init` writes.
+</Callout>
+
+## What gets created
+
+```text
+my-app/
+  schema.forge          starter schema (from --template)
+  forgedb.toml          [project], [generate].targets, and the runtime knobs
+  .gitignore            generated/ is COMMITTED; data/ and *.a are not
+  README.md
+  generated/            written by `forgedb generate`
+  data/db/ data/wal/    the app's data directory
+  Dockerfile            multi-stage, installs the pinned CLI and runs it
+  .dockerignore
+  docker-compose.yml
+  deploy/app.service    systemd unit
+  deploy/app.env
+  deploy/README.md
+```
+
+<Callout type="note" title="The deploy files drive the CLI, not cargo">
+The Dockerfile copies your schema and `forgedb.toml`, installs a pinned `forgedb`, then
+runs `forgedb generate` + `forgedb build` and copies out the path
+`forgedb build --print-artifact server` reports. It never runs `cargo build` on a crate
+of yours, because there is no crate of yours.
+</Callout>
+
+<Callout type="note" title="generated/ is committed">
+The scaffolded `.gitignore` no longer ignores `/generated/` wholesale. That directory is
+source you review and ship — `database.rs`, `api.rs`, `types.ts`, `openapi.json`, the
+client SDKs, the Go package. The one compiled artifact ForgeDB delivers into the tree is
+the static archive the Go binding links, and that is ignored by extension
+(`/generated/**/*.a`).
 </Callout>
 
 ## Examples
 
-Scaffold a blog project and generate its Rust database:
+Scaffold a blog project and build it:
 
 ```bash
 forgedb init my-blog --template blog
 cd my-blog
-forgedb generate rust
+forgedb generate
 forgedb build
 ```
 
-Scaffold an API-only project (no Rust server or deploy files):
+Add a second app inside an existing project (sharing its cache and lockfile):
 
 ```bash
-forgedb init my-api --template ecommerce --api-only
+forgedb init reporting --no-isolated
 ```
 
 ## Next steps

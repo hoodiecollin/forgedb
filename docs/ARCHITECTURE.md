@@ -42,13 +42,23 @@ forgedb-validation    semantic checks (types, relations, directives)
    ▼
 forgedb-codegen       one generator per artifact:
    ├─ RustGenerator        → database.rs   (storage, CRUD, indexes, relations, txns)
-   ├─ TypeScriptGenerator  → types.ts      (typed SDK client)
    ├─ ApiGenerator         → api.rs        (axum REST + WS routes)
+   ├─ CorePackage          → core/         (database.rs as a library crate — everything links it)
+   ├─ ServerPackage        → server/       (api.rs + a generated main.rs)
+   ├─ Napi/Pyo3/Ffi/Wasm   → the four wrapper packages over core/
+   ├─ GoGenerator          → go/           (cgo source over the ffi staticlib)
+   ├─ TypeScriptGenerator  → types.ts      (typed SDK client)
    ├─ StubGenerator        → placeholder stubs README  (no UI/component codegen today)
    ├─ OpenApiGenerator     → openapi.json  (offline OpenAPI 3.1 document)
-   ├─ WasmGenerator        → replica/*     (browser read-replica; opt-in)
-   └─ TransformGenerator   → migrations/transform/*  (offline data migration bin)
+   ├─ {Rust,Python,Go}SdkGenerator → the three REST client SDKs (opt-in)
+   ├─ TransformGenerator   → transform-<a>-<b>/  (offline data-migration bin)
+   └─ EngineGenerator      → engine-<a>-<b>/     (engine byte-format hop bin)
 ```
+
+**The output has two destinations, and which one a file goes to is not a preference.** Every
+Rust file ForgeDB compiles is written into the project's build cache; the output directory
+holds the text a user reads, commits and imports, plus a read-only mirror of
+`database.rs`/`api.rs`. See [What it builds](#what-it-builds-and-who-runs-cargo).
 
 Rust output is built with `quote!` + `prettyplease` and snapshot-tested with `insta`
 (`crates/codegen/tests/`). **Snapshot pass ≠ output compiles** — codegen changes are also
@@ -109,7 +119,9 @@ once per *app*.
   Cargo.toml            # the workspace ROOT — virtual, rewritten in full each time
   Cargo.lock            # one resolution shared by every app
   target/               # one target dir shared by every app
-  apps/<member-hash>/   # one member per app
+  apps/<member-hash>/   # one CONTAINER per app — a marker file, and no manifest
+    core/ server/ napi/ pyo3/ ffi/ wasm/        # the members are one level deeper
+    transform-<a>-<b>/ engine-<a>-<b>/
 ```
 
 - **A member path is a pure function of `(project id, project-relative schema path)`**, so
@@ -138,7 +150,136 @@ once per *app*.
   scoped by #343 §4, and nothing may depend on the lockfile surviving.
 - **A data root that resolves inside the cache is refused** (C4). The trap is not a bad
   decision but a relative default: `[tenant].root` defaults to `"data"`, so running from
-  inside the cache dir puts a database there without anyone choosing it.
+  inside the cache dir puts a database there without anyone choosing it. The refusal is
+  **generated code in the server's own `main.rs`**, not documentation: the population that
+  would hit it is exactly the population following a path ForgeDB printed.
+
+---
+
+### What it builds, and who runs cargo
+
+`src/naming.rs` · `src/commands/build/driver.rs` · `crates/codegen/src/{core_pkg,server_pkg}.rs`
+
+#335 moved one more thing behind the CLI: **ForgeDB owns the build.** `forgedb build` used to
+run a bare `cargo build` in the current directory and was right by coincidence in exactly one
+scaffold shape — point it at a directory holding an unrelated crate and it compiled *that*,
+printed `✓ Compiled database`, and exited 0. `forgedb init` no longer scaffolds a cargo package
+at all, and there is nothing left for a user to `cargo build` by hand.
+
+**One app becomes a layered set of packages, not one crate**, each a member of the project
+workspace above:
+
+| Package | Target | Emitted when | Holds |
+|---|---|---|---|
+| `core/` | rlib | any Rust target is declared | the one `database.rs`, verbatim as `src/lib.rs` |
+| `server/` | bin | the API target is declared | `api.rs` + a generated `main.rs` |
+| `napi/` `pyo3/` `ffi/` `wasm/` | cdylib (`ffi` also staticlib) | that runtime is declared | the wrapper only |
+| `transform-<a>-<b>/` `engine-<a>-<b>/` | bin | `migrate build` / `migrate engine` | version-stamped databases |
+
+**Layering is a correctness property, not a build-time optimization.** Before it, five code
+paths emitted `database.rs` and two of them emitted a *different* database: `generate_all`
+threaded the app's `GenConfig` while the four binding arms called
+`generate_with_schema_version`, i.e. `GenConfig::DEFAULT`. Under default config all five are
+byte-identical, which is why it went unnoticed — set `[storage] fsync = "never"` and one
+`generate` run wrote two databases with different durability semantics. With one `core` that
+every wrapper links, the divergence is *unrepresentable* rather than merely fixed. The wrappers
+pin **zero** substrate crates and reach the substrate through `core`'s re-exports, which is what
+makes their `Uuid`/`ColumnExport` types genuinely unify instead of happening to resolve to the
+same version in one lockfile.
+
+The two class-C packages deliberately **do not** link `core`: a hop must be pinned to the
+version range it was planned for, not to whatever the current schema happens to be.
+
+**Every name is derived, in one place** (`src/naming.rs`): `<slug>-<hash>-<kind>` for packages
+and bins, and a per-app prefix for the FFI C symbols. Uniqueness rests on the member hash and
+the kind; the slug is legibility, so `Compiling blog-3f2a…-core` names the app. Two forces make
+this non-optional. Cargo package names cannot begin with a digit and six of sixteen hex digits
+are, so a bare `<hash>-<kind>` scheme breaks for roughly three apps in eight — hence a slug
+forced to start with a letter. And cargo only *warns* on a duplicate artifact name, exits 0 and
+leaves one file, which is how one app's `transform/` and `engine/` shipped declaring the same
+bin: the CLI could run the wrong hop over a user's data at exit 0. ForgeDB refuses what cargo
+tolerates — a `cargo metadata --no-deps` pass collects every bin/cdylib/staticlib name before
+any compile, and a duplicate is a hard error naming both packages.
+
+**The member set is derived by a scan of the cache**, expanding each live container into the
+subdirectories that hold a `Cargo.toml`. This is not the downward walk of the *user's* tree the
+epic rejects: it is one `read_dir` per live container, on the same axis `live_members` already
+walked. A declared set cannot work (generating app A cannot know app B's targets); a recorded
+set is the second record `write_workspace_root` exists to refuse; a glob detonates on one stray
+directory. Two ordering rules follow, and cargo's failure modes are what force them:
+
+- **Reserve before emission, render the root after.** A root rendered from a scan *before*
+  anything is written lists the previous run's packages, so an app's first `generate` produces a
+  root without its own packages. `place()` therefore split into `reserve()` (make the container,
+  before emission) and `sync_root()` (scan, expand, render, after).
+- **De-list before deleting.** A member the root names but that does not exist is
+  **project-wide fatal** — every app in the project, not just the one being pruned. A package on
+  disk that the root does not name is inert. So a prune rewrites the root first and deletes
+  after, and the prune judges the **declared** target set (`[generate].targets`, which is why it
+  is required) rather than the target one invocation selected — otherwise `generate rust` would
+  delete `napi/`.
+
+`default-members` is derived by **filtering the already-computed `members` vector in the same
+function**, excluding `wasm`/`transform-*`/`engine-*` so a bare `cargo build` at the cache root
+does not fail on the replica's `wasm32`-only imports. Two derivations is how a skew happens, and
+a `default-members` that is not a subset of `members` is project-wide fatal.
+
+**The driver is the only thing that runs cargo** (`src/commands/build/driver.rs`), split into a
+pure `plan()` + `parse_artifacts()` and an impure `execute()`. `forgedb build --plan` prints the
+invocations and compiles nothing, which is both the C7 answer ("show me what you are about to run
+in a directory I cannot see") and the seam that makes the driver testable without mocking cargo —
+mocking it would encode the same misunderstanding of cargo the change exists to fix.
+
+- **One invocation per target triple**, not per package: `--target` is invocation-wide, so a
+  package set containing the replica cannot be expressed in one call. The split is on the target
+  axis, which is forced; splitting per package would forfeit the shared graph.
+- **`[profile.*]` is never emitted into a member manifest**, because cargo silently ignores it
+  there (`warning: profiles for the non root package will be ignored`) — three shipped scaffolds
+  carried one that read as applied and was not. The profile floor lives on the invocation instead:
+  every call carries `--config 'profile.release.panic="unwind"'`, which **beats** a machine-wide
+  `$CARGO_HOME/config.toml` that would otherwise turn every FFI panic into a process abort, and
+  the wasm32 call alone carries the whole-graph `opt-level="s"`. The flag form is chosen over the
+  environment variable because it is visible in what `--plan` prints.
+- **Artifact paths are read out of cargo's JSON message stream and existence-checked**, never
+  composed by joining `target/release/…` — `CARGO_TARGET_DIR` and `[build] target-dir` move it
+  machine-wide, which is #292. Kind matters: an rlib reports both `.rlib` and `.rmeta`, and `ffi`
+  reports three filenames, so Go delivery has to filter for the **staticlib** specifically.
+
+**Where generation writes.** Every Rust file ForgeDB compiles goes to the cache, and the cache
+copy is the only one a ForgeDB-driven build reads. `[generate].output` keeps its meaning and
+holds the text a user reads, commits and imports — `types.ts`, `openapi.json`, `stubs/`, the REST
+SDKs, `go/` — plus a **mirror** of `database.rs`/`api.rs` written from the *same* `GeneratedCode`
+value that wrote the cache copy. One value, two writes: two writes of one value cannot drift,
+which is precisely how the shipped `generated/database.rs` vs `generated/ffi/src/database.rs`
+disagreement happened.
+
+Two rules keep that honest:
+
+- **Nothing in the cache is user-editable**, and every cache manifest is rewritten in full on
+  every generate. The only-when-absent rule that protects a user's `go.mod` is exactly wrong for
+  a file in a directory the user never opens, where a stale substrate pin would never be reached
+  by a CLI upgrade. For the same reason the project records the CLI version that wrote it and
+  **drops `Cargo.lock` when that changes** — a rewritten pin re-resolves, but a newly published
+  patch under an unchanged pin does not.
+- **ForgeDB never leaves a Rust file it generated in a place it has stopped writing.** When the
+  four wrapper directories left `output/`, the files there would otherwise have stayed frozen,
+  never regenerated, and **still compilable** — green CI against a database that no longer tracks
+  the schema. Instead the file's contents are replaced by a `compile_error!` naming what happened,
+  idempotently, leaving the user-editable scaffolds beside it untouched.
+
+**Go links the FFI engine statically**, and that is the one delivery carve-out (#337 owns
+delivery in general): `ffi/` emits `cdylib + rlib + staticlib`, and the `.a` is delivered into
+`output/go/` beside the header the Go source already imports. Dynamic delivery was measured and
+rejected — rustc stamps an **absolute** `LC_ID_DYLIB`, so a consumer records the cache path and
+dangles the moment the cache is GC'd, which the C8 contract permits at any time and which CI
+cannot see because the cache still exists while it runs.
+
+**`migrate` joined the cache with everything else**, so it is no longer CWD-relative: every
+subcommand takes a required `--schema`, the transformer and engine hops are range-stamped members
+compiled by the same driver, and there is no fallback to a `migrations/transform` beside you — a
+fallback would emit a `[package]` under whatever foreign workspace root the shell is standing in
+(#328), on the *mandatory* engine-upgrade command. `forgedb migrate up` was removed rather than
+re-homed; the per-tenant sweep that was its only unique capability is #373.
 
 ---
 
@@ -236,7 +377,7 @@ Key properties that the rest of the system is built on:
 
   | Manifest field | Owned by | Counts | Migrated by |
   |---|---|---|---|
-  | `schema_version` (on-disk key `format_version`) | the **app's** `migrations/` lineage | applied schema migrations | `forgedb migrate up` |
+  | `schema_version` (on-disk key `format_version`) | the **app's** `migrations/` lineage | applied schema migrations | `forgedb migrate build` + `migrate run` |
   | `engine_version` | **ForgeDB's** release line | the engine's byte-format generation | `forgedb migrate engine` |
 
   A manifest with no `engine_version` baselines to generation 1, so the counter is additive rather
@@ -536,6 +677,13 @@ a guard test, not only by a doc comment.
 - **Substrate / compiler-internals split.** Generated code links only schema-agnostic crates;
   the compiler crates stay off the runtime path, which is what makes the generator identity
   verifiable.
+- **ForgeDB owns the build, over scaffolding a crate the user compiles.** One `core` per app
+  makes a second, differently-configured `database.rs` unrepresentable, and the driver can
+  enforce a profile floor a manifest cannot. The costs are stated rather than discovered: the
+  editable `src/main.rs` is gone until #338's in-tree mode (a user's existing scaffold is never
+  deleted, and the mirror keeps its `#[path]` modules resolving), `panic` is irreducibly
+  project-wide because cargo makes it so, and one shared `target/` serializes concurrent builds
+  of sibling apps.
 
 ---
 
