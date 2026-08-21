@@ -48,6 +48,8 @@
 //! ```
 
 pub mod config;
+pub mod core_pkg;
+pub mod server_pkg;
 pub mod go_sdk;
 pub mod python_sdk;
 pub mod rust;
@@ -67,6 +69,8 @@ pub mod go;
 // Re-export generators for convenience
 pub use api::ApiGenerator;
 pub use config::{FsyncMode, GenConfig};
+pub use core_pkg::CorePackage;
+pub use server_pkg::{ServerLayout, ServerPackage};
 pub use ffi::FfiGenerator;
 pub use go::GoGenerator;
 pub use go_sdk::GoSdkGenerator;

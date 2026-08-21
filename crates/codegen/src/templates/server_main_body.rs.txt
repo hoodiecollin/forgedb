@@ -1,0 +1,317 @@
+
+// Deployment config comes from the environment — one binary, N tenant processes
+// (12-factor). Multi-tenancy (#59) is physical: this process serves ONE tenant,
+// opening its data dir; a front proxy routes each tenant's subdomain/host to its
+// process. Nothing here reads schema.forge at runtime.
+//
+//   FORGEDB_TENANT       the tenant this process serves (selects <data>/<tenant>)
+//   FORGEDB_DATA         tenant root dir (default: data)
+//   FORGEDB_HOST         bind host (default: 127.0.0.1)
+//   FORGEDB_PORT         bind port (default: 3000)
+//   FORGEDB_SHUTDOWN_TIMEOUT  max seconds to drain in-flight requests on
+//                        SIGINT/SIGTERM before forcing exit (default: 0 = unbounded)
+//   FORGEDB_CORS_ORIGINS comma-separated origins allowed to call this API from a
+//                        browser on a different origin — e.g.
+//                        `https://app.example,https://staging.app.example`, or a
+//                        single `*` for a deliberately public API. Unset (the
+//                        default) emits no CORS layer at all, so a cross-origin
+//                        browser call is blocked by the browser; the generated
+//                        TypeScript SDK is fetch-based, so set this whenever the
+//                        page and the API are not same-origin. An unparseable
+//                        value refuses to start rather than silently serving with
+//                        CORS closed. NOTE: this covers the HTTP routes. The
+//                        WebSocket routes (/subscribe, /live-query, /replicate)
+//                        are checked against the SAME list by the handlers,
+//                        because browsers neither preflight nor CORS-enforce a
+//                        handshake — so with this unset they stay reachable from
+//                        any origin, which is the pre-existing behavior.
+//
+// Verify-only JWT tenant guard (enabled when FORGEDB_JWT_PUBKEY is set):
+//   FORGEDB_JWT_PUBKEY   path to the IdP's PEM public key (verification key)
+//   FORGEDB_JWT_ALGS     comma-separated signature-algorithm allowlist (default:
+//                        RS256; asymmetric only). FORGEDB_JWT_ALG (singular) is
+//                        still accepted for one algorithm.
+//   FORGEDB_JWT_ISSUER   expected `iss`
+//   FORGEDB_JWT_AUDIENCE expected `aud`
+//   FORGEDB_TENANT_CLAIM claim carrying the tenant id (default: tenant)
+//   FORGEDB_JWT_LEEWAY   clock-skew leeway seconds (default: 60)
+//   FORGEDB_JWKS_URL     JWKS endpoint (.well-known/jwks.json) — fetched over
+//                        HTTP + refreshed for key rotation (alternative to
+//                        FORGEDB_JWT_PUBKEY; the static PEM wins if both are set)
+//   FORGEDB_JWKS_REFRESH_SECS  JWKS re-fetch interval seconds (default: 300)
+#[tokio::main]
+async fn main() {
+    // Structured logging (Phase 5): the router logs each request as a
+    // `tracing` span via tower-http's TraceLayer; install a subscriber that
+    // honors `RUST_LOG` (default `info`) so those spans are emitted.  Set
+    // FORGEDB_LOG_FORMAT=json for machine-parseable JSON lines (log aggregators);
+    // any other value (or unset) keeps the human-readable text format.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json_logs = std::env::var("FORGEDB_LOG_FORMAT")
+        .map(|f| f.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt().json().with_env_filter(env_filter).init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    let tenant = std::env::var("FORGEDB_TENANT").ok();
+    let data_root = std::env::var("FORGEDB_DATA").unwrap_or_else(|_| "data".to_string());
+    let host = std::env::var("FORGEDB_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let port: u16 = std::env::var("FORGEDB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+
+    // Per-tenant data dir: <data_root>/<tenant> when a tenant is set, else the
+    // root itself (single-tenant / tenancy off).
+    let data_dir = match &tenant {
+        Some(t) => std::path::Path::new(&data_root).join(t),
+        None => std::path::PathBuf::from(&data_root),
+    };
+
+    // C4: the build cache never holds database data.
+    //
+    // This binary now lives only in ForgeDB's build cache, `forgedb build`
+    // prints that path, and running a dev server out of it is expressly
+    // allowed — so `cd ~/.forgedb/projects/<id> && ./target/release/<app>`
+    // would create `<that dir>/data/` and quietly turn a build cache into an
+    // installation. The default data root is RELATIVE (`data`), which is what
+    // makes it reachable by accident rather than by mistake.
+    //
+    // Refusing here is generated per-app code rather than documentation,
+    // because the population that hits this is exactly the population
+    // following a path ForgeDB printed.
+    if let Some(home) = forgedb_home_dir() {
+        let resolved = closest_real_ancestor(&data_dir);
+        if resolved.starts_with(&home) {
+            eprintln!(
+                "refusing to open a database inside the ForgeDB build cache\n\n\
+                 resolved data directory: {}\n\
+                 ForgeDB home:            {}\n\n\
+                 The cache holds derived build artifacts only and may be deleted at\n\
+                 any time, which would take this database with it. Pass an absolute\n\
+                 FORGEDB_DATA, or run from your project directory.",
+                resolved.display(),
+                home.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    let db = std::sync::Arc::new(tokio::sync::RwLock::new(
+        database::Database::open_at(data_dir),
+    ));
+
+    // Cross-origin policy (#140) is deployment identity, not a generate-time
+    // decision: the same binary is promoted to localhost, staging and production
+    // with different allowed origins. So it is read here, at process start, and
+    // never baked into the generated code. Fail closed and LOUD on a malformed
+    // value — serving with CORS silently shut would present to the developer as
+    // "the browser is blocking me" with nothing on the server side to explain it,
+    // which is the exact no-diagnostic failure this knob exists to remove. Same
+    // stance as `build_authenticator`'s refusal to start unauthenticated.
+    let cors_origins = match std::env::var("FORGEDB_CORS_ORIGINS") {
+        Ok(raw) => match api::parse_origins(&raw) {
+            Ok(origins) => origins,
+            Err(e) => panic!("FORGEDB_CORS_ORIGINS is invalid: {e} — refusing to start"),
+        },
+        Err(_) => None,
+    };
+    if let Some(list) = &cors_origins {
+        tracing::info!(origins = ?list, "CORS enabled for the HTTP and WebSocket routes");
+    }
+    let http_opts = api::HttpOptions { allowed_origins: cors_origins };
+
+    let router = match build_authenticator(tenant.as_deref()) {
+        Some(auth) => {
+            tracing::info!(tenant = ?tenant, "JWT tenant guard enabled");
+            api::create_router_with_auth_and_options(db, std::sync::Arc::new(auth), http_opts)
+        }
+        None => api::create_router_with_options(db, http_opts),
+    };
+
+    let addr = format!("{host}:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("bind listener");
+    tracing::info!(tenant = ?tenant, data_root = %data_root, %addr, "ForgeDB serving");
+    // Graceful shutdown (Phase 5): drain in-flight requests on SIGINT/SIGTERM
+    // so a container stop or `Ctrl-C` doesn't sever open connections mid-write.
+    // The drain is unbounded by default (FORGEDB_SHUTDOWN_TIMEOUT unset or 0);
+    // set it to bound how long a stuck in-flight request can hold up the exit
+    // (#142) — after the signal fires, the process force-exits once the deadline
+    // passes even if a connection has not finished draining.
+    let drain_timeout_secs: u64 = std::env::var("FORGEDB_SHUTDOWN_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    // A watch channel lets the shutdown future signal the watchdog that draining
+    // has begun, so the deadline is measured from the signal, not from boot.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        let _ = drain_tx.send(true);
+    });
+    if drain_timeout_secs == 0 {
+        server.await.expect("serve");
+    } else {
+        let watchdog = async move {
+            let mut rx = drain_rx;
+            // Wait until the shutdown signal fires, then start the deadline.
+            let _ = rx.changed().await;
+            tokio::time::sleep(std::time::Duration::from_secs(drain_timeout_secs)).await;
+            tracing::warn!(
+                timeout_secs = drain_timeout_secs,
+                "shutdown drain exceeded FORGEDB_SHUTDOWN_TIMEOUT — forcing exit"
+            );
+        };
+        tokio::select! {
+            r = server => r.expect("serve"),
+            _ = watchdog => std::process::exit(0),
+        }
+    }
+}
+
+/// Resolve on the first shutdown signal — `Ctrl-C` (SIGINT) or, on Unix, SIGTERM
+/// (how Docker/Kubernetes ask a container to stop).  Returning from this future
+/// tells `axum::serve` to stop accepting and drain (Phase 5).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl-C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received — draining connections");
+}
+
+/// Build the verify-only JWT authenticator from env, or `None` to run without a
+/// tenant guard. Enabled when EITHER FORGEDB_JWT_PUBKEY (static PEM) OR
+/// FORGEDB_JWKS_URL (JWKS-over-HTTP, #81) is set; FORGEDB_TENANT must then name
+/// the tenant this process serves (cross-checked against the token's tenant
+/// claim). Static PEM takes precedence if both are set.
+///
+/// Fail-loud: if a key source is configured but cannot be loaded (unreadable PEM,
+/// or an unreachable/invalid JWKS endpoint), this PANICS rather than falling
+/// through to an unauthenticated server the operator believed was protected.
+fn build_authenticator(tenant: Option<&str>) -> Option<forgedb_auth::Authenticator> {
+    let pubkey_path = std::env::var("FORGEDB_JWT_PUBKEY").ok();
+    let jwks_url = std::env::var("FORGEDB_JWKS_URL").ok();
+    // No key source configured → run without a tenant guard.
+    if pubkey_path.is_none() && jwks_url.is_none() {
+        return None;
+    }
+    let tenant = tenant.expect("FORGEDB_TENANT is required when the JWT guard is enabled");
+
+    // Algorithm allowlist (#147): the substrate accepts a full Vec<Algorithm>, so
+    // parse the comma-separated FORGEDB_JWT_ALGS (falling back to the singular
+    // FORGEDB_JWT_ALG for back-compat). Unknown/HS* names are dropped; an empty
+    // list defaults to [RS256]. A static PEM key binds ONE algorithm, so it is
+    // built from the PRIMARY (first) of the allowlist — the allowlist may be
+    // broader than the single static key's own algorithm.
+    let algorithms: Vec<forgedb_auth::Algorithm> = std::env::var("FORGEDB_JWT_ALGS")
+        .or_else(|_| std::env::var("FORGEDB_JWT_ALG"))
+        .unwrap_or_else(|_| "RS256".to_string())
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter_map(forgedb_auth::parse_algorithm)
+        .collect();
+    let algorithms = if algorithms.is_empty() {
+        vec![forgedb_auth::Algorithm::RS256]
+    } else {
+        algorithms
+    };
+    let primary_alg = algorithms[0];
+    let cfg = forgedb_auth::AuthConfig {
+        algorithms,
+        issuer: std::env::var("FORGEDB_JWT_ISSUER").ok(),
+        audience: std::env::var("FORGEDB_JWT_AUDIENCE").ok(),
+        tenant_claim: std::env::var("FORGEDB_TENANT_CLAIM").unwrap_or_else(|_| "tenant".to_string()),
+        leeway_secs: std::env::var("FORGEDB_JWT_LEEWAY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60),
+        required_claims: vec![],
+    };
+
+    // Key source: a static PEM takes precedence; otherwise fetch the JWKS over
+    // HTTP and refresh it in the background (#81) — a signing key rotated in at
+    // the IdP is picked up within FORGEDB_JWKS_REFRESH_SECS (default 300).
+    let keys = if let Some(pubkey_path) = pubkey_path {
+        let pem = std::fs::read_to_string(&pubkey_path).expect("read FORGEDB_JWT_PUBKEY");
+        forgedb_auth::KeySource::static_pem(None, pem, primary_alg)
+    } else {
+        let url = jwks_url.expect("jwks_url is Some when pubkey_path is None");
+        let refresh_secs = std::env::var("FORGEDB_JWKS_REFRESH_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        forgedb_auth::KeySource::jwks_url(&url, std::time::Duration::from_secs(refresh_secs))
+            .expect("fetch JWKS from FORGEDB_JWKS_URL (refusing to start unauthenticated)")
+    };
+    Some(forgedb_auth::Authenticator::new(cfg, keys, tenant))
+}
+
+
+/// `$FORGEDB_HOME`, else `~/.forgedb` — resolved the same way the CLI resolves
+/// it, so the C4 guard above cannot disagree with where the cache actually is.
+///
+/// Returns `None` when no home can be determined, in which case the guard does
+/// not fire: refusing to start because a home directory is unknowable would be a
+/// worse failure than the one being prevented.
+fn forgedb_home_dir() -> Option<std::path::PathBuf> {
+    // Written WITHOUT a let-chain on purpose: generated code must compile under
+    // the consumer's edition, and the `init` scaffold is edition 2021 where
+    // `if let ... && ...` is a hard error. Caught by compiling a real scaffold —
+    // the CLI itself is edition 2024, so nothing in-tree would have shown it.
+    match std::env::var_os("FORGEDB_HOME") {
+        Some(explicit) if !explicit.is_empty() => {
+            return std::fs::canonicalize(&explicit)
+                .ok()
+                .or_else(|| Some(std::path::PathBuf::from(explicit)));
+        }
+        _ => {}
+    }
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home).join(".forgedb");
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// Canonicalize as much of a path as exists, keeping the rest verbatim.
+///
+/// Both sides of the containment check may name directories that do not exist
+/// yet, while a symlinked home (`/tmp` -> `/private/tmp` on macOS) makes a purely
+/// lexical comparison wrong.
+fn closest_real_ancestor(path: &std::path::Path) -> std::path::PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map(|c| c.join(path)).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(canonical) = current.canonicalize() {
+            let remainder = absolute.strip_prefix(current).unwrap_or(std::path::Path::new(""));
+            return canonical.join(remainder);
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return absolute.clone(),
+        }
+    }
+}
