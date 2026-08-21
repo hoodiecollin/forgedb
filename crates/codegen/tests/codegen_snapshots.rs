@@ -11273,3 +11273,211 @@ Note {
         "this schema no longer exercises #[schema(..)], so the OFF assertion above is vacuous"
     );
 }
+
+/// The `timestamp` fixture for the #389 quantum guards below: every index kind a
+/// coarse timestamp can reach, plus a `timestamp(us)` control and an FK whose target
+/// identity is itself a coarse timestamp.
+const TIMESTAMP_QUANTUM_SCHEMA: &str = r#"
+Stamped {
+  id: timestamp(ms)
+  label: string
+  kitchens: [Kitchen]
+}
+
+Kitchen {
+  id: +uuid
+  t_at: ^timestamp
+  c_at: ^timestamp(s)
+  u_at: ^timestamp(us)
+  o_at: ^timestamp?
+  stamp: *Stamped
+}
+"#;
+
+/// The text of a generated function, from its signature to the end of the window we
+/// care about. **Panics if the signature is absent**, which is what stops the
+/// assertions below from passing vacuously the day a method is renamed: a
+/// `contains` over the whole file would just stop matching and report nothing.
+fn generated_fn<'a>(code: &'a str, signature: &str) -> &'a str {
+    generated_span(code, signature, None)
+}
+
+/// [`generated_fn`] with an explicit end: the span runs to the next occurrence of
+/// `until` after the start. Without one it is a flat 1200-character window.
+///
+/// Pass an `until` whenever the assertion is **negative** ("this is not floored")
+/// or the span is longer than that window. A fixed window is fine for a short
+/// function whose neighbours are other functions; it is not fine for one arm of a
+/// long run of sibling `if let` blocks, where it spills into the next field's block
+/// and reads that field's flooring as this one's — a guard that passes or fails for
+/// a reason that has nothing to do with what it names.
+fn generated_span<'a>(code: &'a str, signature: &str, until: Option<&str>) -> &'a str {
+    let start = code.find(signature).unwrap_or_else(|| {
+        panic!("generated code no longer contains `{signature}` — this guard is measuring nothing")
+    });
+    let rest = &code[start..];
+    match until {
+        Some(u) => match rest[signature.len()..].find(u) {
+            Some(i) => &rest[..signature.len() + i],
+            None => rest,
+        },
+        None => &rest[..rest.len().min(1200)],
+    }
+}
+
+/// #389: a `timestamp` probe is floored to the field quantum, exactly as the write
+/// was — so a written value finds its own row.
+///
+/// The write gate (`timestamp_gate_walk`) floors on the way in; before this, nothing
+/// floored on the way out, so a row was filed under `floor(t)` and asked for under
+/// `t`. The failure was silent — an empty `Vec`, not an error — which is why it
+/// wants a guard per *derivation site* rather than one over the whole file: the key
+/// is derived in four independent places and fixing one does not reach the others.
+///
+/// `u_at` is the control in every assertion. `timestamp(us)` has quantum 1, so no
+/// flooring is emitted for it at all — which is what proves the quantum literal is
+/// read from the field rather than hard-coded. An assertion that only checked "some
+/// `floor_to_micros` appears" would pass on a generator that floored everything to
+/// a millisecond.
+///
+/// The end-to-end half of this contract — that the row actually comes back — is
+/// `tests/index_test.rs`. This is the fast-suite half, and the only coverage of the
+/// REST filter path, which that harness does not start a server for.
+#[test]
+fn test_rust_generation_timestamp_probe_floors_to_quantum() {
+    let mut parser = forgedb_parser::Parser::new(TIMESTAMP_QUANTUM_SCHEMA).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = RustGenerator::generate(&schema).unwrap().code;
+
+    // --- the hash index (`index_value_expr`) ---------------------------------
+    let t_at = generated_fn(&code, "pub fn find_by_t_at(");
+    assert!(
+        t_at.contains("floor_to_micros(1000)"),
+        "find_by_t_at must floor its argument to the ms quantum (#389).\nGot: {t_at}"
+    );
+    let c_at = generated_fn(&code, "pub fn find_by_c_at(");
+    assert!(
+        c_at.contains("floor_to_micros(1000000)"),
+        "the quantum is per-field: `timestamp(s)` floors to 1_000_000, not to the \
+         millisecond `t_at` uses (#389).\nGot: {c_at}"
+    );
+    let u_at = generated_fn(&code, "pub fn find_by_u_at(");
+    assert!(
+        !u_at.contains("floor_to_micros"),
+        "`timestamp(us)` has quantum 1 — flooring is the identity and none should be \
+         emitted. Emitting one here would mean the quantum is assumed, not read.\nGot: {u_at}"
+    );
+
+    // Nullable floors through the `Option`, not around it.
+    let o_at = generated_fn(&code, "pub fn find_by_o_at(");
+    assert!(
+        o_at.contains("map(|__t| __t.floor_to_micros(1000))"),
+        "a nullable timestamp probe floors inside the `Option` (#389).\nGot: {o_at}"
+    );
+
+    // The FK column: `index_value_expr` resolves through the relation to the
+    // target's identity type, exactly as `index_key_expr` does. Before #389 only
+    // one of the two resolved, so they disagreed about what type they transformed.
+    let stamp = generated_fn(&code, "pub fn find_by_stamp(");
+    assert!(
+        stamp.contains("floor_to_micros(1000)"),
+        "an FK whose target identity is `timestamp(ms)` is a coarse timestamp column \
+         and its probe floors like any other (#389).\nGot: {stamp}"
+    );
+
+    // --- the ordered index (`ordered_key_expr`) ------------------------------
+    // A separate derivation from the hash index, so it needs its own assertion:
+    // BOTH bounds are floored, which is what makes the degenerate `[t, t]` range
+    // agree with `find_by_t_at(t)`.
+    let range = generated_fn(&code, "pub fn find_by_t_at_range(");
+    assert!(
+        range.contains("min.map(|__v| (__v).floor_to_micros(1000))")
+            && range.contains("max.map(|__v| (__v).floor_to_micros(1000))"),
+        "both range bounds floor to the field quantum (#389).\nGot: {range}"
+    );
+
+    // --- the FK write path ---------------------------------------------------
+    // `Storage::insert` is a documented public path (#91) that skips FK checks
+    // entirely, so the wrapper prelude below never runs for it. Without its own
+    // floor a row written that way stores a non-canonical reference: the index
+    // agrees with itself (both sides floor), but the value handed back by `get`
+    // resolves to no parent. Spans to the next method rather than taking the flat
+    // window: `Kitchen` has four timestamp fields ahead of the FK in the gate, and
+    // each one's range check is long.
+    let insert = generated_span(
+        &code,
+        "pub fn insert(&mut self, record: Kitchen)",
+        Some("pub fn "),
+    );
+    assert!(
+        insert.contains("record.stamp = record.stamp.floor_to_micros(1000)"),
+        "the storage write gate floors a coarse-timestamp FK too — the wrapper's \
+         floor does not run on the direct `Storage::insert` path (#91/#389).\nGot: {insert}"
+    );
+
+
+    // Ordering is the whole assertion here. The dangling-reference check resolves
+    // the FK against the target storage, whose rows are keyed by the FLOORED
+    // identity, so a floor emitted after it would be too late and the create would
+    // still return a 422 for a value the parent itself accepted.
+    for wrapper in ["pub fn create_kitchen(", "pub fn update_kitchen("] {
+        let body = generated_fn(&code, wrapper);
+        let floor = body.find("record.stamp = record.stamp.floor_to_micros(1000)").unwrap_or_else(|| {
+            panic!("{wrapper} must floor a coarse-timestamp FK (#389).\nGot: {body}")
+        });
+        let check = body.find("DanglingReference").unwrap_or_else(|| {
+            panic!("{wrapper} no longer emits an FK check — this ordering guard is vacuous.\nGot: {body}")
+        });
+        assert!(
+            floor < check,
+            "{wrapper} must floor the FK BEFORE resolving it, or the check runs \
+             against a value the target storage is not keyed by (#389).\nGot: {body}"
+        );
+    }
+}
+
+/// #389, the REST/live-query half: a filter parameter is floored to the field
+/// quantum before it is compared to the stored value.
+///
+/// Not covered by the index guard above, and not a duplicate of it. `Timestamp`'s
+/// `PartialEq` is over the raw `i64` micros, so a `==` against a floored stored
+/// value does not self-correct — unlike `Decimal`, whose `PartialEq` is already
+/// scale-invariant, which is why only its *key* ever needed normalizing.
+///
+/// The two are load-bearing together: on the REST list path the index pushdown
+/// selects candidate rows and this predicate re-checks them, so flooring one without
+/// the other would find the row and then discard it — still an empty list, for a new
+/// reason.
+#[test]
+fn test_api_generation_timestamp_filter_floors_to_quantum() {
+    let mut parser = forgedb_parser::Parser::new(TIMESTAMP_QUANTUM_SCHEMA).unwrap();
+    let schema = parser.parse().unwrap();
+    let code = ApiGenerator::generate(&schema).unwrap().code;
+
+    // Emitted twice — once over the borrowed scan view, once over the full record
+    // for `<model>_event_matches`. Both must floor, so count rather than `contains`.
+    let floored = code.matches("map(|__t| __t.floor_to_micros(1000))").count();
+    assert!(
+        floored >= 4,
+        "each of `t_at` and `o_at` is filtered in BOTH the scan view and \
+         `_event_matches`, so all four checks must floor (#389). Found {floored}.\nGot: {code}"
+    );
+    assert!(
+        code.contains("map(|__t| __t.floor_to_micros(1000000))"),
+        "the quantum is per-field on the filter path too: `timestamp(s)` floors to \
+         1_000_000 (#389).\nGot: {code}"
+    );
+
+    // The control, anchored on its own check so a stray floor elsewhere cannot
+    // satisfy it.
+    let u_at = generated_span(
+        &code,
+        r#"if let Some(want) = params.get("u_at")"#,
+        Some("if let Some(want) = params.get("),
+    );
+    assert!(
+        !u_at.contains("floor_to_micros"),
+        "`timestamp(us)` has quantum 1 — its filter parses and compares with no \
+         flooring at all.\nGot: {u_at}"
+    );
+}
