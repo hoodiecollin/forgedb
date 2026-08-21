@@ -1121,6 +1121,25 @@ impl ApiGenerator {
             // way the body is.  Parsing a bare integer here would have silently
             // meant *seconds* while storage moved to micros — a filter that
             // matched nothing rather than failing.
+            //
+            // #389: and then floored to the field quantum, because the value it is
+            // about to be compared against was floored on write.  `Timestamp`'s
+            // `PartialEq` is over the raw `i64` micros, so unlike `Decimal` — whose
+            // `PartialEq` is already scale-invariant, which is why only its *key*
+            // needed normalizing — it does not self-correct.  Without this,
+            // `?t_at=<a sub-quantum instant>` matches no row while the same instant
+            // written through `create` is stored happily.
+            //
+            // This is the second of two sites the same param has to survive on the
+            // REST list path: the index pushdown (`__rows_by_<field>`) selects
+            // candidate rows and this predicate re-checks them, so flooring one
+            // without the other would find the row and then throw it away.
+            FieldType::Timestamp(p) if p.quantum_micros() > 1 => {
+                let quantum = proc_macro2::Literal::i64_unsuffixed(p.quantum_micros());
+                quote! {
+                    want.parse::<forgedb_types::Timestamp>().ok().map(|__t| __t.floor_to_micros(#quantum))
+                }
+            }
             FieldType::Timestamp(_) => {
                 quote! { want.parse::<forgedb_types::Timestamp>().ok() }
             }

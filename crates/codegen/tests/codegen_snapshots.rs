@@ -5685,11 +5685,23 @@ Widget {
         code.contains("want.parse::<i32>()"),
         "i32 filter parses the param to i32"
     );
+    // Whitespace-flattened, unlike its siblings above: since #389 the timestamp arm
+    // continues `.ok().map(|__t| __t.floor_to_micros(q))`, and prettyplease breaks the
+    // longer chain across lines, so `want.parse::<..>()` is no longer contiguous in the
+    // formatted output. Flattening keeps the receiver in the assertion — dropping
+    // `want.` to regain a contiguous span would stop checking WHAT is parsed.
+    let flat_ws: String = code.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        code.contains("want.parse::<forgedb_types::Timestamp>()"),
+        flat_ws.contains("want.parse::<forgedb_types::Timestamp>()"),
         "#254: a timestamp filter parses the RFC 3339 wire form, the same form the \
          body uses — parsing a bare integer here would have silently meant SECONDS \
          against microsecond storage, matching nothing instead of failing"
+    );
+    // #389: and floors the parsed value to the field quantum before comparing it to a
+    // stored value the write gate already floored.
+    assert!(
+        flat_ws.contains(".map(|__t|__t.floor_to_micros("),
+        "#389: a coarse-timestamp filter param is floored to the field quantum"
     );
     // (The generic path may wrap across lines in the formatted output, so match
     // the pieces rather than one contiguous span.)
