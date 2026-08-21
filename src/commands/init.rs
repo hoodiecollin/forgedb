@@ -5,7 +5,10 @@ use std::path::Path;
 pub struct InitOptions {
     pub project_name: String,
     pub template: Option<String>,
+    /// REMOVED (#335 §15). Carried only so `refuse_removed_flags` can name the
+    /// replacement; setting it is always an error.
     pub rust: bool,
+    /// REMOVED (#335 §15). Same as `rust`.
     pub api_only: bool,
     /// `--isolated` / `--no-isolated`.  `None` means "decide from what is
     /// above me", which is the whole reason this is three-valued rather than a
@@ -14,6 +17,11 @@ pub struct InitOptions {
 }
 
 pub fn run(options: InitOptions) -> Result<()> {
+    // Before anything touches the filesystem: a removed flag is refused by name,
+    // never absorbed. Placed first so the refusal cannot leave a half-scaffolded
+    // directory behind.
+    refuse_removed_flags(&options)?;
+
     ui::header("✨", &format!("Creating project: {}", options.project_name));
 
     // Check if project directory already exists
@@ -45,30 +53,74 @@ pub fn run(options: InitOptions) -> Result<()> {
     // Create README
     create_readme(&options)?;
 
-    // Create Rust files if needed
-    if options.rust || !options.api_only {
-        create_rust_files(&options)?;
-        // The blessed container deploy path (Phase 5) targets the generated
-        // Rust server, so it rides along with the Rust scaffold.
-        create_deploy_files(&options)?;
-    }
+    // The deploy path is no longer gated on a Rust scaffold existing (#335 §15):
+    // there is no Rust scaffold. It drives the CLI instead, so it is emitted for
+    // every project.
+    create_deploy_files(&options)?;
 
     ui::success("Done! Run the following to get started:");
     println!();
     println!("  cd {}", options.project_name);
-    println!("  forgedb generate rust");
+    println!("  forgedb generate");
     println!("  forgedb build");
     println!();
+    ui::info(
+        "This project contains no Cargo.toml on purpose (#335): ForgeDB compiles the \
+         generated Rust in its own build cache. `forgedb build` prints where the \
+         artifacts landed; `forgedb build --print-artifact server` prints just the \
+         server binary's path.",
+    );
 
+    Ok(())
+}
+
+/// Refuse `--rust` / `--api-only` by name (#335 §15).
+///
+/// Both selected between "scaffold a cargo package" and "do not", and `init` no
+/// longer scaffolds one either way — so there is nothing left for them to
+/// select. They stay in the parser (hidden) purely so this diagnostic can name
+/// the replacement: dropping them from clap would produce "unexpected argument
+/// '--rust' found", which tells the user nothing about where the Rust went.
+fn refuse_removed_flags(options: &InitOptions) -> Result<()> {
+    if options.rust {
+        return Err(CliError::ConfigDiagnostic(
+            "`--rust` was removed in #335.\n\n\
+             `forgedb init` no longer scaffolds a cargo package: the generated Rust \
+             (core, server, and the runtime bindings) is built in ForgeDB's own cache \
+             under $FORGEDB_HOME, not in your repository. There is no longer a \
+             \"without Rust\" project to opt out of.\n\n\
+             Choose which generators run with `targets` under `[generate]` in \
+             forgedb.toml — `targets = [\"all\"]` is what the scaffold writes — then \
+             run `forgedb generate` and `forgedb build`."
+                .to_string(),
+        ));
+    }
+    if options.api_only {
+        return Err(CliError::ConfigDiagnostic(
+            "`--api-only` was removed in #335.\n\n\
+             It suppressed the scaffolded cargo package, and `forgedb init` no longer \
+             scaffolds one — the generated Rust is built in ForgeDB's own cache under \
+             $FORGEDB_HOME.\n\n\
+             To narrow what is generated, set `targets` under `[generate]` in \
+             forgedb.toml — e.g. `targets = [\"api\", \"openapi\"]` — then run \
+             `forgedb generate`."
+                .to_string(),
+        ));
+    }
     Ok(())
 }
 
 fn create_project_structure(options: &InitOptions) -> Result<()> {
     let project_path = Path::new(&options.project_name);
 
-    // Create main directories
+    // Create main directories.
+    //
+    // No `src/` (#335 §15): that was the scaffolded cargo package's source dir,
+    // and there is no scaffolded cargo package. `generated/` stays — it receives
+    // the read-only mirror of `database.rs`/`api.rs` plus every non-Rust
+    // artifact (types.ts, openapi.json, the SDKs, `go/`), all of which is text
+    // the user commits.
     fs::create_dir_all(project_path)?;
-    fs::create_dir_all(project_path.join("src"))?;
     fs::create_dir_all(project_path.join("generated"))?;
     fs::create_dir_all(project_path.join("data/db"))?;
     fs::create_dir_all(project_path.join("data/wal"))?;
@@ -193,110 +245,68 @@ fn create_readme(options: &InitOptions) -> Result<()> {
     Ok(())
 }
 
-fn create_rust_files(options: &InitOptions) -> Result<()> {
-    // Create Cargo.toml with all dependencies required by generated code.
-    //
-    // The generated `database.rs` needs: forgedb-storage, forgedb-types, serde,
-    // utoipa (with uuid feature for ToSchema on Uuid/Timestamp fields), plus
-    // forgedb-changefeed for the change-feed emits (#62 Direction A),
-    // forgedb-wal for the durable write path (#89 — WAL commit + crash recovery),
-    // and forgedb-compaction for in-process auto-compaction (#92 — schema-agnostic
-    // dead-row reclaim keyed by dir name; the trigger + reindex are generated).
-    //
-    // The generated `api.rs` needs: axum (with the `ws` feature for the
-    // change-feed subscription endpoints), utoipa-axum, tokio (full), serde_json,
-    // forgedb-query-params for list-endpoint filter/sort/paginate (#90 — the
-    // query string is parsed by this schema-agnostic substrate; all field-aware
-    // filtering/sorting is generated per-model), and tower-http (trace feature)
-    // for the request-logging layer on the generated router (Phase 5
-    // observability).  The scaffold `main.rs` installs a `tracing-subscriber`
-    // (env-filtered via `RUST_LOG`) so those spans are emitted.
-    let cargo_toml = format!(
-        r#"[package]
-name = "{}"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-forgedb-storage = "0.3"
-forgedb-types = "0.3"
-forgedb-changefeed = "0.2"
-forgedb-wal = "0.2"
-forgedb-auth = {{ version = "0.2", features = ["jwks-http"] }}
-forgedb-query-params = "0.1"
-forgedb-compaction = "0.1"
-forgedb-txn = "0.1"
-forgedb-coordinator = "0.2"
-regex = "1"
-rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
-serde = {{ version = "1", features = ["derive"] }}
-serde_json = "1"
-utoipa = {{ version = "5", features = ["uuid"] }}
-utoipa-axum = "0.2"
-axum = {{ version = "0.8", features = ["ws"] }}
-tokio = {{ version = "1", features = ["full"] }}
-tower-http = {{ version = "0.6", features = ["trace", "cors"] }}
-tracing = "0.1"
-tracing-subscriber = {{ version = "0.3", features = ["env-filter", "json"] }}
-"#,
-        options.project_name
-    );
-
-    let cargo_path = Path::new(&options.project_name).join("Cargo.toml");
-    fs::write(cargo_path, cargo_toml)?;
-
-    // Create src/main.rs — a real, env-driven, process-per-tenant server (#59).
-    //
-    // The generated files are `#[path]` modules (they carry inner `#![allow]` /
-    // `//!` docs, illegal inside `include!`ed inline `mod { }`, E0753). `api.rs`
-    // refers to the model types as `super::*`, so the crate root re-exports
-    // `database::*`.
-    // ONE definition of the generated server body, shared with the cache
-    // `server/` package (#335 §1). Only the module preamble differs: this
-    // scaffold reaches the generated files through `#[path]` modules, while the
-    // cache package links `core` as a cargo dependency. A copy here would be
-    // two emitters of one artifact — the exact drift #335 exists to end.
-    let main_rs = forgedb_codegen::ServerPackage::main_rs(
-        forgedb_codegen::ServerLayout::InTree,
-    );
-
-    let main_rs_path = Path::new(&options.project_name).join("src").join("main.rs");
-    fs::write(main_rs_path, main_rs)?;
-
-    ui::step("🦀", "Created Rust project files");
-    ui::info("Run 'forgedb generate rust' to generate the database code");
-    Ok(())
-}
-
-/// Emit the blessed container deploy path (Phase 5): a multi-stage
-/// `Dockerfile`, a `.dockerignore`, and a `docker-compose.yml`.  The image builds
-/// the generated Rust server and runs it as a non-root user with `/data` on a
-/// volume, `FORGEDB_HOST=0.0.0.0`, and a `HEALTHCHECK` against the generated
-/// `/health` endpoint (Phase 5).  None of this reads `schema.forge` at
-/// runtime — it is ops packaging around the already-generated server binary.
+/// Emit the blessed container deploy path: a multi-stage `Dockerfile`, a
+/// `.dockerignore`, and a `docker-compose.yml` (#335 §15).
+///
+/// **The image drives the CLI.** Before #335 the builder stage did
+/// `COPY Cargo.toml`, `COPY src`, `COPY generated`, `RUN cargo build --release`
+/// and then copied `target/release/<project>` — every one of those inputs is
+/// gone, because `init` no longer scaffolds a cargo package and the generated
+/// Rust is compiled in ForgeDB's own cache. So the builder installs the pinned
+/// `forgedb`, copies the project source (schema + config, never `generated/`),
+/// runs `forgedb generate` + `forgedb build`,
+/// and copies out **the path ForgeDB reports** rather than a path this file
+/// guessed.
+///
+/// It is still ops packaging: nothing here reads `schema.forge` at runtime.
 fn create_deploy_files(options: &InitOptions) -> Result<()> {
     let project_path = Path::new(&options.project_name);
-    let bin = &options.project_name;
+    // The image/service name is the project's final path component, never the
+    // whole `project_name` — which may be a path (`forgedb init apps/api`), and
+    // a `/` is illegal in both a docker tag and a compose service name.
+    let bin = derive_project_id(&options.project_name);
+    // Pin the CLI that scaffolded this project. A floating `cargo install
+    // forgedb` would change the generated code between two builds of the same
+    // commit, which is the reproducibility hole a Dockerfile exists to close.
+    let forgedb_version = env!("CARGO_PKG_VERSION");
 
-    // Multi-stage: build with the full Rust toolchain, run on a slim base.
-    // `forgedb generate` must have produced ./generated/{database,api}.rs into the
-    // build context first (documented); committing Cargo.lock makes builds
-    // reproducible (it is copied when present).
     let dockerfile = format!(
         r#"# syntax=docker/dockerfile:1
-# ForgeDB generated-server image (Phase 5 deploy path).
+# ForgeDB generated-server image (#335 §15).
 #
-# Build context expects the generated code present:
-#   forgedb generate all --output ./generated
+# ForgeDB owns the build. This image copies your SCHEMA — not generated code, and
+# not a cargo package, because ForgeDB no longer scaffolds one — installs the
+# pinned CLI, and lets it generate and compile into its own build cache. The
+# server binary's path is never guessed here: it is the one `forgedb build`
+# reports.
+#
 #   docker build -t {bin} .
 
 FROM rust:1-slim AS builder
+
+# Name the build cache explicitly. Leaving it at $HOME/.forgedb works, but in a
+# container HOME is an accident of the base image, and every artifact path
+# `forgedb build` reports lives under this directory.
+ENV FORGEDB_HOME=/forgedb
+
+# Pinned to the CLI that scaffolded this project. Bump it deliberately.
+RUN cargo install forgedb --version {forgedb_version} --locked
+
 WORKDIR /build
-# Manifests first for dependency-layer caching, then sources.
-COPY Cargo.toml ./
-COPY src ./src
-COPY generated ./generated
-RUN cargo build --release --locked || cargo build --release
+# The whole project, minus what .dockerignore drops. `generated/` is dropped on
+# purpose: the builder regenerates it from schema.forge, so a stale committed
+# copy can never reach the image.
+COPY . ./
+
+RUN forgedb generate
+
+# Resolve the artifact; do not construct its path. Package names carry a per-app
+# hash and change when the schema file is renamed, so the Dockerfile names the
+# stable KIND (`server`) instead. One invocation emits both the human build and
+# the machine-readable inventory; `--print-artifact` puts the single path on
+# stdout and everything else on stderr.
+RUN mkdir -p /out \
+ && cp "$(forgedb build --release --report /out/artifacts.json --print-artifact server)" /out/server
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -304,10 +314,18 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 forgedb
 WORKDIR /app
-COPY --from=builder /build/target/release/{bin} /usr/local/bin/forgedb-server
+COPY --from=builder /out/server /usr/local/bin/forgedb-server
+# The build inventory, for anything downstream that wants more than one path.
+COPY --from=builder /out/artifacts.json /app/artifacts.json
 
 # Config comes from the environment (12-factor). Data lives on a mounted volume —
 # never baked into the image.
+#
+# FORGEDB_DATA is ABSOLUTE, and outside the builder's FORGEDB_HOME, on purpose:
+# the generated server refuses to open a database inside the ForgeDB build cache
+# (#335 C4), and the built-in data root is RELATIVE (`data`), which is what makes
+# the cache reachable by accident rather than by mistake. FORGEDB_HOME does not
+# exist in this stage at all.
 ENV FORGEDB_HOST=0.0.0.0 \
     FORGEDB_PORT=3000 \
     FORGEDB_DATA=/data \
@@ -317,7 +335,7 @@ VOLUME ["/data"]
 USER forgedb
 EXPOSE 3000
 
-# Liveness against the generated /health endpoint (Phase 5).
+# Liveness against the generated /health endpoint.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=5 \
     CMD curl -fsS http://localhost:3000/health || exit 1
 
@@ -326,18 +344,33 @@ CMD ["forgedb-server"]
     );
     fs::write(project_path.join("Dockerfile"), dockerfile)?;
 
+    // The builder regenerates from the schema, so generated code, build output
+    // and database files must not enter the context.
     let dockerignore = "\
-target/
+# Regenerated inside the image from schema.forge — a committed copy must never
+# win over a fresh generate (#335).
+generated/
+
+# Never ship data or build output into a build context.
 data/
+target/
 .git/
 node_modules/
 **/*.rs.bk
+
+# The deploy files themselves are not build inputs.
+Dockerfile
+.dockerignore
+docker-compose.yml
 ";
     fs::write(project_path.join(".dockerignore"), dockerignore)?;
 
     let compose = format!(
-        r#"# ForgeDB generated-server compose file (Phase 5).
+        r#"# ForgeDB generated-server compose file.
 #   docker compose up --build
+#
+# The image generates and builds from schema.forge itself (#335) — there is no
+# `forgedb generate` step to run first, and no cargo package in this directory.
 services:
   {bin}:
     build: .
@@ -346,6 +379,8 @@ services:
     environment:
       FORGEDB_HOST: 0.0.0.0
       FORGEDB_PORT: "3000"
+      # Absolute, and not inside a ForgeDB build cache — the server refuses the
+      # latter (#335 C4).
       FORGEDB_DATA: /data
       RUST_LOG: info
       # Machine-parseable JSON logs for a log aggregator (default is text):
@@ -388,7 +423,7 @@ volumes:
 /// the generated binary as a non-root `DynamicUser` with a managed
 /// `StateDirectory` (the on-host analogue of the container's non-root user +
 /// `/data` VOLUME), reads config from the env file (12-factor, same knobs as the
-/// compose file), and relies on the scaffold `main.rs` graceful-shutdown path for
+/// compose file), and relies on the generated server's graceful-shutdown path for
 /// a clean `systemctl stop`.  systemd goes under `deploy/` (not the project root
 /// like the `Dockerfile`) because a unit has no build-context root requirement —
 /// it is installed to `/etc/systemd/system/`.  Nothing here reads `schema.forge`.
@@ -409,13 +444,14 @@ fn create_systemd_files(options: &InitOptions) -> Result<()> {
     // `DynamicUser=yes` + `StateDirectory=<name>` give a non-root, isolated,
     // persistent data dir (/var/lib/<name>) without a manual useradd/chown; the
     // env file below points FORGEDB_DATA at it.  `KillSignal=SIGTERM` +
-    // `TimeoutStopSec=30` pair with the graceful-shutdown drain in main.rs.
+    // `TimeoutStopSec=30` pair with the generated server's graceful-shutdown drain.
     let service = format!(
         r#"# systemd unit for the {bin} ForgeDB generated server (#115 on-host deploy).
 #
 # Install:
-#   cargo build --release
-#   sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+#   forgedb generate
+#   sudo install -Dm755 \
+#       "$(forgedb build --release --print-artifact server)" /usr/local/bin/{bin}
 #   sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
 #   sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
 #   sudo systemctl daemon-reload
@@ -442,7 +478,7 @@ StateDirectory={bin}
 
 Restart=on-failure
 RestartSec=2
-# main.rs drains in-flight requests on SIGTERM (graceful shutdown).
+# The generated server drains in-flight requests on SIGTERM.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
@@ -509,8 +545,12 @@ environment — an ideal systemd citizen.
 ## systemd (Linux — the scaffolded path)
 
 ```bash
-cargo build --release
-sudo install -Dm755 target/release/{bin} /usr/local/bin/{bin}
+forgedb generate
+# ForgeDB compiles the generated Rust in its own cache and REPORTS where the
+# binary landed (#335); there is no cargo package in this directory to build,
+# and the path is never one you construct by hand.
+sudo install -Dm755 \
+    "$(forgedb build --release --print-artifact server)" /usr/local/bin/{bin}
 sudo install -Dm644 deploy/{bin}.env     /etc/{bin}/{bin}.env
 sudo install -Dm644 deploy/{bin}.service /etc/systemd/system/{bin}.service
 sudo systemctl daemon-reload
@@ -526,7 +566,7 @@ Edit config in `/etc/{bin}/{bin}.env`, then `sudo systemctl restart {bin}`.
 
 The unit runs as a non-root `DynamicUser` with a managed `StateDirectory`
 (`/var/lib/{bin}`, the data dir) and drains in-flight requests on stop (SIGTERM →
-the graceful-shutdown path in `main.rs`).
+the graceful-shutdown path in the generated server).
 
 ## One writer per data directory
 

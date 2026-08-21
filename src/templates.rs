@@ -250,17 +250,32 @@ enabled = false
 }
 
 /// Default .gitignore
+///
+/// **Generated TEXT is committed; only compiled output is ignored** (#335 §15).
+/// This file used to ignore `/generated/` wholesale, which contradicted the rule
+/// outright — and after #335 it is plainly wrong: ForgeDB compiles the generated
+/// Rust in its own cache under `$FORGEDB_HOME`, so nothing under `generated/` is
+/// a build artifact any more. It holds reviewable, diffable source.
 pub fn default_gitignore() -> &'static str {
-    r#"# ForgeDB Generated Files
-/generated/
+    r#"# ForgeDB generated code is COMMITTED, not ignored.
+#
+# `generated/` holds source you review and ship — database.rs, api.rs, types.ts,
+# openapi.json, the client SDKs and go/. ForgeDB compiles the Rust in its own
+# build cache under $FORGEDB_HOME, so none of this is build output. Commit it.
+#
+# The one COMPILED artifact ForgeDB delivers into the tree is the static library
+# the Go binding links against, and that is ignored:
+/generated/**/*.a
+/generated/**/*.lib
 
 # Database Files
 /data/
 
-# Rust
+# Rust — ForgeDB scaffolds no cargo package (#335); these cover a crate you add
+# yourself. Cargo.lock is deliberately NOT ignored: a binary crate commits its
+# lockfile, and ForgeDB's own lockfile lives in its cache, not here.
 /target/
 **/*.rs.bk
-Cargo.lock
 
 # TypeScript / Node
 node_modules/
@@ -294,20 +309,39 @@ A ForgeDB project.
 ### Development
 
 ```bash
-# Generate code from schema
-cargo run
+# Generate code from schema.forge
+forgedb generate
 
-# Run the application
-cargo run --example basic
+# Compile it (ForgeDB builds in its own cache — there is no Cargo.toml here)
+forgedb build
+
+# Where did the server binary land?
+forgedb build --release --print-artifact server
 ```
 
 ### Schema
 
-Edit `schema.forge` to define your data models. The code will be automatically generated.
+Edit `schema.forge` to define your data models, then re-run `forgedb generate`.
+Which generators run is declared by `targets` under `[generate]` in
+`forgedb.toml`.
 
 ### Generated Code
 
-- `generated/database.rs` - Rust database implementation
+`generated/` is source: review it, diff it, commit it. ForgeDB compiles the Rust
+in its own build cache under `$FORGEDB_HOME`, so this directory holds no build
+output.
+
+- `generated/database.rs` - Rust database implementation (a read-only mirror of
+  the copy ForgeDB compiles)
+- `generated/api.rs` - the REST API layer
+- `generated/types.ts`, `generated/openapi.json` - the TypeScript types and the
+  OpenAPI document
+
+### Deploying
+
+`Dockerfile` / `docker-compose.yml` build the image by driving the CLI, and
+`deploy/` holds the on-host systemd path. Both copy out the artifact path
+`forgedb build` reports rather than constructing one.
 
 ## Learn More
 
