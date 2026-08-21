@@ -55,6 +55,35 @@ fn scoped_home() -> EnvGuard {
 // Scenario 1 — the member path is a pure function of its inputs
 // ---------------------------------------------------------------------------
 
+/// The cargo package name one app's `core` gets, derived through the SAME API
+/// the CLI uses rather than spelled out here.
+///
+/// The exact format is pinned by golden vectors in `naming_test.rs`; these
+/// tests are about a package being *addressable*, so re-spelling the format
+/// would be a second definition that drifts. What they must not do is assume
+/// the old `<stem>-<hash>-<kind>` shape, which is what four of them did.
+fn core_package_of(project_id: &str, rel: &str, siblings: &[&str]) -> String {
+    let sibs: Vec<PathBuf> = siblings.iter().map(PathBuf::from).collect();
+    let app = forgedb::naming::app_name(
+        project_id,
+        Path::new(rel),
+        &sibs,
+        forgedb::naming::SymbolNaming::Minimal,
+    );
+    forgedb::naming::package_name(&app, &forgedb::naming::PackageKind::Core)
+}
+
+fn package_of(project_id: &str, rel: &str, siblings: &[&str], kind: forgedb::naming::PackageKind) -> String {
+    let sibs: Vec<PathBuf> = siblings.iter().map(PathBuf::from).collect();
+    let app = forgedb::naming::app_name(
+        project_id,
+        Path::new(rel),
+        &sibs,
+        forgedb::naming::SymbolNaming::Minimal,
+    );
+    forgedb::naming::package_name(&app, &kind)
+}
+
 #[test]
 fn scenario_1_member_path_is_a_pure_function_of_its_inputs() {
     let _env = scoped_home();
@@ -972,7 +1001,7 @@ fn reserve_does_not_write_the_workspace_root() {
     let schema = root.join("schema.forge");
     write(&schema, SCHEMA);
 
-    let reserved = cache::reserve("fresh", &root, &schema).expect("reserve");
+    let reserved = cache::reserve("fresh", &root, &schema, forgedb::naming::SymbolNaming::Minimal).expect("reserve");
 
     assert!(reserved.container.is_dir(), "the container was not created");
     assert!(
@@ -1121,14 +1150,13 @@ fn s335_5_a_cold_cache_first_generate_is_addressable() {
 
     let project = env.home.join("projects").join("cold");
     let names = cargo_package_names(&project);
-    let hash = cache::member_hash(Path::new("schema.forge"));
 
     assert!(
-        names.iter().any(|n| n == &format!("schema-{hash}-core")),
+        names.iter().any(|n| n == &core_package_of("cold", "schema.forge", &["schema.forge"])),
         "the app's core is not addressable after its first generate: {names:?}"
     );
     assert!(
-        names.iter().any(|n| n == &format!("schema-{hash}-server")),
+        names.iter().any(|n| n == &package_of("cold", "schema.forge", &["schema.forge"], forgedb::naming::PackageKind::Server)),
         "the app's server is not addressable: {names:?}"
     );
 }
@@ -1165,7 +1193,7 @@ fn s335_6_a_rust_only_app_lists_its_sole_core() {
         "the sole core must be listed explicitly: {members:?}"
     );
     assert!(
-        cargo_package_names(&project).contains(&format!("schema-{hash}-core")),
+        cargo_package_names(&project).contains(&core_package_of("solo", "schema.forge", &["schema.forge"])),
         "cargo cannot address the sole core"
     );
 }
@@ -1241,8 +1269,376 @@ fn s335_10_a_server_app_carries_utoipa() {
     // The server links `core` by a RENAMED dependency, so no generated source
     // byte carries the per-app hash.
     let server_manifest = std::fs::read_to_string(app.join("server/Cargo.toml")).unwrap();
-    assert!(server_manifest.contains(&format!("schema-{hash}-core")));
+    assert!(server_manifest.contains(&core_package_of("web", "schema.forge", &["schema.forge"])));
     let main_rs = std::fs::read_to_string(app.join("server/src/main.rs")).unwrap();
     assert!(main_rs.contains("use forgedb_core as database;"));
     assert!(!main_rs.contains(&hash), "the app hash leaked into main.rs");
+}
+
+// ---------------------------------------------------------------------------
+// The per-kind package prune — plan #347 scenarios 12–15
+// ---------------------------------------------------------------------------
+//
+// `cache::prunable` decides WHAT may be removed, `cache::prune` decides in what
+// ORDER, and `main.rs`'s `sync_after_emission` is the call site. The order half
+// is guarded by unit tests inside `src/cache.rs` (the intermediate state is only
+// observable from inside); these are the end-to-end halves, driven through the
+// CLI so that a prune wired to nothing fails here rather than passing quietly.
+
+/// A stub cargo package standing in for one a generator has not learned to emit
+/// yet (`napi/`, `transform-1-2/`). The prune keys on the DIRECTORY NAME, so a
+/// stub is indistinguishable from the real thing as far as it is concerned.
+fn plant_package(dir: &Path, name: &str) {
+    write(
+        &dir.join("Cargo.toml"),
+        &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+    );
+    write(&dir.join("src/lib.rs"), "");
+}
+
+/// **Scenario 12 (★), the end-to-end half.** The state a kill between the root
+/// rewrite and the directory removal leaves behind is one in which every app in
+/// the project still builds.
+///
+/// The interruption is simulated by running the de-list and stopping —
+/// `cache::sync_root_excluding` is exactly the first half of `cache::prune`, and
+/// it is public precisely because it deletes nothing. What must hold at that
+/// instant: the root no longer names the doomed package, the directory is still
+/// there (inert), and `cargo metadata` over the root exits 0 **for both apps**.
+///
+/// The inverse order leaves the root naming a member that does not exist, which
+/// is project-wide fatal: `cargo metadata` exits 101 for every app, not just the
+/// one being pruned.
+#[test]
+fn s335_12_an_interrupted_prune_leaves_every_app_in_the_project_buildable() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"killed\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+
+    for app in ["api", "web"] {
+        write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
+        let out = forgedb(
+            &root,
+            &env.home,
+            &["generate", "rust", "--schema", &format!("apps/{app}/schema.forge")],
+        );
+        assert!(out.status.success(), "generate {app}:\n{}", combined(&out));
+    }
+
+    let project = env.home.join("projects").join("killed");
+    let doomed_container = project
+        .join("apps")
+        .join(cache::member_hash(Path::new("apps/api/schema.forge")));
+    plant_package(&doomed_container.join("napi"), "planted-napi");
+
+    // Re-derive so the planted package is a member, as a `generate` that emitted
+    // it would have left things.
+    cache::sync_root(&project, &doomed_container).unwrap();
+    assert!(
+        members_of(&project).iter().any(|m| m.ends_with("/napi")),
+        "the fixture starts with the doomed package LISTED: {:?}",
+        members_of(&project)
+    );
+
+    // The kill: de-list, and stop before deleting anything.
+    let doomed = cache::prunable(
+        &doomed_container,
+        &[forgedb::naming::PackageKind::Core],
+        forgedb::naming::PruneOwner::GenerateBuild,
+    )
+    .unwrap();
+    assert_eq!(doomed, vec![doomed_container.join("napi")]);
+    cache::sync_root_excluding(&project, &doomed_container, &doomed).unwrap();
+
+    let members = members_of(&project);
+    assert!(
+        !members.iter().any(|m| m.ends_with("/napi")),
+        "the root still names the package that is about to be deleted: {members:?}"
+    );
+    assert!(
+        doomed_container.join("napi/Cargo.toml").is_file(),
+        "the directory is still on disk — that is what makes this the interrupted state"
+    );
+    assert_eq!(members.len(), 2, "both apps' cores are still members: {members:?}");
+
+    // "Every app in the project still builds", asserted the only way that
+    // distinguishes it from "the pruned app still builds": load the WHOLE
+    // workspace. `--no-deps` keeps this a manifest check rather than a
+    // networked substrate build.
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&project)
+        .output()
+        .expect("cargo runs");
+    assert!(
+        meta.status.success(),
+        "the cache root stopped loading after the interrupted prune:\n{}",
+        String::from_utf8_lossy(&meta.stderr)
+    );
+    let meta = String::from_utf8_lossy(&meta.stdout);
+    for app in ["apps/api/schema.forge", "apps/web/schema.forge"] {
+        assert!(
+            meta.contains(&core_package_of(
+                "killed",
+                app,
+                &["apps/api/schema.forge", "apps/web/schema.forge"]
+            )),
+            "{app} is missing"
+        );
+    }
+}
+
+/// **Scenario 13.** A prune judges only the container it was given.
+///
+/// Two apps under one root config; the narrowed target set is a property of the
+/// project, so a prune that judged the project rather than the app would reap
+/// the sibling's package too — and the sibling's next build would fail in a
+/// directory nobody touched.
+#[test]
+fn s335_13_a_prune_judges_only_the_container_it_was_given() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"siblings\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+
+    for app in ["api", "web"] {
+        write(&root.join(format!("apps/{app}/schema.forge")), SCHEMA);
+        let out = forgedb(
+            &root,
+            &env.home,
+            &["generate", "rust", "--schema", &format!("apps/{app}/schema.forge")],
+        );
+        assert!(out.status.success(), "generate {app}:\n{}", combined(&out));
+    }
+
+    let project = env.home.join("projects").join("siblings");
+    let container = |app: &str| {
+        project
+            .join("apps")
+            .join(cache::member_hash(Path::new(&format!("apps/{app}/schema.forge"))))
+    };
+    plant_package(&container("api").join("napi"), "planted-api-napi");
+    plant_package(&container("web").join("napi"), "planted-web-napi");
+
+    // Regenerate ONLY the api app. `targets = ["rust"]` declares no napi, so
+    // api's is pruned — and web's must be untouched, though the same config
+    // governs it.
+    let out = forgedb(
+        &root,
+        &env.home,
+        &["generate", "rust", "--force", "--schema", "apps/api/schema.forge"],
+    );
+    assert!(out.status.success(), "{}", combined(&out));
+
+    assert!(
+        !container("api").join("napi").exists(),
+        "the acted-on app's undeclared package survived — the prune never ran"
+    );
+    assert!(
+        container("web").join("napi/Cargo.toml").is_file(),
+        "the SIBLING's package was deleted by an invocation that never named it"
+    );
+    assert!(
+        members_of(&project).iter().any(|m| m.ends_with("/napi")),
+        "and it is still a member: {:?}",
+        members_of(&project)
+    );
+}
+
+/// **Scenario 14.** `generate rust` does not prune `napi/`.
+///
+/// The prune judges the **declared** set (`[generate].targets`), never the
+/// target this invocation selected. Pruning against *selected* is the reflex
+/// error, and it deletes a package the config still asks for on every
+/// single-target regenerate.
+///
+/// The second half is not decoration: "it survived" is exactly what a prune
+/// wired to nothing produces, so the same fixture then narrows the config and
+/// requires the deletion. One test, both directions — otherwise the guard is
+/// green for the absence of the feature.
+#[test]
+fn s335_14_generate_rust_does_not_prune_a_declared_napi() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let config = root.join("forgedb.toml");
+    write(&config, "[project]\nname = \"declared\"\n\n[generate]\ntargets = [\"all\"]\n");
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
+
+    let project = env.home.join("projects").join("declared");
+    let container = project
+        .join("apps")
+        .join(cache::member_hash(Path::new("schema.forge")));
+    let napi = container.join("napi");
+    plant_package(&napi, "planted-napi");
+
+    // Declared `all`, selected `rust`.
+    let out = forgedb(&root, &env.home, &["generate", "rust", "--force"]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(
+        napi.join("Cargo.toml").is_file(),
+        "`generate rust` pruned a package `targets = [\"all\"]` declares:\n{}",
+        combined(&out)
+    );
+
+    // Now narrow the DECLARED set. Same invocation, opposite outcome — which is
+    // what proves the call site runs at all.
+    write(
+        &config,
+        "[project]\nname = \"declared\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    let out = forgedb(&root, &env.home, &["generate", "rust", "--force"]);
+    assert!(out.status.success(), "{}", combined(&out));
+    assert!(
+        !napi.exists(),
+        "an undeclared package survived — the prune is not wired to anything:\n{}",
+        combined(&out)
+    );
+    assert!(
+        !members_of(&project).iter().any(|m| m.ends_with("/napi")),
+        "…and the root still names it: {:?}",
+        members_of(&project)
+    );
+    assert!(
+        combined(&out).contains("Pruned"),
+        "a deletion in a directory the user never opens must be reported:\n{}",
+        combined(&out)
+    );
+}
+
+/// **Scenario 15.** `generate` does not delete what `migrate` owns.
+///
+/// `transform-*` and `engine-*` are not expressible in `[generate].targets` at
+/// all, so without per-kind ownership the first `generate` after a `migrate
+/// build` reaps the transformer as garbage — and the next `migrate run` has no
+/// binary to run.
+///
+/// The `napi/` half of this fixture is the control: it makes the surviving
+/// transformer mean "ownership held" rather than "nothing was pruned".
+#[test]
+fn s335_15_generate_does_not_prune_what_migrate_owns() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"owned\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
+
+    let project = env.home.join("projects").join("owned");
+    let container = project
+        .join("apps")
+        .join(cache::member_hash(Path::new("schema.forge")));
+    plant_package(&container.join("transform-1-2"), "planted-transform");
+    plant_package(&container.join("engine-1-2"), "planted-engine");
+    plant_package(&container.join("napi"), "planted-napi");
+
+    let out = forgedb(&root, &env.home, &["generate", "rust", "--force"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    assert!(
+        container.join("transform-1-2/Cargo.toml").is_file(),
+        "`generate` deleted the transformer `migrate build` owns:\n{}",
+        combined(&out)
+    );
+    assert!(
+        container.join("engine-1-2/Cargo.toml").is_file(),
+        "`generate` deleted the engine hop `migrate engine` owns:\n{}",
+        combined(&out)
+    );
+    assert!(
+        !container.join("napi").exists(),
+        "the control failed: nothing was pruned at all, so surviving proves nothing"
+    );
+}
+
+/// A directory name ForgeDB does not emit is never reaped — fail toward keeping.
+///
+/// The asymmetry is deliberate: a wrongly-kept directory is inert (the root does
+/// not name it, so it is never built), while a wrongly-deleted one costs a
+/// regeneration — or, for something the user put there, is unrecoverable.
+#[test]
+fn s335_15_an_unrecognised_directory_is_never_reaped() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"strangers\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
+
+    let project = env.home.join("projects").join("strangers");
+    let container = project
+        .join("apps")
+        .join(cache::member_hash(Path::new("schema.forge")));
+    plant_package(&container.join("something-else"), "planted-stranger");
+
+    assert!(forgedb(&root, &env.home, &["generate", "rust", "--force"]).status.success());
+
+    assert!(container.join("something-else/Cargo.toml").is_file());
+    assert!(
+        !members_of(&project).iter().any(|m| m.ends_with("/something-else")),
+        "…and it is not listed either — kept, but inert: {:?}",
+        members_of(&project)
+    );
+}
+
+/// `generate --check` is a CI staleness gate: it generates into a scratch dir,
+/// compares, and removes it. It must therefore **delete nothing** — a prune on
+/// the check path would have a read-only CI job reaping a real package out of a
+/// developer's cache, and the next `--check` would still pass.
+#[test]
+fn s335_14_check_mode_prunes_nothing() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"checked\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "rust"]).status.success());
+
+    let project = env.home.join("projects").join("checked");
+    let container = project
+        .join("apps")
+        .join(cache::member_hash(Path::new("schema.forge")));
+    plant_package(&container.join("napi"), "planted-napi");
+
+    let out = forgedb(&root, &env.home, &["generate", "rust", "--check"]);
+    assert!(out.status.success(), "the check itself must pass:\n{}", combined(&out));
+    assert!(
+        container.join("napi/Cargo.toml").is_file(),
+        "`--check` deleted a package while claiming to touch nothing:\n{}",
+        combined(&out)
+    );
+
+    // The control: the same fixture, without `--check`, does prune it.
+    assert!(
+        forgedb(&root, &env.home, &["generate", "rust", "--force"])
+            .status
+            .success()
+    );
+    assert!(
+        !container.join("napi").exists(),
+        "the control failed: nothing prunes here, so surviving proves nothing"
+    );
 }

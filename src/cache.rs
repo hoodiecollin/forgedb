@@ -13,6 +13,7 @@
 //!   target/               # one target dir shared by every app
 //!   apps/<hash>/          # one CONTAINER per app — no manifest of its own
 //!     schema-path         #   which schema this container belongs to
+//!     app-name            #   its legible derived identity (foo_services_blog)
 //!     core/               #   the workspace MEMBERS are one level deeper
 //!     server/
 //!     ffi/  napi/  pyo3/  wasm/
@@ -329,6 +330,36 @@ pub fn member_schema(member: &Path) -> Option<PathBuf> {
     (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
+/// Records the member's derived app name — the legible identity that replaced
+/// hash-based disambiguation.
+///
+/// It is **persisted rather than re-derived** because deriving it needs the
+/// project's whole app set (see [`crate::naming::app_name`]), and the three
+/// consumers — `generate`, `build`, `migrate` — hold only this container path.
+/// Re-deriving it in each would be three chances to disagree, and a disagreement
+/// between the emitter of a C symbol and the emitter of its header is a link
+/// error at the far end of the build.
+const MEMBER_APP_NAME_FILE: &str = "app-name";
+
+/// Note the derived app name for a member directory.
+pub fn record_app_name(member: &Path, app_name: &str) -> Result<()> {
+    std::fs::create_dir_all(member)?;
+    std::fs::write(member.join(MEMBER_APP_NAME_FILE), app_name.as_bytes())?;
+    Ok(())
+}
+
+/// The derived app name a member directory recorded, if any.
+///
+/// `None` means a member written before this marker existed, or an unreadable
+/// one. Callers fall back to the container's own directory name, which is the
+/// pre-existing hash — legible names are an improvement, not a load-bearing
+/// invariant, and a cache from an older CLI must still build.
+pub fn member_app_name(member: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(member.join(MEMBER_APP_NAME_FILE)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Every member directory in a project whose schema still exists, plus `keep`.
 ///
 /// This is how the member set **accretes**: generating one app does not know
@@ -443,38 +474,6 @@ pub fn assert_not_in_cache(data_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Where one app's generated code is cached, and the state of the project around
-/// it.
-#[derive(Debug)]
-pub struct Placement {
-    /// The ForgeDB-owned workspace root for this project.
-    pub project: PathBuf,
-    /// This app's member directory beneath it.
-    pub member: PathBuf,
-    /// Member directories whose schema no longer exists.
-    pub orphans: Vec<PathBuf>,
-    /// C9 fired: the CLI version changed, so `Cargo.lock` was deleted.
-    pub lock_dropped: bool,
-}
-
-/// Place an app in its project's cache workspace: ensure the member directory,
-/// record what it belongs to, and rewrite the workspace root around the current
-/// member set.
-///
-/// `project_root` is the app's project root **on the user's filesystem** — the
-/// directory the schema path is made relative to, so that the member hash is a
-/// property of the tree rather than of this machine.
-pub fn place(project_id: &str, project_root: &Path, schema: &Path) -> Result<Placement> {
-    let reserved = reserve(project_id, project_root, schema)?;
-    let synced = sync_root(&reserved.project, &reserved.container)?;
-    Ok(Placement {
-        project: reserved.project,
-        member: reserved.container,
-        orphans: synced.orphans,
-        lock_dropped: synced.lock_dropped,
-    })
-}
-
 /// One app's container directory, and the project root above it.
 #[derive(Debug)]
 pub struct Reserved {
@@ -483,6 +482,12 @@ pub struct Reserved {
     /// This app's container beneath it.  Holds the `schema-path` marker and the
     /// per-kind package directories — and **no manifest of its own**.
     pub container: PathBuf,
+    /// The app's legible derived identity, e.g. `foo_services_blog`.
+    ///
+    /// Every package name, `[[bin]]` name and exported C symbol for this app is
+    /// built from it, so it is computed once here and persisted in the container
+    /// rather than re-derived by each consumer.
+    pub app_name: String,
 }
 
 /// Ensure an app's container exists and record what it belongs to.
@@ -497,7 +502,12 @@ pub struct Reserved {
 /// packages and `cargo build -p <its core>` would fail with `did not match any
 /// packages` — a failure invisible on a warm cache and reachable only on the
 /// first generate for an app.  [`sync_root`] is the after half.
-pub fn reserve(project_id: &str, project_root: &Path, schema: &Path) -> Result<Reserved> {
+pub fn reserve(
+    project_id: &str,
+    project_root: &Path,
+    schema: &Path,
+    mode: crate::naming::SymbolNaming,
+) -> Result<Reserved> {
     let project = project_dir(project_id)?;
     let schema = absolutize(schema);
 
@@ -514,9 +524,17 @@ pub fn reserve(project_id: &str, project_root: &Path, schema: &Path) -> Result<R
     let member = member_dir(project_id, &relative)?;
     record_member(&member, &schema)?;
 
+    // The app's legible identity, computed HERE because this is the one place
+    // that holds all three inputs at once: the project id, the project-relative
+    // schema path, and (via the project root) its siblings.
+    let siblings = crate::project::discover_schemas(project_root);
+    let app_name = crate::naming::app_name(project_id, &relative, &siblings, mode);
+    record_app_name(&member, &app_name)?;
+
     Ok(Reserved {
         project,
         container: member,
+        app_name,
     })
 }
 
@@ -612,12 +630,30 @@ fn enforce_cli_version(project: &Path) -> Result<bool> {
 /// `schema-path` file, but a single stray *directory* under it is a hard error
 /// that takes the whole project down.
 pub fn sync_root(project: &Path, keep: &Path) -> Result<Synced> {
+    sync_root_excluding(project, keep, &[])
+}
+
+/// [`sync_root`], minus a set of package directories that are about to be
+/// deleted — the **de-list** half of a prune.
+///
+/// Excluding here rather than deleting first is #335 §3 rule 1: the root must
+/// stop naming a package *before* that package's directory is removed.  A root
+/// naming a member that does not exist is **project-wide fatal** — `cargo
+/// metadata`/`build` exit 101 for *every* app in the project, not just the one
+/// pruned — while a directory present but unlisted is inert.  So the safe
+/// intermediate state is the one this function alone produces, and it is the
+/// state a kill between the two steps leaves behind.
+///
+/// Public because it is safe by construction: it removes nothing.  Deletion is
+/// reachable only through [`prune`], which calls this first.
+pub fn sync_root_excluding(project: &Path, keep: &Path, excluded: &[PathBuf]) -> Result<Synced> {
     let live = live_members(project, keep)?;
 
     let mut members = Vec::new();
     for container in &live {
         members.extend(packages_in(container)?);
     }
+    members.retain(|m| !excluded.iter().any(|e| same_dir(e, m)));
     members.sort();
     members.dedup();
 
@@ -630,6 +666,84 @@ pub fn sync_root(project: &Path, keep: &Path) -> Result<Synced> {
         orphans,
         lock_dropped,
     })
+}
+
+/// What one [`prune`] pass de-listed and removed.
+#[derive(Debug)]
+pub struct Pruned {
+    /// The root rewrite that de-listed the removed packages — done FIRST.
+    pub synced: Synced,
+    /// The package directories actually removed from disk.
+    pub removed: Vec<PathBuf>,
+}
+
+/// De-list, then delete — **the only function that removes a package
+/// directory** (#335 §3 rule 1).
+///
+/// The order is the whole content of this function, and it is not
+/// reversible by a caller: the root is rewritten without `doomed` first, and
+/// only then is anything unlinked.  Inverted, a kill (or a failing `rmdir`, or
+/// a full disk) in between leaves the root naming a member that does not
+/// exist, which breaks every app in the project rather than the one being
+/// pruned.
+///
+/// `doomed` must come from [`prunable`], which decides *what* may be removed;
+/// this decides only *in what order* — plus one refusal [`prunable`] cannot
+/// express, because it is about the caller rather than the container: a path
+/// outside `keep` is never deleted, so a wrong container or a wrong declared
+/// set can damage at most the app it was handed.
+///
+/// The de-list matches on [`same_dir`] rather than on `Path` equality: a doomed
+/// path spelled with a `..` component, or relatively, or through a symlink,
+/// must still be removed from the member list before it is unlinked.
+pub fn prune(project: &Path, keep: &Path, doomed: &[PathBuf]) -> Result<Pruned> {
+    prune_with(project, keep, doomed, &mut |dir| std::fs::remove_dir_all(dir))
+}
+
+/// [`prune`] with the removal itself injected, so a test can observe the state
+/// at the instant between the de-list and the delete — the state a kill leaves.
+///
+/// An end-state assertion cannot tell the two orders apart (both end with the
+/// directory gone and unlisted); only the intermediate state can, so it has to
+/// be reachable.
+fn prune_with(
+    project: &Path,
+    keep: &Path,
+    doomed: &[PathBuf],
+    remove: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Pruned> {
+    // Nothing outside the container being acted on is ever deletable (#335 §3:
+    // "only the container being acted on is judged"). A sibling app's package
+    // reaching this list would be a bug in the CALLER — a wrong `declared` set,
+    // the wrong container — and the damage is another app's build, so it is
+    // refused here rather than trusted.
+    for dir in doomed {
+        let inside = closest_real_ancestor(dir).starts_with(closest_real_ancestor(keep));
+        if !inside {
+            return Err(CliError::Config(format!(
+                "Refusing to prune {}: it is outside the app container {} this prune \
+                 was given. A prune never reaches beyond one app.",
+                dir.display(),
+                keep.display()
+            )));
+        }
+    }
+
+    // 1. De-list.
+    let synced = sync_root_excluding(project, keep, doomed)?;
+
+    // 2. Delete.
+    let mut removed = Vec::new();
+    for dir in doomed {
+        match remove(dir) {
+            Ok(()) => removed.push(dir.clone()),
+            // Already gone: the de-list is what mattered and it happened.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Ok(Pruned { synced, removed })
 }
 
 /// Package directories in a container that the given command may remove.
@@ -742,6 +856,18 @@ fn packages_in(container: &Path) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
+/// Whether two paths name the same directory, independent of spelling.
+///
+/// `Path` equality is component-based, so it already sees through a trailing
+/// separator and a `.` component — but not through `..`, a relative spelling, or
+/// a symlink. The de-list half of a prune has to see through all of them: a
+/// doomed path that fails to match its member entry would be deleted while the
+/// root still named it, which is the project-wide-fatal state the ordering rule
+/// exists to prevent.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b || closest_real_ancestor(a) == closest_real_ancestor(b)
+}
+
 fn absolutize(p: &Path) -> PathBuf {
     if p.is_absolute() {
         return p.to_path_buf();
@@ -768,5 +894,192 @@ fn closest_real_ancestor(path: &Path) -> PathBuf {
             Some(parent) => current = parent,
             None => return path.to_path_buf(),
         }
+    }
+}
+
+#[cfg(test)]
+mod prune_order_tests {
+    //! **Plan #347 scenario 12 (★) — a prune de-lists before it deletes.**
+    //!
+    //! These live here rather than in `tests/cache_dir_test.rs` because the
+    //! thing under test is an *order*, and an order is only observable from
+    //! inside: both orders end with the directory gone and unlisted, so no
+    //! end-state assertion can tell them apart. [`prune_with`] is the seam —
+    //! the removal is injected, so a test can stand exactly where a `kill -9`
+    //! would and read what is on disk at that instant.
+    //!
+    //! What the interrupted state must be: the root manifest already excludes
+    //! the doomed package, and the doomed directory is still there. The reverse
+    //! — directory gone, root still naming it — is **project-wide fatal**:
+    //! `cargo metadata`/`build` exit 101 for every app in the project.
+
+    use super::*;
+    use crate::naming::PruneOwner;
+
+    fn stub_package(dir: &Path, name: &str) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+    }
+
+    /// A project with one app whose container holds `core` and `napi`, plus a
+    /// sibling app holding `core` — so the "every app in the project" half of
+    /// the scenario has a second app to be true of.
+    fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("projects/p");
+        let container = project.join("apps/aaaaaaaaaaaaaaaa");
+        let sibling = project.join("apps/bbbbbbbbbbbbbbbb");
+
+        stub_package(&container.join("core"), "a-core");
+        stub_package(&container.join("napi"), "a-napi");
+        stub_package(&sibling.join("core"), "b-core");
+        // No `schema-path` marker: a container that recorded nothing is KEPT,
+        // so the sibling stays live without a schema file on disk.
+
+        // The root as an ordinary prior invocation left it — naming all three
+        // packages. Without this the manifest does not exist at the moment of
+        // the kill, and the scenario-12 assertion below would panic on a missing
+        // file instead of evaluating: red, but for the wrong reason.
+        sync_root(&project, &container).unwrap();
+        assert!(
+            members_in_manifest(&project).contains("/napi"),
+            "the fixture starts with the doomed package LISTED"
+        );
+
+        (tmp, project, container)
+    }
+
+    fn members_in_manifest(project: &Path) -> String {
+        std::fs::read_to_string(project.join("Cargo.toml")).unwrap()
+    }
+
+    /// The mandatory one: at the instant of the kill, the root must already
+    /// have stopped naming the package whose directory is still on disk.
+    #[test]
+    fn scenario_12_the_root_is_rewritten_before_anything_is_unlinked() {
+        let (_tmp, project, container) = fixture();
+        let doomed = prunable(&container, &[PackageKind::Core], PruneOwner::GenerateBuild).unwrap();
+        assert_eq!(doomed, vec![container.join("napi")], "napi is the doomed one");
+
+        let mut observed = 0;
+        let killed = prune_with(&project, &container, &doomed, &mut |dir| {
+            observed += 1;
+
+            // Stand where the kill would land.
+            let manifest = members_in_manifest(&project);
+            assert!(
+                !manifest.contains("/napi"),
+                "the root still names the package about to be deleted — every app \
+                 in this project is about to become unbuildable:\n{manifest}"
+            );
+            assert!(manifest.contains("/core"), "the survivors are still listed:\n{manifest}");
+            assert!(dir.is_dir(), "the delete has not happened yet");
+
+            Err(std::io::Error::other("killed between the de-list and the delete"))
+        });
+
+        assert_eq!(observed, 1, "the removal seam ran exactly once");
+        assert!(killed.is_err(), "the injected failure propagates");
+
+        // And the state the interrupted process left behind is the SAFE one:
+        // an unlisted directory is inert, so every app still builds.
+        let manifest = members_in_manifest(&project);
+        assert!(!manifest.contains("/napi"), "{manifest}");
+        assert!(manifest.contains("apps/aaaaaaaaaaaaaaaa/core"), "{manifest}");
+        assert!(manifest.contains("apps/bbbbbbbbbbbbbbbb/core"), "{manifest}");
+        assert!(
+            container.join("napi/Cargo.toml").is_file(),
+            "the directory is still there — that is what makes this the interrupted state"
+        );
+    }
+
+    /// The completed prune: same root, and the directory is gone.
+    #[test]
+    fn scenario_12_a_completed_prune_removes_the_directory_and_the_member() {
+        let (_tmp, project, container) = fixture();
+        let doomed = prunable(&container, &[PackageKind::Core], PruneOwner::GenerateBuild).unwrap();
+
+        let pruned = prune(&project, &container, &doomed).unwrap();
+
+        assert_eq!(pruned.removed, doomed);
+        assert!(!container.join("napi").exists());
+        let manifest = members_in_manifest(&project);
+        assert!(!manifest.contains("/napi"), "{manifest}");
+        assert!(manifest.contains("apps/aaaaaaaaaaaaaaaa/core"), "{manifest}");
+        assert!(manifest.contains("apps/bbbbbbbbbbbbbbbb/core"), "{manifest}");
+    }
+
+    /// A doomed path spelled differently from its member entry is still
+    /// de-listed before it is unlinked.
+    ///
+    /// `Path` equality is component-based, so it already sees through a `.`
+    /// component and a trailing separator (checked: `a/napi/.` compares equal to
+    /// `a/napi`), but NOT through `..`, a relative spelling, or a symlink. A
+    /// doomed path that failed to match its member entry would be deleted while
+    /// the root still named it — the project-wide-fatal state — and it would
+    /// happen silently, on a caller that looked correct.
+    #[test]
+    fn a_differently_spelled_doomed_path_is_still_de_listed_first() {
+        let (_tmp, project, container) = fixture();
+
+        // The same directory on disk, spelled so that `Path` equality misses it.
+        let hash = container.file_name().unwrap().to_owned();
+        let mistyped = vec![container.join("..").join(hash).join("napi")];
+        assert!(mistyped[0].is_dir(), "the mis-spelling names a real directory");
+        assert_ne!(mistyped[0], container.join("napi"), "…and is not Path-equal to it");
+
+        let pruned = prune(&project, &container, &mistyped).unwrap();
+
+        assert_eq!(pruned.removed, mistyped, "it was deleted");
+        assert!(!container.join("napi").exists());
+        let manifest = members_in_manifest(&project);
+        assert!(
+            !manifest.contains("/napi"),
+            "the root still names a directory that is now GONE — every app in this \
+             project is unbuildable:\n{manifest}"
+        );
+    }
+
+    /// A prune never reaches outside the container it was given (#335 §3), and
+    /// the refusal is here rather than in the caller because the damage is
+    /// another app's build.
+    #[test]
+    fn a_doomed_path_outside_the_container_is_refused() {
+        let (_tmp, project, container) = fixture();
+        let sibling = project.join("apps/bbbbbbbbbbbbbbbb/core");
+
+        let mut removals = 0;
+        let err = prune_with(&project, &container, std::slice::from_ref(&sibling), &mut |_| {
+            removals += 1;
+            Ok(())
+        })
+        .expect_err("must refuse");
+
+        assert_eq!(removals, 0, "nothing was deleted");
+        assert!(err.to_string().contains("outside the app container"), "{err}");
+        assert!(sibling.join("Cargo.toml").is_file(), "the sibling is untouched");
+        let manifest = members_in_manifest(&project);
+        assert!(
+            manifest.contains("apps/bbbbbbbbbbbbbbbb/core"),
+            "and is still a member:\n{manifest}"
+        );
+    }
+
+    /// An empty prune is a plain [`sync_root`] — the path every ordinary
+    /// invocation takes.
+    #[test]
+    fn an_empty_prune_deletes_nothing_and_still_rewrites_the_root() {
+        let (_tmp, project, container) = fixture();
+
+        let pruned = prune(&project, &container, &[]).unwrap();
+
+        assert!(pruned.removed.is_empty());
+        assert_eq!(pruned.synced.members.len(), 3, "{:?}", pruned.synced.members);
+        assert!(container.join("napi/Cargo.toml").is_file());
     }
 }
