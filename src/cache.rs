@@ -632,6 +632,65 @@ pub fn sync_root(project: &Path, keep: &Path) -> Result<Synced> {
     })
 }
 
+/// Package directories in a container that the given command may remove.
+///
+/// **Returns them; does NOT delete.** That asymmetry is the API shape enforcing
+/// #335 §3 rule 1: the caller must rewrite the workspace root against the
+/// post-prune set *before* removing anything. Inverted, the root names a member
+/// that does not exist, which is **project-wide fatal for every app in the
+/// project** rather than just the one being pruned — while a directory that is
+/// present but unlisted is inert (measured). A function that cannot delete
+/// cannot get that order wrong.
+///
+/// Three further rules, all from §3:
+///
+/// * **Only the container being acted on is judged.** Sibling apps are never
+///   touched, mirroring `orphans()`, which reports rather than deletes.
+/// * **Pruned against the DECLARED set, never the invocation's selected set.**
+///   `declared` is `[generate].targets`, now required and explicit, so it is
+///   always stated. Pruning against *selected* would make `forgedb generate
+///   rust` delete `napi/`.
+/// * **Each command prunes only the kinds it owns.** Without this the first
+///   `generate` after a `migrate build` deletes the transformer.
+///
+/// A directory whose name ForgeDB does not emit is never returned — fail toward
+/// keeping, because a wrongly-kept package costs nothing and a wrongly-deleted
+/// one costs a regeneration.
+pub fn prunable(
+    container: &Path,
+    declared_kinds: &[PackageKind],
+    owner: crate::naming::PruneOwner,
+) -> Result<Vec<PathBuf>> {
+    let mut doomed = Vec::new();
+    let entries = match std::fs::read_dir(container) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(doomed),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(kind) = PackageKind::from_dir(name) else {
+            continue;
+        };
+        if kind.owner() != owner {
+            continue;
+        }
+        if declared_kinds.contains(&kind) {
+            continue;
+        }
+        doomed.push(entry.path());
+    }
+
+    doomed.sort();
+    Ok(doomed)
+}
+
 /// The package directories inside one container.
 ///
 /// A subdirectory counts when it holds a `Cargo.toml` **and** its name is one

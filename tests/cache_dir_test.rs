@@ -1056,3 +1056,193 @@ fn c9_an_absent_marker_is_treated_as_a_mismatch() {
     assert!(!project.join("Cargo.lock").exists());
     assert!(project.join("cli-version").is_file(), "the marker was not written");
 }
+
+// ---------------------------------------------------------------------------
+// #335 step 5a — `core` and `server` are emitted into the cache
+//
+// These assert through `cargo metadata --no-deps`, which needs no network and no
+// compile. That is the right instrument, not a weaker one: the failure being
+// guarded is `did not match any packages` — a package that exists on disk but is
+// not a MEMBER — and `metadata` answers exactly that. The full substrate compile
+// is the reclose's job on CI.
+// ---------------------------------------------------------------------------
+
+/// Package names cargo can see at the cache root.
+fn cargo_package_names(project: &Path) -> Vec<String> {
+    let out = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(project)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("cargo runs");
+    assert!(
+        out.status.success(),
+        "cargo metadata failed at {}:\n{}",
+        project.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = String::from_utf8_lossy(&out.stdout);
+    // Minimal extraction — pulling in a JSON dep for two fields is not worth it.
+    let mut names = Vec::new();
+    for chunk in json.split("\"name\":\"").skip(1) {
+        if let Some(name) = chunk.split('"').next() {
+            if name.contains("-core") || name.contains("-server") {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// **Scenario 5 (mandatory).** An app's very FIRST generate leaves a workspace in
+/// which that app's `core` is addressable.
+///
+/// This is the ordering the `reserve`/`sync_root` split exists for. Rendering the
+/// root from a scan *before* emission lists the packages of the previous run, so
+/// a first generate writes a root naming none of its own packages — and it passes
+/// on every warm cache, failing only here.
+#[test]
+fn s335_5_a_cold_cache_first_generate_is_addressable() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"cold\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    // Exactly one invocation, against a cache that does not exist yet.
+    let out = forgedb(&root, &env.home, &["generate", "all"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let project = env.home.join("projects").join("cold");
+    let names = cargo_package_names(&project);
+    let hash = cache::member_hash(Path::new("schema.forge"));
+
+    assert!(
+        names.iter().any(|n| n == &format!("schema-{hash}-core")),
+        "the app's core is not addressable after its first generate: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == &format!("schema-{hash}-server")),
+        "the app's server is not addressable: {names:?}"
+    );
+}
+
+/// **Scenario 6 (mandatory).** A Rust-only app whose SOLE package is `core` is
+/// listed explicitly.
+///
+/// Cargo makes a path dependency of a listed member automatically a member, so an
+/// under-specified `members` list is masked in every shape that has a wrapper and
+/// surfaces only here. Without this scenario the hole ships.
+#[test]
+fn s335_6_a_rust_only_app_lists_its_sole_core() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"solo\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+
+    let out = forgedb(&root, &env.home, &["generate", "all"]);
+    assert!(out.status.success(), "{}", combined(&out));
+
+    let project = env.home.join("projects").join("solo");
+    let hash = cache::member_hash(Path::new("schema.forge"));
+
+    // Listed as a member, not merely present on disk.
+    let members = members_of(&project);
+    assert_eq!(
+        members,
+        vec![format!("apps/{hash}/core")],
+        "the sole core must be listed explicitly: {members:?}"
+    );
+    assert!(
+        cargo_package_names(&project).contains(&format!("schema-{hash}-core")),
+        "cargo cannot address the sole core"
+    );
+}
+
+/// **§10, absorbing #336.** An app with no web surface carries no utoipa — in the
+/// manifest AND in the source.
+///
+/// Both halves matter and they failed separately during implementation: gating
+/// only the manifest leaves `use utoipa::ToSchema;` in `lib.rs` and the package
+/// does not compile at all.
+#[test]
+fn s335_10_no_server_means_no_utoipa_anywhere() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"noweb\"\n\n[generate]\ntargets = [\"rust\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "all"]).status.success());
+
+    let hash = cache::member_hash(Path::new("schema.forge"));
+    let core = env
+        .home
+        .join("projects/noweb/apps")
+        .join(&hash)
+        .join("core");
+
+    let manifest = std::fs::read_to_string(core.join("Cargo.toml")).unwrap();
+    assert!(!manifest.contains("utoipa"), "{manifest}");
+
+    // Assert on the IMPORT, not the bare name: `ToSchema` also appears in a
+    // generated doc comment, so a substring test on the name reports a survivor
+    // that is prose (#364's `FsyncPolicy::Always` trap, same shape).
+    let lib = std::fs::read_to_string(core.join("src/lib.rs")).unwrap();
+    assert!(!lib.contains("use utoipa::"), "the utoipa import survived");
+    assert!(
+        !lib.lines().any(|l| l.contains("#[derive(") && l.contains("ToSchema")),
+        "a ToSchema derive survived"
+    );
+
+    // The re-export block is what lets dependents pin zero substrate.
+    assert!(lib.contains("pub use forgedb_storage;"), "core lost its re-exports");
+    assert!(lib.contains("pub use forgedb_types;"));
+}
+
+/// An app that declares a web surface DOES carry utoipa — so the test above
+/// cannot pass by the gate being stuck off.
+#[test]
+fn s335_10_a_server_app_carries_utoipa() {
+    let env = scoped_home();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write(
+        &root.join("forgedb.toml"),
+        "[project]\nname = \"web\"\n\n[generate]\ntargets = [\"rust\", \"api\"]\n",
+    );
+    write(&root.join("schema.forge"), SCHEMA);
+    assert!(forgedb(&root, &env.home, &["generate", "all"]).status.success());
+
+    let hash = cache::member_hash(Path::new("schema.forge"));
+    let app = env.home.join("projects/web/apps").join(&hash);
+
+    let manifest = std::fs::read_to_string(app.join("core/Cargo.toml")).unwrap();
+    assert!(manifest.contains("utoipa"), "the gate is stuck off:\n{manifest}");
+
+    let lib = std::fs::read_to_string(app.join("core/src/lib.rs")).unwrap();
+    assert!(lib.contains("use utoipa::ToSchema;"));
+
+    // The server links `core` by a RENAMED dependency, so no generated source
+    // byte carries the per-app hash.
+    let server_manifest = std::fs::read_to_string(app.join("server/Cargo.toml")).unwrap();
+    assert!(server_manifest.contains(&format!("schema-{hash}-core")));
+    let main_rs = std::fs::read_to_string(app.join("server/src/main.rs")).unwrap();
+    assert!(main_rs.contains("use forgedb_core as database;"));
+    assert!(!main_rs.contains(&hash), "the app hash leaked into main.rs");
+}

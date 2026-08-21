@@ -25,6 +25,8 @@ pub struct BuildOptions {
     /// unreachable from `forgedb build`. `build` could not reach a target the
     /// project had explicitly declared.
     pub config_targets: Vec<String>,
+    /// The app's container in the build cache, reserved by the caller.
+    pub cache_container: Option<std::path::PathBuf>,
 }
 
 pub fn run(options: BuildOptions) -> Result<()> {
@@ -59,6 +61,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
                 output: options.output.clone(),
                 schema: options.schema.clone(),
                 config_targets: Some(options.config_targets.clone()),
+                cache_container: options.cache_container.clone(),
                 gen_config: options.gen_config,
                 force: true,
                 from: None,
@@ -75,6 +78,7 @@ pub fn run(options: BuildOptions) -> Result<()> {
             output: options.output.clone(),
             schema: options.schema.clone(),
             config_targets: Some(options.config_targets.clone()),
+            cache_container: options.cache_container.clone(),
             gen_config: options.gen_config,
             force: true,
             from: None,

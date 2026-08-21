@@ -514,21 +514,48 @@ fn place_in_cache(
 ) -> Result<cache::Placement> {
     let placement = cache::place(&project.name, &project.root, schema)?;
     ui::info(&format!("Build cache: {}", placement.member.display()));
+    report_sync(&placement.project, placement.lock_dropped, &placement.orphans);
+    Ok(placement)
+}
+
+/// Reserve an app's container and report where it is — the BEFORE half of the
+/// old `place_in_cache` (#335 §3).
+///
+/// Split from [`sync_after_emission`] because rendering the workspace root here
+/// would list the packages of the PREVIOUS run: an app's very first `generate`
+/// would write a root naming none of its own packages, and `cargo build -p <its
+/// core>` would fail with `did not match any packages`.
+fn reserve_in_cache(
+    project: &project::ProjectId,
+    schema: &std::path::Path,
+) -> Result<cache::Reserved> {
+    let reserved = cache::reserve(&project.name, &project.root, schema)?;
+    ui::info(&format!("Build cache: {}", reserved.container.display()));
+    Ok(reserved)
+}
+
+/// Re-derive the workspace root from what is now on disk — the AFTER half.
+fn sync_after_emission(reserved: &cache::Reserved) -> Result<cache::Synced> {
+    let synced = cache::sync_root(&reserved.project, &reserved.container)?;
+    report_sync(&reserved.project, synced.lock_dropped, &synced.orphans);
+    Ok(synced)
+}
+
+fn report_sync(project: &std::path::Path, lock_dropped: bool, orphans: &[std::path::PathBuf]) {
     // C9: a CLI upgrade invalidates the project's dependency resolution, and the
     // drop happens in a directory the user never opens — so it is reported.
-    if placement.lock_dropped {
+    if lock_dropped {
         ui::info(&format!(
             "CLI version changed — dropped {}/Cargo.lock so dependencies re-resolve",
-            placement.project.display()
+            project.display()
         ));
     }
-    for orphan in &placement.orphans {
+    for orphan in orphans {
         ui::detail(&format!(
             "Orphaned member (its schema is gone): {}",
             orphan.display()
         ));
     }
-    Ok(placement)
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -583,7 +610,9 @@ fn run(cli: Cli) -> Result<()> {
             // precondition of generating, so a collision must be refused before
             // any bytes are written, not after.
             let project = governing.identify_reported()?;
-            place_in_cache(&project, &schema_path)?;
+            // Reserve BEFORE emission (it needs the path); re-derive the
+            // workspace root AFTER, once this app's packages exist (#335 §3).
+            let reserved = reserve_in_cache(&project, &schema_path)?;
             let forge_config = governing.config();
             // Precedence: CLI flag > config > built-in default.  A config's
             // relative `output` is resolved against the SCHEMA's directory, so a
@@ -625,7 +654,10 @@ fn run(cli: Cli) -> Result<()> {
                 force,
                 from,
                 to,
-            })
+                cache_container: Some(reserved.container.clone()),
+            })?;
+            sync_after_emission(&reserved)?;
+            Ok(())
         }
 
         Commands::Validate {
@@ -658,7 +690,7 @@ fn run(cli: Cli) -> Result<()> {
             let schema_path = project::find_schema(schema.as_deref())?;
             let governing = project::govern(explicit_config, schema_dir(&schema_path))?;
             let project = governing.identify_reported()?;
-            place_in_cache(&project, &schema_path)?;
+            let reserved = reserve_in_cache(&project, &schema_path)?;
             let forge_config = governing.config();
             let resolved_output = Some(governing.output(output.as_deref()));
             let resolved_schema = Some(schema_path.display().to_string());
@@ -679,7 +711,10 @@ fn run(cli: Cli) -> Result<()> {
                 // Same resolution as `Commands::Generate` above, from the same
                 // loaded config — `build` must bake what `generate` would (#361).
                 gen_config: forge_config.gen_config()?,
-            })
+                cache_container: Some(reserved.container.clone()),
+            })?;
+            sync_after_emission(&reserved)?;
+            Ok(())
         }
 
         Commands::Dev {

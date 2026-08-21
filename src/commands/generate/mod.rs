@@ -54,6 +54,14 @@ pub struct GenerateOptions {
     pub from: Option<u32>,
     /// Destination format version for the `transform` target (#74 Phase 3).
     pub to: Option<u32>,
+    /// The app's container in the build cache, reserved by the caller BEFORE
+    /// this runs (#335 §1/§3).
+    ///
+    /// `None` means "do not write cache packages" — the `check` mode and any
+    /// caller that has not reserved one. The caller re-derives the workspace
+    /// root AFTER this returns, because a root rendered before emission lists
+    /// the previous run's packages.
+    pub cache_container: Option<PathBuf>,
 }
 
 pub fn run(options: GenerateOptions) -> Result<()> {
@@ -325,6 +333,15 @@ pub fn run(options: GenerateOptions) -> Result<()> {
         return Err(CliError::CodeGeneration(
             "generated code is out of date".to_string(),
         ));
+    }
+
+    // The cache packages (#335 §1). Written from the SAME `GeneratedCode` values
+    // emitted above — one value, two writes — never a second generator
+    // invocation. That is the whole point: `generated/database.rs` and
+    // `generated/ffi/src/database.rs` disagree today precisely because they come
+    // from two invocations with different config.
+    if let Some(container) = &options.cache_container {
+        emit_cache_packages(container, &output_path, &schema_path, &generated_files)?;
     }
 
     // Report results
@@ -1058,4 +1075,116 @@ fn find_schema_file() -> Result<String> {
     // One list of candidate names, in `project` (#333) — this used to be one of
     // three open-coded copies, so adding a name meant finding all three.
     Ok(crate::project::find_schema(None)?.display().to_string())
+}
+
+/// Substrate `core` re-exports so its dependents can reach it without pinning it.
+///
+/// **This is what makes substrate type identity structural rather than lucky.**
+/// The generated `api.rs` and the four binding wrappers name substrate crates
+/// ABSOLUTELY — `forgedb_storage::Snapshot`, `forgedb_types::*` — so each of
+/// them would otherwise have to pin those crates itself, and their types would
+/// unify with `core`'s only because one lockfile happened to resolve several
+/// independently-authored pin lists identically. Routing every dependent
+/// through `core` makes agreement a property of the code.
+///
+/// Only the crates a dependent names but does not pin belong here. `auth`,
+/// `query-params` and `changefeed` stay pinned by `server` directly: those are
+/// API-layer substrate that `core` itself does not link.
+///
+/// Reached through the crate root's `use forgedb_core::*;`, which is why these
+/// must be `pub use` at the root rather than inside a module.
+const CORE_SUBSTRATE_REEXPORTS: &str = "\n\
+// ---------------------------------------------------------------------------\n\
+// Appended by ForgeDB (#335 §1). Not part of the generated database.\n\
+//\n\
+// Dependents of this crate name these substrate crates by absolute path. They\n\
+// are re-exported here so those dependents pin ZERO substrate of their own and\n\
+// their types UNIFY with this crate's, rather than merely resolving to the same\n\
+// version by lockfile coincidence.\n\
+// ---------------------------------------------------------------------------\n\
+pub use forgedb_storage;\n\
+pub use forgedb_types;\n";
+
+/// Write the app's cache packages from the values just emitted (#335 §1).
+///
+/// # One value, two writes
+///
+/// `core/src/lib.rs` is **the same `GeneratedCode` that produced
+/// `<output>/database.rs`**, not a second `RustGenerator` invocation. That is
+/// what makes the two structurally incapable of disagreeing — the shipped defect
+/// is precisely two invocations with different config, which produced two
+/// databases with different durability semantics from one `generate` run.
+///
+/// # The manifests are rewritten, not preserved
+///
+/// Every scaffolder in the output directory writes its `Cargo.toml` only when
+/// absent, and says so: those files are the user's. **Nothing in the cache is
+/// user-editable.** Carried forward unchanged, a CLI upgrade that bumps a
+/// substrate pin would never reach an existing member, and the stale pin would
+/// sit in a directory the user never opens where the publish-gap check cannot
+/// see it.
+fn emit_cache_packages(
+    container: &Path,
+    output_path: &Path,
+    schema_path: &str,
+    generated: &[(PathBuf, forgedb_codegen::GeneratedCode)],
+) -> Result<()> {
+    // Match on the exact top-level paths: the binding arms also emit
+    // `ffi/src/database.rs` and friends, and those are copies this step is in
+    // the business of deleting rather than propagating.
+    let find = |name: &str| -> Option<&forgedb_codegen::GeneratedCode> {
+        let want = output_path.join(name);
+        generated.iter().find(|(p, _)| p == &want).map(|(_, g)| g)
+    };
+
+    let Some(database) = find("database.rs") else {
+        // No Rust database was emitted in this invocation (a `--sdk`-only or
+        // stubs-only run), so there is no `core` to write and nothing that
+        // depends on one.
+        return Ok(());
+    };
+    let api = find("api.rs");
+
+    let hash = container
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let slug = crate::naming::slug(Path::new(schema_path));
+
+    let core_pkg = crate::naming::package_name(&slug, &hash, &crate::naming::PackageKind::Core);
+    let core_dir = container.join(crate::naming::PackageKind::Core.dir());
+    fs::create_dir_all(core_dir.join("src"))?;
+    // utoipa is pinned iff this app emits a server (#335 §10): with the derive
+    // in `core` and its `#[openapi(components(schemas(...)))]` consumer in
+    // `server`, the orphan rule blocks supplying the impl from `server`.
+    fs::write(
+        core_dir.join("Cargo.toml"),
+        forgedb_codegen::CorePackage::cargo_toml(&core_pkg, api.is_some()),
+    )?;
+    fs::write(
+        core_dir.join("src/lib.rs"),
+        format!("{}{}", database.code, CORE_SUBSTRATE_REEXPORTS),
+    )?;
+    ui::detail(&format!("  ✓ {} (cache package)", core_dir.display()));
+
+    if let Some(api) = api {
+        let server_pkg =
+            crate::naming::package_name(&slug, &hash, &crate::naming::PackageKind::Server);
+        let server_dir = container.join(crate::naming::PackageKind::Server.dir());
+        fs::create_dir_all(server_dir.join("src"))?;
+        fs::write(
+            server_dir.join("Cargo.toml"),
+            forgedb_codegen::ServerPackage::cargo_toml(&server_pkg, &core_pkg),
+        )?;
+        // `api.rs` needs no generator change: it opens with `use super::*;`, so a
+        // `main.rs` that globs `forgedb_core` compiles it verbatim.
+        fs::write(server_dir.join("src/api.rs"), &api.code)?;
+        fs::write(
+            server_dir.join("src/main.rs"),
+            forgedb_codegen::ServerPackage::main_rs(forgedb_codegen::ServerLayout::Cache),
+        )?;
+        ui::detail(&format!("  ✓ {} (cache package)", server_dir.display()));
+    }
+
+    Ok(())
 }
