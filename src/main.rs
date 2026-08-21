@@ -514,6 +514,14 @@ fn place_in_cache(
 ) -> Result<cache::Placement> {
     let placement = cache::place(&project.name, &project.root, schema)?;
     ui::info(&format!("Build cache: {}", placement.member.display()));
+    // C9: a CLI upgrade invalidates the project's dependency resolution, and the
+    // drop happens in a directory the user never opens — so it is reported.
+    if placement.lock_dropped {
+        ui::info(&format!(
+            "CLI version changed — dropped {}/Cargo.lock so dependencies re-resolve",
+            placement.project.display()
+        ));
+    }
     for orphan in &placement.orphans {
         ui::detail(&format!(
             "Orphaned member (its schema is gone): {}",

@@ -979,3 +979,78 @@ fn reserve_does_not_write_the_workspace_root() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #335 step 3 — C9: the lockfile dies with the CLI version
+// ---------------------------------------------------------------------------
+
+/// **C9.** A CLI version change drops the project's `Cargo.lock`.
+///
+/// This is the half a manifest rewrite alone cannot do: a rewritten pin
+/// re-resolves, but a **newly published patch under an unchanged pin** does not.
+#[test]
+fn c9_a_cli_version_change_drops_the_lockfile() {
+    let env = scoped_home();
+    let (project, container) = synth_project(&env, "c9", &["core"]);
+
+    // The first sync recorded the running version and there was no lock to drop.
+    let lock = project.join("Cargo.lock");
+    write(&lock, "# resolved by some earlier run\n");
+
+    // Same version: the lock survives.
+    let again = cache::sync_root(&project, &container).expect("sync_root");
+    assert!(!again.lock_dropped);
+    assert!(lock.is_file(), "an unchanged CLI version must not drop the lock");
+
+    // A different recorded version: the lock goes.
+    write(&project.join("cli-version"), "0.0.0-something-else");
+    let bumped = cache::sync_root(&project, &container).expect("sync_root");
+    assert!(bumped.lock_dropped, "the drop was not reported");
+    assert!(!lock.exists(), "Cargo.lock survived a CLI version change");
+
+    // ...and the new version is recorded, so it happens once rather than on
+    // every subsequent invocation.
+    let third = cache::sync_root(&project, &container).expect("sync_root");
+    assert!(!third.lock_dropped, "the version was not re-recorded");
+}
+
+/// **C9, the case the epic actually names.** An upgraded CLI regenerating an
+/// **unchanged** target set creates, deletes and prunes nothing — so a check
+/// gated on the package set moving would skip exactly it.
+#[test]
+fn c9_fires_when_the_package_set_does_not_move() {
+    let env = scoped_home();
+    let (project, container) = synth_project(&env, "c9-static", &["core"]);
+
+    let before = members_of(&project);
+    write(&project.join("Cargo.lock"), "# stale\n");
+    write(&project.join("cli-version"), "0.0.0-older");
+
+    let synced = cache::sync_root(&project, &container).expect("sync_root");
+
+    assert_eq!(
+        members_of(&project),
+        before,
+        "this test is vacuous unless the member set is unchanged"
+    );
+    assert!(
+        synced.lock_dropped,
+        "C9 must not be gated on the package set changing"
+    );
+}
+
+/// An absent marker is a mismatch, not a fresh start: the lockfile may have been
+/// written by a version that recorded nothing — which is every cache in
+/// existence before this change.
+#[test]
+fn c9_an_absent_marker_is_treated_as_a_mismatch() {
+    let env = scoped_home();
+    let (project, container) = synth_project(&env, "c9-absent", &["core"]);
+
+    std::fs::remove_file(project.join("cli-version")).expect("remove marker");
+    write(&project.join("Cargo.lock"), "# written by a version that recorded nothing\n");
+
+    let synced = cache::sync_root(&project, &container).expect("sync_root");
+    assert!(synced.lock_dropped);
+    assert!(!project.join("Cargo.lock").exists());
+    assert!(project.join("cli-version").is_file(), "the marker was not written");
+}

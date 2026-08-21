@@ -453,6 +453,8 @@ pub struct Placement {
     pub member: PathBuf,
     /// Member directories whose schema no longer exists.
     pub orphans: Vec<PathBuf>,
+    /// C9 fired: the CLI version changed, so `Cargo.lock` was deleted.
+    pub lock_dropped: bool,
 }
 
 /// Place an app in its project's cache workspace: ensure the member directory,
@@ -469,6 +471,7 @@ pub fn place(project_id: &str, project_root: &Path, schema: &Path) -> Result<Pla
         project: reserved.project,
         member: reserved.container,
         orphans: synced.orphans,
+        lock_dropped: synced.lock_dropped,
     })
 }
 
@@ -524,6 +527,62 @@ pub struct Synced {
     pub members: Vec<PathBuf>,
     /// Containers whose schema no longer exists.
     pub orphans: Vec<PathBuf>,
+    /// C9 fired: the CLI version changed, so `Cargo.lock` was deleted.  The
+    /// caller reports this — it is a thing that happened to the user's project,
+    /// in a directory they never open.
+    pub lock_dropped: bool,
+}
+
+/// Records which CLI version last wrote a project's workspace root.
+///
+/// A plain file beside the manifest rather than a key inside it, so that reading
+/// it costs no TOML parse and a corrupt value degrades to "mismatch" — which is
+/// the safe direction, since the remedy is dropping a lockfile that is
+/// reproducible by definition.
+const CLI_VERSION_FILE: &str = "cli-version";
+
+/// Drop `Cargo.lock` when the CLI version that last wrote this project differs
+/// from the running one (C9).
+///
+/// # Why this is unconditional
+///
+/// C9's wording is unconditional, and the case the epic names — an upgraded CLI
+/// regenerating an *unchanged* target set — creates, deletes and prunes nothing.
+/// Gating the check on a package-set change would skip exactly it.  So this runs
+/// from [`sync_root`], which runs on every invocation that touches the project.
+///
+/// # Why dropping the lock is the right remedy, and why it is safe
+///
+/// It is the half a manifest rewrite alone cannot do.  A rewritten pin
+/// re-resolves; a **newly published patch under an unchanged pin** does not.
+/// C1 explicitly scopes this as permitted — the cache "may reproduce a different
+/// dependency RESOLUTION; nothing may depend on the lockfile surviving".
+///
+/// #335 is the first change that produces a real, long-lived `Cargo.lock` per
+/// project, which is what the epic means by turning #290 "from rare into
+/// routine".  Before it, the cache workspace had no members and recorded no
+/// meaningful resolution at all.
+fn enforce_cli_version(project: &Path) -> Result<bool> {
+    let running = env!("CARGO_PKG_VERSION");
+    let marker = project.join(CLI_VERSION_FILE);
+
+    let recorded = std::fs::read_to_string(&marker).ok();
+    let matches = recorded.as_deref().map(str::trim) == Some(running);
+    if matches {
+        return Ok(false);
+    }
+
+    // An absent marker is a mismatch, not a fresh start: the lockfile may have
+    // been written by a version that did not record one.
+    let lock = project.join("Cargo.lock");
+    let dropped = lock.is_file();
+    if dropped {
+        std::fs::remove_file(&lock)?;
+    }
+
+    std::fs::create_dir_all(project)?;
+    std::fs::write(&marker, running.as_bytes())?;
+    Ok(dropped)
 }
 
 /// Rebuild the workspace root from what is on disk.
@@ -563,9 +622,14 @@ pub fn sync_root(project: &Path, keep: &Path) -> Result<Synced> {
     members.dedup();
 
     write_workspace_root(project, &members)?;
+    let lock_dropped = enforce_cli_version(project)?;
     let orphans = orphans(project, &live)?;
 
-    Ok(Synced { members, orphans })
+    Ok(Synced {
+        members,
+        orphans,
+        lock_dropped,
+    })
 }
 
 /// The package directories inside one container.
