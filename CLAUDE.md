@@ -314,7 +314,10 @@ allocate sentinel, so it cannot be inserted explicitly), `&`
 unique, `^` index; `?` nullable (postfix after type, or prefix on a model for an optional
 FK). Types: `u32/u64/i32/i64/f64/bool/string/json/decimal/uuid`, `timestamp` / `timestamp(s|ms|us)`
 (#254 — an instant; storage is ALWAYS `i64` **microseconds**, the declared key is the *quantum*
-a written value is floored to and an allocated identity advances by; bare = `ms`; no `ns`. Wire
+a written value is floored to and an allocated identity advances by; bare = `ms`; no `ns`. A
+**probe** argument is floored the same way (#389 — `index_value_expr` / `ordered_key_expr` /
+`generate_filter_check`), so two instants inside one quantum share an index bucket, match the
+same REST filter, and conflict under `&unique`. Wire
 form is the **RFC 3339 string** on every serde surface — JSON, TS SDK, OpenAPI `date-time`, the
 three REST SDKs, REST filter params — but NOT the index key, which stays the stored number so the
 order stays numeric. An instant outside RFC 3339's `0000`–`9999` is a 422. `id: +timestamp(us)` is
