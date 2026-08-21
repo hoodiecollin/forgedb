@@ -191,7 +191,16 @@ disk; it is the **quantum**:
 
 - a value you supply is **floored** to it on write (floor, never truncate — a
   pre-epoch value truncated toward zero would round *forward* in time);
+- a value you supply when **reading** is floored the same way, so the flooring is
+  never something a caller has to remember. `find_by_<field>` and its `&unique`,
+  composite and range forms, plus the REST filter parameter, all interpret an
+  argument at the field's declared precision — which is what makes a value that was
+  accepted on write find its own row;
 - an allocated `+timestamp` identity advances by one unit of it.
+
+Two values inside the same quantum are therefore the same instant *to that field*:
+they share an index bucket, they match the same filter, and under `&unique` the
+second one is a conflict. That is what `timestamp(s)` means.
 
 So precision buys *fidelity*, not correctness. `timestamp(s)` is a promise that the
 stored value is second-aligned, which is what makes it meaningful to display, index

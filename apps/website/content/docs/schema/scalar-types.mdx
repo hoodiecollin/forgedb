@@ -193,6 +193,12 @@ change what is on disk — it is the **quantum**: a value you supply is *floored
 write, and an allocated `+timestamp` identity advances by one unit of it. A bare `timestamp`
 is `timestamp(ms)`.
 
+A value you supply when **reading** is floored the same way, so you never have to round a
+value before looking it up: `find_by_<field>`, its `&unique`, composite and range forms, and
+the REST filter parameter all interpret an argument at the field's declared precision. Two
+instants inside the same quantum are the same instant *to that field* — they share an index
+bucket, they match the same filter, and under `&unique` the second one is a conflict.
+
 `ns` is not offerable: microseconds is the storage unit, and `i64` nanoseconds would cap the
 type at 1678–2262.
 
