@@ -190,16 +190,27 @@ same version in one lockfile.
 The two class-C packages deliberately **do not** link `core`: a hop must be pinned to the
 version range it was planned for, not to whatever the current schema happens to be.
 
-**Every name is derived, in one place** (`src/naming.rs`): `<slug>-<hash>-<kind>` for packages
-and bins, and a per-app prefix for the FFI C symbols. Uniqueness rests on the member hash and
-the kind; the slug is legibility, so `Compiling blog-3f2a…-core` names the app. Two forces make
-this non-optional. Cargo package names cannot begin with a digit and six of sixteen hex digits
-are, so a bare `<hash>-<kind>` scheme breaks for roughly three apps in eight — hence a slug
-forced to start with a letter. And cargo only *warns* on a duplicate artifact name, exits 0 and
-leaves one file, which is how one app's `transform/` and `engine/` shipped declaring the same
-bin: the CLI could run the wrong hop over a user's data at exit 0. ForgeDB refuses what cargo
-tolerates — a `cargo metadata --no-deps` pass collects every bin/cdylib/staticlib name before
-any compile, and a duplicate is a hard error naming both packages.
+**Every name is derived, in one place** (`src/naming.rs`): `<app-name>-<kind>` for packages and
+bins, and a per-app prefix for the FFI C symbols. The app name is `<project-id>_<path
+segments…>` — `acme_services_blog` — so uniqueness is **structural** rather than probabilistic:
+two distinct relative paths cannot reduce to the same segment list. That is also why the file
+name alone cannot do the job; `forgedb init` writes `schema.forge` for every project it
+scaffolds, so a stem-derived name would be the same constant for every app in a project.
+
+**The member *directory* is still keyed by `member_hash`, and only it.** It is an internal
+storage key nobody reads, so it keeps the stability a path-derived name gives up — adding an app
+can shorten or lengthen a sibling's name under `Minimal`, re-keying its packages and changing
+every exported C symbol, which is the accepted price (`[project].symbol_naming = "uniform"`
+narrows it to renames caused by *moving* a schema, and cannot eliminate it). The hash reaches no
+public name, and `tests/cache_dir_test.rs` asserts it does not leak into generated source.
+
+Two forces make derivation non-optional. Cargo package names cannot begin with a digit, so a
+segment that does is rescued by an `app` prefix. And cargo only *warns* on a duplicate artifact
+name, exits 0 and leaves one file, which is how one app's `transform/` and `engine/` shipped
+declaring the same bin: the CLI could run the wrong hop over a user's data at exit 0. ForgeDB
+refuses what cargo tolerates — a `cargo metadata --no-deps` pass collects every
+bin/cdylib/staticlib name before any compile, and a duplicate is a hard error naming both
+packages.
 
 **The member set is derived by a scan of the cache**, expanding each live container into the
 subdirectories that hold a `Cargo.toml`. This is not the downward walk of the *user's* tree the
