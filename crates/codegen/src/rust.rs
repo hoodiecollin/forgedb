@@ -3343,7 +3343,7 @@ impl RustGenerator {
                 let ident = Self::index_field_ident(f);
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
-                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                     quote! { record.#fident },
                 ));
                 if exclude_self {
@@ -3427,21 +3427,62 @@ impl RustGenerator {
     }
 
     /// Pre-transform a field value expression before it is fed to `index_key_expr`,
-    /// so the resulting index key is **scale-invariant** for `decimal` fields.
+    /// so that two values which *name the same thing* derive the same key.
     ///
-    /// `rust_decimal::Decimal` preserves scale (`1.0` != `1.00` in `to_string()` /
-    /// serde form) even though they are `Ord`-equal; feeding them raw into
-    /// `index_key_expr` would bucket them separately (the same key-collision class
-    /// #102 fixed for nullable).  `Decimal::normalize()` collapses trailing-zero
-    /// scale, so normalizing both the stored value and the probe argument keys them
-    /// identically.  Nullable decimal normalizes through `.map(...)`; every other
-    /// field type is returned unchanged.
-    fn index_value_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
-        match field_type {
-            forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
-            forgedb_parser::FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
+    /// This hook exists because the index key is emitted twice — once over the
+    /// stored record, once over a probe argument — and nothing outside generated
+    /// code can call either.  Anything that must be true of both sides belongs
+    /// here, where it cannot be applied to one and forgotten on the other.  Two
+    /// types need it:
+    ///
+    /// * **`decimal` — scale.**  `rust_decimal::Decimal` preserves scale (`1.0` !=
+    ///   `1.00` in `to_string()` / serde form) even though they are `Ord`-equal;
+    ///   feeding them raw into `index_key_expr` would bucket them separately (the
+    ///   same key-collision class #102 fixed for nullable).  `Decimal::normalize()`
+    ///   collapses trailing-zero scale.
+    /// * **`timestamp` — the declared quantum (#389).**  A `timestamp` field
+    ///   declares a quantum and the write gate floors a written value to it
+    ///   ([`Self::timestamp_gate_walk`]).  That gate is spliced into the write path
+    ///   ONLY, so before this arm existed the record side was floored and the probe
+    ///   side was not, and a row could not find itself: `find_by_t_at(t)` asked for
+    ///   `t` while the row sat under `floor(t)`, silently returning nothing.
+    ///   Flooring here makes the two agree by construction rather than by every
+    ///   caller remembering to — which is the read-side half of #254's decision to
+    ///   *record* a too-precise value coarsely rather than refuse it.
+    ///
+    /// Both transforms are **idempotent**, which is what lets one hook serve both
+    /// sides: on the record side the value has already been normalized/floored by
+    /// the write gate, so the arm is a no-op there (`floor_to_micros` returns early
+    /// on quantum <= 1, and a second flooring of an aligned value changes nothing).
+    ///
+    /// The type is **resolved through an FK first**, exactly as `index_key_expr`
+    /// does: `*Parent` is stored as the parent's identity, which may itself be a
+    /// coarse `timestamp` (`id: timestamp(ms)` is a legal identity).  Resolving in
+    /// only one of the two places would mean they disagree about what type they are
+    /// transforming.  Every other field type is returned unchanged.
+    fn index_value_expr(
+        schema: &Schema,
+        field_type: &forgedb_parser::FieldType,
+        value_expr: TokenStream,
+    ) -> TokenStream {
+        use forgedb_parser::FieldType;
+        let field_type = Self::resolved_type(schema, field_type);
+        match &field_type {
+            FieldType::Decimal => quote! { (#value_expr).normalize() },
+            FieldType::Nullable(inner) if Self::is_decimal_type(inner) => {
                 quote! { (#value_expr).map(|__d| __d.normalize()) }
             }
+            FieldType::Timestamp(p) if p.quantum_micros() > 1 => {
+                let quantum = proc_macro2::Literal::i64_unsuffixed(p.quantum_micros());
+                quote! { (#value_expr).floor_to_micros(#quantum) }
+            }
+            FieldType::Nullable(inner) => match inner.as_ref() {
+                FieldType::Timestamp(p) if p.quantum_micros() > 1 => {
+                    let quantum = proc_macro2::Literal::i64_unsuffixed(p.quantum_micros());
+                    quote! { (#value_expr).map(|__t| __t.floor_to_micros(#quantum)) }
+                }
+                _ => value_expr,
+            },
             _ => value_expr,
         }
     }
@@ -3674,7 +3715,7 @@ impl RustGenerator {
             quote! { #ident.clone() }
         } else {
             let fname = format_ident!("{}", field.name);
-            let val = Self::index_value_expr(&field.field_type, quote! { #record_expr.#fname });
+            let val = Self::index_value_expr(schema, &field.field_type, quote! { #record_expr.#fname });
             Self::index_key_expr(schema, &field.field_type, val)
         }
     }
@@ -3717,7 +3758,7 @@ impl RustGenerator {
         for f in Self::shared_index_key_fields(model) {
             let ident = format_ident!("__ik_{}_{}", prefix, f.name);
             let fname = format_ident!("{}", f.name);
-            let val = Self::index_value_expr(&f.field_type, quote! { #record_expr.#fname });
+            let val = Self::index_value_expr(schema, &f.field_type, quote! { #record_expr.#fname });
             let key = Self::index_key_expr(schema, &f.field_type, val);
             binds.push(quote! { let #ident: String = { #key }; });
             map.insert(f.name.clone(), ident);
@@ -3843,15 +3884,44 @@ impl RustGenerator {
 
     /// The typed ordered-index key for a field value expression — the value
     /// itself, `decimal` normalized (scale-invariant, matching the hash index's
-    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound, and `f64`
-    /// run through its total-order encoding (#242) since it has no `Ord`.
+    /// `index_value_expr`) so `1.0` and `1.00` share a bucket / bound, `f64` run
+    /// through its total-order encoding (#242) since it has no `Ord`, and
+    /// `timestamp` floored to the field quantum (#389).
     ///
     /// This is applied to the stored value AND to each range bound, which is what
     /// keeps a bound comparable to what it is bounding.
+    ///
+    /// # The timestamp arm is not quite like the other two
+    ///
+    /// Normalizing a decimal and encoding an `f64` are order-preserving *and*
+    /// injective, so a bound still names exactly the values it named.  Flooring is
+    /// order-preserving but **not** injective, so it is worth being explicit about
+    /// what each bound does:
+    ///
+    /// * `max` is unaffected in every case.  Stored keys are all multiples of the
+    ///   quantum, so `Included(t)` and `Included(floor(t))` admit the same
+    ///   multiples.  It is floored anyway, so both bounds keep sharing one
+    ///   expression and neither can drift away from the stored key.
+    /// * `min` widens by at most one bucket: `Included(floor(t))` includes the
+    ///   bucket holding `t`, which `Included(t)` would have excluded.  That is the
+    ///   intended reading — the field records only quanta, so "at or after an
+    ///   instant partway into a bucket" has no answer the storage can distinguish,
+    ///   and interpreting a sub-quantum bound at the field's declared precision is
+    ///   the same choice #254 made on the write side.  It is also what makes the
+    ///   degenerate `find_by_<f>_range(Some(t), Some(t))` agree with
+    ///   `find_by_<f>(t)` instead of silently returning nothing.
+    ///
+    /// No FK resolution and no nullable arm here, unlike `index_value_expr`:
+    /// `ordered_key_type` admits neither, so an ordered field is always a bare
+    /// scalar.
     fn ordered_key_expr(field_type: &forgedb_parser::FieldType, value_expr: TokenStream) -> TokenStream {
         match field_type {
             forgedb_parser::FieldType::Decimal => quote! { (#value_expr).normalize() },
             forgedb_parser::FieldType::F64 => quote! { __forgedb_f64_key(#value_expr) },
+            forgedb_parser::FieldType::Timestamp(p) if p.quantum_micros() > 1 => {
+                let quantum = proc_macro2::Literal::i64_unsuffixed(p.quantum_micros());
+                quote! { (#value_expr).floor_to_micros(#quantum) }
+            }
             _ => value_expr,
         }
     }
@@ -6925,8 +6995,8 @@ impl RustGenerator {
             let find_at_fn = format_ident!("find_by_{}_at", f.name);
             let params = quote! { value: #param_ty };
             let key_from_arg =
-                Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type, quote! { value }));
-            let key_from_rec = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type, quote! { value }));
+            let key_from_rec = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                 quote! { __rec.#fname },
             ));
             let subject = format!("`{}`.`{}`", model.name, f.name);
@@ -6969,14 +7039,14 @@ impl RustGenerator {
                 .iter()
                 .map(|c| {
                     let pn = format_ident!("{}", c.name);
-                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type, quote! { #pn }))
+                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(schema, &c.field_type, quote! { #pn }))
                 })
                 .collect();
             let rec_keys: Vec<_> = comps
                 .iter()
                 .map(|c| {
                     let cf = format_ident!("{}", c.name);
-                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type,
+                    Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(schema, &c.field_type,
                         quote! { __rec.#cf },
                     ))
                 })
@@ -7791,6 +7861,12 @@ impl RustGenerator {
                 &mut stmts,
                 0,
             );
+            // #389: an FK backed by a coarse-timestamp identity is a timestamp the
+            // walk above cannot see, because it matches on the declared type and a
+            // `Relation` only becomes a `Timestamp` once resolved.  Floor-only —
+            // see `fk_timestamp_floor` for why it carries no range check and why
+            // the create/update wrappers emit it again.
+            stmts.extend(Self::fk_timestamp_floor(schema, field));
         }
         if stmts.is_empty() {
             return quote! {};
@@ -7803,6 +7879,67 @@ impl RustGenerator {
             let mut record = record;
             #(#stmts)*
         }
+    }
+
+    /// The write-path floor for a **foreign key whose target identity is a coarse
+    /// `timestamp`** (#389) — `record.<fk> = record.<fk>.floor_to_micros(q);`, or
+    /// the `.map(..)` form for an optional FK.  `None` for every other field.
+    ///
+    /// `id: timestamp(ms)` is a legal non-auto identity, so `*Parent` / `?Parent`
+    /// can be a `Timestamp` column whose quantum is coarser than a microsecond.
+    /// [`Self::timestamp_gate_walk`] does not reach it: the walk matches on the
+    /// field's *declared* type and a `Relation` is not a `Timestamp` until it is
+    /// resolved.  So the FK value was the one timestamp on a record that was never
+    /// floored, and a reference handed the same misaligned instant its parent was
+    /// created with did not resolve to that parent.
+    ///
+    /// **This is deliberately floor-only — no `is_rfc3339_representable` check.**
+    /// The range check belongs to the field that *owns* the instant; the parent's
+    /// own write already made it, and repeating it here would answer a bad FK with
+    /// a `timestamp_range` constraint error naming the reference field instead of
+    /// the `DanglingReference` that actually describes the problem.
+    ///
+    /// # Where this has to be emitted, and why it is more than one place
+    ///
+    /// The dangling-reference check runs in the `create_<model>` / `update_<model>`
+    /// wrapper, which resolves the FK against the target storage **before** calling
+    /// `Storage::insert`.  A floor emitted only in the storage write gate would
+    /// therefore be applied *after* the check that needs it, and the create would
+    /// still fail.  So this goes in front of every FK check (the shared-database
+    /// wrapper and both transaction handles) *and* into the storage gate — the
+    /// latter because `Storage::insert` is a documented public path (#91) that
+    /// skips FK checks entirely, and a row written through it must still store a
+    /// canonical reference.  The statement is idempotent, so the sites overlapping
+    /// is harmless.
+    fn fk_timestamp_floor(
+        schema: &Schema,
+        field: &forgedb_parser::Field,
+    ) -> Option<TokenStream> {
+        use forgedb_parser::{FieldType, RelationType};
+        let optional = match &field.field_type {
+            FieldType::Relation(RelationType::RequiredReference(_)) => false,
+            FieldType::Relation(RelationType::OptionalReference(_)) => true,
+            _ => return None,
+        };
+        let backing = Self::fk_backing_type(schema, &field.field_type)?;
+        let precision = match &backing {
+            FieldType::Timestamp(p) => *p,
+            FieldType::Nullable(inner) => match inner.as_ref() {
+                FieldType::Timestamp(p) => *p,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if precision.quantum_micros() <= 1 {
+            return None;
+        }
+        let quantum = proc_macro2::Literal::i64_unsuffixed(precision.quantum_micros());
+        let name = format_ident!("{}", field.name);
+        Some(if optional {
+            quote! { record.#name = record.#name.map(|__fk| __fk.floor_to_micros(#quantum)); }
+        } else {
+            quote! { record.#name = record.#name.floor_to_micros(#quantum); }
+        })
     }
 
     /// One leaf of [`Self::generate_timestamp_write_gate`].  `place` is an
@@ -9155,7 +9292,7 @@ impl RustGenerator {
             // scan_pushdown_fields guarantees eligibility; other types are excluded.
             _ => return quote! {},
         };
-        let key = Self::index_key_expr(schema, &field.field_type, Self::index_value_expr(&field.field_type, key_value));
+        let key = Self::index_key_expr(schema, &field.field_type, Self::index_value_expr(schema, &field.field_type, key_value));
         quote! {
             /// #160 (C): resolve list candidate ROWS for this indexed field from the
             /// secondary index (O(matches)) rather than a full scan.  Feed the result
@@ -10147,7 +10284,7 @@ impl RustGenerator {
                     .map(|f| {
                         let ident = Self::index_field_ident(f);
                         let val = format_ident!("{}_value", f.name);
-                        let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type, quote! { #val }),
+                        let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type, quote! { #val }),
                         );
                         Self::index_add_block(recv, &ident, key, &id_tok)
                     })
@@ -10166,7 +10303,7 @@ impl RustGenerator {
                         .iter()
                         .map(|c| {
                             let val = format_ident!("{}_value", c.name);
-                            Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(&c.field_type, quote! { #val }),
+                            Self::index_key_expr(schema, &c.field_type, Self::index_value_expr(schema, &c.field_type, quote! { #val }),
                             )
                         })
                         .collect();
@@ -11128,18 +11265,47 @@ impl RustGenerator {
             );
             let auto_synth =
                 Self::generate_auto_synthesis(model, &quote! { self.#storage_field });
+            // #389: floor a coarse-timestamp FK BEFORE the dangling-reference check
+            // below, not after.  The check resolves the reference against the target
+            // storage, whose rows are keyed by the *floored* identity, so a
+            // reference carrying the same misaligned instant its parent was created
+            // with would otherwise fail to resolve — a 422 for a value the parent
+            // accepted.  The storage-level write gate floors it too (for the direct
+            // `Storage::insert` path, #91), but that runs after `insert` is already
+            // called, which is too late for this check.  The two transaction handles
+            // need no equivalent: both already run the full `ts_gate` ahead of their
+            // own FK checks.
+            let fk_ts_floors: Vec<TokenStream> = model
+                .fields
+                .iter()
+                .filter_map(|f| Self::fk_timestamp_floor(schema, f))
+                .collect();
+            // `update_<model>` takes `record` by value and non-mut; rebind rather
+            // than widening the signature, and emit nothing at all when the model
+            // has no such FK so output stays byte-identical for every other schema.
+            let fk_ts_prelude = if fk_ts_floors.is_empty() {
+                quote! {}
+            } else {
+                quote! {
+                    #[allow(unused_mut)]
+                    let mut record = record;
+                    #(#fk_ts_floors)*
+                }
+            };
             methods.push(quote! {
                 #[doc = #create_doc]
                 pub fn #create_fn(&mut self, mut record: #model_ident) -> Result<#id_type, ValidationError> {
                     // #187: synthesize omitted `+` auto fields (uuid/timestamp) before
                     // integrity checks so a create body may omit id/created_at.
                     #auto_synth
+                    #fk_ts_prelude
                     #(#fk_checks)*
                     self.#storage_field.insert(record)
                 }
 
                 #[doc = #update_doc]
                 pub fn #update_fn(&mut self, id: #id_type, record: #model_ident) -> Result<bool, ValidationError> {
+                    #fk_ts_prelude
                     #(#fk_checks)*
                     self.#storage_field.update(id, record)
                 }
@@ -11995,7 +12161,7 @@ impl RustGenerator {
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
                     let mtag = model.name.as_str();
-                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -12025,7 +12191,7 @@ impl RustGenerator {
                     let fident = format_ident!("{}", f.name);
                     let fname = f.name.as_str();
                     let mtag = model.name.as_str();
-                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                    let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                         quote! { record.#fident },
                     ));
                     quote! {
@@ -12465,7 +12631,7 @@ impl RustGenerator {
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
                 let mtag = model.name.as_str();
-                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
@@ -12493,7 +12659,7 @@ impl RustGenerator {
                 let fident = format_ident!("{}", f.name);
                 let fname = f.name.as_str();
                 let mtag = model.name.as_str();
-                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(&f.field_type,
+                let key = Self::index_key_expr(schema, &f.field_type, Self::index_value_expr(schema, &f.field_type,
                     quote! { record.#fident },
                 ));
                 quote! {
