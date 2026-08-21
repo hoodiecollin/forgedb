@@ -45,7 +45,11 @@ fn test_init_command_creates_project_structure() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
         // Explicit: these fixtures live in a tempdir with no enclosing project,
         // and pinning the answer keeps them independent of what is above them.
@@ -57,7 +61,6 @@ fn test_init_command_creates_project_structure() {
 
     // Check that directories were created
     assert!(project_path.exists());
-    assert!(project_path.join("src").exists());
     assert!(project_path.join("generated").exists());
     assert!(project_path.join("data/db").exists());
 
@@ -66,8 +69,19 @@ fn test_init_command_creates_project_structure() {
     assert!(project_path.join("forgedb.toml").exists());
     assert!(project_path.join(".gitignore").exists());
     assert!(project_path.join("README.md").exists());
-    assert!(project_path.join("Cargo.toml").exists());
-    assert!(project_path.join("src/main.rs").exists());
+
+    // ...and that the two the scaffold STOPPED writing are absent (#335 §15).
+    // Asserted rather than merely deleted: `init` scaffolding no cargo package
+    // is the change, and an absent assertion cannot notice it coming back.
+    assert!(
+        !project_path.join("Cargo.toml").exists(),
+        "init scaffolded a cargo package; the generated Rust is compiled in \
+         ForgeDB's build cache now"
+    );
+    assert!(
+        !project_path.join("src").exists(),
+        "init scaffolded a src/ directory; the server is a cache artifact"
+    );
 }
 
 #[test]
@@ -81,7 +95,11 @@ fn test_init_with_blog_template() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: Some("blog".to_string()),
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
         // Explicit: these fixtures live in a tempdir with no enclosing project,
         // and pinning the answer keeps them independent of what is above them.
@@ -113,7 +131,11 @@ fn test_init_emits_onhost_systemd_deploy() {
     let options = InitOptions {
         project_name: project_path.to_string_lossy().to_string(),
         template: None,
-        rust: true,
+        // Both are TOMBSTONES (#335 §15): they still exist so that setting one
+        // is an error naming its replacement, so a fixture that sets either is
+        // asserting the refusal, not the scaffold. What they used to select is
+        // now `[generate].targets`.
+        rust: false,
         api_only: false,
         // Explicit: these fixtures live in a tempdir with no enclosing project,
         // and pinning the answer keeps them independent of what is above them.
@@ -365,9 +387,15 @@ fn test_migrate_auto_records_and_scaffolds_authored_hop() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(combined.contains("[authored]"), "marks the authored hop: {combined}");
+    // `migrate up` was removed (#335 §9): the next steps name the two commands
+    // it wrapped, and both are now `--schema`-addressed.
     assert!(
-        combined.contains("migrate up"),
-        "prints the migrate up next steps: {combined}"
+        !combined.contains("migrate up"),
+        "still teaches the removed `migrate up`: {combined}"
+    );
+    assert!(
+        combined.contains("migrate build") && combined.contains("migrate run"),
+        "does not print the build+run next steps: {combined}"
     );
     assert!(dir.join("migrations/schemas/v3.forge").exists(), "v3 versioned schema recorded");
 

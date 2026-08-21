@@ -50,6 +50,36 @@ fn run(cwd: &Path, home: &Path, args: &[&str]) -> std::process::Output {
         .expect("forgedb binary runs")
 }
 
+/// The one `ffi` package this project's cache holds, if any.
+///
+/// **The discriminator for "did `all` reach the opt-in targets" lives in the
+/// CACHE, not in the output directory** (#335 step 7): `generate` stopped
+/// writing `ffi/`, `napi/`, `pyo3/` and `replica/` into the user's tree and
+/// emits them as members of the project's cargo workspace instead. Asserting on
+/// `generated/ffi` after that flip is asserting on a directory nothing writes
+/// any more — it would fail whatever the target filter did, which is the same
+/// as not testing the filter.
+///
+/// Found by scan rather than by joining a hash: the app hash is FNV-1a over the
+/// project-relative schema path, and recomputing it here would be a second
+/// derivation of something the CLI already settled.
+fn cache_ffi_package(home: &Path) -> Option<PathBuf> {
+    let projects = home.join("projects");
+    for project in std::fs::read_dir(&projects).ok()?.flatten() {
+        let apps = project.path().join("apps");
+        let Ok(entries) = std::fs::read_dir(&apps) else {
+            continue;
+        };
+        for app in entries.flatten() {
+            let ffi = app.path().join("ffi");
+            if ffi.join("Cargo.toml").is_file() {
+                return Some(ffi);
+            }
+        }
+    }
+    None
+}
+
 fn combined(out: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -725,7 +755,8 @@ fn s335_16_absent_targets_is_a_positioned_error() {
 /// `config_targets` at all (#335 §12) — so written that way this test passes
 /// whatever the default is, including `None`. Verified by mutation: nulling the
 /// default left the `generate rust` form green. `ffi` is the discriminator
-/// because it is reachable only by the filter naming it.
+/// because it is reachable only by the filter naming it — and it is looked for
+/// in the CACHE, per [`cache_ffi_package`].
 #[test]
 fn s335_16_no_config_file_still_generates() {
     let tmp = tempfile::tempdir().unwrap();
@@ -737,7 +768,7 @@ fn s335_16_no_config_file_still_generates() {
     assert!(out.status.success(), "no config should be fine:\n{}", combined(&out));
     assert!(root.join("generated/database.rs").is_file());
     assert!(
-        root.join("generated/ffi").is_dir(),
+        cache_ffi_package(home.path()).is_some(),
         "the built-in default did not declare `all`:\n{}",
         combined(&out)
     );
@@ -757,7 +788,7 @@ fn s335_16_a_config_without_a_generate_table_still_generates() {
     let out = run(&root, home.path(), &["generate", "all"]);
     assert!(out.status.success(), "{}", combined(&out));
     assert!(
-        root.join("generated/ffi").is_dir(),
+        cache_ffi_package(home.path()).is_some(),
         "an absent [generate] table did not take the built-in default:\n{}",
         combined(&out)
     );
@@ -838,9 +869,11 @@ fn s335_18_all_reaches_the_opt_in_targets() {
     // Always-on, as before.
     assert!(root.join("generated/database.rs").is_file());
     assert!(root.join("generated/types.ts").is_file());
-    // Opt-in — unreachable from `all` before #335 §12.
+    // Opt-in — unreachable from `all` before #335 §12. Looked for in the CACHE:
+    // step 7 moved the ffi package out of the output directory, so the old
+    // `generated/ffi` assertion would now fail no matter what the filter did.
     assert!(
-        root.join("generated/ffi").is_dir(),
+        cache_ffi_package(home.path()).is_some(),
         "`all` did not reach the opt-in ffi target"
     );
 }
