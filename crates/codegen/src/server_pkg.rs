@@ -107,6 +107,23 @@ forgedb-changefeed = "0.2"
 
 serde = {{ version = "1", features = ["derive"] }}
 serde_json = "1"
+
+# NOT substrate, and therefore pinned here rather than routed through `core`:
+# `api.rs` names `rust_decimal::Decimal` ABSOLUTELY when any model carries a
+# `decimal` field, to parse a REST filter value out of the query string. Only a
+# direct dependency puts a crate in this crate's extern prelude — `core`
+# re-exporting it would answer `forgedb_core::rust_decimal`, not the bare path
+# the generated code writes.
+#
+# Pinned unconditionally rather than per-schema, matching how `utoipa` and
+# `serde_json` are handled: the manifest is not schema-shaped, and a
+# conditional pin would make the failure depend on whether the app happens to
+# declare a `decimal` — which is exactly how this shipped broken. It was
+# invisible to every snapshot (they compare strings) and to every in-tree
+# build, and surfaced only on a real `forgedb build` of a schema with a
+# `decimal` column: `error[E0433]: cannot find module or crate rust_decimal`.
+rust_decimal = {{ version = "1", features = ["serde-with-str"] }}
+
 utoipa = {{ version = "5", features = ["uuid"] }}
 utoipa-axum = "0.2"
 axum = {{ version = "0.8", features = ["ws"] }}
