@@ -285,6 +285,20 @@ crash-test:
 index-test:
 	cargo test --test index_test -- --ignored --nocapture
 
+.PHONY: timestamp-filter-test
+
+## Timestamp quantum contract on the REST path (#389): a `timestamp` field declares a
+## quantum, the write path floors a written value to it, and BOTH read paths have to
+## floor identically — the index pushdown (`__rows_by_<f>`) and the residual predicate
+## (`<model>_scan_matches`). A codegen string assertion passes if each merely contains
+## a flooring; only a booted router shows that they agree with each other and with the
+## write gate. Cases isolate: one field is indexed (both paths), one is not (predicate
+## alone, at a coarser quantum), one is `timestamp(us)` (the control, no flooring at
+## all), and a neighbouring bucket must match nothing. Also the compile test for
+## `api.rs` on this shape. #[ignore]d out of the fast suite (compiles a crate).
+timestamp-filter-test:
+	cargo test --test timestamp_filter_wire_test -- --ignored --nocapture
+
 .PHONY: oversized-array-test
 
 ## Oversized-array proof (#243): serde implements `[T; N]` only to N = 32, so a

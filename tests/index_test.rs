@@ -15,6 +15,13 @@
 //!   3. **The null bucket is its own bucket** (#102). `None`, the literal string
 //!      `"null"` and the empty string are three different things; an unlinked
 //!      optional FK keys as absent rather than as some uuid.
+//!   4. **A probe is floored to the field quantum, exactly as the write was**
+//!      (#389). Every timestamp value in the fixture is misaligned to its field's
+//!      declared quantum on purpose, across all three quanta and across all four
+//!      index kinds — hash, nullable hash, `&unique`, ordered range — plus an FK
+//!      column whose parent identity is itself a coarse timestamp. This is the one
+//!      property here that is about the value rather than the type, and it is the
+//!      one an aligned fixture silently stops testing.
 //!
 //! # What it deliberately does NOT assert
 //!
@@ -107,6 +114,9 @@ Kitchen {
   d_price: ^decimal
   u_ref: ^uuid
   t_at: ^timestamp
+  c_at: ^timestamp(s)
+  u_at: ^timestamp(us)
+  q_at: ^&timestamp
   e_status: ^Status
 
   o_name: ^string?
@@ -122,11 +132,21 @@ Kitchen {
 
   owner: *Owner
   editor: ?Owner
+  stamp: *Stamped
 }
 
 Owner {
   id: +uuid
   email: &string
+  kitchens: [Kitchen]
+}
+
+// A non-auto coarse-timestamp identity: legal (`is_identity_key` admits
+// `timestamp(s|ms|us)`), and the only shape in which an FK column is a `Timestamp`
+// whose quantum is coarser than a microsecond (#389).
+Stamped {
+  id: timestamp(ms)
+  label: string
   kitchens: [Kitchen]
 }
 "#;
@@ -208,19 +228,41 @@ use forgedb_types::{Timestamp, Uuid};
 
 static mut FAILURES: u32 = 0;
 
-/// The `t_at` fixture value, in microseconds.
+/// The timestamp fixture values, in microseconds. **Every one of them carries a
+/// remainder past its field's quantum, deliberately** (#389).
 ///
-/// A WHOLE NUMBER OF MILLISECONDS, deliberately: `t_at` is declared `^timestamp`,
-/// whose quantum is a millisecond, and the write path floors a value to the field
-/// quantum while the index probe does NOT floor its argument (#389). A value with
-/// a sub-millisecond remainder is therefore stored under a different key than the
-/// one `find_by_t_at` computes for the same value, and the round-trip below would
-/// fail for a reason that is not about indexes at all.
+/// A `timestamp` field declares a *quantum*, and the write path floors a written
+/// value to it. Before #389 the read path did not: the probe hashed the raw
+/// argument, so a value with a sub-quantum remainder was filed under one key and
+/// asked for under another, and a row could not find itself. The fix floors both
+/// sides, from one place per index kind.
 ///
-/// Do not "simplify" this to an arbitrary integer. When #389 lands, the flooring
-/// happens on both sides and any value will do — until then this alignment is what
-/// keeps the guard measuring what it claims to.
-const T_AT: i64 = 1_234_567_890_000;
+/// These values are what make that assertable. An aligned value passes either way
+/// — which is exactly the alignment #381 had to make here to keep the round-trip
+/// measuring indexes rather than quanta. Do not "simplify" any of them back to a
+/// round number: doing so silently restores the workaround and deletes the only
+/// end-to-end check that the two sides agree.
+///
+/// The three quanta are all exercised, because the emitted quantum literal is
+/// per-field and a hard-coded one would pass a single-field test:
+///   * `t_at`  — `^timestamp`, quantum 1_000 (ms)   → stored `…_890_000`
+///   * `c_at`  — `^timestamp(s)`, quantum 1_000_000 → stored `…_000_000`
+///   * `u_at`  — `^timestamp(us)`, quantum 1        → the CONTROL: no flooring is
+///     emitted at all, so it must round-trip unchanged both before and after.
+const T_AT: i64 = 1_234_567_890_123;
+/// The `^timestamp(s)` fixture value — a whole 1 042 µs past a second boundary, so
+/// it is misaligned for the second quantum AND for the millisecond one.
+const C_AT: i64 = 1_234_567_000_000 + 1_042;
+/// The `^timestamp(us)` control value. Every digit is significant at quantum 1.
+const U_AT: i64 = 1_234_567_890_987;
+/// The `^&timestamp` (unique) fixture value for the first row. Rows 2 and 3 offset
+/// by a whole millisecond each so they stay distinct *after* flooring — a `&unique`
+/// timestamp is unique at the field quantum, not at microsecond resolution.
+const Q_AT: i64 = 1_777_000_000_456;
+/// The `Stamped` identity — a non-auto `timestamp(ms)` primary key, misaligned, so
+/// the row is stored under the floored id while `Kitchen.stamp` is handed the raw
+/// one.
+const STAMP_ID: i64 = 1_555_000_111_222;
 
 /// The observable contract, through the real generated index paths.
 fn roundtrip(dir: std::path::PathBuf) {
@@ -229,6 +271,21 @@ fn roundtrip(dir: std::path::PathBuf) {
         .create_owner(Owner { id: Uuid::nil(), email: "o@x.test".into(), kitchens: () })
         .expect("owner");
     let uref = Uuid::new_v4();
+
+    // A parent keyed by a MISALIGNED `timestamp(ms)`. `create_stamped` floors the
+    // identity on write, so the row lives at `STAMP_ID` truncated to a whole
+    // millisecond — and `stamp_id` is that floored value, not the one passed in.
+    let stamp_id = db
+        .create_stamped(Stamped {
+            id: Timestamp::from_micros(STAMP_ID),
+            label: "s".into(),
+            kitchens: (),
+        })
+        .expect("stamped");
+    if stamp_id != Timestamp::from_micros(STAMP_ID / 1000 * 1000) {
+        println!("FAIL  create_stamped did not floor the identity to the ms quantum");
+        unsafe { FAILURES += 1 };
+    }
 
     let base = |name: &str| Kitchen {
         id: Uuid::nil(),
@@ -244,6 +301,9 @@ fn roundtrip(dir: std::path::PathBuf) {
         d_price: "1.00".parse().unwrap(),
         u_ref: uref,
         t_at: Timestamp::from_micros(T_AT),
+        c_at: Timestamp::from_micros(C_AT),
+        u_at: Timestamp::from_micros(U_AT),
+        q_at: Timestamp::from_micros(Q_AT),
         e_status: Status::Published,
         o_name: None,
         o_code: None,
@@ -253,22 +313,32 @@ fn roundtrip(dir: std::path::PathBuf) {
         o_flag: None,
         o_price: None,
         o_ref: None,
-        o_at: None,
+        o_at: Some(Timestamp::from_micros(T_AT)),
         o_status: None,
         owner,
         editor: None,
+        // The raw, unfloored value — NOT `stamp_id`. A reference is resolved at the
+        // field's declared precision, so handing the FK the same misaligned instant
+        // the parent was created with must find that parent (#389).
+        stamp: Timestamp::from_micros(STAMP_ID),
     };
 
+    // `q_at` is `&unique`, so the three rows must differ — and they differ by a
+    // WHOLE millisecond each, because a `&unique` timestamp is unique at the field
+    // quantum. Two values a microsecond apart in a `^&timestamp` field floor to the
+    // same instant and are, correctly, a uniqueness conflict.
     let mut unset = base("unset");
     unset.o_name = None;
     let id_unset = db.create_kitchen(unset).expect("insert unset");
 
     let mut literal_null = base("literal-null");
     literal_null.o_name = Some("null".to_string());
+    literal_null.q_at = Timestamp::from_micros(Q_AT + 1_000);
     let id_null = db.create_kitchen(literal_null).expect("insert literal-null");
 
     let mut empty = base("empty");
     empty.o_name = Some(String::new());
+    empty.q_at = Timestamp::from_micros(Q_AT + 2_000);
     let id_empty = db.create_kitchen(empty).expect("insert empty");
 
     // Every plain indexed field resolves through its own index.
@@ -293,9 +363,61 @@ fn roundtrip(dir: std::path::PathBuf) {
     hit("n_f64", db.kitchen.find_by_n_f64(1.0), id_unset);
     hit("b_flag", db.kitchen.find_by_b_flag(true), id_unset);
     hit("u_ref", db.kitchen.find_by_u_ref(uref), id_unset);
-    hit("t_at", db.kitchen.find_by_t_at(Timestamp::from_micros(T_AT)), id_unset);
     hit("e_status", db.kitchen.find_by_e_status(Status::Published), id_unset);
     hit("owner", db.kitchen.find_by_owner(owner), id_unset);
+
+    // --- the quantum contract (#389) -------------------------------------------
+    // Each value below carries a remainder past its field's quantum. The write path
+    // floors it; the probe must floor it identically, or the row cannot find itself.
+    // One probe per index kind, because each kind derives its key from a different
+    // place in the generator and a fix to one does not reach the others.
+    hit("t_at", db.kitchen.find_by_t_at(Timestamp::from_micros(T_AT)), id_unset);
+    hit("c_at (quantum 1_000_000)", db.kitchen.find_by_c_at(Timestamp::from_micros(C_AT)), id_unset);
+    hit("o_at (nullable)", db.kitchen.find_by_o_at(Some(Timestamp::from_micros(T_AT))), id_unset);
+    // The FK column: `stamp` was handed the raw instant, the parent lives at the
+    // floored one.
+    hit("stamp (FK to a timestamp identity)", db.kitchen.find_by_stamp(Timestamp::from_micros(STAMP_ID)), id_unset);
+    // The ordered index (#169) is a separate derivation from the hash index: a
+    // degenerate `[t, t]` range must select what `find_by_t_at(t)` selects.
+    hit(
+        "t_at_range [t, t]",
+        db.kitchen.find_by_t_at_range(
+            Some(Timestamp::from_micros(T_AT)),
+            Some(Timestamp::from_micros(T_AT)),
+            false,
+            None,
+        ),
+        id_unset,
+    );
+    // The `&unique` probe returns at most one row, so it needs its own check.
+    match db.kitchen.get_by_q_at(Timestamp::from_micros(Q_AT)) {
+        Some(r) if r.id == id_unset => println!("ok    get_by_q_at (unique)"),
+        _ => {
+            println!("FAIL  get_by_q_at did not return the inserted row");
+            unsafe { FAILURES += 1 };
+        }
+    }
+    // The CONTROL. `timestamp(us)` has quantum 1, so no flooring is emitted on
+    // either side — this passed before the fix and must still pass after, which is
+    // what proves the quantum literal is read from the field rather than assumed.
+    hit("u_at (quantum 1 — control)", db.kitchen.find_by_u_at(Timestamp::from_micros(U_AT)), id_unset);
+
+    // Flooring must not merge buckets that the quantum keeps apart: `Q_AT + 1_000`
+    // is a whole millisecond away, so it is a different row, not the same one.
+    for (label, rows, forbidden) in [
+        (
+            "q_at floors without collapsing distinct quanta",
+            db.kitchen.find_by_q_at(Timestamp::from_micros(Q_AT)),
+            id_null,
+        ),
+    ] {
+        if rows.iter().any(|r| r.id == forbidden) {
+            println!("FAIL  {label}");
+            unsafe { FAILURES += 1 };
+        } else {
+            println!("ok    {label}");
+        }
+    }
 
     // decimal stays scale-invariant: stored "1.00", probed "1.0".
     hit("d_price", db.kitchen.find_by_d_price("1.0".parse().unwrap()), id_unset);
