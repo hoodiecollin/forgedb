@@ -606,10 +606,20 @@ Closes #123
 ### Review Process
 
 **1. Automated checks** run (CI):
-- Build succeeds
-- Tests pass
-- Linter passes
-- Documentation builds
+- Cycle-scope gate, on PRs into `develop` (see below)
+- Substrate outside-repo reclose, on `main` only
+- Go reclose, when the Go/FFI generators change
+
+**The test suite is NOT among them.** Nothing in `.github/workflows/` runs
+`cargo test` — every other workflow there is a release, publish or deploy job.
+Run the baseline yourself before opening a PR:
+
+```bash
+cargo test --workspace --no-fail-fast
+cargo build --workspace --examples   # --lib/--bins/--tests AND --doc all EXCLUDE examples
+```
+
+Tracked as [#390](https://github.com/hoodiecollin/forgedb/issues/390).
 
 **2. Code review** by maintainers:
 - Code quality
