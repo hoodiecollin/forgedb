@@ -494,6 +494,23 @@ impl Governing {
             .unwrap_or(&self.fallback)
     }
 
+    /// How this project derives its app names — read from the **project root**
+    /// config, never the nearest one.
+    ///
+    /// This is the same split identity already takes: knobs come from
+    /// `Chain::nearest()`, project-wide facts from `Chain::project_root()`.
+    /// `symbol_naming` is the second kind, and reading it from the nearest
+    /// config would be worse than merely wrong — two apps in one project could
+    /// then disagree about the mode, so one would compute its siblings' names
+    /// under different rules than they compute their own, and the "shortest
+    /// unique suffix" would stop being unique.
+    pub fn symbol_naming(&self) -> crate::naming::SymbolNaming {
+        self.chain
+            .project_root()
+            .map(|l| l.config.project.symbol_naming)
+            .unwrap_or_default()
+    }
+
     /// Resolve a config-declared relative path against the schema's directory,
     /// then express it relative to the CWD again when it sits beneath it — so the
     /// common single-app case prints exactly the path it always printed.
@@ -618,4 +635,60 @@ fn normalize(p: &Path) -> PathBuf {
 
 fn canonical_or(p: &Path) -> PathBuf {
     p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Directories a schema never lives in, skipped so the walk stays cheap and
+/// cannot pick up a fixture as if it were one of the project's apps.
+const NOT_A_SCHEMA_DIR: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    ".forgedb",
+    ".venv",
+    "vendor",
+];
+
+/// Every `.forge` schema in the project, **project-relative and sorted**.
+///
+/// This is the sibling set [`crate::naming::app_name`] needs: dropping the hash
+/// made a name a function of the project's whole app set, so one app cannot be
+/// named without enumerating the others.
+///
+/// Sorted because the order is an *input* to nothing today but would be a
+/// silent source of name drift the moment it were — two runs that disagree
+/// about the app set must at least not disagree about its order.  Unreadable
+/// directories are skipped rather than raised: a project with one unreadable
+/// subtree should still build its other apps, and a name that changes because a
+/// permission changed would be worse than one derived from what is visible.
+pub fn discover_schemas(project_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_for_schemas(project_root, project_root, &mut out);
+    out.sort();
+    out
+}
+
+fn walk_for_schemas(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else { continue };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+
+        if kind.is_dir() {
+            // Symlinked directories are not followed: a link pointing at an
+            // ancestor makes the walk unbounded, and a link pointing outside
+            // the project would admit a schema that is not one of its apps.
+            if kind.is_symlink() || name.starts_with('.') || NOT_A_SCHEMA_DIR.contains(&&*name) {
+                continue;
+            }
+            walk_for_schemas(root, &path, out);
+        } else if path.extension().is_some_and(|e| e == "forge")
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(rel.to_path_buf());
+        }
+    }
 }
